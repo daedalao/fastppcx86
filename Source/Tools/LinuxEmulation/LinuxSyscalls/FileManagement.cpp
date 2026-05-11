@@ -92,6 +92,15 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
       for (auto Prefix : LibPrefixes) {
         PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, ArchPrefix));
       }
+      // Arch Linux ships 64-bit libraries in /usr/lib (with /usr/lib64 as a symlink
+      // to /usr/lib). Without an explicit "lib" entry in 64-bit mode, the thunk
+      // overlay map never matches the rootfs's actual paths and FEX silently loads
+      // the real x86 library instead of substituting our guest thunk stub.
+      if (Is64BitMode()) {
+        for (auto Prefix : LibPrefixes) {
+          PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib"));
+        }
+      }
     }
 
     FEX::JSON::JsonAllocator Pool {};

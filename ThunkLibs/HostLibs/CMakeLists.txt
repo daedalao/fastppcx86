@@ -10,6 +10,26 @@ if (ENABLE_CLANG_THUNKS)
   add_link_options(${LD_OVERRIDE})
 endif()
 
+# On PPC64LE (Arch) clang picks the Debian-style triple powerpc64le-linux-gnu
+# for the GCC toolchain, but the platform-specific c++ headers live under
+# powerpc64le-unknown-linux-gnu. The mismatch hides <bits/c++config.h>.
+# Discover the real path once and add it to every thunkgen invocation.
+set(PPC_THUNKGEN_EXTRA_FLAGS "")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|powerpc64)")
+  set(_PPC_CXX_PLATFORM_INC "")
+  file(GLOB _PPC_CXX_DIRS /usr/include/c++/*/powerpc64le-*linux-gnu)
+  foreach(_d ${_PPC_CXX_DIRS})
+    if (EXISTS "${_d}/bits/c++config.h")
+      set(_PPC_CXX_PLATFORM_INC "${_d}")
+      break()
+    endif()
+  endforeach()
+  if (_PPC_CXX_PLATFORM_INC)
+    message(STATUS "PPC64LE thunkgen: using platform c++ headers at ${_PPC_CXX_PLATFORM_INC}")
+    list(APPEND PPC_THUNKGEN_EXTRA_FLAGS "-isystem${_PPC_CXX_PLATFORM_INC}")
+  endif()
+endif()
+
 # Syntax: generate(libxyz libxyz-interface.cpp)
 # This defines two targets and a custom command:
 # - custom command: Main build step that runs the thunk generator on the given interface definition
@@ -58,6 +78,7 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
       "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
+      ${PPC_THUNKGEN_EXTRA_FLAGS}
     VERBATIM
     COMMAND_EXPAND_LISTS)
 
