@@ -483,6 +483,26 @@ VDSOParser::VDSOParser(const uint8_t* HeaderBase) {
 }
 
 void LoadHostVDSO() {
+#ifdef ARCHITECTURE_ppc64le
+  // PowerPC64 Linux's vDSO (__kernel_clock_getres, __kernel_clock_gettime,
+  // __kernel_gettimeofday, __kernel_time, __kernel_getcpu) returns POSITIVE
+  // errno on error rather than the kernel-syscall convention of -errno or
+  // the libc convention of -1+errno. Upstream's VDSO::clock_getres handler
+  // assumes -errno, so a +EINVAL=22 return from __kernel_clock_getres ends
+  // up looking like a positive success value (22 nanoseconds resolution),
+  // and glibc on the guest interprets that as the syscall succeeding.
+  //
+  // Rather than papering over each handler with a "positive-errno -> -errno"
+  // conversion (and risking conflating a real positive return with an error),
+  // skip the vDSO function-pointer fast path entirely on PPC64LE hosts. The
+  // x64::glibc::* / x32::glibc::* fallback handlers call ::clock_getres etc.
+  // directly, which use the standard -1+errno libc convention that
+  // SyscallRet() already handles correctly. Cost: one extra C-call per vDSO
+  // op instead of a direct kernel-vDSO function call. Trivial vs the cost
+  // of x86 -> PPC64LE JIT translation.
+  LogMan::Msg::IFmt("VDSO fast-path disabled on PPC64LE: kernel vDSO returns +errno, not -errno. Using libc handlers.");
+  return;
+#endif
   // Linux gives the VDSO ELF header base in the auxv value AT_SYSINFO_EHDR.
   auto VDSOHeader = ::getauxval(AT_SYSINFO_EHDR);
 
