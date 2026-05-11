@@ -2,8 +2,10 @@
 #include <FEXCore/Utils/SpinWaitLock.h>
 
 #include <Interface/Context/Context.h>
+#ifndef ARCHITECTURE_ppc64le
 #include <Interface/Core/ArchHelpers/Arm64Emitter.h>
 #include <Interface/Core/Dispatcher/Dispatcher.h>
+#endif
 #include <Interface/Core/JIT/DebugData.h>
 #include <Interface/Core/JIT/Relocations.h>
 #include <Interface/Core/LookupCache.h>
@@ -610,6 +612,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
 bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
                                      std::span<const FEXCore::CPU::Relocation> EntryRelocations, bool ForStorage) {
+#ifndef ARCHITECTURE_ppc64le
   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
   for (size_t j = 0; j < EntryRelocations.size(); ++j) {
     const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
@@ -650,6 +653,44 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
   }
 
   return true;
+#else
+  // PPC64LE relocation patching
+  for (size_t j = 0; j < EntryRelocations.size(); ++j) {
+    const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
+    auto* Ptr = reinterpret_cast<uint8_t*>(Code.data()) + Reloc.Header.Offset;
+    const size_t Remaining = Code.size() - Reloc.Header.Offset;
+
+    switch (Reloc.Header.Type) {
+    case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
+      uint64_t Pointer = ForStorage ? 0 : GetNamedSymbolLiteral(CTX, Reloc.NamedSymbolLiteral.Symbol);
+      memcpy(Ptr, &Pointer, sizeof(Pointer));
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: {
+      uint64_t Pointer = ForStorage ? 0 : reinterpret_cast<uint64_t>(CTX.ThunkHandler->LookupThunk(Reloc.NamedThunkMove.Symbol));
+      if (Pointer == ~0ULL) {
+        return false;
+      }
+      FEXCore::CPU::PPC64EmitterBase PatchEmitter(&CTX, Ptr, Remaining);
+      PatchEmitter.LoadConstant(PPC64Emitter::r(Reloc.NamedThunkMove.RegisterIndex), Pointer);
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
+      uint64_t Val = GuestEntry + Reloc.GuestRIP.GuestRIP;
+      memcpy(Ptr, &Val, sizeof(Val));
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
+      uint64_t Pointer = Reloc.GuestRIP.GuestRIP + GuestEntry;
+      FEXCore::CPU::PPC64EmitterBase PatchEmitter(&CTX, Ptr, Remaining);
+      PatchEmitter.LoadConstant(PPC64Emitter::r(Reloc.GuestRIP.RegisterIndex), Pointer);
+      break;
+    }
+    default: ERROR_AND_DIE_FMT("Unknown relocation type {}", ToUnderlying(Reloc.Header.Type));
+    }
+  }
+  return true;
+#endif
 }
 
 } // namespace FEXCore::Context

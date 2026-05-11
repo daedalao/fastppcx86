@@ -3,6 +3,9 @@
 
 #include "Common/JitSymbols.h"
 #include "Interface/Core/CPUBackend.h"
+#ifdef ARCHITECTURE_ppc64le
+#include "Interface/Core/JIT/PPC64LE/PPC64Dispatcher.h"
+#endif
 #include "Interface/Core/CPUID.h"
 #include <Interface/IR/IntrusiveIRList.h>
 #include <FEXCore/Config/Config.h>
@@ -36,7 +39,9 @@ namespace Core {
 } // namespace Core
 
 namespace CPU {
+#ifndef ARCHITECTURE_ppc64le
   class Dispatcher;
+#endif
 } // namespace CPU
 
 namespace HLE {
@@ -273,7 +278,11 @@ public:
   FEXCore::HLE::SyscallHandler* SyscallHandler {};
   FEXCore::HLE::SourcecodeResolver* SourcecodeResolver {};
   FEXCore::ThunkHandler* ThunkHandler {};
+#ifdef ARCHITECTURE_ppc64le
+  fextl::unique_ptr<FEXCore::CPU::PPC64Dispatcher> Dispatcher;
+#else
   fextl::unique_ptr<FEXCore::CPU::Dispatcher> Dispatcher;
+#endif
   CodeCache CodeCache;
   fextl::unique_ptr<CodeMapWriter> CodeMapWriter;
 

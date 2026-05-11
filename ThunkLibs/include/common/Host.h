@@ -82,6 +82,8 @@ struct GuestcallInfo {
 #define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mov %%r11, %0" : "=r"(target_variable))
 #elif defined(ARCHITECTURE_arm64)
 #define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mov %0, x11" : "=r"(target_variable))
+#elif defined(ARCHITECTURE_ppc64le)
+#define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mr %0, 11" : "=r"(target_variable))
 #endif
 
 struct ParameterAnnotations {

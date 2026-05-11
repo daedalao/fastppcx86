@@ -655,8 +655,36 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   }
 #endif
 
+  // PPC64LE Altivec/VSX is 128-bit only, but the OpDispatcher's AVX-128
+  // lowering decomposes 256-bit YMM ops into pairs of 128-bit XMM ops with
+  // separate Low/High vector values at IR-generation time. The high half is
+  // routed by the IR allocator into either a host VR or avx_high[] context
+  // memory. So as long as our 128-bit vector ops are functional, AVX/AVX2 is
+  // viable without true 256-bit hardware. Reporting AVX lets glibc IFUNCs
+  // pick their AVX-aware paths instead of falling through to slower variants.
   HostFeatures.SupportsAVX = true;
+  // AES-NI lowering uses the FABI software-helper path (PPC64_VAESEnc et al.
+  // in JIT.cpp) — POWER8 has hardware vcipher/vncipher but the bridge through
+  // the existing FABI mini-frame is the simplest correct first cut. Without
+  // SupportsAES the OpcodeDispatcher rewrites AESENC/AESDEC/AESIMC/etc. to
+  // UnimplementedOp before the IR ever reaches the JIT, so the DEF_OP bodies
+  // never run and tests see input bytes echoed unchanged.
+  HostFeatures.SupportsAES = true;
   HostFeatures.SupportsAES256 = HostFeatures.SupportsAVX && HostFeatures.SupportsAES;
+  // SHA-1 / SHA-256 software helpers (PPC64_VSha1*/VSha256* in JIT.cpp) —
+  // POWER8 has no SHA-NI, so each SHA IR op routes through the FABI bridge.
+  // Without SupportsSHA the OpcodeDispatcher (Crypto.cpp) rewrites the
+  // SHA1NEXTE/SHA1MSG*/SHA1RNDS4/SHA256MSG*/SHA256RNDS2 mnemonics to
+  // UnimplementedOp.
+  HostFeatures.SupportsSHA = true;
+  // PCLMULQDQ goes through the same FABI helper bridge (PPC64_PCLMUL in
+  // JIT.cpp). Without claiming PMULL_128Bit the OpcodeDispatcher rewrites
+  // PCLMUL to UnimplementedOp.
+  HostFeatures.SupportsPMULL_128Bit = true;
+  // CRC32 is a software polynomial loop in DEF_OP(CRC32) — see ALUOps.cpp.
+  // Without claiming SupportsCRC the OpcodeDispatcher rewrites SSE4.2 crc32
+  // to UnimplementedOp / SIGILL Break before the IR ever reaches the JIT.
+  HostFeatures.SupportsCRC = true;
   HostFeatures.SupportsPreserveAllABI = FEX_HAS_PRESERVE_ALL_ATTR;
 
   if (CTR) {
@@ -666,6 +694,14 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     HostFeatures.DCacheLineSize = 64;
     HostFeatures.ICacheLineSize = 64;
   }
+
+  // PPC64LE deliberately leaves SupportsAtomics=false. POWER8 has lwarx/stwcx.
+  // (and byte/halfword variants on POWER8+) but they require natural alignment
+  // — the FEX ASM atomic test suite intentionally exercises misaligned atomics
+  // (lock add at +3/+7/+15/+63) which would fault under lwarx. The non-atomic
+  // fallback path handles these correctly for single-threaded execution; full
+  // atomic correctness for multi-threaded code requires alignment-handling glue
+  // (split into two CAS loops across the boundary) — TODO.
 
   if (!HostFeatures.SupportsAtomics) {
     WARN_ONCE_FMT("Host CPU doesn't support atomics. Expect bad performance");
@@ -735,6 +771,8 @@ FEXCore::HostFeatures FetchHostFeatures() {
     Features.RemoveFeature(CPUFeatures::Feature::AFP);
     // Vixl simulator doesn't support RPRES.
     Features.RemoveFeature(CPUFeatures::Feature::RPRES);
+#elif defined(ARCHITECTURE_ppc64le)
+    // PPC64LE has no ARM64 ID registers; leave Features as default (no ARM extensions).
 #else
     Features = GetCPUFeaturesFromIDRegisters();
 #endif

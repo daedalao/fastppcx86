@@ -30,6 +30,8 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     list(APPEND compile_prop ARCHITECTURE_x86_64=1)
   elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     list(APPEND compile_prop ARCHITECTURE_arm64=1)
+  elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^ppc64|^powerpc64")
+    list(APPEND compile_prop ARCHITECTURE_ppc64le=1)
   endif()
 
   # Target for IDE integration

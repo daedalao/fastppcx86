@@ -376,7 +376,11 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(landlock_create_ruleset, SyscallPassthrough3<SYSCALL_DEF(landlock_create_ruleset)>);
   REGISTER_SYSCALL_IMPL(landlock_add_rule, SyscallPassthrough4<SYSCALL_DEF(landlock_add_rule)>);
   REGISTER_SYSCALL_IMPL(landlock_restrict_self, SyscallPassthrough2<SYSCALL_DEF(landlock_restrict_self)>);
+#ifdef ARCHITECTURE_ppc64le
+  REGISTER_SYSCALL_IMPL(memfd_secret, UnimplementedSyscallSafe);
+#else
   REGISTER_SYSCALL_IMPL(memfd_secret, SyscallPassthrough1<SYSCALL_DEF(memfd_secret)>);
+#endif
   REGISTER_SYSCALL_IMPL(process_mrelease, SyscallPassthrough2<SYSCALL_DEF(process_mrelease)>);
   if (Handler->IsHostKernelVersionAtLeast(5, 16, 0)) {
     REGISTER_SYSCALL_IMPL(futex_waitv, SyscallPassthrough5<SYSCALL_DEF(futex_waitv)>);
@@ -436,7 +440,11 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(setsockopt, SyscallPassthrough5<SYSCALL_DEF(setsockopt)>);
     REGISTER_SYSCALL_IMPL_X64(getsockopt, SyscallPassthrough5<SYSCALL_DEF(getsockopt)>);
     REGISTER_SYSCALL_IMPL_X64(wait4, SyscallPassthrough4<SYSCALL_DEF(wait4)>);
+#ifdef ARCHITECTURE_ppc64le
+    REGISTER_SYSCALL_IMPL_X64(semop, UnimplementedSyscallSafe);
+#else
     REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(gettimeofday, SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>);
     REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);

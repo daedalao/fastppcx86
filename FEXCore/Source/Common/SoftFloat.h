@@ -33,6 +33,9 @@ struct FEX_PACKED X80SoftFloat {
 #elif defined(ARCHITECTURE_arm64)
 #define BIGFLOAT float128_t
 #define BIGFLOATSIZE 16
+#elif defined(ARCHITECTURE_ppc64le)
+#define BIGFLOAT float128_t
+#define BIGFLOATSIZE 16
 #else
 #error No 128bit float for this target!
 #endif

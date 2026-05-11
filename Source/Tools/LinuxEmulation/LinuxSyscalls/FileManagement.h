@@ -162,6 +162,15 @@ private:
   };
   EmulatedFDPathResult GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymlink, FDPathTmpData& TmpFilename) const;
 
+  // Opens a path scoped strictly to RootFS via openat2(RESOLVE_IN_ROOT).
+  // Returns an O_PATH fd whose symlink resolution (intermediate AND leaf) is
+  // confined to the rootfs namespace, preventing absolute symlinks from
+  // escaping into the host filesystem (e.g. an x86 libtinfo.so.6 in the
+  // rootfs accidentally resolving through to the host's PowerPC libncursesw).
+  // FollowSymlink: true follows the leaf symlink, false uses O_NOFOLLOW.
+  // Returns -1 on error (errno is set). Caller owns returned fd.
+  int OpenPathInRootFS(const EmulatedFDPathResult& Path, bool FollowSymlink) const;
+
   std::optional<std::string_view> GetSelf(const char* Pathname) const;
   bool IsSelfNoFollow(const char* Pathname, int flags) const;
 

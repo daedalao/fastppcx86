@@ -12,14 +12,21 @@ $end_info$
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
+#ifndef ARCHITECTURE_ppc64le
 #include "Interface/Core/ArchHelpers/Arm64Emitter.h"
+#endif
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/CPUID.h"
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/OpcodeDispatcher.h"
+#ifdef ARCHITECTURE_ppc64le
+#include "Interface/Core/JIT/PPC64LE/JITClass.h"
+#include "Interface/Core/JIT/PPC64LE/PPC64Dispatcher.h"
+#else
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#endif
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include <Interface/GDBJIT/GDBJIT.h>
 #include "Interface/IR/IR.h"
@@ -343,9 +350,14 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
 
 bool ContextImpl::InitCore() {
   // Initialize the CPU core signal handlers & DispatcherConfig
+#ifdef ARCHITECTURE_ppc64le
+  Dispatcher = FEXCore::CPU::PPC64Dispatcher::Create(this);
+#else
   Dispatcher = FEXCore::CPU::Dispatcher::Create(this);
+#endif
 
-  // Set up the SignalDelegator config since core is initialized.
+  // Set up the SignalDelegator config so it knows our dispatcher's code range,
+  // SRA mappings, and handler addresses.
   SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
 
 #if defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)
@@ -396,7 +408,11 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
 
   // Create CPU backend
   Thread->PassManager->InsertRegisterAllocationPass(this);
+#ifdef ARCHITECTURE_ppc64le
+  Thread->CPUBackend = FEXCore::CPU::CreatePPC64JITCore(this, Thread);
+#else
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
+#endif
 
   Thread->PassManager->Finalize();
 }

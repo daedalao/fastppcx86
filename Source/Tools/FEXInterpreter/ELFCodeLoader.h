@@ -476,7 +476,7 @@ public:
     do {
       // Allocate the base of the full 128MB stack range.
       StackPointerBase = Handler->GuestMmap(Thread, reinterpret_cast<void*>(StackHint), FULL_STACK_SIZE, PROT_NONE,
-                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_GROWSDOWN | MAP_FIXED_NOREPLACE, -1, 0);
       // Scan-downward until we fit.
       StackHint -= PageSize;
     } while (FEX::HLE::HasSyscallError(StackPointerBase) && static_cast<int64_t>(StackHint) > 0);

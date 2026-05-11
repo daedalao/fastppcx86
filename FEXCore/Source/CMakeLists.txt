@@ -31,21 +31,40 @@ set(SRCS
   Interface/Core/OpcodeDispatcher/X87.cpp
   Interface/Core/OpcodeDispatcher/X87F64.cpp
   Interface/Core/OpcodeDispatcher.cpp
-  Interface/Core/ArchHelpers/Arm64Emitter.cpp
-  Interface/Core/Dispatcher/Dispatcher.cpp
   Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
-  Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp
-  Interface/Core/JIT/JIT.cpp
-  Interface/Core/JIT/ALUOps.cpp
-  Interface/Core/JIT/AtomicOps.cpp
-  Interface/Core/JIT/BranchOps.cpp
-  Interface/Core/JIT/ConversionOps.cpp
-  Interface/Core/JIT/EncryptionOps.cpp
-  Interface/Core/JIT/MemoryOps.cpp
-  Interface/Core/JIT/MiscOps.cpp
-  Interface/Core/JIT/MoveOps.cpp
-  Interface/Core/JIT/VectorOps.cpp
-  Interface/Core/JIT/Arm64Relocations.cpp
+  Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp)
+
+if (ARCHITECTURE_ppc64le)
+  # PPC64LE JIT backend — replaces ARM64 JIT and Dispatcher
+  list(APPEND SRCS
+    Interface/Core/ArchHelpers/PPC64Emitter.cpp
+    Interface/Core/JIT/PPC64LE/JIT.cpp
+    Interface/Core/JIT/PPC64LE/ALUOps.cpp
+    Interface/Core/JIT/PPC64LE/AtomicOps.cpp
+    Interface/Core/JIT/PPC64LE/BranchOps.cpp
+    Interface/Core/JIT/PPC64LE/MemoryOps.cpp
+    Interface/Core/JIT/PPC64LE/VectorOps.cpp
+    Interface/Core/JIT/PPC64LE/X87Ops.cpp
+    Interface/Core/JIT/PPC64LE/PPC64Dispatcher.cpp)
+else()
+  # ARM64 JIT backend (default)
+  list(APPEND SRCS
+    Interface/Core/ArchHelpers/Arm64Emitter.cpp
+    Interface/Core/Dispatcher/Dispatcher.cpp
+    Interface/Core/JIT/JIT.cpp
+    Interface/Core/JIT/ALUOps.cpp
+    Interface/Core/JIT/AtomicOps.cpp
+    Interface/Core/JIT/BranchOps.cpp
+    Interface/Core/JIT/ConversionOps.cpp
+    Interface/Core/JIT/EncryptionOps.cpp
+    Interface/Core/JIT/MemoryOps.cpp
+    Interface/Core/JIT/MiscOps.cpp
+    Interface/Core/JIT/MoveOps.cpp
+    Interface/Core/JIT/VectorOps.cpp
+    Interface/Core/JIT/Arm64Relocations.cpp)
+endif()
+
+list(APPEND SRCS
   Interface/Core/X86Tables/BaseTables.cpp
   Interface/Core/X86Tables/DDDTables.cpp
   Interface/Core/X86Tables/H0F38Tables.cpp
@@ -72,8 +91,18 @@ set(SRCS
 
 if (ARCHITECTURE_arm64)
   list(APPEND SRCS Utils/ArchHelpers/Arm64.cpp)
+elseif (ARCHITECTURE_ppc64le)
+  # PPC64LE uses its own atomic helpers; no Arm64 stubs needed
+  # (stubs would pull in ARM-specific headers)
 else()
   list(APPEND SRCS Utils/ArchHelpers/Arm64_stubs.cpp)
+endif()
+
+if (ARCHITECTURE_ppc64le)
+  # LongJump.cpp and ForcedAssert.cpp use naked+inline-asm which LLVM 21's LTO
+  # Gold plugin rejects for PPC64 DS-form memory operands. Compile without LTO.
+  set_property(SOURCE Utils/LongJump.cpp APPEND PROPERTY COMPILE_OPTIONS "-fno-lto")
+  set_property(SOURCE Utils/ForcedAssert.cpp APPEND PROPERTY COMPILE_OPTIONS "-fno-lto")
 endif()
 
 if (ENABLE_GLIBC_ALLOCATOR_HOOK_FAULT)
@@ -81,7 +110,11 @@ if (ENABLE_GLIBC_ALLOCATOR_HOOK_FAULT)
     Utils/AllocatorOverride.cpp)
 endif()
 
-set(DEFINES -DJIT_ARM64)
+if (ARCHITECTURE_ppc64le)
+  set(DEFINES -DJIT_PPC64LE)
+else()
+  set(DEFINES -DJIT_ARM64)
+endif()
 
 if (ARCHITECTURE_x86_64)
   list(APPEND DEFINES -DARCHITECTURE_x86_64=1)
@@ -89,6 +122,10 @@ endif()
 
 if (ARCHITECTURE_arm64)
   list(APPEND DEFINES -DARCHITECTURE_arm64=1)
+endif()
+
+if (ARCHITECTURE_ppc64le)
+  list(APPEND DEFINES -DARCHITECTURE_ppc64le=1)
 endif()
 
 if (ENABLE_VIXL_DISASSEMBLER)

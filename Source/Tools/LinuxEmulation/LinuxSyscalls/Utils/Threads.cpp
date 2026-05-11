@@ -128,6 +128,12 @@ void StackTracker::DeallocateStackObjectAndExit(void* Ptr, int Status) {
                  "svc #0;" ::[SyscallNum] "i"(SYSCALL_DEF(exit)),
                  [Result] "r"(Status)
                  : "memory", "x0", "x8");
+#elif defined(ARCHITECTURE_ppc64le)
+  __asm volatile("li %%r0, %[SyscallNum];"
+                 "mr %%r3, %[Result];"
+                 "sc;" ::[SyscallNum] "i"(SYSCALL_DEF(exit)),
+                 [Result] "r"(Status)
+                 : "memory", "r0", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "cr0");
 #else
   __asm volatile("mov %[Result], %%edi;"
                  "syscall;" ::"a"(SYSCALL_DEF(exit)),
@@ -162,6 +168,34 @@ __attribute__((naked)) void StackPivotAndCall(void* Arg, FEXCore::Threads::Threa
     ret;
     )" ::
                    : "memory");
+}
+#elif defined(ARCHITECTURE_ppc64le)
+__attribute__((naked)) void StackPivotAndCall(void* Arg, FEXCore::Threads::ThreadFunc Func, uint64_t StackPivot) {
+  // r3: Arg
+  // r4: Function to call
+  // r5: StackPivot
+  __asm volatile(
+    // ELFv2: caller must provide a frame with LR-save at +16 for the callee
+    // to clobber during its prologue. A 16-byte pivot frame placed at the
+    // top of the new stack puts +16 one byte past the mapping -> SEGV.
+    // Use 32 bytes so +16 is in-mapping. Host LR at +8 (CR save area, only
+    // touched by callees that save CR — none of ours do).
+    "mflr  %%r6\n\t"
+    "mr    %%r7, %%r1\n\t"       // save original SP
+    "mr    %%r1, %%r5\n\t"       // pivot to new stack
+    "stdu  %%r7, -32(%%r1)\n\t"  // back-chain at 0; 32-byte ELFv2 frame
+    "std   %%r6,  8(%%r1)\n\t"   // host LR (CR-save slot)
+    "std   %%r2, 24(%%r1)\n\t"   // preserve TOC across bctrl
+    "mr    %%r12, %%r4\n\t"      // ELFv2 global-entry: r12 = func addr
+    "mtctr %%r4\n\t"
+    "bctrl\n\t"
+    "ld    %%r2, 24(%%r1)\n\t"
+    "ld    %%r6,  8(%%r1)\n\t"
+    "ld    %%r1,  0(%%r1)\n\t"
+    "mtlr  %%r6\n\t"
+    "blr"
+    ::
+    : "memory", "r6", "r7", "r12");
 }
 #else
 __attribute__((naked)) void StackPivotAndCall(void* Arg, FEXCore::Threads::ThreadFunc Func, uint64_t StackPivot) {

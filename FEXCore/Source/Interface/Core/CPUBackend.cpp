@@ -3,7 +3,9 @@
 #include "Interface/Context/Context.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/LookupCache.h"
+#ifndef ARCHITECTURE_ppc64le
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#endif
 
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/AllocatorHooks.h>

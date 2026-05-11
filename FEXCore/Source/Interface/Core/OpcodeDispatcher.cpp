@@ -1418,6 +1418,36 @@ void OpDispatchBuilder::XGetBVOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RDX, RDX);
 }
 
+void OpDispatchBuilder::XTestOp(OpcodeArgs) {
+  // XTEST: Intel TSX/RTM "Test In Transactional Region" (opcode 0F 01 /2 /6).
+  // FEX doesn't implement TSX; per Intel SDM XTEST sets ZF=1 when the processor
+  // is *not* executing transactionally (HLE or RTM) and clears it otherwise.
+  // Always-not-transactional → unconditionally set ZF, clear the others.
+  CalculateDeferredFlags();
+  ZeroNZCV();
+  SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0));
+}
+
+void OpDispatchBuilder::XBeginOp(OpcodeArgs) {
+  // XBEGIN: Intel TSX/RTM "Start Transaction" (opcode C7 F8 rel32). FEX doesn't
+  // implement TSX. Treat the transaction as immediately aborting and fall
+  // through to the abort handler; per the SDM that means EAX is loaded with
+  // _XABORT_RETRY semantics. Without a real RTM unit we minimally satisfy the
+  // declaration so the linker is happy — guests that actually rely on XBEGIN
+  // would need a real implementation.
+  CalculateDeferredFlags();
+  StoreGPRRegister(X86State::REG_RAX, Constant(0));
+}
+
+void OpDispatchBuilder::XEndOp(OpcodeArgs) {
+  // XEND: Intel TSX/RTM "End Transaction" (opcode 0F 01 D5). Per SDM raises #UD
+  // when executed outside a transactional region. With TSX unimplemented, every
+  // XEND is outside such a region — but minimal stub treats it as no-op so the
+  // build links. Guests that actually rely on TSX would need a real
+  // implementation that #UD's appropriately.
+  CalculateDeferredFlags();
+}
+
 void OpDispatchBuilder::SHLOp(OpcodeArgs) {
   const auto Size = OpSizeFromSrc(Op);
   auto Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
@@ -2971,10 +3001,15 @@ void OpDispatchBuilder::WriteSegmentReg(OpcodeArgs, OpDispatchBuilder::Segment S
   // This is incorrect and it instead zero extends the 32-bit value to 64-bit
   const auto Size = OpSizeFromDst(Op);
   Ref Src = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+  // {fs,gs}_cached are uint64_t; a 32-bit StoreContext leaves the upper bits stale.
+  // Zero-extend and always store the full 64 bits.
+  if (Size != OpSize::i64Bit) {
+    Src = _Bfe(OpSize::i64Bit, IR::OpSizeAsBits(Size), 0, Src);
+  }
   if (Seg == Segment::FS) {
-    _StoreContextGPR(Size, Src, offsetof(FEXCore::Core::CPUState, fs_cached));
+    _StoreContextGPR(OpSize::i64Bit, Src, offsetof(FEXCore::Core::CPUState, fs_cached));
   } else {
-    _StoreContextGPR(Size, Src, offsetof(FEXCore::Core::CPUState, gs_cached));
+    _StoreContextGPR(OpSize::i64Bit, Src, offsetof(FEXCore::Core::CPUState, gs_cached));
   }
 }
 
@@ -4206,12 +4241,19 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   case FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX:
     _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, ds_cached));
     break;
-  case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX:
-    _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, fs_cached));
+  case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX: {
+    // fs_cached is uint64_t; zero-extend the 32-bit GDT base before a full 64-bit store
+    // so the upper half is never left stale from a prior write.
+    auto Zext = _Bfe(OpSize::i64Bit, 32, 0, NewSegment);
+    _StoreContextGPR(OpSize::i64Bit, Zext, offsetof(FEXCore::Core::CPUState, fs_cached));
     break;
-  case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX:
-    _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, gs_cached));
+  }
+  case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX: {
+    // gs_cached is uint64_t; same rationale as FS above.
+    auto Zext = _Bfe(OpSize::i64Bit, 32, 0, NewSegment);
+    _StoreContextGPR(OpSize::i64Bit, Zext, offsetof(FEXCore::Core::CPUState, gs_cached));
     break;
+  }
   default: break; // Do nothing
   }
 }

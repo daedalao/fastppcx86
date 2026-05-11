@@ -24,6 +24,10 @@ static inline uint64_t GetCycleCounter() {
                  : [Res] "=r"(Result));
   return Result;
 }
+#elif defined(ARCHITECTURE_ppc64le)
+static inline uint64_t GetCycleCounter() {
+  return __builtin_ppc_get_timebase();
+}
 #else
 static inline uint64_t GetCycleCounter() {
   unsigned dummy;

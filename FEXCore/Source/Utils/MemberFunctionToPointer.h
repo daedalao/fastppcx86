@@ -20,7 +20,7 @@ public:
   }
 
   uintptr_t GetConvertedPointer() const {
-#ifdef ARCHITECTURE_x86_64
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_ppc64le)
     // Itanium C++ ABI (https://itanium-cxx-abi.github.io/cxx-abi/abi.html#member-function-pointers)
     // Low bit of ptr specifies if this Member function pointer is virtual or not
     // Throw an assert if we were trying to cast a virtual member
@@ -39,7 +39,7 @@ public:
 
   // Gets the vtable entry position of a virtual member function.
   size_t GetVTableOffset() const {
-#ifdef ARCHITECTURE_x86_64
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_ppc64le)
     // Itanium C++ ABI (https://itanium-cxx-abi.github.io/cxx-abi/abi.html#member-function-pointers)
     // Low bit of ptr specifies if this Member function pointer is virtual or not
     // Throw an assert if we are not loading a virtual member.

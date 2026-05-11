@@ -60,6 +60,31 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
     "0: \n"
     ".quad 0, 0, 0, 0 \n" // TrampolineInstanceInfo
   );
+#elif defined(ARCHITECTURE_ppc64le)
+  // r11 is the custom ABI register pointing to TrampolineInstanceInfo (mirrors x11 on ARM64).
+  // bl-trick gives a PC-relative address without modifying LR permanently.
+  // Layout (8 insns = 32 bytes of code, then 32 bytes of TrampolineInstanceInfo):
+  //   +0:  mflr r0          save caller LR
+  //   +4:  bl 1f            LR = &label1; fall through to label1
+  //   +8:  [label1] mflr r12   r12 = &label1
+  //   +12: mtlr r0          restore caller LR
+  //   +16: addi r11,r12,24  r11 = &TrampolineInstanceInfo (label1+24 = +32 from func start)
+  //   +20: ld r12,0(r11)    r12 = TrampolineInstanceInfo.HostPacker
+  //   +24: mtctr r12
+  //   +28: bctr
+  //   +32: .quad 0,0,0,0    TrampolineInstanceInfo
+  asm(
+    "mflr %r0 \n"
+    "bl 1f \n"
+    "1: mflr %r12 \n"
+    "mtlr %r0 \n"
+    "addi %r11, %r12, 24 \n"
+    "ld %r12, 0(%r11) \n"
+    "mtctr %r12 \n"
+    "bctr \n"
+    ".align 3 \n"
+    ".quad 0, 0, 0, 0 \n"
+  );
 #else
 #error Unsupported host architecture
 #endif

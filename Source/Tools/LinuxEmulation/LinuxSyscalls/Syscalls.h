@@ -40,9 +40,12 @@ $end_info$
 #include <list>
 #ifdef ARCHITECTURE_x86_64
 #define SYSCALL_ARCH_NAME x64
-#elif ARCHITECTURE_arm64
+#elif defined(ARCHITECTURE_arm64)
 #include "LinuxSyscalls/Arm64/SyscallsEnum.h"
 #define SYSCALL_ARCH_NAME Arm64
+#elif defined(ARCHITECTURE_ppc64le)
+#include "LinuxSyscalls/PPC64LE/SyscallsEnum.h"
+#define SYSCALL_ARCH_NAME PPC64LE
 #endif
 
 #include "LinuxSyscalls/x64/SyscallsEnum.h"
@@ -460,81 +463,16 @@ struct clone3_args {
 
 uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args);
 
-inline static int RemapFromX86Flags(int flags) {
-#ifdef ARCHITECTURE_x86_64
-  // Nothing to change here
-#elif ARCHITECTURE_arm64
-  constexpr int X86_64_FLAG_O_DIRECT = 040000;
-  constexpr int X86_64_FLAG_O_LARGEFILE = 0100000;
-  constexpr int X86_64_FLAG_O_DIRECTORY = 0200000;
-  constexpr int X86_64_FLAG_O_NOFOLLOW = 0400000;
-
-  constexpr int AARCH64_FLAG_O_DIRECTORY = 040000;
-  constexpr int AARCH64_FLAG_O_NOFOLLOW = 0100000;
-  constexpr int AARCH64_FLAG_O_DIRECT = 0200000;
-  constexpr int AARCH64_FLAG_O_LARGEFILE = 0400000;
-
-  int new_flags {};
-  if (flags & X86_64_FLAG_O_DIRECT) {
-    flags = (flags & ~X86_64_FLAG_O_DIRECT);
-    new_flags |= AARCH64_FLAG_O_DIRECT;
-  }
-  if (flags & X86_64_FLAG_O_LARGEFILE) {
-    flags = (flags & ~X86_64_FLAG_O_LARGEFILE);
-    new_flags |= AARCH64_FLAG_O_LARGEFILE;
-  }
-  if (flags & X86_64_FLAG_O_DIRECTORY) {
-    flags = (flags & ~X86_64_FLAG_O_DIRECTORY);
-    new_flags |= AARCH64_FLAG_O_DIRECTORY;
-  }
-  if (flags & X86_64_FLAG_O_NOFOLLOW) {
-    flags = (flags & ~X86_64_FLAG_O_NOFOLLOW);
-    new_flags |= AARCH64_FLAG_O_NOFOLLOW;
-  }
-  flags |= new_flags;
+// open(2) flag remapping — implementation is per-arch, in FlagRemapping.h
+#if defined(ARCHITECTURE_x86_64)
+#  include "LinuxSyscalls/x64/FlagRemapping.h"
+#elif defined(ARCHITECTURE_arm64)
+#  include "LinuxSyscalls/Arm64/FlagRemapping.h"
+#elif defined(ARCHITECTURE_ppc64le)
+#  include "LinuxSyscalls/PPC64LE/FlagRemapping.h"
 #else
-#error Unknown flag remappings for this host platform
+#  error "RemapFromX86Flags / RemapToX86Flags: unknown host architecture"
 #endif
-  return flags;
-}
-
-inline static int RemapToX86Flags(int flags) {
-#ifdef ARCHITECTURE_x86_64
-  // Nothing to change here
-#elif ARCHITECTURE_arm64
-  constexpr int X86_64_FLAG_O_DIRECT = 040000;
-  constexpr int X86_64_FLAG_O_LARGEFILE = 0100000;
-  constexpr int X86_64_FLAG_O_DIRECTORY = 0200000;
-  constexpr int X86_64_FLAG_O_NOFOLLOW = 0400000;
-
-  constexpr int AARCH64_FLAG_O_DIRECTORY = 040000;
-  constexpr int AARCH64_FLAG_O_NOFOLLOW = 0100000;
-  constexpr int AARCH64_FLAG_O_DIRECT = 0200000;
-  constexpr int AARCH64_FLAG_O_LARGEFILE = 0400000;
-
-  int new_flags {};
-  if (flags & AARCH64_FLAG_O_DIRECT) {
-    flags = (flags & ~AARCH64_FLAG_O_DIRECT);
-    new_flags |= X86_64_FLAG_O_DIRECT;
-  }
-  if (flags & AARCH64_FLAG_O_LARGEFILE) {
-    flags = (flags & ~AARCH64_FLAG_O_LARGEFILE);
-    new_flags |= X86_64_FLAG_O_LARGEFILE;
-  }
-  if (flags & AARCH64_FLAG_O_DIRECTORY) {
-    flags = (flags & ~AARCH64_FLAG_O_DIRECTORY);
-    new_flags |= X86_64_FLAG_O_DIRECTORY;
-  }
-  if (flags & AARCH64_FLAG_O_NOFOLLOW) {
-    flags = (flags & ~AARCH64_FLAG_O_NOFOLLOW);
-    new_flags |= X86_64_FLAG_O_NOFOLLOW;
-  }
-  flags |= new_flags;
-#else
-#error Unknown flag remappings for this host platform
-#endif
-  return flags;
-}
 
 /**
  * @brief Checks raw syscall return for error

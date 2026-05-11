@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <sys/ioctl.h>
+#include <termios.h>
 
 namespace FEX::HLE::x32 {
 namespace streams {

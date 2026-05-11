@@ -166,19 +166,36 @@ fextl::unique_ptr<FEX::HLE::MemAllocator> InitAllocator(bool Is64Bit) {
 
   // Setup our userspace allocator
   FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
-  auto Allocator = FEX::HLE::CreatePassthroughAllocator();
+  // PassthroughAllocator delegates straight to ::mmap, which on PPC64LE
+  // (and any host whose default mmap base sits above 4 GiB) returns
+  // addresses outside the 32-bit guest address space. glibc i686 then
+  // truncates those pointers when calling through *gs:0x10 (AT_SYSINFO) and
+  // SEGVs on first syscall. The real 32-bit allocator tracks a 4 GiB
+  // bitmap and only hands out low addresses, which is required for any
+  // 32-bit guest binary that consumes AT_SYSINFO.
+  auto Allocator = FEX::HLE::Create32BitAllocator();
 
   // Now that the upper 32-bit address space is blocked for future allocations,
   // exhaust all of jemalloc's remaining internal allocations that it reserved before.
   // TODO: It's unclear how reliably this exhausts those reserves
   // TODO: This will likely consume one arena inside the 32-bit VA space.
   //   - (HdkR): I've noticed jemalloc consuming an 8MB arena commonly.
+  //
+  // PPC64LE-host caveat: Linux on PPC64LE puts userspace heap entirely in the
+  // 0x3fff_xxxx_xxxx range, so jemalloc never returns a low-4 GiB address and
+  // the unbounded loop spins forever. Cap the iteration count so we drain
+  // whatever's available below 4 GiB and bail out otherwise.
   FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator glibc;
-  void* data;
-  do {
+  void* data = nullptr;
+  for (int i = 0; i < (1 << 20); ++i) {
     data = malloc(0x1);
-  } while (reinterpret_cast<uintptr_t>(data) >> 32 != 0);
-  free(data);
+    if (reinterpret_cast<uintptr_t>(data) >> 32 == 0) {
+      break;
+    }
+  }
+  if (data) {
+    free(data);
+  }
 
   return Allocator;
 }
@@ -612,7 +629,10 @@ int main(int argc, char** argv, char** const envp) {
   CTX->ExecuteThread(ParentThread->Thread);
 
   DebugServer.reset();
-  SyscallHandler->TM.Stop();
+  // The JIT thread (current thread) has already exited — sending SIGRTMIN to
+  // ourselves with a stale ReturningStackLocation would corrupt r1 and crash.
+  // Pass IgnoreCurrentThread=true so only other (worker) threads are stopped.
+  SyscallHandler->TM.Stop(true);
 
   auto ProgramStatus = ParentThread->StatusCode;
 

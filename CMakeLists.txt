@@ -109,9 +109,12 @@ elseif (processor MATCHES "^aarch64|^arm64|^armv8\.*")
     set(ARCHITECTURE_arm64ec 1)
     add_compile_definitions(ARCHITECTURE_arm64ec=1)
   endif()
+elseif (processor MATCHES "^ppc64|^powerpc64")
+  set(ARCHITECTURE_ppc64le 1)
+  add_compile_definitions(ARCHITECTURE_ppc64le=1)
 endif()
 
-if (NOT (ARCHITECTURE_arm64 OR ARCHITECTURE_arm64ec OR ARCHITECTURE_x86_64))
+if (NOT (ARCHITECTURE_arm64 OR ARCHITECTURE_arm64ec OR ARCHITECTURE_x86_64 OR ARCHITECTURE_ppc64le))
   message(FATAL_ERROR "Unsupported processor type ${processor}."
     " If you believe this is in error, file an issue.")
 endif()
@@ -627,70 +630,76 @@ if (BUILD_THUNKS)
   # Thunk targets for IDE integration of guest code, only
   add_subdirectory(ThunkLibs/GuestLibs)
 
-  # Thunk targets for guest libraries
-  include(ExternalProject)
-  ExternalProject_Add(guest-libs
-    PREFIX guest-libs
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
-    BINARY_DIR "Guest"
-    CMAKE_ARGS
-      "-DBITNESS=64"
-      "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-      "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-      "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
-      "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
-      "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
-      "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
-      "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
-    INSTALL_COMMAND ""
-    BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+  # Optionally cross-build the actual guest-side stub libraries. Disable on
+  # hosts without an x86_64 cross-compile chain (e.g. POWER8) and ship in
+  # pre-built guest stubs separately.
+  option(BUILD_GUEST_THUNKS "Build x86_64 (and 32-bit) guest stub libraries via ExternalProject" ON)
+  if (BUILD_GUEST_THUNKS)
+    # Thunk targets for guest libraries
+    include(ExternalProject)
+    ExternalProject_Add(guest-libs
+      PREFIX guest-libs
+      SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
+      BINARY_DIR "Guest"
+      CMAKE_ARGS
+        "-DBITNESS=64"
+        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+        "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
+        "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
+        "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
+        "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
+        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+      INSTALL_COMMAND ""
+      BUILD_ALWAYS ON
+      DEPENDS thunkgen)
 
-  ExternalProject_Add(guest-libs-32
-    PREFIX guest-libs-32
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
-    BINARY_DIR "Guest_32"
-    CMAKE_ARGS
-      "-DBITNESS=32"
-      "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-      "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-      "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
-      "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
-      "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
-      "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
-      "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
-    INSTALL_COMMAND ""
-    BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+    ExternalProject_Add(guest-libs-32
+      PREFIX guest-libs-32
+      SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
+      BINARY_DIR "Guest_32"
+      CMAKE_ARGS
+        "-DBITNESS=32"
+        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+        "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
+        "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
+        "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
+        "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
+        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+      INSTALL_COMMAND ""
+      BUILD_ALWAYS ON
+      DEPENDS thunkgen)
 
-  install(
-    CODE "message(\"-- Installing: guest-libs\")"
-    CODE "
-      execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)"
-    DEPENDS guest-libs
-    COMPONENT Runtime)
+    install(
+      CODE "message(\"-- Installing: guest-libs\")"
+      CODE "
+        execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)"
+      DEPENDS guest-libs
+      COMPONENT Runtime)
 
-  install(
-    CODE "message(\"-- Installing: guest-libs-32\")"
-    CODE "
-      execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
-    DEPENDS guest-libs-32
-    COMPONENT Runtime)
+    install(
+      CODE "message(\"-- Installing: guest-libs-32\")"
+      CODE "
+        execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
+      DEPENDS guest-libs-32
+      COMPONENT Runtime)
 
-  add_custom_target(uninstall_guest-libs
-    COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
+    add_custom_target(uninstall_guest-libs
+      COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
 
-  add_custom_target(uninstall_guest-libs-32
-    COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
+    add_custom_target(uninstall_guest-libs-32
+      COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
 
-  add_dependencies(uninstall uninstall_guest-libs)
-  add_dependencies(uninstall uninstall_guest-libs-32)
+    add_dependencies(uninstall uninstall_guest-libs)
+    add_dependencies(uninstall uninstall_guest-libs-32)
+  endif()
 endif()
 
 if (NOT MINGW AND BUILD_STEAM_SUPPORT)

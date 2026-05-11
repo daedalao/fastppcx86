@@ -36,5 +36,15 @@ using VectorRegPairType = __m256i;
 static inline VectorRegPairType MakeVectorRegPair(VectorRegType low, VectorRegType high) {
   return _mm256_set_m128i(high, low);
 }
+
+#elif defined(ARCHITECTURE_ppc64le)
+using VectorRegType = __attribute__((vector_size(16))) uint8_t;
+struct VectorRegPairType {
+  VectorRegType val[2];
+};
+
+static inline VectorRegPairType MakeVectorRegPair(VectorRegType low, VectorRegType high) {
+  return VectorRegPairType {low, high};
+}
 #endif
 } // namespace FEXCore

@@ -25,6 +25,12 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/fextl/set.h>
 
+// Debug RIP tracing from PPC64LE dispatcher
+extern "C" {
+  extern uint64_t g_dispatch_count;
+  extern uint64_t g_recent_rips[16];
+}
+
 namespace FEXCore::Frontend {
 #include "Interface/Core/VSyscall/VSyscall.inc"
 
@@ -82,7 +88,11 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
   if (CTX->HostFeatures.SupportsAVX && CTX->HostFeatures.SupportsSVE256) {
     VEXTable = &FEXCore::X86Tables::VEXTableOps;
     VEXTableGroup = &FEXCore::X86Tables::VEXTableGroupOps;
-  } else if (CTX->HostFeatures.SupportsAVX) {
+  } else {
+    // Even when AVX isn't reported (PPC64LE has 128-bit-only Altivec), install
+    // the AVX128 VEX table. Static glibc unconditionally emits VEX-encoded
+    // versions of 128-bit ops (vmovd, vpinsrd, ...) during init regardless of
+    // CPUID — those decode into the same IR as their SSE counterparts.
     VEXTable = &FEXCore::X86Tables::VEXTableOps_AVX128;
     VEXTableGroup = &FEXCore::X86Tables::VEXTableGroupOps_AVX128;
   }
@@ -1506,12 +1516,44 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           InstStream -= PCOffset;
           EraseBlock = true;
         } else {
-          LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
-                            BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST   ? "Invalid" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST    ? "NoExec" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION ? "BadRelocation" :
-                                                                                         "PartialDecode",
-                            OpAddress);
+          {
+            uint64_t _dcount = g_dispatch_count;
+            LogMan::Msg::EFmt("{} instruction in entry block: {:X} (dispatch={})",
+                              BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST   ? "Invalid" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST    ? "NoExec" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION ? "BadRelocation" :
+                                                                                           "PartialDecode",
+                              OpAddress, _dcount);
+            for (int _ri = 1; _ri <= 8 && _ri <= (int)_dcount; ++_ri) {
+              LogMan::Msg::EFmt("  rip[-{}] = {:X}", _ri, g_recent_rips[(_dcount - _ri) & 15]);
+            }
+            // Dump guest register state to diagnose stack corruption
+            {
+              auto& S = Thread->CurrentFrame->State;
+              uint64_t rsp_val = S.gregs[4]; // RSP index
+              uint64_t r12_val = S.gregs[12];
+              uint64_t r13_val = S.gregs[13];
+              uint64_t r14_val = S.gregs[14];
+              uint64_t r15_val = S.gregs[15];
+              LogMan::Msg::EFmt("  gregs: RAX={:X} RCX={:X} RDX={:X} RBX={:X}",
+                                S.gregs[0], S.gregs[1], S.gregs[2], S.gregs[3]);
+              LogMan::Msg::EFmt("  gregs: RSP={:X} RBP={:X} RSI={:X} RDI={:X}",
+                                rsp_val, S.gregs[5], S.gregs[6], S.gregs[7]);
+              LogMan::Msg::EFmt("  gregs: R8={:X} R9={:X} R10={:X} R11={:X}",
+                                S.gregs[8], S.gregs[9], S.gregs[10], S.gregs[11]);
+              LogMan::Msg::EFmt("  gregs: R12={:X} R13={:X} R14={:X} R15={:X}",
+                                r12_val, r13_val, r14_val, r15_val);
+              // Print what is on the guest stack at [RSP-8..RSP+64]
+              if (rsp_val >= 0x1000) {
+                for (int _si = -1; _si <= 8; ++_si) {
+                  uint64_t addr = rsp_val + (uint64_t)(_si * 8);
+                  if (addr < 0x1000) continue;
+                  uint64_t val = *reinterpret_cast<const uint64_t*>(addr);
+                  LogMan::Msg::EFmt("  [RSP{:+d}]={:X}", _si * 8, val);
+                }
+              }
+            }
+          }
         }
         break;
       }

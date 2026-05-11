@@ -24,6 +24,15 @@ struct JumpBuf {
   // SP,
   uint64_t Registers[21];
 };
+#elif defined(ARCHITECTURE_ppc64le)
+struct JumpBuf {
+  // ELFv2 ABI: save r14-r31, r1 (SP), LR, CR.
+  // FPRs (f14-f31) and VMX (v20-v31) are omitted — FEX's own C++ control paths
+  // do not rely on callee-saved FP/vector state across a longjmp recovery.
+  // Same slot count as ARM64 (21) so InternalThreadState stays within 2 pages.
+  // Layout: [r14..r31]=0..17, SP=18, LR=19, CR=20
+  uint64_t Registers[21];
+};
 #else
 struct JumpBuf {
   // Registers to preserve

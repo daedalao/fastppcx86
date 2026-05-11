@@ -411,6 +411,9 @@ public:
   void CMOVOp(OpcodeArgs);
   void CPUIDOp(OpcodeArgs);
   void XGetBVOp(OpcodeArgs);
+  void XTestOp(OpcodeArgs);
+  void XBeginOp(OpcodeArgs);
+  void XEndOp(OpcodeArgs);
   uint32_t GetConstantShift(X86Tables::DecodedOp Op, bool Is1Bit);
   void SHLOp(OpcodeArgs);
   void SHLImmediateOp(OpcodeArgs, bool SHL1Bit);

@@ -399,8 +399,9 @@ void ThreadManager::Stop(bool IgnoreCurrentThread) {
     std::lock_guard lk(ThreadCreationMutex);
     for (auto& Thread : Threads) {
       if (IgnoreCurrentThread && Thread->ThreadInfo.TID == tid) {
-        // If we are callign stop from the current thread then we can ignore sending signals to this thread
-        // This means that this thread is already gone
+        // If we are calling stop from the current thread then we can ignore sending signals to this thread.
+        // This thread is already gone - do NOT send it a stop signal.
+        continue;
       } else if (Thread->ThreadInfo.TID == tid) {
         // We need to save the current thread for last to ensure all threads receive their stop signals
         CurrentThread = Thread;

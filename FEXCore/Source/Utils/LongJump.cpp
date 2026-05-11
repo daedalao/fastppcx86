@@ -82,6 +82,85 @@ FEX_DEFAULT_VISIBILITY void ManuallyLoadJumpBuf(const JumpBuf& Buffer, uint64_t 
   *PC = GPRs[30];
 }
 
+#elif defined(ARCHITECTURE_ppc64le)
+// PPC64LE ELFv2 ABI SetJump/LongJump.
+// Saves r14-r31 (18 callee-saved GPRs), r1 (SP), LR, CR — 21 slots total.
+// FPRs (f14-f31) and VMX (v20-v31) are intentionally omitted: FEX's own C++
+// control paths don't use callee-saved FP/vector state across a longjmp recovery.
+// 21 slots = 168 bytes, matching the ARM64 JumpBuf size so InternalThreadState
+// stays within its required 2-page (8192-byte) layout constraint.
+[[nodiscard]]
+FEX_DEFAULT_VISIBILITY FEX_NAKED uint64_t SetJump(JumpBuf& Buffer) {
+  __asm volatile(
+    /* r3 = Buffer* — slots 0-17: r14-r31, slot 18: r1, slot 19: LR, slot 20: CR */
+    "std  %%r14,   0(%%r3)\n\t"
+    "std  %%r15,   8(%%r3)\n\t"
+    "std  %%r16,  16(%%r3)\n\t"
+    "std  %%r17,  24(%%r3)\n\t"
+    "std  %%r18,  32(%%r3)\n\t"
+    "std  %%r19,  40(%%r3)\n\t"
+    "std  %%r20,  48(%%r3)\n\t"
+    "std  %%r21,  56(%%r3)\n\t"
+    "std  %%r22,  64(%%r3)\n\t"
+    "std  %%r23,  72(%%r3)\n\t"
+    "std  %%r24,  80(%%r3)\n\t"
+    "std  %%r25,  88(%%r3)\n\t"
+    "std  %%r26,  96(%%r3)\n\t"
+    "std  %%r27, 104(%%r3)\n\t"
+    "std  %%r28, 112(%%r3)\n\t"
+    "std  %%r29, 120(%%r3)\n\t"
+    "std  %%r30, 128(%%r3)\n\t"
+    "std  %%r31, 136(%%r3)\n\t"
+    "std   %%r1, 144(%%r3)\n\t"
+    "mflr  %%r4\n\t"
+    "std   %%r4, 152(%%r3)\n\t"
+    "mfcr  %%r4\n\t"
+    "std   %%r4, 160(%%r3)\n\t"
+    "li    %%r3, 0\n\t"
+    "blr"
+    ::
+    : "memory", "r4");
+}
+
+[[noreturn]]
+FEX_DEFAULT_VISIBILITY FEX_NAKED void LongJump(const JumpBuf& Buffer, uint64_t Value) {
+  __asm volatile(
+    /* r3 = Buffer*, r4 = Value */
+    /* Restore CR, LR, SP first (using r5 as scratch, which is caller-saved) */
+    "ld   %%r5, 160(%%r3)\n\t"
+    "mtcr %%r5\n\t"
+    "ld   %%r5, 152(%%r3)\n\t"
+    "mtlr %%r5\n\t"
+    "ld   %%r1, 144(%%r3)\n\t"
+    /* Restore r14-r31 last (keeps r3 valid until the end) */
+    "ld  %%r14,   0(%%r3)\n\t"
+    "ld  %%r15,   8(%%r3)\n\t"
+    "ld  %%r16,  16(%%r3)\n\t"
+    "ld  %%r17,  24(%%r3)\n\t"
+    "ld  %%r18,  32(%%r3)\n\t"
+    "ld  %%r19,  40(%%r3)\n\t"
+    "ld  %%r20,  48(%%r3)\n\t"
+    "ld  %%r21,  56(%%r3)\n\t"
+    "ld  %%r22,  64(%%r3)\n\t"
+    "ld  %%r23,  72(%%r3)\n\t"
+    "ld  %%r24,  80(%%r3)\n\t"
+    "ld  %%r25,  88(%%r3)\n\t"
+    "ld  %%r26,  96(%%r3)\n\t"
+    "ld  %%r27, 104(%%r3)\n\t"
+    "ld  %%r28, 112(%%r3)\n\t"
+    "ld  %%r29, 120(%%r3)\n\t"
+    "ld  %%r30, 128(%%r3)\n\t"
+    "ld  %%r31, 136(%%r3)\n\t"
+    "mr   %%r3, %%r4\n\t"
+    "blr"
+    ::
+    : "memory");
+}
+
+FEX_DEFAULT_VISIBILITY void ManuallyLoadJumpBuf(const JumpBuf& Buffer, uint64_t Value, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC) {
+  LOGMAN_MSG_A_FMT("ManuallyLoadJumpBuf unimplemented on ppc64le");
+}
+
 #else
 [[nodiscard]]
 FEX_DEFAULT_VISIBILITY FEX_NAKED uint64_t SetJump(JumpBuf& Buffer) {
@@ -139,7 +218,7 @@ FEX_DEFAULT_VISIBILITY FEX_NAKED void LongJump(const JumpBuf& Buffer, uint64_t V
                    : "memory");
 }
 
-FEX_DEFAULT_VISIBILITY void ManuallyLoadJumpBuf(JumpBuf& Buffer, uint64_t Value, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC) {
+FEX_DEFAULT_VISIBILITY void ManuallyLoadJumpBuf(const JumpBuf& Buffer, uint64_t Value, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC) {
   LOGMAN_MSG_A_FMT("This is unimplemented on x86-64");
 }
 
