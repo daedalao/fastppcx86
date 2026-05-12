@@ -679,7 +679,19 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
               (0 << 16) |                              // AVX512-F
               (0 << 17) |                              // AVX512-DQ
               (CTX->HostFeatures.SupportsRAND << 18) | // RDSEED
+#ifdef ARCHITECTURE_ppc64le
+              // ADCX/ADOX (ADX) instructions are broken under the PPC64LE JIT
+              // (CFInverted-vs-OF carry-chain confusion in OpDispatchBuilder::ADXOp's
+              // fallback path); OpenSSL's CRYPTOGAMS x25519_fe64_mul deterministically
+              // computes wrong shared secret. Advertise ADX as unavailable so OpenSSL
+              // (and any future ADX consumer) falls back to the plain MUL+ADC path,
+              // which FEX-PPC64 handles correctly (verified via direct dlsym test of
+              // x25519_fe51_mul and x25519_fe51_sqr — both produce identical output
+              // to native x86_64). Remove the gate once ADXOp is fixed.
+              (0 << 19) |
+#else
               (1 << 19) |                              // ADCX and ADOX instructions
+#endif
               (0 << 20) |                              // SMAP Supervisor mode access prevention and CLAC/STAC instructions
               (0 << 21) |                              // AVX512-IFMA
               (0 << 22) |                              // PCOMMIT (deprecated?)
