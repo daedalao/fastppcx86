@@ -258,23 +258,19 @@ DEF_OP(LoadNamedVectorIndexedConstant) {
     vperm(Dst, VTMP1, VTMP1, VTMP2);
     break;
   case IR::OpSize::i64Bit:
-    // Load 8 LE bytes, place in low 64 bits of Dst, zero upper.
+    // Load 8 LE bytes into low 8 bytes of bounce, zero high 8, single lvx.
+    // Mirrors LoadNamedVectorConstant's i64 case - no byte-reverse needed:
+    // lvx places memory-byte-i at phys-byte-i, and downstream consumers
+    // (e.g. VTBL1) read FEX's phys-i = LE-i convention directly.  The prior
+    // vperm reversed the bytes within the low 8, which scrambled the
+    // PSHUFLW / PSHUFHW byte-index tables and made MMX PSHUFW with imm
+    // values that hit the default path (not 0x00 / 0xFF fast-path) produce
+    // a broadcast of the source's LE byte 0.
     ld(TMP2, 0, TMP1);
     std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0);
-    std(TMP2, -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, TMP2, r0);
-    // Byte-reverse the loaded 8 bytes into LE element-0 position (low half).
-    LoadConstant(TMP2, 0x1011121314151617ULL); std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0001020304050607ULL); std(TMP2, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP2, TMP2, r0);
-    // VTMP1 holds the 8 LE bytes at physical 0..7 (high half BE).  We want
-    // them at LE element 0 = physical 8..15 reversed. The vperm above maps
-    // dst-physical-i ← VTMP1-physical-(perm[i]). Indices ≥0x10 read 0 from
-    // the second source (also VTMP1's other half = 0).
-    vperm(Dst, VTMP1, VTMP1, VTMP2);
+    std(r(0), -8, r1);
+    addi(TMP3, r1, -16);
+    lvx(Dst, r(0), TMP3);
     break;
   case IR::OpSize::i32Bit:
     lwz(TMP2, 0, TMP1);
