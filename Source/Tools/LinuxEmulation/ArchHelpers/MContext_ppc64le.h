@@ -18,27 +18,33 @@ constexpr uint32_t PPC_PT_DSISR = 42;  // Data Storage Interrupt Status Register
 constexpr uint32_t PPC_PT_STATE = 27;  // FEX JIT thread-state pointer (r27)
 
 struct PPC64ContextBackup {
-  // ELFv2 caller linkage area, MUST be the first 32 bytes of the backup so
-  // that `r1+0..31` writes by code that runs with `r1 == &Backup` land here
-  // instead of clobbering GPRs[0..3].
+  // ELFv2 caller-frame reservation: linkage area (+0..31) + parameter
+  // save area (+32..95). MUST be at the head of the backup so that any
+  // code which runs with `r1 == &Backup` and writes within the standard
+  // ABI-defined caller-frame slots lands here instead of clobbering GPRs.
   //
-  // This matters because HandleDispatcherGuestSignal sets host PC to
-  // `DispatcherLoopTopFillSRAAddress` (i.e. PAST the dispatcher's
+  // Why this matters: HandleDispatcherGuestSignal sets host PC to
+  // `DispatcherLoopTopFillSRAAddress` (PAST the dispatcher's
   // PushCalleeSavedRegisters prologue). The kernel resumes user code with
-  // r1 == NewSP == &Backup, no dispatcher frame pushed. Falling through to
-  // the L1-lookup loop and then jumping to ExitFunctionLinker hits
+  // r1 == NewSP == &Backup and no dispatcher frame pushed. Two distinct
+  // families of writes then hit Backup memory without the pad:
   //
-  //   std r2, 24, r1       ; save TOC across the C bctrl
+  //   (a) The dispatcher's `std r2, 24, r1` (ExitFunctionLinker's TOC save
+  //       across the C bctrl) writes at r1+24. Without the linkage portion
+  //       of the pad that clobbered Backup->GPRs[3] -- sigsuspend then
+  //       returned a TOC pointer instead of -EINTR. (Fixed first in
+  //       commit 3b9b640a3 with a 32-byte head pad.)
   //
-  // which without this pad would write the host TOC pointer (a value like
-  // 0x3fffafc36f00) into Backup->GPRs[3]. On the rt_sigreturn / SIGILL
-  // round-trip back through HandleSIGILL -> RestoreThreadState, that
-  // corrupted GPRs[3] gets restored as the host r3 — turning a
-  // sigsuspend-returns-`-EINTR` into a sigsuspend-returns-some-TOC-pointer.
+  //   (b) Any callee invoked by `bctrl` is entitled by ELFv2 to spill its
+  //       incoming r3..r10 args into the CALLER's parameter save area at
+  //       r1+32..r1+95. With only the 32-byte linkage pad, a callee's
+  //       spill of r5 (parameter slot at r1+48) clobbered Backup->GPRs[2].
+  //       Restore then fed back a stale host TOC, and the host PC ran into
+  //       an unmapped library page when resuming libc::select -- observed
+  //       as sigaction-17-12's MAXINST=500 infinite SIGSEGV loop.
   //
-  // Layout below r1 still grows down as usual; only +0..+31 is reserved.
-  // Sized as four uint64_t so the struct layout is alignment-clean.
-  uint64_t LinkageArea[4];
+  // 96 bytes (12 doublewords) covers both. Sized as 16 for headroom.
+  uint64_t LinkageArea[16];  // 128 bytes (>= 96 required by ELFv2 caller-frame ABI)
 
   // All 48 gregs: r0-r31, then NIP/MSR/ORIG_R3/CTR/LR/XER/CCR/...
   uint64_t GPRs[48];
