@@ -1529,6 +1529,15 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   Ptrs.MonoBackpatcherWrite =
     reinterpret_cast<uint64_t>(&FEXCore::Context::ContextImpl::MonoBackpatcherWrite);
 
+  // ThreadRemoveCodeEntryFromJIT is invoked from DEF_OP(ThreadRemoveCodeEntry)
+  // (ALUOps.cpp:3072) which runs at the tail of the SMC validate-and-evict
+  // side block emitted in CONFIG_SMC_FULL mode. Mirrors ARM64's JIT.cpp:645.
+  // Without this, the JIT loads r12=0 and bctrls into NULL, observed as the
+  // SelfModifyingCode/SameBlock + DifferentBlock + Delinking test crashes
+  // when FEX_SMCCHECKS=full.
+  Ptrs.ThreadRemoveCodeEntryFromJIT =
+    reinterpret_cast<uintptr_t>(&FEXCore::Context::ContextImpl::ThreadRemoveCodeEntryFromJit);
+
   // Tell the register allocator how many registers the PPC64 backend provides.
   RAPass = Thread->PassManager->GetPass<IR::RegisterAllocationPass>("RA");
   RAPass->AddRegisters(IR::RegClass::GPR,      GeneralRegisters.size());
