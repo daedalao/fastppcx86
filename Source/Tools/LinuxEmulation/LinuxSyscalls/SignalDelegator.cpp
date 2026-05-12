@@ -51,7 +51,15 @@ __attribute__((naked)) static void sigrestore() {
 constexpr static uint32_t X86_MINSIGSTKSZ = 2048;
 
 static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_stack) {
-  // The thread object lives just before the alt-stack begin.
+  // The thread object lives just before the alt-stack begin. If the alt-stack
+  // is disabled or has no base (signal arrived during thread teardown after
+  // sigaltstack(SS_DISABLE) in UninstallTLSState), there is no valid thread
+  // pointer to read. Return nullptr so the caller can chain the default
+  // handler -- the original fault is then preserved in a clean coredump
+  // instead of being clobbered by a recovery-path double-fault.
+  if ((alt_stack.ss_flags & SS_DISABLE) || alt_stack.ss_sp == nullptr) {
+    return nullptr;
+  }
   FEX::HLE::ThreadStateObject* ThreadObject {};
   memcpy(&ThreadObject, reinterpret_cast<void*>(reinterpret_cast<uint64_t>(alt_stack.ss_sp) - 8), sizeof(void*));
   return ThreadObject;
@@ -60,6 +68,16 @@ static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_sta
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ucontext_t* _context = (ucontext_t*)UContext;
   auto ThreadObject = GetThreadFromAltStack(_context->uc_stack);
+  if (!ThreadObject) {
+    // No valid alt-stack: cannot dispatch this signal through FEX. Restore
+    // the default disposition and return -- the kernel will re-deliver on
+    // resume, preserving the original fault NIP/siginfo in the coredump.
+    struct sigaction sa {};
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(Signal, &sa, nullptr);
+    return;
+  }
   FEXCORE_PROFILE_ACCUMULATION(ThreadObject->Thread, AccumulatedSignalTime);
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }
