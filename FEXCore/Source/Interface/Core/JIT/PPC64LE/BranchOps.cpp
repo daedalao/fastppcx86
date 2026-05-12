@@ -118,8 +118,20 @@ DEF_OP(CondJump) {
     // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
     CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
   } else {
-    EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
+    // Route the compare through cr(7) so we don't disturb CR0 / XER.
+    // CR0 carries packed-NZCV N/Z bits filled by FillStaticRegs at block
+    // entry (and consumed by downstream FromNZCV CondJump / NZCVSelect
+    // ops). Under CONFIG_SMC_FULL the SMC IR pass emits a non-FromNZCV
+    // CondJump (on the ValidateCode result) right before the actual x86
+    // instruction body — clobbering CR0 here cascades into wrong-direction
+    // x86 conditional jumps. (See SelfModifyingCode/Delinking under
+    // SMC_FULL: cmp/jg + cmp/je fall the wrong way because CR0 held the
+    // validate compare's eq/lt outcome rather than the guest cmp result.)
+    EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2, /*CRField=*/7);
     CC = MapCC(Op->Cond);
+    // MapCC returns a Cond with BI numbered against CR0 (BI in 0..3).
+    // Shift to the equivalent CR7 bit positions (BI in 28..31).
+    CC = {CC.BO, static_cast<uint8_t>(CC.BI + 28)};
   }
   Label Skip;
   bc(InvertCond(CC), &Skip);

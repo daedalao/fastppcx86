@@ -2998,6 +2998,24 @@ DEF_OP(MonoBackpatcherWrite) {
   li(r(0), 0);
 }
 DEF_OP(ValidateCode) {
+  // CRITICAL: all compares route through cr(7), not the default cr(0).
+  //
+  // Under CONFIG_SMC_FULL the IR pass emits this op at the start of every
+  // x86-instruction block, BEFORE the actual instruction body. FillStaticRegs
+  // (run at block entry by the dispatcher) populates CR0+XER from the
+  // previously-spilled NZCV — the x86 flag state left by the prior block.
+  // If ValidateCode clobbered CR0 here, any subsequent x86 conditional in
+  // the same JIT-compile (cmp/jg, cmp/je, ...) consuming NZCV via
+  // CondJumpNZCV / MapNZCVCC would read stale bits set by the validate
+  // compare instead of the guest cmp's result.
+  //
+  // Concretely surfaces in SelfModifyingCode/Delinking under SMC_FULL: the
+  // test's `cmp rcx,0; jg patched_op` always falls through and `cmp rbx,0;
+  // je end` always takes, because CR0 carries the byte-compare's eq/lt
+  // outcome rather than the guest cmp's result. SameBlock and DifferentBlock
+  // pass only because they don't use conditional jumps.
+  //
+  // BI mapping for cr7: CR7.LT=28, CR7.GT=29, CR7.EQ=30, CR7.SO=31.
   auto Op = IROp->C<IR::IROp_ValidateCode>();
   const auto OldCode = Op->CodeOriginal.data();
   const auto Base    = GetReg(Op->Header.Args[0]);
@@ -3008,12 +3026,15 @@ DEF_OP(ValidateCode) {
   PPC64Emitter::Label Fail{};
   PPC64Emitter::Label End{};
 
+  // cr7 not-equal: BO=4 (branch if false), BI=30 (CR7.EQ).
+  constexpr PPC64Emitter::Cond CR7_NE = {4, 30};
+
   // 8-byte chunks — ld zero-extends implicitly (64-bit load on LE host)
   while (len >= 8) {
     ld(TMP1, Offset, Base);
     LoadConstant(TMP2, *reinterpret_cast<const uint64_t*>(OldCode + Offset));
-    cmpld(TMP1, TMP2);
-    bc(CC_NE, &Fail);
+    cmpld(cr(7), TMP1, TMP2);
+    bc(CR7_NE, &Fail);
     Offset += 8; len -= 8;
   }
 
@@ -3021,8 +3042,8 @@ DEF_OP(ValidateCode) {
   if (len >= 4) {
     lwz(TMP1, Offset, Base);
     LoadConstant(TMP2, static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(OldCode + Offset)));
-    cmpld(TMP1, TMP2);
-    bc(CC_NE, &Fail);
+    cmpld(cr(7), TMP1, TMP2);
+    bc(CR7_NE, &Fail);
     Offset += 4; len -= 4;
   }
 
@@ -3030,8 +3051,8 @@ DEF_OP(ValidateCode) {
   if (len >= 2) {
     lhz(TMP1, Offset, Base);
     LoadConstant(TMP2, static_cast<uint64_t>(*reinterpret_cast<const uint16_t*>(OldCode + Offset)));
-    cmpld(TMP1, TMP2);
-    bc(CC_NE, &Fail);
+    cmpld(cr(7), TMP1, TMP2);
+    bc(CR7_NE, &Fail);
     Offset += 2; len -= 2;
   }
 
@@ -3039,8 +3060,8 @@ DEF_OP(ValidateCode) {
   if (len >= 1) {
     lbz(TMP1, Offset, Base);
     LoadConstant(TMP2, static_cast<uint64_t>(OldCode[Offset]));
-    cmpld(TMP1, TMP2);
-    bc(CC_NE, &Fail);
+    cmpld(cr(7), TMP1, TMP2);
+    bc(CR7_NE, &Fail);
   }
 
   LoadConstant(Dst, UINT64_C(0));

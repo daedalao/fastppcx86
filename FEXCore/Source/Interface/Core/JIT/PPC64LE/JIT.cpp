@@ -1383,7 +1383,8 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
 // -------------------------------------------------------------------------
 void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
                                IR::OrderedNodeWrapper Src1,
-                               IR::OrderedNodeWrapper Src2) {
+                               IR::OrderedNodeWrapper Src2,
+                               uint8_t CRField) {
   // FP conditions: operands are FPRs (vector reg holding scalar in element 0).
   const bool IsFP = (Cond == IR::CondClass::FLU || Cond == IR::CondClass::FGE ||
                      Cond == IR::CondClass::FLEU || Cond == IR::CondClass::FGT ||
@@ -1402,7 +1403,7 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
       lfd(PPC64Emitter::FPRegs::f0, -32, r1);
       lfd(PPC64Emitter::FPRegs::f1, -16, r1);
     }
-    fcmpu(cr(0), PPC64Emitter::FPRegs::f0, PPC64Emitter::FPRegs::f1);
+    fcmpu(cr(CRField), PPC64Emitter::FPRegs::f0, PPC64Emitter::FPRegs::f1);
     return;
   }
 
@@ -1415,35 +1416,35 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
     if (IsUnsigned) {
       if (Const <= 0xFFFF) {
         if (Sz <= IR::OpSize::i32Bit)
-          cmplwi(cr(0), Reg1, static_cast<uint16_t>(Const));
+          cmplwi(cr(CRField), Reg1, static_cast<uint16_t>(Const));
         else
-          cmpldi(Reg1, static_cast<uint16_t>(Const));
+          cmpldi(cr(CRField), Reg1, static_cast<uint16_t>(Const));
       } else {
         LoadConstant(TMP4, Const);
-        if (Sz <= IR::OpSize::i32Bit) cmplw(Reg1, TMP4);
-        else                           cmpld(Reg1, TMP4);
+        if (Sz <= IR::OpSize::i32Bit) cmplw(cr(CRField), Reg1, TMP4);
+        else                           cmpld(cr(CRField), Reg1, TMP4);
       }
     } else {
       int64_t sConst = static_cast<int64_t>(Const);
       if (sConst >= -32768 && sConst <= 32767) {
         if (Sz <= IR::OpSize::i32Bit)
-          cmpwi(Reg1, static_cast<int16_t>(sConst));
+          cmpwi(cr(CRField), Reg1, static_cast<int16_t>(sConst));
         else
-          cmpdi(Reg1, static_cast<int16_t>(sConst));
+          cmpdi(cr(CRField), Reg1, static_cast<int16_t>(sConst));
       } else {
         LoadConstant(TMP4, Const);
-        if (Sz <= IR::OpSize::i32Bit) cmpw(Reg1, TMP4);
-        else                           cmpd(Reg1, TMP4);
+        if (Sz <= IR::OpSize::i32Bit) cmpw(cr(CRField), Reg1, TMP4);
+        else                           cmpd(cr(CRField), Reg1, TMP4);
       }
     }
   } else {
     GPR Reg2 = GetReg(Src2);
     if (IsUnsigned) {
-      if (Sz <= IR::OpSize::i32Bit) cmplw(Reg1, Reg2);
-      else                           cmpld(Reg1, Reg2);
+      if (Sz <= IR::OpSize::i32Bit) cmplw(cr(CRField), Reg1, Reg2);
+      else                           cmpld(cr(CRField), Reg1, Reg2);
     } else {
-      if (Sz <= IR::OpSize::i32Bit) cmpw(Reg1, Reg2);
-      else                           cmpd(Reg1, Reg2);
+      if (Sz <= IR::OpSize::i32Bit) cmpw(cr(CRField), Reg1, Reg2);
+      else                           cmpd(cr(CRField), Reg1, Reg2);
     }
   }
 }

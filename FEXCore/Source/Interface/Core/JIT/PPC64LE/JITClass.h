@@ -228,7 +228,8 @@ private:
   // Emit compare for a CondJump that evaluates Src1 op Src2.
   // After this, CR0 reflects the comparison result for MapCC(Cond).
   void EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
-                   IR::OrderedNodeWrapper Src1, IR::OrderedNodeWrapper Src2);
+                   IR::OrderedNodeWrapper Src1, IR::OrderedNodeWrapper Src2,
+                   uint8_t CRField = 0);
 
   // Project XER.SO/OV/CA -> CR1.LT/GT/EQ non-destructively. Used to make
   // C/V flags branch-testable after an x86 *WithFlags op. Clobbers TMP1, TMP2.
