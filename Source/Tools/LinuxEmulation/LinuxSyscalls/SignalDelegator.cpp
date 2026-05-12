@@ -630,14 +630,16 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // - If there are *no* deferred signals
       //  - No need to mprotect, it is already RW
     } else {
-#ifdef ARCHITECTURE_arm64
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_ppc64le)
       // If RefCount != 0 then that means we hit an access with nested signal-deferring sections.
-      // Increment the PC past the `str zr, [x1]` to continue code execution until we reach the outermost section.
+      // Increment the PC past the unconditional refcount-store (`str zr, [x1]` on Arm64,
+      // `std rN, 0(rM)` on PPC64LE — both 4-byte fixed-size stores) so execution continues
+      // until we reach the outermost section.
       ArchHelpers::Context::SetPc(UContext, ArchHelpers::Context::GetPc(UContext) + 4);
       return;
 #else
       // X86 should always be doing a refcount compare and branch since we can't guarantee instruction size.
-      // ARM64 just always does the access to reduce branching overhead.
+      // ARM64 / PPC64LE just always do the access to reduce branching overhead.
       ERROR_AND_DIE_FMT("X86 shouldn't hit this InterruptFaultPage");
 #endif
     }
