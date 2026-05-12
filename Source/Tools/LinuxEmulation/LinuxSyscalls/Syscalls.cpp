@@ -30,6 +30,7 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -827,6 +828,39 @@ uint32_t SyscallHandler::CalculateGuestKernelVersion() {
 }
 
 uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args) {
+  // Phase 3 of signal-cluster fix: defer async signals across the entire
+  // host syscall body. Background:
+  //
+  // Without this guard, the host kernel can deliver an async signal at any
+  // point inside the host C++ syscall handler (often deep inside a libc
+  // ::syscall call). FEX's signal handler then captures host context with
+  // the guest SRA in a partially-mutated state -- some registers were spilled
+  // to State by the JIT's Syscall op, some are still live in host registers
+  // per the InSyscallInfo bitmask. When the guest signal handler runs and
+  // returns, FEX restores that partially-spilled snapshot, leaving certain
+  // guest registers wrong.
+  //
+  // The visible symptoms include: bash $() returning stack-pointer-shaped
+  // bytes (project_steam_nul_underlying_cause.md); 4 POSIX signal API
+  // conformance failures (project_posix_signal_cluster_open.md); and Steam
+  // i686 SEGV'ing at __kernel_rt_sigreturn after 5.4M dispatches with EBX=0
+  // (project_steam_vdso_sigreturn_segv.md).
+  //
+  // Deferring across the host syscall is safe: blocking host syscalls still
+  // get interrupted by the kernel (::syscall returns -EINTR, which propagates
+  // to the JIT exactly as a real Linux kernel would); the queued signal then
+  // gets delivered at the natural clean point when this guard destructs.
+  // The destructor's InterruptFaultPage->Store(0) is what triggers delivery
+  // when a deferred signal is pending -- the page is PROT_NONE in that case,
+  // the store faults, and FEX's SIGSEGV handler (recognising the InterruptFaultPage
+  // address) drains the deferred queue and resumes.
+  //
+  // Phase 1 (commit 8774c7dda) added InSyscallInfo bookkeeping. Phase 2
+  // (today's d441d9869) made PPC64LE handle the InterruptFaultPage refcount-store
+  // fault correctly. This Phase 3 closes the loop by actually arming the guard
+  // at the right scope.
+  FEXCore::DeferredSignalRefCountGuard SignalGuard(Frame->Thread);
+
   // Grab the return address which will be inside the JIT.
   const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
 
