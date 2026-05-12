@@ -77,12 +77,25 @@ private:
     return &JumpTargets[Block->ID];
   }
 
-  // Spill slots management
+  // Spill slots management.
+  //
+  // SpillSlots is sampled from IR->SpillSlots() at the top of CompileCode.
+  // EmitEntryPoint allocates `SpillFrameSize` bytes below the dispatcher
+  // frame via stdu r1, -SpillFrameSize, r1. SpillRegister/FillRegister then
+  // address slots at POSITIVE offsets from the new r1: slot 0 at [r1+0],
+  // slot 1 at [r1+32], etc. Every block-exit emit site calls ResetStack()
+  // to undo the frame extension before transferring control out of the JIT.
+  //
+  // Mirrors Arm64JITCore::CompileCode + ResetStack (gemini-fex JIT.cpp:804
+  // and JIT.cpp:1157). The previous fixed `SpillBase = -768` formula went
+  // positive after slot 24 and silently walked off the top of r1; observed
+  // as a SIGSEGV in add_sub_carry_2.asm.jit_500 where the RA spilled 200+
+  // NZCV temps from 256 unrolled SBBs in a single IR block.
   uint32_t SpillSlots {};
-  static constexpr int32_t SpillBase = -512 - 256;  // below callee-save area
+  uint32_t SpillFrameSize {};
 
   int32_t SpillOffset(uint32_t slot) const {
-    return SpillBase + static_cast<int32_t>(slot * MaxSpillSlotSize);
+    return static_cast<int32_t>(slot * MaxSpillSlotSize);
   }
 
   // -----------------------------------------------------------------------

@@ -1449,10 +1449,25 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
 }
 
 // -------------------------------------------------------------------------
-// ResetStack: restore stack pointer to JIT frame entry
+// ResetStack: undo the per-block spill frame extension emitted by
+// EmitEntryPoint, restoring r1 to the dispatcher's frame bottom.
+//
+// Must be called at every JIT-to-dispatcher transition emit site so the
+// dispatcher's frame accounting stays correct on the way out. Currently
+// invoked from DEF_OP(ExitFunction), DEF_OP(Break), and DEF_OP(CallbackReturn)
+// — the only ops that hand control back to the dispatcher / C++ caller.
 // -------------------------------------------------------------------------
 void PPC64JITCore::ResetStack() {
-  // The JIT doesn't grow the stack during normal execution — this is a no-op.
+  if (SpillFrameSize == 0) {
+    return;
+  }
+  // addi's 16-bit signed immediate covers up to +32767. SpillFrameSize is
+  // always a multiple of MaxSpillSlotSize (=32) and bounded by the assert in
+  // CompileCode's prologue stdu, so the constant-load path isn't needed.
+  LOGMAN_THROW_A_FMT(SpillFrameSize <= 32767,
+                     "SpillFrameSize {} exceeds addi range",
+                     SpillFrameSize);
+  addi(r1, r1, static_cast<int16_t>(SpillFrameSize));
 }
 
 // -------------------------------------------------------------------------
@@ -1562,7 +1577,12 @@ void PPC64JITCore::ClearCache() {
 void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF) {
   Bind(&HeaderLabel);
 
-  // Fill SRA registers from the CpuStateFrame
+  // Fill SRA registers from the CpuStateFrame. NOTE: this only runs on the
+  // cold path (ExitFunctionLink slow return). The dispatcher's L1-hit path
+  // branches directly to CodeData.EntryPoints[Entry], which the caller sets
+  // AFTER this function returns, so warm dispatch skips this FillStaticRegs.
+  // SRA on warm dispatch is filled once by DispatcherLoopTopFillSRA before
+  // falling into the L1 lookup loop.
   FillStaticRegs();
 
   if (CheckTF) {
@@ -1599,6 +1619,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   this->IR       = IRView;
   this->DebugData = DebugData_;
 
+  // Sample SpillSlots from the post-RA IR and compute the per-block
+  // spill-frame size. align16() is implicit because MaxSpillSlotSize=32
+  // is already a multiple of 16, keeping the PPC ELFv2 stack alignment.
+  SpillSlots     = IRView->SpillSlots();
+  SpillFrameSize = SpillSlots * MaxSpillSlotSize;
+
   // Use the current code buffer at the current write offset
   auto* CB = CurrentCodeBuffer.get();
   SetBuffer(CB->Ptr + CodeBuffers.LatestOffset,
@@ -1630,7 +1656,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   PPC64Emitter::Label HeaderLabel{};
   EmitEntryPoint(HeaderLabel, CheckTF);
 
-  // The entry point map: guest RIP → host code address
+  // The entry point map: guest RIP -> host code address.
+  // NOTE: this is the COLD-PATH entry recorded right after EmitEntryPoint
+  // (post-FillStaticRegs). The per-IR-block loop below OVERWRITES this with
+  // the same Entry key when BlockIROp->EntryPoint && GuestEntryOffset == 0,
+  // so the address the dispatcher actually branches to is the block's
+  // bound JumpTarget. The spill-frame stdu therefore has to be emitted
+  // INSIDE the for-loop, immediately after the EntryPoint recording, not
+  // here.
   CodeData.EntryPoints[Entry] = GetCursorAddress<uint8_t*>();
 
   // -------------------------------------------------------------------------
@@ -1721,6 +1754,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // -------------------------------------------------------------------------
   // Block iteration
   // -------------------------------------------------------------------------
+  // Spill-frame setup needs to land inside the dispatch target — that is,
+  // after the EntryPoint recording below — so an L1-hit branch actually
+  // runs the stdu before the block body. The dispatcher branches to the
+  // FIRST EntryPoint recorded; emit the stdu once on the first hit.
+  bool SpillFrameEmitted = false;
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
 
@@ -1731,6 +1769,21 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+    }
+
+    // On the FIRST block (entry block), emit the per-CompileCode spill
+    // frame. Each block within the same CompileCode shares this frame; the
+    // matching ResetStack at every block-exit emit site (ExitFunction,
+    // Break, CallbackReturn) undoes it on the way out. See JITClass.h
+    // SpillOffset comment for the full rationale (mirrors Arm64JITCore).
+    if (!SpillFrameEmitted) {
+      if (SpillFrameSize) {
+        LOGMAN_THROW_A_FMT(SpillFrameSize <= 32768,
+                           "SpillFrameSize {} exceeds stdu range; IR block too large",
+                           SpillFrameSize);
+        stdu(r1, -static_cast<int16_t>(SpillFrameSize), r1);
+      }
+      SpillFrameEmitted = true;
     }
 
     // Emit all ops in this block
