@@ -18,11 +18,36 @@ constexpr uint32_t PPC_PT_DSISR = 42;  // Data Storage Interrupt Status Register
 constexpr uint32_t PPC_PT_STATE = 27;  // FEX JIT thread-state pointer (r27)
 
 struct PPC64ContextBackup {
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  uint64_t StackCookie;
-#endif
+  // ELFv2 caller linkage area, MUST be the first 32 bytes of the backup so
+  // that `r1+0..31` writes by code that runs with `r1 == &Backup` land here
+  // instead of clobbering GPRs[0..3].
+  //
+  // This matters because HandleDispatcherGuestSignal sets host PC to
+  // `DispatcherLoopTopFillSRAAddress` (i.e. PAST the dispatcher's
+  // PushCalleeSavedRegisters prologue). The kernel resumes user code with
+  // r1 == NewSP == &Backup, no dispatcher frame pushed. Falling through to
+  // the L1-lookup loop and then jumping to ExitFunctionLinker hits
+  //
+  //   std r2, 24, r1       ; save TOC across the C bctrl
+  //
+  // which without this pad would write the host TOC pointer (a value like
+  // 0x3fffafc36f00) into Backup->GPRs[3]. On the rt_sigreturn / SIGILL
+  // round-trip back through HandleSIGILL -> RestoreThreadState, that
+  // corrupted GPRs[3] gets restored as the host r3 — turning a
+  // sigsuspend-returns-`-EINTR` into a sigsuspend-returns-some-TOC-pointer.
+  //
+  // Layout below r1 still grows down as usual; only +0..+31 is reserved.
+  // Sized as four uint64_t so the struct layout is alignment-clean.
+  uint64_t LinkageArea[4];
+
   // All 48 gregs: r0-r31, then NIP/MSR/ORIG_R3/CTR/LR/XER/CCR/...
   uint64_t GPRs[48];
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+  // Sanity check trailing the GPRs (the head used to hold this cookie, but
+  // ExitFunctionLinker would clobber it before any consumer could read it,
+  // so the cookie now sits past the linkage area).
+  uint64_t StackCookie;
+#endif
   uint64_t sa_mask;
   uint16_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
