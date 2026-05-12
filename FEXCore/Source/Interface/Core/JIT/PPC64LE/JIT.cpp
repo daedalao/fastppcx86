@@ -1626,6 +1626,37 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   SpillSlots     = IRView->SpillSlots();
   SpillFrameSize = SpillSlots * MaxSpillSlotSize;
 
+  // ------------------------------------------------------------------
+  // Code-buffer capacity guard
+  // ------------------------------------------------------------------
+  // Emit32 / EmitD etc. have only a debug-build assert for buffer
+  // overrun; in release builds writing past the end silently faults on
+  // the trailing guard page (the last page of every CodeBuffer is
+  // PROT_NONE; see CodeBuffer::CodeBuffer). Unlike Arm64JITCore which
+  // emits into a per-thread TempCodeBuffer and copies under the lock,
+  // PPC64 emits directly into the shared CurrentCodeBuffer, so we must
+  // pre-check that enough headroom remains for this CompileCode.
+  //
+  // kBlockHeadroom is a worst-case conservative bound. A single IR op
+  // typically expands to <= 80 host bytes (SpillStaticRegs + flag pack
+  // / unpack is the heaviest), and IRView->SSACount() bounds the IR-op
+  // count, but we don't want to walk the IR twice. 1 MiB is comfortable
+  // for any real x86 block (post-frontend block cap is well under that
+  // even after host-side expansion); rotating early is cheap because
+  // the new buffer is geometrically larger up to MAX_CODE_SIZE (128 MiB).
+  //
+  // When the buffer is too full, drop the lock and call ClearCache().
+  // ClearCache acquires its own LookupCache write lock and allocates a
+  // fresh, larger CodeBuffer via GetEmptyCodeBuffer/StartLargerCodeBuffer,
+  // migrating the L1/L2 mapping via ChangeGuestToHostMapping. After
+  // re-acquiring CodeBufferLock, LatestOffset is 0 in the new buffer.
+  constexpr size_t kBlockHeadroom = 1u << 20;  // 1 MiB
+  if (CodeBuffers.LatestOffset + kBlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+    CodeBufferLock.unlock();
+    ClearCache();
+    CodeBufferLock.lock();
+  }
+
   // Use the current code buffer at the current write offset
   auto* CB = CurrentCodeBuffer.get();
   SetBuffer(CB->Ptr + CodeBuffers.LatestOffset,
