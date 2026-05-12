@@ -854,25 +854,44 @@ DEF_OP(Pop) {
 }
 
 DEF_OP(PopTwo) {
-  // PopTwo's IR signature is `OpSize:$Size` (an argument), so read Op->Size.
-  // (IROp->Size happens to equal it via DestSize=Size, but that's incidental.)
-  // RA fusion gates on `Size >= OpSize::i32Bit`, so SZ ∈ {4, 8}.
+  // PopTwo's IR signature is `OpSize:$Size, GPR:$Addr` — the Addr is an RMW
+  // input that gets post-incremented by 2*Size and lives in a RA-assigned
+  // GPR (typically but not always the SRA REG_RSP slot).
+  //
+  // CRITICAL: do NOT hardcode StaticRegisters[REG_RSP] as the load base. The
+  // IR pass chains Pop and PopTwo ops via an RMWHandle SSA value seeded from
+  // REG_RSP; the RMW handle's allocation may be a DIFFERENT physical register
+  // than the SRA-RSP slot. Pop operates on the RMW reg (advancing it) while
+  // the SRA-RSP register stays unchanged. If PopTwo then loads from
+  // SRA-RSP, the load EA is stale and PopTwo reads the wrong stack slots.
+  //
+  // Bash $() doesn't hit this because $() unwinds linearly without
+  // re-popping a chained RSP. IRET (Primary_CF) DOES: it emits
+  // PopTwo + Pop + PopTwo with the IR-RMW SSA Addr chained across all three;
+  // the middle Pop advances the RMW reg but the second PopTwo, hardcoded
+  // to SRA-RSP, reads from the original RSP+16 (RFLAGS slot) instead of
+  // RSP+24 (the actual RSP-slot to pop). The popped value ends up being
+  // RFLAGS (0x202) instead of the saved RSP (0xe0000030).
+  //
+  // Use Op->InoutAddr like DEF_OP(Pop) does. The RA pass should keep this
+  // bound to SRA-RSP in trivial cases (RMWHandle becomes a no-op), and even
+  // when not, the chain is correct because all three Pops use the same SSA.
   auto Op = IROp->C<IR::IROp_PopTwo>();
+  auto Addr = GetReg(Op->InoutAddr);
   auto D1 = GetReg(Op->OutValue1);
   auto D2 = GetReg(Op->OutValue2);
   uint32_t SZ = IR::OpSizeToSize(Op->Size);
-  auto RSP = StaticRegisters[FEXCore::X86State::REG_RSP];
   // 32-bit guest: mask the load base so EA wraps at 4 GiB.
-  GPR LoadBase = RSP;
+  GPR LoadBase = Addr;
   if (!CTX->Config.Is64BitMode()) {
-    rldicl(TMP3, RSP, 0, 32);
+    rldicl(TMP3, Addr, 0, 32);
     LoadBase = TMP3;
   }
   li(TMP4, static_cast<int16_t>(SZ));
   switch (SZ) {
   case 4:
-    lwzx(TMP1, LoadBase, r0);          // TMP1 = [RSP]
-    lwzx(TMP2, LoadBase, TMP4);        // TMP2 = [RSP+4]
+    lwzx(TMP1, LoadBase, r0);          // TMP1 = [Addr+0]
+    lwzx(TMP2, LoadBase, TMP4);        // TMP2 = [Addr+SZ]
     break;
   case 8:
     ldx(TMP1, LoadBase, r0);
@@ -882,8 +901,13 @@ DEF_OP(PopTwo) {
     LOGMAN_MSG_A_FMT("PopTwo: unsupported Size {}", SZ);
     break;
   }
-  addi(RSP, RSP, static_cast<int16_t>(SZ * 2));
-  MaybeClrUpper32(RSP);
+  addi(Addr, Addr, static_cast<int16_t>(SZ * 2));
+  MaybeClrUpper32(Addr);
+  // Writeback Value1 / Value2. If D1 happens to equal Addr (the IR can wire
+  // OutValue1 to REG_RSP directly when the last popped slot IS the new RSP
+  // — that's exactly the IRET case), the mr overwrites Addr's post-increment
+  // with the loaded data, which is the intended semantic (the new RSP IS
+  // the popped value, NOT the post-incremented value).
   if (D1 != TMP1) mr(D1, TMP1);
   if (D2 != TMP2) mr(D2, TMP2);
 }
