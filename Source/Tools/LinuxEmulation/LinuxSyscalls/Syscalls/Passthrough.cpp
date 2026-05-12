@@ -424,7 +424,28 @@ namespace x64 {
     using namespace FEXCore::IR;
     RegisterCommon(Handler);
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
+#ifdef ARCHITECTURE_ppc64le
+    // PowerPC uses _IOW('f', N, int)/_IOR style ioctl values for stream/socket
+    // ioctls (FIONBIO = 0x8004667E, FIONREAD = 0x4004667F) instead of the
+    // asm-generic constants x86/ARM/MIPS share (FIONBIO = 0x5421,
+    // FIONREAD = 0x541B). A naive passthrough leaves the guest's asm-generic
+    // values intact, which the PPC kernel does not recognise and returns
+    // ENOTTY (errno 25) -- exactly what OpenSSL BIO_socket_ioctl and the
+    // Steam launcher's CreateBoundSocket reported. Translate the small set
+    // actually used by common networking software; all other ioctls fall
+    // through unchanged.
+    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+      switch (cmd) {
+        case 0x5421u: cmd = FIONBIO;  break;
+        case 0x541Bu: cmd = FIONREAD; break;
+        default: break;
+      }
+      uint64_t Result = ::ioctl(fd, cmd, arg);
+      SYSCALL_ERRNO();
+    });
+#else
     REGISTER_SYSCALL_IMPL_X64(ioctl, SyscallPassthrough3<SYSCALL_DEF(ioctl)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
     REGISTER_SYSCALL_IMPL_X64(pwrite_64, SyscallPassthrough4<SYSCALL_DEF(pwrite_64)>);
     REGISTER_SYSCALL_IMPL_X64(readv, SyscallPassthrough3<SYSCALL_DEF(readv)>);
