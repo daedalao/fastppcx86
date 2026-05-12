@@ -1755,37 +1755,44 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // -------------------------------------------------------------------------
   // Block iteration
   // -------------------------------------------------------------------------
-  // Spill-frame setup needs to land inside the dispatch target — that is,
-  // after the EntryPoint recording below — so an L1-hit branch actually
-  // runs the stdu before the block body. The dispatcher branches to the
-  // FIRST EntryPoint recorded; emit the stdu once on the first hit.
-  bool SpillFrameEmitted = false;
+  // Per-EntryPoint spill-frame prologue.
+  //
+  // ExitFunction / Break / CallbackReturn all call ResetStack, which emits
+  //   addi r1, r1, +SpillFrameSize — the matching pop for the block-prologue
+  // stdu. The dispatcher's LookupCache registers EVERY block tagged
+  // EntryPoint=true (Core.cpp AddBlockMapping loop), so a dispatcher hit can
+  // jump DIRECTLY to any non-first EntryPoint block. Previously the JIT
+  // emitted the stdu only at the first IR block (SpillFrameEmitted guard);
+  // dispatcher hits at secondary EntryPoints skipped the stdu while still
+  // running the addi at exit, so r1 drifted up by SpillFrameSize per such
+  // dispatch and eventually walked off the host stack mapping → SIGSEGV
+  // after ~5000 dispatches in multi-block CompileCodes (e.g. sse2-mul-1
+  // gcc-target at MAXINST=500).
+  //
+  // Fix mirrors Arm64JITCore: every EntryPoint emits its own stdu. Layout:
+  //   <EntryPoint addr>     ← dispatcher target (LookupCache hit lands here)
+  //     stdu r1, -SpillFrameSize, r1
+  //   JumpTarget(BlockNode):  ← intra-CompileCode  b BlockN_label  lands here
+  //     block body
+  // Intra-block jumps skip the stdu because the calling block already has
+  // the frame live; dispatcher hits run the stdu. Both paths balance at
+  // ExitFunction's ResetStack.
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
 
-    // Bind this block's label to the current position
-    Bind(JumpTarget(BlockNode));
-
-    // Emit additional entry-point mapping for this block if it's tagged
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
-    }
-
-    // On the FIRST block (entry block), emit the per-CompileCode spill
-    // frame. Each block within the same CompileCode shares this frame; the
-    // matching ResetStack at every block-exit emit site (ExitFunction,
-    // Break, CallbackReturn) undoes it on the way out. See JITClass.h
-    // SpillOffset comment for the full rationale (mirrors Arm64JITCore).
-    if (!SpillFrameEmitted) {
       if (SpillFrameSize) {
         LOGMAN_THROW_A_FMT(SpillFrameSize <= 32768,
                            "SpillFrameSize {} exceeds stdu range; IR block too large",
                            SpillFrameSize);
         stdu(r1, -static_cast<int16_t>(SpillFrameSize), r1);
       }
-      SpillFrameEmitted = true;
     }
+
+    // Intra-CompileCode jump label, bound AFTER the per-EntryPoint stdu.
+    Bind(JumpTarget(BlockNode));
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
