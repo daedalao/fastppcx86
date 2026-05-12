@@ -100,16 +100,23 @@ DEF_OP(CondJump) {
   } else if (Op->Cond == IR::CondClass::TSTZ || Op->Cond == IR::CondClass::TSTNZ) {
     // Bit-test branch: Cmp2 is an inline constant giving the bit POSITION
     // (0..63), not a mask. TSTZ jumps if bit clear, TSTNZ if bit set.
-    // Extract the bit to CR0 via rldicl. (rotate left so target bit lands at
-    // PPC bit 63 = LE position 0, mask to that bit, record). This is FEX's
-    // CondJumpBit lowering — analogous to ARM64's tbz/tbnz.
+    // Extract the bit and compare against zero via cr7, so we don't disturb
+    // CR0 — downstream IR ops (e.g. a CondJumpNZCV in the very next block
+    // produced by x86 `jp; je`) consume CR0 as the AXFlag/NZCV side-channel,
+    // and clobbering CR0 here would silently corrupt them.
+    //
+    // (This is the same invariant honored by DEF_OP(Parity), which uses
+    //  rldicl (no Rc) rather than andi. for exactly this reason — see
+    //  ALUOps.cpp::Parity.)
     uint64_t Bit;
     LOGMAN_THROW_A_FMT(IsInlineConstant(Op->Cmp2, &Bit) && Bit < 64,
                        "CondJump TSTZ/TSTNZ: expected inline-constant bit < 64");
     auto Reg = GetReg(Op->Cmp1);
     uint32_t sh = (64u - static_cast<uint32_t>(Bit)) & 63u;
-    rldicl_(TMP1, Reg, sh, 63);   // TMP1 = (Reg >> Bit) & 1, sets CR0
-    CC = (Op->Cond == IR::CondClass::TSTNZ) ? CC_NE : CC_EQ;
+    rldicl(TMP1, Reg, sh, 63);          // TMP1 = (Reg >> Bit) & 1 (no Rc, CR untouched)
+    cmpldi(cr(7), TMP1, 0);             // cr7 = (TMP1 == 0)
+    // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
+    CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
   } else {
     EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
     CC = MapCC(Op->Cond);
@@ -175,6 +182,21 @@ DEF_OP(Syscall) {
   // Spill SRA to STATE (physical registers retain their values for arg reads below).
   SpillStaticRegs(TMP1);
 
+  // Mark that we are inside the JIT-emitted Syscall op. The signal handler
+  // path in HandleDispatcherGuestSignal reads (InSyscallInfo & 0xFFFF) as the
+  // SpillSRA IgnoreMask — bits 0..15 each represent one already-spilled SRA
+  // GPR. PPC64LE's x64-mode SRA has 16 GPRs, all spilled by the call above,
+  // so we set 0xFFFF. Mirrors ARM64 backend at JIT/BranchOps.cpp:277-278.
+  // Without this, an async signal arriving between SpillStaticRegs and
+  // FillStaticRegs causes the handler to re-spill from post-bctrl volatile
+  // registers, overwriting the freshly-stored gregs[RAX] with junk.
+  {
+    const int32_t isi_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    LoadConstant(TMP1, 0xFFFFu);
+    std(TMP1, static_cast<int16_t>(isi_off), STATE);
+  }
+
   // Create a mini-frame for the C call.  Layout (96 bytes, 16-byte aligned):
   //   [r1+ 0]: back chain (old r1)
   //   [r1+ 8]: empty
@@ -228,6 +250,15 @@ DEF_OP(Syscall) {
     std(r3, rax_off, STATE);
   }
 
+  // Mirror ARM64 (JIT/BranchOps.cpp:319-323): write the syscall result to
+  // the IR destination SSA reg so consumers reading the edge directly (not
+  // via _LoadRegister(RAX)) get the right value. Must happen BEFORE
+  // FillStaticRegs because that helper uses TMP1=r3 as scratch and will
+  // clobber the return value. GetReg(Node) is in the dynamic RA pool
+  // (r24-r26, r30-r31), all callee-saved per ELFv2, so it survives
+  // everything that follows.
+  mr(GetReg(Node), r3);
+
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
   addi(r1, r1, 96);
   FillStaticRegs();
@@ -235,6 +266,16 @@ DEF_OP(Syscall) {
   // r0=0 zero-index invariant before falling back into JIT code that uses
   // ldx/stdx.
   li(r(0), 0);
+
+  // Clear InSyscallInfo. From here onward the JIT-emitted Syscall op is
+  // done; any signal arriving treats this code as normal JIT and the full
+  // SRA spill path is correct again.
+  {
+    const int32_t isi_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    li(TMP1, 0);
+    std(TMP1, static_cast<int16_t>(isi_off), STATE);
+  }
 }
 
 DEF_OP(Thunk) {

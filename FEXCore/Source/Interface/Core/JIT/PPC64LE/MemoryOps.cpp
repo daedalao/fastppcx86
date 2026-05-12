@@ -789,6 +789,12 @@ DEF_OP(PushTwo) {
   // so the inline header `Size` (= IROp->Size) is unset/zero — reading it gives
   // SZ=0, producing a no-op `addi r11,r11,0` and skipping the case-8 stores.
   // The actual element width is the explicit `ValueSize` argument.
+  //
+  // RA fusion gates on `ValueSize >= OpSize::i32Bit`, so SZ ∈ {4, 8}. The
+  // 32-bit case is required for i686 guest mode — without it, every fused
+  // push pair silently dropped both stores (RSP decremented but memory
+  // unchanged), corrupting any stack frame whose prologue had two adjacent
+  // pushes (notably _start's `push $0; push %ecx` argv setup).
   auto Op = IROp->C<IR::IROp_PushTwo>();
   uint32_t SZ = IR::OpSizeToSize(Op->ValueSize);
   auto RSP = StaticRegisters[FEXCore::X86State::REG_RSP];
@@ -798,12 +804,19 @@ DEF_OP(PushTwo) {
   auto S1 = GetReg(Op->Value1);
   auto S2 = GetReg(Op->Value2);
   switch (SZ) {
+  case 4:
+    stwx(S1, RSP, r0);
+    li(TMP4, 4);
+    stwx(S2, RSP, TMP4);
+    break;
   case 8:
     stdx(S1, RSP, r0);
     li(TMP4, 8);
     stdx(S2, RSP, TMP4);
     break;
-  default: break;
+  default:
+    LOGMAN_MSG_A_FMT("PushTwo: unsupported ValueSize {}", SZ);
+    break;
   }
 }
 
@@ -843,7 +856,7 @@ DEF_OP(Pop) {
 DEF_OP(PopTwo) {
   // PopTwo's IR signature is `OpSize:$Size` (an argument), so read Op->Size.
   // (IROp->Size happens to equal it via DestSize=Size, but that's incidental.)
-  // Use TMP1/TMP2 as staging to eliminate any aliasing between D1/D2/RSP.
+  // RA fusion gates on `Size >= OpSize::i32Bit`, so SZ ∈ {4, 8}.
   auto Op = IROp->C<IR::IROp_PopTwo>();
   auto D1 = GetReg(Op->OutValue1);
   auto D2 = GetReg(Op->OutValue2);
@@ -855,9 +868,20 @@ DEF_OP(PopTwo) {
     rldicl(TMP3, RSP, 0, 32);
     LoadBase = TMP3;
   }
-  ldx(TMP1, LoadBase, r0);             // TMP1 = [RSP]
   li(TMP4, static_cast<int16_t>(SZ));
-  ldx(TMP2, LoadBase, TMP4);           // TMP2 = [RSP+SZ]
+  switch (SZ) {
+  case 4:
+    lwzx(TMP1, LoadBase, r0);          // TMP1 = [RSP]
+    lwzx(TMP2, LoadBase, TMP4);        // TMP2 = [RSP+4]
+    break;
+  case 8:
+    ldx(TMP1, LoadBase, r0);
+    ldx(TMP2, LoadBase, TMP4);
+    break;
+  default:
+    LOGMAN_MSG_A_FMT("PopTwo: unsupported Size {}", SZ);
+    break;
+  }
   addi(RSP, RSP, static_cast<int16_t>(SZ * 2));
   MaybeClrUpper32(RSP);
   if (D1 != TMP1) mr(D1, TMP1);

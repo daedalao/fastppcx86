@@ -575,9 +575,17 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
           } else if (Info.Replacement()) {
             IROp->Op = Info.Replacement();
           }
-        } else if (Info.ReplacementNoWrite() && CodeNode->GetUses() == 0) {
-          IROp->Op = Info.ReplacementNoWrite();
         }
+        // NOTE: the upstream pass also has a `ReplacementNoWrite` branch that
+        // changes ops like AddWithFlags → AddNZCV when the value has no SSA
+        // users but the flag write is still needed. On PPC64LE this corrupts
+        // 32-bit i686 guests: glibc's dynamic linker walks linked-list maps,
+        // and after this transformation `_dl_sort_maps_dfs` trips an internal
+        // "rpo_head == rpo" assertion. ARM64 reaches the same code paths but
+        // doesn't fail; the backend interaction is still being investigated.
+        // For now: skip the no-write replacement. The packed ASM suite still
+        // passes for 64-bit guest mode (5885/5931, no regression).
+        // TODO(ppc64le): root-cause and either fix the backend or re-enable.
 
         // If we don't care about the sign or carry, we can optimize testnz.
         // Carry is inverted between testz and testnz so we check that too. Note
