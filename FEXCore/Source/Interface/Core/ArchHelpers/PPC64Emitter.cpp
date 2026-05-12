@@ -118,9 +118,32 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   // CR/XER pack — but TMP2 (=r4) is also load-bearing for the FABI int-arg
   // contract: the dispatcher's per-FABI stubs (FABI_F80_I16_I16/I32_PTR)
   // expect TMP2 to still hold the int argument set by the JIT's Op_Unhandled
-  // dispatch when SpillForABICall returns. So save TMP2 to the red zone
-  // (288-byte ELFv2 red zone below r1) around this scratch use, then restore.
-  std(TMP2, -8, r1);                            // save TMP2 (FABI int-arg holder)
+  // dispatch when SpillForABICall returns.
+  //
+  // Save TMP2 through FPR f0 via mtfprd/mffprd. Why f0:
+  //   * PPC64 ELFv2 has NO red zone, so the previous `std TMP2, -8(r1)` save
+  //     faulted whenever r1 sat at a stack-mapping boundary (Steam bash
+  //     subshells with tight clone()-allocated stacks SEGV'd here at
+  //     si_addr = r1-8, one byte past the [stack] mapping).
+  //   * f0 is volatile (caller-saved) per ELFv2 FP register conventions, and
+  //     not in any FEX SRA/RA pool — it is used only as an op-local scratch
+  //     by a few VectorOps emitters (lfd/fdiv/fsqrt sequences) and is
+  //     guaranteed dead between IR ops.
+  //   * Unlike VTMP1 / VR{0..15}, f0 carries no FABI-stub cross-call state.
+  //     FABI bridges pass FP args in f1..f13 and read vector args from
+  //     VTMP1/VTMP2 -- f0 is never read by any stub.
+  //   * mtfprd/mffprd are POWER8 ISA 2.07 instructions; available on host.
+  //
+  // Earlier abandoned approaches:
+  //   - mtvsrd VTMP1, TMP2: VTMP1 is the FABI vector source 1 and is
+  //     read AFTER SpillForABICall in stubs like FABI_F32_I16_F80_PTR
+  //     (`vmr VR{2}, VTMP1` runs post-spill). Broke 535 ASM tests.
+  //   - mtvsrd VR{0}, TMP2: VR{0} would have been free in isolation but
+  //     the broader regression suggests the FPR loop's `stvx VR{0}` had
+  //     not yet committed by the time later code re-read v0 -- whatever the
+  //     mechanism, breaks 1949 ASM tests. f0 sidesteps this entirely by
+  //     using a non-VSR-aliased FPR slot.
+  mtfprd(FPR{0}, TMP2);                         // save TMP2 in f0 (no memory)
   mfcr(TMP2);                                   // TMP2 = CR (LT@LSB31, EQ@LSB29)
   rlwinm(TMP3, TMP2, 0, 0, 0);                 // TMP3 = N @ LSB31
   rlwinm(TMP2, TMP2, 1, 1, 1);                 // TMP2 = Z (CR0.EQ@LSB29 → LSB30)
@@ -133,7 +156,7 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   int32_t nzcv_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, State.flags[FEXCore::X86State::RFLAG_NZCV_LOC]));
   stw(TMP3, static_cast<int16_t>(nzcv_off), STATE);
-  ld(TMP2, -8, r1);                             // restore TMP2
+  mffprd(TMP2, FPR{0});                         // restore TMP2 from f0
 }
 
 // Fill static registers from CpuStateFrame → host regs
@@ -359,36 +382,45 @@ void PPC64EmitterBase::PopDynamicRegs() {
 // `ld(...,ea)` loads from a corrupted base. Always stash into TMP4 first.
 // Callers may pass `ea = TMP4` (e.g. StoreMemPair); detect and skip the copy.
 void PPC64EmitterBase::LoadUnalignedV128(VR dst, GPR ea) {
+  // Bounce through STATE-relative JITScratch (16 bytes, alignas(16) in
+  // CpuStateFrame).  PPC64 ELFv2 has NO red zone below r1, so the prior
+  // r1-relative bounce faulted whenever r1 sat at a stack mapping boundary
+  // (observed: fork-children inherit a 132 KiB kernel-allocated stack and
+  // tight inner-loop dispatcher round-trips can push r1 above [stack] end).
+  // JITScratch is always valid: CpuStateFrame is heap-allocated.
   GPR EaSafe = ea;
   if (ea == TMP1 || ea == TMP2 || ea == TMP3) {
     mr(TMP4, ea);
     EaSafe = TMP4;
   }
+  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
+                "JITScratch offset must fit in int16 for addi-based addressing");
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));   // TMP3 = &JITScratch
   ld(TMP1, 0, EaSafe);
   ld(TMP2, 8, EaSafe);
-  std(TMP1, -16, r1);
-  std(TMP2,  -8, r1);
-  addi(TMP3, r1, -16);
+  std(TMP1, 0, TMP3);
+  std(TMP2, 8, TMP3);
   li(TMP1, 0);
   lvx(dst, TMP3, TMP1);
 }
 
 void PPC64EmitterBase::StoreUnalignedV128(VR src, GPR ea) {
-  // Aligned vector store to scratch slot, two scalar loads, two scalar stores
-  // back to `ea`. The internal sequence clobbers TMP1/TMP2/TMP3 (li TMP1,0
-  // alone is enough to wreck `ea` when ea==TMP1, which is the common case
-  // when LoadMemPair's offset fits int16 and Base = addi(TMP1,...)). Capture
-  // into TMP4 if ea aliases any internal scratch.
+  // Bounce through STATE+JITScratch.  See LoadUnalignedV128 for rationale
+  // (PPC64 ELFv2 has no red zone; r1-relative scratch faults at stack
+  // boundaries).  The internal sequence clobbers TMP1/TMP2/TMP3, so capture
+  // ea into TMP4 if it aliases any of them.
   GPR EaSafe = ea;
   if (ea == TMP1 || ea == TMP2 || ea == TMP3) {
     mr(TMP4, ea);
     EaSafe = TMP4;
   }
-  addi(TMP3, r1, -16);
+  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
   li(TMP1, 0);
   stvx(src, TMP3, TMP1);
-  ld(TMP1, -16, r1);
-  ld(TMP2,  -8, r1);
+  ld(TMP1, 0, TMP3);
+  ld(TMP2, 8, TMP3);
   std(TMP1, 0, EaSafe);
   std(TMP2, 8, EaSafe);
 }
@@ -412,26 +444,27 @@ void PPC64EmitterBase::StoreFPRSized(VR src, GPR ea, uint32_t size) {
     mr(TMP4, ea);
     EaSafe = TMP4;
   }
-  // Spill V128 to aligned 16B redzone slot at r1-16.
-  addi(TMP3, r1, -16);
+  // Spill V128 into STATE+JITScratch (see LoadUnalignedV128 for rationale).
+  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
   li(TMP1, 0);
   stvx(src, TMP3, TMP1);
   // Pull the low `size` bytes from the slot and store them to *ea.
   switch (size) {
   case 1:
-    lbz(TMP1, -16, r1);
+    lbz(TMP1, 0, TMP3);
     stbx(TMP1, EaSafe, GPRegs::r0);
     break;
   case 2:
-    lhz(TMP1, -16, r1);
+    lhz(TMP1, 0, TMP3);
     sthx(TMP1, EaSafe, GPRegs::r0);
     break;
   case 4:
-    lwz(TMP1, -16, r1);
+    lwz(TMP1, 0, TMP3);
     stwx(TMP1, EaSafe, GPRegs::r0);
     break;
   case 8:
-    ld(TMP1, -16, r1);
+    ld(TMP1, 0, TMP3);
     stdx(TMP1, EaSafe, GPRegs::r0);
     break;
   default: break;
@@ -448,35 +481,39 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
     mr(TMP4, ea);
     EaSafe = TMP4;
   }
-  // Zero the 16B redzone slot, then write `size` bytes from *ea into its
-  // low end so the upper bits are zero (matches x86 vmovd/vmovq semantics).
-  std(GPRegs::r0, -16, r1);
-  std(GPRegs::r0,  -8, r1);
+  // Zero the 16-byte JITScratch slot, then write `size` bytes from *ea into
+  // its low end so the upper bits are zero (matches x86 vmovd/vmovq
+  // zero-extend semantics).  See LoadUnalignedV128 for why we bounce through
+  // STATE+JITScratch instead of r1-redzone.
+  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  std(GPRegs::r0, 0, TMP3);
+  std(GPRegs::r0, 8, TMP3);
   switch (size) {
   case 1:
     lbzx(TMP1, EaSafe, GPRegs::r0);
-    stb(TMP1, -16, r1);
+    stb(TMP1, 0, TMP3);
     break;
   case 2:
     lhzx(TMP1, EaSafe, GPRegs::r0);
-    sth(TMP1, -16, r1);
+    sth(TMP1, 0, TMP3);
     break;
   case 4:
     lwzx(TMP1, EaSafe, GPRegs::r0);
-    stw(TMP1, -16, r1);
+    stw(TMP1, 0, TMP3);
     break;
   case 8:
     ldx(TMP1, EaSafe, GPRegs::r0);
-    std(TMP1, -16, r1);
+    std(TMP1, 0, TMP3);
     break;
   case 10:
     // 80-bit float (FLD tword [mem]): read 8+2 bytes from EA into scratch's
-    // low 10 bytes, leaving the upper 6 zeroed by the std r0 prelude.
+    // low 10 bytes, leaving the upper 6 zeroed by the std r0 prelude above.
     ldx(TMP1, EaSafe, GPRegs::r0);
-    std(TMP1, -16, r1);
+    std(TMP1, 0, TMP3);
     li(TMP2, 8);
     lhzx(TMP1, EaSafe, TMP2);
-    sth(TMP1, -8, r1);
+    sth(TMP1, 8, TMP3);
     break;
   case 16:
     // Should be unreachable (early return at top of fn for size==16), but
@@ -485,7 +522,6 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
     break;
   default: break;
   }
-  addi(TMP3, r1, -16);
   li(TMP1, 0);
   lvx(dst, TMP3, TMP1);
 }

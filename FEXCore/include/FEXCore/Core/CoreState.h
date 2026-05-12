@@ -427,6 +427,17 @@ struct CpuStateFrame {
   uint32_t SuspendDoorbell {};
 #endif
 
+#ifdef ARCHITECTURE_ppc64le
+  // 16-byte aligned scratch slot used by JIT-emitted helpers that need a
+  // bounce buffer for unaligned vector loads/stores or to spill a GPR around
+  // mfcr/mfxer. Previously the emitter used r1-relative negative offsets as
+  // an implicit red zone -- but PPC64 ELFv2 has NO red zone, so those stores
+  // faulted whenever r1 sat at a stack-mapping boundary (observed on Steam's
+  // bash subshells with tight clone()-allocated stacks). Address as
+  // `[STATE + offsetof(CpuStateFrame, JITScratch)]`.
+  alignas(16) uint64_t JITScratch[2] {};
+#endif
+
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;
 };
