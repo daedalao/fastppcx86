@@ -1252,6 +1252,16 @@ DEF_OP(Bfxil) {
   auto Src  = GetReg(Op->Src);
   uint32_t width = Op->Width;
   uint32_t lsb   = Op->lsb;
+  // If RA chose Dst == Src (last-use alias) but Dst != S1, the mr(Dst, S1)
+  // below would overwrite Src before the rlwimi/rlwinm can read it. Stash
+  // Src into TMP3 first. Caught by `arpl ax, bx` in 32-bit guest mode where
+  // the ARPLOp dispatcher emits Bfxil(2, 0, Dest, SrcRPL) with SrcRPL having
+  // last use here: RA aliased Dst and SrcRPL into the same physical reg,
+  // so the mr clobbered SrcRPL and ARPL's modify path became a no-op.
+  if (Dst == Src && Dst != S1) {
+    mr(TMP3, Src);
+    Src = TMP3;
+  }
   if (Dst != S1) mr(Dst, S1);
   if (IROp->Size <= IR::OpSize::i32Bit) {
     if (lsb == 0) {
