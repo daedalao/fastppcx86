@@ -1462,13 +1462,16 @@ void PPC64JITCore::ResetStack() {
   if (SpillFrameSize == 0) {
     return;
   }
-  // addi's 16-bit signed immediate covers up to +32767. SpillFrameSize is
-  // always a multiple of MaxSpillSlotSize (=32) and bounded by the assert in
-  // CompileCode's prologue stdu, so the constant-load path isn't needed.
-  LOGMAN_THROW_A_FMT(SpillFrameSize <= 32767,
-                     "SpillFrameSize {} exceeds addi range",
-                     SpillFrameSize);
-  addi(r1, r1, static_cast<int16_t>(SpillFrameSize));
+  // addi's 16-bit signed immediate covers +/-32767. Large CompileCodes
+  // (heavy spill pressure under TLS / X25519) can exceed this; fall back to
+  // LoadImm32 + add. Skipping this check let asserts silently fail in release
+  // builds and r1 walked into unmapped territory after ~2.6M dispatches.
+  if (SpillFrameSize <= 32767u) {
+    addi(r1, r1, static_cast<int16_t>(SpillFrameSize));
+  } else {
+    LoadImm32(TMP1, SpillFrameSize);
+    add(r1, r1, TMP1);
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -1815,10 +1818,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
       if (SpillFrameSize) {
-        LOGMAN_THROW_A_FMT(SpillFrameSize <= 32768,
-                           "SpillFrameSize {} exceeds stdu range; IR block too large",
-                           SpillFrameSize);
-        stdu(r1, -static_cast<int16_t>(SpillFrameSize), r1);
+        // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
+        // For larger frames, emit the equivalent of stdu manually so callers
+        // can't silently wrap to a positive displacement and overrun the host
+        // stack mapping. Observed in TLS / X25519 paths where a single JIT
+        // block has thousands of SSA values (heavy openssl C inlining).
+        if (SpillFrameSize <= 32760u) {
+          stdu(r1, -static_cast<int16_t>(SpillFrameSize), r1);
+        } else {
+          // Manual: TMP2 = old r1; r1 = r1 - SpillFrameSize; *r1 = TMP2.
+          LoadImm32(TMP1, SpillFrameSize);
+          mr(TMP2, r1);
+          subf(r1, TMP1, r1);
+          std(TMP2, 0, r1);
+        }
       }
     }
 
