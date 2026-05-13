@@ -169,7 +169,14 @@ function(add_guest_lib NAME SONAME)
   endif()
 endfunction()
 
-# These thunks only support 64-bit
+# These thunks only support 64-bit (libvulkan is enabled for 32-bit too —
+# Steam ubuntu12_32 needs it for zink/Vulkan rendering)
+if (BITNESS EQUAL 32 OR BITNESS EQUAL 64)
+  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
+  target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+  add_guest_lib(vulkan "libvulkan.so.1")
+endif()
+
 if (BITNESS EQUAL 64)
   #add_guest_lib(fex_malloc_loader)
   #target_link_libraries(fex_malloc_loader-guest PRIVATE dl)
@@ -187,10 +194,6 @@ if (BITNESS EQUAL 64)
   # target_include_directories(SDL2-guest PRIVATE ${SDL2_INCLUDE_DIRS})
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
-
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
-  target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
-  add_guest_lib(vulkan "libvulkan.so.1")
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
