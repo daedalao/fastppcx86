@@ -97,6 +97,12 @@ namespace ProductNames {
   static const char ARM_Ampere_1A[] = "AmpereOneA";
   static const char ARM_Ampere_1B[] = "AmpereOneB";
   static const char ARM_Ampere_1C[] = "AmpereOneC";
+#else
+  // Non-ARM hosts (PPC64LE etc.) still need a ProductName fallback for the
+  // CPUID 0x80000002-0x80000004 brand-string leaves. We just need any
+  // non-null C-string; CPUID itself reports the canonical x86 brand string
+  // from elsewhere (this is only a fallback path).
+  static const char ARM_UNKNOWN[] = "FEX-Emu";
 #endif
 } // namespace ProductNames
 
@@ -414,7 +420,21 @@ uint64_t GetCycleCounterFrequency() {
   return 0;
 }
 
-void CPUIDEmu::SetupHostHybridFlag() {}
+void CPUIDEmu::SetupHostHybridFlag() {
+  // Non-ARM hosts don't populate CTX->HostFeatures.CPUMIDRs (it's an
+  // ARM-specific concept), so Cores defaulted to 0 and PerCPUData stayed
+  // empty.  Function_8000_0002h/_0003h/_0004h then index PerCPUData[0]
+  // unconditionally and SEGV on the null/garbage ProductName pointer.
+  // Initialise a single default entry so the CPUID brand-string leaves
+  // return a valid (if generic) string instead of crashing.
+  if (Cores == 0) {
+    Cores = 1;
+  }
+  PerCPUData.resize(Cores);
+  for (auto& e : PerCPUData) {
+    e.ProductName = ProductNames::ARM_UNKNOWN;
+  }
+}
 
 #endif
 
