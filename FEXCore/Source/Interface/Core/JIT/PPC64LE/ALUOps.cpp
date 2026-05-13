@@ -2182,6 +2182,15 @@ DEF_OP(NZCVSelectV) {
   auto False_= GetVReg(Op->FalseVal);
   auto CC   = MapNZCVCC(IntegerNZCVCond(Op->Cond));
 
+  // Aliasing guard (mirrors NZCVSelect above): if RA tied Dst to True, the
+  // `vmr Dst, False` below would wipe True before the conditional `vmr Dst,
+  // True` could read it.  Hit by X87 F64 FXTRACT, which emits two back-to-back
+  // NZCVSelectV ops whose first dest aliases its own TrueVal.
+  if (True == Dst) {
+    vmr(VTMP1, True);
+    True = VTMP1;
+  }
+
   if (Dst != False_) vmr(Dst, False_);
   PPC64Emitter::Label Done{};
   bc(InvertCond(CC), &Done);
