@@ -1225,7 +1225,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0006h(uint32_t Leaf) con
   Res.edx = (64 << 0) | // cacheline size
             (1 << 8) |  // cachelines per tag
             (6 << 12) | // cache associativity
-            (16 << 18); // L2 cache size in KB
+            (16 << 18); // L3 cache size in 512KB units → 8MB
   return Res;
 }
 

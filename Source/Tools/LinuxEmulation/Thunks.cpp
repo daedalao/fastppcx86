@@ -164,7 +164,11 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
       ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RDI] = (uintptr_t)arg0;
       ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSI] = (uintptr_t)arg1;
     } else {
-      if ((reinterpret_cast<uintptr_t>(arg1) >> 32) != 0) {
+      // 32-bit guest: both arg slots are 32-bit pointers. Guard both — a host
+      // library returning a >4 GiB pointer in either slot would silently leak
+      // the high bits into the guest GPR, undebuggable downstream.
+      if ((reinterpret_cast<uintptr_t>(arg0) >> 32) != 0 ||
+          (reinterpret_cast<uintptr_t>(arg1) >> 32) != 0) {
         ERROR_AND_DIE_FMT("Tried to call guest function with arguments packed to a 64-bit address");
       }
       ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RCX] = (uintptr_t)arg0;
