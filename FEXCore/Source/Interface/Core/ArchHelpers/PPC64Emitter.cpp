@@ -529,10 +529,27 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
 void PPC64EmitterBase::SpillForABICall(GPR tmp, bool FPRs) {
   SpillStaticRegs(tmp);
   PushDynamicRegs(tmp);
+  // Mark InSyscallInfo=0xFFFF so SignalDelegator's SpillSRA path uses the
+  // bits as an IgnoreMask and skips re-spilling SRA gprs from
+  // volatile-clobbered host registers during the host C call. Mirrors the
+  // DEF_OP(Syscall) site in BranchOps.cpp and the ARM64 MiscOps.cpp:260
+  // pattern. Required for signal safety across every spill+host-call+fill
+  // sequence; without it, async signal arrival during the call has its
+  // handler clobber State.gregs with junk from post-call volatile regs.
+  LoadConstant(tmp, 0xFFFFu);
+  std(tmp,
+      static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)),
+      STATE);
 }
 
 void PPC64EmitterBase::FillForABICall(bool FPRs) {
   PopDynamicRegs();
+  // Clear InSyscallInfo BEFORE FillStaticRegs so a signal arriving mid-fill
+  // doesn't see a stale "inside ABI call" marker. Use r0 as zero source.
+  li(GPRegs::r0, 0);
+  std(GPRegs::r0,
+      static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)),
+      STATE);
   FillStaticRegs();
   // r0 is volatile per the C ABI; the JIT relies on r0=0 as a "zero index" for
   // stdx/ldx-style instructions. Re-establish that invariant after every
