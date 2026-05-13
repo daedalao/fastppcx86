@@ -381,7 +381,16 @@ void PPC64Dispatcher::EmitDispatcher() {
       offsetof(CpuStateFrame, State.gregs[FEXCore::X86State::REG_RSP]));
     ld(TMP1, ret_off, STATE);     // TMP1 = ThunkCallbackRet (guest x86 VA)
     ld(TMP2, rsp_off, STATE);     // TMP2 = guest RSP
+    // 32-bit guest: mask the upper 32 bits of RSP defensively. State.gregs is
+    // 64-bit storage, and while SpillStaticRegs masks on the way out, host C++
+    // code paths (RestoreFrame_ia32, CallCallback, etc.) can write gregs as
+    // 64-bit values whose upper bits leak host pointers. Without this mask,
+    // "addi -16; std TMP1, 0(TMP2)" stores ThunkCallbackRet to a host stack
+    // address — observed in Steam-with-Vulkan-thunk as NoExec crashes when
+    // the guest later derefs the corrupted RSP.
+    MaybeClrUpper32(TMP2);
     addi(TMP2, TMP2, -16);        // RSP -= 16 (stack grows down, 16-byte align)
+    MaybeClrUpper32(TMP2);        // re-mask after addi in case borrow extended high bits
     std(TMP1, 0, TMP2);           // [RSP+0] = ThunkCallbackRet
     std(TMP2, rsp_off, STATE);    // write back new RSP to state
   }
