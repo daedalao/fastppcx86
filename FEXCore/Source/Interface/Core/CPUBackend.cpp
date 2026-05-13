@@ -68,7 +68,7 @@ namespace CPU {
   };
 
   constexpr static auto PSHUFLW_LUT {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint64_t Val[2];
     };
     // Expectation for this LUT is to simulate PSHUFLW with ARM's TBL (single register) instruction
@@ -98,7 +98,7 @@ namespace CPU {
   }()};
 
   constexpr static auto PSHUFHW_LUT {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint64_t Val[2];
     };
     // Expectation for this LUT is to simulate PSHUFHW with ARM's TBL (single register) instruction
@@ -129,7 +129,7 @@ namespace CPU {
   }()};
 
   constexpr static auto PSHUFD_LUT {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint64_t Val[2];
     };
     // Expectation for this LUT is to simulate PSHUFD with ARM's TBL (single register) instruction
@@ -157,7 +157,7 @@ namespace CPU {
   }()};
 
   constexpr static auto SHUFPS_LUT {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint64_t Val[2];
     };
     // 32-bit words in [127:96], [95:64], [63:32], [31:0] are selected using the 8-bit Index.
@@ -200,7 +200,7 @@ namespace CPU {
   }()};
 
   constexpr static auto DPPS_MASK {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint32_t Val[4];
     };
 
@@ -223,7 +223,7 @@ namespace CPU {
   }()};
 
   constexpr static auto DPPD_MASK {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint64_t Val[2];
     };
 
@@ -244,7 +244,7 @@ namespace CPU {
   }()};
 
   constexpr static auto PBLENDW_LUT {[]() consteval {
-    struct LUTType {
+    struct alignas(16) LUTType {
       uint16_t Val[8];
     };
     // 16-bit words in [127:112], [111:96], [95:80], [79:64], [63:48], [47:32], [31:16], [15:0] are selected using 8-bit swizzle.
