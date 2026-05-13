@@ -288,9 +288,19 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
     auto Frame = Thread->CurrentFrame;
 
     if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) {
-      // XXX: Unsupported since it needs state reconstruction
-      // If we are in the JIT then SRA might need to be restored to values from the context
-      // We can't currently support this since it might result in tearing without real state reconstruction
+#if defined(ARCHITECTURE_ppc64le)
+      // PPC64LE: BackupContext saves host GPRs only — not VMX/AltiVec registers.
+      // Resuming at the original NIP (mid-block) would let SpillStaticRegs write
+      // stale post-handler AltiVec values to State.xmm at block exit, corrupting
+      // the XMM state for all subsequent blocks. Route through the dispatcher's
+      // FillSRA entry instead: FillStaticRegs reloads both GPR and FPR SRA from
+      // State (corrected by the GuestState re-capture in HandleDispatcherGuestSignal)
+      // and re-dispatches from State.rip. The block re-enters at its proper head
+      // with a fully coherent register file, eliminating all mid-block resume hazards.
+      Frame->InSyscallInfo = Context->InSyscallInfo;
+      ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+      ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+#endif
     }
 
     if (Is64BitMode) {
@@ -338,6 +348,16 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 
     // We are in jit, SRA must be spilled
     SpillSRA(Thread, ucontext, IgnoreMask);
+
+#if defined(ARCHITECTURE_ppc64le)
+    // StoreThreadState captured GuestState BEFORE SpillSRA ran. SpillSRA has
+    // now committed the correct x86 state (gregs, rip, xmm) from the actual
+    // signal-arrival register file into Thread->CurrentFrame->State. Re-capture
+    // so that RestoreThreadState's memcpy(State, GuestState) restores the
+    // authoritative pre-signal values rather than a stale one-block-behind copy.
+    memcpy(&ContextBackup->GuestState, &Thread->CurrentFrame->State,
+           sizeof(FEXCore::Core::CPUState));
+#endif
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
 
