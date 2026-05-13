@@ -127,10 +127,22 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
   auto* guest_uctx = reinterpret_cast<FEXCore::x86_64::ucontext_t*>(Context->UContextLocation);
   [[maybe_unused]] auto* guest_siginfo = reinterpret_cast<siginfo_t*>(Context->SigInfoLocation);
 
-  // If the guest modified the RIP then we need to take special precautions here
-  if (Context->OriginalRIP != guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP] || Context->FaultToTopAndGeneratedException) {
+  // If the guest modified the RIP then we need to take special precautions here.
+  // Sanity-check that the saved RIP is a canonical user-space address. Vulkan
+  // thunk callbacks on pthread workers can have their alt-stack memory
+  // recycled between signal entry and rt_sigreturn, leaving the sigframe
+  // filled with glibc poison (0xDFDFDFDFDFDFDFDF). Without this check we
+  // dispatch to that poison and hit NoExec. The INJIT redirect already routes
+  // resume through the dispatcher with the pre-signal State.rip, so skipping
+  // the modification path keeps execution alive.
+  const uint64_t NewRIPx64 = guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP];
+  const bool RIPCanonical = (NewRIPx64 >> 47) == 0;
+  if (Context->OriginalRIP != NewRIPx64 && !RIPCanonical && !Context->FaultToTopAndGeneratedException) {
+    return;
+  }
+  if (Context->OriginalRIP != NewRIPx64 || Context->FaultToTopAndGeneratedException) {
 
-    // Restore previous `InSyscallInfo` structure.
+    // Restore previous InSyscallInfo structure.
     Frame->InSyscallInfo = Context->InSyscallInfo;
 
     // Hack! Go back to the top of the dispatcher top
@@ -208,7 +220,15 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
 void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
                                         FEXCore::Core::CpuStateFrame* Frame, void* ucontext) {
   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(Context->UContextLocation);
-  // If the guest modified the RIP then we need to take special precautions here
+  // See RestoreFrame_x64 comment — same poison-sigframe defense for i686. The
+  // 32-bit guest's RIP must fit in 32 bits; poison values like 0xDFDFDFDF still
+  // fit, but they're extremely unlikely to coincide with a real guest RIP
+  // changed by the handler. Treat (NewRIP == 0xDFDFDFDF) as poison too.
+  const uint64_t NewIP32 = guest_uctx->sc.ip;
+  const bool IP32Plausible = (NewIP32 >> 32) == 0 && NewIP32 != 0xDFDFDFDFu;
+  if (Context->OriginalRIP != NewIP32 && !IP32Plausible && !Context->FaultToTopAndGeneratedException) {
+    return;
+  }
   if (Context->OriginalRIP != guest_uctx->sc.ip || Context->FaultToTopAndGeneratedException) {
     // Restore previous `InSyscallInfo` structure.
     Frame->InSyscallInfo = Context->InSyscallInfo;
@@ -238,7 +258,13 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
     Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
     Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
 
-#define COPY_REG(x, y) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->sc.y;
+// 32-bit guest: zero-extend each guest GPR explicitly. The sigcontext fields
+    // are 32-bit, but gregs is uint64_t; if the compiler ever picks a signed
+    // type for the rhs the assignment sign-extends and pollutes the upper 32
+    // bits with 0xFFFFFFFF, which then propagates through SRA to State and
+    // breaks 32-bit RSP / RIP-derived addressing in downstream callback /
+    // thunk paths. Static-cast to uint32_t to nail it down.
+#define COPY_REG(x, y) Frame->State.gregs[FEXCore::X86State::REG_##x] = (uint32_t)guest_uctx->sc.y;
     COPY_REG(RDI, di);
     COPY_REG(RSI, si);
     COPY_REG(RBP, bp);
@@ -317,7 +343,7 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
     Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
     Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
 
-#define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x];
+#define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = (uint32_t)guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x];
     COPY_REG(RDI);
     COPY_REG(RSI);
     COPY_REG(RBP);
