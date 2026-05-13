@@ -323,19 +323,62 @@ DEF_OP(Div) {
     rldicl(Quotient,  Quotient,  0, 32);
     rldicl(Remainder, Remainder, 0, 32);
   } else if (LongDiv) {
-    // 64-bit signed long-div: (Upper:Lower) / Divisor (128-bit signed
-    // dividend). x86 IDIV's invariant is that the quotient fits in 64-bit
-    // signed; the cqo idiom guarantees that by sign-extending RAX. In that
-    // case Upper is just the sign-extend of Lower and the divide collapses
-    // to divd(Lower, Divisor) — handle that path here. A genuine non-trivial
-    // 128-bit dividend (e.g. rdx=1, rax=0; idiv rcx → 2^62) needs a more
-    // complex absolute-value-and-rebuild dance: divde+divdu+correction
-    // mixes signed and unsigned semantics and miscompiles the common
-    // negative-dividend case, so leave that as a known-limitation gap and
-    // emit the 64-bit divd which gives Q=0, R=Lower for cqo-style IDIVs.
-    divd(Quotient, Lower, Divisor);
-    mulld(TMP4, Quotient, Divisor);
-    subf(Remainder, TMP4, Lower);
+    // Real signed 128/64 divide: (Upper:Lower) / Divisor.
+    //   1) Save sign masks (dividend = sign(Upper); quotient = sign XOR).
+    //   2) Take |dividend| as a 128-bit pair, |divisor| as 64-bit.
+    //   3) Run the unsigned divdeu+divdu+correction sequence (same as
+    //      DEF_OP(UDiv)'s 64-bit long path).
+    //   4) Negate quotient if signs differed; negate remainder if dividend
+    //      was negative (x86 rem takes the dividend's sign).
+    //
+    // Red-zone slots -40/-48 hold the saved sign masks across the divide;
+    // -8/-16/-24 are reserved by other ops, so stay below -32.
+    auto Upper = GetReg(Op->Upper);
+
+    sradi(TMP1, Upper, 63);                   // dividend sign mask (-1 or 0)
+    sradi(TMP2, Divisor, 63);                 // divisor  sign mask
+    xor_(TMP3, TMP1, TMP2);                   // quotient sign mask
+    std(TMP1, -40, r1);
+    std(TMP3, -48, r1);
+
+    // abs(Divisor) → TMP3
+    xor_(TMP3, Divisor, TMP2);
+    subf(TMP3, TMP2, TMP3);
+
+    // abs(Upper:Lower) → (TMP2=abs_Upper, TMP4=abs_Lower) via two-word negate.
+    Label NotNegDividend, AfterAbs;
+    cmpdi(Upper, 0);
+    bc(CC_GE, &NotNegDividend);
+    subfic(TMP4, Lower, 0);                   // TMP4 = -Lower, CA = (Lower==0)
+    subfze(TMP2, Upper);                      // TMP2 = -Upper - 1 + CA
+    b(&AfterAbs);
+    Bind(&NotNegDividend);
+    mr(TMP4, Lower);
+    mr(TMP2, Upper);
+    Bind(&AfterAbs);
+
+    // Unsigned 128/64 via POWER8 divdeu + divdu + at-most-one correction.
+    divdeu(TMP1, TMP2, TMP3);                 // q1 = (abs_Upper * 2^64) / abs_Div
+    divdu(TMP2, TMP4, TMP3);                  // q2 = abs_Lower / abs_Div
+    add(TMP1, TMP1, TMP2);                    // tentative quotient
+    mulld(TMP2, TMP1, TMP3);                  // (tentative * abs_Div) low 64
+    subf(TMP2, TMP2, TMP4);                   // rem_lo = abs_Lower - mul_lo
+
+    Label NoCorrection;
+    cmpld(TMP2, TMP3);
+    bc(CC_ULT, &NoCorrection);
+    addi(TMP1, TMP1, 1);
+    subf(TMP2, TMP3, TMP2);
+    Bind(&NoCorrection);
+
+    // Re-apply signs. xor+subf is the standard "conditional negate by mask"
+    // idiom: value^mask - mask = value if mask==0, -value if mask==-1.
+    ld(TMP3, -48, r1);                         // quotient sign mask
+    ld(TMP4, -40, r1);                         // dividend sign mask
+    xor_(TMP1, TMP1, TMP3);
+    subf(Quotient, TMP3, TMP1);
+    xor_(TMP2, TMP2, TMP4);
+    subf(Remainder, TMP4, TMP2);
   } else {
     divd(Quotient, Lower, Divisor);
     mulld(TMP4, Quotient, Divisor);
