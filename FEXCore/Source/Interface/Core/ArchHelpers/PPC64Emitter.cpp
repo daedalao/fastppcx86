@@ -544,17 +544,26 @@ void PPC64EmitterBase::SpillForABICall(GPR tmp, bool FPRs) {
 
 void PPC64EmitterBase::FillForABICall(bool FPRs) {
   PopDynamicRegs();
-  // Clear InSyscallInfo BEFORE FillStaticRegs so a signal arriving mid-fill
-  // doesn't see a stale "inside ABI call" marker. Use r0 as zero source.
+  // Order matters: FillStaticRegs FIRST, THEN clear InSyscallInfo.
+  // Mirrors the ARM64 reference pattern at MiscOps.cpp:280-299 — "Now that
+  // we are done in the syscall we need to carefully peel back the state.
+  // First unspill the registers from before. Now the registers we've spilled
+  // are back in their original host registers. We can safely claim we are no
+  // longer in a syscall."
+  //
+  // If we clear InSyscallInfo first (the WRONG order), an async signal
+  // arriving between the clear and FillStaticRegs sees IgnoreMask=0 and runs
+  // a FULL SpillSRA from host registers that are still in volatile-clobbered
+  // (post-host-call) state — overwriting State.gregs with junk. The handler
+  // then returns via rt_sigreturn and the JIT resumes with corrupted gregs
+  // (most visibly: guest EBX=0 → next [ebx + disp] access SEGVs near NULL).
+  FillStaticRegs();
   li(GPRegs::r0, 0);
   std(GPRegs::r0,
       static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)),
       STATE);
-  FillStaticRegs();
   // r0 is volatile per the C ABI; the JIT relies on r0=0 as a "zero index" for
-  // stdx/ldx-style instructions. Re-establish that invariant after every
-  // host-ABI call.
-  li(GPRegs::r0, 0);
+  // stdx/ldx-style instructions. Already 0 from the InSyscallInfo clear above.
 }
 
 } // namespace FEXCore::CPU
