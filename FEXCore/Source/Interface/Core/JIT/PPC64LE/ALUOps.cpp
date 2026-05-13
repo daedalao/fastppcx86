@@ -710,6 +710,20 @@ DEF_OP(AndWithFlags) {
   // CR0 from and./andi. covers full 64 bits; refine to operand size so SF/ZF
   // reflect only the low N bits (high garbage from S1 must not leak into Z/N).
   if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(Dst, IROp->Size);
+  // IR contract for sub-64-bit results: upper bits must be zero (StoreResult_WithOpSize
+  // relies on this when GPRSize == i64 && OpSize < i64).  is a full-width AND
+  // and only produces a zero-extended result when at least one source is zero-extended
+  // in its upper bits — when AllowUpperGarbage=true is passed (which is common for
+  // ALU operands), the upper 32 bits of Dst can hold leftover garbage. Mask down
+  // explicitly. Without this,  (a 32-bit no-op) silently keeps RBXs
+  // original upper 32 bits, breaking x86s implicit-zext-on-32bit-op rule.
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    rldicl(Dst, Dst, 0, 32);
+  } else if (IROp->Size == IR::OpSize::i16Bit) {
+    rldicl(Dst, Dst, 0, 48);
+  } else if (IROp->Size == IR::OpSize::i8Bit) {
+    rldicl(Dst, Dst, 0, 56);
+  }
 }
 
 // =========================================================================
@@ -750,7 +764,16 @@ DEF_OP(Lshr) {
   if (IsInlineConstant(Op->Src2, &Const)) {
     uint32_t sh = static_cast<uint32_t>(Const & (IROp->Size <= IR::OpSize::i32Bit ? 31 : 63));
     if (IROp->Size <= IR::OpSize::i32Bit) {
-      rlwinm(Dst, S1, 32 - sh, sh, 31);
+      if (sh == 0) {
+        // sh==0 would make 32-sh==32, and rlwinm only encodes SH in 5 bits.
+        // Passing 32 to EmitM as the SH operand spills bit 5 (value 0x20) into
+        // the RA field at bit 16 of the encoded instruction — silently corrupting
+        // the destination register (e.g. r8 -> r9). Just zero-extend the low 32
+        // via rldicl instead; semantically identical for shift-by-zero.
+        rldicl(Dst, S1, 0, 32);
+      } else {
+        rlwinm(Dst, S1, 32 - sh, sh, 31);
+      }
     } else {
       srdi(Dst, S1, sh);
     }
