@@ -198,6 +198,8 @@ int main(int argc, char** argv, char** const envp) {
 
   FEX::Config::InitializeConfigs(FEX::Config::PortableInformation {});
   FEXCore::Config::Initialize();
+  FEXCore::Config::AddLayer(FEX::Config::CreateGlobalMainLayer());
+  FEXCore::Config::AddLayer(FEX::Config::CreateMainLayer());
   FEXCore::Config::AddLayer(FEX::Config::CreateEnvironmentLayer(envp));
   FEXCore::Config::Load();
 
