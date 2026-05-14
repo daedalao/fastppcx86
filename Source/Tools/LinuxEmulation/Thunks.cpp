@@ -348,10 +348,31 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
   if (ThunkHandler->HostTrampolineInstanceDataAvailable < HostToGuestTrampolineSize) {
     const auto allocation_step = 16 * 1024;
     ThunkHandler->HostTrampolineInstanceDataAvailable = allocation_step;
-    ThunkHandler->HostTrampolineInstanceDataPtr = (uint8_t*)mmap(0, ThunkHandler->HostTrampolineInstanceDataAvailable,
-                                                                 PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    LOGMAN_THROW_A_FMT(ThunkHandler->HostTrampolineInstanceDataPtr != MAP_FAILED, "Failed to mmap HostTrampolineInstanceDataPtr");
+    // For 32-bit guests the trampoline pointer is stored in guest function-pointer
+    // slots, which are 32 bits wide. A naked mmap(0,...) lets the kernel pick any
+    // host address; on PPC64LE that's typically a 64-bit address well above 4 GiB.
+    // The guest truncates it to its low 32 bits, the host VK / GL library then
+    // calls the truncated address as a host function pointer, and the host SEGVs
+    // at the unmapped low-address (e.g. host PC 0x63315230 = a guest-space
+    // address). Route through the guest's 32-bit allocator so the trampoline
+    // lives in the low 4 GiB and 32-bit truncation is lossless.
+    if (!FEX::HLE::_SyscallHandler->Is64BitMode()) {
+      auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
+      auto* Result = Alloc->Mmap(nullptr, ThunkHandler->HostTrampolineInstanceDataAvailable,
+                                 PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      LOGMAN_THROW_A_FMT(!FEX::HLE::HasSyscallError(reinterpret_cast<uint64_t>(Result)),
+                         "Failed to allocate 32-bit host trampoline page (errno {})",
+                         -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
+      LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(Result) >> 32) == 0,
+                         "32-bit trampoline allocator returned a >4 GiB address {:#x}",
+                         reinterpret_cast<uintptr_t>(Result));
+      ThunkHandler->HostTrampolineInstanceDataPtr = static_cast<uint8_t*>(Result);
+    } else {
+      ThunkHandler->HostTrampolineInstanceDataPtr = (uint8_t*)mmap(0, ThunkHandler->HostTrampolineInstanceDataAvailable,
+                                                                   PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      LOGMAN_THROW_A_FMT(ThunkHandler->HostTrampolineInstanceDataPtr != MAP_FAILED, "Failed to mmap HostTrampolineInstanceDataPtr");
+    }
   }
 
   auto HostTrampoline = reinterpret_cast<HostToGuestTrampolinePtr*>(ThunkHandler->HostTrampolineInstanceDataPtr);
