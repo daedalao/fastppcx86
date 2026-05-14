@@ -591,19 +591,29 @@ static uint64_t Clone3Handler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clo
 uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
   uint64_t flags = args->args.flags;
 
-  if (flags & CLONE_CLEAR_SIGHAND) {
-    // CLONE_CLEAR_SIGHAND was added in kernel 5.5. FEX doesn't properly support this.
-    // glibc started using this flag in 2.38 as an optimization for posix_spawn.
-    // If clone returns EINVAL or ENOSYS then it will fallback to the non-optimized path.
-    LogMan::Msg::IFmt("CLONE_CLEAR_SIGHAND passed to clone3. Returning EINVAL.");
-    return -EINVAL;
-  }
+  // CLONE_CLEAR_SIGHAND (kernel 5.5+) is the posix_spawn-style optimisation:
+  // the child resets all non-default sigactions to SIG_DFL atomically with the
+  // clone, so glibc doesn't have to do a sigaction() loop after fork. We can't
+  // pass the flag through to the host kernel because it would also reset
+  // *FEX's own* host signal handlers (SIGSEGV/SIGILL/SIGBUS for the dispatcher,
+  // SIGUSR1/SIGUSR2 for thread management, the SignalDelegator pause signal),
+  // breaking the runtime — observed as a futex-wait deadlock on Steam i686.
+  //
+  // Silently strip the flag and proceed. The guest's tracked GuestAction
+  // entries in SignalDelegator::HostHandlers will be slightly stale (set to
+  // whatever the parent had rather than SIG_DFL), but the real consumers of
+  // CLONE_CLEAR_SIGHAND (glibc posix_spawn and pressure-vessel container
+  // setup) all execve() immediately after the clone, which resets the entire
+  // SignalDelegator state in the new address space anyway. Returning EINVAL —
+  // as we used to — left pressure-vessel stuck partway through container init.
+  flags &= ~CLONE_CLEAR_SIGHAND;
+  args->args.flags &= ~CLONE_CLEAR_SIGHAND;
 
   auto HasUnhandledFlags = [](FEX::HLE::clone3_args* args) -> bool {
     constexpr uint64_t UNHANDLED_FLAGS = CLONE_NEWNS |
                                          // CLONE_UNTRACED |
                                          CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET |
-                                         CLONE_IO | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP;
+                                         CLONE_IO | CLONE_INTO_CGROUP;
 
     if ((args->args.flags & UNHANDLED_FLAGS) != 0) {
       // Basic unhandled flags
