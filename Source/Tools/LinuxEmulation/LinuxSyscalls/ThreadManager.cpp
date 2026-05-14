@@ -14,10 +14,85 @@
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <fcntl.h>
 #include <git_version.h>
 
 namespace FEX::HLE {
+
+namespace {
+// Manual robust-futex cleanup for 32-bit guests on a 64-bit FEX host.
+// On real Linux, set_robust_list registers the list with the kernel and the
+// kernel walks it on thread exit to mark each held futex with FUTEX_OWNER_DIED
+// and wake any waiter. For 32-bit guests we cannot register the list with the
+// host kernel (the kernel parses it as a native pointer-width list, but the
+// guest's list uses 4-byte pointers/offsets), so the cleanup never runs and
+// any pthread mutexes the dying thread still held leak as locked forever.
+// Result on heavily-threaded i686 programs (Steam client, 65+ pthreads with
+// frequent mutex hand-off): glibc's malloc arena metadata is held in such a
+// mutex; subsequent free() in another thread sees a stale list head and
+// aborts with "free(): invalid pointer".
+//
+// Implementation mirrors the kernel's `exit_robust_list` walk, restricted to
+// the 32-bit list-head and list-entry layout. We're in the same address space
+// as the guest, so direct dereferences work; the thread has already exited by
+// the time DestroyThread runs so there is no concurrent guest mutation.
+
+constexpr uint32_t FEX_FUTEX_TID_MASK = 0x3FFFFFFFu;
+constexpr uint32_t FEX_FUTEX_WAITERS = 0x80000000u;
+constexpr uint32_t FEX_FUTEX_OWNER_DIED = 0x40000000u;
+constexpr int ROBUST_LIST_MAX_ITERS = 2048;
+
+struct robust_list_head_32 {
+  uint32_t next;
+  int32_t  futex_offset;
+  uint32_t list_op_pending;
+};
+
+void HandleFutexDeath(uint32_t* uaddr, uint32_t exiting_tid) {
+  uint32_t val = __atomic_load_n(uaddr, __ATOMIC_RELAXED);
+  while ((val & FEX_FUTEX_TID_MASK) == exiting_tid) {
+    uint32_t new_val = (val & FEX_FUTEX_WAITERS) | FEX_FUTEX_OWNER_DIED;
+    if (__atomic_compare_exchange_n(uaddr, &val, new_val, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+      if (new_val & FEX_FUTEX_WAITERS) {
+        ::syscall(SYS_futex, uaddr, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+      }
+      return;
+    }
+  }
+}
+
+void WalkAndCleanupRobustList32(uint32_t head_addr, uint32_t exiting_tid) {
+  if (!head_addr) return;
+  auto* head = reinterpret_cast<robust_list_head_32*>(
+    static_cast<uintptr_t>(head_addr));
+
+  uint32_t pending = head->list_op_pending;
+  int32_t  offset  = head->futex_offset;
+  uint32_t cur     = head->next;
+  int iters = 0;
+  while (cur != head_addr && iters++ < ROBUST_LIST_MAX_ITERS) {
+    auto* entry = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cur));
+    uint32_t next = entry[0];
+    if (cur != pending) {
+      auto* futex = reinterpret_cast<uint32_t*>(
+        static_cast<uintptr_t>(cur) + static_cast<intptr_t>(offset));
+      HandleFutexDeath(futex, exiting_tid);
+    }
+    cur = next;
+  }
+
+  // list_op_pending captures a mutex that was being added/removed when the
+  // thread died — must be handled even though it's not yet in the linked list.
+  if (pending) {
+    auto* futex = reinterpret_cast<uint32_t*>(
+      static_cast<uintptr_t>(pending) + static_cast<intptr_t>(offset));
+    HandleFutexDeath(futex, exiting_tid);
+  }
+}
+} // namespace
 
 ThreadManager::StatAlloc::StatAlloc() {
   Initialize();
@@ -272,6 +347,15 @@ void ThreadManager::StopThread(FEX::HLE::ThreadStateObject* Thread) {
 }
 
 void ThreadManager::HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall) {
+  // Robust-futex cleanup for 32-bit guests. The kernel performs this for
+  // 64-bit guests via the native set_robust_list registration (passthrough);
+  // 32-bit needs us to walk the list manually because the kernel can't parse
+  // the 32-bit list layout from our 64-bit task. See WalkAndCleanupRobustList32.
+  if (Thread->ThreadInfo.robust_list_head != 0 && !Is64BitMode()) {
+    WalkAndCleanupRobustList32(static_cast<uint32_t>(Thread->ThreadInfo.robust_list_head),
+                               static_cast<uint32_t>(Thread->ThreadInfo.TID));
+  }
+
   if (Thread->ExecutionThread) {
     if (Thread->ExecutionThread->joinable()) {
       Thread->ExecutionThread->join(nullptr);
