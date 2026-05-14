@@ -44,6 +44,21 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     return true;
   }
 
+  // The SIGSEGV that brought us here may have interrupted a JIT block
+  // currently executing under a shared_lock on CodeInvalidationMutex (taken
+  // by ContextImpl::CompileBlock or PPC64LE ExitFunctionLink).  The
+  // InvalidateGuestCodeRange call below acquires the WRITE side of the same
+  // mutex; since WritePriorityMutex is non-recursive, the same thread holding
+  // a read lock would self-deadlock when asking for the write lock.  Force-
+  // release any such read locks now; the interrupted scope's TrackedSharedLock
+  // dtor becomes a no-op via TakeOverAndUnlock().  Whether or not we end up
+  // redirecting PC below (the "intersects current block" path), the
+  // interrupted scope is safe to leave with the lock released: if PC is
+  // redirected the original frame is abandoned; if PC is NOT redirected the
+  // original instruction retries -- it may re-enter CompileBlock/ExitFunction-
+  // Link from scratch and acquire a fresh read lock, which is correct.
+  FEXCore::ReleaseAllPendingSharedLocks();
+
   {
     // Can't use the deferred signal lock in the SIGSEGV handler.
     auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);

@@ -22,6 +22,7 @@ $end_info$
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/Event.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -82,6 +83,17 @@ static void* ThreadHandler(void* Data) {
   Handler->StartRunningResponse.NotifyOne();
 
   CTX->ExecuteThread(Thread->Thread);
+
+  // Release any WritePriorityMutex shared locks the dying thread is still
+  // registered for on its per-thread PendingSharedLockStack.  This recovers
+  // the reader-count slot if the guest exited mid-GuardSignalDeferringSection
+  // without unwinding the host C++ stack (e.g. guest _exit() syscall during
+  // ContextImpl::CompileBlock or PPC64LE ExitFunctionLink) — without this
+  // sweep the next writer on the mutex hangs forever, and every subsequent
+  // reader queues behind that phantom writer.  See project_steam_2026-05-13
+  // and project_steam_2026-05-14 memory entries for the deadlock signature.
+  FEXCore::ReleaseAllPendingSharedLocks();
+
   FEX::HLE::_SyscallHandler->UninstallTLSState(Thread);
   FEX::HLE::_SyscallHandler->TM.DestroyThread(Thread);
   return nullptr;
@@ -452,6 +464,14 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                         }));
 
   REGISTER_SYSCALL_IMPL(exit, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    // Release any WritePriorityMutex shared locks this thread is still
+    // registered for.  The exit path below either longjmps out (which skips
+    // C++ stack unwinding) or hard-kills via the kernel without running
+    // destructors -- without this sweep, a CompileBlock or ExitFunctionLink
+    // scope guard that the thread was inside leaks its reader-count slot
+    // and the mutex deadlocks every future writer.
+    FEXCore::ReleaseAllPendingSharedLocks();
+
     // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
     // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
     FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
@@ -569,6 +589,13 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(exit_group, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    // Release this thread's shared-lock holdings before the kernel kills it
+    // and every sibling thread.  Sibling threads can't sweep their own TLS
+    // from here, but if this thread happened to be the one holding the
+    // CodeInvalidationMutex reader slot, the cleanup recovers it for any
+    // diagnostics tooling that inspects the dump after exit_group.
+    FEXCore::ReleaseAllPendingSharedLocks();
+
     Frame->Thread->CTX->FlushAndCloseCodeMap();
 
     // Save telemetry if we're exiting.

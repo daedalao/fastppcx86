@@ -2,8 +2,10 @@
 #pragma once
 
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -11,6 +13,7 @@
 #ifndef _WIN32
 #include <sys/syscall.h>
 #endif
+#include <type_traits>
 #include <unistd.h>
 #include <variant>
 
@@ -175,6 +178,126 @@ private:
   std::optional<uint64_t> OriginalMask {};
 };
 
+// Per-thread bookkeeping of WritePriorityMutex::Mutex shared locks held via
+// GuardSignalDeferringSection<std::shared_lock>.  Solves two related issues:
+//
+//  1. A guest thread can terminate without unwinding the host C++ stack
+//     (e.g. guest _exit() syscall path: LongjumpDeallocateAndExit longjmps
+//     past the scope guard dtors; SIGKILL kills the thread; etc).  The
+//     reader-count slot inside the mutex stays incremented forever, and
+//     every future writer hangs.
+//
+//  2. A synchronous signal (SIGSEGV for SMC tracking) can interrupt a JIT
+//     block currently executing under a CompileBlock or ExitFunctionLink
+//     scope guard.  The signal handler then attempts to acquire the WRITE
+//     side of CodeInvalidationMutex via InvalidateGuestCodeRange -- which
+//     self-deadlocks because the same thread holds the read side, and
+//     WritePriorityMutex is non-recursive.  ReleaseAllPendingSharedLocks()
+//     called from the SMC handler before InvalidateGuestCodeRange clears
+//     this thread's outstanding read locks so the write acquisition can
+//     proceed.  The interrupted scope guard is then either abandoned
+//     (signal handler redirects PC away from the original block) or its
+//     dtor is converted into a no-op via TrackedSharedLock::TakeOver().
+//
+// Depth bound: WritePriorityMutex is non-recursive, so at most one shared
+// lock per Mutex per thread.  Today only one mutex hits this path
+// (ContextImpl::CodeInvalidationMutex); observed max depth in practice = 1.
+// Capacity 8 is ample headroom.  Overflow silently skips registration --
+// in that pathological case behavior degrades to pre-patch (the original
+// std::shared_lock dtor still runs the unlock).
+inline constexpr std::size_t PendingSharedLockCapacity = 8;
+
+// Forward declaration -- defined below.
+class TrackedSharedLock;
+
+inline thread_local TrackedSharedLock* PendingSharedLockStack[PendingSharedLockCapacity] {};
+inline thread_local std::size_t PendingSharedLockDepth {0};
+
+// RAII shared lock on a WritePriorityMutex::Mutex.  Replaces std::shared_lock
+// inside the GuardSignalDeferringSection<std::shared_lock, WritePriorityMutex>
+// path so that:
+//   - On normal scope exit, dtor unlocks_shared and pops from the stack.
+//   - On forced sweep (TakeOver), the mutex is unlocked AND ownership
+//     is cleared so the later dtor is a no-op.
+// "TakeOver" semantics intentionally mirror std::shared_lock::release() but
+// also perform the actual unlock_shared, because the stack-stored pointer
+// cannot live longer than the lock owner.
+class TrackedSharedLock final {
+public:
+  explicit TrackedSharedLock(FEXCore::Utils::WritePriorityMutex::Mutex& mutex)
+    : Mutex(&mutex) {
+    Mutex->lock_shared();
+    if (PendingSharedLockDepth < PendingSharedLockCapacity) {
+      PendingSharedLockStack[PendingSharedLockDepth++] = this;
+    }
+    // If full: not tracked.  Lock is still held and will be unlocked by
+    // this object's dtor on normal scope exit.  Worst case (leak via
+    // signal-handler death with depth >= cap) matches pre-patch behavior.
+  }
+
+  TrackedSharedLock(const TrackedSharedLock&) = delete;
+  TrackedSharedLock& operator=(const TrackedSharedLock&) = delete;
+  // Non-movable: the stack-stored pointer is stable only while this object
+  // stays in place.  Callers must use it as a stack/struct member.
+  TrackedSharedLock(TrackedSharedLock&&) = delete;
+  TrackedSharedLock& operator=(TrackedSharedLock&&) = delete;
+
+  ~TrackedSharedLock() {
+    if (!Mutex) {
+      // Already swept by an external ReleaseAllPendingSharedLocks() --
+      // mutex has already been unlocked, stack already drained.
+      return;
+    }
+    // Normal RAII path.  Pop from the stack (LIFO expected; defensive scan
+    // to tolerate non-stack release order) then unlock.
+    for (std::size_t i = PendingSharedLockDepth; i > 0; --i) {
+      if (PendingSharedLockStack[i - 1] == this) {
+        for (std::size_t j = i - 1; j + 1 < PendingSharedLockDepth; ++j) {
+          PendingSharedLockStack[j] = PendingSharedLockStack[j + 1];
+        }
+        --PendingSharedLockDepth;
+        PendingSharedLockStack[PendingSharedLockDepth] = nullptr;
+        break;
+      }
+    }
+    Mutex->unlock_shared();
+  }
+
+  // External-sweep entry point: unlock the mutex and disassociate.  After
+  // TakeOver(), this object's dtor is a no-op.  Called from
+  // ReleaseAllPendingSharedLocks() below.
+  void TakeOverAndUnlock() {
+    if (Mutex) {
+      auto* m = Mutex;
+      Mutex = nullptr;
+      m->unlock_shared();
+    }
+  }
+private:
+  FEXCore::Utils::WritePriorityMutex::Mutex* Mutex;
+};
+
+// Forcibly releases every shared lock currently registered on this thread's
+// PendingSharedLockStack.  Idempotent (no-op on empty stack).  Must be called
+// FROM THE OWNING THREAD; the stack is thread_local storage.
+//
+// Two correct call sites:
+//   - The dying-thread cleanup path (ThreadHandler/SYS_exit/SYS_exit_group)
+//     where C++ destructors may not run.
+//   - The SMC SIGSEGV handler in HandleSegfault, before InvalidateGuestCodeRange
+//     attempts to acquire the write lock -- otherwise the same thread
+//     self-deadlocks.
+inline void ReleaseAllPendingSharedLocks() {
+  while (PendingSharedLockDepth > 0) {
+    --PendingSharedLockDepth;
+    auto* lk = PendingSharedLockStack[PendingSharedLockDepth];
+    PendingSharedLockStack[PendingSharedLockDepth] = nullptr;
+    if (lk) {
+      lk->TakeOverAndUnlock();
+    }
+  }
+}
+
 /**
  * @brief Produces a wrapper object around a scoped lock of the given mutex
  * while ensuring POSIX signals are masked while the mutex is locked
@@ -202,16 +325,49 @@ static auto MaskSignalsAndLockMutex(MutexType& mutex, uint64_t Mask = ~0ULL) {
  * @brief Produces a wrapper object around a scoped lock of the given mutex
  * while bumping the Thread's deferred signal refcount while the mutex is
  * locked.
+ *
+ * When invoked as GuardSignalDeferringSection<std::shared_lock>(...) on a
+ * WritePriorityMutex::Mutex, the returned scope guard ALSO registers the
+ * mutex on this thread's PendingSharedLockStack so that
+ * ReleaseAllPendingSharedLocks() can recover the reader-count slot if the
+ * thread terminates without unwinding the host C++ stack (the canonical
+ * cause of the CodeInvalidationMutex phantom-reader deadlock observed in
+ * Steam under PPC64LE FEX).
  */
 template<template<typename> class LockType = std::unique_lock, typename MutexType>
 [[nodiscard]]
 static auto GuardSignalDeferringSection(MutexType& mutex, FEXCore::Core::InternalThreadState* Thread, uint64_t Mask = ~0ULL) {
-  // Refcount is incremented first, and then the lock is acquired.
-  struct {
-    std::optional<DeferredSignalRefCountGuard> refcount;
-    LockType<MutexType> lock;
-  } scope_guard = {DeferredSignalRefCountGuard {Thread}, LockType<MutexType> {mutex}};
-  return scope_guard;
+  if constexpr (std::is_same_v<LockType<MutexType>, std::shared_lock<MutexType>> &&
+                std::is_same_v<MutexType, FEXCore::Utils::WritePriorityMutex::Mutex>) {
+    // Tracked variant.  Replaces std::shared_lock with TrackedSharedLock,
+    // which both acquires/releases the mutex AND registers in
+    // PendingSharedLockStack so ReleaseAllPendingSharedLocks() can unlock
+    // it externally without a later dtor double-unlocking.
+    //
+    // Move/copy semantics: this scope_guard cannot be moved/copied because
+    // TrackedSharedLock is non-movable -- the registered pointer must stay
+    // stable.  This matches the only existing callers (Core.cpp:844, :946;
+    // PPC64LE/JIT.cpp:1490) which use `auto lk = ...;` and never move it.
+    struct ScopeGuard {
+      std::optional<DeferredSignalRefCountGuard> refcount;
+      TrackedSharedLock lock;
+      ScopeGuard(FEXCore::Core::InternalThreadState* T, MutexType& m)
+        : refcount(DeferredSignalRefCountGuard {T})
+        , lock(m) {}
+      ScopeGuard(const ScopeGuard&) = delete;
+      ScopeGuard& operator=(const ScopeGuard&) = delete;
+      ScopeGuard(ScopeGuard&&) = delete;
+      ScopeGuard& operator=(ScopeGuard&&) = delete;
+    };
+    return ScopeGuard {Thread, mutex};
+  } else {
+    // Refcount is incremented first, and then the lock is acquired.
+    struct {
+      std::optional<DeferredSignalRefCountGuard> refcount;
+      LockType<MutexType> lock;
+    } scope_guard = {DeferredSignalRefCountGuard {Thread}, LockType<MutexType> {mutex}};
+    return scope_guard;
+  }
 }
 
 // Like GuardSignalDeferringSection but falls back to masking signals when Thread is nullptr
