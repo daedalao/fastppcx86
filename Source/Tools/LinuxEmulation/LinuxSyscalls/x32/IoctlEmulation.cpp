@@ -38,6 +38,21 @@ static void UnhandledIoctl(const char* Type, int fd, uint32_t cmd, uint32_t args
 
 namespace BasicHandler {
   uint32_t BasicHandler(FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t cmd, uint32_t args) {
+#ifdef ARCHITECTURE_ppc64le
+    // PowerPC overrides the asm-generic FION*/FIO* values in <asm/ioctls.h>
+    // (FIONBIO=0x8004667E, FIONREAD=0x4004667F, etc.) -- a naked passthrough
+    // leaves the x86 guest values intact and the PPC kernel returns ENOTTY.
+    // Mirrors the x64 mitigation in Syscalls/Passthrough.cpp; this 32-bit
+    // path is what Steam launcher s CreateBoundSocket(setnonblocking) hits.
+    switch (cmd) {
+    case 0x5421u: cmd = FIONBIO;  break;
+    case 0x541Bu: cmd = FIONREAD; break;
+    case 0x5450u: cmd = FIONCLEX; break;
+    case 0x5451u: cmd = FIOCLEX;  break;
+    case 0x5452u: cmd = FIOASYNC; break;
+    default: break;
+    }
+#endif
     uint64_t Result = ::ioctl(fd, cmd, args);
     SYSCALL_ERRNO();
   }
