@@ -152,30 +152,84 @@ void OpDispatchBuilder::SHA256RNDS2Op(OpcodeArgs) {
   }
   Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
-  // Hardcoded to XMM0
+  // SHA256RNDS2 implicitly reads round constants W+K from XMM0.
   auto XMM0 = LoadXMMRegister(0);
 
-  auto shuffle_abcd = [this](Ref Src1, Ref Src2) -> Ref {
-    // Generates a suitable SHA256 `abcd` configuration from x86 format.
-    auto Tmp = _VZip2(OpSize::i128Bit, OpSize::i64Bit, Src2, Src1);
-    return _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
+  // x86 SHA256RNDS2 advances SHA-256 state by exactly TWO rounds.  The
+  // previous implementation mapped this to _VSha256H + _VSha256H2, which on
+  // both ARM64 (native sha256h) and PPC64LE (Sha256Round4 software helper)
+  // advance state by FOUR rounds total -- twice the correct rate.  Result:
+  // SHA-256("") via sha256rnds2 produced 45d60b0c...87d9be instead of
+  // NIST's e3b0c442...b852b855, breaking every TLS handshake that probes
+  // CPUID and selects the SHA-NI fast path (notably the Steam launcher's
+  // bundled OpenSSL 1.1).  tmp/sha_ni_test.c on POWER8 is the repro.
+  //
+  // Correct mapping per Intel SDM Vol.2:
+  //   src1 holds {A, B, E, F} in 32-bit lanes [3, 2, 1, 0]
+  //   dst  holds {C, D, G, H} in 32-bit lanes [3, 2, 1, 0]
+  //   xmm0[31:0]  = WK_0 (round 0 message+key sum)
+  //   xmm0[63:32] = WK_1 (round 1 message+key sum)
+  // After 2 rounds, dst is overwritten with {A_2, B_2, E_2, F_2} in
+  // lanes [3, 2, 1, 0].  This is host-portable: the round math is plain
+  // 32-bit ALU IR, so ARM64 picks up the fix too without a dedicated
+  // sha256rnds2 emitter.
+  const auto i32 = OpSize::i32Bit;
+  Ref A = _VExtractToGPR(OpSize::i128Bit, i32, Src,  3);
+  Ref B = _VExtractToGPR(OpSize::i128Bit, i32, Src,  2);
+  Ref E = _VExtractToGPR(OpSize::i128Bit, i32, Src,  1);
+  Ref F = _VExtractToGPR(OpSize::i128Bit, i32, Src,  0);
+  Ref C = _VExtractToGPR(OpSize::i128Bit, i32, Dest, 3);
+  Ref D = _VExtractToGPR(OpSize::i128Bit, i32, Dest, 2);
+  Ref G = _VExtractToGPR(OpSize::i128Bit, i32, Dest, 1);
+  Ref H = _VExtractToGPR(OpSize::i128Bit, i32, Dest, 0);
+  Ref WK0 = _VExtractToGPR(OpSize::i128Bit, i32, XMM0, 0);
+  Ref WK1 = _VExtractToGPR(OpSize::i128Bit, i32, XMM0, 1);
+
+  // SHA-256 mixing functions.
+  auto Sigma0 = [&](Ref X) {
+    return _Xor(i32,
+                _Xor(i32, _Ror(i32, X, _Constant( 2)),
+                          _Ror(i32, X, _Constant(13))),
+                _Ror(i32, X, _Constant(22)));
+  };
+  auto Sigma1 = [&](Ref X) {
+    return _Xor(i32,
+                _Xor(i32, _Ror(i32, X, _Constant( 6)),
+                          _Ror(i32, X, _Constant(11))),
+                _Ror(i32, X, _Constant(25)));
+  };
+  auto Ch = [&](Ref X, Ref Y, Ref Z) {
+    return _Xor(i32, _And(i32, X, Y),
+                     _And(i32, _Not(i32, X), Z));
+  };
+  auto Maj = [&](Ref X, Ref Y, Ref Z) {
+    return _Xor(i32,
+                _Xor(i32, _And(i32, X, Y),
+                          _And(i32, X, Z)),
+                _And(i32, Y, Z));
+  };
+  auto Round = [&](Ref& A_, Ref& B_, Ref& C_, Ref& D_,
+                   Ref& E_, Ref& F_, Ref& G_, Ref& H_, Ref WK) {
+    // T1 = H + Sigma1(E) + Ch(E,F,G) + WK
+    auto T1 = _Add(i32, _Add(i32, H_, Sigma1(E_)),
+                        _Add(i32, Ch(E_, F_, G_), WK));
+    // T2 = Sigma0(A) + Maj(A,B,C)
+    auto T2 = _Add(i32, Sigma0(A_), Maj(A_, B_, C_));
+    Ref Enew = _Add(i32, D_, T1);
+    Ref Anew = _Add(i32, T1, T2);
+    H_ = G_; G_ = F_; F_ = E_; E_ = Enew;
+    D_ = C_; C_ = B_; B_ = A_; A_ = Anew;
   };
 
-  auto shuffle_efgh = [this](Ref Src1, Ref Src2) -> Ref {
-    // Generates a suitable SHA256 `efgh` configuration from x86 format.
-    auto Tmp = _VZip(OpSize::i128Bit, OpSize::i64Bit, Src2, Src1);
-    return _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
-  };
+  Round(A, B, C, D, E, F, G, H, WK0);
+  Round(A, B, C, D, E, F, G, H, WK1);
 
-  auto ABCD = shuffle_abcd(Dest, Src);
-  auto EFGH = shuffle_efgh(Dest, Src);
-
-  // x86 uses only the bottom 64-bits of the key, so duplicate to match ARM64 semantics.
-  auto Key = _VDupElement(OpSize::i128Bit, OpSize::i64Bit, XMM0, 0);
-
-  auto A = _VSha256H(ABCD, EFGH, Key);
-  auto B = _VSha256H2(EFGH, ABCD, Key);
-  auto Result = shuffle_abcd(A, B);
+  // Pack {A_2, B_2, E_2, F_2} into output lanes [3, 2, 1, 0].
+  Ref Result = LoadZeroVector(OpSize::i128Bit);
+  Result = _VInsGPR(OpSize::i128Bit, i32, 3, Result, A);
+  Result = _VInsGPR(OpSize::i128Bit, i32, 2, Result, B);
+  Result = _VInsGPR(OpSize::i128Bit, i32, 1, Result, E);
+  Result = _VInsGPR(OpSize::i128Bit, i32, 0, Result, F);
 
   StoreResultFPR(Op, Result);
 }
