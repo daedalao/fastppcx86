@@ -99,18 +99,42 @@ static inline void SetState(void* ucontext, uint64_t val) {
 // SRA single-instruction fill is handled inside the JIT dispatcher for ppc64le.
 static inline void SetFillSRASingleInst(void*, bool) {}
 
-// GetArmReg / SetArmReg map caller-saved ARM64 register conventions onto the
-// closest ppc64le equivalent. ARM64 r30 (link register) → ppc64le LR;
-// ARM64 r0 (return/arg) → ppc64le r3.
+// GetArmReg / SetArmReg map ARM64 caller-saved register IDs onto the closest
+// ppc64le equivalent.  Cross-arch callers (e.g. the SMC SIGSEGV handler in
+// SyscallsSMCTracking.cpp using ARM64 X1 == ENTRY_FILL_SRA_SINGLE_INST_REG ==
+// TMP2) refer to ARM register indices; we have to map those to ppc64le's
+// SRA/scratch numbering or the wrong host GPR gets written.
+//
+// Mapping:
+//   ARM X0  (= TMP1 / first arg)      → ppc64le r3   (TMP1)
+//   ARM X1  (= TMP2 / second arg / ENTRY_FILL_SRA_SINGLE_INST_REG)
+//                                     → ppc64le r4   (TMP2)
+//   ARM X2  (= TMP3 / third arg)      → ppc64le r5   (TMP3)
+//   ARM X3  (= TMP4 / fourth arg)     → ppc64le r6   (TMP4)
+//   ARM X30 (= LR)                    → ppc64le LR (PPC_PT_LR)
+//   any other id:                     → ppc64le gp_regs[id+3] (best-effort)
+//
+// BUG history: previously did `gp_regs[id == 0 ? 3 : id]`, so id=1 wrote
+// the STACK POINTER (r1) instead of TMP2 (r4).  SyscallHandler::HandleSegfault
+// calls SetArmReg(ucontext, 1, 1) to force single-step on SMC retries; on
+// PPC64LE that silently corrupted r1, leading to an immediate fault when
+// the dispatcher resumed and touched the stack.
 static inline uint64_t GetArmReg(void* ucontext, uint32_t id) {
   if (id == 30) {
     return GetMContext(ucontext)->gp_regs[PPC_PT_LR];
   }
-  return GetMContext(ucontext)->gp_regs[id == 0 ? 3u : id];
+  // ARM X(i) → PPC r(i+3) for i in [0..3] (TMP1..TMP4).  For larger IDs we
+  // currently have no caller mapping; fall through to gp_regs[id+3] as a
+  // best-effort -- any future caller using id > 3 should map explicitly.
+  return GetMContext(ucontext)->gp_regs[3u + id];
 }
 
 static inline void SetArmReg(void* ucontext, uint32_t id, uint64_t val) {
-  GetMContext(ucontext)->gp_regs[id == 0 ? 3u : id] = val;
+  if (id == 30) {
+    GetMContext(ucontext)->gp_regs[PPC_PT_LR] = val;
+    return;
+  }
+  GetMContext(ucontext)->gp_regs[3u + id] = val;
 }
 
 static inline uint64_t GetArmPState(void* ucontext) {

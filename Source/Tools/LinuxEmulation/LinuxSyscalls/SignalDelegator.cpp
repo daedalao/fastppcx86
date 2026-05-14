@@ -28,6 +28,7 @@ $end_info$
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <fcntl.h>
 #include <functional>
 #include <linux/futex.h>
 #include <syscall.h>
@@ -65,8 +66,96 @@ static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_sta
   return ThreadObject;
 }
 
+// 2026-05-14 diagnostic: capture host PC + si_addr for every sync fault
+// (SIGSEGV/SIGBUS/SIGILL/SIGFPE) BEFORE FEX hands it to the guest.  Steam
+// installs breakpad which re-raises via tgkill, destroying the original
+// si_code and clobbering host registers -- so the coredump shows post-
+// breakpad state instead of the actual fault site.  Logging via raw
+// write() to /tmp/fex_signal_trace.log is async-signal-safe.  Set
+// FEX_TRACE_SIGNALS=1 to enable.  No-op otherwise; one atomic-load fast path.
+// On the first fatal-signal hit, copy /proc/self/maps to /tmp/fex_maps.log so
+// any LR / nip we log can be matched to a loaded library after the fact.
+[[gnu::cold]]
+static void DumpMapsOnce() {
+  static int done = 0;
+  if (done) return;
+  done = 1;
+  int in = ::open("/proc/self/maps", O_RDONLY);
+  if (in < 0) return;
+  int out = ::open("/tmp/fex_maps.log",
+                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (out < 0) { ::close(in); return; }
+  char buf[4096];
+  ssize_t n;
+  while ((n = ::read(in, buf, sizeof(buf))) > 0) {
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = ::write(out, buf + off, n - off);
+      if (w <= 0) break;
+      off += w;
+    }
+  }
+  ::close(in);
+  ::close(out);
+}
+
+[[gnu::cold]]
+static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
+  static int trace_fd = -2;
+  if (trace_fd == -2) {
+    if (getenv("FEX_TRACE_SIGNALS")) {
+      trace_fd = ::open("/tmp/fex_signal_trace.log",
+                        O_WRONLY | O_CREAT | O_APPEND, 0644);
+      DumpMapsOnce();
+    } else {
+      trace_fd = -1;
+    }
+  }
+  if (trace_fd < 0) return;
+  // Build line manually (no fprintf -- not async-signal-safe).
+  char buf[256];
+  auto write_hex = [](char* dst, uint64_t v) -> int {
+    int n = 0;
+    char tmp[18];
+    if (v == 0) { tmp[n++] = '0'; }
+    while (v) { int d = v & 0xf; tmp[n++] = (d < 10 ? '0'+d : 'a'+d-10); v >>= 4; }
+    int len = 0;
+    dst[len++] = '0'; dst[len++] = 'x';
+    while (n > 0) dst[len++] = tmp[--n];
+    return len;
+  };
+  int len = 0;
+  const char* prefix = "FEX-SIG tid=";
+  for (const char* p = prefix; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)::syscall(SYS_gettid));
+  const char* sig = " sig="; for (const char* p = sig; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)Signal);
+  const char* code = " code="; for (const char* p = code; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)Info->si_code);
+  const char* addr = " addr="; for (const char* p = addr; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)Info->si_addr);
+  const char* nip = " nip="; for (const char* p = nip; *p; p++) buf[len++] = *p;
+#ifdef ARCHITECTURE_ppc64le
+  len += write_hex(buf + len, (uint64_t)_context->uc_mcontext.regs->nip);
+  const char* r27 = " r27="; for (const char* p = r27; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)_context->uc_mcontext.regs->gpr[27]);
+  const char* r3 = " r3="; for (const char* p = r3; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)_context->uc_mcontext.regs->gpr[3]);
+  const char* lr = " lr="; for (const char* p = lr; *p; p++) buf[len++] = *p;
+  len += write_hex(buf + len, (uint64_t)_context->uc_mcontext.regs->link);
+#endif
+  buf[len++] = '\n';
+  ::write(trace_fd, buf, len);
+}
+
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ucontext_t* _context = (ucontext_t*)UContext;
+  // Diagnostic: log the raw kernel-delivered context before any FEX/guest
+  // handler runs.  Steam's breakpad clobbers this in the post-mortem
+  // coredump via SIGSEGV re-raise (tgkill SI_TKILL).
+  if (Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) {
+    TraceSyncSignal(Signal, Info, _context);
+  }
   auto ThreadObject = GetThreadFromAltStack(_context->uc_stack);
   if (!ThreadObject) {
     // No valid alt-stack: cannot dispatch this signal through FEX. Restore
