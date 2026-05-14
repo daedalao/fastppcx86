@@ -638,6 +638,32 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   auto MustDeferSignal = (Thread->CurrentFrame->State.DeferredSignalRefCount.Load() != 0);
+
+#if defined(ARCHITECTURE_ppc64le)
+  // PPC64LE: also defer async signals whose host PC lies inside the JIT code
+  // buffer. SpillSRA blindly copies the ucontext SRA regs into State.gregs
+  // assuming they hold the coherent x86 register file at the snapped x86
+  // boundary returned by RestoreRIPFromHostPC. That assumption only holds at
+  // IR-op boundaries. The host kernel can interrupt a block mid-IR-op (for
+  // example between an `and__` writing a 64-bit AND result into SRA[rax] and
+  // the follow-up `rldicl` that zero-extends to 32 bits) — at which point
+  // SRA[rax] holds the un-zero-extended scratch value and *not* the post-x86
+  // RAX. Eager processing of such a signal corrupts State.gregs and the
+  // INJIT-routed FillSRA on return re-dispatches with garbage gregs (typical
+  // crash: SEGV_MAPERR at NULL+8 ~2 KB later, when a now-NULL gregs-derived
+  // pointer is dereferenced).
+  //
+  // Treat the entire JIT code buffer as a deferral region for async signals;
+  // the EmitSuspendInterruptCheck poke at every block entry / backward branch
+  // drains the queued signal at a guaranteed-coherent boundary. Synchronous
+  // signals (SIGSEGV/SIGBUS/SIGILL/SIGFPE — IsAsyncSignal is false) still go
+  // through their normal handlers, so a real guest fault is not affected.
+  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(UContext));
+  const bool MustDeferAsync = MustDeferSignal || InJIT_ForDefer;
+#else
+  const bool MustDeferAsync = MustDeferSignal;
+#endif
+
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
@@ -681,7 +707,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       ERROR_AND_DIE_FMT("X86 shouldn't hit this InterruptFaultPage");
 #endif
     }
-  } else if (IsAsyncSignal(&SigInfo, Signal) && MustDeferSignal) {
+  } else if (IsAsyncSignal(&SigInfo, Signal) && MustDeferAsync) {
     // If the signal is asynchronous (as determined by si_code) and FEX is in a state of needing
     // to defer the signal, then add the signal to the thread's signal queue.
     LOGMAN_THROW_A_FMT(ThreadObject->SignalInfo.DeferredSignalFrames.size() != ThreadObject->SignalInfo.DeferredSignalFrames.capacity(),
