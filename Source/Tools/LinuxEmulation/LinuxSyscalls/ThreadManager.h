@@ -23,11 +23,14 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <unistd.h>
+#include <FEXCore/Utils/LogManager.h>
 #include <sys/stat.h>
 
 #include <bits/types/sigset_t.h>
@@ -215,13 +218,47 @@ public:
     ++IdleWaitRefCount;
   }
 
+  // 2026-05-14 deadlock recovery: both overloads sweep the calling thread's
+  // PendingSharedLockStack first (defensive against the caller having an
+  // unreleased CompileBlock/ExitFunctionLink read lock in scope), and use a
+  // bounded-wait write-lock acquisition that calls StealAndDropActiveLocks()
+  // after InvalidateGuestCodeRangeStealTimeoutSec seconds.  This recovers
+  // from the phantom-reader leak family of bugs we've been hitting under
+  // Steam and FTL.  The underlying leak source(s) should still be found,
+  // but live workloads can make forward progress in the meantime.
+  static constexpr int InvalidateGuestCodeRangeStealTimeoutSec = 4;
+
+  void TakeCodeInvalidationWriteLockOrSteal(FEXCore::Utils::WritePriorityMutex::Mutex& M) {
+    if (M.try_lock()) {
+      return;
+    }
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec);
+    while (!M.try_lock()) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        LogMan::Msg::EFmt("InvalidateGuestCodeRange: write-lock stalled {}s, "
+                          "suspect phantom reader leak -- calling "
+                          "StealAndDropActiveLocks() to recover",
+                          InvalidateGuestCodeRangeStealTimeoutSec);
+        M.StealAndDropActiveLocks();
+        M.lock();
+        return;
+      }
+      ::usleep(50);
+    }
+  }
+
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
+    FEXCore::ReleaseAllPendingSharedLocks();
     std::lock_guard lk(ThreadCreationMutex);
 
-    // Potential deferred since Thread might not be valid.
-    // Thread object isn't valid very early in frontend's initialization.
-    // To be more optimal the frontend should provide this code with a valid Thread object earlier.
-    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
     for (auto& Thread : Threads) {
       CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
@@ -230,18 +267,21 @@ public:
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
+    FEXCore::ReleaseAllPendingSharedLocks();
     std::lock_guard lk(ThreadCreationMutex);
 
-    // Potential deferred since Thread might not be valid.
-    // Thread object isn't valid very early in frontend's initialization.
-    // To be more optimal the frontend should provide this code with a valid Thread object earlier.
-    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
     for (auto& Thread : Threads) {
       CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
     }
 
-    // Callback while holding the locks.
     after_callback(Start, Length);
   }
 

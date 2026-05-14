@@ -64,6 +64,16 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
 }
 
 PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
+  // 2026-05-14: bootstrap self-return.  Loaders commonly call this with the
+  // name "vkGetDeviceProcAddr" or "vkGetInstanceProcAddr" to populate their
+  // dispatch tables.  Return our own thunk so subsequent dispatches go
+  // through the guest_layout-marshalling shim that we ARE.
+  if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
+    return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+  }
+  if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
+    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
+  }
   auto Ret = fexfn_pack_vkGetDeviceProcAddr(a_0, a_1);
   if (!Ret) {
     return nullptr;
@@ -74,13 +84,26 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
 PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
   if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
-  } else {
-    auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
-    if (!Ret) {
-      return nullptr;
-    }
-    return MakeGuestCallable(__FUNCTION__, Ret, a_1);
   }
+  // 2026-05-14: the Vulkan loader spec allows (and several loaders do) calling
+  // vkGetInstanceProcAddr with the name "vkGetInstanceProcAddr" to fetch a
+  // pointer to itself -- either with a NULL instance (early bootstrap) or a
+  // real one.  Without this case, MakeGuestCallable() couldn't find the name
+  // in HostPtrInvokers (vkGetInstanceProcAddr isn't in the thunkgen FOREACH
+  // list -- it IS the thunkgen entry point) and returned nullptr.  Loaders
+  // then retried via dlsym(libvulkan, "vkGetInstanceProcAddr"), which looped
+  // back through us; with the Vulkan host thunk enabled the recursion
+  // accreted guest-stack frames until exhaustion.  Symptom: Steam, FTL, and
+  // Grimrock all crashed on the same `stdx r3, r11, r0` push at stack bottom
+  // with r3=0x671903 (the bit-identical return-RIP of the looping caller).
+  if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
+    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
+  }
+  auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
+  if (!Ret) {
+    return nullptr;
+  }
+  return MakeGuestCallable(__FUNCTION__, Ret, a_1);
 }
 }
 
