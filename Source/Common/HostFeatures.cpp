@@ -671,12 +671,19 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   // never run and tests see input bytes echoed unchanged.
   HostFeatures.SupportsAES = true;
   HostFeatures.SupportsAES256 = HostFeatures.SupportsAVX && HostFeatures.SupportsAES;
-  // SHA-1 / SHA-256 software helpers (PPC64_VSha1*/VSha256* in JIT.cpp) —
-  // POWER8 has no SHA-NI, so each SHA IR op routes through the FABI bridge.
-  // Without SupportsSHA the OpcodeDispatcher (Crypto.cpp) rewrites the
-  // SHA1NEXTE/SHA1MSG*/SHA1RNDS4/SHA256MSG*/SHA256RNDS2 mnemonics to
-  // UnimplementedOp.
-  HostFeatures.SupportsSHA = true;
+  // SHA-1 / SHA-256: helpers exist (PPC64_VSha1*/VSha256* in JIT.cpp) but
+  // the x86 SHA256RNDS2 / SHA1RNDS4 dispatcher in Crypto.cpp maps the
+  // two-round x86 ops onto ARM-style _VSha256H/_VSha256H2 which advance
+  // state by FOUR rounds each (see Sha256Round4 in JIT.cpp -- loop runs
+  // i=0..3). Net result: SHA-256("") via sha256rnds2 produces a wildly
+  // wrong hash, which breaks every TLS handshake whose client probes CPUID
+  // and chooses the SHA-NI fast path (notably Steam launcher s bundled
+  // OpenSSL 1.1). tmp/sha_ni_test.c on POWER8 is the canonical repro.
+  // Disabling here makes CPUID drop the SHA bit (CPUID.cpp:447), so guest
+  // crypto libs fall back to their SSSE3/AVX2 SHA-256 implementations --
+  // which our 32-bit crypto-primitive bisect (tmp/crypto_bisect.c) showed
+  // match native byte-for-byte under FEX.
+  HostFeatures.SupportsSHA = false;
   // PCLMULQDQ goes through the same FABI helper bridge (PPC64_PCLMUL in
   // JIT.cpp). Without claiming PMULL_128Bit the OpcodeDispatcher rewrites
   // PCLMUL to UnimplementedOp.
