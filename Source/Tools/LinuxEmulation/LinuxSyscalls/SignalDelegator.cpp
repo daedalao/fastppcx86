@@ -244,7 +244,18 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
       // Skip this one, it's already spilled
       continue;
     }
-    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
+    // NOTE: read the ucontext slot DIRECTLY, not via GetArmReg().
+    // GetArmReg() applies a cross-arch ARM-X-name -> PPC-r-reg `+3` shift
+    // (ARM X0 -> PPC r3 = TMP1, etc.) for callers like
+    // SyscallHandler::HandleSegfault that name registers in ARM terms.
+    // SRAGPRMapping[i] is the *host-native* register index (ARM xN on
+    // arm64, PPC rN on ppc64le); passing it through GetArmReg on ppc64le
+    // silently rotated every gregs[i] read by 3 slots, producing the
+    // recurring "bogus-RSP / RAX==RSP / ".com"-fragment" cascade seen
+    // during signal-during-JIT delivery (see project_spillsra_offset_bug).
+    // GetArmGPRs() returns the raw gp_regs[0] pointer on both arches,
+    // matching SRAGPRMapping's native-index semantics.
+    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmGPRs(ucontext)[SRAIdxMap];
   }
 
   if (SupportsAVX) {
