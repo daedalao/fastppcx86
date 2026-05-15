@@ -149,74 +149,6 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
 #endif
   buf[len++] = '\n';
   ::write(trace_fd, buf, len);
-
-  // If this is a stack-bottom guard fault (si_addr ends within the last 4KB
-  // of mapped page), dump 64 qwords from si_addr+8 upward.  Those are the
-  // most-recently-pushed return RIPs that built up the recursion.  Reading
-  // si_addr itself is fine -- it was already written-to (that's what faulted),
-  // so the page exists (it's beyond the mapped region, but si_addr+8 .. +N is
-  // in the mapped region one page above).
-  uintptr_t fault = (uintptr_t)Info->si_addr;
-  // Locate the page just above the fault page that IS mapped.
-  uintptr_t stack_top = (fault + 0x1000) & ~0xfffULL;
-  // Cheap probe: try /proc/self/mem-style read by just dereferencing in a
-  // sigaltstack-protected way.  Simpler: just write the values out, trust
-  // they're in a mapped page.
-  // Histogram return-RIP-shaped values (low 32 bits look like a code address)
-  // across the first 256KB of stack from the bottom.  Top-N counts will reveal
-  // the recursion pattern -- e.g. 30000 hits on 0x671903 means that call site
-  // pushed 30K frames.
-  struct Bucket { uint64_t addr; uint64_t count; };
-  Bucket buckets[16] {};
-  int nbuckets = 0;
-  // Scan 32K qwords = 256KB.
-  for (int i = 0; i < 32768; i++) {
-    uintptr_t addr = stack_top + i * 8;
-    uint64_t val = *reinterpret_cast<volatile uint64_t*>(addr);
-    // Filter: only count "code-shaped" values (32-bit-low userspace pointers)
-    if (val < 0x400000 || val >= 0x800000) continue;
-    int found = -1;
-    for (int b = 0; b < nbuckets; b++) {
-      if (buckets[b].addr == val) { found = b; break; }
-    }
-    if (found >= 0) {
-      buckets[found].count++;
-    } else if (nbuckets < 16) {
-      buckets[nbuckets].addr = val;
-      buckets[nbuckets].count = 1;
-      nbuckets++;
-    }
-  }
-  // Sort top 8 by count.
-  for (int i = 0; i < nbuckets - 1; i++) {
-    for (int j = i + 1; j < nbuckets; j++) {
-      if (buckets[j].count > buckets[i].count) { auto t = buckets[i]; buckets[i] = buckets[j]; buckets[j] = t; }
-    }
-  }
-  char dbuf[1024];
-  int dlen = 0;
-  const char* dprefix = "FEX-STK-HIST nbuckets="; for (const char* p = dprefix; *p; p++) dbuf[dlen++] = *p;
-  dlen += write_hex(dbuf + dlen, (uint64_t)nbuckets);
-  for (int b = 0; b < nbuckets && b < 8 && dlen < (int)sizeof(dbuf) - 48; b++) {
-    dbuf[dlen++] = ' ';
-    dlen += write_hex(dbuf + dlen, buckets[b].addr);
-    dbuf[dlen++] = ':';
-    dlen += write_hex(dbuf + dlen, buckets[b].count);
-  }
-  dbuf[dlen++] = '\n';
-  ::write(trace_fd, dbuf, dlen);
-
-  // Also raw dump first 32 qwords for context.
-  int rlen = 0;
-  const char* rprefix = "FEX-STK"; for (const char* p = rprefix; *p; p++) dbuf[rlen++] = *p;
-  for (int i = 0; i < 32 && rlen < (int)sizeof(dbuf) - 24; i++) {
-    uintptr_t addr = stack_top + i * 8;
-    uint64_t val = *reinterpret_cast<volatile uint64_t*>(addr);
-    dbuf[rlen++] = ' ';
-    rlen += write_hex(dbuf + rlen, val);
-  }
-  dbuf[rlen++] = '\n';
-  ::write(trace_fd, dbuf, rlen);
 }
 
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
@@ -448,19 +380,17 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
     auto Frame = Thread->CurrentFrame;
 
     if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) {
-#if defined(ARCHITECTURE_ppc64le)
-      // PPC64LE: BackupContext saves host GPRs only — not VMX/AltiVec registers.
-      // Resuming at the original NIP (mid-block) would let SpillStaticRegs write
-      // stale post-handler AltiVec values to State.xmm at block exit, corrupting
-      // the XMM state for all subsequent blocks. Route through the dispatcher's
-      // FillSRA entry instead: FillStaticRegs reloads both GPR and FPR SRA from
-      // State (corrected by the GuestState re-capture in HandleDispatcherGuestSignal)
-      // and re-dispatches from State.rip. The block re-enters at its proper head
-      // with a fully coherent register file, eliminating all mid-block resume hazards.
+      // 2026-05-15: PPC64LE used to route INJIT signal returns through the
+      // dispatcher's FillSRA entry because BackupContext didn't save VMX
+      // (V0..V31).  That workaround broke signal-driven inter-thread wakeups
+      // (Steam manifest deadlock, Mono/.NET GC busy loops) by forcing every
+      // signal return to re-enter the JIT block from its head with state
+      // memcpy'd back from memory.  With BackupContext/RestoreContext now
+      // saving and restoring VMX state (MContext_ppc64le.h), PPC64LE can
+      // resume at the original NIP like ARM64 -- the kernel's RestoreContext
+      // path runs, RestoreContext puts V0..V31 back, and execution continues
+      // mid-block with the live pre-signal register file.
       Frame->InSyscallInfo = Context->InSyscallInfo;
-      ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
-      ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
-#endif
     }
 
     if (Is64BitMode) {

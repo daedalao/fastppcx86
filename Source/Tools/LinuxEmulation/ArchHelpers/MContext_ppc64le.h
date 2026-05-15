@@ -48,6 +48,24 @@ struct PPC64ContextBackup {
 
   // All 48 gregs: r0-r31, then NIP/MSR/ORIG_R3/CTR/LR/XER/CCR/...
   uint64_t GPRs[48];
+
+  // 2026-05-15: AltiVec (VMX) register save area.  The FEX JIT maps the guest
+  // XMM register file to V0..V31 via SRA, so a signal interrupting a JIT
+  // block leaves live XMM values in those registers.  Without this save the
+  // signal handler's RestoreContext would resume the dispatcher with the
+  // host's post-handler AltiVec state, then SpillStaticRegs at block exit
+  // would copy that stale state to State.xmm, corrupting XMM for every
+  // subsequent block.  The previous workaround (route through FillSRA in
+  // SignalDelegator::RestoreThreadState) avoided the corruption but breaks
+  // signal-driven sync wakeups inside the guest (Steam manifest deadlock,
+  // Mono/.NET GC spin -- see project_steam_2026-05-12_evening_summary.md).
+  //
+  // Mirrors ArmContextBackup::{FPRs,FPCR,FPSR}.  glibc's ppc64le mcontext
+  // exposes 32 vrregs + VSCR + VRSAVE via __v_regs.
+  alignas(16) __uint128_t VRRs[32];  // V0..V31, each 128-bit
+  uint32_t VSCR;
+  uint32_t VRSAVE;
+
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   // Sanity check trailing the GPRs (the head used to hold this cookie, but
   // ExitFunctionLinker would clobber it before any consumer could read it,
@@ -178,6 +196,25 @@ static inline void BackupContext(void* ucontext, T* Backup) {
   memcpy(&Backup->GPRs[0], &_mcontext->gp_regs[0], 48 * sizeof(uint64_t));
   memcpy(&Backup->sa_mask, &_ucontext->uc_sigmask, sizeof(uint64_t));
 
+  // 2026-05-15: save AltiVec/VMX state alongside GPRs.  The kernel saves
+  // vrregs whenever MSR_VEC is set; since the FEX JIT always uses AltiVec
+  // (V0..V31 are SRA-mapped to guest XMM), v_regs is always populated when
+  // we land in the signal handler from JIT code.  vrregset_t layout is
+  // documented as { vector unsigned int vrregs[32][4]; vector unsigned int
+  // vscr; unsigned int vrsave; }, i.e. 32 × 128-bit vector regs followed by
+  // VSCR (in element 3 of a 16-byte aligned slot) and VRSAVE (4 bytes).
+  if (_mcontext->v_regs) {
+    memcpy(&Backup->VRRs[0], &_mcontext->v_regs->vrregs[0], sizeof(Backup->VRRs));
+    Backup->VSCR   = _mcontext->v_regs->vscr.vscr_word;
+    Backup->VRSAVE = _mcontext->v_regs->vrsave;
+  } else {
+    // No VMX state in this frame (e.g. signal landed in pre-FillSRA stub).
+    // Zero so RestoreContext is deterministic.
+    memset(&Backup->VRRs[0], 0, sizeof(Backup->VRRs));
+    Backup->VSCR   = 0;
+    Backup->VRSAVE = 0;
+  }
+
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   Backup->StackCookie = STACK_COOKIE_MAGIC;
 #endif
@@ -195,4 +232,14 @@ static inline void RestoreContext(void* ucontext, T* Backup) {
 
   memcpy(&_mcontext->gp_regs[0], &Backup->GPRs[0], 48 * sizeof(uint64_t));
   memcpy(&_ucontext->uc_sigmask, &Backup->sa_mask, sizeof(uint64_t));
+
+  // 2026-05-15: restore AltiVec/VMX state so the dispatcher resumes with
+  // the pre-handler V0..V31 (= guest XMM via SRA).  Without this, the JIT
+  // block's first SpillStaticRegs would write whatever AltiVec values the
+  // signal handler happened to leave behind into State.xmm.
+  if (_mcontext->v_regs) {
+    memcpy(&_mcontext->v_regs->vrregs[0], &Backup->VRRs[0], sizeof(Backup->VRRs));
+    _mcontext->v_regs->vscr.vscr_word = Backup->VSCR;
+    _mcontext->v_regs->vrsave         = Backup->VRSAVE;
+  }
 }
