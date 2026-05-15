@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <type_traits>
+#include <typeinfo>
 
 #include "PackedArguments.h"
 
@@ -72,6 +73,13 @@ MAKE_THUNK(fex, link_address_to_function,
 MAKE_THUNK(fex, allocate_host_trampoline_for_guest_function,
            "0x9b, 0xb2, 0xf4, 0xb4, 0x83, 0x7d, 0x28, 0x93, 0x40, 0xcb, 0xf4, 0x7a, 0x0b, 0x47, 0x85, 0x87, 0xf9, 0xbc, 0xb5, 0x27, 0xca, "
            "0xa6, 0x93, 0xa5, 0xc0, 0x73, 0x27, 0x24, 0xae, 0xc8, 0xb8, 0x5a")
+// 2026-05-15 cross-arch callback registry. Lets the guest pre-register the
+// address of CallbackUnpack<F>::Unpack for each known signature so the host
+// wrapper (GuestWrapperForHostFunction::Call) can synthesise a host trampoline
+// when the thunkgen-annotated callback path was skipped for a given signature.
+MAKE_THUNK(fex, register_callback_unpacker,
+           "0x1b, 0xc2, 0x72, 0xb3, 0x65, 0xbe, 0x39, 0x15, 0xb0, 0xcb, 0xda, 0x79, 0xaf, 0xa2, 0x8c, 0x19, 0x50, 0x2a, 0xbe, 0xc8, 0xd5, "
+           "0xbb, 0x64, 0x48, 0x2b, 0x87, 0x7f, 0xb6, 0xd6, 0xee, 0x3a, 0x86")
 
 #define LOAD_LIB_BASE(name, init_fn)                   \
   __attribute__((constructor)) static void loadlib() { \
@@ -205,6 +213,39 @@ struct CallbackUnpack<Result (*)(Args...)> : CallbackUnpack<Result(Args...)> {};
 template<typename Target>
 inline Target* AllocateHostTrampolineForGuestFunction(Target* GuestTarget) {
   return AllocateHostTrampolineForGuestFunction(CallbackUnpack<Target*>::Unpack, GuestTarget);
+}
+
+// Cross-arch callback registry, guest side.
+//
+// Some host APIs accept guest function pointers via struct fields, layer
+// chains, or other paths that thunkgen does not classify as callback
+// parameters.  In matched-arch builds the host can simply reinterpret_cast
+// the guest VA and `bctrl` through it; in cross-arch builds the guest VA
+// is not host-executable and we need a HostToGuestTrampoline.
+//
+// We register CallbackUnpack<F>::Unpack here, keyed by `typeid(F).name()`
+// (the compiler-mangled type name -- stable across guest/host compilation
+// of the same source).  The host side looks up by the same name in
+// GuestWrapperForHostFunction::Call, then calls
+// MakeHostTrampolineForGuestFunction to bridge.
+inline void RegisterCallbackUnpacker(const char* signature_name, uintptr_t guest_unpacker) {
+  // Both fields are uint64_t so the struct has the same byte layout on
+  // 32-bit and 64-bit guests (no implicit padding between a 4-byte pointer
+  // and an 8-byte aligned uint64_t).  The pointer fits in the low 32 bits
+  // on i386 and the host casts back via uintptr_t.
+  struct args_t {
+    uint64_t signature_name;
+    uint64_t guest_unpacker;
+  };
+  args_t args = {reinterpret_cast<uint64_t>(signature_name), guest_unpacker};
+  fexthunks_fex_register_callback_unpacker(&args);
+}
+
+// Convenience: register the unpacker for the given F = Result(Args...) signature.
+// Use it once per callback signature in your thunk's OnInit().
+template<typename F>
+inline void RegisterGuestCallbackUnpacker() {
+  RegisterCallbackUnpacker(typeid(F).name(), reinterpret_cast<uintptr_t>(&CallbackUnpack<F>::Unpack));
 }
 
 inline bool IsHostHeapAllocation(void* ptr) {

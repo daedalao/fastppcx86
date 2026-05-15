@@ -135,6 +135,7 @@ namespace ThunkFunctions {
   void IsHostHeapAllocation(void* ArgsRV);
   void LinkAddressToGuestFunction(void* argsv);
   void AllocateHostTrampolineForGuestFunction(void* ArgsRV);
+  void RegisterCallbackUnpacker(void* argsv);
 } // namespace ThunkFunctions
 
 struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
@@ -148,6 +149,14 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
 
   uint8_t* HostTrampolineInstanceDataPtr;
   size_t HostTrampolineInstanceDataAvailable = 0;
+
+  // 2026-05-15 cross-arch callback registry: signature_name (the C++ mangled
+  // typeid().name() of a callback signature, e.g. "FvPjE" for VkResult(uint*))
+  // -> guest VA of CallbackUnpack<F>::Unpack.  Populated by guest thunk OnInit
+  // calls to RegisterCallbackUnpacker; consumed by libvulkan-host.so etc. via
+  // the weak LookupGuestCallbackUnpacker entry below.
+  std::shared_mutex CallbackUnpackerByNameMutex;
+  fextl::unordered_map<fextl::string, uintptr_t> CallbackUnpackerByName;
 
   /*
       Set arg0/1 to arg regs, use CTX::HandleCallback to handle the callback
@@ -232,6 +241,10 @@ private:
      {0x9b, 0xb2, 0xf4, 0xb4, 0x83, 0x7d, 0x28, 0x93, 0x40, 0xcb, 0xf4, 0x7a, 0x0b, 0x47, 0x85, 0x87,
       0xf9, 0xbc, 0xb5, 0x27, 0xca, 0xa6, 0x93, 0xa5, 0xc0, 0x73, 0x27, 0x24, 0xae, 0xc8, 0xb8, 0x5a},
      &ThunkFunctions::AllocateHostTrampolineForGuestFunction},
+    {// sha256(fex:register_callback_unpacker)
+     {0x1b, 0xc2, 0x72, 0xb3, 0x65, 0xbe, 0x39, 0x15, 0xb0, 0xcb, 0xda, 0x79, 0xaf, 0xa2, 0x8c, 0x19,
+      0x50, 0x2a, 0xbe, 0xc8, 0xd5, 0xbb, 0x64, 0x48, 0x2b, 0x87, 0x7f, 0xb6, 0xd6, 0xee, 0x3a, 0x86},
+     &ThunkFunctions::RegisterCallbackUnpacker},
   };
 
   FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
@@ -490,7 +503,50 @@ namespace ThunkFunctions {
 
     args->rv = (uintptr_t)MakeHostTrampolineForGuestFunction(nullptr, args->GuestTarget, args->GuestUnpacker);
   }
+
+  /**
+   * 2026-05-15 cross-arch callback registry: guest pre-registers the address
+   * of CallbackUnpack<F>::Unpack for each signature F so the host wrapper
+   * can synthesise a HostToGuestTrampoline when thunkgen's callback annotation
+   * was skipped for that signature.  Keyed by the C++ mangled typeid().name()
+   * of the signature type, which is stable across guest/host compilation of
+   * the same source.
+   */
+  void RegisterCallbackUnpacker(void* argsv) {
+    // Args struct: both fields uint64_t so 32-bit and 64-bit guests have
+    // identical layout (no padding hole).  Guest VA pointer fits in the low
+    // 32 bits on i386.
+    struct args_t {
+      uint64_t signature_name;
+      uint64_t guest_unpacker;
+    }* args = reinterpret_cast<args_t*>(argsv);
+    const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(args->signature_name));
+    if (!name || !args->guest_unpacker) {
+      return;
+    }
+    auto* handler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
+    std::lock_guard lk(handler->CallbackUnpackerByNameMutex);
+    // Insert or overwrite; if the guest re-registers, trust the latest value.
+    handler->CallbackUnpackerByName.insert_or_assign(fextl::string {name}, static_cast<uintptr_t>(args->guest_unpacker));
+  }
 } // namespace ThunkFunctions
+
+/**
+ * Cross-arch callback registry lookup, weak-symbol exported for use by host
+ * thunk libraries (libvulkan-host.so etc.).  Returns the guest VA of
+ * CallbackUnpack<F>::Unpack registered for `signature_name`, or 0 if not
+ * registered.  Called from GuestWrapperForHostFunction::Call in Host.h on
+ * cross-arch builds when the wrapper sees an un-wrapped guest VA.
+ */
+FEX_DEFAULT_VISIBILITY uintptr_t LookupGuestCallbackUnpacker(const char* signature_name) {
+  if (!signature_name || !FEX::HLE::_SyscallHandler) {
+    return 0;
+  }
+  auto* handler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
+  std::shared_lock lk(handler->CallbackUnpackerByNameMutex);
+  auto it = handler->CallbackUnpackerByName.find(fextl::string {signature_name});
+  return (it == handler->CallbackUnpackerByName.end()) ? 0 : it->second;
+}
 
 FEX_DEFAULT_VISIBILITY void* GetGuestStack() {
   if (!ThreadObject) {

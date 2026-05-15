@@ -113,6 +113,17 @@ void OnInit() {
   fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+
+  // 2026-05-15 cross-arch callback registry: register CallbackUnpack<F>::Unpack
+  // for every signature the host wrapper might see as an un-wrapped callback
+  // (i.e. function pointers that flow through struct fields, ICD interface,
+  // Vulkan layer chains, or any other path thunkgen doesn't annotate as a
+  // callback parameter).  Steam (i686) hits VkResult(uint32_t*) first because
+  // the Vulkan layer-chain dispatch table contains a PFN_vkEnumerateInstanceVersion
+  // entry whose signature is exactly that.
+  RegisterGuestCallbackUnpacker<VkResult(uint32_t*)>();
+  RegisterGuestCallbackUnpacker<VkBool32(uint32_t*)>();
+  RegisterGuestCallbackUnpacker<void(uint32_t*)>();
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)
