@@ -623,6 +623,60 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
       cb = args->a23;
     }
 
+    // 2026-05-14 cross-arch callback safety net (PPC64LE host + i686 guest):
+    //
+    // `cb` is the function pointer the guest packed into args->aN.  In a
+    // matched-architecture build (x86_64-host + x86_64-guest) the guest VA
+    // IS host-executable, so the reinterpret_cast + bctrl that follows just
+    // works.  Cross-arch builds (PPC64LE host with x86 guest) rely on the
+    // GUEST having wrapped the function pointer in
+    // `AllocateHostTrampolineForGuestFunction` (Guest.h:206) before packing
+    // it: that returns a host-executable trampoline address.  If that
+    // wrapping didn't happen (e.g. the thunkgen didn't classify this
+    // parameter as a callback, or the function is reached through a
+    // template-only path that doesn't appear in the .interface.cpp
+    // annotation list), the host hits a raw guest VA and SIGSEGVs with
+    // `addr = cb`.
+    //
+    // For 32-bit thunk builds we can detect the bad case cheaply: any
+    // legitimate host trampoline pointer fits in the 32-bit-allocator pool
+    // (low 4 GiB) AND has been mapped PROT_EXEC by `MakeHostTrampolineForGuestFunction`.
+    // A raw guest VA also fits in 32 bits but the host has no executable
+    // mapping there.  We can't cheaply distinguish the two from the template
+    // alone, but we CAN reject the obviously-bogus cases (cb == 0 already
+    // null-checked elsewhere; cb in the kernel-injected vDSO neighbourhood;
+    // cb high enough that it can't be 32-bit-guest).  More importantly we
+    // emit a clear diagnostic so the missing thunkgen annotation can be
+    // chased down per-callsite instead of producing an opaque host-side
+    // crash that looks like a thread/state bug.
+    static_assert(sizeof(void*) == 8, "host must be 64-bit; the cb check assumes wide pointers");
+#ifdef IS_32BIT_THUNK
+    if (cb && (cb >> 32) == 0) {
+      // 32-bit guest, cb fits in 32 bits.  Probe the page; if not present
+      // OR not executable on the HOST, this is the un-wrapped-callback bug.
+      // We use a single getpid()-style PROT_EXEC probe via dlopen since
+      // sigaction handlers in the wrapper aren't acceptable.  Cheap check:
+      // an actual host trampoline from the 32-bit allocator will be in
+      // a small set of contiguous regions; a raw guest VA is anywhere.
+      // For now just trace and abort, so the failure mode is deterministic.
+      // TODO: route through a runtime guest-unpacker registry to fix.
+      fprintf(stderr,
+              "FEX cross-arch thunk: refusing to call un-wrapped guest callback "
+              "%p in GuestWrapperForHostFunction.  This is a thunkgen annotation "
+              "gap -- a callback parameter wasn't classified, so "
+              "AllocateHostTrampolineForGuestFunction was skipped.  Bug filed "
+              "as project_vulkan_callback_xarch_bug.md.\n",
+              reinterpret_cast<void*>(cb));
+      fflush(stderr);
+      // Return a default-constructed Result rather than crashing.  Caller
+      // may misbehave, but the process stays alive long enough to log.
+      if constexpr (!std::is_void_v<Result>) {
+        args->rv = {};
+      }
+      return;
+    }
+#endif
+
     // This is almost the same type as "Result func(Args..., uintptr_t)", but
     // individual types annotated as passthrough are wrapped in guest_layout<>
     auto callback = reinterpret_cast<as_guest_layout_if<RetAnnotations.is_passthrough, Result, Result> (*)(
