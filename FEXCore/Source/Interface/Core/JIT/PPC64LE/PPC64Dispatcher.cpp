@@ -22,6 +22,7 @@
 #include "Interface/Core/JIT/PPC64LE/PPC64Dispatcher.h"
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
+#include "Utils/MemberFunctionToPointer.h"
 #include "Interface/Core/Interpreter/InterpreterOps.h"
 
 #include <FEXCore/Core/CoreState.h>
@@ -134,7 +135,18 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   // Fill-SRA entry point: signal-return / pause-resume jump here so SRA is
   // reloaded from Frame->State before falling into the L1 lookup loop.
+  //
+  // SMC single-instruction recovery: the SMC SIGSEGV handler (SyscallsSMCTracking.cpp
+  // HandleSegfault) sets r4=1 in the kernel ucontext when it needs the next JIT
+  // entry to recompile as a single-instruction block (so a racing SMC write to
+  // the same page is observed before the rest of the original block runs).
+  // Mirrors ARM64's ENTRY_FILL_SRA_SINGLE_INST_REG / cbnz pattern
+  // (Dispatcher.cpp:89-94). Check BEFORE FillStaticRegs because PPC's
+  // FillStaticRegs uses TMP2 (=r4) as scratch in its NZCV unpack stage.
+  PPC64Emitter::Label CompileSingleStepLabel{};
   DispatcherLoopTopFillSRAAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  cmpdi(r4, 0);
+  bc(CC_NE, &CompileSingleStepLabel);
   FillStaticRegs();
 
   // Fall through into DispatcherLoopTop
@@ -282,6 +294,50 @@ void PPC64Dispatcher::EmitDispatcher() {
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();
   }
+
+  // ==============================================================
+  // CompileSingleStep — SMC recovery path.
+  // Entered from DispatcherLoopTopFillSRA when r4 (= TMP2 =
+  // ENTRY_FILL_SRA_SINGLE_INST_REG) was non-zero, set by the SMC fault
+  // handler via SetFillSRASingleInst.  SRA is NOT in host regs yet (the
+  // FillStaticRegs at the entry was skipped via the branch). r1 still
+  // points at the dispatcher's frame so a host C call is safe.
+  //
+  // Calls uintptr_t ContextImpl::CompileSingleStep(CpuStateFrame*, uint64_t)
+  // which compiles JUST the next x86 instruction at State.rip as its own
+  // JIT block and returns the host code pointer.  We then FillStaticRegs
+  // and jump straight to that block, bypassing the L1 lookup (so a racing
+  // stale cache entry can't be hit).
+  // ==============================================================
+  Bind(&CompileSingleStepLabel);
+  {
+    // ContextImpl::CompileSingleStep is a non-static member.
+    // ELFv2 calling convention: r3 = this (CTX), r4 = Frame, r5 = RIP.
+    LoadConstant(r3, reinterpret_cast<uint64_t>(CTX));
+    mr(r4, STATE);
+    int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
+    ld(r5, rip_off, STATE);
+    MaybeClrUpper32(r5);  // 32-bit guest: canonical 32-bit RIP
+
+    // MemberFunctionToPointerCast handles the data-vs-text-vs-thunk wrapping
+    // that PPC64LE needs for non-static member function pointers.
+    FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(
+      &FEXCore::Context::ContextImpl::CompileSingleStep);
+    LoadConstant(r(12), PMFCompileSingleStep.GetConvertedPointer());
+    mtctr(r(12));
+
+    // Save/restore TOC around the indirect C call per ELFv2.
+    std(r2, 24, r1);
+    bctrl();
+    ld(r2, 24, r1);
+  }
+  // CompileSingleStep returned the host code ptr in r3. Save it past
+  // FillStaticRegs (which uses TMP1=r3 as scratch for XMM fills).
+  mr(r(0), r3);
+  FillStaticRegs();
+  mtctr(r(0));
+  li(r(0), 0);  // restore r0=0 zero-index invariant
+  bctr();
 
   // ==============================================================
   // ThreadStopHandler — unwind JIT and return to C++ caller

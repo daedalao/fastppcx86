@@ -8,6 +8,7 @@
 // CTR(35), LR(36), XER(37), CCR(38), SOFTE(39), TRAP(40), DAR(41), DSISR(42),
 // RESULT(43), DSCR(44..47).
 constexpr uint32_t PPC_PT_R1    = 1;   // Stack pointer
+constexpr uint32_t PPC_PT_R4    = 4;   // TMP2 / ENTRY_FILL_SRA_SINGLE_INST_REG
 constexpr uint32_t PPC_PT_NIP   = 32;  // Program counter (Next Instruction Pointer)
 constexpr uint32_t PPC_PT_MSR   = 33;  // Machine State Register
 constexpr uint32_t PPC_PT_CTR   = 35;  // Count Register
@@ -114,8 +115,16 @@ static inline void SetState(void* ucontext, uint64_t val) {
   GetMContext(ucontext)->gp_regs[PPC_PT_STATE] = val;
 }
 
-// SRA single-instruction fill is handled inside the JIT dispatcher for ppc64le.
-static inline void SetFillSRASingleInst(void*, bool) {}
+// SRA single-instruction fill: when the SMC SIGSEGV handler (in
+// SyscallsSMCTracking.cpp) needs to force the next JIT entry to compile a
+// single-x86-instruction block, it sets ENTRY_FILL_SRA_SINGLE_INST_REG
+// (TMP2 = PPC r4) to non-zero in the kernel ucontext. The dispatcher's
+// DispatcherLoopTopFillSRAAddress entry checks this BEFORE FillStaticRegs
+// clobbers TMP2 in its NZCV unpack stage and branches to a CompileSingleStep
+// helper if set. Mirrors Arm64Emitter.h:ENTRY_FILL_SRA_SINGLE_INST_REG.
+static inline void SetFillSRASingleInst(void* ucontext, bool SingleInst) {
+  GetMContext(ucontext)->gp_regs[PPC_PT_R4] = SingleInst ? 1 : 0;
+}
 
 // GetArmReg / SetArmReg map ARM64 caller-saved register IDs onto the closest
 // ppc64le equivalent.  Cross-arch callers (e.g. the SMC SIGSEGV handler in
