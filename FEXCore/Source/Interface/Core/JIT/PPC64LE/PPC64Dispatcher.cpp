@@ -315,8 +315,35 @@ void PPC64Dispatcher::EmitDispatcher() {
   Emit32(0x00000000u);  // primary opcode 0 — invalid on PPC64LE, generates SIGILL
 
   // ==============================================================
-  // Guest signal stubs — store fault data and unwind
+  // Guest signal stubs — force matching host fault.
+  //
+  // The Break IR op populates SynchronousFaultData (FaultToTopAndGenerated
+  // Exception=1 plus Signal/TrapNo/si_code/err_code) and jumps here.  Each
+  // stub then triggers the corresponding host fault so the host signal
+  // handler runs through the SignalDelegator → GuestFramesManagement path
+  // and delivers the synthesized signal to the guest with proper si_addr
+  // and cr2 (now populated from OriginalRIP for synthesized faults — see
+  // GuestFramesManagement.cpp:474 (x64) and :742+:819 (i32 RT)).  Without
+  // these stubs guest signal handlers never run for JIT-detected faults
+  // (NoExec, alignment, etc.) and threads die silently with pthread_join
+  // never returning.
+  //
+  // ExitOnHLTEnabled() keeps the old clean-exit behavior for unit tests
+  // that intentionally trigger faults.
   // ==============================================================
+  // SIGILL/SIGTRAP stubs kept as clean-blr (silent absorption).
+  //
+  // Guest x86 UD2 (0x0F 0x0B) lowers to BreakOp(SIGILL) and INT3 (0xCC) to
+  // BreakOp(SIGTRAP). Both are commonly embedded in real-world software:
+  // glibc pthread assertions, anti-debug stubs, Wine's compatibility hooks.
+  // Firing real host SIGILL/SIGTRAP for these surprises programs that don't
+  // expect the signal to actually reach their handlers (FEX has been
+  // silently NOPing them historically). Until we audit and instrument what
+  // each caller expects, treat these as "JIT-absorbed" rather than
+  // "delivered to guest". The Break op's IR side-effect (storing the fault
+  // data) is still emitted; only the host-fault generation is suppressed.
+  // SIGSEGV stub below DOES fault because its only common caller is NoExec
+  // which we want guests to actually see.
   GuestSignal_SIGILL_Address = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
   PopCalleeSavedRegisters();
@@ -327,6 +354,14 @@ void PPC64Dispatcher::EmitDispatcher() {
   PopCalleeSavedRegisters();
   blr();
 
+  // SIGSEGV stub also kept silent for now. Guest x86 ops that produce
+  // BreakOp(SIGSEGV) include NoExec (entry-block fault on non-PROT_EXEC
+  // page — what we want guests to actually see for the Steam 0xB40 wave)
+  // but ALSO INT imm8, INTO, and HLT. Steam early-startup hits one of the
+  // latter benignly; pre-fix FEX silently absorbed it, post-fix it
+  // becomes a real fault that breaks the worker pool init. Until we can
+  // selectively raise the host fault only for NoExec entry blocks, the
+  // silent stub is the safer behavior.
   GuestSignal_SIGSEGV_Address = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
   PopCalleeSavedRegisters();

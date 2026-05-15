@@ -471,7 +471,15 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
     guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_ERR] = ConvertSignalToError(ucontext, Signal, HostSigInfo);
   }
   guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_OLDMASK] = 0;
-  guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CR2] = 0;
+  // cr2 on x86_64 SIGSEGV/SIGBUS = faulting linear address.  For synthesized
+  // faults (FaultToTop) use OriginalRIP (instruction-fetch fault address);
+  // for real OS-delivered faults use the host siginfo si_addr.  Was
+  // unconditional zero, which gave handlers reading cr2 a wrong fault addr.
+  if (ContextBackup->FaultToTopAndGeneratedException) {
+    guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CR2] = ContextBackup->OriginalRIP;
+  } else {
+    guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CR2] = reinterpret_cast<uint64_t>(HostSigInfo->si_addr);
+  }
 
 #define COPY_REG(x) guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_##x] = Frame->State.gregs[FEXCore::X86State::REG_##x];
   COPY_REG(R8);
@@ -739,7 +747,16 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP] = ContextBackup->OriginalRIP;
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EFL] = eflags;
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_UESP] = Frame->State.gregs[FEXCore::X86State::REG_RSP];
-  guest_uctx->uc.uc_mcontext.cr2 = 0;
+  // cr2 on x86 SIGSEGV/SIGBUS = faulting linear address.  For synthesized
+  // faults from the JIT Break op we use OriginalRIP (which is the guest
+  // instruction-fetch fault address); for real OS-delivered faults use the
+  // host siginfo si_addr.  Unconditional zero (the prior behavior) gave
+  // glibc handlers reading cr2 directly a wrong/NULL fault address.
+  if (ContextBackup->FaultToTopAndGeneratedException) {
+    guest_uctx->uc.uc_mcontext.cr2 = static_cast<uint32_t>(ContextBackup->OriginalRIP);
+  } else {
+    guest_uctx->uc.uc_mcontext.cr2 = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(HostSigInfo->si_addr));
+  }
 
 #define COPY_REG(x) guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x] = Frame->State.gregs[FEXCore::X86State::REG_##x];
   COPY_REG(RDI);
@@ -814,9 +831,16 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
     guest_uctx->info._sifields._poll.fd = HostSigInfo->si_fd;
     break;
   case SigInfoLayout::LAYOUT_FAULT:
-    // Macro expansion to get the si_addr
-    // This is the address trying to be accessed, not the RIP
-    guest_uctx->info._sifields._sigfault.addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(HostSigInfo->si_addr));
+    // For synthesized faults the host siginfo is from FEX's own injection
+    // (e.g., load-from-0 on PPC) and carries no real guest fault address;
+    // use OriginalRIP-derived address from SynchronousFaultData instead.
+    // x86_64 path (line ~467) does this unconditionally; the i32 RT path
+    // historically only got it right for the LAYOUT_FAULT_RIP case.
+    if (ContextBackup->FaultToTopAndGeneratedException) {
+      guest_uctx->info._sifields._sigfault.addr = static_cast<uint32_t>(ContextBackup->OriginalRIP);
+    } else {
+      guest_uctx->info._sifields._sigfault.addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(HostSigInfo->si_addr));
+    }
     break;
   case SigInfoLayout::LAYOUT_FAULT_RIP:
     // Macro expansion to get the si_addr

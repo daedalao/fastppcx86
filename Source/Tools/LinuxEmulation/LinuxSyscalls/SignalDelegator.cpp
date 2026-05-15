@@ -170,6 +170,21 @@ static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
     sigaction(Signal, &sa, nullptr);
     return;
   }
+  // UAF guard (Steam SteamRT3 teardown race, 2026-05-15): the kernel can
+  // deliver an in-flight signal AFTER ThreadManager::DestroyThread has run
+  // (which now zeroes ThreadInfo.TID before leaking the slab). If the TID
+  // is zero or doesn't match the current kernel TID, the ThreadObject is
+  // a zombie and dereferencing ->Thread / ->SignalInfo crashes.  Fall
+  // through to default disposition; coredump preserves original siginfo.
+  const uint32_t HostTid = FHU::Syscalls::gettid();
+  const uint32_t ObjTid = ThreadObject->ThreadInfo.TID.load(std::memory_order_relaxed);
+  if (ObjTid == 0 || ObjTid != HostTid) {
+    struct sigaction sa {};
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(Signal, &sa, nullptr);
+    return;
+  }
   FEXCORE_PROFILE_ACCUMULATION(ThreadObject->Thread, AccumulatedSignalTime);
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }
@@ -468,6 +483,81 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   }
 
   uint64_t OldGuestSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+
+  // Defensive: refuse to lay out a signal frame on a guest SP that is
+  // clearly unusable. Threads created via clone() with unsupported flags
+  // (FEX has been logging "clone: Unsupported flags w/o CLONE_THREAD"
+  // for pressure-vessel's CLONE_PIDFD calls) can end up with a near-NULL
+  // RSP. SetupFrame_x64 then decrements NewGuestSP by ucontext_t size and
+  // writes to (RSP - sizeof(...))  which wraps to ~0xFFFFFFFFFFFFFE48 and
+  // SIGSEGVs. Better to bail out and let the default disposition run.
+  // Valid x86_64 user-space addresses are 0x10000..0x7FFFFFFFFFFF; i386
+  // is 0x1000..0xFFFFFFFF. The lower bound catches both.
+  if (OldGuestSP < 0x10000ULL || OldGuestSP > 0x00007FFFFFFFFFFFULL) {
+    // Diagnostic dump: capture as much state as possible to root-cause the
+    // bogus-RSP. Print TID, signal info, guest RIP/RBP/segment selectors,
+    // and full guest GPR snapshot. Helps distinguish "freshly-cloned thread
+    // with uninitialized state" vs "syscall-return-window race" vs other.
+    auto& S = Thread->CurrentFrame->State;
+    siginfo_t* si = reinterpret_cast<siginfo_t*>(info);
+    LogMan::Msg::EFmt("HandleDispatcherGuestSignal: refusing to deliver "
+                      "signal {} to guest with bogus RSP {:#x}",
+                      Signal, OldGuestSP);
+    LogMan::Msg::EFmt("  tid={} si_code={} si_addr={:#x} si_pid={}",
+                      FHU::Syscalls::gettid(),
+                      si->si_code, reinterpret_cast<uint64_t>(si->si_addr), si->si_pid);
+    LogMan::Msg::EFmt("  guest RIP={:#x} RBP={:#x} CS={:x} SS={:x}",
+                      S.rip, S.gregs[FEXCore::X86State::REG_RBP],
+                      S.cs_idx, S.ss_idx);
+    LogMan::Msg::EFmt("  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
+                      S.gregs[0], S.gregs[3], S.gregs[1], S.gregs[2]);
+    LogMan::Msg::EFmt("  RSI={:#x} RDI={:#x} R8={:#x} R9={:#x}",
+                      S.gregs[6], S.gregs[7], S.gregs[8], S.gregs[9]);
+    LogMan::Msg::EFmt("  R10={:#x} R11={:#x} R12={:#x} R13={:#x}",
+                      S.gregs[10], S.gregs[11], S.gregs[12], S.gregs[13]);
+    LogMan::Msg::EFmt("  R14={:#x} R15={:#x}",
+                      S.gregs[14], S.gregs[15]);
+
+    // Guest code dump around RIP (16 bytes before, 32 after). Lets us
+    // decode the x86 instruction that was about to execute -- the trailing
+    // instruction is almost certainly the one that tried to use the bogus
+    // stack. Probe with msync to avoid a double-fault if RIP is unmapped.
+    auto dump_guest = [](uint64_t addr, size_t len, const char* label) {
+      if (addr < 0x1000ULL || addr > 0x00007FFFFFFFFFFFULL) {
+        LogMan::Msg::EFmt("  {} {:#x}: <out of range>", label, addr);
+        return;
+      }
+      uint64_t page = addr & ~0xFFFULL;
+      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) != 0) {
+        LogMan::Msg::EFmt("  {} {:#x}: <unmapped>", label, addr);
+        return;
+      }
+      const uint8_t* mem = reinterpret_cast<const uint8_t*>(addr);
+      char buf[3 * 32 + 1];
+      size_t off = 0;
+      for (size_t i = 0; i < len && off + 3 < sizeof(buf); ++i) {
+        off += std::snprintf(buf + off, sizeof(buf) - off, "%02x ", mem[i]);
+      }
+      buf[sizeof(buf) - 1] = 0;
+      LogMan::Msg::EFmt("  {} {:#x}: {}", label, addr, buf);
+    };
+    if (S.rip >= 16) {
+      dump_guest(S.rip - 16, 16, "code[RIP-16]");
+    }
+    dump_guest(S.rip, 32, "code[RIP]   ");
+    // Stack walk via RBP -- the guest RBP often survives RSP corruption.
+    uint64_t rbp = S.gregs[FEXCore::X86State::REG_RBP];
+    if (rbp >= 0x1000ULL && rbp <= 0x00007FFFFFFFFFFFULL) {
+      uint64_t page = rbp & ~0xFFFULL;
+      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) == 0) {
+        const uint64_t* fp = reinterpret_cast<const uint64_t*>(rbp);
+        LogMan::Msg::EFmt("  RBP frame: saved_RBP={:#x} return_RIP={:#x}",
+                          fp[0], fp[1]);
+      }
+    }
+    return false;
+  }
+
   uint64_t NewGuestSP = OldGuestSP;
 
   // altstack is only used if the signal handler was setup with SA_ONSTACK
@@ -858,7 +948,14 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // We handled this signal, continue running
       return;
     }
-    ERROR_AND_DIE_FMT("Unhandled guest exception");
+    // GuestHandler returned false: we tried to deliver the signal but the
+    // dispatcher refused (e.g., bogus guest RSP per the HandleDispatcherGuestSignal
+    // SP guard, or pressure-vessel sandbox half-init state). Aborting the whole
+    // emulator with "Unhandled guest exception" is too aggressive -- the thread
+    // is in a bad state but the rest of the process is fine. Fall through to
+    // the default-disposition path below so SIGSEGV terminates THAT THREAD
+    // (or process, per kernel default for SIGSEGV) instead of crashing FEX.
+    LogMan::Msg::EFmt("HandleGuestSignal: GuestHandler refused signal {}; falling to default disposition", Signal);
   }
 
   // Unhandled crash

@@ -36,23 +36,42 @@ static void UnhandledIoctl(const char* Type, int fd, uint32_t cmd, uint32_t args
   LogMan::Msg::AFmt("@@@@@@@@@@@@@@@@@@@@@@@@@");
 }
 
+#ifdef ARCHITECTURE_ppc64le
+// PPC uses 3-bit dir at [29:31] + 13-bit size, x86 uses 2-bit dir at
+// [30:31] + 14-bit size, with different NONE/READ/WRITE codes.  A blanket
+// remap breaks ioctls that happen to match between archs; narrow to the
+// FIO* family + types we've measured failing on PPC64LE (DRM type 'd' and
+// udmabuf type 'u').  Applied at the ioctl32 dispatcher so every Handler
+// (DRM/V4L2/BasicHandler) receives a PPC-encoded cmd suitable for direct
+// passthrough or for keying off _IOC_NR.  See Syscalls/Passthrough.cpp
+// for the x64 counterpart.
+static uint32_t RemapIoctlForPPC(uint32_t cmd) {
+  switch (cmd) {
+  case 0x5421u: return FIONBIO;
+  case 0x541Bu: return FIONREAD;
+  case 0x5450u: return FIONCLEX;
+  case 0x5451u: return FIOCLEX;
+  case 0x5452u: return FIOASYNC;
+  default: break;
+  }
+
+  const uint32_t type = (cmd >> 8) & 0xFFu;
+  if (type != 0x64u && type != 0x75u) { // DRM, udmabuf
+    return cmd;
+  }
+
+  const uint32_t nr      = cmd & 0xFFu;
+  const uint32_t size    = (cmd >> 16) & 0x3FFFu;
+  const uint32_t dir_x86 = (cmd >> 30) & 0x3u;
+  static constexpr uint32_t DirX86ToPPC[4] = {1u, 4u, 2u, 6u};
+  const uint32_t dir_ppc = DirX86ToPPC[dir_x86];
+  const uint32_t size_ppc = size & 0x1FFFu;
+  return (dir_ppc << 29) | (size_ppc << 16) | (type << 8) | nr;
+}
+#endif
+
 namespace BasicHandler {
   uint32_t BasicHandler(FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t cmd, uint32_t args) {
-#ifdef ARCHITECTURE_ppc64le
-    // PowerPC overrides the asm-generic FION*/FIO* values in <asm/ioctls.h>
-    // (FIONBIO=0x8004667E, FIONREAD=0x4004667F, etc.) -- a naked passthrough
-    // leaves the x86 guest values intact and the PPC kernel returns ENOTTY.
-    // Mirrors the x64 mitigation in Syscalls/Passthrough.cpp; this 32-bit
-    // path is what Steam launcher s CreateBoundSocket(setnonblocking) hits.
-    switch (cmd) {
-    case 0x5421u: cmd = FIONBIO;  break;
-    case 0x541Bu: cmd = FIONREAD; break;
-    case 0x5450u: cmd = FIONCLEX; break;
-    case 0x5451u: cmd = FIOCLEX;  break;
-    case 0x5452u: cmd = FIOASYNC; break;
-    default: break;
-    }
-#endif
     uint64_t Result = ::ioctl(fd, cmd, args);
     SYSCALL_ERRNO();
   }
@@ -1018,6 +1037,13 @@ std::array<DRMLRUCacheFDCache::HandlerType, 1U << _IOC_TYPEBITS> Handlers = []()
 }();
 
 uint32_t ioctl32(FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t request, uint32_t args) {
+#ifdef ARCHITECTURE_ppc64le
+  // Remap x86-encoded guest ioctl numbers to PPC encoding once at the
+  // dispatcher entry so DRM/V4L2/BasicHandler all receive a usable cmd.
+  // _IOC_TYPE returns the same byte before and after remap, so dispatcher
+  // routing is unaffected.
+  request = RemapIoctlForPPC(request);
+#endif
   return Handlers[_IOC_TYPE(request)](Frame, fd, request, args);
 }
 

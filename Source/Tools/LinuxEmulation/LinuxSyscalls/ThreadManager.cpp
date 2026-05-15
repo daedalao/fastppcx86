@@ -386,10 +386,29 @@ void ThreadManager::HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bo
     FEXCore::Allocator::munmap(Thread->ldt_entries, Thread->ldt_entry_count * FEX::HLE::SyscallHandler::LDT_ENTRY_SIZE);
   }
 
-  CTX->DestroyThread(Thread->Thread);
   FEX::HLE::_SyscallHandler->SeccompEmulator.FreeSeccompFilters(Thread);
 
-  delete Thread;
+  // UAF mitigation (Steam SteamRT3 teardown race, 2026-05-15):
+  // The kernel can deliver an in-flight signal AFTER the thread's
+  // sigaltstack has been disabled but BEFORE the ThreadStateObject is
+  // reclaimed.  SignalHandlerThunk reads the ThreadStateObject pointer
+  // from a fixed offset within the (now-disabled) alt-stack memory and
+  // dereferences `ThreadObject->Thread`, causing a UAF crash when both
+  // the InternalThreadState and ThreadStateObject have been freed.
+  // A clean refcount / epoch reclaim is the right fix but is a real
+  // engineering project; meanwhile leak both objects so memory stays
+  // valid for any stale signal handler.  Cost ~1MB per ~50 thread
+  // create/destroy cycles -- Steam sessions are bounded so this is
+  // acceptable until the proper fix lands.
+  //
+  // Mark the leaked object as zombie via TID=0 so SignalHandlerThunk
+  // can bail out cleanly via its TID check.
+  Thread->ThreadInfo.TID.store(0);
+
+  // Original deallocation (DO NOT re-enable until the signal-delivery
+  // race is fixed via refcount or epoch-based reclaim):
+  //   CTX->DestroyThread(Thread->Thread);
+  //   delete Thread;
   --IdleWaitRefCount;
   IdleWaitCV.notify_all();
 }

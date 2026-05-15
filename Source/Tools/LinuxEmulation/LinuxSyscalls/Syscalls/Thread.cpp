@@ -268,7 +268,28 @@ uint64_t HandleNewClone(FEX::HLE::ThreadStateObject* Thread, FEXCore::Context::C
 }
 
 static int CloneFork(uint32_t flags, uint64_t exit_signal) {
-  return ::syscall(SYSCALL_DEF(clone), (flags & (CLONE_FS | CLONE_FILES)) | exit_signal, nullptr, nullptr, nullptr, nullptr);
+  // For fork-style clones (no CLONE_THREAD) most flags can and should pass
+  // through to the host kernel.  The previous code stripped EVERYTHING
+  // except CLONE_FS | CLONE_FILES, which silently broke any caller that
+  // relied on namespace flags (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID,
+  // CLONE_NEWNET, CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWCGROUP), or
+  // CLONE_PIDFD, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_CHILD_SETTID,
+  // CLONE_CHILD_CLEARTID, CLONE_VFORK. bwrap / pressure-vessel exercises
+  // many of these to set up sandbox containers; without them the "child"
+  // is just a plain fork with no namespace isolation, the sandbox is
+  // half-baked, and downstream code (libraries reading their data
+  // sections from a broken bind-mount view) corrupts in subtle ways
+  // (GLib NULL-name flood, garbage RSP, etc.).
+  //
+  // We must NOT pass:
+  //   - CLONE_THREAD: callers of this function are explicitly fork-style
+  //   - CLONE_VM:     incompatible without CLONE_THREAD; kernel will EINVAL
+  //   - CLONE_SIGHAND: same
+  //   - CLONE_SETTLS: TLS pointer is FEX-internal, not a guest TLS
+  //
+  // Everything else is safe to forward.
+  constexpr uint64_t StripFlags = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND | CLONE_SETTLS;
+  return ::syscall(SYSCALL_DEF(clone), (flags & ~StripFlags) | exit_signal, nullptr, nullptr, nullptr, nullptr);
 }
 
 uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
@@ -375,6 +396,26 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
     if (Result != -1) {
       if (flags & CLONE_PARENT_SETTID) {
         *parent_tid = Result;
+      }
+
+      // CLONE_PIDFD emulation for the fork (non-CLONE_THREAD) path.
+      // CloneFork() strips all flags except CLONE_FS|CLONE_FILES|exit_signal,
+      // so the kernel does not populate args->pidfd as it would for a real
+      // clone(CLONE_PIDFD). Mirror HandleNewClone's CLONE_PIDFD handling
+      // (Thread.cpp:170-178) so pressure-vessel/bwrap and other fork-with-
+      // pidfd callers get a usable pidfd in the parent.
+      // Without this, Steam's pressure-vessel sniper sandbox setup fails:
+      // bwrap forks the supervisor with CLONE_PIDFD, expects to poll the
+      // pidfd for the child's exit, but pidfd is never populated -> waits
+      // on an invalid fd -> sandbox setup is half-baked -> downstream
+      // signal-delivery and guest-RSP corruption (2026-05-15).
+      if (flags & CLONE_PIDFD) {
+        const int pidfd = ::syscall(SYSCALL_DEF(pidfd_open), Result, 0);
+        if (pidfd >= 0) {
+          *reinterpret_cast<int*>(args->args.pidfd) = pidfd;
+        } else {
+          LogMan::Msg::EFmt("CLONE_PIDFD: pidfd_open for child pid {} failed (errno {})", Result, errno);
+        }
       }
     }
 

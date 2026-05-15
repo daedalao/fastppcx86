@@ -172,6 +172,22 @@ void SeccompEmulator::FreeSeccompFilters(FEX::HLE::ThreadStateObject* Thread) {
 
   bool HasFiltersToDelete {};
   for (auto& Filter : Thread->Filters) {
+    // Defensive (Steam SteamRT3 thread-teardown crash, 2026-05-15):
+    // crash dumps showed `Filter` becoming nullptr in this loop, causing
+    // a NULL deref at offset 8 (RefCount field).  Root cause unknown --
+    // possibly heap corruption, possibly a missed init path, possibly a
+    // teardown-re-entry race.  Skip nulls so teardown finishes cleanly,
+    // and log once so we know this path fires.
+    if (!Filter) {
+      static std::atomic<bool> Logged {false};
+      bool Expected = false;
+      if (Logged.compare_exchange_strong(Expected, true)) {
+        LogMan::Msg::EFmt("FreeSeccompFilters: skipping null Filter entry "
+                          "in Thread->Filters (size={})",
+                          Thread->Filters.size());
+      }
+      continue;
+    }
     auto RefCount = std::atomic_ref<uint64_t>(Filter->RefCount).fetch_sub(1);
 
     if (RefCount == 1) {

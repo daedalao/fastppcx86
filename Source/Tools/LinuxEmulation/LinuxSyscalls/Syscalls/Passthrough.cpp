@@ -425,21 +425,46 @@ namespace x64 {
     RegisterCommon(Handler);
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
 #ifdef ARCHITECTURE_ppc64le
-    // PowerPC uses _IOW('f', N, int)/_IOR style ioctl values for stream/socket
-    // ioctls (FIONBIO = 0x8004667E, FIONREAD = 0x4004667F) instead of the
-    // asm-generic constants x86/ARM/MIPS share (FIONBIO = 0x5421,
-    // FIONREAD = 0x541B). A naive passthrough leaves the guest's asm-generic
-    // values intact, which the PPC kernel does not recognise and returns
-    // ENOTTY (errno 25) -- exactly what OpenSSL BIO_socket_ioctl and the
-    // Steam launcher's CreateBoundSocket reported. Translate the small set
-    // actually used by common networking software; all other ioctls fall
-    // through unchanged.
-    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+    // PowerPC uses different ioctl encoding than x86: 3 dir bits at [29:31]
+    // (NONE=1/READ=2/WRITE=4/RW=6) vs x86's 2 dir bits at [30:31]
+    // (NONE=0/WRITE=1/READ=2/RW=3), and a 13-bit size field instead of 14.
+    // A blanket encoding remap risks breaking working ioctls whose values
+    // happen to match between archs; we narrow the fix to DRM type ('d')
+    // ioctls which the rootfs DRM stack issues during GL initialization
+    // (amdgpu_query_info returns EINVAL without this -- see
+    // project_grimrock_amdgpu_ioctl.md).
+    //
+    // PPC-FIO* family (commit 828352361) is a separate quirk handled first.
+    static constexpr auto RemapIoctlForPPC = [](uint32_t cmd) -> uint32_t {
       switch (cmd) {
-        case 0x5421u: cmd = FIONBIO;  break;
-        case 0x541Bu: cmd = FIONREAD; break;
-        default: break;
+      case 0x5421u: return FIONBIO;
+      case 0x541Bu: return FIONREAD;
+      case 0x5450u: return FIONCLEX;
+      case 0x5451u: return FIOCLEX;
+      case 0x5452u: return FIOASYNC;
+      default: break;
       }
+
+      // DRM type 'd' (0x64) and udmabuf type 'u' (0x75) ioctls rely on
+      // _IOC encoding; translate their direction bits from x86's 2-bit
+      // layout to PPC's 3-bit layout.  Anything else passes through.
+      const uint32_t type = (cmd >> 8) & 0xFFu;
+      if (type != 0x64u && type != 0x75u) {
+        return cmd;
+      }
+
+      const uint32_t nr      = cmd & 0xFFu;
+      const uint32_t size    = (cmd >> 16) & 0x3FFFu;
+      const uint32_t dir_x86 = (cmd >> 30) & 0x3u;
+
+      static constexpr uint32_t DirX86ToPPC[4] = {1u, 4u, 2u, 6u};
+      const uint32_t dir_ppc = DirX86ToPPC[dir_x86];
+      const uint32_t size_ppc = size & 0x1FFFu;
+      return (dir_ppc << 29) | (size_ppc << 16) | (type << 8) | nr;
+    };
+
+    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+      cmd = RemapIoctlForPPC(cmd);
       uint64_t Result = ::ioctl(fd, cmd, arg);
       SYSCALL_ERRNO();
     });
