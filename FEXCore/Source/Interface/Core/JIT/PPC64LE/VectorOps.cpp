@@ -4394,12 +4394,33 @@ DEF_OP(Vector_FToS) {
     // round-to-nearest then truncate — double-rounding for x.5 cases.
     xvrspic(VTMP1, Src);
     xvcvspsxws(Dst, VTMP1);
+    // POWER returns INT_MAX on +overflow but x86 wants INT_MIN ("integer
+    // indefinite") sentinel.  Detect Src >= 2^31 and substitute INT_MIN.
+    // NaN comparisons return 0 from xvcmpgesp (and POWER already maps NaN
+    // → INT_MIN), so the mask correctly captures only +overflow / +Inf.
+    LoadConstant(TMP1, 0x4F0000004F000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);  // VTMP2 = splat f32(2^31)
+    xvcmpgesp(VTMP1, Src, VTMP2);                  // mask: 1 where Src >= 2^31
+    LoadConstant(TMP1, 0x8000000080000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);                        // VTMP2 = splat INT_MIN
+    xxsel(Dst, Dst, VTMP2, VTMP1);                 // overflow ? INT_MIN : Dst
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // Match Vector_FToISized's HostRound=true path for f64→i64.
     xvrdpic(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
+    // Same INT_MIN sentinel fix for f64 → i64.  Bound = 2^63 as f64.
+    LoadConstant(TMP1, 0x43E0000000000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    xvcmpgedp(VTMP1, Src, VTMP2);
+    LoadConstant(TMP1, 0x8000000000000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);
+    xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -4414,11 +4435,29 @@ DEF_OP(Vector_FToZS) {
   if (ElemSz == IR::OpSize::i32Bit) {
     vrfiz(VTMP1, Src);    // round towards zero
     vctsxs(Dst, VTMP1, 0);
+    // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
+    LoadConstant(TMP1, 0x4F0000004F000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);
+    LoadConstant(TMP1, 0x8000000080000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);
+    xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     xvrdpiz(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
+    // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
+    LoadConstant(TMP1, 0x43E0000000000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    xvcmpgedp(VTMP1, Src, VTMP2);
+    LoadConstant(TMP1, 0x8000000000000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);
+    xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
   Op_Unhandled(IROp, Node);
