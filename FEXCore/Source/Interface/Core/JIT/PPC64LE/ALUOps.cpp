@@ -2667,6 +2667,12 @@ DEF_OP(RotateFlags) {
   uint32_t Mask = (Sz == 8) ? 0x3F : 0x1F;
 
   PPC64Emitter::Label noRotate, done;
+  // x86 ROL/ROR preserve ZF/SF/PF/AF.  Save CR0 (the canonical packed-NZCV
+  // scratch) to the red zone before andi_ which would otherwise clobber it
+  // for both the rotate-body and rotate-by-0-fallthrough paths.  Restore
+  // at the noRotate label so the prior compare's NZCV survives the op.
+  mfcr(TMP4);
+  std(TMP4, -16, r1);
   andi_(TMP1, Shift, Mask);
   bc(CC_EQ, &noRotate);
 
@@ -2703,6 +2709,9 @@ DEF_OP(RotateFlags) {
   mtspr(1, TMP4);
 
   Bind(&noRotate);
+  // Restore CR0 (packed-NZCV) saved before the andi_ above.
+  ld(TMP4, -16, r1);
+  mtcrf(0x80, TMP4);
   Bind(&done);
 }
 DEF_OP(CmpPairZ) {
