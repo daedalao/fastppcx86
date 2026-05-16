@@ -679,6 +679,24 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             }
           } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
             ForceTSO = IR::ForceTSOMode::ForceEnabled;
+          } else if (Config.LockOnlyTSO()) {
+            // Opt-in: only x86 instructions carrying FLAG_LOCK (LOCK CMPXCHG,
+            // LOCK XADD, implicit-LOCK XCHG-mem-reg, etc.) get TSO acquire/
+            // release emission.  Plain `MOV reg,[mem]` falls back to the
+            // cheap LoadMem path -- skips the 4-instruction `ldx; cmpd self;
+            // bc never; isync` dance that ARM64 sidesteps via single-insn
+            // LDAR.  Inert when global TSOEnabled is false (TSO already off).
+            //
+            // Pitfall: real concurrent guest code that relies on x86's
+            // "every load is acquire" contract may race -- particularly
+            // glibc futex / PLT lazy resolution.  LOCK CMPXCHG is the
+            // primitive backing those, so LOCK-only TSO should keep them
+            // correct.  Tune-at-own-risk.
+            if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_LOCK) {
+              ForceTSO = IR::ForceTSOMode::ForceEnabled;
+            } else {
+              ForceTSO = IR::ForceTSOMode::ForceDisabled;
+            }
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);

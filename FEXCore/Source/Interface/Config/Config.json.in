@@ -437,6 +437,22 @@
           "Highly likely to break any multithreaded application if disabled."
         ]
       },
+      "LockOnlyTSO": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Opt-in: when TSOEnabled is also true, restrict TSO acquire/release",
+          "emission to x86 instructions carrying FLAG_LOCK (LOCK CMPXCHG,",
+          "LOCK XADD, implicit-LOCK XCHG-mem, etc.) plus any FLAG_FORCE_TSO",
+          "ranges from MonoHacks.  Plain MOV reg,[mem] uses the cheap LoadMem",
+          "path instead of LoadMemTSO.  Designed for weakly-ordered hosts",
+          "(PPC64LE) where the per-load acquire dance is microarchitecturally",
+          "cheap but cumulatively dominates runtime in libc / pthread tight",
+          "loops.  Risk: real concurrent code using non-LOCK volatile reads",
+          "may race -- glibc futex / PLT lazy resolve are normally safe.",
+          "Inert (no effect) when TSOEnabled is false."
+        ]
+      },
       "VectorTSOEnabled": {
         "Type": "bool",
         "Default": "false",
