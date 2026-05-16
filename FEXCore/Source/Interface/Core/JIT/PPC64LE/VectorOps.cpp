@@ -446,11 +446,29 @@ DEF_OP(VFRecpPrecision) {
   // vmaddfp(t,a,b,c)  = a*c + b  →  Dst = r0 * VTMP2 + 0
   vspltisw(Dst, 0);
   vmaddfp(Dst, VTMP1, Dst, VTMP2);
-  // Newton-Raphson refinement produces NaN for Src=±0 (because 2-0*inf=NaN);
-  // 3DNow PFRCP must return ±inf for ±0. Detect NaN lanes (NaN != NaN) and
-  // substitute the unrefined vrefp output, which AltiVec defines as ±inf.
-  vcmpeqfp(VTMP2, Dst, Dst);                // mask = ~NaN  (all-ones on finite)
-  vsel(Dst, VTMP1, Dst, VTMP2);             // NaN lanes ← VTMP1 (vrefp)
+  // Newton-Raphson refinement misbehaves on three input classes that x86
+  // PFRCP / RCPSS must still answer correctly:
+  //   (1) Src = ±0      →  vrefp = ±inf; step = 2 - 0*inf = NaN;
+  //                        Newton = inf*NaN = NaN.
+  //   (2) Src very tiny non-zero subnormal (|Src| < ~2^-127, e.g. 1.4e-45 =
+  //                        0x00000001):  vrefp returns ±inf (the subnormal
+  //                        is flushed inside vrefp).  But in the subsequent
+  //                        vnmsubfp the multiply Src*r0 = subnormal*inf is
+  //                        NOT flushed to 0; it produces ±inf, so the step
+  //                        = 2 - ±inf = ∓inf, and the final r0*step = inf *
+  //                        ∓inf = ∓inf — sign-flipped vs. the correct
+  //                        estimate (x86 PFRCP saturates to ±inf with the
+  //                        SAME sign as Src).
+  //   (3) Src = ±inf     →  vrefp = ±0; step = 2 - inf*0 = NaN; Newton = NaN.
+  // In all three cases the unrefined vrefp output already supplies the
+  // x86-correct answer (±inf for ±0, ±inf for tiny subnormal, ±0 for ±inf).
+  // Detect any non-finite Newton lane via `(Dst - Dst) == 0  ⇔  Dst finite`
+  // (verified on POWER8: ±inf-±inf = NaN, NaN-NaN = NaN, finite-finite = 0).
+  // No extra constants needed: a self-equal check (NaN != NaN) collapses the
+  // 0-or-NaN intermediate to the finite-mask.
+  vsubfp(VTMP2, Dst, Dst);                  // 0 where Dst finite, NaN otherwise
+  vcmpeqfp(VTMP2, VTMP2, VTMP2);            // finite-mask: NaN!=NaN → 0; 0==0 → 1s
+  vsel(Dst, VTMP1, Dst, VTMP2);             // non-finite Newton lanes ← vrefp
 }
 
 DEF_OP(VFSqrt) {
