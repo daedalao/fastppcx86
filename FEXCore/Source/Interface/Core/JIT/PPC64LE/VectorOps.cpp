@@ -4697,6 +4697,18 @@ DEF_OP(Vector_FToISized) {
       xvrspiz(VTMP1, Src);
     }
     xvcvspsxws(Dst, VTMP1);
+    // POWER returns INT_MAX on f32 +overflow but x86 CVT{T}PS2DQ wants
+    // INT_MIN (0x80000000) as the integer-indefinite sentinel.  See
+    // commit c9db77322 for the rationale.  xvcmpgesp NaN compare returns
+    // 0, so NaN (already INT_MIN per POWER) is correctly preserved.
+    LoadConstant(TMP1, 0x4F0000004F000000ULL);  // splat f32(2^31)
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    LoadConstant(TMP1, 0x8000000080000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);                      // splat INT_MIN
+    xxsel(Dst, Dst, VTMP2, VTMP1);               // overflow ? INT_MIN : Dst
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit && IntSize == IR::OpSize::i64Bit) {
@@ -4706,6 +4718,15 @@ DEF_OP(Vector_FToISized) {
       xvrdpiz(VTMP1, Src);
     }
     xvcvdpsxds(Dst, VTMP1);
+    // INT_MIN sentinel for f64 -> i64 +overflow (matches CVT{T}SD2SI etc.).
+    LoadConstant(TMP1, 0x43E0000000000000ULL);  // f64(2^63)
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    xvcmpgedp(VTMP1, Src, VTMP2);
+    LoadConstant(TMP1, 0x8000000000000000ULL);
+    std(TMP1, -16, r1); std(TMP1, -8, r1);
+    lvx(VTMP2, r(0), TMP2);
+    xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
   Op_Unhandled(IROp, Node);
