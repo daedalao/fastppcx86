@@ -353,6 +353,22 @@ protected:
 
   FEXCore::Context::Context* CTX;
 
+public:
+  // Linux equivalent of Windows InvalidationTracker.cpp's mono-DLL-load
+  // detection.  Called from the openat / open / openat2 syscall handlers
+  // (Syscalls/FD.cpp) with each guest-opened file path.  If the basename
+  // matches a known Mono runtime library (libmono*, libmonosgen*,
+  // libmonoboehm*, mono-2.0-bdwgc*) and we haven't already detected,
+  // call CTX->MarkMonoDetected() to enable the MonoHacks code paths.
+  //
+  // Atomic short-circuit on MonoDetectionComplete makes the post-detection
+  // cost one relaxed load.  Gated by Config.MonoHacks: if the user hasn't
+  // opted in, the check is a no-op so we don't even pay the strstr cost.
+  void MaybeDetectMonoFromPath(const char* pathname);
+
+private:
+  std::atomic<bool> MonoDetectionComplete {false};
+
 private:
   FEX::HLE::SignalDelegator* SignalDelegation;
   FEX::HLE::ThunkHandler* ThunkHandler;

@@ -1293,4 +1293,59 @@ DoGenerate:
   }
 }
 
+// Linux Mono runtime detection — flip MonoDetected when the guest opens a
+// libmono / libmonosgen / libmonoboehm / mono-2.0-bdwgc shared library.
+// Cheap atomic gate after first detection so the openat hot path stays fast.
+void SyscallHandler::MaybeDetectMonoFromPath(const char* pathname) {
+  // Relaxed load is enough — we only need eventually-consistent short-circuit;
+  // the first writer pays the cost of going through MarkMonoDetected once.
+  if (MonoDetectionComplete.load(std::memory_order_relaxed)) {
+    return;
+  }
+  // Skip the path check if MonoHacks isn't even configured — the detected
+  // flag would have no consumers, so don't pay the strstr cost.
+  FEX_CONFIG_OPT(MonoHacksConfig, MONOHACKS);
+  if (!MonoHacksConfig()) {
+    MonoDetectionComplete.store(true, std::memory_order_relaxed);
+    return;
+  }
+  if (!pathname) {
+    return;
+  }
+  // Find basename — last '/' or full string.
+  const char* base = pathname;
+  for (const char* p = pathname; *p; ++p) {
+    if (*p == '/') {
+      base = p + 1;
+    }
+  }
+  // Match known Mono runtime library prefixes.  Cheap prefix match, no regex.
+  auto starts_with = [](const char* s, const char* prefix) {
+    while (*prefix) {
+      if (*s++ != *prefix++) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const bool is_mono =
+    starts_with(base, "libmonosgen-")    ||  // mainline mono runtime (sgen GC)
+    starts_with(base, "libmono-2.0")     ||  // older mono runtime
+    starts_with(base, "libmonoboehm-")   ||  // Boehm-GC mono variant
+    starts_with(base, "libmono.so")      ||  // generic libmono
+    starts_with(base, "mono-2.0-bdwgc")  ||  // matches Windows-side name too
+    starts_with(base, "mono.so");
+
+  if (!is_mono) {
+    return;
+  }
+  // Mark only once.  compare_exchange ensures only the winning thread invokes
+  // MarkMonoDetected; subsequent callers short-circuit.
+  bool expected = false;
+  if (MonoDetectionComplete.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LogMan::Msg::IFmt("Mono runtime detected via '{}' — MonoHacks active.", pathname);
+    CTX->MarkMonoDetected();
+  }
+}
+
 } // namespace FEX::HLE
