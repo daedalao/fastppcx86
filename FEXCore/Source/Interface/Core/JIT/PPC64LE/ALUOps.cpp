@@ -1193,10 +1193,13 @@ DEF_OP(Rbit) {
     and_(TMP4, TMP1, TMP2);
     sldi(TMP4, TMP4, 4);
     or_(TMP1, TMP3, TMP4);
-    // byte-reverse word
+    // byte-reverse word.  On LE host, stw stores native LE and lwbrx
+    // byte-reverses on load — those two operations cancel out, leaving
+    // an identity load (no actual byte swap).  Match the 64-bit path
+    // which correctly uses stdbrx + ld for the bswap.
     addi(r1, r1, -16);
-    stw(TMP1, 0, r1);   // store in LE
-    lwbrx(Dst, r0, r1); // load with byte swap = bswap(TMP1)
+    stwbrx(TMP1, r0, r1); // byte-reverse on store
+    lwz(Dst, 0, r1);      // load native LE -> bswap(TMP1)
     addi(r1, r1, 16);
   }
 }
@@ -1376,6 +1379,12 @@ DEF_OP(Extr) {
     or_(Dst, TMP1, TMP2);
     rldicl(Dst, Dst, 0, 32);                // zero-extend
   } else {
+    if (sh == 0) {
+      // sldi(_, _, 64) encodes rldicr SH=64 which wraps SH-low-6-bits=0
+      // and produces mr instead of zero.  Mirror the 32-bit sh==0 path.
+      if (Dst != S2) mr(Dst, S2);
+      return;
+    }
     srdi(TMP1, S2, sh);
     sldi(TMP2, S1, 64 - sh);
     or_(Dst, TMP1, TMP2);
@@ -1398,6 +1407,11 @@ DEF_OP(PDep) {
   mr(Input, OrigIn);
   mr(Mask, OrigMask);
   li(Dest, 0);
+  // x86 BMI2 PDEP preserves flags per Intel SDM ("Flags Affected: None").
+  // CR0 here is the canonical packed-NZCV scratch — save it to a red-zone
+  // slot before the loop and restore at the end so flags survive the op.
+  mfcr(T0);                    // T0 = full CR snapshot (using T0 briefly)
+  std(T0, -16, r1);            // stash to red zone
   cmpdi(Mask, 0);              // read snapshot (Dest may alias OrigMask)
   bc(CC_EQ, &Done);
 
@@ -1415,6 +1429,10 @@ DEF_OP(PDep) {
 
   Bind(&Done);
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
+  // Restore CR0 (only — mtocrf field 0 mask = 0x80) so any packed-NZCV
+  // held there pre-PDep survives.
+  ld(T0, -16, r1);
+  mtcrf(0x80, T0);
 }
 
 DEF_OP(PExt) {
@@ -1432,6 +1450,10 @@ DEF_OP(PExt) {
   mr(InputSnap, OrigIn);
   mr(Mask, OrigMask);
   li(Dest, 0);
+  // x86 BMI2 PEXT preserves flags per Intel SDM.  Save CR0 (the canonical
+  // packed-NZCV scratch) to a red-zone slot and restore at op end.
+  mfcr(Scratch);
+  std(Scratch, -16, r1);
   cmpdi(Mask, 0);
   bc(CC_EQ, &Done);
 
@@ -1463,6 +1485,9 @@ DEF_OP(PExt) {
 
   Bind(&Done);
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
+  // Restore CR0 so the packed-NZCV scratch held there pre-PExt survives.
+  ld(Scratch, -16, r1);
+  mtcrf(0x80, Scratch);
 }
 
 // =========================================================================
