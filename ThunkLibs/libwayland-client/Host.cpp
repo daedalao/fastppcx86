@@ -448,8 +448,13 @@ fexfn_impl_libwayland_client_wl_proxy_add_listener(struct wl_proxy* proxy, guest
     } else if (signature == "ss") {
       WaylandFinalizeHostTrampolineForGuestListener<'s', 's'>(callback);
     } else {
-      fprintf(stderr, "TODO: Unknown wayland event signature descriptor %s\n", signature.data());
-      std::abort();
+      // Newer wayland protocol versions may grow event signature characters
+      // we have not added marshalling for yet.  Aborting was hostile to any
+      // forward-compat client (e.g. Sway with experimental protocol extensions).
+      // Log loudly and skip — the listener fails silently for that proxy event,
+      // which matches what an older wayland-client.so would do on an unknown event.
+      fprintf(stderr, "FEX: warning: unhandled wayland event signature \"%s\"; listener skipped for this event\n", signature.data());
+      (void)0;
     }
   }
 

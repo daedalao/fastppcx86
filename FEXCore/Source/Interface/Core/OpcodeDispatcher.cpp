@@ -4420,6 +4420,16 @@ void OpDispatchBuilder::StoreGPRRegister(uint32_t GPR, const Ref Src, IR::OpSize
     Size = GPRSize;
   }
 
+  // x86 semantics footgun: 32-bit register writes in 64-bit mode ZERO-EXTEND
+  // to the full 64-bit register, but this function's BfiInto branch PRESERVES
+  // the upper bits.  All current callers route through StoreResult_WithOpSize
+  // which pre-handles the i32-in-i64 case via Bfe(0,32) + StoreGPRRegister
+  // with Size=GPRSize.  Forbid the direct i32-in-i64 path so a future caller
+  // doesn't accidentally introduce the bug.
+  LOGMAN_THROW_A_FMT(!(Size == OpSize::i32Bit && GPRSize == OpSize::i64Bit),
+                     "StoreGPRRegister i32-in-i64 takes BfiInto (preserves upper 32) but x86 zero-extends. "
+                     "Route through StoreResult_WithOpSize, which Bfe(0,32) + StoreGPRRegister(gpr, val, GPRSize).");
+
   Ref Reg = Src;
   if (Size != GPRSize || Offset != 0) {
     // Need to do an insert if not automatic size or zero offset.
