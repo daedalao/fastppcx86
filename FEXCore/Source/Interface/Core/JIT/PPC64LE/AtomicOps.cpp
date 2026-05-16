@@ -75,6 +75,15 @@ DEF_OP(AtomicSwap) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 XCHG / LOCK XCHG preserve flags per Intel SDM.  Save CR0 (the
+  // canonical packed-NZCV scratch) before the alignment-check andi_ and
+  // the LL/SC loop's stdcx_, restore at op end.  Unlike other LOCK ops
+  // where a flag-setter follows and fully overwrites CR0, XCHG has no
+  // such follower — any leaked CR0 state from the andi_/stdcx_ would
+  // contaminate downstream NZCVSelect / LAHF / Jcc reads.
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
+
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -99,6 +108,9 @@ DEF_OP(AtomicSwap) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 — XCHG preserves flags.
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
