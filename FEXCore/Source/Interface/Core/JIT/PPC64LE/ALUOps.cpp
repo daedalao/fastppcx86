@@ -3388,6 +3388,36 @@ DEF_OP(VExtractToGPR) {
     break;
   }
 }
+// Helper: substitute Dst with x86 "integer indefinite" sentinel (INT_MIN of
+// the destination width) on +overflow / NaN, after POWER fctiw[z]/fctid[z]
+// has already converted Src into Dst.
+//
+// POWER's scalar fctiw[z]/fctid[z] saturate +overflow to INT_MAX and -overflow
+// to INT_MIN, and produce INT_MIN for NaN.  x86 CVT[T]SS2SI / CVT[T]SD2SI
+// instead want INT_MIN (0x80000000_i32 / 0x8000000000000000_i64) for ALL of
+// {+overflow, -overflow already matches, NaN already matches}.  So we only
+// need to fix up the +overflow case; -overflow and NaN are already correct.
+//
+// Strategy: scalar fcmpu against the smallest FP value strictly greater than
+// INT_MAX in the source precision (equivalently 2^N where N is dst width-1).
+// If Src >= bound  OR  Src is NaN  → load INT_MIN into Dst.
+//
+// fcmpu sets CR.LT / CR.GT / CR.EQ / CR.SO; "no fixup needed" is exactly
+// CR.LT set (Src < bound, finite, ordered).  We use cr(1) so we don't
+// clobber CR0 (packed NZCV).  bc with BO=12 BI=4 branches on CR1.LT set.
+//
+// Bound constants (smallest FP > INT_MAX, equal to 2^(W-1) in source precision):
+//   f32 -> i32:  2^31  as f32 = 0x4F000000
+//   f32 -> i64:  2^63  as f32 = 0x5F000000
+//   f64 -> i32:  2^31  as f64 = 0x41E0000000000000
+//   f64 -> i64:  2^63  as f64 = 0x43E0000000000000
+// Note 2^31 is exactly representable in both f32 and f64 (and 2^63 in f64),
+// so "Src == bound" is also overflow on x86 (x86 INT_MAX = 2^(W-1)-1).
+// The condition is thus Src >= bound (or NaN), i.e. !CR.LT.
+
+// "Branch if CR1.LT set" — BO=12 (branch if BI set), BI=4 (CR1 bit 0 = LT).
+// We use cr(1) for the overflow fcmpu so CR0 (packed NZCV) is preserved.
+
 // Float_ToGPR_ZS: scalar float → signed integer GPR, truncate-toward-zero.
 // FPR scalar is element 0 of a vector register; extract via stack roundtrip.
 DEF_OP(Float_ToGPR_ZS) {
@@ -3404,6 +3434,25 @@ DEF_OP(Float_ToGPR_ZS) {
   } else {
     lfd(f0, -32, r1);
   }
+
+  // Materialise bound = 2^(DstWidth-1) in source precision, compare via
+  // fcmpu(cr(1), ...).  See helper-block comment above for derivation.
+  uint64_t Bound;
+  if (SrcES == IR::OpSize::i32Bit) {
+    Bound = (DstES == IR::OpSize::i32Bit) ? 0x4F000000ULL          // 2^31 f32
+                                          : 0x5F000000ULL;         // 2^63 f32
+    LoadConstant(TMP1, Bound);
+    std(TMP1, -16, r1);
+    lfs(f1, -16, r1);
+  } else {
+    Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
+                                          : 0x43E0000000000000ULL; // 2^63 f64
+    LoadConstant(TMP1, Bound);
+    std(TMP1, -16, r1);
+    lfd(f1, -16, r1);
+  }
+  fcmpu(cr(1), f0, f1);
+
   if (DstES == IR::OpSize::i32Bit) {
     fctiwz(f0, f0);
     mffprd(Dst, f0);
@@ -3412,6 +3461,17 @@ DEF_OP(Float_ToGPR_ZS) {
     fctidz(f0, f0);
     mffprd(Dst, f0);
   }
+
+  // If CR1.LT set (Src < bound, ordered), POWER's result is x86-correct.
+  // Otherwise (Src >= bound or NaN) overwrite Dst with INT_MIN sentinel.
+  PPC64Emitter::Label NoOvf;
+  bc(PPC64Emitter::Cond{12, 4}, &NoOvf);  // branch if CR1.LT set
+  if (DstES == IR::OpSize::i32Bit) {
+    LoadConstant(Dst, 0x80000000ULL);  // INT_MIN_i32 zero-extended to 64
+  } else {
+    LoadConstant(Dst, 0x8000000000000000ULL);  // INT_MIN_i64
+  }
+  Bind(&NoOvf);
 }
 
 // Float_ToGPR_S: scalar float → signed integer GPR using host rounding mode.
@@ -3430,6 +3490,24 @@ DEF_OP(Float_ToGPR_S) {
   } else {
     lfd(f0, -32, r1);
   }
+
+  // Same INT_MIN-on-overflow fixup as Float_ToGPR_ZS above.
+  uint64_t Bound;
+  if (SrcES == IR::OpSize::i32Bit) {
+    Bound = (DstES == IR::OpSize::i32Bit) ? 0x4F000000ULL
+                                          : 0x5F000000ULL;
+    LoadConstant(TMP1, Bound);
+    std(TMP1, -16, r1);
+    lfs(f1, -16, r1);
+  } else {
+    Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL
+                                          : 0x43E0000000000000ULL;
+    LoadConstant(TMP1, Bound);
+    std(TMP1, -16, r1);
+    lfd(f1, -16, r1);
+  }
+  fcmpu(cr(1), f0, f1);
+
   if (DstES == IR::OpSize::i32Bit) {
     fctiw(f0, f0);
     mffprd(Dst, f0);
@@ -3438,6 +3516,15 @@ DEF_OP(Float_ToGPR_S) {
     fctid(f0, f0);
     mffprd(Dst, f0);
   }
+
+  PPC64Emitter::Label NoOvf;
+  bc(PPC64Emitter::Cond{12, 4}, &NoOvf);  // branch if CR1.LT set
+  if (DstES == IR::OpSize::i32Bit) {
+    LoadConstant(Dst, 0x80000000ULL);
+  } else {
+    LoadConstant(Dst, 0x8000000000000000ULL);
+  }
+  Bind(&NoOvf);
 }
 
 // FCmp: scalar FP unordered compare, produces ARM-FCMP-style NZCV.
