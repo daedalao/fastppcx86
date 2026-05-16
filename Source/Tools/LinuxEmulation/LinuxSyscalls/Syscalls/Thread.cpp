@@ -283,29 +283,12 @@ static int CloneFork(uint32_t flags, uint64_t exit_signal) {
   //
   // We must NOT pass:
   //   - CLONE_THREAD: callers of this function are explicitly fork-style
-  //   - CLONE_SIGHAND: incompatible without CLONE_THREAD; kernel will EINVAL
+  //   - CLONE_VM:     incompatible without CLONE_THREAD; kernel will EINVAL
+  //   - CLONE_SIGHAND: same
   //   - CLONE_SETTLS: TLS pointer is FEX-internal, not a guest TLS
   //
-  // Special case CLONE_VM:
-  //   - Without CLONE_VFORK: stripping is correct.  CLONE_VM without
-  //     CLONE_THREAD or CLONE_VFORK is unusual (a child sharing memory with
-  //     parent indefinitely) and not safe to pass through -- the child
-  //     would share the FEX JIT state with the parent.
-  //   - With CLONE_VFORK: this is canonical vfork() semantics.  The child
-  //     shares the parent's address space and the parent is suspended until
-  //     the child execs (or exits).  bwrap / pressure-vessel uses this to
-  //     spawn sandbox-setup helpers that modify shared variables to
-  //     coordinate with the parent BEFORE exec().  If we strip CLONE_VM
-  //     here, those writes happen in the now-private-memory child and the
-  //     parent never sees them -- the canonical symptom is the parent
-  //     polling a condition variable forever that the helper was supposed
-  //     to flip (Steam manifest-download path).
-  //
   // Everything else is safe to forward.
-  uint64_t StripFlags = CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS;
-  if (!(flags & CLONE_VFORK)) {
-    StripFlags |= CLONE_VM;
-  }
+  constexpr uint64_t StripFlags = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND | CLONE_SETTLS;
   return ::syscall(SYSCALL_DEF(clone), (flags & ~StripFlags) | exit_signal, nullptr, nullptr, nullptr, nullptr);
 }
 
