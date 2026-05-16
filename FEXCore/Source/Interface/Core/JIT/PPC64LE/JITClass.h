@@ -4,6 +4,7 @@
 #pragma once
 
 #include "Interface/Core/ArchHelpers/PPC64Emitter.h"
+#include <FEXCore/Utils/ArchHelpers/PPC64.h>
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/JIT/Relocations.h"
 #include "Interface/IR/IR.h"
@@ -255,6 +256,24 @@ private:
   // direct compare. May emit ProjectXERToCR1() and CR-bit ops (crand/crxor/...)
   // to synthesize composite conditions; returns the {BO, BI} for the final bc.
   PPC64Emitter::Cond MapNZCVCC(IR::CondClass Cond);
+
+  // Emit a misaligned-LOCK-RMW helper call (split-lock path).
+  // Sets up a 64-byte mini-frame, stages Val and Addr into stack slots,
+  // spills dynamic regs, marshals (op, addr, value_ptr, result_ptr, size)
+  // into r3..r7, calls PPC64_SplitLockEmulate, restores dyn regs, then
+  // loads the helper's result into Dst. The mini-frame is sized to keep
+  // the original [r1-8] CR0 stash untouched, so callers can leave their
+  // existing mfcr/std/ld/mtcrf bracket in place.
+  void EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp Op,
+                               PPC64Emitter::GPR Addr, PPC64Emitter::GPR Val,
+                               PPC64Emitter::GPR Dst, IR::OpSize Sz);
+
+  // CAS variant: same frame, but Expected is also staged into the result
+  // slot so the helper can compare-and-swap. Returns the loaded value in
+  // Dst (caller computes ZF by cmp'ing Dst against Expected).
+  void EmitSplitLockCASCall(PPC64Emitter::GPR Addr, PPC64Emitter::GPR Expected,
+                            PPC64Emitter::GPR Desired, PPC64Emitter::GPR Dst,
+                            IR::OpSize Sz);
 
   // -----------------------------------------------------------------------
   // Stack management

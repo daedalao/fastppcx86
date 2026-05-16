@@ -18,6 +18,7 @@
 // the implementation-defined behavior x86 already has for cross-cache-line
 // LOCK ops). The 8-bit (lbarx) path is always aligned by definition.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
+#include "Interface/Context/Context.h"
 
 namespace FEXCore::CPU {
 
@@ -61,6 +62,131 @@ namespace FEXCore::CPU {
     } \
   } while (0)
 
+
+// ---------------------------------------------------------------------------
+// SplitLock mini-frame helper. The misaligned LOCK-RMW path used to inline a
+// non-atomic LD->op->ST (single-thread correct only). Phase 3 replaces it
+// with a call into PPC64_SplitLockEmulate (process-wide mutex-serialized),
+// which is correct across cores.
+//
+// Frame layout (64 bytes, allocated via stdu r1, -64, r1):
+//   [r1+0]:  back-chain (auto-written by stdu)
+//   [r1+8]:  CR save area (ELFv2 reserves; unused)
+//   [r1+16]: LR save area (helper prologue writes incoming LR here)
+//   [r1+24]: pad
+//   [r1+32]: SlotValue        Val operand
+//   [r1+40]: SlotResult       helper writes pre-RMW Old here
+//   [r1+48]: SlotAddrStash    staged Addr (read into r4 after spill)
+//   [r1+56]: SlotTOC          saved r2 across bctrl
+//
+// CR0 stash: callers save CR0 to [original_r1 - 8] before this helper fires.
+// stdu does NOT touch [original_r1 - 8] (it writes the back-chain to
+// [new_r1 + 0] = [original_r1 - 64]). The callee stack frame is allocated
+// BELOW new_r1 by its own prologue, so it cannot touch [original_r1 - 8]
+// either. After we tear down via addi r1, +64, r1 reverts to its original
+// value and the caller ld(TMP4, -8, r1) finds the stash intact.
+namespace {
+constexpr int SplitLockMiniFrameSize = 80;
+constexpr int SplitLockSlotValue       = 32;
+constexpr int SplitLockSlotResult      = 40;
+constexpr int SplitLockSlotAddrStash   = 48;
+constexpr int SplitLockSlotTOC         = 56;
+// CAS-only side slot: Expected value preserved across the bctrl so the
+// caller can re-emit its CmpDst-vs-Expected sequence on return (helper
+// overwrites SlotResult with Old).
+constexpr int SplitLockSlotExpectedSave = 64;
+// Top 8 bytes [r1+72] left as pad. The caller-supplied CR0 stash lives at
+// [original_r1 - 8] = [r1 + 72] post-stdu — we MUST NOT write there.
+static_assert(SplitLockSlotExpectedSave + 8 == SplitLockMiniFrameSize - 8,
+              "Top 8 bytes of mini-frame must be reserved for CR0 stash preservation");
+}
+
+void PPC64JITCore::EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp Op,
+                                          PPC64Emitter::GPR Addr, PPC64Emitter::GPR Val,
+                                          PPC64Emitter::GPR Dst, IR::OpSize Sz) {
+  const int SpillSize = CTX->Config.Is64BitMode()
+    ? static_cast<int>(x64::kDynRegSaveSize)
+    : static_cast<int>(x32::kDynRegSaveSize);
+  const auto PostSpill = [&](int off) { return off + SpillSize; };
+
+  stdu(r1, -SplitLockMiniFrameSize, r1);
+  mflr(r(0));
+  std(r(0), 16, r1);
+
+  std(Val,  SplitLockSlotValue,     r1);
+  std(Addr, SplitLockSlotAddrStash, r1);
+
+  SpillForABICall(TMP1);
+
+  li(r(3), static_cast<int>(Op));
+  ld(r(4), PostSpill(SplitLockSlotAddrStash), r1);
+  addi(r(5), r1, PostSpill(SplitLockSlotValue));
+  addi(r(6), r1, PostSpill(SplitLockSlotResult));
+  li(r(7), static_cast<int>(IR::OpSizeToSize(Sz)));
+
+  LoadConstant(r(12), reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate));
+  std(r(2), PostSpill(SplitLockSlotTOC), r1);
+  mtctr(r(12));
+  bctrl();
+  ld(r(2), PostSpill(SplitLockSlotTOC), r1);
+
+  FillForABICall();
+  ld(Dst, SplitLockSlotResult, r1);
+
+  ld(r(0), 16, r1);
+  mtlr(r(0));
+  addi(r1, r1, SplitLockMiniFrameSize);
+  li(r(0), 0);
+}
+
+void PPC64JITCore::EmitSplitLockCASCall(PPC64Emitter::GPR Addr, PPC64Emitter::GPR Expected,
+                                       PPC64Emitter::GPR Desired, PPC64Emitter::GPR Dst,
+                                       IR::OpSize Sz) {
+  const int SpillSize = CTX->Config.Is64BitMode()
+    ? static_cast<int>(x64::kDynRegSaveSize)
+    : static_cast<int>(x32::kDynRegSaveSize);
+  const auto PostSpill = [&](int off) { return off + SpillSize; };
+
+  stdu(r1, -SplitLockMiniFrameSize, r1);
+  mflr(r(0));
+  std(r(0), 16, r1);
+
+  // CAS contract: *value = Desired, *result = Expected (helper compares
+  // observed-Old against *result and overwrites *result with Old). We
+  // additionally stash Expected into a side slot so the caller can re-cmp
+  // against the original value after the helper returns (which it must do
+  // when RA aliased Expected onto Dst — the SRA-restore in FillForABICall
+  // brings back Old, not Expected, since the helper has written Dst's
+  // register through the shared slot).
+  std(Desired,  SplitLockSlotValue,        r1);
+  std(Expected, SplitLockSlotResult,       r1);
+  std(Expected, SplitLockSlotExpectedSave, r1);
+  std(Addr,     SplitLockSlotAddrStash,    r1);
+
+  SpillForABICall(TMP1);
+
+  li(r(3), static_cast<int>(FEXCore::ArchHelpers::PPC64::SplitLockOp::CAS));
+  ld(r(4), PostSpill(SplitLockSlotAddrStash), r1);
+  addi(r(5), r1, PostSpill(SplitLockSlotValue));
+  addi(r(6), r1, PostSpill(SplitLockSlotResult));
+  li(r(7), static_cast<int>(IR::OpSizeToSize(Sz)));
+
+  LoadConstant(r(12), reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate));
+  std(r(2), PostSpill(SplitLockSlotTOC), r1);
+  mtctr(r(12));
+  bctrl();
+  ld(r(2), PostSpill(SplitLockSlotTOC), r1);
+
+  FillForABICall();
+  ld(Dst,  SplitLockSlotResult,       r1);
+  ld(TMP4, SplitLockSlotExpectedSave, r1);  // caller resumes EmitCmp(Dst,TMP4)
+
+  ld(r(0), 16, r1);
+  mtlr(r(0));
+  addi(r1, r1, SplitLockMiniFrameSize);
+  li(r(0), 0);
+}
+
 // ---------------------------------------------------------------------------
 // AtomicSwap — exchange, returns old value
 // ---------------------------------------------------------------------------
@@ -93,10 +219,9 @@ DEF_OP(AtomicSwap) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    STORE_NONATOMIC(Val, A, Sz);
-    hwsync();
+    // Misaligned LOCK XCHG: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::Swap,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -152,11 +277,9 @@ DEF_OP(AtomicFetchAdd) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    add(TMP2, Dst, Val);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK ADD: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAdd,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -203,11 +326,9 @@ DEF_OP(AtomicFetchSub) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    subf(TMP2, Val, Dst);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK SUB: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchSub,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -254,11 +375,9 @@ DEF_OP(AtomicFetchAnd) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    and_(TMP2, Dst, Val);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK AND: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAnd,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -305,11 +424,9 @@ DEF_OP(AtomicFetchCLR) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    andc(TMP2, Dst, Val);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK BTR: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchCLR,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -356,11 +473,9 @@ DEF_OP(AtomicFetchOr) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    or_(TMP2, Dst, Val);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK OR: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchOr,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -407,11 +522,9 @@ DEF_OP(AtomicFetchXor) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    xor_(TMP2, Dst, Val);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK XOR: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchXor,
+                            A, Val, Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -456,11 +569,9 @@ DEF_OP(AtomicFetchNeg) {
     // already supplies hwsync;...;isync, but the misaligned fallback
     // was barrier-less, dropping the release/acquire fences.  Bracket
     // with hwsync to match the aligned path's ordering.
-    hwsync();
-    LOAD_NONATOMIC(Dst, A, Sz);
-    neg(TMP2, Dst);
-    STORE_NONATOMIC(TMP2, A, Sz);
-    hwsync();
+    // Misaligned LOCK NEG: route through the mutex-serialized helper.
+    EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchNeg,
+                            A, r(0), Dst, Sz);
     b(&done);
   }
   Bind(&aligned);
@@ -530,7 +641,6 @@ DEF_OP(CAS) {
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
-    auto na_skip = PPC64Emitter::Label{};
     // CRITICAL: andi_ writes its dest to TMP3 (NOT TMP4). TMP4 may hold the
     // stashed Expected (from line 370 when Expected==Dst); the prior code used
     // TMP4 here and clobbered E in both the misaligned and aligned paths.
@@ -542,12 +652,21 @@ DEF_OP(CAS) {
     // point (no caller path stashes through TMP3) so we use it for the test.
     andi_(TMP3, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // Misaligned: plain load → compare → conditional store.
-    LOAD_NONATOMIC(Dst, A, Sz);
-    EmitCmp();
-    bc(CC_NE, &na_skip);
-    STORE_NONATOMIC(D, A, Sz);
-    Bind(&na_skip);
+    // Misaligned: route through the mutex-serialized helper. The helper does
+    // the compare-and-conditional-swap internally and returns the observed
+    // Old in Dst. It also reloads our Expected into TMP4 from a side slot,
+    // so we can compare Dst vs TMP4 to set CR0 for downstream ZF consumers.
+    //
+    // Inline the comparison here rather than using EmitCmp() — EmitCmp's
+    // closure binds to the *outer* E variable, so reassigning E=TMP4 would
+    // leak into the aligned LL/SC path that runs after Bind(&aligned).
+    EmitSplitLockCASCall(A, E, D, Dst, Sz);
+    switch (Sz) {
+    case IR::OpSize::i8Bit:  clrldi(TMP3, TMP4, 56); cmpw(Dst, TMP3); break;
+    case IR::OpSize::i16Bit: clrldi(TMP3, TMP4, 48); cmpw(Dst, TMP3); break;
+    case IR::OpSize::i32Bit: cmpw(Dst, TMP4);                          break;
+    default:                 cmpd(Dst, TMP4);                          break;
+    }
     b(&done);
   }
   Bind(&aligned);

@@ -23,6 +23,7 @@ enum class SplitLockOp : uint8_t {
   FetchXor = 5,
   FetchNeg = 6,
   CAS      = 7,
+  FetchCLR = 8, // x86 LOCK BTR/BTC mask-clear semantics: New = Old & ~Operand
 };
 
 /**

@@ -106,6 +106,7 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   case SplitLockOp::FetchAnd: New = (Old & Operand);     break;
   case SplitLockOp::FetchOr:  New = (Old | Operand);     break;
   case SplitLockOp::FetchXor: New = (Old ^ Operand);     break;
+  case SplitLockOp::FetchCLR: New = (Old & ~Operand);    break;
   case SplitLockOp::FetchNeg: New = static_cast<uint64_t>(-static_cast<int64_t>(Old)); break;
   case SplitLockOp::CAS:
     // For CAS the contract is:
