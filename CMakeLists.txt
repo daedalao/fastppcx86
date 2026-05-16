@@ -550,6 +550,26 @@ if (OVERRIDE_HASH STREQUAL "detect")
       OUTPUT_VARIABLE GIT_HASH
       ERROR_QUIET
       OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    # Cache invalidation guard for uncommitted source changes.
+    # FEX code-cache uses GIT_HASH as the version key (CodeCache.cpp:358).
+    # Without this guard, a cached JIT blob compiled by a dirty binary will be
+    # loaded by a subsequently-rebuilt dirty binary, even when the source has
+    # changed and the resulting codegen differs.
+    # When the working tree has uncommitted changes, derive a fresh hash by
+    # SHA1-mixing HEAD with the diff content. Cmake-time only — re-run
+    # `cmake .` (or wipe ~/.cache/fex-emu/cache/) after editing source if you
+    # want the cache to invalidate. A build-time custom-command refresh is a
+    # follow-up.
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} diff HEAD --binary
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      OUTPUT_VARIABLE GIT_DIRTY_DIFF
+      ERROR_QUIET)
+    if (NOT GIT_DIRTY_DIFF STREQUAL "")
+      string(SHA1 GIT_HASH "${GIT_HASH}${GIT_DIRTY_DIFF}")
+      message(STATUS "FEX commit (dirty-derived): ${GIT_HASH}")
+    endif()
   endif()
 else()
   set(GIT_HASH "${OVERRIDE_HASH}")
