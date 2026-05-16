@@ -1202,8 +1202,12 @@ public:
   }
 
   // Conditional branch: bc BO, BI, offset
+  // BD field is 14 bits signed, i.e. byte offset must fit in [-32768, +32764].
+  // Silent masking here means out-of-range forward branches land in random
+  // nearby blocks; assert so we catch JIT block growths past the limit.
   void bc(uint32_t bo, uint32_t bi, int32_t offset) {
     assert((offset & 3) == 0);
+    assert(offset >= -32768 && offset <= 32764 && "bc offset out of 14-bit signed range");
     uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 0u);
   }
@@ -1424,17 +1428,23 @@ public:
   // rfid (return from interrupt doubleword; supervisor only, just for completeness)
   void rfid() { Emit32((19u << 26) | (18u << 1)); }
 
-  // Patch a previously emitted branch at byte offset to jump to current position
+  // Patch a previously emitted branch at byte offset to jump to current position.
+  // Range checks: opcode 18 (b) has 24-bit signed LI (byte offset ±32 MiB);
+  // opcode 16 (bc) has 14-bit signed BD (byte offset ±32 KiB).  Silent
+  // truncation in either field mis-patches the branch to a wrong target.
   void PatchBranchAt(size_t patch_offset, size_t target_offset) {
     uint32_t insn;
     memcpy(&insn, Buffer + patch_offset, 4);
     uint32_t opcode = insn >> 26;
     int32_t offset = static_cast<int32_t>(target_offset) - static_cast<int32_t>(patch_offset);
+    assert((offset & 3) == 0);
 
     if (opcode == 18) {  // unconditional branch
+      assert(offset >= -(1 << 25) && offset < (1 << 25) && "b: LI offset out of 24-bit signed range");
       uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
       insn = (insn & 0xFC000003u) | (li << 2);
     } else if (opcode == 16) {  // conditional branch
+      assert(offset >= -32768 && offset <= 32764 && "bc: BD offset out of 14-bit signed range");
       uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
       insn = (insn & 0xFFFF0003u) | (bd << 2);
     }
