@@ -58,8 +58,12 @@ void CopySigInfo(FEXCore::x86::siginfo_t* Info, const siginfo_t& Host) {
       Info->_sifields._sigchld.pid = Host.si_pid;
       Info->_sifields._sigchld.uid = Host.si_uid;
       Info->_sifields._sigchld.status = Host.si_status;
-      Info->_sifields._sigchld.utime = Host.si_utime;
-      Info->_sifields._sigchld.stime = Host.si_stime;
+      // Host si_utime / si_stime are clock_t (64-bit on PPC); guest field is
+      // 32-bit on i386.  Explicit cast documents the truncation — for very
+      // long-running children (CPU-seconds > ~49 days at HZ=100) the high
+      // bits are lost.  This matches what a real i386 kernel would do.
+      Info->_sifields._sigchld.utime = static_cast<int32_t>(Host.si_utime);
+      Info->_sifields._sigchld.stime = static_cast<int32_t>(Host.si_stime);
       break;
     case SIGALRM:
     case SIGVTALRM:
