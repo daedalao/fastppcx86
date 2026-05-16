@@ -4742,7 +4742,42 @@ DEF_OP(Vector_F64ToI32) {
   // upper half (CVTPD2DQ YMM) or want it zeroed (CVTPD2DQ XMM via
   // AVX128_Zext). Doing this conditionally on the Zero flag left the
   // duplicate-int garbage visible in the YMM path's VBSL, miscompiling
-  // CVTPD2DQ/CVTTPD2DQ 256→128.
+  // CVTPD2DQ/CVTTPD2DQ 256->128.
+
+  // First: build the overflow mask BEFORE packing the convert result, so
+  // we have the f64 source comparison available in a per-lane form that
+  // shares the same BE byte 0..3-of-each-dw layout as xvcvdpsxws's output.
+  // POWER returns INT_MAX on f64 +overflow but x86 wants INT_MIN (the
+  // "integer indefinite" sentinel).  NaN already maps to INT_MIN per POWER
+  // and xvcmpgedp NaN compare returns 0 — both handled correctly.
+  //
+  // Sequence:
+  //   1. Stash 2^31_f64 splat into the stack scratch.
+  //   2. Load it into VTMP2 (overwriting any prior content), compare:
+  //        VTMP2 = (Src >= splat(2^31_f64)) per lane, all-ones or zero
+  //   3. xxsel between Dst (POWER's INT_MAX-saturated result) and an
+  //      INT_MIN broadcast.  Since the mask's per-dw layout is full-64-on
+  //      or full-64-off, xxsel acts per-byte but identically across all
+  //      bytes of each dw — i.e. for each i64 lane, either preserve all
+  //      32 bits of POWER's result word OR substitute INT_MIN.
+  //   4. AFTER the substitution, do the existing vperm-pack to LE-low.
+  LoadConstant(TMP1, 0x43E0000000000000ULL);  // 2^31 as f64
+  std(TMP1, -16, r1); std(TMP1, -8, r1);
+  addi(TMP1, r1, -16);
+  lvx(VTMP2, r(0), TMP1);                     // VTMP2 = splat f64(2^31)
+  xvcmpgedp(VTMP2, Src, VTMP2);               // per-i64-lane overflow mask
+  LoadConstant(TMP1, 0x80000000ULL);          // INT_MIN as i32; broadcast via mtvsrd-splat
+  std(TMP1, -16, r1);
+  LoadConstant(TMP1, 0x80000000ULL);
+  std(TMP1, -8, r1);
+  // Actually need per-32-bit INT_MIN.  Splat 0x80000000 8 times (16 bytes):
+  LoadConstant(TMP1, 0x8000000080000000ULL);
+  std(TMP1, -16, r1); std(TMP1, -8, r1);
+  addi(TMP1, r1, -16);
+  lvx(VTMP1, r(0), TMP1);                     // VTMP1 = splat i32(INT_MIN)
+  xxsel(Dst, Dst, VTMP1, VTMP2);              // mask ? INT_MIN : Dst (per-byte == per-i32-lane here)
+
+  // Now pack the (possibly INT_MIN-substituted) i32 results to LE-low.
   vspltisw(VTMP1, 0);
   LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -16, r1);
   LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
