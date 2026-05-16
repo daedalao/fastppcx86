@@ -73,7 +73,10 @@ static inline void EmitLoadTopPlus(PPC64JITCore* self, GPR dst, uint8_t offset) 
   if (offset != 0) {
     self->addi(dst, dst, static_cast<int16_t>(offset));
   }
-  self->andi_(dst, dst, 7);
+  // rldicl(dst, dst, 0, 61) masks low 3 bits without writing CR0.  Using
+  // andi_ here would silently clobber the canonical packed-NZCV scratch
+  // (CR0) on every x87 stack-top read.
+  self->rldicl(dst, dst, 0, 61);
 }
 
 // Compute STATE + X87_MM_OFFSET + ((TOP + Offset) & 7) * 16 into `dst_ea`.
@@ -107,7 +110,7 @@ DEF_OP(InitStack) {
 DEF_OP(IncStackTop) {
   lbz(TMP1, static_cast<int16_t>(X87_TOP_OFFSET), STATE);
   addi(TMP1, TMP1, 1);
-  andi_(TMP1, TMP1, 7);
+  rldicl(TMP1, TMP1, 0, 61);  // mask low 3 bits without writing CR0
   stb(TMP1, static_cast<int16_t>(X87_TOP_OFFSET), STATE);
 }
 
@@ -115,7 +118,7 @@ DEF_OP(IncStackTop) {
 DEF_OP(DecStackTop) {
   lbz(TMP1, static_cast<int16_t>(X87_TOP_OFFSET), STATE);
   addi(TMP1, TMP1, -1);
-  andi_(TMP1, TMP1, 7);
+  rldicl(TMP1, TMP1, 0, 61);  // mask low 3 bits without writing CR0
   stb(TMP1, static_cast<int16_t>(X87_TOP_OFFSET), STATE);
 }
 
