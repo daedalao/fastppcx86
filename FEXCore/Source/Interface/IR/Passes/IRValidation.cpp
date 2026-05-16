@@ -58,6 +58,19 @@ void IRValidation::Run(IREmitter* IREmit) {
   LOGMAN_THROW_A_FMT(HeaderOp->Header.Op == OP_IRHEADER, "First op wasn't IRHeader");
 #endif
 
+  // Spill-slot dominance tracking. The RA pass guarantees a slot is owned by
+  // at most one SSA at any block-IP (Phase 2 release fires at the last
+  // consumer's kill bit). For each block we track which spill currently
+  // backs each slot; any _FillRegister(slot=N) must be preceded by a
+  // _SpillRegister(slot=N) earlier in the same block, with matching class.
+  // A second Spill to the same slot is legal — that is the intra-block
+  // reuse case Phase 2 enables.
+  const uint32_t TotalSpillSlots = CurrentIR.GetHeader()->SpillSlots;
+  fextl::vector<RegClass> SlotOwnerClass;
+  if (CurrentIR.PostRA()) {
+    SlotOwnerClass.assign(TotalSpillSlots, RegClass::Invalid);
+  }
+
   for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
     LOGMAN_THROW_A_FMT(BlockIROp->Header.Op == OP_CODEBLOCK, "IR type failed to be a code block");
@@ -71,6 +84,12 @@ void IRValidation::Run(IREmitter* IREmit) {
 
     // We only allow defs local to a single block, so clear live set per block
     NodeIsLive.MemClear(Count);
+
+    // Reset spill-slot ownership at every block boundary — slots are
+    // strictly block-local.
+    if (CurrentIR.PostRA() && !SlotOwnerClass.empty()) {
+      std::fill(SlotOwnerClass.begin(), SlotOwnerClass.end(), RegClass::Invalid);
+    }
 
     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
       const auto ID = CurrentIR.GetID(CodeNode);
@@ -178,6 +197,40 @@ void IRValidation::Run(IREmitter* IREmit) {
           Block->second.Predecessors.emplace_back(BlockNode);
         }
 
+        break;
+      }
+      case IR::OP_SPILLREGISTER: {
+        if (CurrentIR.PostRA()) {
+          auto Op = IROp->C<IR::IROp_SpillRegister>();
+          if (Op->Slot >= SlotOwnerClass.size()) {
+            HadError |= true;
+            Errors << "%" << ID << ": SpillRegister slot=" << Op->Slot
+                   << " exceeds IRHeader->SpillSlots=" << SlotOwnerClass.size() << std::endl;
+          } else {
+            SlotOwnerClass[Op->Slot] = Op->Class;
+          }
+        }
+        break;
+      }
+      case IR::OP_FILLREGISTER: {
+        if (CurrentIR.PostRA()) {
+          auto Op = IROp->C<IR::IROp_FillRegister>();
+          if (Op->Slot >= SlotOwnerClass.size()) {
+            HadError |= true;
+            Errors << "%" << ID << ": FillRegister slot=" << Op->Slot
+                   << " exceeds IRHeader->SpillSlots=" << SlotOwnerClass.size() << std::endl;
+          } else if (SlotOwnerClass[Op->Slot] == RegClass::Invalid) {
+            HadError |= true;
+            Errors << "%" << ID << ": FillRegister slot=" << Op->Slot
+                   << " has no dominating SpillRegister in this block" << std::endl;
+          } else if (SlotOwnerClass[Op->Slot] != Op->Class) {
+            HadError |= true;
+            Errors << "%" << ID << ": FillRegister slot=" << Op->Slot
+                   << " class=" << uint32_t(Op->Class)
+                   << " differs from current SpillRegister class=" << uint32_t(SlotOwnerClass[Op->Slot])
+                   << std::endl;
+          }
+        }
         break;
       }
       case IR::OP_JUMP: {
