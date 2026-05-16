@@ -309,9 +309,11 @@ void PPC64EmitterBase::PopCalleeSavedRegisters() {
   // Restore CR (caller's linkage area) and LR.
   lwz(TMP2, CR_SAVE_OFFSET, r1);
   ld(r(0), LR_SAVE_OFFSET, r1);
-  // mtcrf with FXM=0xFF restores all 8 CR fields (only 2/3/4 are required, but
-  // restoring all is harmless and matches the mfcr above).
-  mtcrf(0xFF, TMP2);
+  // Per ELFv2 ABI only CR2/3/4 are callee-saved (FXM=0x38).  Restoring all
+  // 8 fields would overwrite CR0 (the JIT block may have packed post-spill
+  // NZCV before exiting) and CR1/5/6/7 (volatile per ABI but cleaner to
+  // leave alone).  Only-CR2/3/4 is faster and ABI-correct.
+  mtcrf(0x38, TMP2);
   mtlr(r(0));
 
   // Deallocate frame.
