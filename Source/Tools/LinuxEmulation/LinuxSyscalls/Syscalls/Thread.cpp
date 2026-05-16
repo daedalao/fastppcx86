@@ -616,6 +616,16 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(clone3, ([](FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::kernel_clone3_args* cl_args, size_t size) -> uint64_t {
+                          // Kernel requires size >= CLONE_ARGS_SIZE_VER0 (= 64,
+                          // the first clone3 ABI version).  Smaller sizes get
+                          // -EINVAL from the host kernel anyway; reject early to
+                          // avoid spawning an unflagged kernel thread on size=0
+                          // (memcpy would copy zero bytes, leaving args.flags=0
+                          // which is interpreted as fork-style).
+                          // CLONE_ARGS_SIZE_VER0 comes from linux/sched.h (= 64).
+                          if (size < CLONE_ARGS_SIZE_VER0) {
+                            return -EINVAL;
+                          }
                           FEX::HLE::clone3_args args {};
                           args.Type = TypeOfClone::TYPE_CLONE3;
                           memcpy(&args.args, cl_args, std::min(sizeof(FEX::HLE::kernel_clone3_args), size));

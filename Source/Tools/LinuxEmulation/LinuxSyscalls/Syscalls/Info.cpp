@@ -40,6 +40,11 @@ void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(uname, [](FEXCore::Core::CpuStateFrame* Frame, struct utsname* buf) -> uint64_t {
     auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
+    // Verify writability before doing any strcpy/memcpy into the guest buffer.
+    // A bad guest pointer would otherwise cause a host SEGV in the first write
+    // (the kernel returns -EFAULT in that case, which is what we want to mimic).
+    FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
+
     struct utsname Local {};
     if (::uname(&Local) == 0) {
       memcpy(buf->nodename, Local.nodename, sizeof(Local.nodename));

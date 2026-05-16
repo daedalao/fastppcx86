@@ -258,8 +258,14 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     fextl::vector<const char*> Args;
     fextl::vector<const char*> Envp;
 
+    // Kernel ARG_MAX is normally ~128K-2M but the per-argv pointer count
+    // cap is MAX_ARG_STRINGS (= 0x7FFFFFFF in Linux).  A pathological guest
+    // with no NUL terminator in argv[] would walk unbounded.  Cap defensively
+    // at a generous-but-bounded value so we fall out with -E2BIG instead.
+    constexpr int kMaxArgStrings = 0x7FFFFFFF;
+
     if (argv) {
-      for (int i = 0; argv[i]; i++) {
+      for (int i = 0; i < kMaxArgStrings && argv[i]; i++) {
         Args.push_back(reinterpret_cast<const char*>(static_cast<uintptr_t>(argv[i])));
       }
 
@@ -267,7 +273,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     }
 
     if (envp) {
-      for (int i = 0; envp[i]; i++) {
+      for (int i = 0; i < kMaxArgStrings && envp[i]; i++) {
         Envp.push_back(reinterpret_cast<const char*>(static_cast<uintptr_t>(envp[i])));
       }
       Envp.push_back(nullptr);
