@@ -142,7 +142,7 @@ bool fex_custom_repack_exit(guest_layout<wl_interface>&, const host_layout<wl_in
 }
 void fex_custom_repack_entry(host_layout<wl_message>& into, const guest_layout<wl_message>& from) {
   auto& host_method = into.data;
-  auto num_types = std::ranges::count_if(std::string_view {host_method.signature}, isalpha);
+  auto num_types = std::ranges::count_if(std::string_view {host_method.signature}, [](char c) { return isalpha(static_cast<unsigned char>(c)); });
   if (num_types) {
     host_method.types = new const wl_interface*[num_types];
     for (int type = 0; type < num_types; ++type) {
@@ -175,7 +175,7 @@ static auto fex_wl_remap_argument_list(guest_layout<wl_argument*> args, const wl
 #else
   // Return a new array of elements zero-extended to 64-bit
   std::array<wl_argument, WL_CLOSURE_MAX_ARGS> host_args;
-  int arg_count = std::ranges::count_if(std::string_view {message.signature}, isalpha);
+  int arg_count = std::ranges::count_if(std::string_view {message.signature}, [](char c) { return isalpha(static_cast<unsigned char>(c)); });
   for (int i = 0; i < arg_count; ++i) {
     // NOTE: wl_argument can store a pointer argument, so for 32-bit guests
     //       we need to make sure the upper 32-bits are explicitly zeroed

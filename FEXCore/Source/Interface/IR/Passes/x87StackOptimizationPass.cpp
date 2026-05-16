@@ -96,9 +96,6 @@ public:
     buffer[Offset] = {StackSlot::VALID, Value};
   }
 
-  bool isValid(size_t Offset) const {
-    return buffer[Offset].first;
-  }
 
   void clear() {
     for (auto& Elem : buffer) {

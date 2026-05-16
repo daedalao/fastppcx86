@@ -139,8 +139,16 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   const VkInstanceCreateInfo* vk_struct_base = a_0;
   for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
        vk_struct = vk_struct->pNext) {
-    // Override guest callbacks used for VK_EXT_debug_report
-    if (reinterpret_cast<const VkBaseInStructure*>(vk_struct->pNext)->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT) {
+    // Override guest callbacks used for VK_EXT_debug_report AND
+    // VK_EXT_debug_utils.  Both struct types embed a pfn*Callback that is
+    // a guest VA — if native libvulkan invokes them, it runs guest code as
+    // host code and SEGVs.  The standalone vkCreateDebugUtilsMessengerEXT
+    // path replaces pfnUserCallback with DummyVkDebugUtilsMessengerCallback,
+    // but the pNext-of-VkInstanceCreateInfo path was bypassing that
+    // protection entirely — strip the messenger struct as well.
+    const auto sType = reinterpret_cast<const VkBaseInStructure*>(vk_struct->pNext)->sType;
+    if (sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT ||
+        sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
       // Overwrite the pNext pointer, ignoring its const-qualifier
       const_cast<VkBaseInStructure*>(vk_struct)->pNext = vk_struct->pNext->pNext;
 

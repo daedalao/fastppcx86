@@ -44,7 +44,7 @@ host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
 
 host_layout<_XDisplay*>::~host_layout() {
   // Flush host-side event queue to make effects of the guest-side connection visible
-  x11_manager.HostXFlush(data);
+  if (data) x11_manager.HostXFlush(data);
 }
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
