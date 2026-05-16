@@ -133,8 +133,16 @@ DEF_OP(AtomicFetchAdd) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  //
+  // Use TMP4 — NOT TMP3 — because the `Addr == Dst` stash above may have just
+  // parked the address in TMP3.  `mfcr(TMP3)` would silently overwrite the
+  // address, and every subsequent andi_/LOAD/STORE that uses `A` (=TMP3) would
+  // dereference CR0 bits instead.  This is the same constraint AtomicSwap has
+  // used since f6db15238; the seven Fetch* ops in 8743eb4f5 originally used
+  // TMP3 and corrupted the address whenever RA aliased Dst onto Addr — which
+  // happens routinely in jit_500/jit_500_m blocks (e.g. `lock not [r15+1]`).
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -163,8 +171,8 @@ DEF_OP(AtomicFetchAdd) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +192,8 @@ DEF_OP(AtomicFetchSub) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -214,8 +222,8 @@ DEF_OP(AtomicFetchSub) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +243,8 @@ DEF_OP(AtomicFetchAnd) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -265,8 +273,8 @@ DEF_OP(AtomicFetchAnd) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +294,8 @@ DEF_OP(AtomicFetchCLR) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -316,8 +324,8 @@ DEF_OP(AtomicFetchCLR) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,8 +345,8 @@ DEF_OP(AtomicFetchOr) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -367,8 +375,8 @@ DEF_OP(AtomicFetchOr) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +396,8 @@ DEF_OP(AtomicFetchXor) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -418,8 +426,8 @@ DEF_OP(AtomicFetchXor) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +445,8 @@ DEF_OP(AtomicFetchNeg) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP3);
-  std(TMP3, -8, r1);
+  mfcr(TMP4);
+  std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -467,8 +475,8 @@ DEF_OP(AtomicFetchNeg) {
   Bind(&done);
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
-  ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  ld(TMP4, -8, r1);
+  mtcrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
