@@ -2337,7 +2337,7 @@ struct fex_gen_config<vkCreateInstance> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCreateInstance, 2, VkInstance*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkDestroyInstance> {};
+struct fex_gen_config<vkDestroyInstance> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkEnumeratePhysicalDevices> {};
@@ -2367,7 +2367,7 @@ struct fex_gen_config<vkCreateDevice> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCreateDevice, 3, VkDevice*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkDestroyDevice> {};
+struct fex_gen_config<vkDestroyDevice> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkEnumerateInstanceExtensionProperties> {};
 template<>
@@ -2561,7 +2561,7 @@ struct fex_gen_config<vkDestroyBufferView> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkCreateShaderModule> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyShaderModule> {};
+struct fex_gen_config<vkDestroyShaderModule> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkCreatePipelineCache> : fexgen::custom_host_impl {};
 template<>
@@ -2755,9 +2755,9 @@ template<>
 struct fex_gen_config<vkCmdDispatchBase> {};
 #endif
 template<>
-struct fex_gen_config<vkCreateDescriptorUpdateTemplate> {};
+struct fex_gen_config<vkCreateDescriptorUpdateTemplate> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyDescriptorUpdateTemplate> {};
+struct fex_gen_config<vkDestroyDescriptorUpdateTemplate> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkUpdateDescriptorSetWithTemplate> {};
 template<>
@@ -2766,9 +2766,9 @@ template<>
 struct fex_gen_config<vkGetDescriptorSetLayoutSupport> {};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkCreateSamplerYcbcrConversion> {};
+struct fex_gen_config<vkCreateSamplerYcbcrConversion> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroySamplerYcbcrConversion> {};
+struct fex_gen_config<vkDestroySamplerYcbcrConversion> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkResetQueryPool> {};
 template<>
@@ -2804,9 +2804,9 @@ struct fex_gen_config<vkCmdEndRenderPass2> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceToolProperties> {};
 template<>
-struct fex_gen_config<vkCreatePrivateDataSlot> {};
+struct fex_gen_config<vkCreatePrivateDataSlot> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyPrivateDataSlot> {};
+struct fex_gen_config<vkDestroyPrivateDataSlot> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkSetPrivateData> {};
 template<>
@@ -2931,7 +2931,7 @@ template<>
 struct fex_gen_config<vkCmdSetRenderingInputAttachmentIndices> {};
 #endif
 template<>
-struct fex_gen_config<vkDestroySurfaceKHR> {};
+struct fex_gen_config<vkDestroySurfaceKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceSupportKHR> {};
 template<>
@@ -2968,11 +2968,11 @@ struct fex_gen_config<vkGetDisplayPlaneSupportedDisplaysKHR> {};
 template<>
 struct fex_gen_config<vkGetDisplayModePropertiesKHR> {};
 template<>
-struct fex_gen_config<vkCreateDisplayModeKHR> {};
+struct fex_gen_config<vkCreateDisplayModeKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetDisplayPlaneCapabilitiesKHR> {};
 template<>
-struct fex_gen_config<vkCreateDisplayPlaneSurfaceKHR> {};
+struct fex_gen_config<vkCreateDisplayPlaneSurfaceKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkCreateSharedSwapchainsKHR> {};
 template<>
@@ -3049,9 +3049,9 @@ struct fex_gen_config<vkCmdPushDescriptorSetWithTemplateKHR> {};
 template<>
 struct fex_gen_param<vkCmdPushDescriptorSetWithTemplateKHR, 4, const void*> : fexgen::assume_compatible_data_layout {};
 template<>
-struct fex_gen_config<vkCreateDescriptorUpdateTemplateKHR> {};
+struct fex_gen_config<vkCreateDescriptorUpdateTemplateKHR> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyDescriptorUpdateTemplateKHR> {};
+struct fex_gen_config<vkDestroyDescriptorUpdateTemplateKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkUpdateDescriptorSetWithTemplateKHR> {};
 template<>
@@ -3100,9 +3100,9 @@ struct fex_gen_config<vkGetBufferMemoryRequirements2KHR> {};
 template<>
 struct fex_gen_config<vkGetImageSparseMemoryRequirements2KHR> {};
 template<>
-struct fex_gen_config<vkCreateSamplerYcbcrConversionKHR> {};
+struct fex_gen_config<vkCreateSamplerYcbcrConversionKHR> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroySamplerYcbcrConversionKHR> {};
+struct fex_gen_config<vkDestroySamplerYcbcrConversionKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkBindBufferMemory2KHR> {};
 template<>
@@ -3353,7 +3353,7 @@ struct fex_gen_config<vkCreateDebugUtilsMessengerEXT> : fexgen::custom_host_impl
 template<>
 struct fex_gen_param<vkCreateDebugUtilsMessengerEXT, 1, const VkDebugUtilsMessengerCreateInfoEXT*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkDestroyDebugUtilsMessengerEXT> {};
+struct fex_gen_config<vkDestroyDebugUtilsMessengerEXT> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkSubmitDebugUtilsMessageEXT> {};
@@ -3364,9 +3364,9 @@ struct fex_gen_config<vkGetPhysicalDeviceMultisamplePropertiesEXT> {};
 template<>
 struct fex_gen_config<vkGetImageDrmFormatModifierPropertiesEXT> {};
 template<>
-struct fex_gen_config<vkCreateValidationCacheEXT> {};
+struct fex_gen_config<vkCreateValidationCacheEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyValidationCacheEXT> {};
+struct fex_gen_config<vkDestroyValidationCacheEXT> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkMergeValidationCachesEXT> {};
 template<>
@@ -3480,7 +3480,7 @@ struct fex_gen_config<vkGetPhysicalDeviceCooperativeMatrixPropertiesNV> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV> {};
 template<>
-struct fex_gen_config<vkCreateHeadlessSurfaceEXT> {};
+struct fex_gen_config<vkCreateHeadlessSurfaceEXT> : fexgen::custom_host_impl {};
 #endif
 template<>
 struct fex_gen_config<vkCmdSetLineStippleEXT> {};
@@ -3546,9 +3546,9 @@ struct fex_gen_config<vkAcquireDrmDisplayEXT> {};
 template<>
 struct fex_gen_config<vkGetDrmDisplayEXT> {};
 template<>
-struct fex_gen_config<vkCreatePrivateDataSlotEXT> {};
+struct fex_gen_config<vkCreatePrivateDataSlotEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyPrivateDataSlotEXT> {};
+struct fex_gen_config<vkDestroyPrivateDataSlotEXT> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkSetPrivateDataEXT> {};
 template<>

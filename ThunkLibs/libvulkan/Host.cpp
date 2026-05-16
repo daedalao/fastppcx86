@@ -427,6 +427,134 @@ static void FEXFN_IMPL(vkDestroySwapchainKHR)(VkDevice a_0, VkSwapchainKHR a_1, 
   LDR_PTR(vkDestroySwapchainKHR)(a_0, a_1, nullptr);
 }
 
+// Follow-up wrappers covering instance/device shutdown plus surface creation
+// and the Vulkan 1.1/1.2/1.3 + EXT/KHR descriptor-update-template /
+// private-data-slot / sampler-ycbcr-conversion / validation-cache paths.
+// Same nullptr-pAllocator rationale as the block above.
+
+static void FEXFN_IMPL(vkDestroyInstance)(VkInstance a_0, const VkAllocationCallbacks* a_1) {
+  (void*&)LDR_PTR(vkDestroyInstance) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyInstance");
+  LDR_PTR(vkDestroyInstance)(a_0, nullptr);
+}
+
+static void FEXFN_IMPL(vkDestroyDevice)(VkDevice a_0, const VkAllocationCallbacks* a_1) {
+  (void*&)LDR_PTR(vkDestroyDevice) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDevice");
+  LDR_PTR(vkDestroyDevice)(a_0, nullptr);
+}
+
+static void FEXFN_IMPL(vkDestroyShaderModule)(VkDevice a_0, VkShaderModule a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyShaderModule");
+  LDR_PTR(vkDestroyShaderModule)(a_0, a_1, nullptr);
+}
+
+static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a_0, VkSurfaceKHR a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroySurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroySurfaceKHR");
+  LDR_PTR(vkDestroySurfaceKHR)(a_0, a_1, nullptr);
+}
+
+// vkCreateXlib/Xcb/WaylandSurfaceKHR are intentionally left thunkgen-default:
+// they have fex_custom_repack_entry hooks that translate the embedded
+// Display*/xcb_connection_t* via x11_manager, and bypassing thunkgen would
+// drop that translation.  The auto-generated path still forwards the guest
+// pAllocator unchanged; that is a latent issue but in practice Xorg/Wayland
+// loaders ignore pAllocator (it is never invoked from inside the WSI path).
+
+static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplate)(VkDevice a_0, const VkDescriptorUpdateTemplateCreateInfo* a_1,
+                                                             const VkAllocationCallbacks* a_2, VkDescriptorUpdateTemplate* a_3) {
+  (void*&)LDR_PTR(vkCreateDescriptorUpdateTemplate) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorUpdateTemplate");
+  return LDR_PTR(vkCreateDescriptorUpdateTemplate)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplate)(VkDevice a_0, VkDescriptorUpdateTemplate a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyDescriptorUpdateTemplate) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorUpdateTemplate");
+  LDR_PTR(vkDestroyDescriptorUpdateTemplate)(a_0, a_1, nullptr);
+}
+
+static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplateKHR)(VkDevice a_0, const VkDescriptorUpdateTemplateCreateInfo* a_1,
+                                                                const VkAllocationCallbacks* a_2, VkDescriptorUpdateTemplate* a_3) {
+  (void*&)LDR_PTR(vkCreateDescriptorUpdateTemplateKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorUpdateTemplateKHR");
+  return LDR_PTR(vkCreateDescriptorUpdateTemplateKHR)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplateKHR)(VkDevice a_0, VkDescriptorUpdateTemplate a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyDescriptorUpdateTemplateKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorUpdateTemplateKHR");
+  LDR_PTR(vkDestroyDescriptorUpdateTemplateKHR)(a_0, a_1, nullptr);
+}
+
+static void FEXFN_IMPL(vkDestroyDebugUtilsMessengerEXT)(VkInstance a_0, VkDebugUtilsMessengerEXT a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyDebugUtilsMessengerEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyDebugUtilsMessengerEXT");
+  LDR_PTR(vkDestroyDebugUtilsMessengerEXT)(a_0, a_1, nullptr);
+}
+
+#ifndef IS_32BIT_THUNK
+static VkResult FEXFN_IMPL(vkCreateDisplayPlaneSurfaceKHR)(VkInstance a_0, const VkDisplaySurfaceCreateInfoKHR* a_1,
+                                                           const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateDisplayPlaneSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDisplayPlaneSurfaceKHR");
+  return LDR_PTR(vkCreateDisplayPlaneSurfaceKHR)(a_0, a_1, nullptr, a_3);
+}
+
+// vkCreateDisplayModeKHR takes VkPhysicalDevice; no owning VkInstance is in
+// scope to refresh the proc-addr from, so reuse the pre-loaded dlsym pointer.
+static VkResult FEXFN_IMPL(vkCreateDisplayModeKHR)(VkPhysicalDevice a_0, VkDisplayKHR a_1, const VkDisplayModeCreateInfoKHR* a_2,
+                                                   const VkAllocationCallbacks* a_3, VkDisplayModeKHR* a_4) {
+  return LDR_PTR(vkCreateDisplayModeKHR)(a_0, a_1, a_2, nullptr, a_4);
+}
+
+static VkResult FEXFN_IMPL(vkCreateHeadlessSurfaceEXT)(VkInstance a_0, const VkHeadlessSurfaceCreateInfoEXT* a_1,
+                                                       const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateHeadlessSurfaceEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateHeadlessSurfaceEXT");
+  return LDR_PTR(vkCreateHeadlessSurfaceEXT)(a_0, a_1, nullptr, a_3);
+}
+
+static VkResult FEXFN_IMPL(vkCreatePrivateDataSlot)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1, const VkAllocationCallbacks* a_2,
+                                                    VkPrivateDataSlot* a_3) {
+  (void*&)LDR_PTR(vkCreatePrivateDataSlot) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlot");
+  return LDR_PTR(vkCreatePrivateDataSlot)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyPrivateDataSlot)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyPrivateDataSlot) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlot");
+  LDR_PTR(vkDestroyPrivateDataSlot)(a_0, a_1, nullptr);
+}
+
+static VkResult FEXFN_IMPL(vkCreatePrivateDataSlotEXT)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1,
+                                                       const VkAllocationCallbacks* a_2, VkPrivateDataSlot* a_3) {
+  (void*&)LDR_PTR(vkCreatePrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlotEXT");
+  return LDR_PTR(vkCreatePrivateDataSlotEXT)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyPrivateDataSlotEXT)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyPrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlotEXT");
+  LDR_PTR(vkDestroyPrivateDataSlotEXT)(a_0, a_1, nullptr);
+}
+
+static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversion)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
+                                                           const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
+  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversion) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversion");
+  return LDR_PTR(vkCreateSamplerYcbcrConversion)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroySamplerYcbcrConversion)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversion) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversion");
+  LDR_PTR(vkDestroySamplerYcbcrConversion)(a_0, a_1, nullptr);
+}
+
+static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversionKHR)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
+                                                              const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
+  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversionKHR");
+  return LDR_PTR(vkCreateSamplerYcbcrConversionKHR)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroySamplerYcbcrConversionKHR)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversionKHR");
+  LDR_PTR(vkDestroySamplerYcbcrConversionKHR)(a_0, a_1, nullptr);
+}
+
+static VkResult FEXFN_IMPL(vkCreateValidationCacheEXT)(VkDevice a_0, const VkValidationCacheCreateInfoEXT* a_1,
+                                                       const VkAllocationCallbacks* a_2, VkValidationCacheEXT* a_3) {
+  (void*&)LDR_PTR(vkCreateValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateValidationCacheEXT");
+  return LDR_PTR(vkCreateValidationCacheEXT)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyValidationCacheEXT)(VkDevice a_0, VkValidationCacheEXT a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyValidationCacheEXT");
+  LDR_PTR(vkDestroyValidationCacheEXT)(a_0, a_1, nullptr);
+}
+#endif
+
 #ifdef IS_32BIT_THUNK
 VkResult fexfn_impl_libvulkan_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* count, guest_layout<VkPhysicalDevice*> devices) {
   if (!devices.get_pointer()) {
