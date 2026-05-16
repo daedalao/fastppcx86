@@ -227,7 +227,19 @@ void PPC64Dispatcher::EmitDispatcher() {
     // LAHF after popfq=0 across ~25 ASM tests (Primary_9C/9D/84/85,
     // ShiftZeroFlagsUpdate, InitialPFFlag, BLSI_flags, etc.). Running cmpd
     // into CR7 leaves CR0 as set by FillStaticRegs.
-    cmpd(cr(7), TMP4, TMP1);
+    // Use cmpw in 32-bit mode: x86 RIP is 32-bit, and FEX zero-extends RIP
+    // to 64 bits via MaybeClrUpper32 before the L1 lookup.  The cached
+    // GuestCode is published as zero-extended-from-32 too, so cmpd is
+    // correct.  But if any publisher were to leave non-zero upper bits in
+    // either operand (32-bit IR ops in the future, signal-frame paths,
+    // etc.), cmpd would falsely miss and take the slow path.  cmpw is
+    // explicitly only-low-32 — it matches what x86 32-bit branch targets
+    // logically are.
+    if (CTX->Config.Is64BitMode()) {
+      cmpd(cr(7), TMP4, TMP1);
+    } else {
+      cmpw(cr(7), TMP4, TMP1);
+    }
 
     // If mismatch, take slow path through ExitFunctionLinker.
     // BO=12 (branch if true), BI=30 (CR7.EQ at PPC bit 4*7+2 = 30).
