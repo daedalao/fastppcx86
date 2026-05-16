@@ -1,12 +1,11 @@
 ;; Simpler versions of FXAM_Push* tests.
-;; In hostrunner tests this will fail because we mentioned below there's no support
-;; for the zero flag. In hostrunner RCX should contain 0x4000 instead of 0x400.
+;; FXAM Zero classification: RCX = 0x4000 (the architecturally-correct value).
 %ifdef CONFIG
 {
   "RegData": {
     "RAX": "0x6",
     "RBX": "0x0400",
-    "RCX": "0x0400",
+    "RCX": "0x4000",
     "RDX": "0x4100"
   }
 }
@@ -29,7 +28,7 @@ fxam
 fwait 
 
 fnstsw ax
-and ax, 0x4500 ; should be 0x4000 for zero, but there's no support for it at the moment, so it'll return 0x0400 as it does for a normal number.
+and ax, 0x4500 ; 0x4000 for zero (TopValid && ExpZero && MantissaZero -> C3:C2:C0 = 100, mask 0x4500 -> bit 14 only)
 mov ecx, eax
 
 fld1
