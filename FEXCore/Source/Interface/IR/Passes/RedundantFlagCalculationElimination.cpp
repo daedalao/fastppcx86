@@ -463,8 +463,10 @@ CondClass DeadFlagCalculationEliminination::X86ToArmFloatCond(CondClass X86) {
   //
   // SF/OF conditions are trivial and therefore shouldn't actually be generated
   switch (X86) {
-  case CondClass::UGE /* A  */: return CondClass::FGE /* GE */;
-  case CondClass::UGT /* AE */: return CondClass::FGT /* GT */;
+  // UGE = CF=0     = x86 "AE" (above-or-equal).  UGT = CF=0 && ZF=0 = x86 "A".
+  // Previous comments had A / AE swapped.  Functional mapping was correct.
+  case CondClass::UGE /* AE */: return CondClass::FGE /* GE */;
+  case CondClass::UGT /* A  */: return CondClass::FGT /* GT */;
   case CondClass::ULT /* B  */: return CondClass::SLT /* LT */;
   case CondClass::ULE /* BE */: return CondClass::SLE /* LE */;
   case CondClass::SLE /* LE */: return CondClass::SLE /* LE */;
