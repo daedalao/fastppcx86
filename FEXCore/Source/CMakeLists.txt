@@ -93,7 +93,10 @@ if (ARCHITECTURE_arm64)
   list(APPEND SRCS Utils/ArchHelpers/Arm64.cpp)
 elseif (ARCHITECTURE_ppc64le)
   # PPC64LE uses its own atomic helpers; no Arm64 stubs needed
-  # (stubs would pull in ARM-specific headers)
+  # (stubs would pull in ARM-specific headers).
+  # PPC64.cpp provides the SIGBUS / split-lock emulation infrastructure
+  # (Phase 1+2 -- handler registered, plug-in to AtomicOps deferred).
+  list(APPEND SRCS Utils/ArchHelpers/PPC64.cpp)
 else()
   list(APPEND SRCS Utils/ArchHelpers/Arm64_stubs.cpp)
 endif()

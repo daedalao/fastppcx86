@@ -21,6 +21,9 @@ $end_info$
 #include <FEXCore/Utils/FPState.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#ifdef ARCHITECTURE_ppc64le
+#include <FEXCore/Utils/ArchHelpers/PPC64.h>
+#endif
 #include <FEXHeaderUtils/Syscalls.h>
 
 #include <atomic>
@@ -1250,6 +1253,60 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
   };
 
   RegisterHostSignalHandler(SIGBUS, SigbusHandler, true);
+#endif
+
+#ifdef ARCHITECTURE_ppc64le
+  // PPC64LE SIGBUS handler -- split-lock infrastructure (Phase 1).
+  //
+  // POWER8's ldarx/lwarx/lharx/lbarx require natural alignment; an x86
+  // LOCK RMW on a misaligned EA will SIGBUS with si_code=BUS_ADRALN
+  // when dispatched to the reservation-load fast path. Today the JIT
+  // emits a runtime alignment check inline and falls back to a
+  // non-atomic LD->op->ST sequence on misalignment, which is incorrect
+  // across cores (see AtomicOps.cpp). Phase 3 will remove that fallback
+  // and rely on a SIGBUS-driven backpatch into PPC64_SplitLockEmulate;
+  // this handler is the SIGBUS detection half.
+  //
+  // Phase 1 (this code): detect a SIGBUS originating from a JIT-emitted
+  // reservation-load, increment telemetry, log, and decline. We don't
+  // yet advance PC / patch code, because the misaligned-fallback path
+  // in AtomicOps.cpp still owns correctness for these cases. Once
+  // Phase 3 lands and the fallback is removed, this handler will start
+  // returning a non-nullopt offset and the helper will actually unstick
+  // the thread.
+  const auto SigbusHandlerPPC64 = [](FEXCore::Core::InternalThreadState* Thread, int Signal, void* _info, void* ucontext) -> bool {
+    const auto PC = ArchHelpers::Context::GetPc(ucontext);
+    if (!Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
+      // SIGBUS outside JIT code -- let default handling (or a guest
+      // handler) take it.
+      return false;
+    }
+    siginfo_t* info = reinterpret_cast<siginfo_t*>(_info);
+    if (info->si_code != BUS_ADRALN) {
+      // We only own alignment SIGBUS. Other si_codes (BUS_ADRERR,
+      // BUS_OBJERR, BUS_MCEERR_*) are real faults.
+      return false;
+    }
+
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+    const auto Result = FEXCore::ArchHelpers::PPC64::HandleUnalignedAtomicSIGBUS(
+      Thread, PC, ArchHelpers::Context::GetArmGPRs(ucontext));
+    if (Result.has_value()) {
+      // Phase 3 will return a PC advance here. Today this branch is
+      // unreachable because HandleUnalignedAtomicSIGBUS always returns
+      // nullopt -- keep the wiring in place so Phase 3 is a single-
+      // file change.
+      ArchHelpers::Context::SetPc(ucontext, PC + Result.value());
+      return true;
+    }
+    // Phase 1 explicitly does NOT consume the signal -- the existing
+    // misaligned-fallback path in AtomicOps.cpp prevents this from
+    // firing in practice on aligned guest atomics; if it ever does
+    // fire, surfacing it as a fault is the safer Phase-1 behavior.
+    return false;
+  };
+
+  RegisterHostSignalHandler(SIGBUS, SigbusHandlerPPC64, true);
 #endif
   // Register pause signal handler.
   RegisterHostSignalHandler(SignalDelegator::SIGNAL_FOR_PAUSE, PauseHandler, true);
