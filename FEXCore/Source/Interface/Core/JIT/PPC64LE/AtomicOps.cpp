@@ -80,8 +80,14 @@ DEF_OP(AtomicSwap) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     STORE_NONATOMIC(Val, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -117,9 +123,15 @@ DEF_OP(AtomicFetchAdd) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     add(TMP2, Dst, Val);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -153,9 +165,15 @@ DEF_OP(AtomicFetchSub) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     subf(TMP2, Val, Dst);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -189,9 +207,15 @@ DEF_OP(AtomicFetchAnd) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     and_(TMP2, Dst, Val);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -225,9 +249,15 @@ DEF_OP(AtomicFetchCLR) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     andc(TMP2, Dst, Val);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -261,9 +291,15 @@ DEF_OP(AtomicFetchOr) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     or_(TMP2, Dst, Val);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -297,9 +333,15 @@ DEF_OP(AtomicFetchXor) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     xor_(TMP2, Dst, Val);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
@@ -331,9 +373,15 @@ DEF_OP(AtomicFetchNeg) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // x86 LOCK semantics require full SC; the aligned LL/SC path
+    // already supplies hwsync;...;isync, but the misaligned fallback
+    // was barrier-less, dropping the release/acquire fences.  Bracket
+    // with hwsync to match the aligned path's ordering.
+    hwsync();
     LOAD_NONATOMIC(Dst, A, Sz);
     neg(TMP2, Dst);
     STORE_NONATOMIC(TMP2, A, Sz);
+    hwsync();
     b(&done);
   }
   Bind(&aligned);
