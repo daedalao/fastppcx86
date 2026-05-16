@@ -953,6 +953,12 @@ void SyscallHandler::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThr
     // Code maps are closed upon fork in the child
     FM.SetProtectedCodeMapFD(-1);
 
+    // glibc reinstalls its SETXID handler when the child first calls
+    // pthread_create.  Re-arm NeedToCheckXID so we re-capture that handler
+    // for the child — without this the first setuid() in a forked child can
+    // run glibc native handler in JIT context and corrupt the SRA.
+    EnableXIDCheck();
+
     VMATracking.Mutex.StealAndDropActiveLocks();
   } else {
     VMATracking.Mutex.unlock();

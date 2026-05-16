@@ -320,6 +320,14 @@ public:
   void DisableXIDCheck() {
     NeedToCheckXID = false;
   }
+  // Re-arm post-fork: the child inherits NeedToCheckXID=false (parent already
+  // captured glibc SETXID handler) but glibc reinstalls SETXID for the child
+  // first newly-created thread; we need to capture THAT copy too, otherwise
+  // the new handler runs as native code in JIT context the first time guest
+  // setuid() fans out and corrupts SRA.
+  void EnableXIDCheck() {
+    NeedToCheckXID = true;
+  }
 
   constexpr static uint64_t TASK_MAX_64BIT = (1ULL << 48);
   constexpr static size_t MAX_LDT_ENTRIES = 8192;
