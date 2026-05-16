@@ -169,7 +169,19 @@ struct guest_layout<T*> {
   // Allow implicit conversion for function pointers, since they disallow use of host_layout
   guest_layout& operator=(const T* from) requires (std::is_function_v<T>)
   {
-    // TODO: Assert upper 32 bits are zero
+    // For 32-bit thunks, guest_layout's data field is uint32_t and we must
+    // verify the host VA fits.  A host pointer above 4 GiB silently truncated
+    // here would land in a downstream guest dispatch as a garbage address.
+    if constexpr (sizeof(data) == 4) {
+      // Plain fprintf+abort because LOGMAN_THROW headers aren't in this TU.
+      // Triggers ONLY on host VA above 4 GiB which is fatal anyway in a
+      // 32-bit thunk — silent truncation produces undebuggable downstream
+      // crashes.  Better to die at the obvious spot.
+      if ((reinterpret_cast<uintptr_t>(from) >> 32) != 0) {
+        fprintf(stderr, "FEX FATAL: guest_layout<T*> 32-bit truncation: host VA %p does not fit in 32 bits\n", (void*)from);
+        std::abort();
+      }
+    }
     data = reinterpret_cast<uintptr_t>(from);
     return *this;
   }
