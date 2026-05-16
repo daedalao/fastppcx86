@@ -198,21 +198,35 @@ void PPC64Dispatcher::EmitDispatcher() {
     // Address of L1 entry: L1Pointer + byte_offset
     add(TMP2, TMP2, TMP4);
 
-    // Load L1Entry: {HostCode (8 bytes), GuestCode (8 bytes)}
-    ld(TMP3, 0, TMP2);   // TMP3 = HostCode
-    ld(TMP4, 8, TMP2);   // TMP4 = GuestCode
+    // Load L1Entry: {HostCode (8 bytes), GuestCode (8 bytes)}.
+    //
+    // ORDERING NOTE (paired with LookupCacheEntry::Publish on the writer
+    // side): we MUST load GuestCode FIRST, branch on the compare, then load
+    // HostCode only on the success path.  The conditional branch establishes
+    // a control dependency that the PPC memory model honors as a load-load
+    // barrier for free, ensuring we don't observe a torn entry where
+    // GuestCode is the new value but HostCode is still stale.
+    //
+    // Loading HostCode first (the original code) was racy: a concurrent
+    // writer mid-Publish could leave us with {stale_HostCode, new_GuestCode},
+    // pass the cmpd, and jump into a half-installed / invalidated block --
+    // the recurring zero-IR-block spin observed at Steam's PLT-to-malloc
+    // stub.  ARM64 sidesteps this entirely by using `stp` (store-pair) for
+    // atomic publish; PPC64LE has no equivalent, hence the release-fence /
+    // control-dep pattern.
+    ld(TMP4, 8, TMP2);   // TMP4 = GuestCode (the "key")
 
     // Compare GuestCode with current RIP — into CR7, NOT CR0.
     //
-    // Why: SpillStaticRegs (called below in ExitFunctionLinker on L1 miss)
-    // packs CR0 + XER into flags[RFLAG_NZCV_LOC] as the canonical NZCV
-    // storage for cross-block transfer. If we used the default CR0 here,
-    // any L1 miss would overwrite the correct (just-spilled-by-the-JIT-
-    // block's-ExitFunction) NZCV with garbage from this lookup compare.
-    // Symptom was a phantom SF=1 (and sometimes ZF=1) appearing in PUSHF
-    // / LAHF after popfq=0 across ~25 ASM tests (Primary_9C/9D/84/85,
-    // ShiftZeroFlagsUpdate, InitialPFFlag, BLSI_flags, etc.). Running
-    // cmpd into CR7 leaves CR0 as set by FillStaticRegs.
+    // Why CR7: SpillStaticRegs (called below in ExitFunctionLinker on L1
+    // miss) packs CR0 + XER into flags[RFLAG_NZCV_LOC] as the canonical
+    // NZCV storage for cross-block transfer. If we used the default CR0
+    // here, any L1 miss would overwrite the correct (just-spilled-by-the-
+    // JIT-block's-ExitFunction) NZCV with garbage from this lookup compare.
+    // Symptom was a phantom SF=1 (and sometimes ZF=1) appearing in PUSHF /
+    // LAHF after popfq=0 across ~25 ASM tests (Primary_9C/9D/84/85,
+    // ShiftZeroFlagsUpdate, InitialPFFlag, BLSI_flags, etc.). Running cmpd
+    // into CR7 leaves CR0 as set by FillStaticRegs.
     cmpd(cr(7), TMP4, TMP1);
 
     // If mismatch, take slow path through ExitFunctionLinker.
@@ -230,7 +244,11 @@ void PPC64Dispatcher::EmitDispatcher() {
     }
 
     Bind(&match_label);
-    // Fast path: JIT block found, jump to it.
+    // Fast path: JIT block found.  Load HostCode AFTER the conditional
+    // branch — the control dependency on the GuestCode==RIP check provides
+    // load-load ordering on PPC, so this load is guaranteed to see the
+    // HostCode that was published alongside the matched GuestCode.
+    ld(TMP3, 0, TMP2);   // TMP3 = HostCode (loaded under control-dep)
     mtctr(TMP3);
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();

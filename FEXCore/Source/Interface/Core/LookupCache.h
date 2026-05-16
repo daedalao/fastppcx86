@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "Interface/Context/Context.h"
+#include <atomic>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
@@ -161,6 +162,23 @@ public:
   struct LookupCacheEntry {
     uintptr_t HostCode;
     uintptr_t GuestCode;
+
+    // Publish a new mapping with release ordering so that any reader that
+    // observes the new GuestCode (the "key") is guaranteed to also observe
+    // the new HostCode (the "data").  Mirrors ARM64's atomic-pair `stp`
+    // semantics on architectures (PPC64LE, riscv64) that don't have a
+    // store-pair instruction.
+    //
+    // Readers must use either:
+    //   (a) load GuestCode, conditional branch on the compare, then load
+    //       HostCode on the success path (control-dependency-ordered, free
+    //       on PPC), OR
+    //   (b) load GuestCode with acquire ordering, then load HostCode.
+    void Publish(uintptr_t NewHostCode, uintptr_t NewGuestCode) {
+      HostCode = NewHostCode;
+      std::atomic_thread_fence(std::memory_order_release);
+      GuestCode = NewGuestCode;
+    }
   };
 
   LookupCache(FEXCore::Context::ContextImpl* CTX);
@@ -174,9 +192,12 @@ public:
   }
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
-    // Try L1, no lock needed
+    // Try L1, no lock needed.  Acquire fence pairs with the writer's release
+    // in LookupCacheEntry::Publish so that observing the new GuestCode also
+    // observes the new HostCode (no torn read of a half-installed entry).
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
+      std::atomic_thread_fence(std::memory_order_acquire);
       return L1Entry.HostCode;
     }
 
@@ -202,8 +223,9 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
-            L1Entry.GuestCode = Address;
-            L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
+            // Publish atomically: HostCode first, release fence, then
+            // GuestCode (the key the dispatcher / fast-path reader checks).
+            L1Entry.Publish(BlockPointers[PageOffset].HostCode, Address);
             HostPtr = L1Entry.HostCode;
           }
         }
@@ -385,10 +407,10 @@ private:
       CachedCodePages[CodePage >> 12].insert(Address);
     }
 
-    // Do L1
+    // Do L1.  Atomic publish: see LookupCacheEntry::Publish for why ordering
+    // matters on weakly-ordered hosts (PPC64LE).
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    L1Entry.GuestCode = Address;
-    L1Entry.HostCode = Entry.HostCode;
+    L1Entry.Publish(Entry.HostCode, Address);
 
     if (!DisableL2Cache() && !L1Only) {
       // Do ful map
