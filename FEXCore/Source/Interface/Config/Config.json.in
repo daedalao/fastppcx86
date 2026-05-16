@@ -453,6 +453,32 @@
           "Inert (no effect) when TSOEnabled is false."
         ]
       },
+      "SyscallObserve": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Opt-in: enable the FEX SyscallObserver. Wraps the bare-passthrough",
+          "implementations of pathology-prone syscalls (futex, tgkill) with",
+          "per-thread state tracking and structured log emission. Zero perf",
+          "cost when disabled; runtime-toggleable.  Currently provides:",
+          "  - futex EAGAIN-storm detection (same addr/op/val repeated within",
+          "    a small time window) with an `IFmt` log on first crossing.",
+          "  - tgkill call logging (cross-thread signal delivery — Mono GC",
+          "    stop-the-world surfaces here)."
+        ]
+      },
+      "FutexMitigate": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Companion to SyscallObserve. When set AND a futex EAGAIN-storm",
+          "is detected for the current thread, emit sched_yield() before",
+          "returning to guest. Lets a competing waker thread make progress,",
+          "breaking userspace mutex livelock that PPC64LE weak memory",
+          "ordering can induce when the guest expects x86-TSO visibility.",
+          "Inert when SyscallObserve is false."
+        ]
+      },
       "VectorTSOEnabled": {
         "Type": "bool",
         "Default": "false",
