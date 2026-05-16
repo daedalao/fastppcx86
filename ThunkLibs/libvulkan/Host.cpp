@@ -2148,6 +2148,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
     // Copy unmodified
     static_assert(sizeof(guest_layout<VkDeviceAddress>) == sizeof(uint64_t));
     memcpy(&into.data.data.accelerationStructure, &from.data.data, sizeof(uint64_t));
+    break;
   }
 
   case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
