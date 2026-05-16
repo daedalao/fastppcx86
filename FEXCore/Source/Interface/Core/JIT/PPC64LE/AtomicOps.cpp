@@ -130,6 +130,11 @@ DEF_OP(AtomicFetchAdd) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -156,6 +161,10 @@ DEF_OP(AtomicFetchAdd) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +181,11 @@ DEF_OP(AtomicFetchSub) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -198,6 +212,10 @@ DEF_OP(AtomicFetchSub) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +232,11 @@ DEF_OP(AtomicFetchAnd) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -240,6 +263,10 @@ DEF_OP(AtomicFetchAnd) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +283,11 @@ DEF_OP(AtomicFetchCLR) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -282,6 +314,10 @@ DEF_OP(AtomicFetchCLR) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +334,11 @@ DEF_OP(AtomicFetchOr) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -324,6 +365,10 @@ DEF_OP(AtomicFetchOr) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +385,11 @@ DEF_OP(AtomicFetchXor) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -366,6 +416,10 @@ DEF_OP(AtomicFetchXor) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +434,11 @@ DEF_OP(AtomicFetchNeg) {
   GPR A = Addr;
   if (Addr == Dst) { mr(TMP3, Addr); A = TMP3; }
 
+  // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
+  // here to defend against any IR-pipeline path that inserts a CR0-reader
+  // between the atomic and the flag-setter (Select01, branch fold, etc.).
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -406,6 +465,10 @@ DEF_OP(AtomicFetchNeg) {
   bc(CC_NE, &loop);
   isync();
   Bind(&done);
+  // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
+  // any prior NZCV state up until the following flag-setter writes its own.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // ---------------------------------------------------------------------------
