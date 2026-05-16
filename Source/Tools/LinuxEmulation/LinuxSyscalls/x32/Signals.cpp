@@ -67,6 +67,31 @@ void CopySigInfo(FEXCore::x86::siginfo_t* Info, const siginfo_t& Host) {
       Info->_sifields._timer.overrun = Host.si_overrun;
       Info->_sifields._timer.sigval.sival_int = Host.si_int;
       break;
+    case SIGSYS:
+      // Seccomp violation: carry which syscall + which arch was rejected.
+      // Mirrors the i32 LAYOUT_SYS path in GuestFramesManagement.cpp — must
+      // report MACHINE_I386 so guest seccomp handlers (Steam pressure-vessel,
+      // Chrome/Firefox sandboxes) see the bitness they think they're running.
+      Info->_sifields._sigsys.call_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Host.si_call_addr));
+      Info->_sifields._sigsys.syscall = Host.si_syscall;
+      {
+        constexpr uint32_t AUDIT_LE = 0x4000'0000U;
+        constexpr uint32_t MACHINE_I386 = 3;
+        Info->_sifields._sigsys.arch = AUDIT_LE | MACHINE_I386;
+      }
+      break;
+    case SIGPOLL:
+      // SIGIO/SIGPOLL: poll bitmask + fd that became ready.
+      Info->_sifields._poll.band = Host.si_band;
+      Info->_sifields._poll.fd = Host.si_fd;
+      break;
+    case SIGTRAP:
+      // TRAP_BRKPT / TRAP_HWBKPT / TRAP_TRACE all carry si_addr (the faulting
+      // user-space PC or watchpoint address). Default branch above only logs
+      // and leaves _sifields uninitialised, so debugger / ptrace consumers in
+      // the guest would read garbage. Truncate to 32-bit per i386 ABI.
+      Info->_sifields._sigfault.addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Host.si_addr));
+      break;
     default: LogMan::Msg::EFmt("Unhandled siginfo_t for sigtimedwait: {}", Info->si_signo); break;
     }
   }
