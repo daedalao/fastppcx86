@@ -649,7 +649,9 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     if (ThreadObject->ThreadInfo.clear_child_tid) {
       auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
       Addr.store(0);
-      syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
+      // FUTEX_WAKE val is int; kernel accepts INT_MAX as wake-all. ~0ULL silently truncates to -1
+      // which the kernel treats the same way, but INT_MAX is the documented spelling.
+      syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, INT_MAX, 0, 0, 0);
     }
 
     ThreadObject->StatusCode = status;
