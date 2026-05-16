@@ -1239,7 +1239,12 @@ static void EmitMaskBitTestSkip(PPC64JITCore* j, int sz) {
   case 1: j->andi_(TMP1, TMP1, 0x80);                  break;  // mask bit7 of byte
   case 2: j->rlwinm_(TMP1, TMP1, 0, 16, 16);           break;  // mask bit15 of halfword
   case 4: j->rlwinm_(TMP1, TMP1, 0, 0, 0);             break;  // mask bit31 of word
-  case 8: j->sradi_(TMP1, TMP1, 63);                   break;  // sets CR0 from sign-replicated value
+  // sradi_ would set CR0 correctly but ALSO writes XER.CA (the canonical
+  // CFInverted x86 CF storage).  Use rldicl_ instead: rotate-left 1 + mask
+  // bit 0 puts the sign bit (originally bit 63 in BE-numbering = MSB) into
+  // LSB position, then Rc form sets CR0.EQ = (sign bit was 0).  rldicl
+  // does not touch XER, so x86 CF is preserved across VPMASKMOVQ-style ops.
+  case 8: j->rldicl_(TMP1, TMP1, 1, 63);                break;
   }
 }
 
