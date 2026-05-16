@@ -16,7 +16,126 @@ $end_info$
 #include <sys/epoll.h>
 
 namespace FEX::HLE {
-#ifdef ARCHITECTURE_arm64
+#if defined(ARCHITECTURE_ppc64le)
+// PPC64LE Linux syscall ABI:
+//   r0    = syscall number
+//   r3..r8 = args 1..6  (r9, r10 for arg 7 if needed)
+//   sc    instruction
+//   r3    = result; CR0.SO set on error (r3 holds positive errno on error)
+// Use inline asm to avoid glibc syscall() wrapper overhead (extra branch,
+// TLS errno write, validation), and to keep the syscall path heap- and
+// TLS-quiet for cases where that matters (vfork window).
+//
+// Errno handling: we mimic glibc semantics — return -errno on error,
+// raw result on success.  The "isel" via mfocrf+rldicl-style check would
+// be tighter, but we use a simple "neg r3 ; mfcr ; isel" idiom that the
+// compiler can fold.  Easier: just test SO bit and conditionally negate.
+
+#define PPC64_SYSCALL_RESULT(r3_out)                                                                              \
+  /* If SO bit (bit 0 of cr0) set, kernel returned positive errno; negate to match Linux's -errno convention. */  \
+  ({                                                                                                              \
+    long _r = (long)(r3_out);                                                                                     \
+    uint64_t _cr;                                                                                                 \
+    __asm volatile("mfcr %0" : "=r"(_cr));                                                                        \
+    if (_cr & 0x10000000u) _r = -_r; /* SO bit lives at bit 28 of cr in CR0 position */                           \
+    (uint64_t)_r;                                                                                                 \
+  })
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough0(FEXCore::Core::CpuStateFrame* Frame) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3");
+  __asm volatile("sc" : "=r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough1(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough2(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4) : : "memory", "r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough3(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  register long r5 asm("r5") = (long)arg3;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5) : : "memory", "r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough4(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  register long r5 asm("r5") = (long)arg3;
+  register long r6 asm("r6") = (long)arg4;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6) : : "memory", "r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough5(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  register long r5 asm("r5") = (long)arg3;
+  register long r6 asm("r6") = (long)arg4;
+  register long r7 asm("r7") = (long)arg5;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7) : : "memory", "r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough6(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5,
+                             uint64_t arg6) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  register long r5 asm("r5") = (long)arg3;
+  register long r6 asm("r6") = (long)arg4;
+  register long r7 asm("r7") = (long)arg5;
+  register long r8 asm("r8") = (long)arg6;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8) : : "memory", "r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+
+template<int syscall_num>
+requires (syscall_num != -1)
+uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5,
+                             uint64_t arg6, uint64_t arg7) {
+  register long r0 asm("r0") = syscall_num;
+  register long r3 asm("r3") = (long)arg1;
+  register long r4 asm("r4") = (long)arg2;
+  register long r5 asm("r5") = (long)arg3;
+  register long r6 asm("r6") = (long)arg4;
+  register long r7 asm("r7") = (long)arg5;
+  register long r8 asm("r8") = (long)arg6;
+  register long r9 asm("r9") = (long)arg7;
+  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8), "+r"(r9) : : "memory", "r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3);
+}
+#elif defined(ARCHITECTURE_arm64)
 template<int syscall_num>
 requires (syscall_num != -1)
 uint64_t SyscallPassthrough0(FEXCore::Core::CpuStateFrame* Frame) {
