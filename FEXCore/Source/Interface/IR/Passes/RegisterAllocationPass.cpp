@@ -76,6 +76,40 @@ private:
   // Maps defs to their assigned spill slot + 1, or 0 if not spilled.
   fextl::vector<unsigned> SpillSlots;
 
+  // Phase 1 of spill-slot reuse: framework only.  ReleaseSlot is stubbed and
+  // never invoked from production code, so FreeSlots stays empty and
+  // AcquireSlot degenerates to the existing bump-allocator behavior.  Phase 2
+  // will hook ReleaseSlot into the spill-bookkeeping logic to actually recycle
+  // slots.  See plan-of-record for details.
+  struct SpillRange {
+    uint32_t SSAID;     // The spilled SSA value's ID
+    uint32_t DefIP;     // IP at which the spill was inserted (block-local)
+    uint32_t LastUseIP; // IP at which the slot can be reclaimed (Phase 2)
+    uint32_t Slot;      // Assigned slot index
+  };
+  fextl::vector<SpillRange> BlockSpills;
+  fextl::vector<uint32_t> FreeSlots; // Reusable indices; always empty in Phase 1
+  uint32_t BlockSlotHighWater {0};
+  uint32_t GlobalSlotHighWater {0};
+
+  // Phase 1: AcquireSlot bumps the per-block high-water mark since FreeSlots
+  // is always empty (ReleaseSlot is stubbed).  Phase 2 will populate
+  // FreeSlots and this will start reusing.
+  uint32_t AcquireSlot() {
+    if (!FreeSlots.empty()) {
+      uint32_t s = FreeSlots.back();
+      FreeSlots.pop_back();
+      return s;
+    }
+    return BlockSlotHighWater++;
+  }
+
+  // Phase 1: stub.  Phase 2 will invoke this on spill-SSA kill bits.
+  void ReleaseSlot(uint32_t /*slot*/) {
+    // Intentionally empty in Phase 1.
+    // FreeSlots.push_back(slot);  <-- enable in Phase 2
+  }
+
   // Next-use distance relative to the block end of each source, last first.
   fextl::vector<uint32_t> SourcesNextUses;
 
@@ -112,6 +146,11 @@ private:
   fextl::vector<uint32_t> NextUses;
 
   bool AnySpilled {};
+
+  // Phase 1: monotonically increasing per-instruction counter for the forward
+  // pass.  Used to stamp DefIP on SpillRange entries.  Reset per block.
+  // Phase 2 will use this (together with LastUseIP) to time slot release.
+  uint32_t ForwardIP {0};
 
   bool IsValidArg(OrderedNodeWrapper Arg) {
     if (Arg.IsInvalid()) {
@@ -327,8 +366,12 @@ private:
         SpillSlots.resize(IR->GetSSACount(), 0);
       }
 
-      // TODO: we should colour spill slots
-      uint32_t Slot = IR->GetHeader()->SpillSlots++;
+      // Phase 1 of spill-slot reuse: route allocation through AcquireSlot
+      // (degenerates to a bump allocator since FreeSlots is always empty).
+      // Record the spill range so Phase 2 can drive slot release; in Phase 1
+      // this metadata is written but not yet consumed.
+      uint32_t Slot = AcquireSlot();
+      BlockSpills.push_back({Value, /*DefIP=*/ForwardIP, /*LastUseIP=*/ForwardIP + NextUses[Value], Slot});
 
       // We must map here in case we're spilling something we shuffled.
       auto SpillOp = IREmit->_SpillRegister(OrderedNodeWrapper::FromImmediate(Reg.Raw), Slot, Reg.AsRegClass());
@@ -579,6 +622,14 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
     // Spilling is local, so reset this per-block
     AnySpilled = false;
 
+    // Phase 1 of spill-slot reuse: reset per-block bookkeeping.  Slots do not
+    // cross block boundaries (spilling is strictly block-local), so the
+    // high-water mark and pool both restart fresh each block.
+    BlockSpills.clear();
+    FreeSlots.clear();
+    BlockSlotHighWater = 0;
+    ForwardIP = 0;
+
     // At the start of each block, all registers are available.
     for (auto& Class : Classes) {
       Class.Available = (1u << Class.Count) - 1;
@@ -661,6 +712,10 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
       if (IROp->Op == OP_GUESTOPCODE || IROp->Op == OP_INLINECONSTANT) {
         continue;
       }
+
+      // Phase 1 of spill-slot reuse: ForwardIP holds the current instruction's
+      // IP for the duration of this iteration; SpillReg reads it as DefIP for
+      // any spills emitted here.  Incremented at the bottom of the loop body.
 
       // Static registers must be consistent at SRA load/store. Evict to ensure.
       if (auto Node = DecodeSRANode(IROp, CodeNode); Node != nullptr) {
@@ -765,18 +820,34 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
       } else {
         LastNode = CodeNode;
       }
+
+      // Phase 1 of spill-slot reuse: advance the per-block IP counter so that
+      // the next instruction's spills (if any) carry a distinct DefIP.
+      ++ForwardIP;
     }
 
     if (AnySpilled) {
       LOGMAN_THROW_A_FMT(SourceIndex == 0, "Consistent source count in block");
     }
+
+    // Phase 1 of spill-slot reuse: roll this block's peak slot usage into the
+    // function-wide high-water mark, which becomes the final SpillSlots count.
+    GlobalSlotHighWater = std::max(GlobalSlotHighWater, BlockSlotHighWater);
   }
+
+  // Phase 1 of spill-slot reuse: publish the function-wide peak slot usage
+  // into the IR header.  Replaces the per-spill `IR->GetHeader()->SpillSlots++`
+  // bump that used to live in SpillReg.  Reset for the next Run() invocation.
+  IR->GetHeader()->SpillSlots = GlobalSlotHighWater;
+  GlobalSlotHighWater = 0;
 
   PreferredReg.clear();
   SSAToReg.clear();
   SpillSlots.clear();
   NextUses.clear();
   Seen.clear();
+  BlockSpills.clear();
+  FreeSlots.clear();
 
   IR->GetHeader()->PostRA = true;
 }
