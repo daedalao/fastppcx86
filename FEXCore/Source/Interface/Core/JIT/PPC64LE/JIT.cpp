@@ -1412,6 +1412,33 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
   bool IsUnsigned = (Cond == IR::CondClass::UGE || Cond == IR::CondClass::ULT ||
                      Cond == IR::CondClass::UGT || Cond == IR::CondClass::ULE);
 
+  // Sub-32 (i8/i16) operands may carry dirty upper bits — GPRs in FEX have no
+  // "clean upper" guarantee at narrow sizes. Shift both operands left by
+  // (64 - 8N) so the operand-size sign bit lines up with bit 63; the resulting
+  // 64-bit compare then matches the operand-size compare for both signed and
+  // unsigned ordering, and EQ/NEQ vs 0 is preserved. Same trick used by
+  // SubNZCV's narrow path. Currently exercised by FoldBranch's i8/i16
+  // EQ/NEQ-vs-0 fold, but written generically so any future caller is safe.
+  if (Sz == IR::OpSize::i8Bit || Sz == IR::OpSize::i16Bit) {
+    uint32_t Sh = (Sz == IR::OpSize::i8Bit) ? 56u : 48u;
+    sldi(TMP1, Reg1, Sh);
+    if (IsInlineConstant(Src2, &Const)) {
+      if (Const == 0) {
+        if (IsUnsigned) cmpldi(cr(CRField), TMP1, 0);
+        else            cmpdi(cr(CRField), TMP1, 0);
+      } else {
+        LoadConstant(TMP2, Const << Sh);
+        if (IsUnsigned) cmpld(cr(CRField), TMP1, TMP2);
+        else            cmpd(cr(CRField), TMP1, TMP2);
+      }
+    } else {
+      sldi(TMP2, GetReg(Src2), Sh);
+      if (IsUnsigned) cmpld(cr(CRField), TMP1, TMP2);
+      else            cmpd(cr(CRField), TMP1, TMP2);
+    }
+    return;
+  }
+
   if (IsInlineConstant(Src2, &Const)) {
     if (IsUnsigned) {
       if (Const <= 0xFFFF) {

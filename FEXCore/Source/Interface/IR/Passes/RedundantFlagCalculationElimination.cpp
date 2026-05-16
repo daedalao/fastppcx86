@@ -495,7 +495,7 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
     // Pattern match a branch fed by a compare. We could also handle bit tests
     // here, but tbz/tbnz has a limited offset range which we don't have a way to
     // deal with yet. Let's hope that's not a big deal.
-    if (!(Op->Cond == CondClass::NEQ || Op->Cond == CondClass::EQ) || (Prev->Size < OpSize::i32Bit)) {
+    if (!(Op->Cond == CondClass::NEQ || Op->Cond == CondClass::EQ)) {
       return;
     }
 
