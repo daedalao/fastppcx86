@@ -56,8 +56,25 @@ static uint32_t RemapIoctlForPPC(uint32_t cmd) {
   }
 
   const uint32_t type = (cmd >> 8) & 0xFFu;
-  if (type != 0x64u && type != 0x75u) { // DRM, udmabuf
-    return cmd;
+  // Types whose ioctl numbers are written with _IO/_IOR/_IOW/_IOWR macros and
+  // therefore encode dir+size in the cmd word: these need PPC-side reencoding
+  // when the guest is x86.  Anything outside this set (notably the FreeBSD-
+  // style FIO* numbers above and bespoke driver families) must pass through
+  // untouched -- a blanket remap silently corrupts those.
+  switch (type) {
+    case 0x64u: // DRM ('d')
+    case 0x75u: // udmabuf ('u')
+    case 0x56u: // V4L2 ('V')
+    case 0x76u: // V4L2 subdev ('v')
+    case 0x49u: // input ('I', EVIOC*)
+    case 0x54u: // tty ('T', TIOC*)
+    case 0x4Bu: // keyboard ('K', KD*)
+    case 0x53u: // sound ('S', SNDRV_*)
+    case 0x46u: // framebuffer ('F', FBIO*)
+    case 0x61u: // atm ('a')
+      break;
+    default:
+      return cmd;
   }
 
   const uint32_t nr      = cmd & 0xFFu;
