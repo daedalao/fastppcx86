@@ -246,12 +246,18 @@ void PPC64EmitterBase::FillStaticRegs() {
 //   [old_SP + 24] TOC save (8 bytes; only used by the callee around indirect calls)
 // After `stdu r1, -512, r1` these become [r1+520], [r1+528], [r1+536] respectively.
 //
-// Local-frame layout (grows down from old_r1, 16-byte aligned, 512 bytes total):
-//   [r1 -  16]: VMX v20-v31 (12 × 16 = 192 bytes)
-//   [r1 - 208]: FPR f14-f31 (18 × 8  = 144 bytes)
-//   [r1 - 352]: GPR r14-r31 (18 × 8  = 144 bytes)
-//   [r1 - 496]: 16 bytes padding to keep r1 16-byte aligned
-//   [r1 +   0]: back chain (= old_r1)
+// Local-frame layout (grows down from old_r1, 16-byte aligned, 512 bytes total).
+// Offsets shown are from old_r1; after stdu r1, -512, r1 the same offsets
+// expressed from the NEW r1 add 512 (so the back-chain at [old_r1-512] is
+// [r1+0] post-stdu).  The save areas are ordered with GPRs CLOSEST to
+// old_r1 (= shallowest stack), then FPRs, then VMX:
+//   [old_r1 -  16 .. -160]: GPR r14..r31  (18 × 8 = 144 bytes)
+//   [old_r1 - 160 .. -304]: FPR f14..f31  (18 × 8 = 144 bytes)
+//   [old_r1 - 304 .. -496]: VMX v20..v31  (12 × 16 = 192 bytes)
+//   [old_r1 - 496 .. -512]: 16 bytes padding (back-chain alignment)
+//   [old_r1 - 512] = [new_r1 + 0]: back chain (= old_r1)
+// The FRAME_GPR_SAVE / FRAME_FPR_SAVE / FRAME_VMX_SAVE constants below give
+// the FIRST (lowest-numbered-reg) slot's offset from old_r1: -160 / -304 / -496.
 static constexpr int32_t FRAME_GPR_SAVE   = -(16 + 8 * 18);   // -160
 static constexpr int32_t FRAME_FPR_SAVE   = FRAME_GPR_SAVE - 8 * 18;  // -304
 static constexpr int32_t FRAME_VMX_SAVE   = FRAME_FPR_SAVE - 16 * 12; // -496
