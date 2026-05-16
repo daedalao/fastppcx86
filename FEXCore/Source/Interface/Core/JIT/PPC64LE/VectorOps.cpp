@@ -4268,10 +4268,14 @@ DEF_OP(Float_FromGPR_S) {
     lwz(TMP1, -8, r1);
     mtvsrd(VTMP1, TMP1);        // 32-bit value in upper bits
     vsldoi(VTMP1, VTMP1, VTMP1, 8);  // move to both halves
-    vspltw(Dst, VTMP1, SplatWordIdx(0)); // splat element 0
-    // Only keep element 0, zero rest
+    vspltw(Dst, VTMP1, SplatWordIdx(0)); // splat element 0 (BE bytes 0..3 = f32)
+    // Only keep element 0, zero rest.  Read from Dst (where vspltw just placed
+    // the f32 in BE bytes 0..3) — NOT from VTMP1, whose BE bytes 0..3 are the
+    // undefined upper-half of mtvsrd (rotated into that position by the prior
+    // vsldoi shb=8).  Previously this `vsldoi(Dst, VTMP2, VTMP1, 4)` would
+    // overwrite the just-built splat with the undefined bytes.
     vspltisw(VTMP2, 0);
-    vsldoi(Dst, VTMP2, VTMP1, 4); // [0(12), float(4)] in phys = elem0=float, rest=0
+    vsldoi(Dst, VTMP2, Dst, 4); // [zero(12) | f32(4)] in BE = LE elem0=f32, rest=0
   } else {
     // lvx ignores low 4 bits of EA. stfd at r1-8 lands the double in the upper
     // half of the r1-16-aligned block, which arrives at LE[8..15] of VTMP1;
