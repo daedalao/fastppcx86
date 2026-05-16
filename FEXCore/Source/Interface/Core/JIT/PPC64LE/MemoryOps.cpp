@@ -935,6 +935,12 @@ DEF_OP(RMWHandle) {
 // linear in element count but the elements are typically small.
 DEF_OP(MemSet) {
   auto Op = IROp->C<IR::IROp_MemSet>();
+  // x86 REP STOS preserves flags per Intel SDM.  Save CR0 (packed-NZCV)
+  // to the red zone before the loop's cmpdi clobbers it; restore after
+  // the loop.  TMP3 is overwritten below by the direction-step setup, so
+  // we use it briefly here as a transit before the std to memory.
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   GPR AddrIn = GetReg(Op->Addr);
   // Op->Value is annotated "Inline: Any" in IR.json — IsInlineConstant may
   // return true and GetReg(Op->Value) would index the RA pool with a stale
@@ -1005,6 +1011,10 @@ DEF_OP(MemSet) {
   b(&loop);
   Bind(&done);
 
+  // Restore CR0 (saved at op entry) — REP STOS preserves flags.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
+
   // Final pointer may sit in upper-half-dirty form for 32-bit guest; mask
   // before writing back to the SSA destination.
   MaybeClrUpper32(TMP1);
@@ -1012,6 +1022,12 @@ DEF_OP(MemSet) {
 }
 
 DEF_OP(MemCpy) {
+  // x86 REP MOVS preserves flags per Intel SDM.  Save CR0 (packed-NZCV)
+  // to the red zone before the loop's cmpdi clobbers it; restore after.
+  // TMP3 is overwritten below by the direction-step setup — that's fine,
+  // we've already stashed the mfcr result to memory.
+  mfcr(TMP3);
+  std(TMP3, -8, r1);
   auto Op = IROp->C<IR::IROp_MemCpy>();
   GPR DestIn = GetReg(Op->Dest);
   GPR SrcIn  = GetReg(Op->Src);
@@ -1077,6 +1093,9 @@ DEF_OP(MemCpy) {
   // r0 was clobbered as the value scratch above; restore the JIT's r0=0
   // zero-index invariant before subsequent indexed mem ops.
   li(r(0), 0);
+  // Restore CR0 (saved at op entry) — REP MOVS preserves flags.
+  ld(TMP3, -8, r1);
+  mtcrf(0x80, TMP3);
 }
 
 // =========================================================================
