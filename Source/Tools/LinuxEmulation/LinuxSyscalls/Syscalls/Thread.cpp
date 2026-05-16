@@ -170,7 +170,9 @@ FEX::HLE::ThreadStateObject* CreateNewThread(FEXCore::Context::Context* CTX, FEX
   if (flags & CLONE_PIDFD) {
     // Use pidfd_open to emulate this flag
     const int pidfd = ::syscall(SYSCALL_DEF(pidfd_open), Result, 0);
-    if (Result == ~0ULL) {
+    if (pidfd < 0) {
+      // Test pidfd, not Result.  Result is the child TID (positive on
+      // success); the failure sentinel lives in pidfd itself (= -1).
       LogMan::Msg::EFmt("Couldn't get pidfd of TID {}\n", Result);
     } else {
       *reinterpret_cast<int*>(args->args.pidfd) = pidfd;

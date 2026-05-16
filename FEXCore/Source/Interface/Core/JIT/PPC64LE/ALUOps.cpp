@@ -2636,7 +2636,10 @@ DEF_OP(RotateFlags) {
   // Flags unchanged if the architectural masked count == 0. The dispatcher
   // hands us Src already masked to 0x3F (64-bit) or 0x1F (smaller); andi_
   // re-tests the same range against the byte-loaded register.
-  uint32_t Mask = (Sz == 8) ? 0x1F : ((Sz == 16 || Sz == 32) ? 0x1F : 0x3F);
+  // x86 rotate count masking: 5 bits for 8/16/32-bit operands, 6 bits
+  // for 64-bit.  Sz is the byte-size of the x86 operand (1, 2, 4, 8).
+  // Mirror ShiftFlags at line 2537.
+  uint32_t Mask = (Sz == 8) ? 0x3F : 0x1F;
 
   PPC64Emitter::Label noRotate, done;
   andi_(TMP1, Shift, Mask);
