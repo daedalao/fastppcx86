@@ -849,23 +849,71 @@ void OpDispatchBuilder::X87FCMOV(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::X87FXAM(OpcodeArgs) {
+  // Per Intel SDM, FXAM classifies ST(0) into one of 7 classes and sets
+  // C3:C2:C0 accordingly.  C1 = sign bit of the operand.  C2:C0 encoding:
+  //   Empty     101    Zero       100    Denormal   110
+  //   Normal    010    Infinity   011    NaN        001
+  //   (Unsupported encodings — pseudo-NaN etc — folded into NaN here.)
+  // Previously we always reported "Normal" for non-empty, which is wrong
+  // for any software dispatching on FXAM (libm fallbacks, Delphi RTL,
+  // Borland Pascal, some scientific codes).
   auto a = _ReadStackValue(0);
-  Ref Result =
-    ReducedPrecisionMode ? _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, a, 0) : _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 1);
 
-  // Extract the sign bit
-  Result = ReducedPrecisionMode ? _Bfe(OpSize::i64Bit, 1, 63, Result) : _Bfe(OpSize::i64Bit, 1, 15, Result);
-  SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Result);
+  Ref Sign;
+  Ref ExpField;
+  Ref MantissaField;
+  Ref ExpAllOnes;
+  Ref IsInfPattern;
 
-  // Claim this is a normal number
-  // We don't support anything else
+  if (ReducedPrecisionMode) {
+    // F64 layout: bits[63]=sign, [62:52]=exp(11), [51:0]=mantissa(52).
+    auto Bits = _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, a, 0);
+    Sign = _Bfe(OpSize::i64Bit, 1, 63, Bits);
+    ExpField = _Bfe(OpSize::i64Bit, 11, 52, Bits);
+    MantissaField = _Bfe(OpSize::i64Bit, 52, 0, Bits);
+    ExpAllOnes = Constant(0x7FF);
+    // F64 +/-Inf has mantissa == 0.
+    IsInfPattern = Select01(OpSize::i64Bit, CondClass::EQ, MantissaField, Constant(0));
+  } else {
+    // F80 layout: upper qword has [15]=sign, [14:0]=exp(15);
+    //             lower qword has [63]=integer-bit, [62:0]=fraction.
+    // The fraction must include the integer bit because x87 80-bit Inf is
+    // distinguishable from pseudo-Inf by whether the int bit is set.
+    auto Upper = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 1);
+    auto Lower = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 0);
+    Sign = _Bfe(OpSize::i64Bit, 1, 15, Upper);
+    ExpField = _Bfe(OpSize::i64Bit, 15, 0, Upper);
+    MantissaField = Lower;
+    ExpAllOnes = Constant(0x7FFF);
+    // F80 +/-Inf has lower qword == 0x8000_0000_0000_0000 (int bit set,
+    // fraction zero).  Any other pattern with all-ones exp is NaN (incl.
+    // pseudo-NaN, pseudo-Inf which are SDM "Unsupported" — fold to NaN).
+    IsInfPattern = Select01(OpSize::i64Bit, CondClass::EQ, MantissaField, Constant(0x8000000000000000ULL));
+  }
+
+  SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Sign);
+
   auto TopValid = _StackValidTag(0);
+  auto ExpIsZero = Select01(OpSize::i64Bit, CondClass::EQ, ExpField, Constant(0));
+  auto ExpIsAllOnes = Select01(OpSize::i64Bit, CondClass::EQ, ExpField, ExpAllOnes);
+  auto MantissaIsZero = Select01(OpSize::i64Bit, CondClass::EQ, MantissaField, Constant(0));
 
-  // In the case of top being invalid then C3:C2:C0 is 0b101
-  auto C3 = Select01(OpSize::i32Bit, CondClass::NEQ, TopValid, Constant(1));
+  // C3 = !TopValid || ExpIsZero            (Empty | Zero | Denormal)
+  // C0 = !TopValid || ExpIsAllOnes         (Empty | Infinity | NaN)
+  // C2 = TopValid
+  //      && (!ExpIsZero || !MantissaIsZero)        // suppress Zero
+  //      && (!ExpIsAllOnes || IsInfPattern)        // suppress NaN
+  auto NotTopValid = Select01(OpSize::i32Bit, CondClass::EQ, TopValid, Constant(0));
+  auto NotExpZero = Select01(OpSize::i32Bit, CondClass::EQ, ExpIsZero, Constant(0));
+  auto NotMantZero = Select01(OpSize::i32Bit, CondClass::EQ, MantissaIsZero, Constant(0));
+  auto NotExpAllOnes = Select01(OpSize::i32Bit, CondClass::EQ, ExpIsAllOnes, Constant(0));
 
-  auto C2 = TopValid;
-  auto C0 = C3; // Mirror C3 until something other than zero is supported
+  auto C3 = _Or(OpSize::i32Bit, NotTopValid, ExpIsZero);
+  auto C0 = _Or(OpSize::i32Bit, NotTopValid, ExpIsAllOnes);
+  auto Term1 = _Or(OpSize::i32Bit, NotExpZero, NotMantZero);
+  auto Term2 = _Or(OpSize::i32Bit, NotExpAllOnes, IsInfPattern);
+  auto C2 = _And(OpSize::i32Bit, TopValid, _And(OpSize::i32Bit, Term1, Term2));
+
   SetRFLAG<FEXCore::X86State::X87FLAG_C0_LOC>(C0);
   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(C2);
   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(C3);
