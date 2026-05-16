@@ -670,7 +670,15 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   // UnimplementedOp before the IR ever reaches the JIT, so the DEF_OP bodies
   // never run and tests see input bytes echoed unchanged.
   HostFeatures.SupportsAES = true;
-  HostFeatures.SupportsAES256 = HostFeatures.SupportsAVX && HostFeatures.SupportsAES;
+  // SupportsAES256 advertises VAES (CPUID.7.ECX bit 9) — VEX/EVEX-encoded
+  // AES that supports 128, 256, and 512-bit operands.  Our IR dispatcher
+  // currently asserts "Is128Bit" on VAESENC/DEC/ENCLAST/DECLAST when the
+  // guest emits VEX.L=1, crashing the process.  Until 256-bit VAES lowering
+  // is implemented (split into two 128-bit lane ops or via a wider FABI
+  // bridge), advertise VAES=0 so the guest dispatcher selects the legacy
+  // AES-NI 128-bit path which works.  Cost: no VAES Stride-2/Stride-4
+  // batched-block-cipher; AES-NI is still fast enough for typical TLS/disk.
+  HostFeatures.SupportsAES256 = false;
   // SHA-1 / SHA-256 software helpers (PPC64_VSha1*/VSha256* in JIT.cpp) —
   // POWER8 has no SHA-NI, so each SHA IR op routes through the FABI bridge.
   // Without SupportsSHA the OpcodeDispatcher (Crypto.cpp) rewrites the
