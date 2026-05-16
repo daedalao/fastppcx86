@@ -2441,9 +2441,9 @@ template<>
 struct fex_gen_config<vkQueueBindSparse> {};
 #endif
 template<>
-struct fex_gen_config<vkCreateFence> {};
+struct fex_gen_config<vkCreateFence> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyFence> {};
+struct fex_gen_config<vkDestroyFence> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkResetFences> {};
 #ifndef IS_32BIT_THUNK
@@ -2453,37 +2453,37 @@ struct fex_gen_config<vkGetFenceStatus> {};
 template<>
 struct fex_gen_config<vkWaitForFences> {};
 template<>
-struct fex_gen_config<vkCreateSemaphore> {};
+struct fex_gen_config<vkCreateSemaphore> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroySemaphore> {};
+struct fex_gen_config<vkDestroySemaphore> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkCreateQueryPool> {};
+struct fex_gen_config<vkCreateQueryPool> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyQueryPool> {};
+struct fex_gen_config<vkDestroyQueryPool> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetQueryPoolResults> {};
 template<>
 struct fex_gen_param<vkGetQueryPoolResults, 5, void*> : fexgen::assume_compatible_data_layout {};
 #endif
 template<>
-struct fex_gen_config<vkCreateBuffer> {};
+struct fex_gen_config<vkCreateBuffer> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyBuffer> {};
+struct fex_gen_config<vkDestroyBuffer> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateImage> {};
+struct fex_gen_config<vkCreateImage> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyImage> {};
+struct fex_gen_config<vkDestroyImage> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetImageSubresourceLayout> {};
 template<>
-struct fex_gen_config<vkCreateImageView> {};
+struct fex_gen_config<vkCreateImageView> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyImageView> {};
+struct fex_gen_config<vkDestroyImageView> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateCommandPool> {};
+struct fex_gen_config<vkCreateCommandPool> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyCommandPool> {};
+struct fex_gen_config<vkDestroyCommandPool> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkResetCommandPool> {};
 #ifndef IS_32BIT_THUNK
@@ -2544,9 +2544,9 @@ struct fex_gen_config<vkCmdCopyQueryPoolResults> {};
 template<>
 struct fex_gen_config<vkCmdExecuteCommands> {};
 template<>
-struct fex_gen_config<vkCreateEvent> {};
+struct fex_gen_config<vkCreateEvent> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyEvent> {};
+struct fex_gen_config<vkDestroyEvent> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetEventStatus> {};
 template<>
@@ -2555,17 +2555,17 @@ template<>
 struct fex_gen_config<vkResetEvent> {};
 #endif
 template<>
-struct fex_gen_config<vkCreateBufferView> {};
+struct fex_gen_config<vkCreateBufferView> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyBufferView> {};
+struct fex_gen_config<vkDestroyBufferView> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkCreateShaderModule> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkDestroyShaderModule> {};
 template<>
-struct fex_gen_config<vkCreatePipelineCache> {};
+struct fex_gen_config<vkCreatePipelineCache> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyPipelineCache> {};
+struct fex_gen_config<vkDestroyPipelineCache> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetPipelineCacheData> {};
@@ -2581,26 +2581,26 @@ struct fex_gen_param<vkGetPipelineCacheData, 3, void*> : fexgen::assume_compatib
 template<>
 struct fex_gen_config<vkMergePipelineCaches> {};
 template<>
-struct fex_gen_config<vkCreateComputePipelines> {};
+struct fex_gen_config<vkCreateComputePipelines> : fexgen::custom_host_impl {};
 #endif
 template<>
-struct fex_gen_config<vkDestroyPipeline> {};
+struct fex_gen_config<vkDestroyPipeline> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreatePipelineLayout> {};
+struct fex_gen_config<vkCreatePipelineLayout> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyPipelineLayout> {};
+struct fex_gen_config<vkDestroyPipelineLayout> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateSampler> {};
+struct fex_gen_config<vkCreateSampler> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroySampler> {};
+struct fex_gen_config<vkDestroySampler> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateDescriptorSetLayout> {};
+struct fex_gen_config<vkCreateDescriptorSetLayout> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyDescriptorSetLayout> {};
+struct fex_gen_config<vkDestroyDescriptorSetLayout> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateDescriptorPool> {};
+struct fex_gen_config<vkCreateDescriptorPool> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyDescriptorPool> {};
+struct fex_gen_config<vkDestroyDescriptorPool> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkResetDescriptorPool> {};
 template<>
@@ -2643,15 +2643,15 @@ struct fex_gen_param<vkCmdPushConstants, 5, const void*> : fexgen::assume_compat
 
 // TODO: Should be custom_host_impl since there may be more than one VkGraphicsPipelineCreateInfo and more than one output pipeline
 template<>
-struct fex_gen_config<vkCreateGraphicsPipelines> {};
+struct fex_gen_config<vkCreateGraphicsPipelines> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateFramebuffer> {};
+struct fex_gen_config<vkCreateFramebuffer> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyFramebuffer> {};
+struct fex_gen_config<vkDestroyFramebuffer> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkCreateRenderPass> {};
+struct fex_gen_config<vkCreateRenderPass> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroyRenderPass> {};
+struct fex_gen_config<vkDestroyRenderPass> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetRenderAreaGranularity> {};
 template<>
@@ -2793,7 +2793,7 @@ template<>
 struct fex_gen_config<vkCmdDrawIndexedIndirectCount> {};
 #endif
 template<>
-struct fex_gen_config<vkCreateRenderPass2> {};
+struct fex_gen_config<vkCreateRenderPass2> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBeginRenderPass2> {};
@@ -2941,9 +2941,9 @@ struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormatsKHR> {}; // TODO: Need to
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfacePresentModesKHR> {};
 template<>
-struct fex_gen_config<vkCreateSwapchainKHR> {};
+struct fex_gen_config<vkCreateSwapchainKHR> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkDestroySwapchainKHR> {};
+struct fex_gen_config<vkDestroySwapchainKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetSwapchainImagesKHR> {};
 template<>
@@ -3057,7 +3057,7 @@ struct fex_gen_config<vkUpdateDescriptorSetWithTemplateKHR> {};
 template<>
 struct fex_gen_param<vkUpdateDescriptorSetWithTemplateKHR, 3, const void*> : fexgen::assume_compatible_data_layout {};
 template<>
-struct fex_gen_config<vkCreateRenderPass2KHR> {};
+struct fex_gen_config<vkCreateRenderPass2KHR> : fexgen::custom_host_impl {};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBeginRenderPass2KHR> {};
