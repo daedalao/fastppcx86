@@ -76,11 +76,12 @@ private:
   // Maps defs to their assigned spill slot + 1, or 0 if not spilled.
   fextl::vector<unsigned> SpillSlots;
 
-  // Phase 1 of spill-slot reuse: framework only.  ReleaseSlot is stubbed and
-  // never invoked from production code, so FreeSlots stays empty and
-  // AcquireSlot degenerates to the existing bump-allocator behavior.  Phase 2
-  // will hook ReleaseSlot into the spill-bookkeeping logic to actually recycle
-  // slots.  See plan-of-record for details.
+  // Phase 2 of spill-slot reuse: ReleaseSlot is now wired into kill-bit
+  // processing (see the main source-arg loop).  Slots dropped onto FreeSlots
+  // are recycled by AcquireSlot before the high-water mark bumps.  Spill
+  // lifetimes never cross block boundaries, so BlockSpills/FreeSlots/
+  // BlockSlotHighWater all reset per block; the function-wide SpillSlots
+  // count is the max of per-block peaks rather than the sum of all spills.
   struct SpillRange {
     uint32_t SSAID;     // The spilled SSA value's ID
     uint32_t DefIP;     // IP at which the spill was inserted (block-local)
@@ -92,9 +93,9 @@ private:
   uint32_t BlockSlotHighWater {0};
   uint32_t GlobalSlotHighWater {0};
 
-  // Phase 1: AcquireSlot bumps the per-block high-water mark since FreeSlots
-  // is always empty (ReleaseSlot is stubbed).  Phase 2 will populate
-  // FreeSlots and this will start reusing.
+  // Phase 2: AcquireSlot pops from the free pool when possible; otherwise it
+  // bumps the per-block high-water mark.  Free slots come from kill-bit
+  // releases earlier in the same block.
   uint32_t AcquireSlot() {
     if (!FreeSlots.empty()) {
       uint32_t s = FreeSlots.back();
@@ -104,10 +105,13 @@ private:
     return BlockSlotHighWater++;
   }
 
-  // Phase 1: stub.  Phase 2 will invoke this on spill-SSA kill bits.
-  void ReleaseSlot(uint32_t /*slot*/) {
-    // Intentionally empty in Phase 1.
-    // FreeSlots.push_back(slot);  <-- enable in Phase 2
+  // Phase 2: invoked when a spilled SSA value finally dies (kill-bit fires
+  // on its last consumer).  The slot it occupied becomes available for any
+  // subsequent spill within the same block.  Slots never cross block
+  // boundaries (BlockSpills/FreeSlots/BlockSlotHighWater all reset per block),
+  // so this is purely intra-block reuse on top of Phase 1's per-block reset.
+  void ReleaseSlot(uint32_t slot) {
+    FreeSlots.push_back(slot);
   }
 
   // Next-use distance relative to the block end of each source, last first.
@@ -366,10 +370,9 @@ private:
         SpillSlots.resize(IR->GetSSACount(), 0);
       }
 
-      // Phase 1 of spill-slot reuse: route allocation through AcquireSlot
-      // (degenerates to a bump allocator since FreeSlots is always empty).
-      // Record the spill range so Phase 2 can drive slot release; in Phase 1
-      // this metadata is written but not yet consumed.
+      // Phase 2 of spill-slot reuse: route allocation through AcquireSlot
+      // (pulls from FreeSlots first, falls back to the per-block bump
+      // allocator).  Record the spill range for diagnostic/validation use.
       uint32_t Slot = AcquireSlot();
       BlockSpills.push_back({Value, /*DefIP=*/ForwardIP, /*LastUseIP=*/ForwardIP + NextUses[Value], Slot});
 
@@ -799,6 +802,17 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
           if (Kill) {
             LOGMAN_THROW_A_FMT(IsInRegisterFile(Node), "sources in file");
             FreeReg(Reg);
+
+            // Phase 2 of spill-slot reuse: if the dying SSA had been spilled,
+            // its slot is now reclaimable.  The kill bit fires on the LAST
+            // consumer of the original SSA; any intermediate InsertFill
+            // re-reads are already past.  Zero out SpillSlots[ID] so a stray
+            // double-release is impossible (the entry is also harmless to
+            // leave, but zero documents intent).
+            if (ID < SpillSlots.size() && SpillSlots[ID] != 0) {
+              ReleaseSlot(SpillSlots[ID] - 1);
+              SpillSlots[ID] = 0;
+            }
           }
 
           IROp->Args[s].SetImmediate(Reg.Raw);
