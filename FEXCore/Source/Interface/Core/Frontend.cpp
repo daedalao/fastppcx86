@@ -13,6 +13,7 @@ $end_info$
 
 #include <array>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -1554,6 +1555,45 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
               }
             }
           }
+            // Dump /proc/self/maps so each rip[-N] in the log above can be
+            // resolved to library + offset post-hoc. Cheap (~few hundred
+            // lines, only fires on the rare entry-block fault) and removes
+            // the need for racy external watchdogs to catch maps before the
+            // process dies.
+            {
+              FILE* maps = fopen("/proc/self/maps", "r");
+              if (maps) {
+                LogMan::Msg::EFmt("  /proc/self/maps:");
+                char line[1024];
+                while (fgets(line, sizeof(line), maps)) {
+                  size_t len = strlen(line);
+                  if (len && line[len - 1] == '\n') {
+                    line[len - 1] = '\0';
+                  }
+                  LogMan::Msg::EFmt("    {}", line);
+                }
+                fclose(maps);
+              } else {
+                LogMan::Msg::EFmt("  /proc/self/maps: <unable to open>");
+              }
+            }
+            // For NOEXEC_INST specifically (decoder hit non-exec / padding
+            // bytes — the Steam ret-to-PLT class), trigger a host SIGABRT so
+            // we get a real coredump with the PPC64 stack into the JIT,
+            // pinpointing which JIT block emitted the bad branch/RET. The
+            // existing SIGSEGV stub at PPC64Dispatcher.cpp ~451 silently
+            // absorbs ALL BreakOp(SIGSEGV) (including legitimate guest
+            // INT/INTO/HLT) which masks the real bug; this path bypasses it
+            // for NOEXEC_INST only, leaving INT/INTO/HLT behavior untouched.
+            // Suppress with FEX_NOEXEC_ABSORB=1 if needed.
+            if (BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST) {
+              static const bool absorb = (getenv("FEX_NOEXEC_ABSORB") != nullptr);
+              if (!absorb) {
+                LogMan::Msg::EFmt("Aborting on entry-block NoExec for forensic coredump "
+                                  "(set FEX_NOEXEC_ABSORB=1 to revert to silent absorb).");
+                std::abort();
+              }
+            }
         }
         break;
       }
