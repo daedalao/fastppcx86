@@ -14,6 +14,7 @@ $end_info$
 #include <FEXCore/IR/IR.h>
 
 #include <stdint.h>
+#include <sched.h>
 #include <sys/epoll.h>
 
 namespace FEX::HLE {
@@ -342,6 +343,27 @@ static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
   return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
 }
 
+// Phase C of SyscallObserver: futex wrapper. Same shape as the tgkill
+// wrapper -- bare passthrough for the syscall, observer for side effects.
+// OnFutexReturn tracks per-thread EAGAIN streaks and signals ThenYield
+// when a livelock pattern is detected (FEX_SYSCALLOBSERVE + FEX_FUTEXMITIGATE
+// both required). When neither knob is set, OnFutexReturn short-circuits
+// on a single bool load and returns JustReturn -- essentially free.
+static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
+                                    uint64_t uaddr, uint64_t futex_op, uint64_t val,
+                                    uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
+  const uint64_t result =
+    SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
+
+  const auto action =
+    FEX::HLE::SyscallObserver::OnFutexReturn(uaddr, futex_op, val, static_cast<int64_t>(result));
+  if (action == FEX::HLE::SyscallObserver::FutexAction::ThenYield) {
+    ::sched_yield();
+  }
+  return result;
+}
+
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -636,7 +658,7 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(setrlimit, SyscallPassthrough2<SYSCALL_DEF(setrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(settimeofday, SyscallPassthrough2<SYSCALL_DEF(settimeofday)>);
     REGISTER_SYSCALL_IMPL_X64(readahead, SyscallPassthrough3<SYSCALL_DEF(readahead)>);
-    REGISTER_SYSCALL_IMPL_X64(futex, SyscallPassthrough6<SYSCALL_DEF(futex)>);
+    REGISTER_SYSCALL_IMPL_X64(futex, WrappedFutexObserved);
     REGISTER_SYSCALL_IMPL_X64(io_getevents, SyscallPassthrough5<SYSCALL_DEF(io_getevents)>);
     REGISTER_SYSCALL_IMPL_X64(semtimedop, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
     REGISTER_SYSCALL_IMPL_X64(timer_create, SyscallPassthrough3<SYSCALL_DEF(timer_create)>);
@@ -726,7 +748,7 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(mq_timedsend_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
     REGISTER_SYSCALL_IMPL_X32(mq_timedreceive_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedreceive)>);
     REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
-    REGISTER_SYSCALL_IMPL_X32(futex_time64, SyscallPassthrough6<SYSCALL_DEF(futex)>);
+    REGISTER_SYSCALL_IMPL_X32(futex_time64, WrappedFutexObserved);
     REGISTER_SYSCALL_IMPL_X32(sched_rr_get_interval_time64, SyscallPassthrough2<SYSCALL_DEF(sched_rr_get_interval)>);
   }
 } // namespace x32
