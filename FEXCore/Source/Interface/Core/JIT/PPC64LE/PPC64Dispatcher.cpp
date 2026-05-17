@@ -34,10 +34,20 @@
 #include <cstring>
 #include <sys/mman.h>
 
+#include <sched.h>
+
 namespace {
 // Called from the pause handler: park the current thread until it is woken.
 static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
   CTX->SyscallHandler->SleepThread(CTX, Frame);
+}
+// Called from JIT-emitted Yield when guest PAUSE has fired enough times in a
+// row that we want to surrender the CPU to another thread on the host. The
+// SMT priority hint (or 27,27,27) emitted inline is a per-core nudge only;
+// sched_yield() is the only way to give the kernel a chance to schedule a
+// different thread (e.g. the lock-holder).
+extern "C" void PPC64_PauseSchedYield() {
+  sched_yield();
 }
 } // namespace
 
@@ -98,6 +108,7 @@ void PPC64Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thr
   Ptrs.GuestSignal_SIGSEGV       = GuestSignal_SIGSEGV_Address;
   Ptrs.SignalReturnHandler       = SignalHandlerReturnAddress;
   Ptrs.SignalReturnHandlerRT     = SignalHandlerReturnAddress;
+  Ptrs.PPC64_PauseSchedYield     = reinterpret_cast<uint64_t>(&PPC64_PauseSchedYield);
 
   InterpreterOps::FillFallbackIndexPointers(Ptrs.FallbackHandlerPointers, &ABIPointers[0]);
 }
@@ -269,10 +280,57 @@ void PPC64Dispatcher::EmitDispatcher() {
   // ==============================================================
   // ExitFunctionLinker — slow path when L1 cache misses.
   // Calls the C++ FindBlock / compile path, then re-dispatches.
+  //
+  // Wrapped in a DeferredSignalRefCount guard (mirror of ARM64's
+  // EmitSignalGuardedRegion at Dispatcher.cpp:254-308 and the contract in
+  // docs/DeferredSignals.md). Increment marks the dispatcher-resident C++
+  // call as uninterruptible so async signals are deferred; decrement +
+  // InterruptFaultPage byte-store drains any signal queued during the
+  // uninterruptible region.
+  //
+  // Scratch register choice: TMP1 (r3) — NOT in SRA (PPC64Emitter.h:53 maps
+  // r7-r12, r14-r23 to guest GPRs; r3-r6 are non-SRA caller-clobbered
+  // scratch). r0 is NOT usable because addi/std with RA=r0 treat RA as
+  // literal zero. r12 is NOT usable because it holds guest RBP after
+  // FillStaticRegs reloads SRA (this bug caused a SIGSEGV on Steam launch
+  // in commit-before-this; symptom was `ldx rX, r5, r0` after `addi r5,
+  // r12, -120` crashing — guest RBP was the refcount value).
   // ==============================================================
   ExitFunctionLinkerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
+  const int32_t deferred_refcount_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, State.DeferredSignalRefCount));
+  const int32_t deferred_fault_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
+    offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+  static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) >=
+                offsetof(FEXCore::Core::InternalThreadState, BaseFrameState),
+                "InterruptFaultPage must lie at or after BaseFrameState");
+
+  auto EmitDeferredSignalEnter = [&]() {
+    // 3-instr non-atomic thread-local increment per docs/DeferredSignals.md.
+    // TMP1 is scratch; SpillStaticRegs(TMP1) below will clobber it again,
+    // so we can freely use it here.
+    ld(TMP1, deferred_refcount_off, STATE);
+    addi(TMP1, TMP1, 1);
+    std(TMP1, deferred_refcount_off, STATE);
+  };
+  auto EmitDeferredSignalExit = [&]() {
+    // 4-instr decrement + fault-page byte-store. If a signal was queued
+    // while refcount > 0, the page is mprotect'd PROT_NONE and the stb
+    // traps SIGSEGV; the host handler picks the queued signal off the
+    // per-thread stack and dispatches the guest handler.
+    ld(TMP1, deferred_refcount_off, STATE);
+    addi(TMP1, TMP1, -1);
+    std(TMP1, deferred_refcount_off, STATE);
+    stb(TMP1, deferred_fault_off, STATE);
+  };
+
   {
+    // Enter uninterruptible region BEFORE SpillStaticRegs so the spill
+    // itself runs under the guard. SRA is live; r12 is non-SRA scratch.
+    EmitDeferredSignalEnter();
+
     // Spill SRA before calling C++
     SpillStaticRegs(TMP1);
 
@@ -305,8 +363,12 @@ void PPC64Dispatcher::EmitDispatcher() {
     auto found_label = PPC64Emitter::Label{};
     bc(CC_NE, &found_label);
 
-    // Block not found/compilable: fall through to ThreadStopHandler
+    // Block not found/compilable: fall through to ThreadStopHandler.
+    // Balance the refcount + drain pending deferred signals before leaving
+    // the dispatcher region — otherwise the refcount stays elevated and
+    // every future signal in this thread silently defers forever.
     {
+      EmitDeferredSignalExit();
       int32_t stop_off = static_cast<int32_t>(
         offsetof(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
       ld(TMP1, stop_off, STATE);
@@ -321,6 +383,12 @@ void PPC64Dispatcher::EmitDispatcher() {
     mr(r(0), r3);
     FillStaticRegs();
     mtctr(r(0));
+    // CTR now holds the host code pointer; exit the guard region. TMP1
+    // (r3) is non-SRA scratch — FillStaticRegs already clobbered it and
+    // the next JIT block expects it to be scratch, so reusing it for the
+    // refcount decrement / fault store is safe. r0 still holds the host
+    // code ptr (only used here to be reset to zero before bctr).
+    EmitDeferredSignalExit();
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();
   }

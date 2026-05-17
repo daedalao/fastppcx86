@@ -349,6 +349,9 @@ struct JITPointers {
   uint64_t LUDIV {};
   uint64_t LDIV {};
   uint64_t ThunkCallbackRet {};
+  // PPC64LE: helper called by Yield (PAUSE) when PauseCount hits threshold.
+  // Sig: void (*)(); just calls sched_yield(). C-ABI.
+  uint64_t PPC64_PauseSchedYield {};
 
   // Handles returning/calling ARM64EC code from the JIT, expects the target PC in TMP3
   uint64_t ExitFunctionEC {};
@@ -436,6 +439,17 @@ struct CpuStateFrame {
   // bash subshells with tight clone()-allocated stacks). Address as
   // `[STATE + offsetof(CpuStateFrame, JITScratch)]`.
   alignas(16) uint64_t JITScratch[2] {};
+
+  // PAUSE-instruction spin-yield counter. Incremented by every guest PAUSE
+  // (x86 `0xF3 0x90`) translation; when it reaches FEX_PAUSE_YIELD_THRESHOLD
+  // the JIT calls sched_yield() on the host kernel and resets to 0. Pure
+  // SMT-yield (`or 27,27,27`) is a CPU-priority hint only — it does NOT
+  // surrender the CPU to the OS scheduler, so on workloads with more guest
+  // threads than host SMT contexts (or where the lock-holder is parked by
+  // the OS), a tight x86 spinlock loop will starve out the lock-holder
+  // indefinitely. The counter gates how often we pay the syscall cost
+  // (~100ns) vs the SMT-hint cost (1 cycle).
+  uint32_t PauseCount {};
 #endif
 
   // Pointers that the JIT needs to load to remove relocations

@@ -3067,15 +3067,83 @@ DEF_OP(PrintMsg) {
 }
 
 // Misc
-// x86 PAUSE -> POWER ISA yield hint (or 27,27,27).
-// No-op on register state (r27 = r27|r27 = r27) but the encoding signals
-// the SMT dispatcher to lower this thread's priority briefly, giving any
-// sibling HW thread on the same POWER8 core a chance to run. Matches
-// ARM64 backend's yield() emission. Critical for x86 spinlock loops
-// (cmpxchg+pause) where, without this, both contenders spin at full
-// priority with no scheduling cooperation. See project_stardew_main_thread_spin
-// and project_ftl_futex_storm for the bug class this addresses.
-DEF_OP(Yield)                { or_(r(27), r(27), r(27)); }
+// x86 PAUSE -> POWER ISA SMT yield hint + counter-gated sched_yield.
+//
+// Two-tier strategy. The hot path is just 5 instructions (lwz/addi/cmplwi/
+// bc/stw) plus the SMT priority hint `or r1,r1,r1`. Every PAUSE_YIELD_LIMIT
+// PAUSEs we fall through to a host C helper that runs sched_yield(), so the
+// OS scheduler gets a chance to run whichever thread is holding the lock the
+// guest is spinning on. Critical for x86 spinlock+PAUSE loops on PPC64LE
+// because:
+//   - `or rN,rN,rN` is a SMT priority hint, NOT a scheduler call. On a host
+//     with more guest threads than physical SMT contexts, the lock-holder
+//     never gets to run.
+//   - The previous code emitted `or r27,r27,r27`. r27 is not on POWER ISA's
+//     priority-hint operand list (only r1=low, r6=medium-low, r2=medium are
+//     user-mode-recognized) — so it was a literal no-op, not even an SMT
+//     priority change. `or r1,r1,r1` is the actual "low priority" form.
+//
+// Bug-class entries: project_stardew_main_thread_spin, project_ftl_futex_storm,
+// project_steam_nul_jit_race (all involve guest threads spinning while their
+// lock-holder is parked in the kernel).
+DEF_OP(Yield) {
+  constexpr uint32_t PAUSE_YIELD_LIMIT = 1000;
+  const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
+  const int16_t pc_off = static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, PauseCount));
+
+  Label skip_full_yield{};
+  Label end{};
+
+  // Hot path: lwz/addi/cmplwi/bc — 4 instructions until we either reach the
+  // threshold or take the skip branch.
+  lwz(TMP1, pc_off, STATE);
+  addi(TMP1, TMP1, 1);
+  cmplwi(cr(0), TMP1, PAUSE_YIELD_LIMIT);
+  bc(CC_ULT, &skip_full_yield);
+
+  // Threshold reached. Reset counter to 0, then call PPC64_PauseSchedYield.
+  li(TMP1, 0);
+  stw(TMP1, pc_off, STATE);
+
+  // Mini-frame: 64 bytes laid out like MonoBackpatcherWrite.
+  //   [r1+ 0]  back chain
+  //   [r1+ 8]  Func ptr (PPC64_PauseSchedYield)
+  //   [r1+16]  LR save
+  //   [r1+24]  TOC save
+  //   [r1+32..56] padding (unused)
+  stdu(r1, -64, r1);
+  mflr(r(0));
+  std(r(0), 16, r1);
+
+  ld(TMP1, static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.PPC64_PauseSchedYield)), STATE);
+  std(TMP1, 8, r1);
+
+  SpillForABICall(TMP1);
+
+  ld(r(12), 8 + kABISpill, r1);
+  std(r2, 24 + kABISpill, r1);
+  mtctr(r(12));
+  bctrl();
+  ld(r2, 24 + kABISpill, r1);
+
+  FillForABICall();
+
+  ld(r(0), 16, r1);
+  mtlr(r(0));
+  addi(r1, r1, 64);
+  b(&end);
+
+  // skip_full_yield: just store the incremented counter.
+  Bind(&skip_full_yield);
+  stw(TMP1, pc_off, STATE);
+
+  Bind(&end);
+  // SMT priority hint: `or r1, r1, r1` is the canonical user-mode "low
+  // priority" form on POWER ISA (Program Priority Register). r1 = r1 (no
+  // effect on stack pointer state) but the encoding is recognized by the
+  // SMT dispatcher.
+  or_(r(1), r(1), r(1));
+}
 DEF_OP(WFET)                 { /* nop */ }
 // =========================================================================
 // MonoBackpatcherWrite: Mono/.NET single-instruction patcher.
