@@ -16,6 +16,8 @@ $end_info$
 #include <stdint.h>
 #include <sched.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <termios.h>  // PPC TCGETS family expands to use sizeof(struct termios)
 
 namespace FEX::HLE {
 #if defined(ARCHITECTURE_ppc64le)
@@ -590,11 +592,62 @@ namespace x64 {
     // PPC-FIO* family (commit 828352361) is a separate quirk handled first.
     static constexpr auto RemapIoctlForPPC = [](uint32_t cmd) -> uint32_t {
       switch (cmd) {
+      // FIO* family (file ioctls).
       case 0x5421u: return FIONBIO;
-      case 0x541Bu: return FIONREAD;
+      case 0x541Bu: return FIONREAD;  // also TIOCINQ on x86 (== FIONREAD)
       case 0x5450u: return FIONCLEX;
       case 0x5451u: return FIOCLEX;
       case 0x5452u: return FIOASYNC;
+
+      // TTY / pty / terminal-control / job-control. On x86 these are
+      // legacy hard-coded 0x54xx values; on PPC asm/ioctls.h overrides
+      // them with _IOR/_IOW-encoded numbers via the 3-bit-direction PPC
+      // convention. The right-hand constants resolve at compile-time to
+      // PPC values because <sys/ioctl.h> pulls in asm/ioctls.h on this
+      // host. Fixes the gvisor socket_unix_*_test TIOCOUTQ failures and
+      // any guest x86 binary that calls TTY ioctls on sockets/files.
+      case 0x5400u: return TCGETS;
+      case 0x5401u: return TCSETS;
+      case 0x5402u: return TCSETSW;
+      case 0x5403u: return TCSETSF;
+      case 0x5404u: return TCGETA;
+      case 0x5405u: return TCSETA;
+      case 0x5406u: return TCSETAW;
+      case 0x5407u: return TCSETAF;
+      case 0x5408u: return TCSBRK;
+      case 0x5409u: return TCXONC;
+      case 0x540Au: return TCFLSH;
+      case 0x540Bu: return TIOCEXCL;
+      case 0x540Cu: return TIOCNXCL;
+      case 0x540Du: return TIOCSCTTY;
+      case 0x540Eu: return TIOCGPGRP;
+      case 0x540Fu: return TIOCSPGRP;
+      case 0x5411u: return TIOCOUTQ;
+      case 0x5412u: return TIOCSTI;
+      case 0x5413u: return TIOCGWINSZ;
+      case 0x5414u: return TIOCSWINSZ;
+      case 0x5415u: return TIOCMGET;
+      case 0x5416u: return TIOCMBIS;
+      case 0x5417u: return TIOCMBIC;
+      case 0x5418u: return TIOCMSET;
+      case 0x5419u: return TIOCGSOFTCAR;
+      case 0x541Au: return TIOCSSOFTCAR;
+      case 0x541Cu: return TIOCLINUX;
+      case 0x541Du: return TIOCCONS;
+      case 0x541Eu: return TIOCGSERIAL;
+      case 0x541Fu: return TIOCSSERIAL;
+      case 0x5420u: return TIOCPKT;
+      case 0x5422u: return TIOCNOTTY;
+      case 0x5423u: return TIOCSETD;
+      case 0x5424u: return TIOCGETD;
+      case 0x5425u: return TCSBRKP;
+      case 0x5429u: return TIOCGSID;
+      case 0x5430u: return TIOCGPTN;
+      case 0x5431u: return TIOCSPTLCK;
+      case 0x5432u: return TIOCGDEV;
+      case 0x5437u: return TIOCSIG;
+      case 0x5438u: return TIOCVHANGUP;
+
       default: break;
       }
 

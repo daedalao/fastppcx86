@@ -165,6 +165,76 @@ bool IsFaultLocation(uint64_t PC) {
   return IsMemcpyFault;
 }
 
+#elif defined(ARCHITECTURE_ppc64le)
+// PPC64LE parity with the ARM64 naked-asm implementations above. Each function
+// has one labelled instruction where a guest-pointer dereference can SIGSEGV;
+// `TryHandleSafeFault` (Syscalls.h) compares the faulting PC against these
+// labels and, on match, sets r3=EFAULT and PC=LR to return to the caller.
+//
+// Calling convention (PPC64LE ELFv2): r3=Dest, r4=Src, r5=Size; return in r3.
+// We use r6 as the loop temp (caller-clobbered scratch under ELFv2).
+__attribute__((naked)) size_t CopyFromUser(void* Dest, const void* Src, size_t Size) {
+  __asm volatile(R"(
+    cmpdi   3, 5, 0
+    beq     3, 2f
+  1:
+    .globl CopyFromUser_FaultInst
+    CopyFromUser_FaultInst:
+    lbz     6, 0(4)          # <- This line can fault on a bad guest Src.
+    stb     6, 0(3)
+    addi    3, 3, 1
+    addi    4, 4, 1
+    addic.  5, 5, -1
+    bne     0, 1b
+  2:
+    li      3, 0
+    blr
+  )" ::
+                   : "memory");
+}
+
+__attribute__((naked)) size_t CopyToUser(void* Dest, const void* Src, size_t Size) {
+  __asm volatile(R"(
+    cmpdi   3, 5, 0
+    beq     3, 2f
+  1:
+    lbz     6, 0(4)
+    .globl CopyToUser_FaultInst
+    CopyToUser_FaultInst:
+    stb     6, 0(3)          # <- This line can fault on a bad guest Dest.
+    addi    3, 3, 1
+    addi    4, 4, 1
+    addic.  5, 5, -1
+    bne     0, 1b
+  2:
+    li      3, 0
+    blr
+  )" ::
+                   : "memory");
+}
+
+extern "C" uint64_t CopyFromUser_FaultInst;
+void* const CopyFromUser_FaultLocation = &CopyFromUser_FaultInst;
+
+extern "C" uint64_t CopyToUser_FaultInst;
+void* const CopyToUser_FaultLocation = &CopyToUser_FaultInst;
+
+// NOTE: ARM64 also implements VerifyIsReadable/Writable/StringReadable as
+// naked-asm probes for assertion-only builds, with matching fault locations
+// in IsFaultLocation. On PPC64LE the corresponding wrappers in
+// `Syscalls.h:559-580` are `inline` stubs (the ASSERTIONS+ARM64 combined
+// gate is false), so defining real impls here would double-define them.
+// The CopyFromUser/CopyToUser path is the only correctness-critical surface
+// for guest user-pointer fault recovery; the Verify* probes are debug-only
+// and can be added later if the inline-stub conflict is resolved.
+
+bool IsFaultLocation(uint64_t PC) {
+  bool IsMemcpyFault = false;
+  IsMemcpyFault |= reinterpret_cast<void*>(PC) == CopyToUser_FaultLocation;
+  IsMemcpyFault |= reinterpret_cast<void*>(PC) == CopyFromUser_FaultLocation;
+  return IsMemcpyFault;
+}
+
 #else
 size_t CopyFromUser(void* Dest, const void* Src, size_t Size) {
   memcpy(Dest, Src, Size);
