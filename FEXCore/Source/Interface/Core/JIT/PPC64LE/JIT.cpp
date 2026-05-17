@@ -1507,7 +1507,206 @@ void PPC64JITCore::ResetStack() {
 // Called from the dispatcher's ExitFunctionLinker when the L1 cache misses.
 // Looks up or compiles the block at GuestRIP and returns its host code address.
 // Returns DispatcherLoopTop if compilation fails (dispatcher will spin and recheck).
+// Forward-declare the dispatcher's ring buffer (defined in PPC64Dispatcher.cpp).
+extern "C" {
+  extern uint64_t g_dispatch_count;
+  extern uint64_t g_recent_rips[16];
+}
+
+// Check if a GuestRIP is plausibly valid (mapped, executable, not all-0xCC,
+// not near-NULL). When it looks bad, dump the JIT-block PC that called us
+// (= the caller's return address = our LR), the last successful guest RIPs
+// from g_recent_rips, and disasm of the JIT block tail so we can identify
+// which guest x86 op's emit produced the bad target. Aborts after the dump.
+//
+// Suppress with FEX_EXITLINK_NOABORT=1 to revert to silent forwarding.
+static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
+                                     FEXCore::Core::CpuStateFrame* Frame) {
+  static const bool absorb = (getenv("FEX_EXITLINK_NOABORT") != nullptr);
+  if (absorb) {
+    return;
+  }
+  LogMan::Msg::EFmt("=== ExitFunctionLink: suspect GuestRIP=0x{:x} ===", GuestRIP);
+  LogMan::Msg::EFmt("    Host LR (JIT block tail that called us) = 0x{:x}", HostLR);
+  LogMan::Msg::EFmt("    Recent dispatched guest RIPs (g_recent_rips):");
+  {
+    uint64_t _dcount = g_dispatch_count;
+    for (int _ri = 1; _ri <= 16 && _ri <= static_cast<int>(_dcount); ++_ri) {
+      LogMan::Msg::EFmt("      rip[-{}] = 0x{:x}", _ri, g_recent_rips[(_dcount - _ri) & 15]);
+    }
+  }
+  LogMan::Msg::EFmt("    Disasm of JIT block at Host LR-512 .. LR+32 (PPC64 instructions):");
+  LogMan::Msg::EFmt("    (Look for `std rX, 0x18(rRR)` = the state.rip store, and "
+                    "`ldx rX, rA, r0` / `lis;ori;sldi;oris;ori` = the LoadConstant+ldx for malloc GOT)");
+  {
+    // Widened window: LR-128 misses the actual `ldx` and earlier LoadConstant.
+    // Bump to LR-512 (128 words) to catch the full x86-op translation
+    // (LoadConstant of GOT VA + ldx + std to State.rip + SpillStaticRegs).
+    const uint32_t* base = reinterpret_cast<const uint32_t*>(HostLR);
+    for (int i = -128; i <= 8; ++i) {
+      const uint32_t* addr = base + i;
+      uint32_t insn = *addr;
+      // Annotate any std/ldx/lis instructions inline so easier to scan.
+      const char* note = "";
+      uint32_t opcode = insn >> 26;
+      if (opcode == 62) note = "  ; std/stdx (store double)";
+      else if (opcode == 58) note = "  ; ld/ldx (load double)";
+      else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 21) note = "  ; ldx (X-form load doubleword)";
+      else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 149) note = "  ; stdx (X-form store doubleword)";
+      else if (opcode == 15) note = "  ; lis (load immed shifted)";
+      else if (opcode == 24) note = "  ; ori (or immediate)";
+      else if (opcode == 25) note = "  ; oris (or immed shifted)";
+      else if (opcode == 30) note = "  ; rldicl/rldicr (rotate-left-double-immed)";
+      if (i == 0) {
+        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}  <-- LR (return-to here from call)",
+                          reinterpret_cast<uint64_t>(addr), insn, note);
+      } else if (i == -1) {
+        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}  <-- call (bctrl)",
+                          reinterpret_cast<uint64_t>(addr), insn, note);
+      } else {
+        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}",
+                          reinterpret_cast<uint64_t>(addr), insn, note);
+      }
+    }
+  }
+
+  // If rip[-1] looks like it points into a mapped x86_64 region, try to
+  // read the bytes there. If it's an x86 `ff 25 disp32` instruction
+  // (jmp [rip+disp32]), compute the GOT slot it dereferences and read
+  // the 8 bytes at that slot. This disambiguates "GOT was actually
+  // corrupted to GuestRIP value" from "JIT read from wrong VA".
+  {
+    uint64_t prev_rip = 0;
+    {
+      uint64_t _dcount = g_dispatch_count;
+      if (_dcount >= 1) {
+        prev_rip = g_recent_rips[(_dcount - 1) & 15];
+      }
+    }
+    if (prev_rip) {
+      // sanity-bounded read of 8 bytes at prev_rip
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(prev_rip);
+      LogMan::Msg::EFmt("    Bytes at rip[-1] (= 0x{:x}):", prev_rip);
+      uint8_t bytes[16] = {};
+      bool readable = true;
+      // try to read; if SIGSEGV, oh well — we're aborting anyway
+      for (int i = 0; i < 16 && readable; ++i) {
+        bytes[i] = p[i];  // may fault; that's fine, we're crashing anyway
+      }
+      LogMan::Msg::EFmt("      {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+      // Check for `ff 25 disp32` PLT pattern
+      if (bytes[0] == 0xff && bytes[1] == 0x25) {
+        int32_t disp = static_cast<int32_t>(static_cast<uint32_t>(bytes[2]) |
+                                            (static_cast<uint32_t>(bytes[3]) << 8) |
+                                            (static_cast<uint32_t>(bytes[4]) << 16) |
+                                            (static_cast<uint32_t>(bytes[5]) << 24));
+        uint64_t rip_after_instr = prev_rip + 6;
+        uint64_t got_va = rip_after_instr + disp;
+        LogMan::Msg::EFmt("    PLT pattern detected: jmp [rip+0x{:x}]; GOT slot VA = 0x{:x}", disp, got_va);
+        const uint64_t* got_ptr = reinterpret_cast<const uint64_t*>(got_va);
+        uint64_t got_value = *got_ptr;  // may fault; we're aborting
+        LogMan::Msg::EFmt("    GOT slot contents = 0x{:x}", got_value);
+        LogMan::Msg::EFmt("    GuestRIP we crashed on = 0x{:x}", GuestRIP);
+        if (got_value == GuestRIP) {
+          LogMan::Msg::EFmt("    CONCLUSION: GOT slot value MATCHES GuestRIP -> JIT load was correct, "
+                            "GOT page is actually corrupted to 0x{:x}", got_value);
+        } else {
+          LogMan::Msg::EFmt("    CONCLUSION: GOT slot value = 0x{:x} but JIT loaded 0x{:x} -> "
+                            "JIT load is reading from WRONG VA",
+                            got_value, GuestRIP);
+        }
+        // Also dump 32 bytes (4 slots) around the GOT slot to see the
+        // neighborhood. If only one slot is corrupted, the others
+        // contain valid pointers.
+        LogMan::Msg::EFmt("    Neighbouring GOT slots (-16..+24 bytes from target):");
+        for (int off = -16; off <= 24; off += 8) {
+          uint64_t addr = got_va + off;
+          uint64_t val = *reinterpret_cast<const uint64_t*>(addr);
+          LogMan::Msg::EFmt("      0x{:x} = 0x{:016x}", addr, val);
+        }
+      }
+    }
+  }
+
+  // Disassemble the PREVIOUS JIT block — the one that stored the bad value
+  // into State.rip via its ExitFunction emit. The previous guest RIP is
+  // rip[-1]; we look it up in the L1 lookup cache to find its host code.
+  {
+    uint64_t prev_rip = 0;
+    {
+      uint64_t _dcount = g_dispatch_count;
+      if (_dcount >= 1) {
+        prev_rip = g_recent_rips[(_dcount - 1) & 15];
+      }
+    }
+    if (prev_rip && Frame && Frame->Thread) {
+      auto Thread = Frame->Thread;
+      uintptr_t PrevBlockHostPC = Thread->LookupCache->FindBlock(Thread, prev_rip);
+      if (PrevBlockHostPC) {
+        LogMan::Msg::EFmt("    Previous JIT block (guest RIP=0x{:x}) host code @ 0x{:x}",
+                          prev_rip, PrevBlockHostPC);
+        LogMan::Msg::EFmt("    Disasm of previous JIT block (first 80 PPC64 instructions):");
+        const uint32_t* base = reinterpret_cast<const uint32_t*>(PrevBlockHostPC);
+        for (int i = 0; i < 80; ++i) {
+          uint32_t insn = base[i];
+          uint32_t opcode = insn >> 26;
+          const char* note = "";
+          if (opcode == 62) note = "  ; std (store doubleword)";
+          else if (opcode == 58) note = "  ; ld (load doubleword)";
+          else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 21)  note = "  ; ldx (X-form load dw)";
+          else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 149) note = "  ; stdx (X-form store dw)";
+          else if (opcode == 15) note = "  ; lis";
+          else if (opcode == 24) note = "  ; ori";
+          else if (opcode == 25) note = "  ; oris";
+          else if (opcode == 30) note = "  ; rldicl/rldicr (sldi)";
+          else if (opcode == 18) note = "  ; b (branch)";
+          else if (opcode == 16) note = "  ; bc (cond branch)";
+          else if (opcode == 19) note = "  ; bclr/bcctr";
+          LogMan::Msg::EFmt("      +0x{:03x} = 0x{:08x}{}", i * 4, insn, note);
+          // Stop if we hit a likely block-exit (bctr/bclr opcode 19)
+          if (opcode == 19) {
+            // Look 4 more after the branch then stop
+            int stop = std::min(80, i + 4);
+            for (int j = i + 1; j <= stop; ++j) {
+              LogMan::Msg::EFmt("      +0x{:03x} = 0x{:08x}", j * 4, base[j]);
+            }
+            break;
+          }
+        }
+      } else {
+        LogMan::Msg::EFmt("    Previous JIT block lookup failed (rip 0x{:x} not in L1)", prev_rip);
+      }
+    }
+  }
+
+  LogMan::Msg::EFmt("Aborting on suspect ExitFunctionLink. To suppress, set FEX_EXITLINK_NOABORT=1.");
+  std::abort();
+}
+
 uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  // Suspect-RIP filter:
+  //   1. Near-NULL (within first page) — can't be valid PIE-loaded x86 code
+  //   2. All-CC pattern (0xCCCCCCCCCCCCCCCC) — typical "uninitialized" value
+  //   3. Outside the 47-bit user-space canonical range — guest RIP must be
+  //      in low canonical addresses (top 17 bits zero) since FEX maps guest
+  //      VAs without using the non-canonical region.
+  // If any of these fire, dump diagnostic + abort.
+  auto LooksSuspect = [GuestRIP]() {
+    if (GuestRIP < 0x1000) return true;                  // near-NULL
+    if (GuestRIP == 0xCCCCCCCCCCCCCCCCULL) return true;  // all-CC
+    if ((GuestRIP >> 47) != 0) return true;              // beyond user canonical
+    return false;
+  };
+  if (LooksSuspect()) {
+    // Grab the host LR (return address into the JIT block that called us).
+    // __builtin_return_address(0) is the address of the instruction AFTER
+    // the bctrl/bl that branched here.
+    uint64_t HostLR = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+    DiagnoseSuspectGuestRIP(GuestRIP, HostLR, Frame);
+  }
+
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
 
