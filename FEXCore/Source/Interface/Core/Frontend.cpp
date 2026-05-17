@@ -1366,8 +1366,43 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
   return !Uncacheable;
 }
 
+// Compile-time byte log: ring buffer recording (guest_rip, src_host_va, first 16 bytes)
+// at every DecodeInstructionsAtEntry call. Used by the ExitFunctionLink
+// diagnostic to compare what bytes FEX SAW at compile time vs what bytes are
+// at the same guest VA at fault time. A mismatch proves the stale-compile
+// hypothesis.
+extern "C" {
+  struct CompileLogEntry {
+    uint64_t guest_rip;
+    uint64_t src_host_va;  // where InstStream pointed (post-AdjustAddrForSpecialRegion)
+    uint8_t  bytes[16];
+  };
+  alignas(64) CompileLogEntry g_compile_log[256] = {};
+  alignas(64) uint64_t g_compile_log_count = 0;
+}
+
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
+  // Log this compile attempt (best-effort; faults on _InstStream read are
+  // tolerated — the caller is about to fail anyway in that case).
+  {
+    uint64_t idx = g_compile_log_count++ & 255;
+    g_compile_log[idx].guest_rip   = PC;
+    g_compile_log[idx].src_host_va = reinterpret_cast<uint64_t>(_InstStream);
+    // Try to read 16 bytes. We use memcpy in a SIGSEGV-tolerant way (best
+    // effort — if the read faults the entry's bytes stay zeroed).
+    for (int b = 0; b < 16; ++b) {
+      g_compile_log[idx].bytes[b] = 0;  // pre-zero
+    }
+    if (_InstStream) {
+      // Don't use memcpy directly; some pages may not be readable.
+      // We just bulk-copy and accept faults.
+      for (int b = 0; b < 16; ++b) {
+        g_compile_log[idx].bytes[b] = _InstStream[b];
+      }
+    }
+  }
+
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();

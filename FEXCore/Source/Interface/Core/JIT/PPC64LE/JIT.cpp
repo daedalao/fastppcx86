@@ -1513,6 +1513,22 @@ extern "C" {
   extern uint64_t g_recent_rips[16];
 }
 
+// Forward-declare the compile-log ring buffer (defined in Frontend.cpp).
+// Records what bytes FEX saw at DecodeInstructionsAtEntry time. Used to
+// confirm/refute the stale-compile hypothesis: if the bytes FEX read at
+// compile time differ from the bytes at the same guest VA at fault time,
+// the JIT block was built from stale bytes (and FEX's SMC detection
+// missed the change).
+extern "C" {
+  struct CompileLogEntry {
+    uint64_t guest_rip;
+    uint64_t src_host_va;
+    uint8_t  bytes[16];
+  };
+  extern CompileLogEntry g_compile_log[256];
+  extern uint64_t g_compile_log_count;
+}
+
 // Check if a GuestRIP is plausibly valid (mapped, executable, not all-0xCC,
 // not near-NULL). When it looks bad, dump the JIT-block PC that called us
 // (= the caller's return address = our LR), the last successful guest RIPs
@@ -1626,6 +1642,56 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
           uint64_t val = *reinterpret_cast<const uint64_t*>(addr);
           LogMan::Msg::EFmt("      0x{:x} = 0x{:016x}", addr, val);
         }
+      }
+    }
+  }
+
+  // Compile-log lookup: did FEX see the same bytes at rip[-1] when it
+  // FIRST compiled the block, vs what's there NOW? Stale-compile bug
+  // confirmed if they differ.
+  {
+    uint64_t prev_rip = 0;
+    {
+      uint64_t _dcount = g_dispatch_count;
+      if (_dcount >= 1) {
+        prev_rip = g_recent_rips[(_dcount - 1) & 15];
+      }
+    }
+    if (prev_rip) {
+      // Walk g_compile_log backward looking for the most recent entry with
+      // guest_rip == prev_rip
+      uint64_t cur = g_compile_log_count;
+      bool found = false;
+      // Scan all 256 entries; oldest first to find earliest match too
+      for (uint64_t off = 1; off <= 256 && off <= cur; ++off) {
+        uint64_t idx = (cur - off) & 255;
+        if (g_compile_log[idx].guest_rip == prev_rip) {
+          auto& e = g_compile_log[idx];
+          LogMan::Msg::EFmt("    >>> COMPILE-LOG: bytes FEX saw at rip[-1] when compiling <<<");
+          LogMan::Msg::EFmt("        compile-log[#{}] guest_rip=0x{:x} src_host_va=0x{:x}",
+                            (cur - off), e.guest_rip, e.src_host_va);
+          LogMan::Msg::EFmt("        bytes-at-compile-time: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            e.bytes[0], e.bytes[1], e.bytes[2], e.bytes[3],
+                            e.bytes[4], e.bytes[5], e.bytes[6], e.bytes[7],
+                            e.bytes[8], e.bytes[9], e.bytes[10], e.bytes[11],
+                            e.bytes[12], e.bytes[13], e.bytes[14], e.bytes[15]);
+          // Compare to bytes at rip[-1] right now
+          const uint8_t* now = reinterpret_cast<const uint8_t*>(prev_rip);
+          bool match = true;
+          for (int b = 0; b < 16; ++b) {
+            if (now[b] != e.bytes[b]) { match = false; break; }
+          }
+          if (match) {
+            LogMan::Msg::EFmt("        ===> bytes MATCH current bytes-at-rip — stale-compile theory REFUTED");
+          } else {
+            LogMan::Msg::EFmt("        ===> bytes DIFFER from current bytes-at-rip — STALE-COMPILE CONFIRMED");
+          }
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        LogMan::Msg::EFmt("    (no compile-log entry for rip[-1] = 0x{:x} in last 256 compiles)", prev_rip);
       }
     }
   }
