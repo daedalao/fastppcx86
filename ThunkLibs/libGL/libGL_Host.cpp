@@ -327,26 +327,26 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
     return guest_layout<XVisualInfo*> {.data = 0};
   }
 
-  auto guest_display = x11_manager.HostToGuestDisplay(HostDisplay);
-#ifndef IS_32BIT_THUNK
-  int num_matches;
-  auto GuestInfo = to_guest(to_host_layout(*HostInfo));
-#else
-  GuestStackBumpAllocator GuestStack;
-  auto& num_matches = *GuestStack.New<int>();
-  auto& GuestInfo = *GuestStack.New<guest_layout<XVisualInfo>>(to_guest(to_host_layout(*HostInfo)));
-#endif
-  auto ret = x11_manager.GuestXGetVisualInfo(guest_display.get_pointer(), VisualScreenMask | VisualIDMask, &GuestInfo, &num_matches);
-
-  if (num_matches != 1) {
-    fprintf(stderr, "ERROR: Did not find unique guest XVisualInfo\n");
+  // The historical implementation called GuestXGetVisualInfo as a guest
+  // callback to relocate the visual into guest-owned memory. That round-
+  // trip is unreliable on cross-arch hosts (project_2026-05-17_trampoline_
+  // yield_bypass + Grimrock). GuestMalloc is also a guest-callback so we
+  // can't use it as a substitute either — it returns garbage on the same
+  // broken path.
+  //
+  // Use host malloc() directly: the guest and host share the same process
+  // VA (FEX maps the guest binary in-process), so a host-allocated 0x3fff…
+  // pointer is dereferenceable by guest JIT code. The guest's eventual
+  // XFree(visualinfo) routes through the thunked XFree → HostXFree →
+  // libX11 XFree → host free(), which matches the host malloc. Safe.
+  guest_layout<XVisualInfo*> GuestRet;
+  GuestRet.data = reinterpret_cast<uintptr_t>(std::malloc(sizeof(guest_layout<XVisualInfo>)));
+  if (!GuestRet.data) {
+    fprintf(stderr, "MapToGuestVisualInfo: host malloc failed\n");
     std::abort();
   }
-
-  // We effectively relocated the VisualInfo, so free the original one now
+  *reinterpret_cast<guest_layout<XVisualInfo>*>(GuestRet.data) = to_guest(to_host_layout(*HostInfo));
   x11_manager.HostXFree(HostInfo);
-  guest_layout<XVisualInfo*> GuestRet;
-  GuestRet.data = reinterpret_cast<uintptr_t>(ret);
   return GuestRet;
 }
 
