@@ -3067,7 +3067,15 @@ DEF_OP(PrintMsg) {
 }
 
 // Misc
-DEF_OP(Yield)                { /* nop */ }
+// x86 PAUSE -> POWER ISA yield hint (or 27,27,27).
+// No-op on register state (r27 = r27|r27 = r27) but the encoding signals
+// the SMT dispatcher to lower this thread's priority briefly, giving any
+// sibling HW thread on the same POWER8 core a chance to run. Matches
+// ARM64 backend's yield() emission. Critical for x86 spinlock loops
+// (cmpxchg+pause) where, without this, both contenders spin at full
+// priority with no scheduling cooperation. See project_stardew_main_thread_spin
+// and project_ftl_futex_storm for the bug class this addresses.
+DEF_OP(Yield)                { or_(r(27), r(27), r(27)); }
 DEF_OP(WFET)                 { /* nop */ }
 // =========================================================================
 // MonoBackpatcherWrite: Mono/.NET single-instruction patcher.
