@@ -357,6 +357,28 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
   const uint64_t result =
     SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
 
+  // Diagnostic: catch any futex syscall whose errno is something glibc
+  // pthread treats as fatal — that's what produces "The futex facility
+  // returned an unexpected error code" panics. glibc accepts 0, EAGAIN,
+  // EINTR, ETIMEDOUT, EWOULDBLOCK; anything else aborts the process.
+  // Enable with FEX_LOG_UNEXPECTED_FUTEX=1.
+  const int64_t signed_result = static_cast<int64_t>(result);
+  if (signed_result < 0) {
+    static const bool log_futex = (getenv("FEX_LOG_UNEXPECTED_FUTEX") != nullptr);
+    if (log_futex) {
+      const int err = static_cast<int>(-signed_result);
+      const bool is_expected = (err == EAGAIN || err == EINTR || err == ETIMEDOUT || err == EWOULDBLOCK);
+      if (!is_expected) {
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf),
+                         "[FEX-futex-bad] op=0x%lx uaddr=0x%lx val=0x%lx timeout=0x%lx uaddr2=0x%lx val3=0x%lx -> errno=%d\n",
+                         (unsigned long)futex_op, (unsigned long)uaddr, (unsigned long)val,
+                         (unsigned long)timeout, (unsigned long)uaddr2, (unsigned long)val3, err);
+        [[maybe_unused]] auto _ = write(2, buf, n);
+      }
+    }
+  }
+
   const auto action =
     FEX::HLE::SyscallObserver::OnFutexReturn(uaddr, futex_op, val, static_cast<int64_t>(result));
   if (action == FEX::HLE::SyscallObserver::FutexAction::ThenYield) {
