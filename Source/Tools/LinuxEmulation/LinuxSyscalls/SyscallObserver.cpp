@@ -14,8 +14,12 @@
 namespace FEX::HLE::SyscallObserver {
 
 namespace {
-FEX_CONFIG_OPT(SyscallObserve, SYSCALLOBSERVE);
-FEX_CONFIG_OPT(FutexMitigate, FUTEXMITIGATE);
+// Config readers MUST NOT be at namespace scope -- the Getter constructor
+// touches FEXCore::Config's hash map, which is not yet initialized at C++
+// static-init time. Move them to function-local statics so they are
+// initialized lazily, on first call (which by then is after FEX has loaded
+// its config). Otherwise we SIGSEGV on the first .find() in MetaLayer.
+//
 
 // Storm detector tunables. Set conservatively so legitimate brief bursts
 // (a few retries during normal mutex acquisition) don't fire — only sustained
@@ -47,6 +51,9 @@ inline uint64_t MonotonicNs() {
 } // namespace
 
 FutexAction OnFutexReturn(uint64_t uaddr, uint64_t futex_op, uint64_t val, int64_t signed_result) {
+  static FEX_CONFIG_OPT(SyscallObserve, SYSCALLOBSERVE);
+  static FEX_CONFIG_OPT(FutexMitigate, FUTEXMITIGATE);
+
   // Hot-path: zero work when observer is disabled. One bool load + branch.
   if (!SyscallObserve()) {
     return FutexAction::JustReturn;
@@ -108,6 +115,7 @@ FutexAction OnFutexReturn(uint64_t uaddr, uint64_t futex_op, uint64_t val, int64
 }
 
 void OnTgkillCall(uint64_t tgid, uint64_t tid, uint64_t sig) {
+  static FEX_CONFIG_OPT(SyscallObserve, SYSCALLOBSERVE);
   if (SyscallObserve()) {
     LogMan::Msg::IFmt("SyscallObserver: tgkill tgid={} tid={} sig={} from-tid={}",
                       tgid, tid, sig, FHU::Syscalls::gettid());

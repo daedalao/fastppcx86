@@ -9,6 +9,7 @@ $end_info$
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
+#include "LinuxSyscalls/SyscallObserver.h"
 
 #include <FEXCore/IR/IR.h>
 
@@ -330,6 +331,17 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 }
 #endif
 
+// Phase B of SyscallObserver: tgkill wrapper. Pure logging side-effect;
+// delegates the actual syscall to the bare SyscallPassthrough3 template
+// so the guest sees byte-identical kernel ABI regardless of observer state.
+// When FEX_SYSCALLOBSERVE is unset, OnTgkillCall is a single bool-load
+// short-circuit -- essentially free.
+static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
+                                     uint64_t tgid, uint64_t tid, uint64_t sig) {
+  FEX::HLE::SyscallObserver::OnTgkillCall(tgid, tid, sig);
+  return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
+}
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -424,7 +436,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(remap_file_pages, SyscallPassthrough5<SYSCALL_DEF(remap_file_pages)>);
   REGISTER_SYSCALL_IMPL(timer_getoverrun, SyscallPassthrough1<SYSCALL_DEF(timer_getoverrun)>);
   REGISTER_SYSCALL_IMPL(timer_delete, SyscallPassthrough1<SYSCALL_DEF(timer_delete)>);
-  REGISTER_SYSCALL_IMPL(tgkill, SyscallPassthrough3<SYSCALL_DEF(tgkill)>);
+  REGISTER_SYSCALL_IMPL(tgkill, WrappedTgkillObserved);
   REGISTER_SYSCALL_IMPL(mbind, SyscallPassthrough6<SYSCALL_DEF(mbind)>);
   REGISTER_SYSCALL_IMPL(set_mempolicy, SyscallPassthrough3<SYSCALL_DEF(set_mempolicy)>);
   REGISTER_SYSCALL_IMPL(get_mempolicy, SyscallPassthrough5<SYSCALL_DEF(get_mempolicy)>);
