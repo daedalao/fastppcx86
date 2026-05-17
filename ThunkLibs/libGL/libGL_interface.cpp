@@ -209,9 +209,9 @@ struct fex_gen_config<glXGetFBConfigAttrib> {};
 template<>
 struct fex_gen_config<glXIsDirect> {};
 template<>
-struct fex_gen_config<glXMakeContextCurrent> {};
+struct fex_gen_config<glXMakeContextCurrent> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<glXMakeCurrent> {};
+struct fex_gen_config<glXMakeCurrent> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXQueryContext> {};
 template<>

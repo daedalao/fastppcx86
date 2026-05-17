@@ -37,8 +37,36 @@ static X11Manager x11_manager;
 
 static void* (*GuestMalloc)(guest_size_t) = nullptr;
 
+// Diagnostic X error handler. libX11's default handler prints and calls
+// exit(1) on BadDrawable etc., which prevents seeing what came before and
+// what request triggered it. Print extra context and let execution continue
+// so we can characterize the call chain. Opt-in via FEX_LIBGL_DEBUG=1.
+static int LoggingXErrorHandler(Display* d, XErrorEvent* ev) {
+  fprintf(stderr, "[fex-libGL] X Error: code=%u request=%u.%u resource=0x%lx serial=%lu\n",
+          (unsigned)ev->error_code, (unsigned)ev->request_code,
+          (unsigned)ev->minor_code, (unsigned long)ev->resourceid,
+          (unsigned long)ev->serial);
+  return 0; // do not abort
+}
+static bool FexLibGLDebug() {
+  static const bool enabled = (getenv("FEX_LIBGL_DEBUG") != nullptr);
+  return enabled;
+}
+static void InstallLoggingXErrorHandler() {
+  static bool installed = false;
+  if (!installed && FexLibGLDebug()) {
+    using XSetErrorHandler_t = int (*(*)(int (*)(Display*, XErrorEvent*)))(Display*, XErrorEvent*);
+    auto setter = reinterpret_cast<XSetErrorHandler_t>(dlsym(X11Manager::GetLibX11(), "XSetErrorHandler"));
+    if (setter) {
+      setter(LoggingXErrorHandler);
+    }
+    installed = true;
+  }
+}
+
 host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
   : guest_display(guest.force_get_host_pointer()) {
+  InstallLoggingXErrorHandler();
   data = x11_manager.GuestToHostDisplay(guest_display);
 }
 
@@ -392,8 +420,39 @@ guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display* Display, in
 
 GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVisualInfo*> Info, GLXContext ShareList, Bool Direct) {
   auto HostInfo = LookupHostVisualInfo(Display, Info);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXCreateContext: display=%p visualid=0x%lx screen=%d direct=%d\n",
+            Display, (unsigned long)(HostInfo ? HostInfo->visualid : 0), HostInfo ? HostInfo->screen : -1, Direct);
+  }
   auto ret = fexldr_ptr_libGL_glXCreateContext(Display, HostInfo, ShareList, Direct);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXCreateContext: returned ctx=%p\n", (void*)ret);
+  }
   x11_manager.HostXFree(HostInfo);
+  return ret;
+}
+
+Bool fexfn_impl_libGL_glXMakeCurrent(Display* Display, GLXDrawable Drawable, GLXContext Context) {
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXMakeCurrent: display=%p drawable=0x%lx context=%p\n",
+            Display, (unsigned long)Drawable, (void*)Context);
+  }
+  auto ret = fexldr_ptr_libGL_glXMakeCurrent(Display, Drawable, Context);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXMakeCurrent: returned %d\n", ret);
+  }
+  return ret;
+}
+
+Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, GLXDrawable Read, GLXContext Context) {
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXMakeContextCurrent: display=%p draw=0x%lx read=0x%lx context=%p\n",
+            Display, (unsigned long)Draw, (unsigned long)Read, (void*)Context);
+  }
+  auto ret = fexldr_ptr_libGL_glXMakeContextCurrent(Display, Draw, Read, Context);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXMakeContextCurrent: returned %d\n", ret);
+  }
   return ret;
 }
 
