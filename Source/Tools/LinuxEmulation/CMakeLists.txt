@@ -129,6 +129,17 @@ get_target_property(INC_DIRS LinuxEmulation INTERFACE_INCLUDE_DIRECTORIES)
 list(TRANSFORM INC_DIRS PREPEND "-I")
 list(APPEND ARGS ${INC_DIRS})
 
+# StructPackVerifier uses clang's Python bindings to cross-parse `x32/*.h` as
+# x86_64 and aarch64 to compare the FEX-emulator-side struct layouts against
+# the expected guest layouts. On PPC64LE hosts, clang's default install does
+# not ship cross-compile c++ headers (only powerpc64le-unknown-linux-gnu
+# c++config.h exists; x86_64/aarch64 equivalents would need separate
+# cross-sysroot packages). Without those, every clang parse returns -1 for
+# every field offset and all 18 tests fail spuriously. Gate the tests off
+# for hosts that don't have the cross-compile environment.
+if (ARCHITECTURE_ppc64le)
+  message(STATUS "StructPackVerifier: skipped on PPC64LE (requires x86_64+aarch64 cross-compile c++ headers; install via separate cross-sysroot if needed)")
+else()
 foreach(Index RANGE 0 ${ARG_COUNT} 2)
   math(EXPR TEST_TYPE_INDEX "${Index}+1")
 
@@ -160,6 +171,7 @@ foreach(Index RANGE 0 ${ARG_COUNT} 2)
   set_property(TEST ${TEST_NAME_ARCH}_x86_64 APPEND PROPERTY DEPENDS "${HEADER}")
   set_property(TEST ${TEST_NAME_ARCH}_aarch64 APPEND PROPERTY DEPENDS "${HEADER}")
 endforeach()
+endif()
 
 add_custom_target(struct_verifier
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
