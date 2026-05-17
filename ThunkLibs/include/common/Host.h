@@ -338,6 +338,31 @@ struct host_layout<T* const> {
     : data {(T*)(uintptr_t)from.data} {}
 };
 
+// Function-pointer specialization. Needed so CallbackUnpack<Sig>::CallGuestPtr
+// can be instantiated for signatures whose argument list contains a callback
+// type (e.g. `void(GLDEBUGPROC, void*)` for glDebugMessageCallbackARB). The
+// body never executes at runtime for such signatures -- a host function whose
+// own argument is itself a callback is never registered by the guest as a
+// callback target -- but the address of CallGuestPtr is taken at the cross-arch
+// wrap site (Host.h:702), forcing instantiation.
+template<typename T>
+  requires (std::is_function_v<T>)
+struct host_layout<T*> {
+  T* data;
+
+  explicit host_layout(const guest_layout<T*>& from)
+    : data {(T*)(uintptr_t)from.data} {}
+  host_layout() = default;
+};
+
+template<typename T>
+  requires (std::is_function_v<T>)
+inline guest_layout<T*> to_guest(const host_layout<T*>& from) {
+  guest_layout<T*> result {};
+  result = from.data;
+  return result;
+}
+
 // Wrapper around host_layout that repacks from a guest_layout on construction
 // and exit-repacks on scope exit (if needed). The wrapper manages the storage
 // needed for repacked data itself.
@@ -492,6 +517,25 @@ inline host_to_guest_convertible<T> to_guest(const host_layout<T>& from) {
   return {from};
 }
 
+// Cross-arch wrap helper: lets CallbackUnpack<Sig>::CallGuestPtr instantiate
+// for signatures containing opaque types whose to_guest is intentionally
+// `= delete`d (e.g. `_XDisplay*` at libGL_Host.cpp:51). Such signatures are
+// never actually used as guest-passed callbacks -- they appear only as
+// parameters of host functions called by guest -- but the cross-arch wrap
+// at GuestWrapperForHostFunction::Call takes the address of CallGuestPtr at
+// compile time, which forces the body to instantiate. Where to_guest is
+// deleted, this branch substitutes an unreachable default-constructed
+// guest_layout so the template instantiates; the runtime path is dead.
+template<typename T>
+auto pack_to_guest(const host_layout<T>& from) {
+  if constexpr (requires { to_guest(from); }) {
+    return to_guest(from);
+  } else {
+    __builtin_unreachable();
+    return guest_layout<T> {};
+  }
+}
+
 template<typename>
 struct CallbackUnpack;
 
@@ -567,10 +611,10 @@ struct CallbackUnpack<Result(Args...)> {
     LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(guestcall);
 
 #ifndef IS_32BIT_THUNK
-    PackedArguments<Result, guest_layout<Args>...> packed_args = {to_guest(to_host_layout(args))...};
+    PackedArguments<Result, guest_layout<Args>...> packed_args = {pack_to_guest(to_host_layout(args))...};
 #else
     GuestStackBumpAllocator GuestStack;
-    auto& packed_args = *GuestStack.New<PackedArguments<Result, guest_layout<Args>...>>(to_guest(to_host_layout(args))...);
+    auto& packed_args = *GuestStack.New<PackedArguments<Result, guest_layout<Args>...>>(pack_to_guest(to_host_layout(args))...);
 #endif
     guestcall->CallCallback(guestcall->GuestUnpacker, guestcall->GuestTarget, &packed_args);
 
@@ -662,8 +706,37 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
     // registered for this template's signature, build a HostToGuestTrampoline
     // on the fly and call THROUGH it.
     static_assert(sizeof(void*) == 8, "host must be 64-bit; the cross-arch check assumes wide pointers");
+#if defined(IS_32BIT_THUNK) || defined(THUNK_HOST_NOT_X86_64)
+    // The `(cb >> 32) == 0` heuristic is only meaningful for 32-bit guests,
+    // where a guest pointer must fit in 32 bits. For 64-bit cross-arch (e.g.
+    // x86_64 guest on PPC64LE host), guest VAs are full 64 bits, and every
+    // guest-passed `cb` requires wrapping since the host ISA cannot execute
+    // guest x86 bytes directly.
+    //
+    // For 32-bit thunks this fallback is always on (upstream behaviour). For
+    // 64-bit cross-arch hosts the fallback is OPT-IN via the
+    // FEX_THUNK_FALLBACK_LOG_ONLY env var. When opted out, behaviour matches
+    // upstream FEX (the wrap site is dead code); the proper fix for any given
+    // API is to write a custom_guest_impl / custom_host_impl that pre-wraps
+    // the callback via AllocateHostTrampolineForGuestFunction (the documented
+    // FEX mechanism). The fallback exists for two reasons:
+    //   1. catch the SIGSEGV class while custom impls are being written, and
+    //   2. surface "no unpacker registered for signature X" to identify which
+    //      APIs still need custom impls.
+    auto fallback_wrap_enabled = []() -> bool {
 #ifdef IS_32BIT_THUNK
-    if (cb && (cb >> 32) == 0 && FEX::HLE::LookupGuestCallbackUnpacker) {
+      return true;
+#else
+      static const bool enabled = (getenv("FEX_THUNK_FALLBACK_LOG_ONLY") != nullptr);
+      return enabled;
+#endif
+    };
+
+    if (fallback_wrap_enabled() && cb && FEX::HLE::LookupGuestCallbackUnpacker
+#ifdef IS_32BIT_THUNK
+        && (cb >> 32) == 0
+#endif
+    ) {
       using Sig = Result(Args...);
       // typeid(Sig).name() is the C++ compiler-mangled name of the signature
       // type; same source compiled with the same compiler on guest and host

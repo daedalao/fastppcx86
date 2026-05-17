@@ -42,6 +42,13 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
   if (GUEST_BITNESS EQUAL 32)
     target_compile_definitions(${NAME}-${GUEST_BITNESS}-deps INTERFACE IS_32BIT_THUNK)
   endif()
+  # Cross-arch host (non-x86_64): guest VAs cannot be bctrl'd into directly,
+  # so callbacks passed by the guest must be wrapped in host trampolines just
+  # like the 32-bit-on-64-bit case. Gates the cross-arch wrap path in
+  # ThunkLibs/include/common/Host.h.
+  if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    target_compile_definitions(${NAME}-${GUEST_BITNESS}-deps INTERFACE THUNK_HOST_NOT_X86_64)
+  endif()
   # Shorthand for the include directories added after calling this function.
   # This is not evaluated directly, hence directories added after return are still picked up
   set(prop "$<TARGET_PROPERTY:${NAME}-${GUEST_BITNESS}-deps,INTERFACE_INCLUDE_DIRECTORIES>")
