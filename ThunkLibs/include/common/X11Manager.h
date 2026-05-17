@@ -50,14 +50,33 @@ struct X11Manager {
   std::unordered_map<_XDisplay*, _XDisplay*> displays;
 
   _XDisplay* GuestToHostDisplay(_XDisplay* GuestDisplay) {
-    // Flush event queue to make effects of the guest-side connection visible
-    GuestXSync(GuestDisplay, 0);
+    // Flush event queue to make effects of the guest-side connection visible.
+    //
+    // Both `GuestXSync` and `GuestXDisplayString` are populated when the
+    // guest libGL (or libvulkan) thunk's OnInit runs and invokes the
+    // corresponding `fexfn_pack_GL_SetGuestX*` host setter. If the guest
+    // reaches a Display-taking API before that init has fired (Grimrock's
+    // glewInit/GLX bootstrap is the documented case — see
+    // project_grimrock_native_diff_2026-05-16 and the GLEW visual-picker
+    // crash at libGL_Host.cpp:42 in PID 359285), these slots are still
+    // nullptr from their declaration default. Previously this NULL-deref'd
+    // with PC=0; now we degrade gracefully:
+    //   - GuestXSync is an optimization (flush guest event queue); safe to skip
+    //   - GuestXDisplayString returns the display name; absent it, pass nullptr
+    //     to XOpenDisplay which uses $DISPLAY — usually the same target as
+    //     the guest's connection (single-display systems are by far the norm
+    //     for the game workloads this path serves)
+    if (GuestXSync) {
+      GuestXSync(GuestDisplay, 0);
+    }
 
     std::unique_lock lock(mutex);
     auto [it, inserted] = displays.emplace(GuestDisplay, nullptr);
     if (inserted) {
-      auto host_display = HostXOpenDisplay(GuestXDisplayString(GuestDisplay));
-      fprintf(stderr, "Opening host-side X11 display: %p -> %p\n", GuestDisplay, host_display);
+      const char* display_name = GuestXDisplayString ? GuestXDisplayString(GuestDisplay) : nullptr;
+      auto host_display = HostXOpenDisplay(display_name);
+      fprintf(stderr, "Opening host-side X11 display: %p -> %p (name=%s)\n",
+              GuestDisplay, host_display, display_name ? display_name : "<default>");
       if (!host_display) {
         fprintf(stderr, "ERROR: Could not open X display\n");
         std::abort();
