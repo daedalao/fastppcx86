@@ -80,6 +80,10 @@ inline uint64_t SizeMask(uint32_t size) {
 } // namespace
 
 extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* value, uint64_t* result, uint32_t size) {
+  // Phase 3 debug: dump every entry so we can characterize what wireup is sending.
+  // TODO: remove once the null-addr bug is fixed; this fires on every misaligned LOCK RMW.
+  LogMan::Msg::IFmt("PPC64_SplitLockEmulate ENTRY: op={} addr={:p} value={:p} result={:p} size={}",
+                    op, (void*)addr, (void*)value, (void*)result, size);
   if (addr == nullptr || result == nullptr) {
     LogMan::Msg::EFmt("PPC64_SplitLockEmulate: null addr/result");
     return;

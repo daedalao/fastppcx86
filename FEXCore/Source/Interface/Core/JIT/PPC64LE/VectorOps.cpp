@@ -3997,16 +3997,44 @@ DEF_OP(VFToIScalarInsert) {
   // fctid+fcfid which honors FPSCR.RN (default RN=0 = banker's), since the
   // direct `frin` instruction is "round-half-away-from-zero" — wrong for x86
   // Nearest semantics.  Other modes have direct in-mode round-to-FP scalar ops.
+  //
+  // ROUNDSS/ROUNDSD on PPC64LE: project_vftoiscalarinsert_nan_inf bug — the
+  // fctid+fcfid round-trip SATURATES NaN and out-of-range FP to INT64_MIN,
+  // which fcfid converts back to a finite -2^63 instead of propagating the
+  // original value. x86 ROUNDSS/ROUNDSD spec: NaN passes through unchanged,
+  // and values with |f0| >= 2^52 are already integer-valued (no fractional
+  // bits in f64) so need no rounding. Bypass the round-trip for both classes.
+  // Other rounding modes (NegInf/PosInf/TowardsZero) use frim/frip/friz which
+  // are FP→FP and already NaN-correct, so they need no special handling.
   switch (Round) {
   case IR::RoundMode::NegInfinity: frim(f0, f0); break;
   case IR::RoundMode::PosInfinity: frip(f0, f0); break;
   case IR::RoundMode::TowardsZero: friz(f0, f0); break;
   case IR::RoundMode::Nearest:
   case IR::RoundMode::Host:
-  default:
-    fctid(f1, f0);   // f64 → i64 using FPSCR.RN (banker's by default)
-    fcfid(f0, f1);   // i64 → f64 (exact)
+  default: {
+    PPC64Emitter::Label skip_roundtrip{};
+
+    // Bypass #1: NaN.  f0 != f0 iff NaN; fcmpu sets CR0.UN (PPC bit 3).
+    fcmpu(cr(0), f0, f0);
+    bc({12, 3}, &skip_roundtrip);  // BO=12 BI=3 → branch if CR0.UN set
+
+    // Bypass #2: |f0| >= 2^52. f64 mantissa is 52 bits; magnitudes at or
+    // above this boundary are integer-valued exactly and need no rounding.
+    // This also covers +/-Infinity (fabs(±Inf) = +Inf > +2^52).
+    LoadConstant(TMP3, 0x4330000000000000ULL);  // double 2^52
+    std(TMP3, -64, r1);
+    lfd(f2, -64, r1);
+    fabs(f3, f0);
+    fcmpu(cr(0), f3, f2);
+    bc({12, 1}, &skip_roundtrip);  // BO=12 BI=1 → branch if CR0.GT (f3 > 2^52)
+
+    fctid(f1, f0);  // f64 → i64 using FPSCR.RN (banker's by default)
+    fcfid(f0, f1);  // i64 → f64 (exact for values within precision boundary)
+
+    Bind(&skip_roundtrip);
     break;
+  }
   }
 
   // Store the rounded *float* back at element 0 of the result image.
