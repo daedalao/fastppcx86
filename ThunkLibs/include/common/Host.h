@@ -577,13 +577,21 @@ auto Projection(guest_layout<T>& data) {
   }
 }
 
-#ifdef IS_32BIT_THUNK
+#if defined(IS_32BIT_THUNK) || defined(THUNK_HOST_NOT_X86_64)
 /**
  * Helper class to manage guest stack memory from a host function.
  *
  * The current guest stack position is saved upon construction and bumped
  * for each object construction. Upon destruction, the old guest stack is
  * restored.
+ *
+ * Needed whenever the guest will dereference a host-supplied pointer:
+ *  - 32-bit guest on 64-bit host (original use): host stack lives above 4 GiB
+ *    so a 64-bit host pointer cannot fit in a 32-bit guest slot.
+ *  - 64-bit guest on non-x86_64 host (PPC64LE etc.): host stack lives in the
+ *    host's VA region (e.g. 0x3fff... on PPC64LE), which is unmapped in the
+ *    x86_64 guest's view. The guest-side unpacker would dereference a host
+ *    VA and either fault or read garbage. Allocate on the guest stack instead.
  */
 class GuestStackBumpAllocator final {
   uintptr_t Top = reinterpret_cast<uintptr_t>(FEX::HLE::GetGuestStack());
@@ -610,11 +618,11 @@ struct CallbackUnpack<Result(Args...)> {
     GuestcallInfo* guestcall;
     LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(guestcall);
 
-#ifndef IS_32BIT_THUNK
-    PackedArguments<Result, guest_layout<Args>...> packed_args = {pack_to_guest(to_host_layout(args))...};
-#else
+#if defined(IS_32BIT_THUNK) || defined(THUNK_HOST_NOT_X86_64)
     GuestStackBumpAllocator GuestStack;
     auto& packed_args = *GuestStack.New<PackedArguments<Result, guest_layout<Args>...>>(pack_to_guest(to_host_layout(args))...);
+#else
+    PackedArguments<Result, guest_layout<Args>...> packed_args = {pack_to_guest(to_host_layout(args))...};
 #endif
     guestcall->CallCallback(guestcall->GuestUnpacker, guestcall->GuestTarget, &packed_args);
 

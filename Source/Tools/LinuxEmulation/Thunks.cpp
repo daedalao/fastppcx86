@@ -109,8 +109,20 @@ struct TrampolineInstanceInfo {
 struct HostToGuestTrampolinePtr;
 
 static TrampolineInstanceInfo& GetInstanceInfo(HostToGuestTrampolinePtr* Trampoline) {
+#if defined(ARCHITECTURE_ppc64le)
+  // The PPC64LE trampoline reads its InstanceInfo via `addi r11, r12, 24`
+  // where r12 holds the address of `label1` (template+8). That fixes the
+  // InstanceInfo at exactly offset 32 from the trampoline start.
+  //
+  // We cannot derive the offset from the section length on PPC64LE: the
+  // assembler emits 12 bytes of trailing padding after the embedded
+  // `.quad 0,0,0,0`, so __stop - __start = 76, and Length - sizeof(info)
+  // points 12 bytes past where the trampoline actually reads. Hardcode it.
+  constexpr auto InstanceInfoOffset = 32;
+#else
   const auto Length = __stop_HostToGuestTrampolineTemplate - __start_HostToGuestTrampolineTemplate;
   const auto InstanceInfoOffset = Length - sizeof(TrampolineInstanceInfo);
+#endif
   return *reinterpret_cast<TrampolineInstanceInfo*>(reinterpret_cast<char*>(Trampoline) + InstanceInfoOffset);
 }
 
@@ -561,7 +573,11 @@ FEX_DEFAULT_VISIBILITY void MoveGuestStack(uintptr_t NewAddress) {
     ERROR_AND_DIE_FMT("Thunked library attempted to query guest stack pointer asynchronously");
   }
 
-  if (NewAddress >> 32) {
+  // 32-bit guest: RSP must fit in 32 bits. 64-bit guest: accept any address
+  // the caller chose. The bump allocator on a cross-arch host (THUNK_HOST_NOT_X86_64)
+  // derives Next from the current guest RSP, so values stay inside guest VA
+  // space provided the guest didn't already have a stray RSP set.
+  if (!FEX::HLE::_SyscallHandler->Is64BitMode() && (NewAddress >> 32)) {
     ERROR_AND_DIE_FMT("Tried to set stack pointer for 32-bit guest to a 64-bit address");
   }
 

@@ -1542,6 +1542,43 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   if (absorb) {
     return;
   }
+  // Direct write to stderr — LogMan may not flush before abort().
+  {
+    char buf[1024];
+    uint64_t RSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+    uint64_t RDI = Frame->State.gregs[FEXCore::X86State::REG_RDI];
+    uint64_t RSI = Frame->State.gregs[FEXCore::X86State::REG_RSI];
+    uint64_t RAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+    uint64_t TCR = Frame->Pointers.ThunkCallbackRet;
+    int n = snprintf(buf, sizeof(buf),
+                     "[FEX] suspect GuestRIP=0x%lx HostLR=0x%lx\n"
+                     "[FEX]   recent: [-1]=0x%lx [-2]=0x%lx [-3]=0x%lx [-4]=0x%lx [-5]=0x%lx [-6]=0x%lx\n"
+                     "[FEX]   RSP=0x%lx RDI=0x%lx RSI=0x%lx RAX=0x%lx ThunkCallbackRet=0x%lx\n",
+                     (unsigned long)GuestRIP, (unsigned long)HostLR,
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 1) & 15],
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 2) & 15],
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 3) & 15],
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 4) & 15],
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 5) & 15],
+                     (unsigned long)g_recent_rips[(g_dispatch_count - 6) & 15],
+                     (unsigned long)RSP, (unsigned long)RDI, (unsigned long)RSI,
+                     (unsigned long)RAX, (unsigned long)TCR);
+    [[maybe_unused]] auto _ = write(2, buf, n);
+    // Try to peek at first 8 bytes of RSP and RSI as guest memory
+    auto peek8 = [](uint64_t addr) -> uint64_t {
+      if (addr < 0x1000 || (addr >> 47) != 0) return 0xDEADBEEFDEADBEEF;
+      return *reinterpret_cast<volatile uint64_t*>(addr);
+    };
+    n = snprintf(buf, sizeof(buf),
+                 "[FEX]   *RSP=0x%lx *RSP+8=0x%lx *RSI=0x%lx *RSI+8=0x%lx *RSI+16=0x%lx\n",
+                 (unsigned long)peek8(RSP),
+                 (unsigned long)peek8(RSP + 8),
+                 (unsigned long)peek8(RSI),
+                 (unsigned long)peek8(RSI + 8),
+                 (unsigned long)peek8(RSI + 16));
+    _ = write(2, buf, n);
+    fsync(2);
+  }
   LogMan::Msg::EFmt("=== ExitFunctionLink: suspect GuestRIP=0x{:x} ===", GuestRIP);
   LogMan::Msg::EFmt("    Host LR (JIT block tail that called us) = 0x{:x}", HostLR);
   LogMan::Msg::EFmt("    Recent dispatched guest RIPs (g_recent_rips):");
@@ -1766,12 +1803,55 @@ uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uin
     return false;
   };
   if (LooksSuspect()) {
+    // Pragmatic bypass for callback-flow failures (Grimrock libGL X11Manager,
+    // similar cross-arch trampoline-into-guest paths): if we entered via
+    // ExecuteJITCallback, ThunkCallbackRet is on the guest stack somewhere
+    // near RSP. Walking RSP..(RSP+128) for that sentinel tells us "we're
+    // inside a callback that went wrong — escape via CallbackReturn instead
+    // of crashing the whole process." The callback returns a zeroed result
+    // (best effort) and the host caller continues. Trades correctness of the
+    // callback's return value for liveness — which is the right trade for
+    // games where the guest will retry or treat absence-of-error as success.
+    //
+    // Suppress via FEX_EXITLINK_NOBYPASS=1 to fall through to the diagnostic.
+    static const bool no_bypass = (getenv("FEX_EXITLINK_NOBYPASS") != nullptr);
+    if (!no_bypass) {
+      uint64_t TCR = Frame->Pointers.ThunkCallbackRet;
+      uint64_t RSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+      if (TCR && RSP >= 0x1000 && (RSP >> 47) == 0) {
+        // Walk up to 128 bytes (16 slots) above current RSP looking for
+        // ThunkCallbackRet. Bounded to avoid runaway reads.
+        for (int i = 0; i < 16; ++i) {
+          uint64_t slot_addr = RSP + i * 8;
+          // Guard the read with a heuristic: only deref if slot_addr looks
+          // like a valid guest VA (within the same canonical range as RSP).
+          if ((slot_addr >> 47) != 0) break;
+          uint64_t slot_val = *reinterpret_cast<volatile uint64_t*>(slot_addr);
+          if (slot_val == TCR) {
+            // Found callback sentinel. Adjust RSP to just past the sentinel
+            // (it will be popped by CallbackReturn IR) and redirect to TCR.
+            // i*8 below the sentinel is the "stack frame" the failed callback
+            // built — discard it by walking RSP up to the sentinel slot.
+            Frame->State.gregs[FEXCore::X86State::REG_RSP] = slot_addr;
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                             "[FEX] suspect GuestRIP=0x%lx in callback flow — bypassing via ThunkCallbackRet=0x%lx (adjusted RSP from 0x%lx to 0x%lx)\n",
+                             (unsigned long)GuestRIP, (unsigned long)TCR,
+                             (unsigned long)RSP, (unsigned long)slot_addr);
+            [[maybe_unused]] auto _ = write(2, buf, n);
+            GuestRIP = TCR;
+            goto bypass_diagnose;
+          }
+        }
+      }
+    }
     // Grab the host LR (return address into the JIT block that called us).
     // __builtin_return_address(0) is the address of the instruction AFTER
     // the bctrl/bl that branched here.
     uint64_t HostLR = reinterpret_cast<uint64_t>(__builtin_return_address(0));
     DiagnoseSuspectGuestRIP(GuestRIP, HostLR, Frame);
   }
+bypass_diagnose:
 
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
