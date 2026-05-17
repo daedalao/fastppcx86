@@ -482,27 +482,51 @@ VDSOParser::VDSOParser(const uint8_t* HeaderBase) {
   }
 }
 
-void LoadHostVDSO() {
 #ifdef ARCHITECTURE_ppc64le
-  // PowerPC64 Linux's vDSO (__kernel_clock_getres, __kernel_clock_gettime,
-  // __kernel_gettimeofday, __kernel_time, __kernel_getcpu) returns POSITIVE
-  // errno on error rather than the kernel-syscall convention of -errno or
-  // the libc convention of -1+errno. Upstream's VDSO::clock_getres handler
-  // assumes -errno, so a +EINVAL=22 return from __kernel_clock_getres ends
-  // up looking like a positive success value (22 nanoseconds resolution),
-  // and glibc on the guest interprets that as the syscall succeeding.
-  //
-  // Rather than papering over each handler with a "positive-errno -> -errno"
-  // conversion (and risking conflating a real positive return with an error),
-  // skip the vDSO function-pointer fast path entirely on PPC64LE hosts. The
-  // x64::glibc::* / x32::glibc::* fallback handlers call ::clock_getres etc.
-  // directly, which use the standard -1+errno libc convention that
-  // SyscallRet() already handles correctly. Cost: one extra C-call per vDSO
-  // op instead of a direct kernel-vDSO function call. Trivial vs the cost
-  // of x86 -> PPC64LE JIT translation.
-  LogMan::Msg::IFmt("VDSO fast-path disabled on PPC64LE: kernel vDSO returns +errno, not -errno. Using libc handlers.");
-  return;
+// PowerPC64 Linux's vDSO (__kernel_clock_getres, __kernel_clock_gettime,
+// __kernel_gettimeofday, __kernel_time, __kernel_getcpu) returns POSITIVE
+// errno on error -- e.g. EINVAL=22 instead of -EINVAL. x86_64 callers and
+// FEX's VDSO::* handlers expect 0 on success and -errno on failure. Adapt
+// via thin sign-flipping shims installed in place of the raw kernel
+// function pointers.
+//
+// Soundness: Linux MAX_ERRNO is 4095. Legitimate success returns from these
+// functions are either 0 (clock_gettime, clock_getres, gettimeofday, getcpu)
+// or seconds-since-epoch (time(), > 1.5e9 since 2017). Neither overlaps the
+// errno space, so `r > 0 && r <= 4095` is a clean discriminant per-function.
+// getrandom is excluded -- its byte-count return CAN fall in errno space, so
+// it stays on the libc fallback.
+namespace ppc_kernel_vdso {
+  static VDSOHandlers::TimeType         RawTime         = nullptr;
+  static VDSOHandlers::GetTimeOfDayType RawGetTimeOfDay = nullptr;
+  static VDSOHandlers::ClockGetTimeType RawClockGetTime = nullptr;
+  static VDSOHandlers::ClockGetResType  RawClockGetRes  = nullptr;
+  static VDSOHandlers::GetCPUType       RawGetCPU       = nullptr;
+
+  static constexpr int MAX_ERRNO_PPC = 4095;
+  static inline int FlipErrno(int r) {
+    return (r > 0 && r <= MAX_ERRNO_PPC) ? -r : r;
+  }
+
+  static time_t ShimTime(time_t* t) {
+    return RawTime(t);
+  }
+  static int ShimGetTimeOfDay(struct timeval* tv, struct timezone* tz) {
+    return FlipErrno(RawGetTimeOfDay(tv, tz));
+  }
+  static int ShimClockGetTime(clockid_t clk_id, struct timespec* tp) {
+    return FlipErrno(RawClockGetTime(clk_id, tp));
+  }
+  static int ShimClockGetRes(clockid_t clk_id, struct timespec* tp) {
+    return FlipErrno(RawClockGetRes(clk_id, tp));
+  }
+  static int32_t ShimGetCPU(uint32_t* cpu, uint32_t* node) {
+    return FlipErrno(RawGetCPU(cpu, node));
+  }
+} // namespace ppc_kernel_vdso
 #endif
+
+void LoadHostVDSO() {
   // Linux gives the VDSO ELF header base in the auxv value AT_SYSINFO_EHDR.
   auto VDSOHeader = ::getauxval(AT_SYSINFO_EHDR);
 
@@ -579,6 +603,48 @@ void LoadHostVDSO() {
     x64::Handler_getrandom = x64::VDSO::getrandom;
     // 32-bit doesn't have getrandom vdso
   }
+
+#ifdef ARCHITECTURE_ppc64le
+  // The PPC kernel vDSO uses the +errno return convention. Wrap each populated
+  // pointer in a sign-flipping shim so callers see the standard 0/-errno
+  // convention that FEX's VDSO::* handlers expect. See ppc_kernel_vdso above.
+  // getrandom is NOT shimmed -- its byte-count return overlaps errno space.
+  // reinterpret_cast bridges the difference between our shim signatures
+  // (non-restricted, non-noexcept, clockid_t-aliased) and the strict glibc
+  // function-pointer types in VDSOHandlers. The underlying ABI matches.
+  uint32_t ShimmedCount = 0;
+  if (VDSOHandlers::TimePtr) {
+    ppc_kernel_vdso::RawTime = VDSOHandlers::TimePtr;
+    VDSOHandlers::TimePtr = reinterpret_cast<VDSOHandlers::TimeType>(&ppc_kernel_vdso::ShimTime);
+    ++ShimmedCount;
+  }
+  if (VDSOHandlers::GetTimeOfDayPtr) {
+    ppc_kernel_vdso::RawGetTimeOfDay = VDSOHandlers::GetTimeOfDayPtr;
+    VDSOHandlers::GetTimeOfDayPtr = reinterpret_cast<VDSOHandlers::GetTimeOfDayType>(&ppc_kernel_vdso::ShimGetTimeOfDay);
+    ++ShimmedCount;
+  }
+  if (VDSOHandlers::ClockGetTimePtr) {
+    ppc_kernel_vdso::RawClockGetTime = VDSOHandlers::ClockGetTimePtr;
+    VDSOHandlers::ClockGetTimePtr = reinterpret_cast<VDSOHandlers::ClockGetTimeType>(&ppc_kernel_vdso::ShimClockGetTime);
+    ++ShimmedCount;
+  }
+  if (VDSOHandlers::ClockGetResPtr) {
+    ppc_kernel_vdso::RawClockGetRes = VDSOHandlers::ClockGetResPtr;
+    VDSOHandlers::ClockGetResPtr = reinterpret_cast<VDSOHandlers::ClockGetResType>(&ppc_kernel_vdso::ShimClockGetRes);
+    ++ShimmedCount;
+  }
+  if (VDSOHandlers::GetCPUPtr) {
+    ppc_kernel_vdso::RawGetCPU = VDSOHandlers::GetCPUPtr;
+    VDSOHandlers::GetCPUPtr = reinterpret_cast<VDSOHandlers::GetCPUType>(&ppc_kernel_vdso::ShimGetCPU);
+    ++ShimmedCount;
+  }
+  // getrandom intentionally left raw -> stays on the libc fallback handler.
+  if (VDSOHandlers::GetRandomPtr) {
+    VDSOHandlers::GetRandomPtr = nullptr;
+    x64::Handler_getrandom = x64::glibc::getrandom;
+  }
+  LogMan::Msg::IFmt("PPC64LE: kernel vDSO fast-path enabled via sign-flipping shims ({} of 5 symbols)", ShimmedCount);
+#endif
 }
 
 static std::array<FEXCore::IR::ThunkDefinition, 7> VDSODefinitions = {{
