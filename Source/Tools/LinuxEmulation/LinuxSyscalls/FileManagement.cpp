@@ -11,6 +11,7 @@ $end_info$
 #include "Common/JSONPool.h"
 
 #include "FEXCore/Config/Config.h"
+#include <sys/syscall.h>
 #include "LinuxSyscalls/FileManagement.h"
 #include "LinuxSyscalls/EmulatedFiles/EmulatedFiles.h"
 #include "LinuxSyscalls/Syscalls.h"
@@ -706,33 +707,42 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
   int fd = -1;
+  bool OverlayAttempted = false;
 
-  if (!ShouldSkipOpenInEmu(flags)) {
+  // Always try rootfs overlay first regardless of write flags. Previously
+  // gating on ShouldSkipOpenInEmu (intended only for EmuFD mocks) made
+  // writeable opens bypass to host /tmp while readable opens went to
+  // <rootfs>/tmp, producing split-state files. open()/creat() both flow
+  // through here, so the split caused creat_test.CreatTruncatesExistingFile
+  // and the *at() ENOENT cluster.
+  {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
+      OverlayAttempted = true;
       FEX::HLE::open_how how = {
         .flags = (uint64_t)flags,
-        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this
-        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
+        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
-
       if (fd == -1 && errno == EXDEV) {
-        // This means a magic symlink (/proc/foo) was involved. In this case we
-        // just punt and do the access without RESOLVE_IN_ROOT.
+        // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
       }
     }
+  }
 
-    // Open through RootFS failed (probably nonexistent), so open directly.
-    if (fd == -1) {
-      fd = ::open(SelfPath, flags, mode);
-    }
-
-    ReplaceEmuFd(fd, flags, mode);
-  } else {
+  // Fall back when overlay was never attempted (NoEntry) or the path was
+  // genuinely absent (ENOENT). Other errnos must propagate.
+  if (fd == -1 && (!OverlayAttempted || errno == ENOENT)) {
     fd = ::open(SelfPath, flags, mode);
+  }
+
+  // EmuFD overlay (read-only mocks of /proc/cpuinfo etc.) only applies to
+  // non-write opens; this is the original ShouldSkipOpenInEmu intent.
+  if (!ShouldSkipOpenInEmu(flags)) {
+    ReplaceEmuFd(fd, flags, mode);
   }
 
   return fd;
@@ -770,15 +780,23 @@ uint64_t FileManager::Stat(const char* pathname, void* buf) {
   // Stat follows symlinks
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, true, TmpFilename);
-  int RootScopedFD = OpenPathInRootFS(Path, true);
-  if (RootScopedFD != -1) {
-    uint64_t Result = ::fstatat(RootScopedFD, "", reinterpret_cast<struct stat*>(buf), AT_EMPTY_PATH);
-    int SavedErrno = errno;
-    ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
-      return Result;
+  if (Path.FD != -1) {
+    int RootScopedFD = OpenPathInRootFS(Path, true);
+    if (RootScopedFD != -1) {
+      uint64_t Result = ::fstatat(RootScopedFD, "", reinterpret_cast<struct stat*>(buf), AT_EMPTY_PATH);
+      int SavedErrno = errno;
+      ::close(RootScopedFD);
+      // Propagate semantic errors as-is; only fall back if the file is
+      // genuinely missing from rootfs (ENOENT).
+      if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+        errno = SavedErrno;
+        return Result;
+      }
+    } else if (errno != ENOENT) {
+      // OpenPathInRootFS itself failed with a non-ENOENT semantic result
+      // (e.g. EACCES when parent perms forbid search). Propagate.
+      return -1;
     }
-    errno = SavedErrno;
   }
   return ::stat(SelfPath, reinterpret_cast<struct stat*>(buf));
 }
@@ -790,15 +808,19 @@ uint64_t FileManager::Lstat(const char* pathname, void* buf) {
   // lstat does not follow symlinks
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
-  int RootScopedFD = OpenPathInRootFS(Path, false);
-  if (RootScopedFD != -1) {
-    uint64_t Result = ::fstatat(RootScopedFD, "", reinterpret_cast<struct stat*>(buf), AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
-    int SavedErrno = errno;
-    ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
-      return Result;
+  if (Path.FD != -1) {
+    int RootScopedFD = OpenPathInRootFS(Path, false);
+    if (RootScopedFD != -1) {
+      uint64_t Result = ::fstatat(RootScopedFD, "", reinterpret_cast<struct stat*>(buf), AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+      int SavedErrno = errno;
+      ::close(RootScopedFD);
+      if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+        errno = SavedErrno;
+        return Result;
+      }
+    } else if (errno != ENOENT) {
+      return -1;
     }
-    errno = SavedErrno;
   }
 
   return ::lstat(pathname, reinterpret_cast<struct stat*>(buf));
@@ -1005,32 +1027,49 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
   int32_t fd = -1;
+  bool OverlayAttempted = false;
 
-  if (!ShouldSkipOpenInEmu(flags)) {
+  // Always try rootfs overlay first, regardless of O_CREAT/O_WRONLY/O_APPEND.
+  // Previously the rootfs attempt was gated on ShouldSkipOpenInEmu (intended
+  // only for the EmuFD lookup), which produced split state: write/create
+  // opens went bare-syscall to host /tmp while read/O_PATH opens went via
+  // openat2(RESOLVE_IN_ROOT) to <rootfs>/tmp. Subsequent *at() calls then
+  // saw dirfd in rootfs but target in host, returning ENOENT (observed in
+  // gvisor chmod_test/chown_test/unlink_test FchmodatFile etc.).
+  {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
+      OverlayAttempted = true;
       FEX::HLE::open_how how = {
         .flags = (uint64_t)flags,
-        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this,
-        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
+        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
       if (fd == -1 && errno == EXDEV) {
-        // This means a magic symlink (/proc/foo) was involved. In this case we
-        // just punt and do the access without RESOLVE_IN_ROOT.
+        // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
       }
     }
+  }
 
-    // Open through RootFS failed (probably nonexistent), so open directly.
-    if (fd == -1) {
-      fd = ::syscall(SYSCALL_DEF(openat), dirfs, SelfPath, flags, mode);
-    }
-
-    ReplaceEmuFd(fd, flags, mode);
-  } else {
+  // Fall back to bare host openat when:
+  //   - Overlay was not attempted (GetEmulatedFDPath returned NoEntry; e.g.
+  //     real dirfd, no RootFS, or relative path). In this case errno is stale
+  //     from prior calls, so we must NOT inspect it.
+  //   - Overlay was attempted but the path was genuinely absent in rootfs
+  //     (ENOENT). Semantic errors (EACCES, EPERM, ENOTDIR, EISDIR, EEXIST,
+  //     etc.) must propagate as-is — falling back on any -1 silently turned
+  //     EACCES into ENOENT and broke gvisor chmod_test/write_test.
+  if (fd == -1 && (!OverlayAttempted || errno == ENOENT)) {
     fd = ::syscall(SYSCALL_DEF(openat), dirfs, SelfPath, flags, mode);
+  }
+
+  // EmuFD overlay (read-only mocks of /proc/cpuinfo etc.) only applies for
+  // non-write opens. This is the original ShouldSkipOpenInEmu intent.
+  if (!ShouldSkipOpenInEmu(flags)) {
+    ReplaceEmuFd(fd, flags, mode);
   }
 
   return fd;
@@ -1084,15 +1123,19 @@ uint64_t FileManager::Statx(int dirfd, const char* pathname, int flags, uint32_t
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
-  int RootScopedFD = OpenPathInRootFS(Path, (flags & AT_SYMLINK_NOFOLLOW) == 0);
-  if (RootScopedFD != -1) {
-    uint64_t Result = FHU::Syscalls::statx(RootScopedFD, "", flags | AT_EMPTY_PATH, mask, statxbuf);
-    int SavedErrno = errno;
-    ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
-      return Result;
+  if (Path.FD != -1) {
+    int RootScopedFD = OpenPathInRootFS(Path, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+    if (RootScopedFD != -1) {
+      uint64_t Result = FHU::Syscalls::statx(RootScopedFD, "", flags | AT_EMPTY_PATH, mask, statxbuf);
+      int SavedErrno = errno;
+      ::close(RootScopedFD);
+      if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+        errno = SavedErrno;
+        return Result;
+      }
+    } else if (errno != ENOENT) {
+      return -1;
     }
-    errno = SavedErrno;
   }
   return FHU::Syscalls::statx(dirfd, SelfPath, flags, mask, statxbuf);
 }
@@ -1111,6 +1154,267 @@ uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
   }
   return ::mknod(SelfPath, mode, dev);
 }
+
+// ---------------------------------------------------------------------------
+// Overlay-aware path-mutating syscalls.
+//
+// Pattern: try the rootfs overlay first via the *at() form against
+// GetEmulatedFDPath()s (RootFSFD, relative) tuple. On overlay-miss
+// (Path.FD == -1, i.e. relative path or dirfd-relative call), fall through
+// to the bare host syscall — the kernel resolves the path from the supplied
+// dirfd (which is itself overlay-aware, having been produced by FM::Open*).
+// On overlay-attempt-fail with the rootfs path, fall back to the bare host
+// syscall too, so we degrade to host-FS behaviour rather than hard-erroring.
+// ---------------------------------------------------------------------------
+
+uint64_t FileManager::Fchmodat(int dirfd, const char* pathname, mode_t mode, int flags) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(fchmodat), Path.FD, Path.Path, mode, flags);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EISDIR/EEXIST/etc. are semantic results that must
+    // propagate to the guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(fchmodat), dirfd, SelfPath, mode, flags);
+}
+
+uint64_t FileManager::Fchmodat2(int dirfd, const char* pathname, mode_t mode, unsigned int flags) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYS_fchmodat2, Path.FD, Path.Path, mode, flags);
+    if (Result != -1) {
+      return Result;
+    }
+  }
+  return ::syscall(SYS_fchmodat2, dirfd, SelfPath, mode, flags);
+}
+
+uint64_t FileManager::Fchownat(int dirfd, const char* pathname, uid_t owner, gid_t group, int flags) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(fchownat), Path.FD, Path.Path, owner, group, flags);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EISDIR/EEXIST/etc. are semantic results that must
+    // propagate to the guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(fchownat), dirfd, SelfPath, owner, group, flags);
+}
+
+uint64_t FileManager::Unlinkat(int dirfd, const char* pathname, int flags) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  // unlink/rmdir never follow the final symlink — the symlink itself is removed.
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, false, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(unlinkat), Path.FD, Path.Path, flags);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EISDIR/EEXIST/etc. are semantic results that must
+    // propagate to the guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(unlinkat), dirfd, SelfPath, flags);
+}
+
+uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, false, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(mkdirat), Path.FD, Path.Path, mode);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EISDIR/EEXIST/etc. are semantic results that must
+    // propagate to the guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(mkdirat), dirfd, SelfPath, mode);
+}
+
+uint64_t FileManager::Linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
+  auto OldNewPath = GetSelf(oldpath);
+  const char* OldSelfPath = OldNewPath ? OldNewPath->data() : nullptr;
+  auto NewNewPath = GetSelf(newpath);
+  const char* NewSelfPath = NewNewPath ? NewNewPath->data() : nullptr;
+
+  FDPathTmpData OldTmp, NewTmp;
+  auto OldPath = GetEmulatedFDPath(olddirfd, OldSelfPath, (flags & AT_SYMLINK_FOLLOW) != 0, OldTmp);
+  auto NewPath = GetEmulatedFDPath(newdirfd, NewSelfPath, false, NewTmp);
+
+  // Per-leg translation: substitute (rootfsFD, relpath) for legs where
+  // GetEmulatedFDPath returned a translation. The other leg keeps the
+  // caller-supplied dirfd/path. This matters when one side is a real
+  // dirfd (NoEntry) but the other is an absolute path under /tmp that
+  // we've been routing to rootfs — without translation the kernel saw
+  // dirfd-on-rootfs-fs and newpath-on-tmpfs and returned EXDEV.
+  int eff_olddirfd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
+  const char* eff_oldpath = (OldPath.FD != -1) ? OldPath.Path : OldSelfPath;
+  int eff_newdirfd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
+  const char* eff_newpath = (NewPath.FD != -1) ? NewPath.Path : NewSelfPath;
+
+  uint64_t Result = ::syscall(SYSCALL_DEF(linkat), eff_olddirfd, eff_oldpath, eff_newdirfd, eff_newpath, flags);
+  // EXDEV with at least one translated leg means our rootfs-substitution
+  // crossed a real filesystem boundary; fall back to the caller's literal
+  // paths. ENOENT with translation means the rootfs leg simply doesn't
+  // exist there; same fallback.
+  if (Result == -1 && (errno == EXDEV || errno == ENOENT) && (OldPath.FD != -1 || NewPath.FD != -1)) {
+    Result = ::syscall(SYSCALL_DEF(linkat), olddirfd, OldSelfPath, newdirfd, NewSelfPath, flags);
+  }
+  return Result;
+}
+
+uint64_t FileManager::Symlinkat(const char* target, int newdirfd, const char* linkpath) {
+  // `target` is link CONTENT (opaque string), not a path to resolve.
+  // Only `linkpath` (where the symlink lands) gets overlay-translated.
+  auto NewLink = GetSelf(linkpath);
+  const char* SelfLink = NewLink ? NewLink->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(newdirfd, SelfLink, false, TmpFilename);
+  int eff_newdirfd = (Path.FD != -1) ? Path.FD : newdirfd;
+  const char* eff_linkpath = (Path.FD != -1) ? Path.Path : SelfLink;
+
+  uint64_t Result = ::syscall(SYSCALL_DEF(symlinkat), target, eff_newdirfd, eff_linkpath);
+  // If translation produced an unsuitable target (EXDEV / EROFS) or the
+  // rootfs leg doesn't exist (ENOENT), retry with the caller's literal
+  // path.
+  if (Result == -1 && (errno == EXDEV || errno == EROFS || errno == ENOENT) && Path.FD != -1) {
+    Result = ::syscall(SYSCALL_DEF(symlinkat), target, newdirfd, SelfLink);
+  }
+  return Result;
+}
+
+uint64_t FileManager::Renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
+  return Renameat2(olddirfd, oldpath, newdirfd, newpath, 0);
+}
+
+uint64_t FileManager::Renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags) {
+  auto OldNewPath = GetSelf(oldpath);
+  const char* OldSelfPath = OldNewPath ? OldNewPath->data() : nullptr;
+  auto NewNewPath = GetSelf(newpath);
+  const char* NewSelfPath = NewNewPath ? NewNewPath->data() : nullptr;
+
+  FDPathTmpData OldTmp, NewTmp;
+  auto OldPath = GetEmulatedFDPath(olddirfd, OldSelfPath, false, OldTmp);
+  auto NewPath = GetEmulatedFDPath(newdirfd, NewSelfPath, false, NewTmp);
+
+  // Per-leg translation (see FM.Linkat for rationale): substitute
+  // (rootfsFD, relpath) on legs that translate, keep the caller's
+  // dirfd/path on legs that don't.
+  int eff_olddirfd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
+  const char* eff_oldpath = (OldPath.FD != -1) ? OldPath.Path : OldSelfPath;
+  int eff_newdirfd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
+  const char* eff_newpath = (NewPath.FD != -1) ? NewPath.Path : NewSelfPath;
+
+  uint64_t Result = ::syscall(SYSCALL_DEF(renameat2), eff_olddirfd, eff_oldpath, eff_newdirfd, eff_newpath, flags);
+  // Fall back to literal paths when our translation crossed filesystems
+  // (EXDEV) or the rootfs leg doesn't exist (ENOENT).
+  if (Result == -1 && (errno == EXDEV || errno == ENOENT) && (OldPath.FD != -1 || NewPath.FD != -1)) {
+    Result = ::syscall(SYSCALL_DEF(renameat2), olddirfd, OldSelfPath, newdirfd, NewSelfPath, flags);
+  }
+  return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Plain (non-*at) wrappers: forward to the *at form with AT_FDCWD.
+// Eliminates the historical bypass that called glibc ::xxx directly, which
+// silently skipped overlay translation and produced split-state where files
+// got created in <rootfs>/foo but lookups walked the host /foo.
+// ---------------------------------------------------------------------------
+
+uint64_t FileManager::Chown(const char* pathname, uid_t owner, gid_t group) {
+  return Fchownat(AT_FDCWD, pathname, owner, group, 0);
+}
+
+uint64_t FileManager::Lchown(const char* pathname, uid_t owner, gid_t group) {
+  return Fchownat(AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+}
+
+uint64_t FileManager::Unlink(const char* pathname) {
+  return Unlinkat(AT_FDCWD, pathname, 0);
+}
+
+uint64_t FileManager::Mkdir(const char* pathname, mode_t mode) {
+  return Mkdirat(AT_FDCWD, pathname, mode);
+}
+
+uint64_t FileManager::Rmdir(const char* pathname) {
+  return Unlinkat(AT_FDCWD, pathname, AT_REMOVEDIR);
+}
+
+uint64_t FileManager::Link(const char* oldpath, const char* newpath) {
+  return Linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+}
+
+uint64_t FileManager::Symlink(const char* target, const char* linkpath) {
+  return Symlinkat(target, AT_FDCWD, linkpath);
+}
+
+uint64_t FileManager::Rename(const char* oldpath, const char* newpath) {
+  return Renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
+}
+
+uint64_t FileManager::Creat(const char* pathname, mode_t mode) {
+  return Open(pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
+}
+
+uint64_t FileManager::Truncate(const char* pathname, off_t length) {
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, true, TmpFilename);
+  if (Path.FD != -1) {
+    // Open writable scoped to rootfs and ftruncate. OpenPathInRootFS hands
+    // back O_PATH which ftruncate(2) rejects with EBADF; open with O_WRONLY
+    // so the kernel naturally returns EISDIR (directory) / EACCES
+    // (read-only file) / ENOENT etc. as the test expects.
+    FEX::HLE::open_how how = {
+      .flags = static_cast<uint64_t>(O_WRONLY | O_CLOEXEC),
+      .mode = 0,
+      .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
+    };
+    int fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+    if (fd != -1) {
+      uint64_t Result = ::ftruncate(fd, length);
+      int SavedErrno = errno;
+      ::close(fd);
+      errno = SavedErrno;
+      return Result;
+    }
+    // Open in rootfs failed. Fall back to bare truncate only on ENOENT;
+    // EISDIR / EACCES / etc. are real semantic results.
+    if (errno != ENOENT) {
+      return -1;
+    }
+  }
+  return ::truncate(SelfPath, length);
+}
+
 
 uint64_t FileManager::Statfs(const char* path, void* buf) {
   auto Path = GetEmulatedPath(path);
@@ -1134,15 +1438,19 @@ uint64_t FileManager::NewFSStatAt(int dirfd, const char* pathname, struct stat* 
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flag & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
-  int RootScopedFD = OpenPathInRootFS(Path, (flag & AT_SYMLINK_NOFOLLOW) == 0);
-  if (RootScopedFD != -1) {
-    uint64_t Result = ::fstatat(RootScopedFD, "", buf, flag | AT_EMPTY_PATH);
-    int SavedErrno = errno;
-    ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
-      return Result;
+  if (Path.FD != -1) {
+    int RootScopedFD = OpenPathInRootFS(Path, (flag & AT_SYMLINK_NOFOLLOW) == 0);
+    if (RootScopedFD != -1) {
+      uint64_t Result = ::fstatat(RootScopedFD, "", buf, flag | AT_EMPTY_PATH);
+      int SavedErrno = errno;
+      ::close(RootScopedFD);
+      if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+        errno = SavedErrno;
+        return Result;
+      }
+    } else if (errno != ENOENT) {
+      return -1;
     }
-    errno = SavedErrno;
   }
   return ::fstatat(dirfd, SelfPath, buf, flag);
 }

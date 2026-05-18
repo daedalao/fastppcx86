@@ -52,12 +52,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(chown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
-    uint64_t Result = ::chown(pathname, owner, group);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chown(pathname, owner, group);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(lchown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
-    uint64_t Result = ::lchown(pathname, owner, group);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lchown(pathname, owner, group);
     SYSCALL_ERRNO();
   });
 

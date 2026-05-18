@@ -26,32 +26,32 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
 
   REGISTER_SYSCALL_IMPL(rename, [](FEXCore::Core::CpuStateFrame* Frame, const char* oldpath, const char* newpath) -> uint64_t {
-    uint64_t Result = ::rename(oldpath, newpath);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Rename(oldpath, newpath);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(mkdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, mode_t mode) -> uint64_t {
-    uint64_t Result = ::mkdir(pathname, mode);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Mkdir(pathname, mode);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(rmdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname) -> uint64_t {
-    uint64_t Result = ::rmdir(pathname);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Rmdir(pathname);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(link, [](FEXCore::Core::CpuStateFrame* Frame, const char* oldpath, const char* newpath) -> uint64_t {
-    uint64_t Result = ::link(oldpath, newpath);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Link(oldpath, newpath);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(unlink, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname) -> uint64_t {
-    uint64_t Result = ::unlink(pathname);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Unlink(pathname);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(symlink, [](FEXCore::Core::CpuStateFrame* Frame, const char* target, const char* linkpath) -> uint64_t {
-    uint64_t Result = ::symlink(target, linkpath);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Symlink(target, linkpath);
     SYSCALL_ERRNO();
   });
 
@@ -61,7 +61,7 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(chmod, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, mode_t mode) -> uint64_t {
-    uint64_t Result = ::chmod(pathname, mode);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chmod(pathname, mode);
     SYSCALL_ERRNO();
   });
 
@@ -71,7 +71,12 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(creat, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, mode_t mode) -> uint64_t {
-    uint64_t Result = ::creat(pathname, mode);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Creat(pathname, mode);
+    SYSCALL_ERRNO();
+  });
+
+  REGISTER_SYSCALL_IMPL(truncate, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, off_t length) -> uint64_t {
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Truncate(pathname, length);
     SYSCALL_ERRNO();
   });
 
@@ -146,5 +151,59 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
     REGISTER_SYSCALL_IMPL(listxattrat, UnimplementedSyscallSafe);
     REGISTER_SYSCALL_IMPL(removexattrat, UnimplementedSyscallSafe);
   }
+
+  // *at() syscall handlers — overlay-aware. Replaces the bare passthrough
+  // registrations in Passthrough.cpp (which were causing split state between
+  // file-creation paths and *at() resolution targets).
+  REGISTER_SYSCALL_IMPL(fchmodat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode) -> uint64_t {
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Fchmodat(dirfd, pathname, mode, 0);
+    SYSCALL_ERRNO();
+  });
+
+  REGISTER_SYSCALL_IMPL(fchownat,
+                        [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, uid_t owner, gid_t group, int flags) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Fchownat(dirfd, pathname, owner, group, flags);
+                          SYSCALL_ERRNO();
+                        });
+
+  REGISTER_SYSCALL_IMPL(unlinkat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, int flags) -> uint64_t {
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Unlinkat(dirfd, pathname, flags);
+    SYSCALL_ERRNO();
+  });
+
+  REGISTER_SYSCALL_IMPL(mkdirat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode) -> uint64_t {
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Mkdirat(dirfd, pathname, mode);
+    SYSCALL_ERRNO();
+  });
+
+  REGISTER_SYSCALL_IMPL(linkat,
+                        [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+                          SYSCALL_ERRNO();
+                        });
+
+  REGISTER_SYSCALL_IMPL(symlinkat,
+                        [](FEXCore::Core::CpuStateFrame* Frame, const char* target, int newdirfd, const char* linkpath) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Symlinkat(target, newdirfd, linkpath);
+                          SYSCALL_ERRNO();
+                        });
+
+  REGISTER_SYSCALL_IMPL(renameat,
+                        [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Renameat(olddirfd, oldpath, newdirfd, newpath);
+                          SYSCALL_ERRNO();
+                        });
+
+  REGISTER_SYSCALL_IMPL(renameat2,
+                        [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
+                          SYSCALL_ERRNO();
+                        });
+
+  REGISTER_SYSCALL_IMPL_X64(fchmodat2,
+                            [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode, unsigned int flags) -> uint64_t {
+                              uint64_t Result = FEX::HLE::_SyscallHandler->FM.Fchmodat2(dirfd, pathname, mode, flags);
+                              SYSCALL_ERRNO();
+                            });
 }
 } // namespace FEX::HLE

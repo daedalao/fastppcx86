@@ -418,7 +418,6 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(flock, SyscallPassthrough2<SYSCALL_DEF(flock)>);
   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
-  REGISTER_SYSCALL_IMPL(truncate, SyscallPassthrough2<SYSCALL_DEF(truncate)>);
   REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
   REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
   REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
@@ -495,14 +494,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(inotify_add_watch, SyscallPassthrough3<SYSCALL_DEF(inotify_add_watch)>);
   REGISTER_SYSCALL_IMPL(inotify_rm_watch, SyscallPassthrough2<SYSCALL_DEF(inotify_rm_watch)>);
   REGISTER_SYSCALL_IMPL(migrate_pages, SyscallPassthrough4<SYSCALL_DEF(migrate_pages)>);
-  REGISTER_SYSCALL_IMPL(mkdirat, SyscallPassthrough3<SYSCALL_DEF(mkdirat)>);
   REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
-  REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
-  REGISTER_SYSCALL_IMPL(unlinkat, SyscallPassthrough3<SYSCALL_DEF(unlinkat)>);
-  REGISTER_SYSCALL_IMPL(renameat, SyscallPassthrough4<SYSCALL_DEF(renameat)>);
-  REGISTER_SYSCALL_IMPL(linkat, SyscallPassthrough5<SYSCALL_DEF(linkat)>);
-  REGISTER_SYSCALL_IMPL(symlinkat, SyscallPassthrough3<SYSCALL_DEF(symlinkat)>);
-  REGISTER_SYSCALL_IMPL(fchmodat, SyscallPassthrough3<SYSCALL_DEF(fchmodat)>);
   REGISTER_SYSCALL_IMPL(unshare, SyscallPassthrough1<SYSCALL_DEF(unshare)>);
   REGISTER_SYSCALL_IMPL(splice, SyscallPassthrough6<SYSCALL_DEF(splice)>);
   REGISTER_SYSCALL_IMPL(tee, SyscallPassthrough4<SYSCALL_DEF(tee)>);
@@ -523,7 +515,6 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(kcmp, SyscallPassthrough5<SYSCALL_DEF(kcmp)>);
   REGISTER_SYSCALL_IMPL(sched_setattr, SyscallPassthrough3<SYSCALL_DEF(sched_setattr)>);
   REGISTER_SYSCALL_IMPL(sched_getattr, SyscallPassthrough4<SYSCALL_DEF(sched_getattr)>);
-  REGISTER_SYSCALL_IMPL(renameat2, SyscallPassthrough5<SYSCALL_DEF(renameat2)>);
   REGISTER_SYSCALL_IMPL(getrandom, SyscallPassthrough3<SYSCALL_DEF(getrandom)>);
   REGISTER_SYSCALL_IMPL(memfd_create, SyscallPassthrough2<SYSCALL_DEF(memfd_create)>);
   REGISTER_SYSCALL_IMPL(membarrier, SyscallPassthrough2<SYSCALL_DEF(membarrier)>);
@@ -779,7 +770,6 @@ namespace x64 {
       REGISTER_SYSCALL_IMPL_X64(cachestat, UnimplementedSyscallSafe);
     }
     if (Handler->IsHostKernelVersionAtLeast(6, 6, 0)) {
-      REGISTER_SYSCALL_IMPL_X64(fchmodat2, SyscallPassthrough4<SYSCALL_DEF(fchmodat2)>);
     } else {
       REGISTER_SYSCALL_IMPL_X64(fchmodat2, UnimplementedSyscallSafe);
     }
