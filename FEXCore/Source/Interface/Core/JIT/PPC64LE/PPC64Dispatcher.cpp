@@ -61,6 +61,13 @@ extern "C" {
   alignas(64) uint64_t g_push_count = 0;
   alignas(64) uint64_t g_push_log[8][3] = {};
   // Slow-path SRA-fill debug: capture r14 (= R6 = RSI) at three points.
+  // 2026-05-17 callback-flow RIP-truncation trace
+  alignas(64) uint64_t g_last_exit_rip = 0;      // NewRIP value just stored by ExitFunction
+  alignas(64) uint64_t g_last_exit_kind = 0;     // 0=inline 1=reg
+  alignas(64) uint64_t g_last_callback_target = 0;   // CallbackPtr: r4 on entry (target RIP)
+  alignas(64) uint64_t g_last_callback_rsp_pushed = 0; // CallbackPtr: new RSP after push
+  alignas(64) uint64_t g_last_callback_pushed_val = 0; // CallbackPtr: value pushed at [RSP]
+  alignas(64) uint64_t g_last_callback_return_rip = 0; // CallbackReturn entry: State.rip
 }
 
 namespace FEXCore::CPU {
@@ -541,6 +548,14 @@ void PPC64Dispatcher::EmitDispatcher() {
   PushCalleeSavedRegisters();
   mr(STATE, r3);
 
+  // DEBUG 2026-05-17: log the callback target RIP (r4 on entry) into a global
+  // BEFORE any masking/clobbering. CRITICAL: TMP2=r4 IS the target RIP we need to
+  // preserve — must use TMP1/TMP3 for the address load, NOT TMP2.
+  {
+    LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_callback_target));
+    std(r4, 0, TMP3);
+  }
+
   // Save target RIP (r4) early — subsequent operations need r4 as scratch.
   {
     int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
@@ -582,6 +597,13 @@ void PPC64Dispatcher::EmitDispatcher() {
     MaybeClrUpper32(TMP2);        // re-mask after addi in case borrow extended high bits
     std(TMP1, 0, TMP2);           // [RSP+0] = ThunkCallbackRet
     std(TMP2, rsp_off, STATE);    // write back new RSP to state
+    // DEBUG 2026-05-17: log what got pushed and where.
+    {
+      LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_callback_pushed_val));
+      std(TMP1, 0, TMP3);
+      LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_callback_rsp_pushed));
+      std(TMP2, 0, TMP3);
+    }
   }
 
   FillStaticRegs();
