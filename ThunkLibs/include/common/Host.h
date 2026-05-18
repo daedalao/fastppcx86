@@ -82,15 +82,30 @@ struct GuestcallInfo {
   uintptr_t GuestTarget;
 };
 
-// Helper macro for reading an internal argument passed through the `r11`
-// host register. This macro must be placed at the very beginning of
-// the function it is used in.
+// Helper macro for reading an internal argument passed through the host's
+// callback custom-ABI. On x86/ARM this is the r11/x11 scratch register and
+// the macro must be placed at the very beginning of the function it is
+// used in. On PPC64LE r11 is the linker's environment-pointer register and
+// gets clobbered by PLT stubs in the receiving function's prologue, so a
+// thread-local variable is used instead — the trampoline writes it
+// pre-bctr and the macro reads it back.
 #if defined(ARCHITECTURE_x86_64)
 #define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mov %%r11, %0" : "=r"(target_variable))
 #elif defined(ARCHITECTURE_arm64)
 #define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mov %0, x11" : "=r"(target_variable))
 #elif defined(ARCHITECTURE_ppc64le)
-#define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable) asm volatile("mr %0, 11" : "=r"(target_variable))
+// Bin/FEX exports this getter; host libs call it. The getter reads the TLS
+// variable inside Bin/FEX's local-exec slot. Dynamic linker resolves at
+// dlopen time (Bin/FEX is linked with --export-dynamic), so the cost is
+// one PLT call per callback dispatch. Declared weak so the host libs link
+// even with --no-undefined; missing at runtime would mean the lib was
+// dlopened from a non-FEX process which would be a serious misuse.
+extern "C" uintptr_t FEX_GetCallbackGuestcallPtr() __attribute__((weak));
+#define LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(target_variable)                                                  \
+  do {                                                                                                          \
+    (target_variable) = reinterpret_cast<std::remove_reference_t<decltype(target_variable)>>(                   \
+      FEX_GetCallbackGuestcallPtr());                                                                           \
+  } while (0)
 #endif
 
 struct ParameterAnnotations {

@@ -61,24 +61,46 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
     ".quad 0, 0, 0, 0 \n" // TrampolineInstanceInfo
   );
 #elif defined(ARCHITECTURE_ppc64le)
-  // r11 is the custom ABI register pointing to TrampolineInstanceInfo (mirrors x11 on ARM64).
-  // bl-trick gives a PC-relative address without modifying LR permanently.
-  // Layout (8 insns = 32 bytes of code, then 32 bytes of TrampolineInstanceInfo):
-  //   +0:  mflr r0          save caller LR
-  //   +4:  bl 1f            LR = &label1; fall through to label1
-  //   +8:  [label1] mflr r12   r12 = &label1
-  //   +12: mtlr r0          restore caller LR
-  //   +16: addi r11,r12,24  r11 = &TrampolineInstanceInfo (label1+24 = +32 from func start)
-  //   +20: ld r12,0(r11)    r12 = TrampolineInstanceInfo.HostPacker
-  //   +24: mtctr r12
-  //   +28: bctr
-  //   +32: .quad 0,0,0,0    TrampolineInstanceInfo
+  // PPC64LE: pass TrampolineInstanceInfo via a thread-local variable.
+  //
+  // Why not r11 like x86/ARM: PPC64LE ELFv2 declares r11 as the "environment
+  // pointer / static chain register," and the linker's PLT lazy-resolution
+  // stubs are documented to clobber r11. The receiving CallGuestPtr also
+  // calls into PLT-resolved external functions (GetGuestStack,
+  // MoveGuestStack, etc.) before the inline asm has a chance to capture
+  // r11, so the value gets corrupted in practice. Empirically observed as
+  // "State.rip = low byte of (whatever was last at offset 16 of the
+  // trampoline page)" across all libGL / libvulkan / libwayland host
+  // thunks on POWER8.
+  //
+  // Replacement: the trampoline writes &TrampolineInstanceInfo into a
+  // __thread variable defined in Bin/FEX, then bctr to HostPacker. The
+  // LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI macro (in ThunkLibs/include/
+  // common/Host.h) reads the same TLS variable from the host thunk
+  // libraries via the dynamic linker's Initial-Exec TLS model. r13 is the
+  // PPC64LE thread pointer and is preserved across PLT stubs (kernel +
+  // ABI invariant), so this is robust.
+  //
+  // Layout (12 insns = 48 bytes of code, then 32 bytes of InstanceInfo):
+  //   +0:  mflr r0
+  //   +4:  bl 1f
+  //   +8:  [label1] mflr r12
+  //   +12: mtlr r0
+  //   +16: addi r11, r12, 32       r11 = &InstanceInfo (label1+32 = template+40)
+  //   +20: addis r0, r13, var@tprel@ha
+  //   +24: std r11, var@tprel@l(r0) write TLS
+  //   +28: ld r12, 0(r11)           r12 = InstanceInfo.HostPacker
+  //   +32: mtctr r12
+  //   +36: bctr
+  //   +40: .quad 0,0,0,0            TrampolineInstanceInfo (32 bytes)
   asm(
     "mflr %r0 \n"
     "bl 1f \n"
     "1: mflr %r12 \n"
     "mtlr %r0 \n"
-    "addi %r11, %r12, 24 \n"
+    "addi %r11, %r12, 32 \n"
+    "addis %r0, %r13, __fex_callback_guestcall_ptr@tprel@ha \n"
+    "std %r11, __fex_callback_guestcall_ptr@tprel@l(%r0) \n"
     "ld %r12, 0(%r11) \n"
     "mtctr %r12 \n"
     "bctr \n"
@@ -92,6 +114,29 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
 
 extern char __start_HostToGuestTrampolineTemplate[];
 extern char __stop_HostToGuestTrampolineTemplate[];
+
+#if defined(ARCHITECTURE_ppc64le)
+// Cross-arch callback side-channel for the PPC64LE trampoline. See the
+// trampoline template comment above for why r11 doesn't work and TLS does.
+//
+// The TLS variable lives in Bin/FEX with Local-Exec model (cheap, just
+// `addis/std OFFSET(r13)` in the trampoline asm). Host thunk libraries
+// (libGL-host.so etc.) can't reach this TLS slot directly because of
+// --no-undefined linker semantics on PPC64LE Initial-Exec relocations.
+// Instead, Bin/FEX exports a default-visibility getter that the host
+// libs call to read the value. The dynamic linker resolves the getter
+// at dlopen time; cost is one PLT call per callback dispatch, which is
+// negligible compared to the JIT re-entry that follows.
+extern "C" __thread uintptr_t __fex_callback_guestcall_ptr;
+// __attribute__((used)) prevents LTO from dropping the symbol because
+// the only C++ reference is inside the trampoline's naked inline asm,
+// which LTO treats as opaque.
+__attribute__((used)) __thread uintptr_t __fex_callback_guestcall_ptr;
+
+extern "C" FEX_DEFAULT_VISIBILITY uintptr_t FEX_GetCallbackGuestcallPtr() {
+  return __fex_callback_guestcall_ptr;
+}
+#endif
 
 namespace FEX::HLE {
 
@@ -110,15 +155,17 @@ struct HostToGuestTrampolinePtr;
 
 static TrampolineInstanceInfo& GetInstanceInfo(HostToGuestTrampolinePtr* Trampoline) {
 #if defined(ARCHITECTURE_ppc64le)
-  // The PPC64LE trampoline reads its InstanceInfo via `addi r11, r12, 24`
+  // The PPC64LE trampoline reads its InstanceInfo via `addi r11, r12, 32`
   // where r12 holds the address of `label1` (template+8). That fixes the
-  // InstanceInfo at exactly offset 32 from the trampoline start.
+  // InstanceInfo at exactly offset 40 from the trampoline start. (The
+  // +32 is because we now have 3 extra instructions: addis + std for TLS
+  // write — bumping the InstanceInfo's offset accordingly.)
   //
   // We cannot derive the offset from the section length on PPC64LE: the
-  // assembler emits 12 bytes of trailing padding after the embedded
-  // `.quad 0,0,0,0`, so __stop - __start = 76, and Length - sizeof(info)
-  // points 12 bytes past where the trampoline actually reads. Hardcode it.
-  constexpr auto InstanceInfoOffset = 32;
+  // assembler emits trailing padding after the embedded `.quad 0,0,0,0`,
+  // so Length - sizeof(info) points past where the trampoline actually
+  // reads. Hardcode it to match the asm above.
+  constexpr auto InstanceInfoOffset = 40;
 #else
   const auto Length = __stop_HostToGuestTrampolineTemplate - __start_HostToGuestTrampolineTemplate;
   const auto InstanceInfoOffset = Length - sizeof(TrampolineInstanceInfo);
