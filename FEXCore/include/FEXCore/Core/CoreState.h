@@ -392,8 +392,21 @@ struct JITPointers {
   alignas(16) uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2];
 };
 
-// Each guest JIT frame has one of these
+// Each guest JIT frame has one of these.
+//
+// Cross-arch alignment note: POWER8 has 128-byte L2/L3 cache lines (vs
+// ARM64/x86 64-byte). When two per-thread CpuStateFrame allocations land
+// adjacent in memory and the structure is only 64-byte aligned, the END
+// of one frame and the START of the next share a 128-byte line. Cross-
+// thread atomic operations (lwarx/stwcx_.) on either frame then cancel
+// the other's reservation -> live-lock or starvation patterns that don't
+// reproduce on ARM64. Force 128-byte alignment + trailing pad on PPC64LE
+// so adjacent frames are on disjoint cache lines.
+#ifdef ARCHITECTURE_ppc64le
+struct alignas(128) CpuStateFrame {
+#else
 struct CpuStateFrame {
+#endif
   CPUState State;
 
   /**
@@ -459,6 +472,17 @@ static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first membe
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
 static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
                                                                                             "than architecture maximum 32768");
+#ifdef ARCHITECTURE_ppc64le
+// Ensure adjacent CpuStateFrame allocations land on disjoint 128-byte cache
+// lines (POWER8 line size). Without size-multiple-of-128, the trailing bytes
+// of one frame share a line with the leading bytes of the next, which
+// causes cross-thread atomic reservations on adjacent frames to cancel each
+// other and produces livelock patterns that don't reproduce on ARM64.
+static_assert((sizeof(CpuStateFrame) % 128) == 0,
+              "CpuStateFrame size must be a multiple of 128 bytes on POWER8 to avoid "
+              "false sharing across adjacent per-thread frame allocations. Add a "
+              "trailing pad inside the struct to absorb the slop.");
+#endif
 
 static_assert(std::is_standard_layout<CpuStateFrame>::value, "This needs to be standard layout");
 static_assert(sizeof(CpuStateFrame::SynchronousFaultData) == 8, "This needs to be 8 bytes");
