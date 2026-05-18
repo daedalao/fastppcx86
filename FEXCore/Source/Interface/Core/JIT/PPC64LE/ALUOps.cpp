@@ -3067,21 +3067,21 @@ DEF_OP(PrintMsg) {
 }
 
 // Misc
-// x86 PAUSE -> POWER ISA SMT yield hint + counter-gated sched_yield.
+// x86 PAUSE -> counter-gated sched_yield (NO SMT priority change).
 //
-// Two-tier strategy. The hot path is just 5 instructions (lwz/addi/cmplwi/
-// bc/stw) plus the SMT priority hint `or r1,r1,r1`. Every PAUSE_YIELD_LIMIT
-// PAUSEs we fall through to a host C helper that runs sched_yield(), so the
-// OS scheduler gets a chance to run whichever thread is holding the lock the
-// guest is spinning on. Critical for x86 spinlock+PAUSE loops on PPC64LE
-// because:
-//   - `or rN,rN,rN` is a SMT priority hint, NOT a scheduler call. On a host
-//     with more guest threads than physical SMT contexts, the lock-holder
-//     never gets to run.
-//   - The previous code emitted `or r27,r27,r27`. r27 is not on POWER ISA's
-//     priority-hint operand list (only r1=low, r6=medium-low, r2=medium are
-//     user-mode-recognized) — so it was a literal no-op, not even an SMT
-//     priority change. `or r1,r1,r1` is the actual "low priority" form.
+// POWER ISA has Program Priority Register hints via `or rN,rN,rN` for N in
+// {1=low, 6=medium-low, 2=medium}. Naively emitting `or r1,r1,r1` (LOW)
+// on every PAUSE is wrong without complementary code to restore MEDIUM
+// after the spinlock is acquired — once the thread drops to LOW it stays
+// there for the entire critical section, starving the lock-holder and
+// causing user-visible hangs across SDL2/Vulkan games (regression
+// introduced + reverted 2026-05-17).
+//
+// Per-block restoration via static-analysis of cmpxchg+jne patterns is
+// future work. For now: skip the priority hint entirely. The counter-
+// gated sched_yield is what actually gives the OS a chance to schedule
+// the lock-holder on a different CPU when threads outnumber physical
+// SMT contexts — and it has no priority-state to leak.
 //
 // Bug-class entries: project_stardew_main_thread_spin, project_ftl_futex_storm,
 // project_steam_nul_jit_race (all involve guest threads spinning while their
@@ -3138,11 +3138,7 @@ DEF_OP(Yield) {
   stw(TMP1, pc_off, STATE);
 
   Bind(&end);
-  // SMT priority hint: `or r1, r1, r1` is the canonical user-mode "low
-  // priority" form on POWER ISA (Program Priority Register). r1 = r1 (no
-  // effect on stack pointer state) but the encoding is recognized by the
-  // SMT dispatcher.
-  or_(r(1), r(1), r(1));
+  // Deliberately no PPR/SMT-priority hint here. See block comment above.
 }
 DEF_OP(WFET)                 { /* nop */ }
 // =========================================================================
