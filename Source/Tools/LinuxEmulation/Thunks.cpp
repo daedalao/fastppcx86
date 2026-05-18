@@ -341,20 +341,6 @@ void ThunkHandler_impl::LoadLib(std::string_view Name) {
 FEX_DEFAULT_VISIBILITY HostToGuestTrampolinePtr*
 MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   LOGMAN_THROW_A_FMT(GuestTarget, "Tried to create host-trampoline to null pointer guest function");
-  // Diagnostic for cross-arch GuestUnpacker truncation hunt: log every
-  // trampoline creation. If GuestUnpacker is ever a small value like 0xC0
-  // here, the truncation happened upstream (in the thunkgen-emitted
-  // SetGuestXSync/SetGuestMalloc/etc. unpack code). Otherwise it happens
-  // downstream in CallGuestPtr's read of guestcall->GuestUnpacker.
-  // Opt-in via FEX_LOG_TRAMPOLINE_CREATE=1.
-  static const bool log_create = (getenv("FEX_LOG_TRAMPOLINE_CREATE") != nullptr);
-  if (log_create) {
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf),
-                     "[FEX-tramp-create] HostPacker=%p GuestTarget=0x%lx GuestUnpacker=0x%lx\n",
-                     HostPacker, (unsigned long)GuestTarget, (unsigned long)GuestUnpacker);
-    [[maybe_unused]] auto _ = write(2, buf, n);
-  }
 
   const auto ThunkHandler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
 

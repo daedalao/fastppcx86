@@ -1511,12 +1511,6 @@ void PPC64JITCore::ResetStack() {
 extern "C" {
   extern uint64_t g_dispatch_count;
   extern uint64_t g_recent_rips[16];
-  extern uint64_t g_last_exit_rip;
-  extern uint64_t g_last_exit_kind;
-  extern uint64_t g_last_callback_target;
-  extern uint64_t g_last_callback_rsp_pushed;
-  extern uint64_t g_last_callback_pushed_val;
-  extern uint64_t g_last_callback_return_rip;
 }
 
 // Forward-declare the compile-log ring buffer (defined in Frontend.cpp).
@@ -1582,16 +1576,6 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
                  (unsigned long)peek8(RSI),
                  (unsigned long)peek8(RSI + 8),
                  (unsigned long)peek8(RSI + 16));
-    _ = write(2, buf, n);
-    // 2026-05-17: callback-flow RIP-truncation trace globals
-    n = snprintf(buf, sizeof(buf),
-                 "[FEX]   trace: last_exit_rip=0x%lx kind=%lu last_cb_target=0x%lx last_cb_rsp_pushed=0x%lx last_cb_pushed_val=0x%lx last_cb_return_rip=0x%lx\n",
-                 (unsigned long)g_last_exit_rip,
-                 (unsigned long)g_last_exit_kind,
-                 (unsigned long)g_last_callback_target,
-                 (unsigned long)g_last_callback_rsp_pushed,
-                 (unsigned long)g_last_callback_pushed_val,
-                 (unsigned long)g_last_callback_return_rip);
     _ = write(2, buf, n);
     fsync(2);
   }
@@ -1849,24 +1833,11 @@ uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uin
             // i*8 below the sentinel is the "stack frame" the failed callback
             // built — discard it by walking RSP up to the sentinel slot.
             Frame->State.gregs[FEXCore::X86State::REG_RSP] = slot_addr;
-            char buf[1024];
+            char buf[256];
             int n = snprintf(buf, sizeof(buf),
-                             "[FEX] suspect GuestRIP=0x%lx in callback flow — bypassing via ThunkCallbackRet=0x%lx (adjusted RSP from 0x%lx to 0x%lx)\n"
-                             "[FEX]   trace: last_exit_rip=0x%lx kind=%lu last_cb_target=0x%lx last_cb_rsp_pushed=0x%lx last_cb_pushed_val=0x%lx last_cb_return_rip=0x%lx slot_i=%d\n"
-                             "[FEX]   recent_rips: [-1]=0x%lx [-2]=0x%lx [-3]=0x%lx [-4]=0x%lx\n",
+                             "[FEX] suspect GuestRIP=0x%lx in callback flow — bypassing via ThunkCallbackRet=0x%lx (adjusted RSP from 0x%lx to 0x%lx)\n",
                              (unsigned long)GuestRIP, (unsigned long)TCR,
-                             (unsigned long)RSP, (unsigned long)slot_addr,
-                             (unsigned long)g_last_exit_rip,
-                             (unsigned long)g_last_exit_kind,
-                             (unsigned long)g_last_callback_target,
-                             (unsigned long)g_last_callback_rsp_pushed,
-                             (unsigned long)g_last_callback_pushed_val,
-                             (unsigned long)g_last_callback_return_rip,
-                             i,
-                             (unsigned long)g_recent_rips[(g_dispatch_count - 1) & 15],
-                             (unsigned long)g_recent_rips[(g_dispatch_count - 2) & 15],
-                             (unsigned long)g_recent_rips[(g_dispatch_count - 3) & 15],
-                             (unsigned long)g_recent_rips[(g_dispatch_count - 4) & 15]);
+                             (unsigned long)RSP, (unsigned long)slot_addr);
             [[maybe_unused]] auto _ = write(2, buf, n);
             GuestRIP = TCR;
             goto bypass_diagnose;

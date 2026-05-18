@@ -10,24 +10,9 @@
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/MathUtils.h>
 
-extern "C" {
-  extern uint64_t g_last_exit_rip;
-  extern uint64_t g_last_exit_kind;
-  extern uint64_t g_last_callback_return_rip;
-}
-
 namespace FEXCore::CPU {
 
 DEF_OP(CallbackReturn) {
-  // DEBUG 2026-05-17: snapshot State.rip on entry — this should equal the
-  // popped guest VA from the  that landed on ThunkCallbackRet.
-  {
-    int32_t _dbg_rip_off = static_cast<int32_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, State.rip));
-    ld(TMP1, _dbg_rip_off, STATE);
-    LoadConstant(TMP2, reinterpret_cast<uint64_t>(&g_last_callback_return_rip));
-    std(TMP1, 0, TMP2);
-  }
   // Spill SRA back to context
   SpillStaticRegs(TMP1);
   ResetStack();
@@ -74,14 +59,6 @@ DEF_OP(ExitFunction) {
     }
     LoadConstant(TMP2, NewRIP);
     std(TMP2, rip_off, STATE);
-    // DEBUG 2026-05-17: log inline ExitFunction RIP
-    {
-      LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_rip));
-      std(TMP2, 0, TMP3);
-      LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_kind));
-      li(TMP4, 0);
-      std(TMP4, 0, TMP3);
-    }
     SpillStaticRegs(TMP1);
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);
@@ -90,24 +67,8 @@ DEF_OP(ExitFunction) {
     if (!CTX->Config.Is64BitMode()) {
       rldicl(TMP2, NewRIPReg, 0, 32);
       std(TMP2, rip_off, STATE);
-      // DEBUG 2026-05-17: log register ExitFunction RIP (32-bit path)
-      {
-        LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_rip));
-        std(TMP2, 0, TMP3);
-        LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_kind));
-        li(TMP4, 2);
-        std(TMP4, 0, TMP3);
-      }
     } else {
       std(NewRIPReg, rip_off, STATE);   // save BEFORE spill clobbers temps
-      // DEBUG 2026-05-17: log register ExitFunction RIP (64-bit path)
-      {
-        LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_rip));
-        std(NewRIPReg, 0, TMP3);
-        LoadConstant(TMP3, reinterpret_cast<uint64_t>(&g_last_exit_kind));
-        li(TMP4, 1);
-        std(TMP4, 0, TMP3);
-      }
     }
     SpillStaticRegs(TMP1);
   }
