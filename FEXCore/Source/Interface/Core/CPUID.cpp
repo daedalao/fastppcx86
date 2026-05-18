@@ -18,6 +18,10 @@ $end_info$
 #include <FEXCore/fextl/string.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#ifdef ARCHITECTURE_ppc64le
+#include <sys/platform/ppc.h>
+#endif
+
 #include "git_version.h"
 
 #include <cstring>
@@ -417,7 +421,16 @@ void CPUIDEmu::SetupHostHybridFlag() {
 
 #else
 uint64_t GetCycleCounterFrequency() {
+#if defined(ARCHITECTURE_ppc64le)
+  // POWERs timebase register (read via mftb) ticks at a fixed system
+  // frequency independent of CPU clock. POWER8 reports 512 MHz.
+  // Reporting the true frequency lets the guests CPUID leaf 0x15
+  // truthfully advertise rdtscs tick rate, matching the ARM64 host
+  // CNTFRQ_EL0 semantics.
+  return __ppc_get_timebase_freq();
+#else
   return 0;
+#endif
 }
 
 void CPUIDEmu::SetupHostHybridFlag() {
