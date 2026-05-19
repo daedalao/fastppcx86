@@ -84,6 +84,24 @@ static void OnInit() {
   fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+
+  // 2026-05-18 cross-arch callback registry: Mesa retrieves function
+  // pointers from the GLX dispatch table that point at guest-side
+  // wrappers. When Mesa later invokes one of those pointers, FEX's
+  // GuestWrapperForHostFunction wrap path needs an Unpack function for
+  // the signature so it can synthesise a host trampoline. On signature
+  // miss the wrap returns zero -- which Mesa then treats as a valid
+  // pointer and crashes downstream. Register the common GL callback
+  // signatures we have observed in FTL/Grimrock startup:
+  //   FvjE  void(unsigned int)
+  //   FvvE  void()
+  // Add more here as the cross-arch warning surfaces them.
+  RegisterGuestCallbackUnpacker<void(unsigned int)>();
+  RegisterGuestCallbackUnpacker<void()>();
+  // glTexImage2D-class signature: void(GLenum, GLint, GLint, GLsizei,
+  // GLsizei, GLint, GLenum, GLenum, const void*). Mesa pulls this from
+  // the GLX dispatch table for FBO texture-attachment setup.
+  RegisterGuestCallbackUnpacker<void(unsigned int, int, int, int, int, int, unsigned int, unsigned int, const void*)>();
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
