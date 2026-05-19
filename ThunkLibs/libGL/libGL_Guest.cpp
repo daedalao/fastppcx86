@@ -105,6 +105,14 @@ static void OnInit() {
   // glGetString-class signature: const char*(GLenum). Mesa pulls this
   // from GLX dispatch to get vendor/renderer/version strings.
   RegisterGuestCallbackUnpacker<const unsigned char*(unsigned int)>();
+  // glViewport/glScissor-class: void(uint, uint, uint, uint, uint). Mangled
+  // FvjjjjjE. Surfaced by Ziggurat (Unity/Mono) at startup; without it the
+  // fallback wrap returns NULL and Mono dereferences it leading to a guest
+  // SIGSEGV at high host VA (0x3ffff...).
+  RegisterGuestCallbackUnpacker<void(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)>();
+  // glIs*-class predicates: unsigned int(unsigned int). Mangled FjjE. Same
+  // failure mode as above in Ziggurat startup.
+  RegisterGuestCallbackUnpacker<unsigned int(unsigned int)>();
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
