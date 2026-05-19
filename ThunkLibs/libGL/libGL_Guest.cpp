@@ -102,6 +102,9 @@ static void OnInit() {
   // GLsizei, GLint, GLenum, GLenum, const void*). Mesa pulls this from
   // the GLX dispatch table for FBO texture-attachment setup.
   RegisterGuestCallbackUnpacker<void(unsigned int, int, int, int, int, int, unsigned int, unsigned int, const void*)>();
+  // glGetString-class signature: const char*(GLenum). Mesa pulls this
+  // from GLX dispatch to get vendor/renderer/version strings.
+  RegisterGuestCallbackUnpacker<const unsigned char*(unsigned int)>();
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
