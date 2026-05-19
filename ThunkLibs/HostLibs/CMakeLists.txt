@@ -147,6 +147,9 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
+
+  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp ${GUEST_BITNESS})
+  add_host_lib(xshmfence ${GUEST_BITNESS})
 endforeach()
 
 set(BITNESS_LIST "32;64")

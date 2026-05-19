@@ -199,6 +199,9 @@ if (BITNESS EQUAL 64)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
   add_guest_lib(drm "libdrm.so.2")
+
+  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp)
+  add_guest_lib(xshmfence "libxshmfence.so.1")
 endif()
 
 generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
