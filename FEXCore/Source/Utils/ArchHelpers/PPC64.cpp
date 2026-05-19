@@ -138,9 +138,43 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   *result = Old; // pre-RMW value (CAS returns observed-old too)
 }
 
+// PPC64LE X-form field extractors (bits numbered per PowerISA big-endian
+// convention; bit 0 = MSB of the 32-bit word).
+namespace {
+constexpr uint32_t XFormPrimary(uint32_t I) { return (I >> 26) & 0x3F; }
+constexpr uint32_t XFormRT(uint32_t I)      { return (I >> 21) & 0x1F; } // bits 6..10
+constexpr uint32_t XFormRA(uint32_t I)      { return (I >> 16) & 0x1F; } // bits 11..15
+constexpr uint32_t XFormRB(uint32_t I)      { return (I >> 11) & 0x1F; } // bits 16..20
+constexpr uint32_t XFormXO(uint32_t I)      { return (I >> 1)  & 0x3FF; }
+
+// Match the (Primary=31, XO) reservation-load opcodes. Returns the operand
+// size in bytes, or 0 on no match.
+constexpr uint32_t LLLoadSize(uint32_t XO) {
+  switch (XO) {
+  case 20:  return 4; // lwarx
+  case 52:  return 1; // lbarx
+  case 84:  return 8; // ldarx
+  case 116: return 2; // lharx
+  default:  return 0;
+  }
+}
+
+// Match the (Primary=31, XO) reservation-store opcodes.
+constexpr bool IsStoreConditional(uint32_t XO) {
+  switch (XO) {
+  case 150: // stwcx.
+  case 214: // stdcx.
+  case 694: // stbcx.
+  case 726: // sthcx.
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
 std::optional<int32_t> HandleUnalignedAtomicSIGBUS(FEXCore::Core::InternalThreadState* Thread, uintptr_t ProgramCounter, uint64_t* GPRs) {
   (void)Thread;
-  (void)GPRs;
 
   if (ProgramCounter == 0 || (ProgramCounter & 3u) != 0) {
     // PowerISA instructions are 4-byte aligned; a misaligned PC means our
@@ -148,52 +182,104 @@ std::optional<int32_t> HandleUnalignedAtomicSIGBUS(FEXCore::Core::InternalThread
     return std::nullopt;
   }
 
-  uint32_t Insn = 0;
-  std::memcpy(&Insn, reinterpret_cast<const void*>(ProgramCounter), sizeof(uint32_t));
+  uint32_t LLInsn = 0;
+  std::memcpy(&LLInsn, reinterpret_cast<const void*>(ProgramCounter), sizeof(uint32_t));
 
-  const uint32_t Primary = (Insn >> 26) & 0x3f;
-  const uint32_t XO      = (Insn >> 1) & 0x3ff;
-
-  // Reservation-load X-form opcodes (PowerISA 3.0 Book II):
-  //   lbarx -- primary 31, XO 52
-  //   lharx -- primary 31, XO 116
-  //   lwarx -- primary 31, XO 20
-  //   ldarx -- primary 31, XO 84
-  if (Primary != 31) {
+  if (XFormPrimary(LLInsn) != 31) {
     return std::nullopt;
   }
-  switch (XO) {
-  case 20:  // lwarx
-  case 52:  // lbarx
-  case 84:  // ldarx
-  case 116: // lharx
-    break;
-  default:
+  const uint32_t Size = LLLoadSize(XFormXO(LLInsn));
+  if (Size == 0) {
     return std::nullopt;
   }
 
   g_SplitLockDetectedCount.fetch_add(1, std::memory_order_relaxed);
-  LogMan::Msg::DFmt("PPC64 split-lock SIGBUS detected at PC=0x{:x} insn=0x{:08x} XO={} (Phase 1: log-only)", ProgramCounter, Insn, XO);
 
-  // TODO Phase 3: wire to PPC64_SplitLockEmulate here.
-  //
-  // Sketch of the eventual logic:
-  //   1. Identify the RA/RB GPRs from the X-form encoding (bits 11:15
-  //      and 16:20) -- Insn was loaded above. EA = (RA?GPRs[RA]:0) + GPRs[RB].
-  //   2. Walk forward from PC up to N (probably 16) instructions to find
-  //      the matching stbcx_/sthcx_/stwcx_/stdcx_, learning the value
-  //      register and the LL/SC body in between (which encodes the RMW
-  //      op tag).
-  //   3. Backpatch the LL through the bc-loop branch to a `bl` of a
-  //      runtime stub that marshals (op, addr, value, result) into the
-  //      ABI and calls PPC64_SplitLockEmulate, then `b`'s over the
-  //      original LL/SC body.
-  //   4. Return the byte count to roll PC backwards so the patched LL
-  //      instruction re-executes via the stub.
-  //
-  // Phase 1 returns nullopt so the SIGBUS escapes to the guest as a
-  // genuine fault rather than looping forever on the unmodified LL.
-  return std::nullopt;
+  // Compute EA from the LL's X-form encoding. The JIT emits the LL with
+  // RA=r0 (which Power's indexed addressing treats as the literal 0,
+  // not GPRs[0]) and RB=addr_reg, so EA == GPRs[RB] in practice -- but
+  // we honour the full RA?GPRs[RA]:0 convention for safety.
+  const uint32_t LL_RT = XFormRT(LLInsn);
+  const uint32_t LL_RA = XFormRA(LLInsn);
+  const uint32_t LL_RB = XFormRB(LLInsn);
+  const uint64_t EA    = (LL_RA ? GPRs[LL_RA] : 0) + GPRs[LL_RB];
+
+  // Decode the body instruction at PC+4. Two patterns match what
+  // JIT/PPC64LE/AtomicOps.cpp emits:
+  //   AtomicSwap          : LL -> SC -> bc                  (no body)
+  //   AtomicFetch{Add,Sub,And,Or,Xor,CLR,Neg}
+  //                       : LL -> <body> -> SC -> bc        (body @ PC+4)
+  // CAS interposes a cmp+bc-fail between LL and SC; we don't recognize
+  // it here and let the fault escape (CAS already has an explicit
+  // alignment check in the JIT and is rare enough as a fault source).
+  uint32_t Body = 0;
+  std::memcpy(&Body, reinterpret_cast<const void*>(ProgramCounter + 4), sizeof(uint32_t));
+  if (XFormPrimary(Body) != 31) {
+    return std::nullopt;
+  }
+  const uint32_t BodyXO = XFormXO(Body);
+
+  SplitLockOp Op {};
+  uint32_t ValueReg = 0;
+  int32_t Advance   = 0;
+
+  if (IsStoreConditional(BodyXO)) {
+    // AtomicSwap: PC+0 LL ; PC+4 SC ; PC+8 bc.NE -> loop ; advance past bc.
+    // SC X-form puts the source register (RS) in bits 6..10, same slot as
+    // RT in load-form encodings, so we reuse XFormRT().
+    Op = SplitLockOp::Swap;
+    ValueReg = XFormRT(Body);
+    Advance = 12; // skip LL + SC + bc
+  } else {
+    // Atomic-with-body. Decode the body's XO to map to a SplitLockOp,
+    // and pick the operand register from the body's field layout.
+    //
+    //   add  RT, RA, RB  (primary 31, XO 266)         -- Val = RB
+    //   subf RT, RA, RB  (primary 31, XO 40)          -- Val = RA (RT = RB - RA)
+    //   and  RA, RS, RB  (primary 31, XO 28,  Rc=1)   -- Val = RB
+    //   or   RA, RS, RB  (primary 31, XO 444, Rc=1)   -- Val = RB
+    //   xor  RA, RS, RB  (primary 31, XO 316, Rc=1)   -- Val = RB
+    //   andc RA, RS, RB  (primary 31, XO 60)          -- Val = RB
+    //   neg  RT, RA      (primary 31, XO 104)         -- no Val operand
+    switch (BodyXO) {
+    case 266: Op = SplitLockOp::FetchAdd; ValueReg = XFormRB(Body); break;
+    case 40:  Op = SplitLockOp::FetchSub; ValueReg = XFormRA(Body); break;
+    case 28:  Op = SplitLockOp::FetchAnd; ValueReg = XFormRB(Body); break;
+    case 444: Op = SplitLockOp::FetchOr;  ValueReg = XFormRB(Body); break;
+    case 316: Op = SplitLockOp::FetchXor; ValueReg = XFormRB(Body); break;
+    case 60:  Op = SplitLockOp::FetchCLR; ValueReg = XFormRB(Body); break;
+    case 104: Op = SplitLockOp::FetchNeg; ValueReg = 0;             break;
+    default:
+      return std::nullopt;
+    }
+    // Verify the SC at PC+8 to defend against XO collisions with random
+    // 31-primary instructions that might trip our pattern match.
+    uint32_t SC = 0;
+    std::memcpy(&SC, reinterpret_cast<const void*>(ProgramCounter + 8), sizeof(uint32_t));
+    if (XFormPrimary(SC) != 31 || !IsStoreConditional(XFormXO(SC))) {
+      return std::nullopt;
+    }
+    Advance = 16; // skip LL + body + SC + bc
+  }
+
+  // Stage Val on the C stack (SplitLockEmulate takes value by pointer).
+  // FetchNeg has no operand, so leave Val zero.
+  uint64_t Val    = (Op == SplitLockOp::FetchNeg) ? 0u : GPRs[ValueReg];
+  uint64_t Result = 0;
+
+  LogMan::Msg::DFmt("PPC64 split-lock SIGBUS recovery: PC=0x{:x} LL=0x{:08x} op={} size={} EA=0x{:x} RT={} VR={}",
+                    ProgramCounter, LLInsn, static_cast<uint32_t>(Op), Size, EA, LL_RT, ValueReg);
+
+  PPC64_SplitLockEmulate(static_cast<uint8_t>(Op),
+                         reinterpret_cast<uint64_t*>(EA),
+                         &Val,
+                         &Result,
+                         Size);
+
+  // Deliver the pre-RMW value into the LL's RT register; advance PC past
+  // the entire LL/SC body so the bc.NE back-edge doesn't loop.
+  GPRs[LL_RT] = Result;
+  return Advance;
 }
 
 } // namespace FEXCore::ArchHelpers::PPC64

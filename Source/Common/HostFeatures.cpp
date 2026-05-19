@@ -703,13 +703,18 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     HostFeatures.ICacheLineSize = 64;
   }
 
-  // PPC64LE deliberately leaves SupportsAtomics=false. POWER8 has lwarx/stwcx.
-  // (and byte/halfword variants on POWER8+) but they require natural alignment
-  // — the FEX ASM atomic test suite intentionally exercises misaligned atomics
-  // (lock add at +3/+7/+15/+63) which would fault under lwarx. The non-atomic
-  // fallback path handles these correctly for single-threaded execution; full
-  // atomic correctness for multi-threaded code requires alignment-handling glue
-  // (split into two CAS loops across the boundary) — TODO.
+#ifdef ARCHITECTURE_ppc64le
+  // POWER8 has lwarx/stwcx. (and byte/halfword variants on POWER8+) with
+  // native LL/SC semantics. PPC64LE atomic codegen uses them for aligned
+  // EAs and falls back to PPC64_SplitLockEmulate (process-wide mutex
+  // serialization) for misaligned EAs; both paths are multi-thread
+  // correct across cores. The HostFeatures.SupportsAtomics flag does
+  // not gate any PPC64LE codegen today -- it is only consulted by the
+  // arm64-shared JIT/AtomicOps.cpp -- but we report it accurately so
+  // the warning below stops firing and any future arch-neutral consumer
+  // of the flag sees the truth.
+  HostFeatures.SupportsAtomics = true;
+#endif
 
   if (!HostFeatures.SupportsAtomics) {
     WARN_ONCE_FMT("Host CPU doesn't support atomics. Expect bad performance");

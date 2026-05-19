@@ -1256,24 +1256,21 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
 #endif
 
 #ifdef ARCHITECTURE_ppc64le
-  // PPC64LE SIGBUS handler -- split-lock infrastructure (Phase 1).
+  // PPC64LE SIGBUS handler -- split-lock safety net.
   //
   // POWER8's ldarx/lwarx/lharx/lbarx require natural alignment; an x86
-  // LOCK RMW on a misaligned EA will SIGBUS with si_code=BUS_ADRALN
-  // when dispatched to the reservation-load fast path. Today the JIT
-  // emits a runtime alignment check inline and falls back to a
-  // non-atomic LD->op->ST sequence on misalignment, which is incorrect
-  // across cores (see AtomicOps.cpp). Phase 3 will remove that fallback
-  // and rely on a SIGBUS-driven backpatch into PPC64_SplitLockEmulate;
-  // this handler is the SIGBUS detection half.
-  //
-  // Phase 1 (this code): detect a SIGBUS originating from a JIT-emitted
-  // reservation-load, increment telemetry, log, and decline. We don't
-  // yet advance PC / patch code, because the misaligned-fallback path
-  // in AtomicOps.cpp still owns correctness for these cases. Once
-  // Phase 3 lands and the fallback is removed, this handler will start
-  // returning a non-nullopt offset and the helper will actually unstick
-  // the thread.
+  // LOCK RMW on a misaligned EA would otherwise SIGBUS with si_code=
+  // BUS_ADRALN. The PPC64LE JIT emits an inline alignment check on
+  // every atomic and routes misaligned EAs through
+  // PPC64_SplitLockEmulate (process-wide mutex), so SIGBUS from an
+  // atomic LL is not expected in normal codegen. This handler is the
+  // safety net for any LL that slips through the inline check
+  // (codegen regressions, future opt passes that elide the gate,
+  // hardware oddities). On a recognized LL it decodes the LL+body+SC
+  // pattern, dispatches to PPC64_SplitLockEmulate, writes the
+  // pre-RMW value to the LL's RT register, and advances PC past the
+  // bc.NE back-edge so the thread doesn't loop on a faulting
+  // reservation.
   const auto SigbusHandlerPPC64 = [](FEXCore::Core::InternalThreadState* Thread, int Signal, void* _info, void* ucontext) -> bool {
     const auto PC = ArchHelpers::Context::GetPc(ucontext);
     if (!Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
@@ -1292,17 +1289,14 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
     const auto Result = FEXCore::ArchHelpers::PPC64::HandleUnalignedAtomicSIGBUS(
       Thread, PC, ArchHelpers::Context::GetArmGPRs(ucontext));
     if (Result.has_value()) {
-      // Phase 3 will return a PC advance here. Today this branch is
-      // unreachable because HandleUnalignedAtomicSIGBUS always returns
-      // nullopt -- keep the wiring in place so Phase 3 is a single-
-      // file change.
       ArchHelpers::Context::SetPc(ucontext, PC + Result.value());
       return true;
     }
-    // Phase 1 explicitly does NOT consume the signal -- the existing
-    // misaligned-fallback path in AtomicOps.cpp prevents this from
-    // firing in practice on aligned guest atomics; if it ever does
-    // fire, surfacing it as a fault is the safer Phase-1 behavior.
+    // HandleUnalignedAtomicSIGBUS only returns an advance on a
+    // recognized LL/SC pattern. If we don't recognize the LL (CAS,
+    // an unfamiliar emit pattern, a SIGBUS from non-atomic JIT
+    // code), let the fault escape -- a faulting non-atomic LD/ST
+    // should crash the thread rather than silently advance past it.
     return false;
   };
 
