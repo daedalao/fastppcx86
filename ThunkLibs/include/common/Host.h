@@ -755,29 +755,7 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
 #endif
     };
 
-    // Discriminate host vs guest cb on 64-bit cross-arch hosts. cb in args
-    // can legitimately be a HOST pointer (e.g. glXGetProcAddress override
-    // returned the host impl, guest stored that host addr and called through
-    // it indirectly). The fallback wrap was unconditionally treating any
-    // non-zero cb as a guest VA and trying cross-arch dispatch, which then
-    // hit CallbackUnpack's trap stub for opaque/layout-wrapper signatures
-    // and SIGILL'd.
-    //
-    // dladdr looks up cb in the HOST dynamic linker's link map. Host libraries
-    // loaded by host dlopen (libGL-host.so etc.) are in that map; guest
-    // libraries loaded by FEX's emulated ld.so are NOT. So a positive result
-    // means cb is host-callable and the cross-arch wrap should be skipped.
-#if defined(THUNK_HOST_NOT_X86_64) && !defined(IS_32BIT_THUNK)
-    bool cb_is_host = false;
-    if (cb) {
-      Dl_info dlinfo;
-      cb_is_host = (dladdr(reinterpret_cast<void*>(cb), &dlinfo) != 0);
-    }
-#else
-    constexpr bool cb_is_host = false;
-#endif
-
-    if (fallback_wrap_enabled() && cb && !cb_is_host && FEX::HLE::LookupGuestCallbackUnpacker
+    if (fallback_wrap_enabled() && cb && FEX::HLE::LookupGuestCallbackUnpacker
 #ifdef IS_32BIT_THUNK
         && (cb >> 32) == 0
 #endif
