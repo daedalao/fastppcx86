@@ -124,6 +124,16 @@ void OnInit() {
   RegisterGuestCallbackUnpacker<VkResult(uint32_t*)>();
   RegisterGuestCallbackUnpacker<VkBool32(uint32_t*)>();
   RegisterGuestCallbackUnpacker<void(uint32_t*)>();
+
+  // 2026-05-18 mirror libGL_Guest cross-arch registrations.  Mesa zink and
+  // host-Vulkan-via-thunk paths pull these same generic signatures out of
+  // Vulkan-side dispatch tables; without them the cross-arch fallback wrap
+  // returns zero (FvjE/FvvE/FPKhjE patterns) and Mesa derefs the null
+  // result.  Same set proven necessary for FTL libGL path; Grimrock zink
+  // and Stardew .NET Core surface the same warnings.
+  RegisterGuestCallbackUnpacker<void(unsigned int)>();
+  RegisterGuestCallbackUnpacker<void()>();
+  RegisterGuestCallbackUnpacker<const unsigned char*(unsigned int)>();
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)
