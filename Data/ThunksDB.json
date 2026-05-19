@@ -18,6 +18,14 @@
         "@PREFIX_LIB@/libEGL.so.1.1.0"
       ]
     },
+    "xshmfence": {
+      "Library": "libxshmfence-guest.so",
+      "Overlay": [
+        "@PREFIX_LIB@/libxshmfence.so",
+        "@PREFIX_LIB@/libxshmfence.so.1",
+        "@PREFIX_LIB@/libxshmfence.so.1.0.0"
+      ]
+    },
     "Vulkan": {
       "Library": "libvulkan-guest.so",
       "Overlay": [
