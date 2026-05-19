@@ -2,11 +2,11 @@
 
 A port of [FEX-Emu](https://github.com/FEX-Emu/FEX) to **PPC64LE (POWER8+)** hosts. FEX is an x86_64 user-mode emulator that JITs x86 code to the host architecture; upstream supports ARM64. This fork adds a complete PPC64LE JIT backend.
 
-Branch: `bank-power8-2026-05-11`
-
 ## Milestone — FTL: Advanced Edition is playable
 
-**FTL: Advanced Edition is the first x86_64 game to run to gameplay on PPC64LE/FEX.** Window opens, main menu reaches, game launches, music + sound effects play. Confirmed end-to-end on POWER8 (overpowered-4k) at the commit stack below.
+**FTL: Advanced Edition is the first x86_64 game to run to gameplay on PPC64LE/FEX.** Window opens, main menu reaches, game launches, music + sound effects play. Confirmed end-to-end on POWER8 at the commit stack below.
+
+[![FTL running on FEX-PPC64LE — click to play](https://img.youtube.com/vi/Dtj-Lqw4zKA/maxresdefault.jpg)](https://www.youtube.com/watch?v=Dtj-Lqw4zKA "FTL: Advanced Edition running on FEX/PPC64LE — click to watch")
 
 A SIGABRT on exit remains (deferred; not blocking gameplay).
 
