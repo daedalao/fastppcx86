@@ -36,6 +36,7 @@
 #include <FEXCore/Utils/ArchHelpers/PPC64.h>
 #include <FEXCore/Utils/LogManager.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -44,12 +45,17 @@
 namespace FEXCore::ArchHelpers::PPC64 {
 
 namespace {
-// Process-wide serialization for split-lock emulation. A single global mutex
-// is the simplest correct option; under typical x86 workloads misaligned
-// LOCK RMW is so rare that contention on this mutex is irrelevant. If it
-// ever becomes a hot path, a 64-way striped mutex keyed by (addr >> 6) would
-// reduce contention without changing semantics.
-std::mutex g_SplitLockMutex;
+// 64-way striped mutexes keyed by (addr >> 6) -- one stripe per cacheline.
+// Mono GC barrier traffic (Unity-managed games) emits hundreds of misaligned
+// LOCK RMW ops at startup; a single global mutex serialised all of them
+// across all threads, stalling GC initialisation enough that no window ever
+// opens. Striping by cacheline lets unrelated cachelines proceed in
+// parallel. For 8-byte misaligned atomics that span two cachelines we
+// acquire both stripes in canonical order via std::scoped_lock to preserve
+// atomicity. 64 stripes -> 6 low bits of the cacheline key, which keeps the
+// table at 64 * sizeof(std::mutex) (~3 KiB), trivially cache-friendly.
+static constexpr size_t SPLIT_LOCK_STRIPES = 64;
+std::array<std::mutex, SPLIT_LOCK_STRIPES> g_SplitLockMutexes;
 
 // Telemetry: incremented every time we recognize a SIGBUS as a split-lock
 // reservation-load fault. Counted even though Phase 1 doesn't yet recover
@@ -80,10 +86,6 @@ inline uint64_t SizeMask(uint32_t size) {
 } // namespace
 
 extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* value, uint64_t* result, uint32_t size) {
-  // Phase 3 debug: dump every entry so we can characterize what wireup is sending.
-  // TODO: remove once the null-addr bug is fixed; this fires on every misaligned LOCK RMW.
-  LogMan::Msg::IFmt("PPC64_SplitLockEmulate ENTRY: op={} addr={:p} value={:p} result={:p} size={}",
-                    op, (void*)addr, (void*)value, (void*)result, size);
   if (addr == nullptr || result == nullptr) {
     LogMan::Msg::EFmt("PPC64_SplitLockEmulate: null addr/result");
     return;
@@ -97,7 +99,28 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   void* HostAddr = reinterpret_cast<void*>(addr);
   const uint64_t Operand = value ? (*value & Mask) : 0;
 
-  std::lock_guard<std::mutex> Lock(g_SplitLockMutex);
+  // Stripe selection: 1/2/4-byte misaligned atomics always live within one
+  // cacheline so a single stripe suffices. 8-byte misaligned atomics CAN
+  // span two cachelines; in that case acquire both stripes in canonical
+  // order (low-index first) so concurrent threads can't deadlock and any
+  // other thread touching the same cacheline pair serialises with us.
+  const uintptr_t HostAddrVal = reinterpret_cast<uintptr_t>(HostAddr);
+  const size_t StripeLo = (HostAddrVal >> 6) & (SPLIT_LOCK_STRIPES - 1);
+  const size_t StripeHi = ((HostAddrVal + size - 1) >> 6) & (SPLIT_LOCK_STRIPES - 1);
+  std::unique_lock<std::mutex> LockLo;
+  std::unique_lock<std::mutex> LockHi;
+  if (StripeLo == StripeHi) {
+    LockLo = std::unique_lock<std::mutex>(g_SplitLockMutexes[StripeLo]);
+  } else {
+    // Acquire both via std::lock to avoid deadlocks; std::lock takes
+    // mutexes in any order safely. unique_lock with std::defer_lock holds
+    // the slot without acquiring, then we transfer ownership after std::lock.
+    const size_t SLo = std::min(StripeLo, StripeHi);
+    const size_t SHi = std::max(StripeLo, StripeHi);
+    LockLo = std::unique_lock<std::mutex>(g_SplitLockMutexes[SLo], std::defer_lock);
+    LockHi = std::unique_lock<std::mutex>(g_SplitLockMutexes[SHi], std::defer_lock);
+    std::lock(LockLo, LockHi);
+  }
 
   // Load the current value at the (possibly misaligned) EA.
   const uint64_t Old = LoadMis(HostAddr, size) & Mask;
