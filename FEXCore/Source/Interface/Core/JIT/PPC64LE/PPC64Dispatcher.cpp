@@ -538,15 +538,30 @@ void PPC64Dispatcher::EmitDispatcher() {
   // ==============================================================
   CallbackPtr = reinterpret_cast<JITCallback>(GetCursorAddress<uint8_t*>());
 
+  // CRITICAL ORDERING: stash incoming RIP (r4) BEFORE PushCalleeSavedRegisters.
+  // PushCalleeSavedRegisters() emits `mfcr(TMP2)` where TMP2==r4 (see
+  // PPC64Emitter.cpp:272), which destroys the C-ABI second argument before
+  // we get a chance to save it. The previous "save r4 early" comment below
+  // referred to scratch usage AFTER the prologue, not the prologue itself --
+  // by then r4 already held CR, not RIP. Symptom: State.rip ends up = CR
+  // (a small value, e.g. 0xC0 when CR6 has bits set), the dispatcher loads
+  // garbage as the next guest PC, and the suspect-RIP bypass fires on every
+  // single host->guest callback (libGL XSync, libvulkan X11Manager.*, etc.).
+  //
+  // r7 is volatile per ELFv2 ABI -- the C++ caller has either spilled it
+  // or doesn't care -- and PushCalleeSavedRegisters only touches r0, r1,
+  // r4 (TMP2), and r14-r31. Stashing in r7 is safe across the prologue.
+  mr(r(7), r4);
+
   PushCalleeSavedRegisters();
   mr(STATE, r3);
 
-  // Save target RIP (r4) early — subsequent operations need r4 as scratch.
+  // Restore RIP from the stash and persist into State.rip. The original
+  // 32-bit clamp is preserved for 32-bit guests.
   {
     int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
-    // 32-bit guest: clamp the callback target RIP to 32 bits.
-    MaybeClrUpper32(r4);
-    std(r4, rip_off, STATE);
+    MaybeClrUpper32(r(7));
+    std(r(7), rip_off, STATE);
   }
 
   // Bump the signal handler ref counter (marks that we're in a JIT callback)
