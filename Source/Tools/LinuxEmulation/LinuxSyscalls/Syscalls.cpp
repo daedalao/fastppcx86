@@ -34,6 +34,7 @@ $end_info$
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
+#include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/FileLoading.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/sstream.h>
@@ -807,6 +808,25 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   SignalDelegation->RegisterHostSignalHandler(SIGSEGV, HandleSegfault, true);
 
   ExtendedMetaData = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(FEXCore::Config::Get_EXTENDEDVOLATILEMETADATA()());
+
+  // The mtrack SMC path drives host mprotect() with FEX_PAGE_SIZE (4K) granularity
+  // and the guest is told AT_PAGESZ=4096, but there is no host-page-size awareness
+  // anywhere in LinuxEmulation.  On a host with a larger page size a 4K-aligned
+  // mprotect is rejected outright (EINVAL -> the AFmt aborts in
+  // SyscallsSMCTracking.cpp), and the cases that do go through degrade to
+  // host-page-granularity protection with re-protect races.  Warn loudly rather
+  // than let someone burn a day chasing the fallout.
+  if (const long HostPageSize = sysconf(_SC_PAGESIZE); HostPageSize > 0 && static_cast<uint64_t>(HostPageSize) != FEXCore::Utils::FEX_PAGE_SIZE) {
+    if (SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+      LogMan::Msg::EFmt("Host page size is {} but FEX's SMC tracking assumes {}. "
+                        "mtrack SMC detection is unsupported on this kernel and will misbehave or abort; "
+                        "boot a {}-page kernel or run with FEX_SMCCHECKS=full.",
+                        HostPageSize, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE);
+    } else {
+      LogMan::Msg::IFmt("Host page size is {} but FEX assumes {}; SMCChecks is not mtrack so the SMC path is not affected.", HostPageSize,
+                        FEXCore::Utils::FEX_PAGE_SIZE);
+    }
+  }
 }
 
 SyscallHandler::~SyscallHandler() {
@@ -1302,7 +1322,22 @@ DoGenerate:
 // Linux Mono runtime detection — flip MonoDetected when the guest opens a
 // libmono / libmonosgen / libmonoboehm / mono-2.0-bdwgc shared library.
 // Cheap atomic gate after first detection so the openat hot path stays fast.
-void SyscallHandler::MaybeDetectMonoFromPath(const char* pathname) {
+bool SyscallHandler::IsMonoRuntimeLibraryPath(std::string_view pathname) {
+  // Take the basename — everything after the last '/'.
+  if (auto Slash = pathname.find_last_of('/'); Slash != std::string_view::npos) {
+    pathname.remove_prefix(Slash + 1);
+  }
+  // Match known Mono runtime library prefixes.  Cheap prefix match, no regex.
+  return pathname.starts_with("libmonosgen-")   || // mainline mono runtime (sgen GC)
+         pathname.starts_with("libmono-2.0")    || // older mono runtime
+         pathname.starts_with("libmonoboehm-")  || // Boehm-GC mono variant
+         pathname.starts_with("libmonobdwgc-")  || // Unity 2017+ / modern Unity runtime
+         pathname.starts_with("libmono.so")     || // generic libmono (Unity 4/5)
+         pathname.starts_with("mono-2.0-bdwgc") || // matches Windows-side name too
+         pathname.starts_with("mono.so");
+}
+
+void SyscallHandler::MaybeDetectMonoFromPath(std::string_view pathname) {
   // Relaxed load is enough — we only need eventually-consistent short-circuit;
   // the first writer pays the cost of going through MarkMonoDetected once.
   if (MonoDetectionComplete.load(std::memory_order_relaxed)) {
@@ -1315,42 +1350,33 @@ void SyscallHandler::MaybeDetectMonoFromPath(const char* pathname) {
     MonoDetectionComplete.store(true, std::memory_order_relaxed);
     return;
   }
-  if (!pathname) {
-    return;
-  }
-  // Find basename — last '/' or full string.
-  const char* base = pathname;
-  for (const char* p = pathname; *p; ++p) {
-    if (*p == '/') {
-      base = p + 1;
-    }
-  }
-  // Match known Mono runtime library prefixes.  Cheap prefix match, no regex.
-  auto starts_with = [](const char* s, const char* prefix) {
-    while (*prefix) {
-      if (*s++ != *prefix++) {
-        return false;
-      }
-    }
-    return true;
-  };
-  const bool is_mono =
-    starts_with(base, "libmonosgen-")    ||  // mainline mono runtime (sgen GC)
-    starts_with(base, "libmono-2.0")     ||  // older mono runtime
-    starts_with(base, "libmonoboehm-")   ||  // Boehm-GC mono variant
-    starts_with(base, "libmono.so")      ||  // generic libmono
-    starts_with(base, "mono-2.0-bdwgc")  ||  // matches Windows-side name too
-    starts_with(base, "mono.so");
 
-  if (!is_mono) {
+  if (!IsMonoRuntimeLibraryPath(pathname)) {
     return;
   }
+
+  // Windows gates the mono hacks on Multiblock with a large MaxInst, because the
+  // scheme assumes every SMC site in the backpatcher can be hooked inside a
+  // single recompiled block.  Apply the same gate here rather than half-enabling
+  // the hacks under -O0-style configs.
+  FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
+  FEX_CONFIG_OPT(MaxInst, MAXINST);
+  if (!Multiblock() || MaxInst() < 500) {
+    if (!MonoDetectionComplete.exchange(true, std::memory_order_acq_rel)) {
+      LogMan::Msg::IFmt("Mono runtime seen via '{}' but NOT applying mono hacks: "
+                        "Multiblock with MaxInst >= 500 required (Multiblock={}, MaxInst={}).",
+                        pathname, Multiblock(), MaxInst());
+    }
+    return;
+  }
+
   // Mark only once.  compare_exchange ensures only the winning thread invokes
   // MarkMonoDetected; subsequent callers short-circuit.
   bool expected = false;
   if (MonoDetectionComplete.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
     LogMan::Msg::IFmt("Mono runtime detected via '{}' — MonoHacks active.", pathname);
     CTX->MarkMonoDetected();
+    MonoHacksActive.store(true, std::memory_order_release);
   }
 }
 

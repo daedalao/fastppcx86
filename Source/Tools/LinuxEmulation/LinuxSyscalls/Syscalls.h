@@ -291,6 +291,40 @@ public:
   ///// VMA (Virtual Memory Area) tracking /////
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+
+  ///// Mono backpatcher hook (Linux port of Source/Windows/Common/InvalidationTracker.cpp) /////
+  //
+  // Windows learns the mono runtime's code range from PE module load and, on the
+  // first SMC fault raised by an XCHG inside that range, marks the containing
+  // guest block as "the mono backpatcher".  That one block is recompiled so its
+  // XCHGs go through the MonoBackpatcherWrite IR op (an explicit
+  // write-then-invalidate helper), after which mprotect-based SMC detection can
+  // be switched off for writable+executable regions entirely.  Without steps 2-4
+  // every mono code patch takes the slow path (fault -> full page invalidation ->
+  // single-inst recompile -> re-protect), which under mono's patch-heavy startup
+  // degenerates into a fault storm.
+  //
+  // These three functions are the Linux equivalents of, respectively,
+  // InvalidationTracker::HandleImageMap's mono branch, DetectMonoBackpatcherBlock
+  // and DisableSMCDetection.
+
+  // Called from TrackMmap for executable file-backed mappings.  Grows
+  // [MonoBase, MonoEnd) across the runtime library's several PT_LOAD mappings.
+  void MaybeRecordMonoMapping(std::string_view Path, uint64_t Base, uint64_t End);
+
+  // Called from HandleSegfault after the invalidation.  Returns true if this
+  // fault identified the backpatcher block.
+  void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+
+  // Stop write-protecting writable+executable VMAs, and un-protect the ones we
+  // already did.  Must be called with VMATracking.Mutex held (shared is fine --
+  // we only mprotect, we don't mutate the tracking structures).
+  void DisableSMCDetectionLocked(FEXCore::Core::InternalThreadState* Thread);
+
+  bool IsSMCDetectionDisabled() const {
+    return SMCDetectionDisabled.load(std::memory_order_relaxed);
+  }
+
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   std::optional<FEXCore::ExecutableFileSectionInfo>
   LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) final override;
@@ -372,10 +406,31 @@ public:
   // Atomic short-circuit on MonoDetectionComplete makes the post-detection
   // cost one relaxed load.  Gated by Config.MonoHacks: if the user hasn't
   // opted in, the check is a no-op so we don't even pay the strstr cost.
-  void MaybeDetectMonoFromPath(const char* pathname);
+  void MaybeDetectMonoFromPath(std::string_view pathname);
+
+  // Returns true if the basename of Path is a known Mono runtime library.
+  static bool IsMonoRuntimeLibraryPath(std::string_view Path);
 
 private:
   std::atomic<bool> MonoDetectionComplete {false};
+
+  // True once MarkMonoDetected has actually fired (i.e. mono was seen *and* the
+  // Multiblock/MaxInst gate passed).  Lets the mmap path avoid tracking a range
+  // for a config where the hacks would never run.
+  std::atomic<bool> MonoHacksActive {false};
+
+  // Guest code range of the mono runtime library, grown across its PT_LOAD
+  // mappings.  Zero until MaybeRecordMonoMapping sees an executable mapping.
+  std::atomic<uint64_t> MonoBase {0};
+  std::atomic<uint64_t> MonoEnd {0};
+
+  // One-shot: set when we have a range and are still looking for the
+  // backpatcher block; cleared once we find it (or give up).
+  std::atomic<bool> MonoBackpatcherDetectionPending {false};
+
+  // Set by DisableSMCDetectionLocked.  Once set, MarkGuestExecutableRange stops
+  // write-protecting VMAs that are both writable and executable.
+  std::atomic<bool> SMCDetectionDisabled {false};
 
 private:
   FEX::HLE::SignalDelegator* SignalDelegation;
