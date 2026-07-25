@@ -34,6 +34,12 @@ enum class THPControl {
 
 #ifndef _WIN32
 FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize);
+// Configures the bundled allocator (page size, naming, and the map/unmap hooks
+// that apply FEX's placement hint). SetupHooks calls this, but SetupHooks only
+// runs for 32-bit guests -- 64-bit guests must call this directly or rpmalloc
+// falls back to its internal mapper and scatters its arenas through the guest's
+// address space.
+FEX_DEFAULT_VISIBILITY void InitializeAllocator(size_t PageSize);
 #else
 using VirtualNamePtr = void (*)(const char*, const void*, size_t);
 using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
