@@ -1860,8 +1860,17 @@ bypass_diagnose:
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
 
-  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
-  uintptr_t HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
+  uintptr_t HostCode;
+  {
+    // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking.
+    // This MUST be dropped before calling CompileBlock: CompileBlock takes the same shared lock,
+    // and WritePriorityMutex is non-recursive. Recursive read acquisition looks harmless until an
+    // exclusive waiter queues up (e.g. GuestMunmap invalidating a code range) — write-priority then
+    // blocks the inner lock_shared while this thread still owns the outer read slot, deadlocking the
+    // thread against itself and stalling every other reader behind the pending writer.
+    auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
+    HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
+  }
   if (!HostCode) {
     HostCode = CTX->CompileBlock(Frame, GuestRIP, 0);
   }
