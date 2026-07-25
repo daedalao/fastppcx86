@@ -29,6 +29,10 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <cfenv>
 #include <cstdio>
 #include <cstring>
@@ -1989,7 +1993,36 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // garbage host instructions. Hold the write mutex for the whole emission
   // window — including the icache flush — so other threads see a coherent
   // buffer state.
+  // Diagnostic: CodeBufferWriteMutex is non-recursive.  If this thread already
+  // owns it we are about to deadlock against ourselves and take every other
+  // thread down with us (they all block here on the next compile).  Report the
+  // re-entry with a host backtrace instead of hanging silently.
+  const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
+  if (CodeBuffers.CodeBufferWriteOwner.load(std::memory_order_relaxed) == SelfTID) {
+    LogMan::Msg::EFmt("PPC64 JIT: re-entrant CompileCode on tid {} for Entry {:#x} -- "
+                      "CodeBufferWriteMutex is already held by this thread. Host backtrace:",
+                      SelfTID, Entry);
+    void* Frames[32];
+    const int Count = ::backtrace(Frames, 32);
+    ::backtrace_symbols_fd(Frames, Count, 2);
+  }
+
   std::unique_lock CodeBufferLock {CodeBuffers.CodeBufferWriteMutex};
+
+  // Clear the owner on every exit path, including the unlock/lock dance in the
+  // capacity guard below.
+  struct OwnerTracker {
+    std::atomic<uint64_t>& Owner;
+    uint64_t TID;
+    OwnerTracker(std::atomic<uint64_t>& O, uint64_t T)
+      : Owner(O)
+      , TID(T) {
+      Owner.store(TID, std::memory_order_relaxed);
+    }
+    ~OwnerTracker() {
+      Owner.store(0, std::memory_order_relaxed);
+    }
+  } OwnerGuard {CodeBuffers.CodeBufferWriteOwner, SelfTID};
 
   this->Entry    = Entry;
   this->IR       = IRView;
@@ -2027,9 +2060,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // re-acquiring CodeBufferLock, LatestOffset is 0 in the new buffer.
   constexpr size_t kBlockHeadroom = 1u << 20;  // 1 MiB
   if (CodeBuffers.LatestOffset + kBlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+    // Drop ownership across the unlock window so a nested compile from
+    // ClearCache() isn't misreported as a re-entrant deadlock.
+    CodeBuffers.CodeBufferWriteOwner.store(0, std::memory_order_relaxed);
     CodeBufferLock.unlock();
     ClearCache();
     CodeBufferLock.lock();
+    CodeBuffers.CodeBufferWriteOwner.store(SelfTID, std::memory_order_relaxed);
   }
 
   // Use the current code buffer at the current write offset
