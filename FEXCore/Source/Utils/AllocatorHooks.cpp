@@ -84,7 +84,18 @@ extern "C" rp_mmap_hook_type rp_mmap_hook;
 extern "C" rp_munmap_hook_type rp_munmap_hook;
 
 #ifndef _WIN32
-mmap_hook_type fex_mmap_hook = ::mmap;
+// Default mapper for FEX's own allocations. Applies the placement hint so the
+// clustering holds regardless of whether SetupHooks/InitializeAllocator ever
+// ran -- they only run for 32-bit guests, so a 64-bit guest would otherwise
+// keep scattering rpmalloc's arenas through the guest's address space.
+static void* FEX_default_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+  if (addr == nullptr && (flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED)) {
+    addr = GetInternalPlacementHint(length);
+  }
+  return ::mmap(addr, length, prot, flags, fd, offset);
+}
+
+mmap_hook_type fex_mmap_hook = FEX_default_mmap;
 munmap_hook_type fex_munmap_hook = ::munmap;
 #endif
 
@@ -151,7 +162,7 @@ static void* FEX_rp_mmap(size_t size, size_t alignment, size_t* offset, size_t* 
   }
 
   size_t map_size = AlignUp(size + alignment, global_config.page_size);
-  auto ptr = fex_mmap_hook(GetInternalPlacementHint(map_size), map_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  auto ptr = fex_mmap_hook(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
   if (ptr == MAP_FAILED) {
     ptr = nullptr;
