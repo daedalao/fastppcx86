@@ -169,6 +169,29 @@ void PPC64Dispatcher::EmitDispatcher() {
   DispatcherLoopTopAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
   {
+    // Re-establish the r0=0 zero-index invariant before dispatching into any
+    // JIT block.
+    //
+    // Every guest load/store the backend emits is an X-form indexed access with
+    // r0 in the rB slot -- ldx(GDst, EA, r0), stdx(GSrc, EA, r0), and ~50 more
+    // in MemoryOps.cpp -- so the effective address is EA + r0. Note that PPC's
+    // "r0 reads as zero" rule applies only to the rA operand, NOT to rB: in
+    // these instructions r0 is an ordinary register whose contents are added to
+    // the address. A nonzero r0 therefore silently offsets EVERY memory access
+    // in the block, producing garbage loads whose values are stored into guest
+    // state and only fault much later somewhere unrelated.
+    //
+    // FillStaticRegs deliberately leaves r0 alone (ExitFunctionLinker smuggles
+    // the resolved host code pointer through it), and only some entry paths
+    // restore it: FillForABICall, the ExitFunctionLinker slow path, and the
+    // syscall return. The DispatcherLoopTopFillSRA entry above -- which is where
+    // HandleSegfault redirects an SMC fault, and where signal and thread-start
+    // paths re-enter -- did not, leaving the invariant dependent on whatever r0
+    // happened to hold. Do it here so it holds for every dispatcher-mediated
+    // block entry regardless of how we got here. One instruction on a path that
+    // already performs several loads.
+    li(r(0), 0);
+
     // Load current RIP from Frame->State.rip
     int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
     ld(TMP1, rip_off, STATE);  // TMP1 = guest RIP
