@@ -1058,6 +1058,24 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
   SignalHandler.HostAction.sa_flags = CheckAndAddFlags(SignalHandler.HostAction.sa_flags, SignalHandler.GuestAction.sa_flags,
                                                        SA_NOCLDSTOP | SA_NOCLDWAIT | SA_NODEFER | SA_RESTART);
 
+#if defined(ARCHITECTURE_ppc64le)
+  // PPC64LE defers async signals for the whole of HandleSyscall (9560b3c8e), which
+  // only works because the interrupted host ::syscall returns -EINTR: that return is
+  // what unwinds to the guard's destructor, which is what drains the deferred queue.
+  //
+  // SA_RESTART on the *host* action defeats that. The kernel runs our thunk, we queue
+  // the signal, and then the kernel silently restarts the syscall instead of returning
+  // -EINTR -- so HandleSyscall never returns, the guard never destructs, and the queued
+  // guest signal is never delivered. A guest thread blocked in futex() when it gets a
+  // suspend signal is then unwakeable. Observed on Ziggurat: mono's GC stop-the-world
+  // handshake wedges permanently at assembly load, one thread holding a PROT_NONE
+  // InterruptFaultPage with nothing left to deliver it.
+  //
+  // Keep the guest's SA_RESTART recorded in GuestAction (it still drives guest-visible
+  // behaviour); just never let the host thunk carry it.
+  SignalHandler.HostAction.sa_flags &= ~SA_RESTART;
+#endif
+
 #ifdef ARCHITECTURE_x86_64
 #define SA_RESTORER 0x04000000
   SignalHandler.HostAction.sa_flags |= SA_RESTORER;
