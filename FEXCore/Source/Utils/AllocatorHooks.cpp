@@ -44,10 +44,11 @@ namespace FEXCore::Allocator {
 // a hint -- never MAP_FIXED -- so if anything already occupies the address the
 // kernel simply places the mapping elsewhere and we are no worse off.
 namespace {
-// 1 TiB base, 512 GiB of hint space.
+// 1 TiB base, 31 TiB of hint space -- still an order of magnitude below the
+// ~64 TiB top-down region the kernel hands out for ordinary mmaps.
 constexpr uintptr_t INTERNAL_ARENA_BASE = 0x0000010000000000ULL;
-constexpr uintptr_t INTERNAL_ARENA_SIZE = 0x0000008000000000ULL;
-std::atomic<uintptr_t> InternalArenaBump {INTERNAL_ARENA_BASE};
+constexpr uintptr_t INTERNAL_ARENA_SIZE = 0x00001F0000000000ULL;
+std::atomic<uintptr_t> InternalArenaOffset {0};
 } // namespace
 
 void* GetInternalPlacementHint(size_t Size) {
@@ -58,12 +59,18 @@ void* GetInternalPlacementHint(size_t Size) {
   // the kernel to ignore the hint entirely.
   constexpr size_t PageSize = 4096;
   const size_t Reserve = ((Size + PageSize - 1) & ~(PageSize - 1)) + PageSize;
-  const uintptr_t Hint = InternalArenaBump.fetch_add(Reserve, std::memory_order_relaxed);
-  if (Hint < INTERNAL_ARENA_BASE || (Hint + Reserve) > (INTERNAL_ARENA_BASE + INTERNAL_ARENA_SIZE)) {
-    // Window exhausted; let the kernel choose.
+  if (Reserve >= INTERNAL_ARENA_SIZE) {
+    // Absurdly large; let the kernel choose.
     return nullptr;
   }
-  return reinterpret_cast<void*>(Hint);
+  // Wrap rather than give up once the window is walked. The bump is cumulative,
+  // not live-set: rpmalloc maps and unmaps continuously, so a monotonic pointer
+  // walks off the end long before FEX's actual footprint would. On wrap the hint
+  // may land on something already mapped, in which case the kernel just picks a
+  // nearby free address -- which is still inside this window, so the clustering
+  // holds either way.
+  const uintptr_t Offset = InternalArenaOffset.fetch_add(Reserve, std::memory_order_relaxed) % (INTERNAL_ARENA_SIZE - Reserve);
+  return reinterpret_cast<void*>(INTERNAL_ARENA_BASE + (Offset & ~(uintptr_t)(PageSize - 1)));
 #endif
 }
 
