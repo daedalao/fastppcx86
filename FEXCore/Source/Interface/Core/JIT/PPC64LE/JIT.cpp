@@ -2033,6 +2033,37 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     }
   } OwnerGuard {CodeBuffers.CodeBufferWriteOwner, SelfTID};
 
+  // ------------------------------------------------------------------
+  // Pick up a code-buffer rotation performed by another thread
+  // ------------------------------------------------------------------
+  // Another thread's ClearCache() may have rotated CodeBuffers to a new buffer
+  // since this thread last compiled. ClearCache only migrates the *rotating*
+  // thread's lookup cache, so without this handshake this thread is left with
+  // CurrentCodeBuffer pointing at the old buffer while CodeBuffers.LatestOffset
+  // (shared, and reset to 0 by the rotation) describes the new one. We would
+  // then emit at old_base + new_offset and publish L1/L2 entries for it, while
+  // ThreadState->LookupCache->Shared still refers to the old buffer's map.
+  //
+  // The observable failure is a guest RIP whose L1 entry resolves into the
+  // middle of an unrelated block. Dispatch lands past that block's RIP store,
+  // so the block spills and returns to DispatcherLoopTop with State.rip
+  // unchanged -- the same lookup hits the same bad pointer forever. Ziggurat
+  // wedged exactly this way at 100% CPU on one thread after mono finished
+  // loading assemblies.
+  //
+  // Arm64JITCore does the same handshake before copying its staging buffer out
+  // (JIT/JIT.cpp:1085); it matters more here because PPC64 emits directly into
+  // the shared buffer rather than staging per-thread. No CallRetStack reset is
+  // needed alongside it: the PPC64LE backend does not use the call-return
+  // predictor stack.
+  if (auto Prev = CheckCodeBufferUpdate()) {
+    auto CacheLock = ThreadState->LookupCache->AcquireWriteLock();
+    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, CacheLock);
+  }
+
+  LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared,
+                     "INVARIANT VIOLATED: SharedLookupCache doesn't match the current code buffer!");
+
   this->Entry    = Entry;
   this->IR       = IRView;
   this->DebugData = DebugData_;
