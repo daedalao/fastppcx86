@@ -2045,21 +2045,34 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // PPC64 emits directly into the shared CurrentCodeBuffer, so we must
   // pre-check that enough headroom remains for this CompileCode.
   //
-  // kBlockHeadroom is a worst-case conservative bound. A single IR op
-  // typically expands to <= 80 host bytes (SpillStaticRegs + flag pack
-  // / unpack is the heaviest), and IRView->SSACount() bounds the IR-op
-  // count, but we don't want to walk the IR twice. 1 MiB is comfortable
-  // for any real x86 block (post-frontend block cap is well under that
-  // even after host-side expansion); rotating early is cheap because
-  // the new buffer is geometrically larger up to MAX_CODE_SIZE (128 MiB).
+  // The requirement MUST scale with the IR size. A fixed bound (this used to be
+  // a flat 1 MiB) is unsafe: with a large MaxInst -- the Unity/mono app configs
+  // in the wild use 50000 against a default of 5000 -- the frontend produces
+  // blocks of hundreds of KiB of guest code whose host expansion exceeds any
+  // constant we could pick. Overrunning is not merely wasted space: emission
+  // walks off the end into the PROT_NONE guard page, the SIGSEGV handler
+  // redirects this thread back into the dispatcher, and this stack frame is
+  // abandoned with CodeBufferWriteMutex still held. The next compile on this
+  // thread then deadlocks against itself and every other thread piles up behind
+  // it -- the whole process wedges with all threads parked in futex waits.
+  //
+  // A single IR op expands to at most ~80 host bytes today (SpillStaticRegs plus
+  // flag pack/unpack is the heaviest); 128 gives margin without walking the IR
+  // twice. GetSSACount() bounds the IR-op count. Keep 1 MiB as a floor.
   //
   // When the buffer is too full, drop the lock and call ClearCache().
   // ClearCache acquires its own LookupCache write lock and allocates a
   // fresh, larger CodeBuffer via GetEmptyCodeBuffer/StartLargerCodeBuffer,
   // migrating the L1/L2 mapping via ChangeGuestToHostMapping. After
   // re-acquiring CodeBufferLock, LatestOffset is 0 in the new buffer.
-  constexpr size_t kBlockHeadroom = 1u << 20;  // 1 MiB
-  if (CodeBuffers.LatestOffset + kBlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+  // Loop, because one rotation only grows the buffer geometrically and a very
+  // large block may need several before it fits.
+  constexpr size_t kMaxHostBytesPerIROp = 128;
+  const size_t BlockHeadroom = std::max<size_t>(1u << 20, IRView->GetSSACount() * kMaxHostBytesPerIROp);
+
+  while (CodeBuffers.LatestOffset + BlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+    const size_t PrevUsable = CurrentCodeBuffer->UsableSize();
+
     // Drop ownership across the unlock window so a nested compile from
     // ClearCache() isn't misreported as a re-entrant deadlock.
     CodeBuffers.CodeBufferWriteOwner.store(0, std::memory_order_relaxed);
@@ -2067,6 +2080,16 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     ClearCache();
     CodeBufferLock.lock();
     CodeBuffers.CodeBufferWriteOwner.store(SelfTID, std::memory_order_relaxed);
+
+    // ClearCache resets LatestOffset to 0 in the new buffer. If the buffer also
+    // stopped growing (MAX_CODE_SIZE reached) and the block still doesn't fit,
+    // another rotation will never help -- bail out loudly rather than spin, or
+    // silently overrun and reproduce the deadlock described above.
+    if (CodeBuffers.LatestOffset + BlockHeadroom > CurrentCodeBuffer->UsableSize() && CurrentCodeBuffer->UsableSize() <= PrevUsable) {
+      ERROR_AND_DIE_FMT("PPC64 JIT: block at {:#x} needs {} bytes of code buffer but the maximum buffer only has {}. "
+                        "Lower MaxInst (currently producing {} IR ops).",
+                        Entry, BlockHeadroom, CurrentCodeBuffer->UsableSize(), IRView->GetSSACount());
+    }
   }
 
   // Use the current code buffer at the current write offset
