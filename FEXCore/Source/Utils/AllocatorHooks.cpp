@@ -63,14 +63,17 @@ void* GetInternalPlacementHint(size_t Size) {
     // Absurdly large; let the kernel choose.
     return nullptr;
   }
-  // Wrap rather than give up once the window is walked. The bump is cumulative,
-  // not live-set: rpmalloc maps and unmaps continuously, so a monotonic pointer
-  // walks off the end long before FEX's actual footprint would. On wrap the hint
-  // may land on something already mapped, in which case the kernel just picks a
-  // nearby free address -- which is still inside this window, so the clustering
-  // holds either way.
-  const uintptr_t Offset = InternalArenaOffset.fetch_add(Reserve, std::memory_order_relaxed) % (INTERNAL_ARENA_SIZE - Reserve);
-  return reinterpret_cast<void*>(INTERNAL_ARENA_BASE + (Offset & ~(uintptr_t)(PageSize - 1)));
+  // Strictly monotonic: never hand out an address twice. Linux only honours a
+  // hint when the target range is free -- if it collides it silently falls back
+  // to the normal top-down search, dumping the mapping right back into the
+  // guest's region, which is exactly what we are trying to avoid. Address space
+  // is the cheap resource here, so burn it rather than risk a collision.
+  const uintptr_t Offset = InternalArenaOffset.fetch_add(Reserve, std::memory_order_relaxed);
+  if (Offset + Reserve > INTERNAL_ARENA_SIZE) {
+    // Window walked; fall back to letting the kernel choose.
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(INTERNAL_ARENA_BASE + Offset);
 #endif
 }
 
