@@ -18,7 +18,55 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <atomic>
+
 namespace FEXCore::Allocator {
+
+// Placement hint for FEX's *own* anonymous reservations.
+//
+// Everything FEX allocates for itself -- the rpmalloc arenas ("FEXAllocator"),
+// the per-thread LookupCache ("FEXMem_Lookup", 272 MiB each with the default
+// VirtualMemSize), JIT code buffers, dispatcher stacks, the fextl pools --
+// used to be mapped with addr=nullptr, letting the kernel place it wherever.
+// In practice that means interleaved with the guest's own mappings, since both
+// come out of the same top-down mmap region.
+//
+// That interleaving breaks guests. Measured running Ziggurat (Unity 4.7) on an
+// 80-core POWER8: FEX held ~69 GiB of reservations against the guest's ~6 GiB,
+// sprayed between the guest's thread stacks, which pushed the guest's heaps
+// across 20 different (address >> 32) 4 GiB regions. Unity indexes its allocator
+// metadata by address>>32 in a fixed 5-entry table, so it overflowed, took its
+// not-found path, and crashed. A guest is entitled to assume its own allocations
+// stay reasonably clustered; the emulator should not be salting its address space.
+//
+// Bump a hint through a window well clear of both the guest's executable/brk and
+// 32-bit region (below) and the kernel's top-down mmap area (above). This is only
+// a hint -- never MAP_FIXED -- so if anything already occupies the address the
+// kernel simply places the mapping elsewhere and we are no worse off.
+namespace {
+// 1 TiB base, 512 GiB of hint space.
+constexpr uintptr_t INTERNAL_ARENA_BASE = 0x0000010000000000ULL;
+constexpr uintptr_t INTERNAL_ARENA_SIZE = 0x0000008000000000ULL;
+std::atomic<uintptr_t> InternalArenaBump {INTERNAL_ARENA_BASE};
+} // namespace
+
+void* GetInternalPlacementHint(size_t Size) {
+#ifdef _WIN32
+  return nullptr;
+#else
+  // Page-align and leave a page of slack so an oversized mapping doesn't force
+  // the kernel to ignore the hint entirely.
+  constexpr size_t PageSize = 4096;
+  const size_t Reserve = ((Size + PageSize - 1) & ~(PageSize - 1)) + PageSize;
+  const uintptr_t Hint = InternalArenaBump.fetch_add(Reserve, std::memory_order_relaxed);
+  if (Hint < INTERNAL_ARENA_BASE || (Hint + Reserve) > (INTERNAL_ARENA_BASE + INTERNAL_ARENA_SIZE)) {
+    // Window exhausted; let the kernel choose.
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(Hint);
+#endif
+}
+
 using mmap_hook_type = void* (*)(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
 using munmap_hook_type = int (*)(void* addr, size_t length);
 
@@ -96,7 +144,7 @@ static void* FEX_rp_mmap(size_t size, size_t alignment, size_t* offset, size_t* 
   }
 
   size_t map_size = AlignUp(size + alignment, global_config.page_size);
-  auto ptr = fex_mmap_hook(0, map_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  auto ptr = fex_mmap_hook(GetInternalPlacementHint(map_size), map_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
   if (ptr == MAP_FAILED) {
     ptr = nullptr;

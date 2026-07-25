@@ -47,53 +47,7 @@ using GLIBC_FREE_Hook = void (*)(void*, const void* caller);
 
 fextl::unique_ptr<Alloc::HostAllocator> Alloc64 {};
 
-// Placement hint for FEX's *own* anonymous reservations.
-//
-// Everything FEX allocates for itself funnels through FEX_mmap: the rpmalloc
-// arenas ("FEXAllocator"), the per-thread LookupCache ("FEXMem_Lookup", 272 MiB
-// each with the default VirtualMemSize), JIT code buffers, dispatcher stacks and
-// the fextl pools. Passing addr=nullptr lets the kernel place them wherever it
-// likes, which in practice means interleaved with the guest's own mappings --
-// they all come out of the same top-down mmap region.
-//
-// That interleaving is not merely untidy, it breaks guests. Measured running
-// Ziggurat (Unity 4.7) on an 80-core POWER8: FEX held ~69 GiB of reservations
-// against the guest's ~6 GiB, sprayed between the guest's thread stacks, which
-// pushed the guest's heaps across 20 different (address >> 32) 4 GiB regions.
-// Unity indexes its allocator metadata by address>>32 in a fixed 5-entry table,
-// so it overflowed, took its not-found path, and crashed. Guests are entitled to
-// assume their own allocations stay reasonably clustered; the emulator should
-// not be salting their address space.
-//
-// So bump a hint pointer through a region well clear of both the guest's
-// executable/heap (low) and the kernel's top-down mmap area (high), and let FEX's
-// reservations pack there instead. This is only a hint: it is not MAP_FIXED, so
-// if anything already occupies the address the kernel simply places the mapping
-// elsewhere and we are no worse off than before.
-namespace {
-// 1 TiB: comfortably above a guest's binary/brk and the 32-bit region, and far
-// below the ~64 TiB top-down area the kernel hands out for ordinary mmaps.
-constexpr uintptr_t INTERNAL_ARENA_BASE = 0x0000'0100'0000'0000ULL;
-constexpr uintptr_t INTERNAL_ARENA_SIZE = 0x0000'0080'0000'0000ULL; // 512 GiB of hint space
-std::atomic<uintptr_t> InternalArenaBump {INTERNAL_ARENA_BASE};
-
-void* GetInternalPlacementHint(size_t length) {
-  // Leave a page of slack between reservations so an oversized mapping doesn't
-  // force the kernel to skip the hint entirely.
-  const size_t Reserve = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE) + FEXCore::Utils::FEX_PAGE_SIZE;
-  const uintptr_t Hint = InternalArenaBump.fetch_add(Reserve, std::memory_order_relaxed);
-  if (Hint + Reserve > INTERNAL_ARENA_BASE + INTERNAL_ARENA_SIZE) {
-    // Exhausted the hint window; fall back to letting the kernel choose.
-    return nullptr;
-  }
-  return reinterpret_cast<void*>(Hint);
-}
-} // namespace
-
 void* FEX_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
-  if (addr == nullptr && (flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED)) {
-    addr = GetInternalPlacementHint(length);
-  }
   void* Result = Alloc64->Mmap(addr, length, prot, flags, fd, offset);
   if (Result >= (void*)-4096) {
     errno = -(uint64_t)Result;
