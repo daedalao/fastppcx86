@@ -147,6 +147,48 @@ about how FEX splits YMM operations. So:
   items in Tier 1 and Tier 2 are mostly of that character already; this is a reason to keep them
   ranked that way.
 
+### Using a 44-core machine well — AOT ahead, dedicated cores behind
+
+Vector units are core-private and there is no path to borrow another core's VSU: operands and
+results would have to cross L2/L3 at ~50-100+ cycles against 2-7 cycles for the VSX op itself, so
+instruction-level work-stealing loses by one to two orders of magnitude. The cores are not usable
+that way. They *are* usable two other ways, and both are `any-host` config work rather than codegen.
+
+**1. Compile ahead of time, on all of them.** `Source/Tools/FEXOfflineCompiler/` already implements
+this upstream — `GenerateSingleCache()` produces a persistent code cache from a block list, with
+`SetupCompileThread()` driving compilation outside of any guest execution. The shape is: run once to
+collect executed blocks, AOT-compile them across the machine, then subsequent runs are largely cache
+hits rather than JIT work. `EnableCodeCacheValidation` (`Config.json.in:26`) controls how expensively
+caches are checked on load.
+
+**Untested on this backend — treat as a real question, not a given.** The code cache persists *host*
+code, so it is backend-specific, and nothing in the port's history suggests the PPC64LE path has ever
+been exercised through it. If it works, it removes most JIT latency from repeat runs on a machine
+that can afford to compile at scale. If it does not, that is a bug worth knowing about early rather
+than discovering later. Cheap to test once the smoke ladder is up.
+
+**2. Give the guest dedicated cores, and consider *lowering* SMT.** SMT4 does not multiply vector
+throughput — four threads share the same two superslices. For a guest that is effectively 1-4 threads,
+SMT2 or SMT1 gives each thread a larger share of issue queues, reservation stations and L1.
+`ppc64_cpu --smt=N` switches at runtime, making it a cheap A/B against FTL or vkmark. Expectation is
+that lower SMT wins for single-threaded guest workloads; worth measuring rather than assuming.
+
+Pair it with pinning: with 176 hardware threads there is room to keep guest execution and JIT
+compilation off each other's cores entirely.
+
+**3. NUMA — this is a 2-socket machine.** Witherspoon/AC922 has two sockets, so cross-socket memory
+access is a real cost for a latency-sensitive workload. Pinning guest threads and their memory to a
+single node (`numactl --cpunodebind=0 --membind=0`) is a one-command experiment that plausibly
+matters more than several of the codegen items in Tier 2. Worth running early for the same reason
+the SMT sweep is: it costs minutes and calibrates everything measured afterwards.
+
+**4. Guest-visible core count is a hazard at this scale.** FEX reports host core count through CPUID
+(`1ea60a763` counts `/sys/devices/system/cpu/online`), so a guest could see 176 CPUs. Game engines
+routinely size thread pools or allocate per-core structures from that number and some behave badly at
+that scale — over-subscription, excessive memory, occasional outright failure. **If a title
+misbehaves in a way that resembles thread-pool sizing, cap what FEX advertises before investigating
+anything deeper.** Recorded so it is not mistaken for a JIT defect.
+
 ### QEMU TCG as a reference — useful, with a hard licensing boundary
 
 QEMU 7.2 added TCG support for AVX, AVX2, F16C, FMA3 and VAES, and TCG has a ppc64 vector backend
