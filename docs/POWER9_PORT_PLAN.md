@@ -654,6 +654,46 @@ Revision 1 claims that did not survive review. Recorded so they are not rediscov
 
 ---
 
+## Confirmed on target hardware
+
+Measured 2026-07-28 on the target machine (build agent task T1; raw output in
+`docs/build-agent-notes.md`). These close several items previously marked "needs hardware".
+
+**Machine:** Witherspoon / AC922, 2-socket **POWER9 rev 2.2** (pvr 004e 1202), 3.3 GHz, 128 threads,
+~472 GiB RAM, PowerNV. Arch POWER, kernel 7.2.0-rc2, gcc 16.1.1, clang 22.1.8, cmake 4.4.0,
+ninja 1.13.2.
+
+| Fact | Value | Consequence |
+|---|---|---|
+| `getconf PAGESIZE` | **4096** | FEX's implicit 4 KB-host prerequisite is satisfied. Tier 0's startup assert will pass trivially |
+| MMU | **Radix** | Confirmed. Kernel advertises 4 K / 64 K / 2 M / 1 G, matching UM Table 4-17 |
+| `AT_DCACHEBSIZE` | **128** | **Confirms the bug.** `HostFeatures`'s 64-byte fallback is wrong here, as is the `addr >> 6` split-lock striping |
+| `AT_ICACHEBSIZE` | **128** | Same; also confirms the 32-byte stride in the icache flush loop is 4× redundant |
+| `AT_HWCAP2` | **0xbef00000** | Decoded below |
+| `AT_HWCAP` | 0xdc0065c2 | Not yet decoded; altivec + VSX present |
+| `mmap_min_addr` | 4096 | Guest low-VA region starts at page 1 |
+| x86_64 cross toolchain | **absent** | No `x86_64-linux-gnu-*`. Guest thunk stubs cannot currently be rebuilt on this host — see [The graphics path](#the-graphics-path-architecture-neutral) |
+
+### `AT_HWCAP2` decode — several plan items confirmed live
+
+Set bits: 31, 29, 28, 27, 26, 25, 23, 22, 21, 20. Against the standard Linux `PPC_FEATURE2_*`
+definitions (high confidence, but these are Linux ABI constants — worth confirming against this
+kernel's `arch/powerpc/include/uapi/asm/cputable.h`):
+
+- **`ARCH_3_00` (0x00800000) — set.** The POWER9 gate every Tier 2 change keys off. This machine
+  passes it.
+- **`VEC_CRYPTO` (0x02000000) — set.** Hardware AES / SHA / `vpmsum` are present, confirming Tier 1
+  item (b) is live on this box. (They are ISA 2.07, so this was expected, but it is now measured.)
+- **`ISEL` (0x08000000) — set.** Confirms Tier 1 item (a).
+- **`DARN` (0x00200000) — set.** Hardware RNG available for the `RDRAND` lowering.
+- **`EBB` (0x10000000) — set.** **Upgrades the `wait` opportunity**: the problem-state
+  event-based-branch timeout harness described in [Additional opportunities](#additional-opportunities)
+  is actually constructible on this hardware, rather than theoretical.
+- **`HAS_IEEE128` (0x00400000) — set.** Makes the binary128-for-x87 idea viable.
+- **`HTM` (0x40000000) — clear.** Confirms negative result 9: hardware transactional memory is not
+  an option for misaligned atomics on this machine.
+- **`ARCH_3_1` (0x00040000) and `MMA` (0x00020000) — clear.** Correct for POWER9; no POWER10 facilities.
+
 ## Hardware probe checklist
 
 Run on the POWER9 box. Note that the first item is **no longer decisive** — it is a sanity check, not
