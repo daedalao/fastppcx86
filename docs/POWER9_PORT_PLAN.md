@@ -141,12 +141,22 @@ Consequences currently attributed to hardware that are actually this:
 - The per-lane scalar GPR loops in `VMul` i8 (~70 instructions, `:2386`) and `VSRSHR` (~160,
   `:1416`), which fall back to scalar partly because there is nowhere to keep intermediates.
 
-**Caveat, and why this is not simply free.** VSR0–31 alias the FPRs, so they are only available to
-the extent the x87/scalar-float path is not using them. And VMX-form instructions (`vperm`,
-`vadduwm`, …) can only address VR0–31; reaching VSR0–31 requires the VSX-form encodings
-(`xxlor`, `xxperm`, `xvadduwm`-class). So exploiting it means preferring VSX forms in the emitter,
-which is a real but bounded piece of work. Even a partial win — say four more scratch registers —
-unblocks the Newton step and the worst of the scalar-loop fallbacks.
+**`xxperm` is what makes this exploitable, and it is POWER9-only.** `vperm` is a VMX-form
+instruction and can only address VR0–31. Before ISA 3.0 there was no byte-granular permute reaching
+VSR0–31 at all, so any arbitrary shuffle forced its operands into the VR subset — which is exactly
+why a 32-register layout was the path of least resistance for the original port. `xxperm` /
+`xxpermr` (v3.0) permute at byte granularity across the whole 64-register file and remove that
+constraint.
+
+**Tag nuance:** the *registers* are `power8+power9` (VSX since POWER7), but *using them for
+shuffle-heavy vector code* is effectively `power9-only`. On POWER8 the available cross-file
+primitives are `xxpermdi` (doubleword granularity only) and `xxlor`-style moves, which is enough for
+scratch/spill traffic but not for the shuffle lowerings that hurt most. Plan accordingly: extending
+the scratch pool helps both, extending the *allocation* pool for shuffle-heavy work is a POWER9 win.
+
+**Other caveat.** VSR0–31 alias the FPRs, so availability depends on what the x87/scalar-float path
+holds live. Even a partial win — four more scratch registers — unblocks the Newton step and the
+worst of the scalar-loop fallbacks.
 
 **Next step:** audit which FPRs the x87 and scalar-float paths actually hold live across vector
 codegen, then extend `RAFPR`/`VTMP` into the free part of VSR0–31.
@@ -154,14 +164,18 @@ codegen, then extend `RAFPR`/`VTMP` into the free part of VSR0–31.
 ### 2. x87 could be *better* on POWER9 than on ARM64 — `power9-only`
 
 `AT_HWCAP2` confirms `HAS_IEEE128` on the target. POWER9 has hardware binary128
-(`xsaddqp`/`xsmulqp`/`xsdivqp`); **ARM64 has no hardware quad-precision at all.** x87 extended is a
-64-bit mantissa; binary128 is 113. So the current choice — softfloat (accurate, slow) or the
-`X87_F64` reduced-precision mode (fast, 53-bit mantissa) — is an ARM64-shaped dilemma that POWER9
-does not necessarily share.
+(`xsaddqp`/`xsmulqp`/`xsdivqp`); **ARM64 has no hardware quad-precision at all.** So the current
+choice — softfloat (accurate, slow) or the `X87_F64` reduced-precision mode (fast, 53-bit mantissa) —
+is an ARM64-shaped dilemma that POWER9 does not necessarily share.
 
-Not automatically bit-exact: correctly-rounded double rounding through 113 bits to a 64-bit mantissa
-needs ≥130 bits in the general case. But it is *vastly* closer than F64, and fast. Worth measuring
-before accepting the reduced-precision path as the only fast option.
+**Representation is exact; only rounding needs hand-rolling.** binary128 has a 113-bit mantissa
+against x87 double-extended's 64, so **a binary128 holds any double-extended value exactly**. The
+work is not representation but the rounding step: results must be rounded to a 64-bit mantissa
+explicitly, and doing that correctly in every case is the classic double-rounding problem
+(guaranteeing correct rounding in general wants ≥130 bits). That is a bounded, well-understood piece
+of work — and vastly closer to correct than the 53-bit F64 path while remaining hardware-fast.
+
+Irrelevant to AVX/SSE; this is purely an x87 play.
 
 This also reframes two inherited registry entries: `unittests/ASM/Disabled_Tests` disables
 `Test_X87/D9_F8.asm` with the comment "Relies on rounding correctness", and `D9_F2`/`D9_F9` with
@@ -878,12 +892,12 @@ Found by the adversarial sweep of the v3.0 opcode list; not evaluated in revisio
 |---|---|---|---|
 | 1 | `xsaddqp`/`xsmulqp`/`xsdivqp` binary128 | v3.0 | Hardware quad float for x87 80-bit. Far faster than softfloat helpers, more accurate than the reduced-precision float64 mode. **Not bit-exact** (113→64-bit double rounding; exactness needs ≥130 bits) — an intermediate fidelity/speed mode. Latencies 12/24/56–58 (UM Table A-1) |
 | 2 | `mffscrn` / `mffscrni` / `mffsl` | v3.0 | Lightweight rounding-mode read-modify without full FPSCR serialization. Directly services the F16C imm8-rounding problem and guest MXCSR.RC switches |
-| 3 | `vcmpneb[.]` / `vcmpnezb[.]` | v3.0 | "Not equal or zero" is purpose-built for null-terminated scans — accelerates `PPC64_VPCMPISTRX` (`VectorOps.cpp:3570`) and REP SCAS/CMPS |
+| 3 | `vcmpneb[.]` / `vcmpnezb[.]`, plus **`vclzlsbb` / `vctzlsbb`** and the vector CLZ/CTZ family | v3.0 | String and `memcmp` primitives. "Not equal or zero" is purpose-built for null-terminated scans; `vclzlsbb`/`vctzlsbb` count leading/trailing zero least-significant bytes, which is the natural way to turn a compare mask into an index. Together these accelerate `PPC64_VPCMPISTRX` (`VectorOps.cpp:3570`), REP SCAS/CMPS, and the `strlen`/`memchr` chains the code comments repeatedly cite |
 | 4 | `maddld` / `maddhd` / `maddhdu` | v3.0 | Fused 64×64+64: IMUL+ADD chains, address arithmetic, 128-bit multiply-accumulate |
 | 5 | `xststdcdp` / `xvtstdcsp/dp` | v3.0 | One-instruction NaN/Inf/denorm/zero classification → x87 `FXAM`, DAZ/FTZ, NaN canonicalization |
 | 6 | `xscmpeqdp` / `xscmpgtdp` / `xscmpgedp` | v3.0 | Scalar CMPSD/CMPSS mask in a register, no CR traffic, no full-vector op |
 | 7 | `lxvwsx`, `xxperm`, `vextsb2w/d`, `vextsh2w/d` | v3.0 | VBROADCASTSS-style splats; copy-free permutes; PMOVSX assists |
-| 8 | `lxvl` / `stxvl` | v3.0 | Length-governed 0–16-byte vector ops: REP MOVS tails, page-boundary-safe partial loads |
+| 8 | `lxvl` / `stxvl` | v3.0 | Load/store vector **with length** — emulate masked loads/stores at buffer boundaries **without faulting**, which is the hard part of doing them safely. REP MOVS tails, page-boundary-safe partial access. Higher value than first assessed |
 | 9 | EBB-bounded `wait` | v3.0 | See negative-result reversal below — high engineering cost |
 
 **`wait` is not strictly unusable.** Revision 1 called it useless for PAUSE because it resumes only
