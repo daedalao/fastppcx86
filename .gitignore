@@ -23,3 +23,6 @@ CMakeLists.txt.user
 
 # Reference documentation (large binaries, not redistributable here)
 docs/*.pdf
+
+# Mono crash dumps from guest harness runs
+mono_crash.*
