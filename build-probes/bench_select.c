@@ -207,12 +207,24 @@ int main(void) {
     printf("bench_select — guest CPU microbenchmark for select/flag codegen\n");
     printf("%u elements, %u inner passes, median of %u reps\n\n", N_ELEMS, N_INNER, N_REPS);
 
+    /* FEX_BENCH_PAD=<N> allocates N * 4 KB before the working arrays, shifting their virtual
+     * addresses. Same binary, same emitted code — used to test whether ns/op tracks placement.
+     * Value ignored if unset or non-numeric. */
+    const char* pad_env = getenv("FEX_BENCH_PAD");
+    unsigned pad_pages = pad_env ? (unsigned)strtoul(pad_env, NULL, 10) : 0;
+    if (pad_pages) {
+        volatile void* p = malloc((size_t)pad_pages * 4096);
+        if (!p) { fprintf(stderr, "OOM (pad)\n"); return 1; }
+        printf("FEX_BENCH_PAD=%u -> %zu byte pad at %p\n", pad_pages, (size_t)pad_pages * 4096, (void*)p);
+    }
+
     uint64_t* rnd  = malloc(N_ELEMS * sizeof *rnd);
     uint64_t* pred = malloc(N_ELEMS * sizeof *pred);
     uint64_t* addx = malloc(N_ELEMS * sizeof *addx);
     uint64_t* addy = malloc(N_ELEMS * sizeof *addy);
     uint64_t* addz = malloc(N_ELEMS * sizeof *addz);
     if (!rnd || !pred || !addx || !addy || !addz) { fprintf(stderr, "OOM\n"); return 1; }
+    printf("arrays: rnd=%p pred=%p addx=%p addy=%p addz=%p\n", (void*)rnd, (void*)pred, (void*)addx, (void*)addy, (void*)addz);
 
     for (unsigned i = 0; i < N_ELEMS; ++i) {
         rnd[i]  = rng_next();                 /* straddles the threshold ~50/50 */
