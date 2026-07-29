@@ -1,6 +1,15 @@
 #include <catch2/catch_all.hpp>
 #include <FEXCore/Utils/Allocator.h>
 
+// These were previously pulled in transitively through <catch2/catch_all.hpp>.
+// Newer libstdc++/glibc no longer provide them that way, so include directly:
+//   unistd.h  - close, lseek, write
+//   stdlib.h  - mkstemp
+//   stdio.h   - remove, P_tmpdir
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 namespace {
 
 using FEXCore::Allocator::MemoryRegion;
