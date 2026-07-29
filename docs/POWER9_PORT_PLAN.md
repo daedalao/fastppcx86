@@ -429,7 +429,7 @@ without saying so explicitly.**
 
 | Inherited claim | Source | Status |
 |---|---|---|
-| Making the `Break` op a real fault "breaks the worker pool init" (Steam) | stub comment near `PPC64Dispatcher.cpp:501-522` | **UNVERIFIED — currently load-bearing.** Under audit. The Break defect is confirmed at runtime, so this comment is the only thing arguing against the obvious fix |
+| Making the `Break` op a real fault "breaks the worker pool init" (Steam) | stub comment near `PPC64Dispatcher.cpp:501-522` | **UNSUPPORTED** — not refuted. The commit that added it (`f78e0613d`) is a pure comment diff whose own message calls it "exploration that got reverted to a clean `blr`", so no code ever implemented or tested the claim. But the first-pass verdict of *refuted* over-reached: a `Break` reached under `CallbackPtr` returns into the C++ thunk caller and execution genuinely continues, which is literal silent absorption, so the comment's premise is not false — merely undemonstrated. Treat as an untested hypothesis, not a disproved one |
 | Mono spins are caused by SMC/page-size tracking | rev 1 of this plan (mine) | **REFUTED.** Host is 4 KB; `AT_PAGESZ` is reported unconditionally; mechanism never fired |
 | Mono-specific workarounds in-tree corroborate an SMC theory | port lineage | **REFUTED.** Upstream ARM64/Wine commits by another author; one is Windows-only and inert on Linux |
 | "only 2 free vector temps on POWER8" | `VectorOps.cpp:1480` | **REFUTED as a hardware limit.** It is the transplanted ARM64 32-register layout; VSR0–31 are unused for vector work |
@@ -1189,8 +1189,74 @@ clean block. It also fits "after cold JIT", when Mono's compile and backpatch tr
 **It is a defect regardless of whether it explains the Mono spin.** Silently terminating a guest
 thread is never correct behaviour.
 
+**Confirmed at runtime**, not merely read: the probe classified both `int3` and `ud2` as
+THREAD-KILLED, and the probe then hung — peers of the destroyed threads waited forever, exactly as
+predicted. `hlt` was never reached. The same run eliminated the two competing hypotheses: 1M
+contended `cmpxchg` operations were all honest, and 200k raw-futex plus 50k condvar round-trips
+produced no EAGAIN storm, so neither a CAS codegen bug nor the futex layer is implicated.
+
+### Fixing it: design plus two adversarial reviews
+
+**Phase 1 is NOT safe as first specified.** Both reviewers independently found the same blocker, and
+it was then confirmed directly.
+
+**Blocker — FEX never installs a host SIGTRAP handler.** Host thunks are installed only for SIGILL
+(`SignalDelegator.cpp:1229`, `Required=true`), SIGSEGV (`:1230`), SIGBUS (`:1255`, plus a
+ppc64-specific `SigbusHandlerPPC64` at `:1303`) and the pause signal (`:1306`). The all-signals loop
+at `:1309-1311` calls `RegisterHostSignalHandlerForGuest`, which at `:1394-1397` assigns only
+`GuestHandler` and **never calls `InstallHostThunk`**. So a SIGTRAP-producing instruction reaches FEX
+only if the guest itself called `sigaction(SIGTRAP, …)`. Otherwise the process dies on the host
+default disposition, bypassing FEX entirely — no `CleanupForExit`, no telemetry, NIP inside the
+dispatcher `mmap`. If the guest sets `SIG_IGN`, `UpdateHostThunk:1080-1084` propagates that to the
+*host* and the result is an uninterceptable refault loop. Fix: register SIGTRAP with
+`Required=true`, which blocks both downgrades exactly as it does for SIGILL.
+
+**This is already a live bug, independent of any Break work.** `X87Ops.cpp:322` emits `0x7FE00008`
+(`trap`) today for unsupported `fstp` conversion paths, while the comment at `:314` promises "a clear
+SIGILL". With no host SIGTRAP thunk that path core-dumps instead of failing loudly, and it is
+reachable by any guest doing `fstp dword`/`fstp qword` from a non-80-bit stack value. Registering
+SIGTRAP fixes the Break work and this together.
+
+**Our verification would have given a false green.** `probe_jit_futex.c:449-451` installs handlers for
+SIGILL/SIGTRAP/SIGSEGV before every step-6 case, so the probe only ever exercises the path that
+works and cannot detect the missing thunk. `GdbServer.cpp:100` registers all signals, so running
+under gdbserver masks it too.
+
+**And the ctest baseline does not cover this at all.** All 2224 ASM tests — 6672 of the 7011 cases —
+terminate on `hlt` → `Break(SIGSEGV)`; **zero** contain `ud2` or `int3`. A green 6/7011 proves only
+that the dispatcher still assembles. Both build caches carry `BUILD_FEX_LINUX_TESTS:BOOL=OFF` and
+`ENABLE_ASSERTIONS:BOOL=OFF`, so `unittests/FEXLinuxTests/tests/signal/invalid_*` — the only
+functional coverage that exists for this path — is not built. A third build directory is a
+prerequisite for verifying any of this, not an optional extra.
+
+**Other findings that revise the design:**
+
+- **The FTL negative control is invalid.** Main-thread `ud2`/`int3` today produces an *orderly
+  shutdown and exit 0* (`FEXInterpreter.cpp:629-660`), because the teardown runs on `ExecuteThread`
+  returning. Only the clone'd-thread path shows the destructive behaviour, so "FTL reaches Running
+  Game!" says nothing about this defect.
+- **SIGILL with `SIG_IGN` is a 100%-CPU hang, not a death.** SIGILL is `Required`, so the `SIG_IGN`
+  downgrade at `:1080` is skipped, FEX's thunk stays installed, and `HandleGuestSignal:951-953`
+  returns without touching the ucontext — NIP never advances and it refaults forever.
+- **`SignalHandlerReturnAddressRT` is aliased to the non-RT address** (`PPC64Dispatcher.cpp:1097-1098`,
+  `:111-112`), so `SignalDelegator.cpp:647-650` always selects `TYPE_REALTIME`. `RestoreThreadState`
+  then reads `ContextBackup` from the wrong guest-stack offset and `memcpy`s 48 `gp_regs` — including
+  r1 and `PPC_PT_NIP` — out of guest-writable memory. This must be fixed **with** Phase 1 rather than
+  filed separately, because Phase 1 makes `int3`, the commonest 32-bit trap, into its trigger.
+- **`UD2` and `UnimplementedOp` emit byte-identical `BreakDefinition`s** (`OpcodeDispatcher.cpp:4757-4762`
+  against `:5043-5050`), with no logging at either site. The backend cannot distinguish a deliberate
+  guest trap from a FEX codegen gap, so after this change an unimplemented op silently becomes a guest
+  SIGILL. Separating them needs a new IR field.
+- **`State.rip` is stale for `MOV CS,r`** — `OpcodeDispatcher.cpp:1273` bypasses `BreakOp`.
+- The `tw` helper already exists at `CodeEmitter/PPC64LE/Emitter.h:1432`; `tw(31, r0, r0)` emits
+  exactly `0x7FE00008`, verified by assembling with the in-tree `powerpc64le-linux-gnu-as`. No
+  hand-assembled word is needed.
+
+**Applicability:** `power8+power9` — every host instruction involved is base Power ISA.
+
 **Testable:** `build-probes/probe_jit_futex.c` step 6 classifies each opcode as
-DELIVERED / NOPED / THREAD-KILLED.
+DELIVERED / NOPED / THREAD-KILLED — but see the false-green caveat above; it needs a
+no-handler-installed variant before it can verify a fix.
 
 ## Diagnostic tooling that already exists and was never documented
 
