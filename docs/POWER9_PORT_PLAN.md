@@ -1102,6 +1102,59 @@ Independent of this bug, Steam carries its own deferred blocker cluster: TLS han
 bundled OpenSSL 1.1, a `ThreadStateObject` UAF in `DestroyThread` currently mitigated by a deliberate
 leak (`f78e0613d`), and NoExec waves. Those are separate problems from WSI.
 
+## Confirmed defect: guest `int3`/`ud2`/`hlt` silently **kills the thread**
+
+Previously characterised in this document as "silent absorbers" — the dispatcher's guest-signal
+stubs swallowing `SIGILL`/`SIGTRAP`/`SIGSEGV` without delivering to the guest. That was too
+generous. Verified mechanism:
+
+1. Guest executes `int3`, `ud2`, `int imm8`, `into` or `hlt`. All lower to `Break`
+   (`OpcodeDispatcher.cpp:4739-4771`).
+2. `DEF_OP(Break)` (`BranchOps.cpp:143-189`) jumps to `GuestSignal_SIGILL/SIGTRAP/SIGSEGV_Address`.
+3. Those stubs (`PPC64Dispatcher.cpp:501-522`) are `SpillStaticRegs; PopCalleeSavedRegisters; blr` —
+   **the dispatcher's epilogue.** Control returns out of `ExecuteThread`.
+4. `Syscalls/Thread.cpp:88-99` then runs `ReleaseAllPendingSharedLocks`, `UninstallTLSState`,
+   `DestroyThread`, and returns `nullptr`. The pthread exits.
+
+**So the thread dies, silently, mid-execution.** FEX's own shared locks are swept, but *guest*-side
+locks the thread held are not — they stay held forever, and any peer waiting on them waits forever.
+No guest signal handler runs; no unwind happens; nothing is logged.
+
+The in-tree comment believes the behaviour is "silently NOPing", which is what pre-fix FEX did. It
+is not what this code does.
+
+**Why this is a strong Mono candidate.** Mono embeds breakpoint opcodes for runtime checks and
+unreachable markers; a plain C++/SDL game like FTL does not — which fits the "Mono-specific"
+framing exactly. A Mono thread dying mid-handshake leaves the coop-suspend protocol waiting on a
+peer that will never answer, and Mono's timed retry loops can turn that into a spin rather than a
+clean block. It also fits "after cold JIT", when Mono's compile and backpatch traffic peaks.
+
+**It is a defect regardless of whether it explains the Mono spin.** Silently terminating a guest
+thread is never correct behaviour.
+
+**Testable:** `build-probes/probe_jit_futex.c` step 6 classifies each opcode as
+DELIVERED / NOPED / THREAD-KILLED.
+
+## Diagnostic tooling that already exists and was never documented
+
+`FEX_SYSCALLOBSERVE=1` (`Config.json.in:458`) enables a per-thread **futex EAGAIN-storm detector**
+(`SyscallObserver.cpp:27-46`): tracks address, op and **value**, fires after 16 back-to-back EAGAINs
+within a 10 ms window, then rate-limits to every 256 to confirm "still stuck" without flooding.
+
+Tracking `val` is what makes it decisive — it separates *the same stale expectation recomputed
+forever* (codegen or stale-read defect) from *a value that is churning* (a livelock or pacing
+problem). That is precisely the discrimination the Stardew and Ziggurat diagnoses lacked.
+
+`FEX_FUTEXMITIGATE=1` (`:472`) is its companion, adding a yield-based mitigation once a storm is
+detected — useful for testing whether the spin is a pacing livelock.
+
+Neither appears in `README.md`. The tool for this bug was built and, as far as the record shows,
+never pointed at it.
+
+**Consequence:** the two-line patch to `FEX_LOG_UNEXPECTED_FUTEX` proposed earlier in this document
+is unnecessary and should not be done. `SYSCALLOBSERVE` is strictly better — streak-deduplicated
+rather than a per-call firehose.
+
 ## Bugs found in the current backend
 
 Discovered incidentally during the audit. None are POWER9-related.
