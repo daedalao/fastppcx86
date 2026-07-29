@@ -5,6 +5,9 @@ vim_rc
 Config.json
 
 [Bb]uild*
+# ...but the build-agent docs are not build output
+![Dd]ocs/build-agent.md
+![Dd]ocs/build-agent-notes.md
 [Bb]in/
 out/
 .vscode/
