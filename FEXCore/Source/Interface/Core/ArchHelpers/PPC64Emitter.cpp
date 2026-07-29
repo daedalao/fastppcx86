@@ -144,7 +144,10 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   //     mechanism, breaks 1949 ASM tests. f0 sidesteps this entirely by
   //     using a non-VSR-aliased FPR slot.
   mtfprd(FPR{0}, TMP2);                         // save TMP2 in f0 (no memory)
-  mfcr(TMP2);                                   // TMP2 = CR (LT@LSB31, EQ@LSB29)
+  // mfocrf 0x80 (single-field, uncracked): the rlwinm extracts below read
+  // only CR0.LT (PPC bit 0) and CR0.EQ (PPC bit 2), both inside the defined
+  // field-0 nibble; the masks discard the pre-3.0C-undefined remainder.
+  mfocrf(TMP2, 0x80);                           // TMP2 = CR0 (LT@LSB31, EQ@LSB29)
   rlwinm(TMP3, TMP2, 0, 0, 0);                 // TMP3 = N @ LSB31
   rlwinm(TMP2, TMP2, 1, 1, 1);                 // TMP2 = Z (CR0.EQ@LSB29 → LSB30)
   or_(TMP3, TMP3, TMP2);                        // TMP3 = N | Z
@@ -220,7 +223,7 @@ void PPC64EmitterBase::FillStaticRegs() {
   rlwinm(TMP1, TMP2, 0,  0, 0);              // N → LSB31 (CR0.LT)
   rlwinm(TMP3, TMP2, 31, 2, 2);              // Z → LSB29 (CR0.EQ)
   or_(TMP1, TMP1, TMP3);
-  mtcrf(0x80, TMP1);                          // CR0 ← bits 31..28 of TMP1
+  mtocrf(0x80, TMP1);                         // CR0 ← bits 31..28 of TMP1 (single-field form)
   // Build XER: clear OV+CA, OR in C @ LSB29 (no shift) + V @ LSB30 (rotl 2).
   mfspr(TMP1, 1);
   LoadImm32(TMP3, 0x60000000u);

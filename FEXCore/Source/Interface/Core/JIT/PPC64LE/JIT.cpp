@@ -1298,12 +1298,14 @@ PPC64Emitter::Cond PPC64JITCore::MapCC(IR::CondClass Cond) {
 // CR1.SO (PPC bit 7) <- 0 (don't care)
 // XER bits in mfspr-result GPR (LSB numbering): SO=31, OV=30, CA=29.
 // rotlwi by 28 maps SO 31->27 (PPC 4), OV 30->26 (PPC 5), CA 29->25 (PPC 6).
-// mtcrf with FXM=0x40 selects only CR1.
+// mtocrf with FXM=0x40 selects only CR1 (single-field form — uncracked where
+// multi-field mtcrf is microcoded; POWER9 UM §4.1.5.6). This is the hot path
+// for every C/V-consuming condition, so the form matters.
 // -------------------------------------------------------------------------
 void PPC64JITCore::ProjectXERToCR1() {
   mfspr(TMP1, 1);
   rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
-  mtcrf(0x40, TMP2);
+  mtocrf(0x40, TMP2);
 }
 
 // -------------------------------------------------------------------------

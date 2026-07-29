@@ -939,7 +939,9 @@ DEF_OP(MemSet) {
   // to the red zone before the loop's cmpdi clobbers it; restore after
   // the loop.  TMP3 is overwritten below by the direction-step setup, so
   // we use it briefly here as a transit before the std to memory.
-  mfcr(TMP3);
+  // mfocrf 0x80 (single-field): only the CR0 nibble is defined pre-3.0C —
+  // sufficient, the sole consumer is the mtocrf(0x80) restore below.
+  mfocrf(TMP3, 0x80);
   std(TMP3, -8, r1);
   GPR AddrIn = GetReg(Op->Addr);
   // Op->Value is annotated "Inline: Any" in IR.json — IsInlineConstant may
@@ -1013,7 +1015,7 @@ DEF_OP(MemSet) {
 
   // Restore CR0 (saved at op entry) — REP STOS preserves flags.
   ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  mtocrf(0x80, TMP3);
 
   // Final pointer may sit in upper-half-dirty form for 32-bit guest; mask
   // before writing back to the SSA destination.
@@ -1025,8 +1027,10 @@ DEF_OP(MemCpy) {
   // x86 REP MOVS preserves flags per Intel SDM.  Save CR0 (packed-NZCV)
   // to the red zone before the loop's cmpdi clobbers it; restore after.
   // TMP3 is overwritten below by the direction-step setup — that's fine,
-  // we've already stashed the mfcr result to memory.
-  mfcr(TMP3);
+  // we've already stashed the CR0 snapshot to memory.
+  // mfocrf 0x80 (single-field): only the CR0 nibble is defined pre-3.0C —
+  // sufficient, the sole consumer is the mtocrf(0x80) restore below.
+  mfocrf(TMP3, 0x80);
   std(TMP3, -8, r1);
   auto Op = IROp->C<IR::IROp_MemCpy>();
   GPR DestIn = GetReg(Op->Dest);
@@ -1095,7 +1099,7 @@ DEF_OP(MemCpy) {
   li(r(0), 0);
   // Restore CR0 (saved at op entry) — REP MOVS preserves flags.
   ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  mtocrf(0x80, TMP3);
 }
 
 // =========================================================================

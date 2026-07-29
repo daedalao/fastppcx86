@@ -1245,7 +1245,34 @@ Considered and rejected: `stop` (privileged), DFP/BCD/`vmul10*` (no x86 analogue
 
 ---
 
-## Repo hazard: there are two `PPC64Emitter.cpp` and one of them is dead
+## Repo hazard: two source files in this tree are never compiled
+
+**Neither of these is in the build. Editing either is a silent no-op.**
+
+| File | Size | Why it is dead |
+|---|---:|---|
+| `FEXCore/Source/Interface/Core/JIT/PPC64LE/PPC64Emitter.{cpp,h}` | 16 KB + 6 KB | `CMakeLists.txt:40` builds `Interface/Core/ArchHelpers/PPC64Emitter.cpp` instead; every consumer includes the ArchHelpers header, and the stale file includes it too |
+| `CodeEmitter/PPC64LE/ALUOps.cpp` | **113 KB** | `CodeEmitter/CMakeLists.txt` declares an `INTERFACE` library — headers only, no sources. Only `Emitter.h` and `Registers.h` are consumed |
+
+Both date from the `e1f83d4c4` snapshot. **The live files are
+`FEXCore/Source/Interface/Core/ArchHelpers/PPC64Emitter.{cpp,h}` and
+`CodeEmitter/PPC64LE/Emitter.h`.**
+
+Deleting them is the obvious fix, deliberately deferred so a build break does not land in the same
+test cycle as a codegen change and confound it.
+
+### This has already cost real effort twice
+
+Line citations in §2.1 and the overlap-sites table were taken against the stale emitter, as was an
+adversarial reviewer's analysis "proving" the red-zone stack slot at `r1-16` was 16-byte aligned.
+The live code had already moved that bounce to `STATE+JITScratch`, because the `r1` red-zone
+approach faulted at stack-mapping boundaries.
+
+The *conclusions* survive — the live bounce also faults on the guest EA via `ld`/`std`, so the DAR
+measurements still apply — but every line number in this document referring to
+`JIT/PPC64LE/PPC64Emitter.cpp` should be read as `ArchHelpers/PPC64Emitter.cpp`.
+
+## Superseded: there are two `PPC64Emitter.cpp` and one of them is dead
 
 **`FEXCore/Source/Interface/Core/JIT/PPC64LE/PPC64Emitter.{cpp,h}` is not compiled.**
 `FEXCore/Source/CMakeLists.txt:40` builds `Interface/Core/ArchHelpers/PPC64Emitter.cpp`, and every

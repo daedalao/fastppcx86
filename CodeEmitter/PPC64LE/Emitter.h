@@ -551,7 +551,16 @@ public:
   void mfcr(GPR rt) { Emit32((31u << 26) | (rt.idx << 21) | (19u << 1)); }
 
   // mfocrf RT, FXM  (move from one condition register field, XO 19 with bit 20 set)
+  //
+  // FXM must have EXACTLY one bit set — multi-bit FXM makes the result undefined, matching the
+  // mtocrf restriction below.
+  //
+  // Note for callers: on processors before ISA 3.0C — which includes POWER8 *and* POWER9 — only
+  // the selected field's four bits of RT are defined. The ISA zeroes the rest only from 3.0C
+  // onward; before that, bits outside the selected field within the containing byte "may or may
+  // not be set". Never read a bit outside the field you selected.
   void mfocrf(GPR rt, uint32_t fxm) {
+    assert(fxm != 0 && (fxm & (fxm - 1)) == 0 && "mfocrf requires exactly one FXM bit");
     Emit32((31u << 26) | (rt.idx << 21) | (1u << 20) | (fxm << 12) | (19u << 1));
   }
 
@@ -560,8 +569,53 @@ public:
     Emit32((31u << 26) | (rs.idx << 21) | (fxm << 12) | (144u << 1));
   }
 
+  // mtocrf FXM, RS  (move to ONE condition register field — XFX-form, XO 144
+  // with BE bit 11 set; ISA 2.01, "preferred form" per ISA 3.0C p.119).
+  // FXM must have EXACTLY one bit set or the whole CR becomes undefined.
+  // Writes only the selected field (others unchanged) — same visible effect
+  // as mtcrf with the same single-bit FXM, but uncracked on POWER8/POWER9
+  // where multi-field mtcrf is microcoded (POWER9 UM §4.1.5.6).
+  // Verified against powerpc64le-linux-gnu-as: mtocrf 0x80,r5 = 0x7CB80120.
+  void mtocrf(uint32_t fxm, GPR rs) {
+    assert(fxm != 0 && (fxm & (fxm - 1)) == 0 && "mtocrf requires exactly one FXM bit");
+    Emit32((31u << 26) | (rs.idx << 21) | (1u << 20) | (fxm << 12) | (144u << 1));
+  }
+
   // mtcr RS = mtcrf 0xFF, RS
   void mtcr(GPR rs) { mtcrf(0xFF, rs); }
+
+  // isel RT, RA, RB, BC  (Integer Select — A-form, opcode 31, XO 15;
+  // ISA 2.03 per the 3.0C opcode tables, description p.89 — base on all
+  // POWER hardware this backend targets).
+  //   RT = (CR bit [BC+32] == 1) ? (RA==0 ? 0 : GPR[RA]) : GPR[RB]
+  // BC is the ABSOLUTE bit index in the 32-bit CR (0..31) — the same
+  // numbering our Cond::BI carries after cr-field composition, so a Cond's
+  // BI can be passed straight through.
+  // CAUTION: RA=0 in the encoding reads LITERAL ZERO, not GPR[r0]. That is
+  // coincidentally consistent with the backend's r0≡0 invariant, so passing
+  // r0 for either operand yields 0 on both slots — but only the RA slot is
+  // architecturally zero; the RB slot relies on the invariant being live.
+  // No Rc form exists; CR and XER are never altered.
+  // Verified against powerpc64le-linux-gnu-as: isel 3,4,5,2 = 0x7C64289E.
+  void isel(GPR rt, GPR ra, GPR rb, uint32_t bc) {
+    assert(bc < 32 && "isel BC field is a 5-bit CR bit index");
+    Emit32((31u << 26) | (rt.idx << 21) | (ra.idx << 16) | (rb.idx << 11) | (bc << 6) | (15u << 1));
+  }
+
+  // iselcc: branch-free select on a Cond as used by bc().
+  //   rt = cond-holds ? vtrue : vfalse
+  // Cond convention: BO=12 means "condition holds when CR[BI] is set",
+  // BO=4 means "condition holds when CR[BI] is clear" (see InvertCond, which
+  // toggles BO bit 3 = value 8). isel always selects RA on bit-set, so the
+  // BO=4 case swaps the operands instead of inverting the CR bit.
+  void iselcc(GPR rt, Cond cond, GPR vtrue, GPR vfalse) {
+    assert((cond.BO == 12 || cond.BO == 4) && "iselcc requires a plain true/false Cond");
+    if (cond.BO & 8) {
+      isel(rt, vtrue, vfalse, cond.BI);
+    } else {
+      isel(rt, vfalse, vtrue, cond.BI);
+    }
+  }
 
   // =========================================================================
   // Load/Store (D-form and DS-form)

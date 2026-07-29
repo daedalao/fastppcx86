@@ -3274,23 +3274,34 @@ DEF_OP(VExtr) {
   }
 
   // PALIGNR with imm in [16..31] effectively shifts VHigh entirely out: only
-  // VLow contributes (with the upper bytes filled with zero). Existing
+  // VLow contributes (with the upper bytes filled with zero). The old
   // vperm-based impl used ByteOff = 16-N which underflows for N>=16 and
   // produces garbage. Split the cases:
-  //   N <  16: vperm(VLow, VHigh, perm[b]=b+16-N)
+  //   N <  16: single vsldoi — see below.
   //   N >= 16: vperm(VLow, ZeroVec, perm[b]=...) — ZeroPad bytes of zero
   //            on the LE-high side, the rest from VLow shifted right.
+  if (N < 16) {
+    // The perm control here was the LINEAR map perm[b] = b + (16-N), i.e.
+    // Dst.phys[b] = concat(VLow, VHigh).phys[b + 16 - N] — exactly what
+    // vsldoi VRT,VRA,VRB,SHB computes with VRA=VLow, VRB=VHigh, SHB=16-N
+    // (VRT.phys[i] = (VRA||VRB).phys[i+SHB], ISA 3.0C p.260, v2.03).
+    // Derivation against FEX/ARM EXT semantics under the lvx-reverse layout
+    // (LE byte k = phys 15-k): for b >= N, Dst.phys[b] = VHigh.phys[b-N]
+    // = VHigh.LE[k+N] with k=15-b (the k+N<16 half); for b < N,
+    // Dst.phys[b] = VLow.phys[b+16-N] = VLow.LE[k+N-16] (the wrap half). ✓
+    // N is 1..15 here (N==0 handled above), so SHB = 16-N is 1..15 — always
+    // a legal 4-bit SHB. One instruction replaces the 13-instruction
+    // perm-control materialisation through the stack.
+    vsldoi(Dst, VLow, VHigh, (uint32_t)(16u - N));
+    return;
+  }
+
+  // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad].
+  // Source slot B receives a zero vector; perm indices >=16 (slot B) read 0.
   uint8_t perm[16];
   auto VSrc1 = VLow;
   auto VSrc2 = VHigh;
-  if (N < 16) {
-    const uint8_t ByteOff = (uint8_t)(16u - N);
-    for (int b = 0; b < 16; b++) {
-      perm[b] = (uint8_t)(b + ByteOff);
-    }
-  } else {
-    // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad].
-    // Source slot B receives a zero vector; perm indices >=16 (slot B) read 0.
+  {
     const uint8_t ZeroPad = (uint8_t)(N - 16u);
     for (int b = 0; b < 16; b++) {
       perm[b] = (b < ZeroPad) ? (uint8_t)16 : (uint8_t)(b - ZeroPad);
