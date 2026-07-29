@@ -75,9 +75,25 @@
 #include <string.h>
 #include <time.h>
 
-#define N_ELEMS   (1u << 16)   /* 512 KB of uint64 — fits L2, so this is not a memory benchmark */
+/* WORKING SET SIZING — the first version got this exactly wrong.
+ *
+ * It used 1<<16 elements = 512 KB per array. POWER9's L2 is 512 KB, 8-way set associative
+ * (UM 18745), so a single array *precisely equalled* L2 capacity — the worst possible size, where
+ * hit rate is decided by allocation alignment and whatever else happens to be resident. Five such
+ * arrays totalled 2.5 MB, five times L2, so the cases evicted each other between runs.
+ *
+ * The symptom was intermittent 5-19% spreads that appeared on the shortest loops only (control,
+ * cmov) and never on the longer ones (setcc, adc-chain) — because a loop with more compute per
+ * element has more work available to hide an L2 miss. That looked like scheduler jitter or an
+ * ISA-path difference; it was neither.
+ *
+ * Now 64 KB per array, 320 KB for all five together, comfortably inside a 512 KB L2 with room for
+ * the JIT's own footprint. N_INNER is raised proportionally so total work per timed repetition is
+ * unchanged.
+ */
+#define N_ELEMS   (1u << 13)   /* 64 KB of uint64 per array; 5 arrays = 320 KB, fits 512 KB L2 */
 #define N_REPS    7            /* timed repetitions per case; median reported */
-#define N_INNER   64           /* passes over the array per timed repetition */
+#define N_INNER   512          /* passes per timed repetition — keeps total ops at 1<<22 */
 
 static uint64_t now_ns(void) {
     struct timespec ts;
