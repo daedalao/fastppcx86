@@ -2144,14 +2144,14 @@ DEF_OP(Select) {
   // that CC names (CC.BI is an absolute CR bit index — CR0-relative 0..3
   // for every path through this op).
   //
-  // OPEN QUESTION — this op is NOT yet measured, unlike DEF_OP(NZCVSelect) below.
-  // NZCVSelect's constant form was reverted to a branch after bench_select showed isel losing 19%
-  // there: materialising a 0/1 that feeds a dependent chain is latency-bound, and isel puts its
-  // cmp->CR->isel latency directly on that chain where a branch stays off it. This op has the same
-  // shape when it feeds Select01 boolean materialisation, so it is a candidate for the same
-  // treatment — but there is no measurement for it yet, and the last two changes made on reasoning
-  // alone were both wrong. Measure before changing. If setcc does not return to roughly the
-  // flag-path improvement (~8.4 ns/op) after the NZCVSelect revert, this op is the remaining cause.
+  // SETTLED — keep isel here too, and do not make the constant form branchy.
+  // This op was flagged as a candidate for a branchy constant form on the same reasoning that
+  // motivated the NZCVSelect change below. That reasoning was wrong at the premise and the change
+  // was measured as a net 5.7 ns/op loss; see the comment in DEF_OP(NZCVSelect) for the numbers and
+  // for why the "constant form == SETcc" assumption does not hold. The argument transfers directly:
+  // a constant-form select on a data-dependent condition feeding pure dataflow is exactly where an
+  // unpredictable branch is worst. Unmeasured here, but there is now no hypothesis motivating the
+  // change, so leaving it alone is the position rather than the deferral it was before.
   //
   // Materialise inline constants into TMPs first (GetReg on an InlineConstant
   // returns garbage — same hazard the old code documented). TMP1 may have
@@ -2186,34 +2186,45 @@ DEF_OP(NZCVSelect) {
   const uint64_t all_ones = IROp->Size == IR::OpSize::i64Bit
     ? 0xFFFFFFFFFFFFFFFFull : 0xFFFFFFFFull;
 
-  // MEASURED: the constant form below stays BRANCHY; the register form below it uses isel.
+  // BOTH forms use isel. Do not make the constant form branchy — that was tried and measured, and
+  // it is a net loss. The history matters because the reasoning that motivated it was wrong at the
+  // premise, not merely wrong in degree.
   //
-  // This split is empirical, not stylistic. bench_select (build-probes/) on POWER9, clean harness,
-  // BEFORE/AFTER over this batch, medians with sub-1.5% spreads on both ISA paths:
+  // The claim was that the constant form is "the SETcc archetype", so a branch keeps isel's latency
+  // off a dependent chain. It is not. Grep `_NZCVSelect01`: SETccOp (OpcodeDispatcher.cpp) is ONE
+  // caller. The dominant caller is per-flag-bit materialisation in OpcodeDispatcher.h — the
+  // `!NZCVDirty` path that reconstructs a single RFLAGS bit (CF/OF/ZF) into a GPR — plus
+  // ConvertNZCVToX87. An IR dump of bench_select's `main` found 15 constant-form NZCVSelects against
+  // 3 register-form, and the constant-form conditions were UGE/ULT/SGT clustered around the compare
+  // sites: flag reconstruction, not SETcc.
   //
-  //     cmov  (register form)   18.31 -> 8.36 ns/op    -54%   isel wins
-  //     setcc (constant form)   15.24 -> 18.09 ns/op   +19%   isel LOSES
+  // That distinction decides the codegen. Flag-bit materialisation selects on a *data-dependent*
+  // condition and feeds pure dataflow, so a branch there is an unpredictable branch that buys
+  // nothing. Making these branchy cost, on bench_select over random data:
   //
-  // Both forms see genuinely data-dependent conditions, so mispredict rates are comparable. What
-  // differs is what consumes the result. The constant form is the SETcc archetype: it materialises
-  // a 0/1 that is immediately consumed by a dependent chain (typically movzx then an accumulate).
-  // isel costs latency 2 plus 3 cycles of CR-source forwarding *on that chain* (POWER9 UM Table
-  // A-1), where the branchy form puts the branch off the chain entirely and leaves only an `li`.
-  // Above roughly a 25-30% mispredict rate isel should still win — but the added latency lands on
-  // the critical path every iteration, while the mispredict cost is paid only on the misses.
+  //     cmov-unpredictable  8.20 -> 13.87 ns/op   +69%
+  //     control             7.69 -> 12.28 ns/op   +60%
+  //     adc-chain          19.53 -> 24.67 ns/op   +26%
+  //     setcc              17.88 ->  8.29 ns/op   -54%   (the one intended win)
+  //     cmov-predictable    8.21 ->  8.12 ns/op     0%   (predictable data — pays nothing)
   //
-  // The register form is the CMOVcc archetype, where the selected value is usually the chain rather
-  // than an input to it, so removing the mispredict dominates.
+  // Summed, branchy is 5.7 ns/op WORSE. The tell is cmov-predictable: same guest instruction
+  // sequence as cmov-unpredictable, differing only in whether its data makes the condition
+  // predictable, and it is the only case that did not regress. The penalty is ~5 ns/op ≈ 20 cycles,
+  // one POWER9 mispredict per iteration, and it is additive rather than proportional to op count.
+  //
+  // The setcc win is real but cannot be captured here, because at this level SETccOp and flag
+  // materialisation are indistinguishable — both arrive as NZCVSelect(cond, 1, 0). Capturing it
+  // needs a distinct IR op emitted only from SETccOp so this backend can lower that one branchy.
+  // Until that exists, isel everywhere is the better trade by a wide margin.
   if (is_const_true) {
     // Only forms generated by the IR frontend: (True=1, False=0) or (True=all_ones, False=0).
     LOGMAN_THROW_A_FMT(is_const_false && const_false == 0 &&
                          (const_true == 1 || const_true == all_ones),
                        "NZCVSelect: unsupported constant pair ({}, {})", const_true, const_false);
-    li(Dst, 0);
-    PPC64Emitter::Label Done{};
-    bc(InvertCond(CC), &Done);
-    li(Dst, const_true == all_ones ? -1 : 1);
-    Bind(&Done);
+    // isel's rA=0 encoding supplies a literal zero, so only the true value needs materialising.
+    LoadConstant(TMP1, const_true == all_ones ? ~0ull : 1);
+    iselcc(Dst, CC, TMP1, GPR{0});
     return;
   }
 
