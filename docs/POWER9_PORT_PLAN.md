@@ -80,11 +80,18 @@ assert will succeed trivially.
 2. Check the three SMC `mprotect` return values in release builds
    (`SyscallsSMCTracking.cpp:79`, `:174`, `:180`). A silently-ignored `mprotect` is a bad failure
    mode on any host.
-3. **Optional, arch-neutral:** round SMC `mprotect` ranges to `sysconf(_SC_PAGESIZE)` rather than to
-   `FEX_PAGE_SIZE`. This would make the tracker correct on a 64 KB host at the cost of
-   false-positive retranslations, and is worth considering because **a 4 KB Radix kernel is
-   non-default on every mainstream ppc64le distribution** — i.e. running POWER9 with 4 KB pages
-   means building a custom kernel. This item, not the page size itself, is the real decision.
+3. **Optional, arch-neutral, and not required here:** round SMC `mprotect` ranges to
+   `sysconf(_SC_PAGESIZE)` rather than to `FEX_PAGE_SIZE`, making the tracker correct on a 64 KB
+   host at the cost of false-positive retranslations.
+
+   A 4 KB Radix kernel is non-default on most mainstream ppc64le distributions, so this would
+   normally be a real decision. **It is not one for this project: the target POWER9 box already runs
+   a 4 KB kernel**, required by the GPU drivers (`amdgpu`'s TTM/GTT paths do not cope with 64 KB
+   pages, which is why 4 K is standard on Talos II / Blackbird graphics setups). FEX's implicit
+   4 KB-host prerequisite is therefore satisfied by a constraint that already exists for unrelated
+   reasons — and the same is very likely true of the original POWER8 machine, which independently
+   corroborates the refutation above. Item 3 is worth doing only as upstream-friendliness, not for
+   this deployment.
 
 ### Rival explanations for the Mono/Stardew spins, ranked
 
