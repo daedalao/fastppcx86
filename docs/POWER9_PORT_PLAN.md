@@ -104,7 +104,29 @@ anything. Keep it that way — prefer a runtime branch over `#ifdef` for ISA 3.0
 | `mtvsrdd`/`mfvsrld`, `xxbrq`, `vpermr`, `xxspltib`, insert/extract family, F16C converts | **power9-only** | |
 | binary128 for x87, `mffscrn`, `vcmpnezb`, `maddld`, `xststdc*`, EBB-bounded `wait` | **power9-only** | From [Additional opportunities](#additional-opportunities) |
 
-**The observation worth drawing from this table:** the two largest wins are split across the divide.
+### Overlap sites — implement once, gated, not twice
+
+Several code sites have **both** a `power8+power9` improvement and a better `power9-only` one. These
+should be written as a single runtime-gated function with two or three paths, not fixed twice.
+Listing them because doing the neutral fix first and the POWER9 one later means touching the same
+code twice and re-testing it twice.
+
+| Site | `power8+power9` path | `power9-only` path |
+|---|---|---|
+| `LoadUnalignedV128` / `StoreUnalignedV128` (`PPC64Emitter.cpp:285-318`) | `lxvd2x` + `xxpermdi` — **2 instructions** (ISA 2.06) vs the current 7 | `lxvx` — **1 instruction**, no fixup |
+| `LoadFPRSized` sub-16-byte (`PPC64Emitter.cpp:365-401`) | `lxsdx` / `lxsiwzx` (2.06 / 2.07) vs the current ~9 | adds `lxsd` / `lxssp` / `lxsibzx` / `lxsihzx` for full width coverage |
+| icache flush loop (`PPC64Dispatcher.cpp:643-645`) | 128 B stride, barriers hoisted out of the loop | one `sync; icbi; isync` for any range (UM §4.6.2.2) |
+| SETcc / CMOVcc lowering | `isel`, branch-free (ISA 2.03) | `setb` where the condition sits in LT/GT |
+| `RDRAND` | software PRNG helper (status quo) | `darn` |
+| AES / SHA / PCLMUL | `vcipher` / `vshasigma*` / `vpmsumd` (2.07), with `vperm`-based byte-order fixups | same instructions, but `xxbrq` replaces the `vperm` fixups |
+
+**The `lxvd2x` finding is the notable one.** The plan previously framed the 7-instruction bounce as
+having no POWER8 remedy, which was wrong: `lxvd2x` is ISA 2.06 and yields the doubleword-swapped
+image, so `lxvd2x` + `xxpermdi` reproduces the required register image in **2 instructions**. That
+recovers most of the win on POWER8 hardware, and makes the eventual `lxvx` change a one-instruction
+refinement of an already-good path rather than a cliff.
+
+**The observation worth drawing from the table above:** the two largest wins are split across the divide.
 `lxvx`/`stxvx` is POWER9-only, but `lqarx` containment — which fixes a real atomicity hole as well as
 removing a mutex from the hot path — is ISA 2.07 and would work on POWER8 today. A POWER8 bring-up
 would inherit that, the crypto work, `isel`, `vbpermq`, and every correctness fix in the ledger.
