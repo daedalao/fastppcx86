@@ -269,6 +269,16 @@ int main(void) {
     }
     report("setcc", samples, ops);
 
+    /* setcc-predictable: same JIT block as setcc, predictable data. If -predictable moves in step
+     * with its rnd twin between builds, the mechanism is NOT mispredict-sensitive; if they diverge,
+     * mispredicts on flag-materialisation are the mechanism. */
+    for (unsigned r = 0; r < N_REPS; ++r) {
+        uint64_t t0 = now_ns();
+        for (unsigned k = 0; k < N_INNER; ++k) { sink += bench_setcc(pred, N_ELEMS, THRESH); }
+        samples[r] = now_ns() - t0;
+    }
+    report("setcc-predictable", samples, ops);
+
     for (unsigned r = 0; r < N_REPS; ++r) {
         uint64_t t0 = now_ns();
         for (unsigned k = 0; k < N_INNER; ++k) { sink += bench_adc(addx, addy, addz, N_ELEMS); }
@@ -282,6 +292,14 @@ int main(void) {
         samples[r] = now_ns() - t0;
     }
     report("control", samples, ops);
+
+    /* control-predictable: same JIT block as control, predictable data. Same test as above. */
+    for (unsigned r = 0; r < N_REPS; ++r) {
+        uint64_t t0 = now_ns();
+        for (unsigned k = 0; k < N_INNER; ++k) { sink += bench_control(pred, N_ELEMS); }
+        samples[r] = now_ns() - t0;
+    }
+    report("control-predictable", samples, ops);
 
     printf("\nsink=%016lx (ignore; exists so nothing is optimised away)\n", (unsigned long)sink);
     printf("\nREADING THIS\n");
