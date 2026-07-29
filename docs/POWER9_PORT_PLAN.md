@@ -116,6 +116,80 @@ Fix: give the i64 inline-immediate paths in `AddWithFlags` / `SubWithFlags` (and
 `SubNZCV` equivalents, which are untested here but share the shape) an OV update, mirroring what the
 i32 path already does with its `addco_` redo.
 
+## Inherited assumptions to re-examine
+
+The port was written by mirroring the ARM64 backend, and upstream FEX's disabled-test registry and
+CPUID suppressions were calibrated on ARM64 hosts. **POWER9 has hardware ARM64 does not**, so a
+constraint inherited from that lineage is not evidence of a constraint here. Each item below is an
+assumption worth testing rather than adopting.
+
+### 1. The backend uses half the vector register file — `power8+power9`
+
+ISA 3.0C: "a set of **64** Vector-Scalar Registers (VSRs)" (Book I §6.2), with "the VRs mapped to
+VSRs 32-63" and the FPRs occupying doubleword 0 of VSRs 0-31.
+
+`FEXCore/Source/Interface/Core/JIT/PPC64LE/PPC64Emitter.h` allocates only VMX `v0`–`v31`
+(= VSR32–63): 16 `SRAFPR` for guest XMM0-15, 14 `RAFPR` dynamic (`v16`–`v29`), and `VTMP1`/`VTMP2` =
+`v30`/`v31`. **VSR0–31 are not used for vector work at all.** That is the ARM64 backend's 32-register
+NEON layout transplanted onto a 64-register machine.
+
+Consequences currently attributed to hardware that are actually this:
+
+- `// TODO: add Newton step once we have a third scratch VR available.` (`VectorOps.cpp:524`) —
+  reciprocal/rsqrt accuracy left on the table for want of a scratch register.
+- "only 2 free vector temps on POWER8" (`VSQSHL`, `VectorOps.cpp:1480`) — the PSIGN-adjacent cluster.
+- The per-lane scalar GPR loops in `VMul` i8 (~70 instructions, `:2386`) and `VSRSHR` (~160,
+  `:1416`), which fall back to scalar partly because there is nowhere to keep intermediates.
+
+**Caveat, and why this is not simply free.** VSR0–31 alias the FPRs, so they are only available to
+the extent the x87/scalar-float path is not using them. And VMX-form instructions (`vperm`,
+`vadduwm`, …) can only address VR0–31; reaching VSR0–31 requires the VSX-form encodings
+(`xxlor`, `xxperm`, `xvadduwm`-class). So exploiting it means preferring VSX forms in the emitter,
+which is a real but bounded piece of work. Even a partial win — say four more scratch registers —
+unblocks the Newton step and the worst of the scalar-loop fallbacks.
+
+**Next step:** audit which FPRs the x87 and scalar-float paths actually hold live across vector
+codegen, then extend `RAFPR`/`VTMP` into the free part of VSR0–31.
+
+### 2. x87 could be *better* on POWER9 than on ARM64 — `power9-only`
+
+`AT_HWCAP2` confirms `HAS_IEEE128` on the target. POWER9 has hardware binary128
+(`xsaddqp`/`xsmulqp`/`xsdivqp`); **ARM64 has no hardware quad-precision at all.** x87 extended is a
+64-bit mantissa; binary128 is 113. So the current choice — softfloat (accurate, slow) or the
+`X87_F64` reduced-precision mode (fast, 53-bit mantissa) — is an ARM64-shaped dilemma that POWER9
+does not necessarily share.
+
+Not automatically bit-exact: correctly-rounded double rounding through 113 bits to a 64-bit mantissa
+needs ≥130 bits in the general case. But it is *vastly* closer than F64, and fast. Worth measuring
+before accepting the reduced-precision path as the only fast option.
+
+This also reframes two inherited registry entries: `unittests/ASM/Disabled_Tests` disables
+`Test_X87/D9_F8.asm` with the comment "Relies on rounding correctness", and `D9_F2`/`D9_F9` with
+"Relies on undefined behaviour". Those were judged on hosts without hardware quad-precision.
+**Re-run them on a binary128 x87 path before assuming they must stay disabled.**
+
+### 3. Suppressed guest CPUID features — `unknown, needs re-examination`
+
+`VAES` is advertised false and `ADX` is suppressed (`CPUID.cpp:716`). The ADX suppression traces to
+a *frontend* bug (`39f664bd9`), not a missing facility. Neither suppression has been re-evaluated
+against POWER9. Similarly, AES/SHA/PCLMUL/CRC32 are advertised as supported but implemented via
+software helpers — on the strength of a comment (`JIT.cpp:88-92`) that is factually wrong about
+POWER8 lacking the hardware.
+
+### 4. The 5-register dynamic GPR pool — `power8+power9`
+
+x64-mode dynamic allocation is 5 GPRs (`r24`–`r26`, `r30`, `r31`; `PPC64Emitter.h:60-62`) against 32
+architectural GPRs, most of the rest being SRA-pinned or reserved. Whether that split is optimal for
+POWER9's dispatch width, or inherited from ARM64's register budget, has not been examined. The
+heavy-spill anecdote in `JITClass.h:90-94` suggests it is worth a look.
+
+### Method note
+
+When something is disabled, suppressed, or routed to a software helper, establish **why** before
+accepting it. The reasons so far have divided into three kinds: real ISA limits (which stand),
+ARM64-era assumptions (which may not), and factual errors in comments (`JIT.cpp:88-92` on POWER8
+crypto; `README.md:36` on PSIGN). Only the first kind is binding.
+
 ## Applicability ledger — keeping POWER8 recoverable
 
 This branch targets POWER9, but **most of the work identified is not POWER9-specific.** Restoring
