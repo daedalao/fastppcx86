@@ -3160,10 +3160,21 @@ DEF_OP(Yield) {
 
   // Hot path: lwz/addi/cmplwi/bc — 4 instructions until we either reach the
   // threshold or take the skip branch.
+  //
+  // Route the threshold compare through cr(7), NOT cr(0): x86 PAUSE must
+  // preserve flags, and CR0 is this backend's live packed-NZCV. Comparing into
+  // cr(0) destroyed ZF on every single PAUSE — `cmp`/`pause`/`setz` returned
+  // ZF=0 after a known-equal compare, 5000 times out of 5000. Any guest spin
+  // loop that evaluates its exit condition after the PAUSE (which is the
+  // ordinary shape: `pause; cmp; jne`) could therefore branch the wrong way.
+  // cr(7) is the established scratch field here — see BranchOps.cpp CondJump
+  // and the MonoBackpatcherWrite compares.
   lwz(TMP1, pc_off, STATE);
   addi(TMP1, TMP1, 1);
-  cmplwi(cr(0), TMP1, PAUSE_YIELD_LIMIT);
-  bc(CC_ULT, &skip_full_yield);
+  cmplwi(cr(7), TMP1, PAUSE_YIELD_LIMIT);
+  // BI = cr7 * 4 + LT(0) = 28; BO = 12 (branch when the bit is set).
+  constexpr PPC64Emitter::Cond CC_ULT_CR7 {12, 28};
+  bc(CC_ULT_CR7, &skip_full_yield);
 
   // Threshold reached. Reset counter to 0, then call PPC64_PauseSchedYield.
   li(TMP1, 0);
@@ -3195,6 +3206,17 @@ DEF_OP(Yield) {
   ld(r(0), 16, r1);
   mtlr(r(0));
   addi(r1, r1, 64);
+  // CRITICAL: restore the r0 == 0 zero-index invariant (c1ac6dac6). JIT blocks
+  // address guest memory as `ldx/stdx rX, rBase, r0`, so r0 must be 0 on every
+  // path back into guest code. The mflr/mtlr round-trip above parks the link
+  // register in r0 and leaves it there, so without this the next guest memory
+  // access computes rBase + <a code address> and SEGVs. Every other helper that
+  // routes LR through r0 already does this (EmitSplitLockHelperCall,
+  // EmitSplitLockCASCall, the dispatcher, MonoBackpatcherWrite, X87 FABI);
+  // Yield was the sole omission. Reproducer: a guest that merely executes
+  // PAUSE_YIELD_LIMIT PAUSE instructions dies with SIGSEGV on the first guest
+  // push after the threshold fires -- `stdx r3, r11, r0`, r11 being guest RSP.
+  li(r(0), 0);
   b(&end);
 
   // skip_full_yield: just store the incremented counter.
