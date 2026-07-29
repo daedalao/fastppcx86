@@ -6,19 +6,31 @@
  *
  *     guest stub -> marshalling -> host thunk -> native ppc64le RADV -> GPU
  *
- * WHY THIS IS A CLEAN SIGNAL
- * --------------------------
- * The discrimination is unusually sharp, because the two outcomes cannot be confused:
+ * READING THE RESULT — A DEVICE NAME ALONE PROVES NOTHING
+ * -------------------------------------------------------
+ * An earlier version of this comment claimed that seeing a real GPU name proved the thunk chain
+ * worked, on the reasoning that no x86_64 driver exists on this machine to produce one. **That was
+ * wrong, and it produced a false milestone.** The FEX rootfs ships a complete x86_64 Mesa,
+ * including libvulkan_radeon; the amdgpu kernel interface is architecture-blind; so guest-native
+ * Mesa, JITted by FEX, enumerates the real card perfectly well with the thunks completely
+ * bypassed. The exciting-looking output is identical either way.
  *
- *   * Thunk working    -> physical devices are enumerated and you see the real GPU, e.g.
- *                         "AMD Radeon RX 7900 XTX (RADV NAVI31)". Only the *host's* driver can
- *                         report that; there is no x86_64 driver on this machine to fake it.
- *   * Thunk NOT active -> the guest resolves the rootfs's own x86_64 libvulkan, which finds no
- *                         usable ICD, so vkCreateInstance fails with
- *                         VK_ERROR_INCOMPATIBLE_DRIVER or zero devices are enumerated.
+ * Check these three things instead — all of them are visible in this probe's own output:
  *
- * So a device name is proof of the whole chain, and its absence localises the failure without
- * needing a second experiment.
+ *   1. HANDLE SHAPE. With thunks active, the VkInstance/VkSurfaceKHR handles are *host* VAs
+ *      (0x3fff… on ppc64le). Guest-heap-shaped handles (0x4b1cf0) mean guest-native Mesa.
+ *   2. DEVICE COUNT. Guest-native Mesa enumerates both the AMD card and llvmpipe, because the
+ *      rootfs ships an x86_64 llvmpipe ICD. The host loader does not, so with thunks active you
+ *      should see the AMD card ONLY. Two devices is a red flag, not a bonus.
+ *   3. FEX_X11MANAGER_DEBUG=1 output, for the WSI probes. Silence means no overlay.
+ *
+ * PREREQUISITE THAT IS EASY TO MISS
+ * ---------------------------------
+ * The thunk overlay needs a ThunksDB.json in the FEX config directory — Data/ThunksDB.json is the
+ * source. Config.json's own "ThunksDB" section only carries enable/disable flags; the schema
+ * mapping "Vulkan" to libvulkan-guest.so and its overlay paths lives in that separate file
+ * (FileManagement.cpp:55). Without it ThunkOverlays stays empty, no dlopen is intercepted, and
+ * everything silently runs guest-native.
  *
  * Deliberately loads libvulkan by dlopen() rather than linking against it. That needs no link-time
  * library or dev package in the sysroot, and it exercises the same path a real application (and

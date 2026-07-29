@@ -921,6 +921,56 @@ suggested itself:
 3. **The values are already wrong on the guest side**, i.e. `dlsym`/`&CallbackUnpack<...>::Unpack` in
    the guest stub resolve to something unexpected under the thunked libX11.
 
+### Status 2026-07-29: the Xlib WSI failure does not reproduce with same-commit thunks
+
+**With guest and host thunk halves built together from one commit, `vkCreateXlibSurfaceKHR`
+succeeds and the cross-arch guest-callback path executes correctly.** Verified rather than inferred:
+
+```
+[X11Manager] GuestToHostDisplay(0x4094e0) #1  GuestXSync=0x3fffb70c8000
+             GuestXDisplayString=0x3fffb70c80a8  GuestXGetVisualInfo=0x3fffb70c8054
+Opening host-side X11 display: 0x4094e0 -> 0x3fffb6543000 (name=:1)
+        surface=0x3fffb642c500
+        device[0] AMD Radeon RX 7900 XTX (RADV NAVI31)  present-capable(qf0): YES
+```
+
+`GuestXSync` is non-null and holds a host trampoline VA — the correct wrapping, not the raw
+host-VA-in-`GuestUnpacker` shape `d91959d2f` describes. `GuestToHostDisplay` fires exactly once, for
+the one Xlib call the probe makes, and returns. The surface handle is a host VA.
+
+**Leading explanation: build provenance, not marshalling.** `README.md:59` records guest stubs being
+built on a separate x86_64 machine and copied back. That workflow's characteristic failure is the
+two halves drifting out of ABI sync — which is exactly what produces garbage in `GuestUnpacker`.
+Building both from one commit fixes it. This is now better supported than any of the marshalling
+hypotheses, and it retroactively explains why three plausible code-level candidates were all
+eliminated by reading.
+
+**Not yet established.** The probe creates a surface and queries presentation support; it does not
+build a swapchain, acquire an image, or present a frame. SuperTuxKart failed further along than
+this. Treat as "the first crossing is clean", not "Xlib WSI is fixed". Confirming needs a render
+loop, or STK itself.
+
+### Deployment prerequisite that cost a day: `ThunksDB.json`
+
+The thunk overlay requires **`ThunksDB.json` in the FEX config directory** (`Data/ThunksDB.json` is
+the source; read at `FileManagement.cpp:55`). `Config.json`'s own `ThunksDB` section carries only
+enable/disable flags — the schema mapping `"Vulkan"` to `libvulkan-guest.so` and its overlay paths
+lives in that separate file.
+
+**Without it, nothing fails.** `ThunkOverlays` stays empty, no `dlopen` is intercepted, and the
+guest silently loads the rootfs's own x86_64 Mesa, which FEX JITs natively. Since the amdgpu kernel
+interface is architecture-blind, that path enumerates the real GPU and creates working surfaces —
+producing output almost identical to a working thunk chain.
+
+Two probe results were initially recorded as milestones on this basis and were wrong. The tells that
+distinguish them, worth checking on any future thunk work:
+
+| Signal | Thunks active | Thunks bypassed |
+|---|---|---|
+| Handle shape | host VA, `0x3fff…` | guest heap, e.g. `0x4b1cf0` |
+| Devices enumerated | AMD only | AMD **and** llvmpipe (rootfs ships an x86_64 llvmpipe ICD; the host loader does not) |
+| `FEX_X11MANAGER_DEBUG=1` | `[X11Manager]` lines | silence |
+
 ### Recommended next step
 
 Breakpoint `fexfn_impl_libvulkan_Vulkan_SetGuestXSync` (`ThunkLibs/libvulkan/Host.cpp:71`) at entry
