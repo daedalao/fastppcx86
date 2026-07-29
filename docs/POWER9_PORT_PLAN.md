@@ -292,20 +292,25 @@ in a writable page and 8 in a `PROT_READ` page:
 
 Both harness controls behaved, and `stxvx` reported identically to the `std` bounce it would replace.
 
-**This is necessary but not sufficient, and the first write-up of it over-claimed.** FEX unprotects
-`AlignDown(si_addr, PAGE)` and re-executes, so the handler must also behave when the *first* page is
-protected, and must *converge* when both are — the retry after unprotecting the named page has to
-fault on the other page, not the same one, or the handler livelocks. `build-probes/probe_dar2.c`
-adds those cases:
+That case alone was necessary but not sufficient. FEX unprotects `AlignDown(si_addr, PAGE)` and
+re-executes, so the handler must also behave when the *first* page is protected, and must *converge*
+when both are — the retry after unprotecting the named page has to fault on the *other* page, not the
+same one, or the handler livelocks. `build-probes/probe_dar2.c` covers all of it, and **all cases
+pass**:
 
-| Case | Requirement |
+| Case | Result |
 |---|---|
-| B — second page protected | `si_addr` names page 2 — **confirmed** |
-| B′ — first page protected | `si_addr` must name page 1 — pending |
-| B″ — both protected | first fault names one page; after unprotecting exactly that page, the retry must name the **other** — pending |
-| E, E′ — same two directions for `lxvx` | pending |
+| B — second page protected | `si_addr` names page 2 ✓ |
+| B′ — first page protected | `si_addr` names page 1 ✓ |
+| B″ — both protected, first fault | names page 1 |
+| B″ — retry after unprotecting page 1 | names **page 2** ✓ — converges, no livelock |
+| E — `lxvx`, second page protected | page 2 ✓ |
+| E′ — `lxvx`, first page protected | page 1 ✓ |
+| D, F — harness controls | page 2 ✓ |
 
-Adoption is gated on all of these, not on B alone.
+**Conclusion: `si_addr` identifies the faulting page in every protection pattern, and the
+unprotect-and-retry loop converges.** Both the load and store paths can move from the
+7-instruction bounce to a single `lxvx`/`stxvx` with no change to the SMC fault handler.
 
 **Scope limit.** DAR content is an implementation property, not an architectural guarantee — Book III
 §7.2.3 requires only "an effective address associated with the storage access". A clean result on
@@ -859,13 +864,12 @@ storage error handler (DSISR bit 61). **Note the absence of a compare-and-swap-E
 
 ## Open questions needing hardware
 
-1. **`stxvx` cross-page DAR precision** — **partially answered.** The second-page-protected case is
-   confirmed precise (§2.1). The first-page-protected and both-protected-convergence cases are
-   pending `build-probes/probe_dar2`. Adoption is gated on all three. Residual, non-blocking:
-   whether a faulting `lxvx` partially writes VRT — the first attempt to measure this was unsound
-   (a `siglongjmp` restores callee-saved VRs and the compiler may spill a volatile one, so neither
-   answer is trustworthy); a valid measurement reads the VSX save area from `ucontext` inside the
-   handler.
+1. ~~**`stxvx` cross-page DAR precision**~~ — **ANSWERED 2026-07-28, all patterns pass** (§2.1),
+   including both-protected convergence. Subject only to the stated scope limit: gate adoption on a
+   runtime check rather than this measurement. Residual, non-blocking: whether a faulting `lxvx`
+   partially writes VRT — the first attempt to measure this was unsound (`siglongjmp` restores
+   callee-saved VRs and the compiler may spill a volatile one, so neither answer is trustworthy); a
+   valid measurement reads the VSX save area from `ucontext` inside the handler.
 2. **AMO latency/throughput vs `larx`/`stcx.`**, contended and uncontended.
 3. **Unaligned `lxvx` penalty boundaries** (64 B / 128 B / page crossings). The UM gives throughput
    (§25.1.7.9) but not crossing penalties.
