@@ -27,6 +27,7 @@ Headline conclusions, post-review:
 
 ## Contents
 
+- [Applicability ledger — keeping POWER8 recoverable](#applicability-ledger--keeping-power8-recoverable)
 - [Tier 0 — SMC hardening (theory refuted)](#tier-0--smc-hardening-theory-refuted)
 - [Tier 1 — POWER8-legal, available today](#tier-1--power8-legal-available-today)
 - [Tier 2 — POWER9-gated wins](#tier-2--power9-gated-wins)
@@ -43,6 +44,70 @@ Headline conclusions, post-review:
 - [Sources and method](#sources-and-method)
 
 ---
+
+## Applicability ledger — keeping POWER8 recoverable
+
+This branch targets POWER9, but **most of the work identified is not POWER9-specific.** Restoring
+POWER8 support later is not a current goal and is not on the critical path — but it is much cheaper
+to keep recoverable than to reconstruct, so every change carries an applicability tag from here on.
+
+### Tag convention
+
+Every commit that changes behaviour gets a trailer:
+
+```
+Applies-to: any-host | power8+power9 | power9-only
+```
+
+- **`any-host`** — nothing POWER-specific at all. Toolchain hygiene, upstream bugs, thunk/ABI
+  plumbing. Upstreamable to FEX as-is.
+- **`power8+power9`** — correct on both. Uses only facilities at ISA 2.07 or below, or fixes a
+  defect present on both. **This is the bulk of the work.** A POWER8 bring-up inherits all of it.
+- **`power9-only`** — requires ISA 3.0; must sit behind the `PPC_FEATURE2_ARCH_3_00` runtime gate so
+  a POWER8 host takes the existing path rather than a SIGILL.
+
+The same tag applies to entries in this document and to build-agent findings.
+
+**Design consequence:** because `power9-only` items are runtime-gated rather than compiled out, a
+POWER8 bring-up is mostly a matter of confirming the gate is honoured on every path, not of reverting
+anything. Keep it that way — prefer a runtime branch over `#ifdef` for ISA 3.0 facilities.
+
+### Ledger as it stands
+
+| Item | Tag | Note |
+|---|---|---|
+| `Allocator.cpp` include fix (`3c6877e31`) | **any-host** | Toolchain hygiene; not even POWER-specific |
+| Startup page-size assert, checked `mprotect` returns | **any-host** | Tier 0 hardening |
+| SMC `mprotect` rounding to host page size | **any-host** | Optional; only matters on a 64 K host |
+| Cross-arch thunk / Vulkan WSI callback work | **any-host** | ELFv2 and marshalling; identical on both |
+| Stale `XER.OV` on i64 inline-immediate arithmetic | **power8+power9** | The `addic_` path exists on both |
+| `HostFeatures.DCacheLineSize` 64 → 128 | **power8+power9** | Both have 128 B lines |
+| Split-lock mutex striping `addr >> 6` → 128 B | **power8+power9** | Reservation granule is 128 B on both |
+| icache flush loop: 32 B stride → 128 B, barriers out of the loop | **power8+power9** | The stride and interior-barrier fixes |
+| icache flush collapsed to one `sync; icbi; isync` for any range | **power9-only** | UM §4.6.2.2, `icbi`-as-NOP behaviour |
+| PAUSE / PPR hint with explicit `or 2,2,2` restore | **power8+power9** | PPR semantics not new in v3.0 |
+| `isel` for `CMOVcc` / selects | **power8+power9** | ISA 2.03 |
+| `vbpermq` + `mfvsrd` for `PMOVMSKB` | **power8+power9** | ISA 2.07 |
+| Hardware AES / PCLMUL / SHA (`vcipher`, `vpmsum*`, `vshasigma*`) | **power8+power9** | ISA 2.07 |
+| `xvcvspdp` / `xvcvdpsp` for CVTPS2PD/PD2PS | **power8+power9** | ISA 2.06 |
+| `mfocrf` / `mtocrf` over `mfcr` / `mtcrf` | **power8+power9** | ISA 2.01 |
+| `VExtr` N<16 → single `vsldoi` | **power8+power9** | ISA 2.03 |
+| `lqarx` / `stqcx.` containment for misaligned atomics | **power8+power9** | ISA 2.07 — the largest single win, and it is *not* POWER9 work |
+| CA save/restore via `addze` / `addic` | **power8+power9** | Base ISA |
+| Misaligned `CMPXCHG8B` routed through the split-lock helper | **power8+power9** | Correctness fix |
+| Scalar VSR loads `lxsdx` / `lxsiwzx` | **power8+power9** | ISA 2.06 / 2.07 |
+| Scalar VSR loads `lxsd` / `lxssp` / `lxsibzx` / `lxsihzx` | **power9-only** | Extends the above |
+| HWCAP2 host feature detection | **power8+power9** | The detection works on both; it is what *enables* gating |
+| `lxvx` / `stxvx` replacing the 7-instruction bounce | **power9-only** | The largest POWER9-gated win |
+| `mcrxrx`, CA32/OV32 flag rework | **power9-only** | |
+| `modsd`/`modud`, `cnttzd`/`cnttzw`, `setb`, `darn`, `extswsli`, `addex`, `cmprb`/`cmpeqb` | **power9-only** | |
+| `mtvsrdd`/`mfvsrld`, `xxbrq`, `vpermr`, `xxspltib`, insert/extract family, F16C converts | **power9-only** | |
+| binary128 for x87, `mffscrn`, `vcmpnezb`, `maddld`, `xststdc*`, EBB-bounded `wait` | **power9-only** | From [Additional opportunities](#additional-opportunities) |
+
+**The observation worth drawing from this table:** the two largest wins are split across the divide.
+`lxvx`/`stxvx` is POWER9-only, but `lqarx` containment — which fixes a real atomicity hole as well as
+removing a mutex from the hot path — is ISA 2.07 and would work on POWER8 today. A POWER8 bring-up
+would inherit that, the crypto work, `isel`, `vbpermq`, and every correctness fix in the ledger.
 
 ## Tier 0 — SMC hardening (theory refuted)
 
