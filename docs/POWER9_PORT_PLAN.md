@@ -147,6 +147,65 @@ about how FEX splits YMM operations. So:
   items in Tier 1 and Tier 2 are mostly of that character already; this is a reason to keep them
   ranked that way.
 
+### Measurement recipe — use this for every perf comparison from here on
+
+Established 2026-07-29 by a 3×-per-configuration sweep. **Use this configuration for any codegen or
+thunk performance work; numbers taken any other way are not comparable and mostly not meaningful.**
+
+```
+sudo ppc64_cpu --smt=2
+numactl --cpunodebind=0 --membind=0 FEX <workload>
+```
+
+vkmark medians, 3 runs each, node-pinned throughout:
+
+| SMT | CPUs | Median | Spread |
+|---|---:|---:|---:|
+| 4 | 64 | 8348 | 2579 (31%) |
+| **2** | **32** | **8730** | **5 (0.06%)** |
+| 1 | 16 | 3503 | 854 (24%) |
+
+NUMA variants at SMT2:
+
+| Config | Median | Spread |
+|---|---:|---:|
+| unpinned | 2997 | 811 (27%) |
+| `--membind=0` only | 4022 | 779 (19%) |
+| `--interleave=all` | 3842 | 1958 (51%) |
+| **`--cpunodebind=0 --membind=0`** | **8730** | **5 (0.06%)** |
+
+**Three things worth extracting.**
+
+**1. The 0.06% spread is the most valuable number here.** It means a 1% codegen change is
+measurable. Most emulation work is done on platforms where benchmark noise swamps individual
+optimisations; on this box, correctly configured, it does not. That makes the whole Tier 1/Tier 2
+ranking empirically checkable rather than argued.
+
+**2. Pinning both CPU and memory to one socket beats using both sockets**, and by a factor of ~2.9
+against unpinned. Node distance is 10/40, so cross-socket is 4×; with everything on one node the
+L2/L3 and memory paths are uniform and the scheduler has nothing to migrate. Halving the CPU pool
+from 64 to 32 threads costs far less than that migration was costing. This was initially dismissed
+as a confounded measurement — halving cores *and* localising memory at once — which was reasonable
+a priori and wrong empirically.
+
+**3. Single runs on this workload are actively misleading.** An earlier unpinned-SMT2 reading of
+5985 briefly looked like a stable result; that configuration's true median is 2997. The spread on
+badly-configured runs reaches 51%.
+
+**On the POWER8 comparison:** at 8730 the machine now exceeds the bank note's POWER8 figure of 7245,
+where the first badly-configured measurement (4694) looked like a 35% regression. Still not a clean
+CPU-to-CPU comparison — different GPUs, different Mesa, different rootfs, an Xwayland hop — but the
+apparent regression was entirely a configuration artefact.
+
+**Why SMT2 specifically** (mechanism, consistent with the data but not yet isolated): POWER9's SMT4
+core has four slices paired into two superslices, each providing 128-bit dataflow. At SMT2 each
+thread owns a full superslice — exactly one XMM register's width, with no sibling contention — which
+lines up with what an x86 SSE guest actually issues. At SMT4 two threads share each 128-bit
+datapath; at SMT1 a single guest thread cannot fill both superslices and three quarters of the
+machine's threads are discarded. Guest software is also tuned for 2-way SMT topologies, so thread
+pools and spin-backoff heuristics see a shape they were designed for. **Testable prediction:** the
+SMT2 advantage should be larger for vector-heavy guest code than scalar-heavy. Not yet measured.
+
 ### Using a 44-core machine well — AOT ahead, dedicated cores behind
 
 Vector units are core-private and there is no path to borrow another core's VSU: operands and
