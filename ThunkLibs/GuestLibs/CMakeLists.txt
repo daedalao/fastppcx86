@@ -32,6 +32,25 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   set(TARGET_TYPE SHARED)
   set(GENERATE_GUEST_INSTALL_TARGETS TRUE)
 
+  # Library headers (alsa, X11, libdrm, GL, wayland, ...) for the guest stubs.
+  #
+  # On an x86_64 host these come from the plain host /usr/include. Cross-building
+  # from a non-x86 host we must not read the native ones, and CMAKE_SYSROOT
+  # (the toolchain's libc/CRT sysroot) only carries libc and libstdc++. The dev
+  # rootfs is the thing that has the actual library headers, so point compiles at
+  # it as well -- thunkgen is already given it for parsing the interfaces.
+  if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
+    if (NOT EXISTS "${X86_DEV_ROOTFS}/usr/include")
+      message(FATAL_ERROR "X86_DEV_ROOTFS '${X86_DEV_ROOTFS}' has no usr/include")
+    endif()
+    include_directories(SYSTEM "${X86_DEV_ROOTFS}/usr/include")
+    foreach(_subdir drm libdrm wayland)
+      if (EXISTS "${X86_DEV_ROOTFS}/usr/include/${_subdir}")
+        include_directories(SYSTEM "${X86_DEV_ROOTFS}/usr/include/${_subdir}")
+      endif()
+    endforeach()
+  endif()
+
   # uninstall target
   if(NOT TARGET uninstall)
     configure_file("${FEX_PROJECT_SOURCE_DIR}/Data/CMake/cmake_uninstall.cmake.in"
