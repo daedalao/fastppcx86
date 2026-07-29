@@ -104,6 +104,57 @@ anything. Keep it that way — prefer a runtime branch over `#ifdef` for ISA 3.0
 | `mtvsrdd`/`mfvsrld`, `xxbrq`, `vpermr`, `xxspltib`, insert/extract family, F16C converts | **power9-only** | |
 | binary128 for x87, `mffscrn`, `vcmpnezb`, `maddld`, `xststdc*`, EBB-bounded `wait` | **power9-only** | From [Additional opportunities](#additional-opportunities) |
 
+### How the gate should be built
+
+FEX already has the machinery; the PPC side simply never used it. Follow the existing convention
+rather than inventing anything.
+
+**1. Add the feature flag.** `FEXCore/include/FEXCore/Core/HostFeatures.h` is a flat struct of
+`Supports*` bools consumed by the backend. Add `bool SupportsISA30 {};`. Name it by **ISA level, not
+by chip** — `PPC_FEATURE2_ARCH_3_00` is also set on POWER10, so `SupportsISA30` stays correct where
+`SupportsPOWER9` would not.
+
+**2. Detect it.** `Source/Common/HostFeatures.cpp` currently leaves ARM defaults in place for PPC
+(`:787-788`) — there is no PPC detection at all. Add a ppc64le branch reading
+`getauxval(AT_HWCAP2) & PPC_FEATURE2_ARCH_3_00`, and while there, take `DCacheLineSize` and
+`ICacheLineSize` from `AT_DCACHEBSIZE` / `AT_ICACHEBSIZE` rather than the wrong 64-byte fallback
+(measured 128 on the target — see [Confirmed on target hardware](#confirmed-on-target-hardware)).
+
+**3. Wire the override.** `Config.json.in:33` defines a `HostFeatures` strenum of `ENABLEX`/`DISABLEX`
+pairs, consumed by the `ENABLE_DISABLE_OPTION` macro at `HostFeatures.cpp:470-498`. Add
+`ENABLEISA30` / `DISABLEISA30` and one line:
+
+```cpp
+ENABLE_DISABLE_OPTION(SupportsISA30, ISA30, ISA30);
+```
+
+**4. Branch at emit time, not at run time.** FEX is a JIT, so the alternate path is selected while
+*generating* code:
+
+```cpp
+if (HostFeatures.SupportsISA30) {
+  lxvx(Dst, 0, Addr);                    // 1 instruction
+} else {
+  lxvd2x(Dst, 0, Addr);                  // 2 instructions, ISA 2.06
+  xxpermdi(Dst, Dst, Dst, 2);
+}
+```
+
+The emitted code contains no branch and pays nothing — the specialisation happens once per compiled
+instruction, not once per execution.
+
+**Why the override matters more than it looks.** `FEX_HOSTFEATURES=disableisa30` makes the POWER9
+machine emit the POWER8 path. That is the only reason "keep POWER8 recoverable" is a real claim
+rather than an aspiration: **there is no POWER8 hardware in this setup**, so without a force-off
+switch the neutral paths would bit-rot the moment they were written and nobody would know until a
+POWER8 bring-up years later.
+
+Concretely, it makes the ASM differential suite double as POWER8 coverage: run it once normally and
+once with `disableisa30`, and both paths at every overlap site are exercised on every change. That
+should be the standing regression procedure for anything in the table below, and it costs one extra
+suite run. `HostFeatures` also carries an `IsInstCountCI` flag, so `unittests/InstructionCountCI` can
+lock in the expected instruction count for *each* path and catch a silent regression to the slow one.
+
 ### Overlap sites — implement once, gated, not twice
 
 Several code sites have **both** a `power8+power9` improvement and a better `power9-only` one. These
