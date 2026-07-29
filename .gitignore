@@ -13,3 +13,6 @@ out/
 .cache
 .idea/
 CMakeLists.txt.user
+
+# Reference documentation (large binaries, not redistributable here)
+docs/*.pdf
