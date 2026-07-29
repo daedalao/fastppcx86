@@ -182,12 +182,39 @@ single node (`numactl --cpunodebind=0 --membind=0`) is a one-command experiment 
 matters more than several of the codegen items in Tier 2. Worth running early for the same reason
 the SMT sweep is: it costs minutes and calibrates everything measured afterwards.
 
-**4. Guest-visible core count is a hazard at this scale.** FEX reports host core count through CPUID
-(`1ea60a763` counts `/sys/devices/system/cpu/online`), so a guest could see 176 CPUs. Game engines
-routinely size thread pools or allocate per-core structures from that number and some behave badly at
-that scale — over-subscription, excessive memory, occasional outright failure. **If a title
-misbehaves in a way that resembles thread-pool sizing, cap what FEX advertises before investigating
-anything deeper.** Recorded so it is not mistaken for a JIT defect.
+**4. Guest-visible core count is a hazard at this scale, in two distinct ways.** FEX reports host
+core count through CPUID (`1ea60a763` counts `/sys/devices/system/cpu/online`), so a guest sees
+**logical** CPUs — 176 on this machine.
+
+*Oversubscription:* engines routinely size thread pools or allocate per-core structures from that
+number, and some behave badly at 176 — excessive memory, thrashing, occasional outright failure.
+
+*The subtler and more likely one — asking for cores and receiving threads.* A guest that requests 8
+"cores" can be placed on 8 SMT siblings occupying **2 physical cores**, taking a quarter of the
+execution resources it believes it has while 42 physical cores idle. Linux's scheduler is SMT-aware
+and prefers idle physical cores first, so the pathological packing is not the default — but it is not
+guaranteed under load, and nothing makes it visible when it happens.
+
+**This penalises FEX more than native code.** SMT pays off when threads stall on memory and siblings
+fill each other's dead cycles. JIT-emitted code is more instruction-dense per unit of guest work, so
+siblings contend on issue queues, reservation stations and rename resources instead — the regime
+where SMT gives least.
+
+Mitigations, cheapest first:
+
+- **Run at SMT1.** This makes the topology honest: 44 logical CPUs = 44 physical cores, every guest
+  thread lands on a full core, and no affinity work is needed. For a game, 44 real cores is not the
+  binding constraint. This is the recommended default until measurement says otherwise.
+- **Or pin one thread per physical core.** `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`
+  gives the grouping; pin to one sibling from each. More flexible, more fiddly, only worth it if the
+  guest genuinely wants more threads than there are physical cores.
+- **Consider what FEX advertises.** Reporting *physical* rather than logical core count on
+  high-SMT hosts would let naive `sysconf(_SC_NPROCESSORS_ONLN)`-style sizing produce a sane answer
+  by itself. Accurately reporting topology (44 cores × 4 threads) is the more correct fix, but only
+  helps guests that read topology rather than a flat count — which many do not. Worth deciding
+  deliberately rather than inheriting the logical count by default.
+
+Recorded so none of this is mistaken for a JIT defect.
 
 ### QEMU TCG as a reference — useful, with a hard licensing boundary
 
