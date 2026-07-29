@@ -40,6 +40,13 @@ option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
 set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
 set(X86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
 set(X86_DEV_ROOTFS "/" CACHE FILEPATH "Path to the sysroot used for cross-compiling for i686 and x86_64")
+# Cross-toolchains keep libstdc++ headers beside the compiler rather than inside the sysroot, so
+# X86_DEV_ROOTFS alone finds libc but not <type_traits>. Point this at the toolchain root (the
+# directory containing lib/gcc/<triple>/<version>) and clang will locate both.
+set(X86_DEV_GCC_TOOLCHAIN "" CACHE FILEPATH "Optional GCC cross-toolchain root passed to clang as --gcc-toolchain when generating thunks")
+# 32-bit thunks require an i686 multilib sysroot in addition to the x86_64 one. Hosts that only have
+# a 64-bit cross-toolchain can disable them; nothing 64-bit-guest-only depends on these.
+option(BUILD_THUNKS_32BIT "Build the 32-bit guest thunk libraries" ON)
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 
@@ -671,10 +678,12 @@ if (BUILD_THUNKS)
         "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
         "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+        "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
 
+    if (BUILD_THUNKS_32BIT)
     ExternalProject_Add(guest-libs-32
       PREFIX guest-libs-32
       SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
@@ -689,9 +698,11 @@ if (BUILD_THUNKS)
         "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
         "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+        "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
+    endif()
 
     install(
       CODE "message(\"-- Installing: guest-libs\")"

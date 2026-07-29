@@ -71,12 +71,42 @@ function(generate NAME SOURCE_FILE)
 
   file(MAKE_DIRECTORY "${OUTFOLDER}")
 
+  # Target selection for thunkgen's clang parse. The header search path is
+  # supplied one of two ways:
+  #
+  #  * X86_DEV_ROOTFS == "/" (the default): fall back to Debian/Ubuntu's
+  #    multilib convention, /usr/{i686,x86_64}-linux-gnu/include/. This is the
+  #    historical behaviour and is preserved for hosts that provide it.
+  #
+  #  * X86_DEV_ROOTFS set to a real sysroot: pass --sysroot instead. Required on
+  #    any host that does not ship Debian's multilib layout — e.g. Arch, and
+  #    every non-x86 host cross-building these, where those paths simply do not
+  #    exist and clang silently falls through to the *host* glibc's
+  #    /usr/include/gnu/stubs.h, which then #includes a gnu/stubs-32.h that is
+  #    not present. The resulting error names stubs-32.h and looks like a
+  #    missing 32-bit package rather than a wrong search path.
+  #
+  # X86_DEV_GCC_TOOLCHAIN is separate and usually also needed with a sysroot: a
+  # cross-toolchain keeps its libstdc++ headers beside the compiler rather than
+  # inside the sysroot, so --sysroot alone finds libc but not <type_traits>.
   if (BITNESS EQUAL 32)
     set(BITNESS_FLAGS "-for-32bit-guest")
-    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu" "-isystem" "/usr/i686-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu")
+    set(_FALLBACK_ISYSTEM "/usr/i686-linux-gnu/include/")
   else()
     set(BITNESS_FLAGS "")
-    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu" "-isystem" "/usr/x86_64-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu")
+    set(_FALLBACK_ISYSTEM "/usr/x86_64-linux-gnu/include/")
+  endif()
+
+  if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
+    list(APPEND BITNESS_FLAGS2 "--sysroot=${X86_DEV_ROOTFS}")
+  else()
+    list(APPEND BITNESS_FLAGS2 "-isystem" "${_FALLBACK_ISYSTEM}")
+  endif()
+
+  if (X86_DEV_GCC_TOOLCHAIN)
+    list(APPEND BITNESS_FLAGS2 "--gcc-toolchain=${X86_DEV_GCC_TOOLCHAIN}")
   endif()
 
   add_custom_command(
