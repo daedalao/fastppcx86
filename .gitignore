@@ -8,6 +8,10 @@ Config.json
 # ...but the build-agent docs are not build output
 ![Dd]ocs/build-agent.md
 ![Dd]ocs/build-agent-notes.md
+# ...and probe sources are worth keeping; their binaries are not
+!build-probes/
+build-probes/*
+!build-probes/*.c
 [Bb]in/
 out/
 .vscode/
