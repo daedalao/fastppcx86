@@ -30,6 +30,7 @@ Headline conclusions, post-review:
 - [Tier 0 — SMC hardening (theory refuted)](#tier-0--smc-hardening-theory-refuted)
 - [Tier 1 — POWER8-legal, available today](#tier-1--power8-legal-available-today)
 - [Tier 2 — POWER9-gated wins](#tier-2--power9-gated-wins)
+- [The graphics path (architecture-neutral)](#the-graphics-path-architecture-neutral)
 - [Bugs found in the current backend](#bugs-found-in-the-current-backend)
 - [Negative results](#negative-results)
 - [Additional opportunities](#additional-opportunities)
@@ -350,6 +351,140 @@ flag-producing op. It is safe only because real ADX sequences generate no interv
 correct but fragile; document the invariant explicitly.
 
 ---
+
+## The graphics path (architecture-neutral)
+
+This section is not POWER9 work. It is here because it is **the highest-value open problem in the
+repository**, because it gates the Proton/Vulkan use case, and because until now it existed only
+inside one commit message (`d91959d2f`) — and this project has already lost most of its design notes
+that way.
+
+### Why this matters more than the OpenGL blockers
+
+Proton renders through Vulkan: DXVK for D3D9/10/11, VKD3D-Proton for D3D12. Native OpenGL titles are
+a shrinking minority. The port's per-game OpenGL callback grind (Grimrock's `glXChooseVisual`, the
+libGL unpacker registrations) is real work, but it is not on the critical path for a Proton-oriented
+goal. **The Vulkan WSI callback bug is.**
+
+### Established state (crash matrix, 2026-05-18, at `ff80fcc8a`)
+
+| Test | WSI | Outcome |
+|---|---|---|
+| vkcube | XCB | works, 30 frames |
+| vkmark --winsys xcb | XCB | works, score 7245 |
+| glxgears | libGL | 60 FPS (callback never fired) |
+| SuperTuxKart --render-driver=vulkan | Xlib | SEGV, PC=0 in XSync callback |
+| vkmark (auto → wayland) | Wayland | SEGV, PC=0 in `wl_listener` |
+
+**Vulkan itself works.** A vkmark score of 7245 means guest x86_64 → thunk → native ppc64le
+RADV → GPU is a functioning pipeline. This is not a "Vulkan is unsupported" situation; it is a single
+defect in one code path.
+
+### Root cause as recorded
+
+`X11Manager::GuestToHostDisplay` → `CallbackUnpack::CallGuestPtr` → `InstanceInfo.CallCallback`
+(`FEX::HLE::CallCallback`) sets guest RIP from `InstanceInfo.GuestUnpacker`, which contains a **host
+VA** (0x3fff… range, inside `libvulkan-host.so`) rather than a guest x86_64 address. The JIT fetches
+from unmapped memory and lands at PC=0.
+
+libGL and libvulkan store identical-pattern garbage in their `GuestUnpacker`/`GuestTarget` slots, so
+**one bug is shared across thunk libraries**. The author's conclusion, which the eliminations below
+support: *the trampoline template is structurally correct and mirrors ARM64; the corruption is in the
+data flow at registration time, not the dispatch mechanism.*
+
+XCB survives only because it never registers a guest callback through
+`MakeHostTrampolineForGuestFunctionAt` — its sole cross-arch translation is `GuestToHostConnection`
+(an opaque `xcb_connection_t*`), which is data, not a callable address. **XCB is not "the WSI that
+works"; it is the WSI that never exercises the bug.**
+
+### Registration data flow
+
+Guest side (`ThunkLibs/libvulkan/Guest.cpp:113-115`) passes two plain guest VAs:
+
+```c
+fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"),
+                                (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
+```
+
+Host side (`ThunkLibs/libvulkan/Host.cpp:67-77`, mirrored at `ThunkLibs/libGL/libGL_Host.cpp:82-94`)
+receives them and calls `MakeHostTrampolineForGuestFunctionAt`
+(`ThunkLibs/include/common/Host.h:821`), which forwards to
+`FEX::HLE::MakeHostTrampolineForGuestFunction` (`Source/Tools/LinuxEmulation/Thunks.cpp:389`) with
+`HostPacker = &CallbackUnpack<FuncType>::CallGuestPtr`.
+
+**Note the coincidence that makes this diagnosable:** `HostPacker` is *legitimately* a host VA inside
+the host thunk library — exactly the value pattern observed in the `GuestUnpacker` slot. Any
+off-by-one-field read, or any argument-order error, would present precisely this symptom.
+
+### Hypotheses eliminated (2026-07-28)
+
+The author's parting note proposed two candidates. Both are now excluded, along with a third that
+suggested itself:
+
+1. **`host_layout<uintptr_t>` mangles the values in transit — ELIMINATED.** The primary
+   `host_layout<T>` template (`ThunkLibs/include/common/Host.h:251-279`) is a plain value copy
+   (`data {from.data}`) for integral types. Pointer translation lives only in the `host_layout<T*>`
+   specialisations (`:304`, `:346`, `:365`), which `uintptr_t` does not select. The values are not
+   transformed by the layout machinery.
+2. **Argument-order / aggregate-init error in the trampoline construction — ELIMINATED.**
+   `TrampolineInstanceInfo` (`Thunks.cpp:145-150`) is populated with *designated* initialisers
+   (`Thunks.cpp:454-455`), so the fields cannot be transposed. The nearby
+   `GuestcallInfo gci = {GuestUnpacker, GuestTarget}` (`Thunks.cpp:394`) looks like a two-initialiser
+   aggregate against the four-field `GuestcallInfo` in `Host.h:78`, but it is a **different, local
+   two-field struct** (`Thunks.cpp:176-181`) used only as a dedup map key. Not a bug; do not "fix" it.
+3. **The hardcoded PPC64LE `InstanceInfo` offset is wrong — ELIMINATED.** `GetInstanceInfo`
+   (`Thunks.cpp:94-112`) hardcodes offset 40 on PPC64LE because assembler padding makes the
+   `Length - sizeof(info)` derivation invalid (the bug `f34dbdb9d` fixed). The asm is 10 instructions
+   × 4 bytes = 40, and `addi r11, r12, 32` with `r12` = label1 = template+8 lands exactly on the
+   `.quad` at +40. Consistent. *(The comment at `Thunks.cpp:84` saying "12 insns = 48 bytes of code"
+   is stale — the arithmetic that matters is right, the prose is not. Worth correcting so the next
+   reader does not chase it.)*
+
+### Remaining candidates, ranked
+
+1. **A stale or ABI-mismatched `libvulkan-guest.so` in the rootfs.** The guest stubs cross-compile to
+   x86_64, and the README records that the cross-sysroot is incomplete, so guest stubs are "typically
+   built on a native x86_64 host and copied back." If the deployed guest stub predates a signature or
+   packing change on the host side, the two `uintptr_t` arguments could be unpacked from the wrong
+   offsets, yielding exactly this garbage. **Check first — it is the cheapest to falsify:** rebuild
+   the guest stubs from the current tree and confirm the deployed `.so` matches.
+2. **The TLS side-channel is written per-dispatch and read later.** On PPC64LE the trampoline writes
+   `&InstanceInfo` into `__fex_callback_guestcall_ptr` (`Thunks.cpp:68-76`, commit `62ea24ce4`) before
+   `bctr`, and the host thunk library reads it back through the exported
+   `FEX_GetCallbackGuestcallPtr` getter — one PLT call later. Between the `std` and that read, the
+   host packer runs and itself calls PLT-resolved functions. **Any nested or reentrant trampoline
+   dispatch in that window overwrites the TLS slot**, and the outer callback then reads the inner
+   callback's `InstanceInfo`. This is a structural difference from x86/ARM, which pass the pointer in
+   a register (r11/x11) with no shared mutable state. It does not obviously produce a *host* VA in
+   the `GuestUnpacker` field, but it is a real reentrancy hazard on this path and should be ruled out.
+3. **The values are already wrong on the guest side**, i.e. `dlsym`/`&CallbackUnpack<...>::Unpack` in
+   the guest stub resolve to something unexpected under the thunked libX11.
+
+### Recommended next step
+
+Breakpoint `fexfn_impl_libvulkan_Vulkan_SetGuestXSync` (`ThunkLibs/libvulkan/Host.cpp:71`) at entry
+and print both `uintptr_t` arguments. That single observation partitions the search:
+
+- **Already host VAs at entry** → the defect is guest-side or in the generated unpacking
+  (`ThunkLibs/HostLibs/gen_64/thunkgen_host_libvulkan.inl:fexfn_unpack_*`); candidate 1 or 3.
+- **Correct guest VAs at entry** → the defect is downstream, in trampoline construction or in the TLS
+  side-channel; candidate 2.
+
+Then dump `GetInstanceInfo(trampoline)` immediately after `MakeHostTrampolineForGuestFunction`
+returns, and again at first dispatch, to see whether the slot is correct at construction and
+corrupted later.
+
+### Why this is worth doing before the POWER9 work
+
+It is one defect, shared across libGL and libvulkan, with a functioning Vulkan pipeline already
+demonstrated behind it. Fixing it plausibly unblocks Xlib WSI, Wayland WSI, and a substantial share
+of the per-game OpenGL callback registrations simultaneously. Note that Wine's `winex11.drv` requests
+Xlib surfaces for `winevulkan` (**verify against the target Proton build**) — if that holds, the Xlib
+WSI is not an alternative path but *the* path for Proton.
+
+Independent of this bug, Steam carries its own deferred blocker cluster: TLS handshake failure on its
+bundled OpenSSL 1.1, a `ThreadStateObject` UAF in `DestroyThread` currently mitigated by a deliberate
+leak (`f78e0613d`), and NoExec waves. Those are separate problems from WSI.
 
 ## Bugs found in the current backend
 
