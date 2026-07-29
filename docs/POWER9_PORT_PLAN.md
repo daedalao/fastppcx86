@@ -45,6 +45,77 @@ Headline conclusions, post-review:
 
 ---
 
+## Baseline — ASM differential suite
+
+Established 2026-07-28 on the target, at `9bb4fd525` + the `Allocator.cpp` include fix. **This is the
+reference for every codegen change from here on.** Full build is ~1 m 45 s, full suite 38.5 s at
+`-j128`, so the edit-build-test loop is about two minutes.
+
+| | Count |
+|---|---:|
+| ctest cases | **7011** — 2224 unique `.asm` × 3 JIT modes (`jit_1`, `jit_500`, `jit_500_m`), + 273 CodeEmitter + 66 misc unit tests |
+| Passed | **6978** |
+| Failed | **9** — 3 unique files × 3 modes |
+| Skipped at ctest runtime | **24** — 8 unique files × 3 modes, all registry-driven |
+| Excluded at cmake configure | 31 — `Test_verify_LinuxSyscalls` + `ThunkGen.*` per `cb3851cb4` |
+
+### The three failing files
+
+| File | Tag | Status |
+|---|---|---|
+| `FEX_bugs/add_sub_inline_imm_of.asm` | `power8+power9` | **Ours, expected.** Reproduces the stale `XER.OV` defect — see below |
+| `FEX_bugs/32bit_syscall.asm` | `any-host` | Upstream capture test (`4f028b861`) for a genuinely unimplemented path: "Trying to execute 32-bit syscall from a 64-bit process". Not in `Known_Failures`, so it presents as a live failure. **Leave it visible** — it is a real gap, and this document is a better place to remember it than a registry entry that diverges from upstream |
+| `X87_F64/D9_F0_02_F64.asm` | `power8+power9` | 2-ULP divergence, not a codegen defect — see below |
+
+### The PSIGN baseline no longer reproduces
+
+`README.md:36` claims 11213 diffs clean on POWER8 "except 6 SSSE3 PSIGN cases (tracked, deferred)".
+**All PSIGN cases now pass** — the SSSE3 and VEX variants alike. Either POWER9 fixed them or they
+were fixed in-tree since the README was written; distinguishing the two is not on the critical path.
+Either way the README's figure is stale and should not be used as a comparison point.
+
+Note also that the README's "31 skipped" and the suite's 24 runtime skips are **different
+mechanisms** — 31 are excluded at cmake configure time by `cb3851cb4` and never become ctest cases;
+24 are runtime skips driven by `unittests/ASM/Disabled_Tests` and friends. Both figures are correct
+and they do not overlap.
+
+### `D9_F0_02_F64` — a calibration divergence, not a bug
+
+The failure is `0x3fda827999fcef34` against an expected `0x3fda827999fcef32` — **exactly 2 ULP** in
+the mantissa. Cause: PPC64LE does **not** JIT-inline this operation. `DEF_OP(F64F2XM1)`
+(`VectorOps.cpp:5005`) calls out to the C helper `F64F2XM1Impl` (`:4872`), which is
+`std::exp2(x) - 1.0` — i.e. glibc's `exp2` on ppc64le. The expected value was calibrated against
+ARM64's lowering. Both results are equally valid approximations.
+
+The framing matters: `X87_F64` is *by definition* the reduced-precision x87 mode, a deliberate
+accuracy trade. Demanding bit-exact agreement across ISAs in a mode whose premise is approximation
+is the wrong bar. Treat as expected-divergent and leave it. If it ever becomes noisy, the fix is a
+tolerance in the harness or a per-host expected value — **not** backend work.
+
+### Confirmed: stale `XER.OV` on i64 inline-immediate arithmetic
+
+`add_sub_inline_imm_of.asm` reproduces cleanly and unambiguously across all three JIT modes:
+
+| Probe | Expected | Measured | |
+|---|---|---|---|
+| R8 — i64 inline-imm ADD must set OF | 1 | **0** | fail |
+| R9 — i64 inline-imm ADD must clear OF | 0 | **1** | fail |
+| R10 — i64 inline-imm SUB must set OF | 1 | **0** | fail |
+| R11 — i64 inline-imm CMP must set OF | 1 | **0** | fail |
+| R12 — i64 inline-imm SUB must clear OF | 0 | **1** | fail |
+| R13 — CONTROL, register-operand ADD | 1 | 1 | **pass** |
+| RAX — CONTROL, 32-bit inline-imm ADD | 1 | 1 | **pass** |
+
+Both controls pass, so the harness is sound and the defect is localised to the i64 inline-immediate
+path. **The measured pattern is precisely "OF passes through unchanged":** every probe primed to
+OF=0 read 0, every probe primed to OF=1 read 1. That characterisation is only available because the
+priming survives optimisation — the `seto` after each priming add, added on adversarial review, is
+what makes the result diagnostic rather than merely red.
+
+Fix: give the i64 inline-immediate paths in `AddWithFlags` / `SubWithFlags` (and the `AddNZCV` /
+`SubNZCV` equivalents, which are untested here but share the shape) an OV update, mirroring what the
+i32 path already does with its `addco_` redo.
+
 ## Applicability ledger — keeping POWER8 recoverable
 
 This branch targets POWER9, but **most of the work identified is not POWER9-specific.** Restoring
