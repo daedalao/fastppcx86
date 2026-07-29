@@ -921,7 +921,53 @@ suggested itself:
 3. **The values are already wrong on the guest side**, i.e. `dlsym`/`&CallbackUnpack<...>::Unpack` in
    the guest stub resolve to something unexpected under the thunked libX11.
 
-### Status 2026-07-29: the Xlib WSI failure does not reproduce with same-commit thunks
+### Status 2026-07-29: the entire `d91959d2f` crash matrix was an artefact. All three WSIs work.
+
+| WSI | `d91959d2f` (POWER8) | Now | What it actually was |
+|---|---|---|---|
+| xcb | works | works | — |
+| Xlib | SEGV, PC=0 in XSync cb | **works**, `vkcube --wsi xlib` renders | thunk halves built separately, out of ABI sync |
+| Wayland | SEGV, PC=0 in `wl_listener` | **works**, 16 surface formats enumerated | `WaylandClient` thunk simply not enabled |
+
+Neither was a marshalling or codegen defect. Both were configuration and build provenance.
+
+**One root cause plausibly explains the whole matrix.** The bank note's own reasoning for why xcb
+survived is the key: *"XCB WSI never registers a guest callback through
+`MakeHostTrampolineForGuestFunctionAt`; its only cross-arch translation is `GuestToHostConnection`,
+which is opaque-pointer data, not a callable address."* If guest-callback registration was broken —
+because the guest stub and host thunk disagreed about layout — then **exactly the WSI that avoids
+callbacks would work, and the two that use them would not.** That is the observed matrix, and it
+falls out of a single defect rather than three.
+
+Fix the provenance and all three work. Measured, not inferred:
+
+```
+[X11Manager] GuestToHostDisplay(0x4094e0) #1  GuestXSync=0x3fffb70c8000
+        surface=0x3fffb642c500          <- host VA
+        device[0] AMD Radeon RX 7900 XTX (RADV NAVI31)  present-capable: YES
+
+W2: wl_display=0x3fff8d4a7a80            <- host VA, was 0x42b290 (guest heap)
+W7: vkGetPhysicalDeviceSurfaceFormatsKHR -> 16 surface formats  (previously a core dump)
+```
+
+**Implication for the rest of the README's status table.** SuperTuxKart, Legend of Grimrock and the
+per-game callback-signature grind (`58973e69e`, `017ebd9f8`, `3caaf4a6e`, `0f17626ac`) were all
+diagnosed under the same conditions — mismatched thunk halves, and in some cases thunks not enabled
+at all. **Those entries should be re-tested before any of them is treated as a real defect.** The
+"open-ended per-game signature registration grind" described in the archaeology may be substantially
+smaller than recorded, or may not exist.
+
+Two deployment requirements that produced these symptoms, both easy to miss and neither of which
+errors when absent:
+
+1. **Guest stubs and host thunks must be built from the same commit.** `README.md:59` describes
+   building guest stubs on a separate x86_64 machine and copying them back — that workflow's
+   characteristic failure is exactly this.
+2. **`ThunksDB.json` must exist in the FEX config directory**, and the specific thunk must be
+   enabled. Without the file nothing is overlaid at all; without the entry, that library runs
+   guest-native and passes raw guest pointers to host drivers.
+
+### Superseded: the Xlib WSI failure does not reproduce with same-commit thunks
 
 **With guest and host thunk halves built together from one commit, `vkCreateXlibSurfaceKHR`
 succeeds and the cross-arch guest-callback path executes correctly.** Verified rather than inferred:
@@ -1086,6 +1132,29 @@ Considered and rejected: `stop` (privileged), DFP/BCD/`vmul10*` (no x86 analogue
 `scv` (the backend emits no raw `sc`; glibc ≥2.33 already uses it).
 
 ---
+
+## Repo hazard: there are two `PPC64Emitter.cpp` and one of them is dead
+
+**`FEXCore/Source/Interface/Core/JIT/PPC64LE/PPC64Emitter.{cpp,h}` is not compiled.**
+`FEXCore/Source/CMakeLists.txt:40` builds `Interface/Core/ArchHelpers/PPC64Emitter.cpp`, and every
+consumer — `JITClass.h`, `PPC64Dispatcher.h`, and the stale file itself — includes the ArchHelpers
+header. The `JIT/PPC64LE` pair is a duplicate from the `e1f83d4c4` snapshot that has never been part
+of the build.
+
+**This has already cost real effort twice.** Line citations in §2.1 and the overlap-sites table were
+taken against the stale copy, as was an adversarial reviewer's analysis "proving" the red-zone stack
+slot at `r1-16` was 16-byte aligned. The live code had already moved that bounce to
+`STATE+JITScratch`, because the `r1` red-zone approach faulted at stack-mapping boundaries — ELFv2
+has no red zone in the sense that code assumed.
+
+The *conclusions* survive (the live bounce also faults on the guest EA via `ld`/`std`, so the DAR
+measurements still apply) but every line number in this document referring to
+`JIT/PPC64LE/PPC64Emitter.cpp` should be read as `ArchHelpers/PPC64Emitter.cpp`.
+
+**Editing the stale file is a silent no-op.** Anyone modifying the PPC64 emitter must confirm they
+are in `ArchHelpers/`. Deleting the duplicate is the obvious fix, deliberately deferred so it does
+not land in the same test cycle as the first codegen changes — a build break and a codegen change
+arriving together would confound each other.
 
 ## Traps and invariants
 
