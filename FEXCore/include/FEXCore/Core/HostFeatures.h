@@ -43,6 +43,13 @@ struct HostFeatures {
   bool SupportsSSE4a {};
   bool SupportsMOPS {};
 
+  // Power ISA v3.0 (POWER9 and later). Named by ISA level rather than by chip:
+  // PPC_FEATURE2_ARCH_3_00 is also set on POWER10, so SupportsPOWER9 would be wrong there.
+  // Gates every ISA 3.0 codegen path in the PPC64LE backend so a POWER8 host takes the older
+  // sequence rather than SIGILLing. Force off with FEX_HOSTFEATURES=disableisa30 to exercise the
+  // POWER8 path on POWER9 hardware — the only way the pre-3.0 paths stay tested.
+  bool SupportsISA30 {};
+
   // Float exception behaviour
   bool SupportsAFP {};
   bool SupportsFloatExceptions {};

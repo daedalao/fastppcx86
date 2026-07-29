@@ -919,6 +919,51 @@ public:
   void stvehx(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 167,  0); }
   void stvebx(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 135,  0); }
 
+  // =========================================================================
+  // VSX vector/scalar loads and stores (X-form, primary opcode 31).
+  //
+  // These take VR operands, and VRs map to VSR32-63 — so the TX/SX bit (BE
+  // bit 31, the slot EmitX calls `rc`) is ALWAYS 1 here.  10-bit XO values
+  // verified against Power ISA 3.0C Book I App. F opcode tables and the
+  // instruction descriptions on the cited pages.
+  //
+  // NOTE on RA=0: for every one of these, RA=0 in the ENCODING means literal
+  // zero, not GPR[r0].  Callers follow the backend convention of passing the
+  // EA in `ra` and the invariant-zero r0 in `rb` (EA = GPR[ra] + GPR[rb]);
+  // never pass an EA that lives in r0 as `ra`.
+  // =========================================================================
+
+  // lxvx XT,RA,RB — **ISA 3.0 (POWER9)** — p.496, XO=268. 16-byte load, any
+  // alignment (no lvx-style EA masking). LE: mem[EA+i] → BE byte elem 15-i.
+  void lxvx(VR vrt, GPR ra, GPR rb)    { EmitX(31, vrt.idx, ra.idx, rb.idx, 268, 1); }
+  // stxvx XS,RA,RB — **ISA 3.0 (POWER9)** — p.514, XO=396. Store form.
+  void stxvx(VR vrs, GPR ra, GPR rb)   { EmitX(31, vrs.idx, ra.idx, rb.idx, 396, 1); }
+
+  // lxvd2x XT,RA,RB — ISA 2.06 (POWER7+) — p.492, XO=844. Two doubleword
+  // elements, any alignment. LE: dword[0] = the 8-byte LE integer at EA,
+  // dword[1] = the 8-byte LE integer at EA+8 — i.e. the DOUBLEWORD-SWAPPED
+  // image of what lxvx produces; follow with xxpermdi(v,v,v,2) to fix up.
+  void lxvd2x(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 844, 1); }
+  // stxvd2x XS,RA,RB — ISA 2.06 (POWER7+) — p.508, XO=972. Store form: writes
+  // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
+  // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
+  void stxvd2x(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 972, 1); }
+
+  // Scalar loads into dword[0].  CAUTION: ISA 3.0 defines dword[1] ← 0 for
+  // all four, but on ISA 2.06/2.07 hardware (POWER7/POWER8) lxsdx/lxsiwzx
+  // leave dword[1] UNDEFINED — never rely on the zeroing in an ungated path.
+  // lxsdx XT,RA,RB — ISA 2.06 — p.484, XO=588. dword[0] = 8-byte LE int at EA.
+  void lxsdx(VR vrt, GPR ra, GPR rb)   { EmitX(31, vrt.idx, ra.idx, rb.idx, 588, 1); }
+  // lxsiwzx XT,RA,RB — ISA 2.07 (POWER8+) — p.488, XO=12. dword[0] =
+  // zero-extended 4-byte LE int at EA.
+  void lxsiwzx(VR vrt, GPR ra, GPR rb) { EmitX(31, vrt.idx, ra.idx, rb.idx,  12, 1); }
+  // lxsibzx XT,RA,RB — **ISA 3.0 (POWER9)** — p.486, XO=781. dword[0] =
+  // zero-extended byte at EA; dword[1] = 0 (architectural, v3.0 instruction).
+  void lxsibzx(VR vrt, GPR ra, GPR rb) { EmitX(31, vrt.idx, ra.idx, rb.idx, 781, 1); }
+  // lxsihzx XT,RA,RB — **ISA 3.0 (POWER9)** — p.486, XO=813. dword[0] =
+  // zero-extended 2-byte LE int at EA; dword[1] = 0.
+  void lxsihzx(VR vrt, GPR ra, GPR rb) { EmitX(31, vrt.idx, ra.idx, rb.idx, 813, 1); }
+
   // Vector arithmetic (VX-form: op=4, VRT, VRA, VRB, XO)
   void vaddubm(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 0);   }
   void vadduhm(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 64);  }

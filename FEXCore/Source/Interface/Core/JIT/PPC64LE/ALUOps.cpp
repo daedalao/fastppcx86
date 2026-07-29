@@ -1522,8 +1522,17 @@ DEF_OP(AddWithFlags) {
   }
 
   if (S2Inline) {
-    if (static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(Const));  // addic. sets CA + CR0 (no OV)
+    // addic. sets CA + CR0 but NOT OV. That is only tolerable at 32-bit,
+    // where the shifted addco_ redo below rewrites CA/OV anyway; at 64-bit
+    // there is no redo, so the stale XER.OV leaked straight through to x86 OF
+    // (FEX_bugs/add_sub_inline_imm_of.asm). Gate the fast path on i32Bit.
+    // Tradeoff considered: keeping addic_ at 64-bit and appending an
+    // OV-setting redo (addco_ into a scratch) costs the same two instructions
+    // as li+addco_ while executing the addition twice — materialising the
+    // constant is strictly no worse, and simpler.
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
+      addic_(Dst, S1, static_cast<int16_t>(Const));  // CA + CR0; OV fixed by the i32 redo below
     } else {
       LoadConstant(TMP4, Const);
       addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
@@ -1576,18 +1585,27 @@ DEF_OP(SubWithFlags) {
     // FEX's subtract convention (CFInverted=true downstream) needs CA=1
     // (no-borrow) for x-0. Force subfco_ path for C2=0 to match the SUB-style
     // carry semantic. Same pitfall as the CondSubNZCV fix earlier today.
-    if (C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(NegC));  // sets CA + CR0
+    // ALSO: addic_ never writes OV, so the fast path is only legal at 32-bit
+    // where the shifted subfco_ redo below rewrites CA/OV (stale-OF bug,
+    // FEX_bugs/add_sub_inline_imm_of.asm). At 64-bit materialise C2 and use
+    // subfco_: for C2 != 0 its CA (carry of S1 + ~C2 + 1) is identical to
+    // addic_'s carry of S1 + (-C2), so the CF semantics documented above are
+    // preserved — subfco_ is the canonical sub-form carry either way.
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        C2 != 0 && NegC >= -32768 && NegC <= 32767) {
+      addic_(Dst, S1, static_cast<int16_t>(NegC));  // CA + CR0; OV fixed by the i32 redo below
     } else {
       LoadConstant(TMP4, C2);
       subfco_(Dst, TMP4, S1);  // sets CA + SO/OV + CR0
     }
   } else if (S1Inline) {
     // Dst = C1 - Src2 with flags. subfic computes the value and sets CA but
-    // doesn't set CR0; pair with cmpwi/cmpdi after to produce SF/ZF.
+    // doesn't set CR0 or OV, so it is likewise only usable at 32-bit where
+    // the redo fixes both (and cmpwi provides SF/ZF).
     auto S2 = GetReg(Op->Src2);
     int64_t SignedC = static_cast<int64_t>(C1);
-    if (SignedC >= -32768 && SignedC <= 32767) {
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        SignedC >= -32768 && SignedC <= 32767) {
       subfic(Dst, S2, static_cast<int16_t>(SignedC));
     } else {
       LoadConstant(TMP4, C1);
@@ -1607,9 +1625,10 @@ DEF_OP(SubWithFlags) {
     subfco_(TMP1, TMP2, TMP1);   // CA/OV reflect 32-bit borrow / overflow
     rldicl(Dst, Dst, 0, 32);     // zero-extend writeback
     cmpwi(Dst, 0);
-  } else if (S1Inline && static_cast<int64_t>(C1) >= -32768 && static_cast<int64_t>(C1) <= 32767) {
-    cmpdi(Dst, 0);  // subfic didn't set CR0; do it now for the 64-bit path
   }
+  // (No trailing cmpdi needed any more: the 64-bit S1Inline case now goes
+  // through subfco_, which sets CR0 itself; subfic survives only at 32-bit,
+  // where the cmpwi above supplies SF/ZF.)
 }
 
 // IMPORTANT: never use r0 as the destination of *NZCV / Test ops. r0 is the
@@ -1641,12 +1660,15 @@ DEF_OP(AddNZCV) {
   }
 
   if (S2Inline) {
-    if (static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(TMP3, S1, static_cast<int16_t>(Const));   // CA + CR0 (no OV)
-    } else {
-      LoadConstant(TMP4, Const);
-      addco_(TMP3, S1, TMP4);                          // CA + SO/OV + CR0
-    }
+    // Only the 64-bit size reaches this point (<= i32Bit returned above), and
+    // at 64-bit there is no shifted redo to repair XER.OV — so the former
+    // addic_ int16 fast path left OF stale (same defect as AddWithFlags,
+    // FEX_bugs/add_sub_inline_imm_of.asm). Materialise the constant and use
+    // addco_, which writes CA + SO/OV + CR0. Costs one extra instruction
+    // (li/LoadConstant) over addic_; an addic_-plus-OV-redo alternative would
+    // cost the same two instructions while executing the add twice.
+    LoadConstant(TMP4, Const);
+    addco_(TMP3, S1, TMP4);                            // CA + SO/OV + CR0
   } else {
     addco_(TMP3, S1, GetReg(Op->Src2));
   }
@@ -1673,31 +1695,27 @@ DEF_OP(SubNZCV) {
 
   if (S2Inline) {
     auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
-    // C2 == 0 cannot use the addic. shortcut: PPC `addic.` sets CA from
-    // S1 + (-C2). For C2==0 that's S1 + 0 → CA=0 (no carry from a +0). But
-    // sub-by-0 has no borrow, so the SUB-form CA must be 1. The bug masks
-    // CFInverted=true downstream: !CA reads as x86 CF=1 instead of CF=0,
-    // and PUSHF / LAHF / Jcc on carry all see a phantom CF=1 across the
-    // ENTIRE block (every shared "no flag change" path that flows through
-    // SubNZCV with imm 0 — popfq init, shl-by-0, test_NZ, etc.). Stay on
-    // subfco_ for that case so the CA semantics match PPC's sub form.
-    if (C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(TMP3, S1, static_cast<int16_t>(NegC));    // CA + CR0
-    } else {
-      LoadConstant(TMP4, C2);
-      subfco_(TMP3, TMP4, S1);                         // CA + SO/OV + CR0
-    }
+    // Historical note — two independent reasons the addic. int16 shortcut is
+    // gone from this (64-bit-only) path:
+    //  1. C2 == 0: PPC `addic.` sets CA from S1 + (-C2). For C2==0 that's
+    //     S1 + 0 → CA=0 (no carry from a +0). But sub-by-0 has no borrow, so
+    //     the SUB-form CA must be 1. The bug masks CFInverted=true downstream:
+    //     !CA reads as x86 CF=1 instead of CF=0, and PUSHF / LAHF / Jcc on
+    //     carry all see a phantom CF=1 across the ENTIRE block.
+    //  2. addic. never writes OV, and only sizes > i32Bit reach here — there
+    //     is no shifted redo to repair it, so x86 OF went stale
+    //     (FEX_bugs/add_sub_inline_imm_of.asm).
+    // subfco_ preserves the CF semantics the C2 != 0 shortcut was chosen for:
+    // its CA (carry of S1 + ~C2 + 1) equals addic_'s carry of S1 + (-C2)
+    // whenever C2 != 0, and is the correct no-borrow=1 for C2 == 0 too.
+    LoadConstant(TMP4, C2);
+    subfco_(TMP3, TMP4, S1);                           // CA + SO/OV + CR0
   } else if (S1Inline) {
     auto S2 = GetReg(Op->Src2);
-    int64_t SignedC = static_cast<int64_t>(C1);
-    if (SignedC >= -32768 && SignedC <= 32767) {
-      subfic(TMP3, S2, static_cast<int16_t>(SignedC)); // CA only, no CR0
-      cmpdi(TMP3, 0);                                  // subfic didn't set CR0
-    } else {
-      LoadConstant(TMP4, C1);
-      subfco_(TMP3, S2, TMP4);                         // CA + SO/OV + CR0
-    }
+    // subfic sets CA but neither CR0 nor OV; with no 64-bit redo available,
+    // materialise C1 and use subfco_ (same stale-OV defect class as above).
+    LoadConstant(TMP4, C1);
+    subfco_(TMP3, S2, TMP4);                           // CA + SO/OV + CR0
   } else {
     auto S1 = GetReg(Op->Src1);
     subfco_(TMP3, GetReg(Op->Src2), S1);

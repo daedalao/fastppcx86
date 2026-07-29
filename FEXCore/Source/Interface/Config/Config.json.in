@@ -34,6 +34,8 @@
         "Type": "strenum",
         "Default": "FEXCore::Config::HostFeatures::OFF",
         "Enums": {
+          "ENABLEISA30": "enableisa30",
+          "DISABLEISA30": "disableisa30",
           "ENABLESVE": "enablesve",
           "DISABLESVE": "disablesve",
           "ENABLEAVX": "enableavx",

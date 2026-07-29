@@ -157,14 +157,20 @@ public:
 
   // Unaligned 128-bit vector load/store. lvx/stvx silently mask the low 4 bits
   // of the effective address, so x86 movdqu / movups can't use them directly.
-  // We bounce through a 16-byte slot in the protected zone below r1 (ELFv2
-  // §2.2.2.4 reserves 288 bytes there for leaf use).  Clobbers TMP1, TMP2, TMP3.
+  // Emit-time selected: lxvx/stxvx (1 insn) when HostFeatures.SupportsISA30,
+  // else lxvd2x/stxvd2x + xxpermdi (2 insns, ISA 2.06). CLOBBER CONTRACT
+  // (superset across paths — callers must assume all of it): TMP1, TMP2, TMP3
+  // (historical bounce contract, kept so callsites stay conservative), plus
+  // VTMP2 (or VTMP1 when src==VTMP2) on the pre-3.0 store path. `ea` must not
+  // be r0 (RA=0 encodes literal zero).
   void LoadUnalignedV128(VR dst, GPR ea);
   void StoreUnalignedV128(VR src, GPR ea);
 
   // Size-correct FPR memory ops (x86 movd/movq/movdqu semantics): for size <16
   // the load zero-extends the upper bits of dst, and the store writes only the
-  // low `size` bytes to *ea. Sizes accepted: 1, 2, 4, 8, 16. Clobbers TMP1..TMP3.
+  // low `size` bytes to *ea. Sizes accepted: 1, 2, 4, 8, 16 (load also 10).
+  // Same superset clobber contract as above: TMP1..TMP3, plus VTMP2 (or VTMP1
+  // on aliasing) on the pre-3.0 scalar-load and V128 store paths.
   void LoadFPRSized(VR dst, GPR ea, uint32_t size);
   void StoreFPRSized(VR src, GPR ea, uint32_t size);
 
