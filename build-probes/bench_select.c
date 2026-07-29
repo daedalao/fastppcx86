@@ -31,6 +31,23 @@
  * CMOV depending on compiler mood, and if it compiles to a branch this benchmark silently measures
  * the wrong thing. Explicit asm removes that doubt.
  *
+ * LOOP CONTROL MUST NOT CONSUME CF — this cost us a measurement
+ * -------------------------------------------------------------
+ * The first version of this file used `inc; cmp; jb` for loop control in every case, including the
+ * control. `jb` consumes the carry flag, and on this backend a carry-consuming condition routes
+ * through `ProjectXERToCR1` (JIT.cpp) — which is exactly one of the sequences the codegen batch it
+ * was built to measure had changed. So the "control" case was measuring the change too, and moved
+ * ~2x between builds, making every relative reading meaningless.
+ *
+ * All loops now use `dec; jnz`. ZF maps to CR0.EQ directly with no XER projection, so loop control
+ * touches none of the flag machinery under test. `dec` is also the last flag-setting instruction
+ * before the branch in each body, which is what makes the ZF it tests the loop counter's rather
+ * than the body's.
+ *
+ * General lesson for any future codegen benchmark here: the loop scaffolding is guest code too, and
+ * it goes through the same JIT. Scaffolding that shares a code path with the thing under test is
+ * not scaffolding.
+ *
  * HOW TO USE IT
  * -------------
  * Absolute numbers are meaningless on their own — they only matter as a before/after on the same
@@ -86,14 +103,13 @@ static uint64_t rng_next(void) {
 static uint64_t bench_cmov(const uint64_t* data, uint64_t n, uint64_t thresh) {
     uint64_t acc = 0;
     __asm__ volatile(
-        "xor %%rcx, %%rcx\n\t"
+        "mov %[n], %%rcx\n\t"
         "1:\n\t"
-        "mov (%[d],%%rcx,8), %%rdx\n\t"
+        "mov -8(%[d],%%rcx,8), %%rdx\n\t"
         "cmp %[t], %%rdx\n\t"
         "cmovg %%rdx, %[a]\n\t"      /* the instruction under test */
-        "inc %%rcx\n\t"
-        "cmp %[n], %%rcx\n\t"
-        "jb 1b\n\t"
+        "dec %%rcx\n\t"              /* ZF-based loop control: see note above */
+        "jnz 1b\n\t"
         : [a] "+r"(acc)
         : [d] "r"(data), [n] "r"(n), [t] "r"(thresh)
         : "rcx", "rdx", "cc", "memory");
@@ -104,16 +120,15 @@ static uint64_t bench_cmov(const uint64_t* data, uint64_t n, uint64_t thresh) {
 static uint64_t bench_setcc(const uint64_t* data, uint64_t n, uint64_t thresh) {
     uint64_t acc = 0;
     __asm__ volatile(
-        "xor %%rcx, %%rcx\n\t"
+        "mov %[n], %%rcx\n\t"
         "1:\n\t"
-        "mov (%[d],%%rcx,8), %%rdx\n\t"
+        "mov -8(%[d],%%rcx,8), %%rdx\n\t"
         "cmp %[t], %%rdx\n\t"
         "setg %%dl\n\t"              /* the instruction under test */
         "movzbq %%dl, %%rdx\n\t"
         "add %%rdx, %[a]\n\t"
-        "inc %%rcx\n\t"
-        "cmp %[n], %%rcx\n\t"
-        "jb 1b\n\t"
+        "dec %%rcx\n\t"
+        "jnz 1b\n\t"
         : [a] "+r"(acc)
         : [d] "r"(data), [n] "r"(n), [t] "r"(thresh)
         : "rcx", "rdx", "cc", "memory");
@@ -151,12 +166,11 @@ static uint64_t bench_adc(const uint64_t* x, const uint64_t* y, uint64_t* z, uin
 static uint64_t bench_control(const uint64_t* data, uint64_t n) {
     uint64_t acc = 0;
     __asm__ volatile(
-        "xor %%rcx, %%rcx\n\t"
+        "mov %[n], %%rcx\n\t"
         "1:\n\t"
-        "add (%[d],%%rcx,8), %[a]\n\t"
-        "inc %%rcx\n\t"
-        "cmp %[n], %%rcx\n\t"
-        "jb 1b\n\t"
+        "add -8(%[d],%%rcx,8), %[a]\n\t"
+        "dec %%rcx\n\t"
+        "jnz 1b\n\t"
         : [a] "+r"(acc)
         : [d] "r"(data), [n] "r"(n)
         : "rcx", "cc", "memory");
