@@ -116,6 +116,59 @@ Fix: give the i64 inline-immediate paths in `AddWithFlags` / `SubWithFlags` (and
 `SubNZCV` equivalents, which are untested here but share the shape) an OV update, mirroring what the
 i32 path already does with its `addco_` redo.
 
+## Realistic throughput ceiling, and what it implies
+
+Confirmed against the POWER9 UM §25 and §1:
+
+- "Execution across **two execution superslices, that each provide 128-bit dataflow**… each
+  superslice is composed of a pair of slices."
+- "Each slice can perform one FX or **VSX operation per cycle**."
+- "**Two 16-byte load and two 16-byte store** operations are supported for VMX and VSX operations
+  per cycle."
+
+So the core sustains **2 × 128-bit VSX ops per cycle** = 8 DP FLOP/cycle. A Skylake core with two
+256-bit FMA units sustains 16. **POWER9 tops out near 50% of Skylake on FP-dense kernels before any
+emulation overhead**, and clock speeds are close enough that nothing papers over it. That is an
+architectural ceiling, not a tuning target. Plan accordingly: FP-throughput-bound guest code will not
+reach parity, and effort spent chasing it has a hard limit.
+
+**The useful corollary: FEX's AVX-128 decomposition costs nothing here.** A native 256-bit unit
+retires one YMM FMA per cycle; POWER9 retires two 128-bit FMAs per cycle — *the same throughput*.
+The decomposition is not a compromise on this hardware, it is exactly what the machine would do
+internally anyway. The gap versus Skylake is Skylake having twice the execution units, not anything
+about how FEX splits YMM operations. So:
+
+- Do **not** treat AVX-128 decomposition as technical debt to be removed. There is nothing to gain.
+- Do treat the **load/store path** as worth optimising, because 2 × 16-byte loads and 2 × 16-byte
+  stores per cycle is real bandwidth that the current 7-instruction red-zone bounce
+  (`PPC64Emitter.cpp:285-318`) cannot get anywhere near. `lxvx`/`stxvx` is what makes the ceiling
+  reachable.
+- Prioritise **correctness, latency and instruction count** over FP throughput generally. The ranked
+  items in Tier 1 and Tier 2 are mostly of that character already; this is a reason to keep them
+  ranked that way.
+
+### QEMU TCG as a reference — useful, with a hard licensing boundary
+
+QEMU 7.2 added TCG support for AVX, AVX2, F16C, FMA3 and VAES, and TCG has a ppc64 vector backend
+that lowers onto VSX. That makes it the only other codebase solving the same instruction-selection
+problem — x86 SIMD onto VSX — and therefore a genuinely useful sanity check on choices like which
+permute primitive to use for `PSHUFB`, or how to handle the `MINSD`/`MAXSD` NaN asymmetry.
+
+**Licensing constraint, and it is not a formality.** QEMU is **GPLv2**; FEX is **MIT**. Those are
+incompatible for code reuse — incorporating GPL code would force the combined work to GPL, which
+conflicts with FEX's licence and would poison any attempt to upstream the work. Practically:
+
+- **Reading it to understand what is possible is fine.** Facts and algorithms are not the
+  copyrightable part; a specific expression of them is.
+- **Copying or closely paraphrasing code is not.** "It picks `xxperm` for this" is a fact worth
+  knowing. Transcribing its lowering function is not something to do.
+- If anything from this work is ever upstreamed to FEX, provenance matters — upstream would be
+  right to reject a GPL-derived contribution.
+
+Treat it as a reference for *what the hardware can be made to do*, then implement independently. Not
+legal advice; if a specific borrowing ever looks tempting, that is the point to stop and ask someone
+qualified.
+
 ## Inherited assumptions to re-examine
 
 The port was written by mirroring the ARM64 backend, and upstream FEX's disabled-test registry and
