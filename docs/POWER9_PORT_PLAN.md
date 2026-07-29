@@ -269,21 +269,37 @@ stack slot is 16-byte aligned — every `r1` adjustment in the backend is a mult
 ELFv2 guarantees 16-byte SP alignment on entry — so the baseline is not itself buggy. Red-zone
 signal safety is also fine: ELFv2 defines a 288-byte protected zone and Linux/ppc64 enforces 512.
 
-**But the fault paths are not equivalent — this is a real caveat on the store side.**
+**Fault reporting — measured on hardware 2026-07-28, caveat resolved.**
 
-- DAR is only required to be "an effective address *associated with*" the access (Book III §7.2.3).
-  For a 16-byte `stxvx` crossing a page boundary where only the **second** page is write-protected,
-  `si_addr` may legally point into the first page. FEX's SMC handler unprotects
-  `AlignDown(si_addr, PAGE)` (`SyscallsSMCTracking.cpp:37`, `:76`) — wrong page means a refault
-  livelock. The current two-`std` bounce makes DAR precise whenever the split falls between them.
-  **Characterize on hardware before switching the store path.** (A narrower pre-existing version of
-  this window already exists for a single `std` spanning pages.)
-- Book II Ch. 2 permits a faulting load to have partially altered registers. The bounce writes the
-  guest VR only in the final `lvx`, after all storage accesses have succeeded, so the destination is
-  provably clean on fault. `lxvx` may legally partially write VRT. Real x86 leaves the destination
-  unmodified on `#PF`.
+The concern was that DAR is only required to be "an effective address *associated with*" the access
+(Book III §7.2.3), so a 16-byte `stxvx` crossing a page boundary might report `si_addr` in the
+*first* page when only the second is protected. FEX's SMC handler unprotects
+`AlignDown(si_addr, PAGE)` (`SyscallsSMCTracking.cpp:37`, `:76`), so an imprecise DAR would unprotect
+the wrong page and refault forever.
 
-**Recommendation:** pursue `lxvx` for loads; treat `stxvx` as gated on the DAR experiment.
+**Measured: reporting is precise.** `build-probes/probe_dar.c`, run on the target, straddled a page
+boundary with 8 bytes in a writable page and 8 in a `PROT_READ` page:
+
+| Form | `si_addr` | Page |
+|---|---|---|
+| A. two `std` (current bounce) | `0x…9000` | protected |
+| B. **`stxvx`** | `0x…9000` | **protected** |
+| C. `stxv` (D-form) | `0x…9000` | protected |
+| D. control, `std` inside page 2 | `0x…9000` | protected |
+| E. `lxvx` (load) | `0x…9000` | protected |
+| F. control, `ld` inside page 2 | `0x…9000` | protected |
+
+Both harness controls behaved, and `stxvx` reports identically to the `std` bounce it would replace.
+**Both the load and store paths can move to `lxvx`/`stxvx` with no change to the SMC fault handler.**
+
+One sub-question remains open but is not blocking: Book II Ch. 2 permits a faulting load to have
+partially altered registers, and real x86 leaves the destination unmodified on `#PF`. The bounce
+writes the guest VR only in the final `lvx`, so it is provably clean on fault; `lxvx` may legally
+partially write VRT. The probe's attempt to measure this (probe E's register dump) is **inconclusive** —
+the compiler placed the destination in `vs0` and the value survived a trip through a signal handler
+and `siglongjmp`, which more likely reflects a stack spill slot than the architectural register. A
+sound measurement would read the VSX save area out of `ucontext` inside the handler rather than after
+returning. Low priority: this is an x86-fidelity nuance, not a correctness blocker for the guest.
 
 `lxv`/`stxv` (DQ-form) also work where a **multiple-of-16 displacement** fits (12-bit DQ, ±32 KiB);
 the save/restore offsets at `PPC64Emitter.cpp:273-274` are well within range.
@@ -822,7 +838,9 @@ storage error handler (DSISR bit 61). **Note the absence of a compare-and-swap-E
 
 ## Open questions needing hardware
 
-1. **`stxvx` cross-page DAR precision** — gates half of the largest Tier 2 win.
+1. ~~**`stxvx` cross-page DAR precision**~~ — **ANSWERED 2026-07-28: precise.** See §2.1. Both load
+   and store paths are adoptable. Residual, non-blocking: whether a faulting `lxvx` partially writes
+   VRT (needs a `ucontext`-based measurement, not the spill-prone one attempted).
 2. **AMO latency/throughput vs `larx`/`stcx.`**, contended and uncontended.
 3. **Unaligned `lxvx` penalty boundaries** (64 B / 128 B / page crossings). The UM gives throughput
    (§25.1.7.9) but not crossing penalties.
