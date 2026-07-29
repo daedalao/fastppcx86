@@ -402,12 +402,45 @@ architectural GPRs, most of the rest being SRA-pinned or reserved. Whether that 
 POWER9's dispatch width, or inherited from ARM64's register budget, has not been examined. The
 heavy-spill anecdote in `JITClass.h:90-94` suggests it is worth a look.
 
-### Method note
+### Method note — binding rule
 
 When something is disabled, suppressed, or routed to a software helper, establish **why** before
 accepting it. The reasons so far have divided into three kinds: real ISA limits (which stand),
 ARM64-era assumptions (which may not), and factual errors in comments (`JIT.cpp:88-92` on POWER8
 crypto; `README.md:36` on PSIGN). Only the first kind is binding.
+
+**A code comment is not evidence.** It is a claim with an author and a date, and on this port a
+material fraction of them have been wrong, stale, or about a different host. Neither is an upstream
+disabled-test entry, a CPUID suppression, or a figure in the original author's notes. Each is a lead
+to verify, and until verified it must not be load-bearing for a design decision. The cost of ignoring
+this has been measured: three separate hypotheses in the `NZCVSelect` investigation alone were
+believed on the strength of plausible reasoning and then refuted, each after real work.
+
+**The corollary is that we root-cause rather than inherit.** Where a claim can be settled by reading
+code, read it and cite file:line. Where it needs the machine, measure it — with a control that should
+not move, and a falsifiable prediction stated *before* the run. Prefer checks that can refute over
+checks that can confirm; confirmation under an unvalidated method is indistinguishable from noise
+agreeing with you.
+
+### Assumption register — what is still taken on faith
+
+Load-bearing inherited claims, with status. **Anything `UNVERIFIED` must not be designed around
+without saying so explicitly.**
+
+| Inherited claim | Source | Status |
+|---|---|---|
+| Making the `Break` op a real fault "breaks the worker pool init" (Steam) | stub comment near `PPC64Dispatcher.cpp:501-522` | **UNVERIFIED — currently load-bearing.** Under audit. The Break defect is confirmed at runtime, so this comment is the only thing arguing against the obvious fix |
+| Mono spins are caused by SMC/page-size tracking | rev 1 of this plan (mine) | **REFUTED.** Host is 4 KB; `AT_PAGESZ` is reported unconditionally; mechanism never fired |
+| Mono-specific workarounds in-tree corroborate an SMC theory | port lineage | **REFUTED.** Upstream ARM64/Wine commits by another author; one is Windows-only and inert on Linux |
+| "only 2 free vector temps on POWER8" | `VectorOps.cpp:1480` | **REFUTED as a hardware limit.** It is the transplanted ARM64 32-register layout; VSR0–31 are unused for vector work |
+| POWER8 lacks AES/SHA/PCLMUL hardware | `JIT.cpp:88-92` | **FACTUALLY WRONG.** Software helpers are therefore unjustified by this reason |
+| `Test_X87/D9_F8.asm` must stay disabled ("relies on rounding correctness") | upstream `Disabled_Tests` | **UNTESTED on POWER9.** Judged on hosts without hardware binary128 |
+| `ADX` must be suppressed | `CPUID.cpp:716` | **MISATTRIBUTED.** Traces to a frontend bug (`39f664bd9`), not a missing facility. Never re-evaluated |
+| POWER8 trapped on unaligned accesses where POWER9 does not | port lineage | **UNSUPPORTED** by either ISA document. Both handle most unaligned access in hardware |
+| The 5-GPR dynamic allocation pool is right-sized | `PPC64Emitter.h:60-62` | **UNEXAMINED.** May be an ARM64 register budget |
+| POWER8 vkmark baseline of 7245 is a comparison we should beat | original author's notes | **NOT A VALID COMPARISON.** Different GPU, Mesa, rootfs, and an Xwayland hop. Our 8730 exceeds it, but the earlier apparent 35% regression was purely a configuration artefact |
+| `mfocrf`/`mtocrf` being uncracked is why the flag path got faster | my own earlier attribution | **REVISED by measurement.** Secondary; branchless replacement of mispredicted branches dominates |
+| The two `PPC64Emitter.cpp` / `CodeEmitter/PPC64LE/ALUOps.cpp` files are live code | tree layout | **FALSE — neither is compiled.** Has misled analysis three times; one holds an unconverted `mtcrf(0xFF)` `FillStaticRegs` now divergent from the live copy |
 
 ## Applicability ledger — keeping POWER8 recoverable
 
