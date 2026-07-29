@@ -43,7 +43,7 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   endif()
 else()
   # We've been included using add_subdirectory, so set up targets for IDE integration using the host toolchain
-  set(GENERATOR_EXE thunkgen)
+  set(GENERATOR_EXE "$<TARGET_FILE:thunkgen>")
   set(TARGET_TYPE OBJECT)
   set(GENERATE_GUEST_INSTALL_TARGETS FALSE)
   set(BITNESS 64)
@@ -113,7 +113,8 @@ function(generate NAME SOURCE_FILE)
     OUTPUT "${OUTFILE}"
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
-    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+    COMMAND ${CMAKE_COMMAND} -E env "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+      "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -154,6 +155,15 @@ function(add_guest_lib NAME SONAME)
     ## Compile for SSE2
     ## Compile with fpmath=sse to remove x87 usage
     target_compile_options(${NAME}-guest PRIVATE -msse2 -mfpmath=sse)
+
+    # When cross-compiling against a dedicated sysroot, that sysroot generally contains only libc
+    # and the C++ standard library. Thunk sources also include ordinary library headers — X11,
+    # libdrm, alsa — which are architecture-agnostic and only exist under the host prefix. Search
+    # there last, so the sysroot still wins for anything platform-specific. This mirrors what
+    # thunkgen already does for its own parse (ThunkLibs/Generator/main.cpp).
+    if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
+      target_compile_options(${NAME}-guest PRIVATE -idirafter /usr/include)
+    endif()
   endif()
 
   if (BITNESS EQUAL 32)

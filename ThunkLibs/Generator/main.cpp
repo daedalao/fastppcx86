@@ -3,6 +3,7 @@
 
 #include "llvm/Support/Signals.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -74,6 +75,19 @@ int main(int argc, char* const argv[]) {
 
     Args.push_back("--sysroot");
     Args.push_back(x86_rootfs);
+
+    // A cross-toolchain keeps its libstdc++ headers beside the compiler rather than inside the
+    // sysroot, so --sysroot alone resolves libc but not <type_traits>. Debian-style multilib hosts
+    // don't need this because their x86 headers live under the host's own prefix; anything else
+    // does. Set FEX_THUNKGEN_GCC_TOOLCHAIN to the toolchain root (the directory containing
+    // lib/gcc/<triple>/<version>) and clang locates both.
+    //
+    // This is applied here rather than from CMake deliberately: these arguments are only used for
+    // the x86 parse, which runs for host thunk generation as well as guest, and pointing the host
+    // (non-x86) parse at an x86 GCC installation would be wrong.
+    if (const char* gcc_toolchain = getenv("FEX_THUNKGEN_GCC_TOOLCHAIN"); gcc_toolchain && *gcc_toolchain) {
+      Args.push_back(std::string {"--gcc-toolchain="} + gcc_toolchain);
+    }
 
     // The dev rootfs is only really needed for the standard library.
     // Other libraries generally don't have platform specific headers.
