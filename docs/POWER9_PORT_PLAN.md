@@ -192,6 +192,30 @@ a priori and wrong empirically.
 5985 briefly looked like a stable result; that configuration's true median is 2997. The spread on
 badly-configured runs reaches 51%.
 
+**4. Low spread is not low error, and this is the trap that has cost the most time.** The 0.06%
+above is variance *within* a configuration. It says nothing about whether two configurations are
+comparable. During the `NZCVSelect` investigation every individual number was reproducible to
+0.1–0.3% across repeated runs and pad sweeps, and the cross-build comparison was still wrong, three
+times running: a dispatcher-round-trip theory, a jitter theory, and a data-placement theory were all
+built on internally-consistent numbers and all refuted. Tight spreads make a wrong comparison look
+authoritative rather than making it right.
+
+Two defences, both cheap, both now standing practice:
+
+- **A control case that should not move.** `bench_select` carries one, and prints its own stop-rule
+  at `bench_select.c:280`: if control moves between builds the comparison is contaminated and no
+  other line can be believed until that is explained. It fired correctly and was nearly talked past.
+- **A predictable-data twin of every data-dependent case.** Running the same guest instruction
+  sequence over predictable and unpredictable data separates *branch behaviour* from *codegen
+  quality* for free, with no `perf` counters and no host-side tooling. This is what identified the
+  branchy-select regression as mispredicts: the predictable twin was the only case that did not
+  regress. On a JIT, where most interesting codegen questions are branchless-versus-branchy, this is
+  the single highest-value control available.
+
+The general rule: **a negative result that kills a hypothesis is worth more than a measurement that
+confirms one**, because confirmation under a contaminated methodology is indistinguishable from
+noise agreeing with you. Prefer checks that can refute.
+
 **On the POWER8 comparison:** at 8730 the machine now exceeds the bank note's POWER8 figure of 7245,
 where the first badly-configured measurement (4694) looked like a 35% regression. Still not a clean
 CPU-to-CPU comparison — different GPUs, different Mesa, different rootfs, an Xwayland hop — but the
@@ -1211,6 +1235,24 @@ Post-review. Three items from revision 1 were overturned; those now appear in
    4 PB, Book III §6.7.10).
 9. **HTM is not an option** for misaligned atomics — POWER9 TM is errata-laden, deprecated, and
    disabled on most kernels.
+10. **Do not make `NZCVSelect`'s constant form branchy.** Tried in `8bf8123c3` on the theory that
+    `NZCVSelect(cond, 1, 0)` is the SETcc archetype, where a branch keeps `isel`'s latency off the
+    dependent chain that consumes the 0/1. Restored to `isel` in `28e34964c` after measuring a net
+    **5.7 ns/op loss**: cmov-unpredictable +69 %, control +60 %, adc-chain +26 %, against the
+    intended setcc −54 %.
+
+    The premise was the error. `SETccOp` is *one* caller of `_NZCVSelect01`; the dominant caller is
+    per-flag-bit materialisation in `OpcodeDispatcher.h` — the `!NZCVDirty` path reconstructing a
+    single RFLAGS bit (CF/OF/ZF) into a GPR — plus `ConvertNZCVToX87`. An IR dump of the benchmark's
+    `main` found **15 constant-form against 3 register-form**, the constant-form conditions being
+    `UGE`/`ULT`/`SGT` clustered around the compare sites. `UGE`/`ULT` is CF. Flag reconstruction
+    selects on a *data-dependent* condition and feeds pure dataflow, which is precisely where an
+    unpredictable branch is worst and where branchless codegen earns its keep.
+
+    Capturing the real setcc win needs a **distinct IR op emitted only from `SETccOp`**, because at
+    the backend both arrive as `NZCVSelect(cond, 1, 0)` and are indistinguishable. Any fix
+    conditioned on *operand shape* is doomed for that reason; the condition has to come from the
+    frontend. Open, unscheduled.
 
 ---
 
