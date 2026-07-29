@@ -2,475 +2,583 @@
 
 Status: **planning document, no code changes yet.** Branch `power9-support`, forked from `main` at `0f17626ac`.
 
-This document records an audit of the existing POWER8 port and a plan for POWER9 (ISA v3.0) support.
-Every ISA-level claim below was adjudicated against the primary sources listed in
-[Sources and method](#sources-and-method); claims that could not be confirmed are marked as such
-rather than dropped.
+Revision 2. Every claim in revision 1 was put through an adversarial review pass whose reviewers
+were instructed to refute rather than confirm. **One headline finding was destroyed, two rankings
+were materially corrected, and three "negative results" were overturned in our favour.** Revision 1's
+errors are recorded in [Refuted and corrected](#refuted-and-corrected) rather than quietly deleted,
+so they are not rediscovered and re-believed later.
 
-The audit's headline conclusion is deliberately unflattering:
+Headline conclusions, post-review:
 
-> **POWER9 does not clear the port's blocker table.** The dominant remaining problems — cross-arch
-> callback dispatch, libxshmfence heap corruption, Steam, the SIGABRT on exit — are ELFv2/ABI and
-> plumbing issues that are byte-identical on POWER9. What POWER9 *does* buy is (a) a plausible fix
-> for the entire Mono/managed-runtime failure class, via 4 KB Radix pages, and (b) a substantial
-> set of ISA 3.0 codegen wins. Both are worth having. Neither is what the branch was originally
-> imagined to be.
-
-A second, more actionable conclusion: **a significant fraction of the identified wins are not
-POWER9 features at all.** They are POWER8-legal facilities (ISA 2.01–2.07) that the backend simply
-never learned to emit. Those should land on `main` first, against the existing POWER8 hardware,
-before anything is gated behind a POWER9 check.
+> **POWER9 does not clear the port's blocker table.** Cross-arch callback dispatch, libxshmfence,
+> Steam and the SIGABRT on exit are ELFv2/ABI and plumbing problems, byte-identical on POWER9. This
+> verdict survived a dedicated attempt to overturn it.
+>
+> **The Mono theory of revision 1 was wrong.** A 64 KB host page size cannot be the cause, because
+> FEX cannot run *any* dynamically-linked guest on a 64 KB host at all. See
+> [Tier 0](#tier-0--smc-hardening-theory-refuted).
+>
+> **The largest wins are POWER8-legal and available today**, on the existing hardware, ungated. Two
+> of them were missed entirely in revision 1 and were found only by the adversarial pass: the
+> `lqarx` containment transform for misaligned atomics, and a two-instruction CA save/restore that
+> replaces XER SPR traffic.
 
 ---
 
 ## Contents
 
-- [Tier 0 — the page-size / SMC defect](#tier-0--the-page-size--smc-defect)
-- [Tier 1 — wins available on POWER8 today](#tier-1--wins-available-on-power8-today)
+- [Tier 0 — SMC hardening (theory refuted)](#tier-0--smc-hardening-theory-refuted)
+- [Tier 1 — POWER8-legal, available today](#tier-1--power8-legal-available-today)
 - [Tier 2 — POWER9-gated wins](#tier-2--power9-gated-wins)
-- [Negative results](#negative-results--do-not-budget-for-these)
+- [Bugs found in the current backend](#bugs-found-in-the-current-backend)
+- [Negative results](#negative-results)
+- [Additional opportunities](#additional-opportunities)
 - [Traps and invariants](#traps-and-invariants)
+- [Refuted and corrected](#refuted-and-corrected)
 - [Hardware probe checklist](#hardware-probe-checklist)
-- [Mono debug plan](#mono-debug-plan)
+- [Mono / spin debug plan](#mono--spin-debug-plan)
 - [Instruction availability tables](#instruction-availability-tables)
 - [Open questions needing hardware](#open-questions-needing-hardware)
 - [Sources and method](#sources-and-method)
 
 ---
 
-## Tier 0 — the page-size / SMC defect
+## Tier 0 — SMC hardening (theory refuted)
 
-**This is the only finding that plausibly unblocks a currently-failing game.**
+### What revision 1 claimed, and why it is wrong
 
-### Mechanism
+Revision 1 argued that FEX's self-modifying-code tracking `mprotect`s at 4 KB granularity
+(`SyscallsSMCTracking.cpp:174-182`, `FEX_PAGE_SIZE = 4096`), discards the return value
+(`LogMan::Throw::AFmt` is an empty function unless `ASSERTIONS_ENABLED`, which is `DEBUG`-only per
+`CMakeLists.txt:186-192`), and therefore fails silently on a 64 KB-page host — leaving Mono's
+backpatched code running stale translations forever.
 
-`SyscallHandler::MarkGuestExecutableRange` write-protects guest code pages so that guest writes
-fault and trigger re-translation. That is how FEX detects self-modifying code. It calls `mprotect`
-at **4 KB-aligned** boundaries, because `FEX_PAGE_SIZE` is hardcoded:
+**The mechanism is internally coherent but unreachable.** FEX reports `AT_PAGESZ = FEX_PAGE_SIZE =
+4096` to the guest unconditionally (`Source/Tools/FEXInterpreter/ELFCodeLoader.h:636`), and guest
+`mmap`/`mprotect` are passed verbatim to the host kernel, returning `-errno`
+(`SyscallsSMCTracking.cpp:303`, `:425`). On a 64 KB-page host, guest `ld.so` would fail its
+`PT_GNU_RELRO` `mprotect` at a 4 K-aligned address; glibc treats that as fatal. **Every
+dynamically-linked guest would die in the dynamic linker.** FTL runs to gameplay for minutes, so the
+POWER8 host is a 4 KB kernel and these `mprotect` calls were never failing.
 
-- `FEXCore/include/FEXCore/Utils/TypeDefines.h:9-10` — `FEX_PAGE_SIZE = 4096`, `FEX_PAGE_SHIFT = 12`
-- `Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp:174-182` — the `mprotect` calls
+This matches upstream FEX's posture: 4 KB hosts are a prerequisite, not a preference (the same
+reason upstream cannot run on Asahi's 16 KB kernels). FEX-on-64K is not degraded; it is non-booting.
 
-The return value of every one of those `mprotect` calls is passed to `LogMan::Throw::AFmt`, which
-in a non-assertions build is defined as (`FEXCore/include/FEXCore/Utils/LogManager.h`):
+Revision 1 also committed a logic error worth naming: it argued "coherence rules out data staleness,
+therefore the cause must be code staleness." That is a false dichotomy — a stale translation still
+contains a real load instruction reading current memory. A persistent `EAGAIN` means the `val`
+argument the guest *computed* mismatches memory at syscall time, every iteration, which points at
+codegen or memory ordering, not at executing old code.
 
-```c
-static inline void AFmt(bool, const char*, ...) {}
-```
+### What is still worth doing
 
-An empty function. Assertions are enabled **only** for `CMAKE_BUILD_TYPE=DEBUG`
-(`CMakeLists.txt:186-192`), while the project's own build instructions specify
-`-DCMAKE_BUILD_TYPE=Release`.
+These are defensive-engineering items, not a fix for any known failure. On the current host the
+assert will succeed trivially.
 
-Therefore, on a host kernel with 64 KB base pages — the default on essentially every ppc64le
-distribution — `mprotect` of a 4 K-aligned-but-not-64 K-aligned address returns `EINVAL`, **and the
-failure is discarded silently**. Write-protection never arms, write faults never fire,
-`InvalidateGuestCodeRange` never runs, and code the guest generates or backpatches keeps executing
-its **stale translation indefinitely**.
+1. Startup assertion that `sysconf(_SC_PAGESIZE) == FEX_PAGE_SIZE`, failing loudly with a clear
+   message. Converts an unreachable-but-catastrophic configuration into a diagnosable one.
+2. Check the three SMC `mprotect` return values in release builds
+   (`SyscallsSMCTracking.cpp:79`, `:174`, `:180`). A silently-ignored `mprotect` is a bad failure
+   mode on any host.
+3. **Optional, arch-neutral:** round SMC `mprotect` ranges to `sysconf(_SC_PAGESIZE)` rather than to
+   `FEX_PAGE_SIZE`. This would make the tracker correct on a 64 KB host at the cost of
+   false-positive retranslations, and is worth considering because **a 4 KB Radix kernel is
+   non-default on every mainstream ppc64le distribution** — i.e. running POWER9 with 4 KB pages
+   means building a custom kernel. This item, not the page size itself, is the real decision.
 
-`SMCChecks` defaults to `mtrack` (`FEXCore/Source/Interface/Config/Config.json.in:420-431`), so this
-is the live path, not a dormant one.
+### Rival explanations for the Mono/Stardew spins, ranked
 
-### Why this presents as "a Mono bug"
-
-Ahead-of-time compiled games (FTL and friends) never self-modify, so a dead SMC path costs them
-nothing. Mono generates and backpatches x86 code continuously at runtime. The reported symptom —
-"main thread spins on `FUTEX_WAIT`→`EAGAIN` **after cold JIT**" — matches precisely: the spin begins
-right after Mono's compile-and-patch burst.
-
-It also explains the futex symptom without any futex bug. Futex is a straight passthrough to the
-host kernel (`LinuxSyscalls/Syscalls/Passthrough.cpp`); there is no address translation and no flag
-remapping. `EAGAIN` means the host kernel compared guest memory and found the expected value absent.
-POWER cache coherence guarantees a plain reload eventually observes new *data*, so data staleness
-cannot sustain an infinite spin — but a stale *translation* of a Mono-patched wait loop can, forever.
-
-Corroborating evidence that the original author was circling this without naming it:
-
-- `ForceFullSMCDetection` for Mono tailcalls — `FEXCore/Source/Interface/Core/Frontend.cpp:1648`
-- `MonoBackpatcherBlock` — `FEXCore/Source/Interface/Core/Core.cpp:560`
-- Multiblock truncation past `CALL` "because calls are always backpatched" — `Frontend.cpp:1138-1143`
-- `MonoHacks` defaulting to **true**, with hardcoded FORCE_TSO on Unity ringbuffer offsets
-  0x80/0x84/0xC0/0xC4 — `Frontend.cpp:1107-1121`, `a37a65f17`
-- Commit `cf17977e8` — "compile-time byte log for **stale-compile diagnosis**"
-
-The README's conclusion that the Ziggurat spin is "not a general FEX bug" is probably wrong in an
-interesting way: it *is* a general FEX bug on this host configuration, which only Mono-class
-workloads exercise.
-
-### What POWER9 changes
-
-POWER9 Radix supports 4 KB pages natively (POWER9 UM §4.10.4.1 Table 4-17: 4 KB, 64 KB, 2 MB, 1 GB
-are the only supported sizes). A Radix 4 K kernel restores the `FEX_PAGE_SIZE == host page size`
-invariant and the mechanism simply starts working.
-
-**Caveat:** if the POWER8 box was *already* running a 4 K kernel, this entire theory dies and the
-residual is invalidation-scope logic, which POWER9 does not change. One command settles it — see
-[Hardware probe checklist](#hardware-probe-checklist).
-
-### Fixes to land regardless of the probe result
-
-1. Startup assertion that `sysconf(_SC_PAGESIZE) == FEX_PAGE_SIZE`, failing loudly.
-2. Check the `mprotect` return values in release builds. A silently-ignored `mprotect` is a bad
-   failure mode on any host. (Three call sites: `SyscallsSMCTracking.cpp:79`, `:174`, `:180`.)
+1. **Memory-ordering or width bug in the emulated wait loop** (glibc condvar `__wseq`/`g_signals`,
+   or Mono's coop-suspend). The port has documented history in exactly this class — upstream needed
+   acquire/release forcing on plain MOVs for these workloads. PPC64LE's weak ordering plus
+   incomplete TSO emulation can sustain a `val`/memory mismatch indefinitely.
+2. **SMC re-arming gap, page-size independent.** `MarkGuestExecutableRange` runs only when a page
+   *newly* contains code (`Core.cpp:934-936`). After a write fault unprotects a page
+   (`SyscallsSMCTracking.cpp:79`), whether it is ever re-protected depends on LookupCache
+   bookkeeping. Worth auditing; POWER9 does not affect it.
+3. **Thunk/cross-arch pointer corruption** clobbering the futex word, given the port's admitted live
+   bugs there (libxshmfence heap corruption; revert `439f8fe4e`).
 
 ---
 
-## Tier 1 — wins available on POWER8 today
+## Tier 1 — POWER8-legal, available today
 
-None of these require POWER9. All are ISA 2.01–2.07 facilities the backend does not currently use.
-**Land these on `main` first** — they are correctness-neutral or correctness-improving, they
-exercise the existing 11213-case ASM differential suite, and they establish a working test loop
-before anything becomes POWER9-conditional.
+None of these need POWER9. **Land them on `main`, against the existing POWER8 box**, before anything
+becomes POWER9-conditional: they establish a working test loop against the 11213-case ASM
+differential suite. Ordered by value.
 
-| # | Change | Current cost | New cost | Evidence |
-|---|---|---|---|---|
-| 1 | `isel` for `CMOVcc` / branch-free selects | 3 insns + branch, 25 `bc` sites in `ALUOps.cpp` | 1 insn (lat 2, +3 CR-forwarding) | `isel` is **v2.03**; emitter has no encoding for it at all |
-| 2 | `vbpermq` + `mfvsrd` for `PMOVMSKB` | dispatcher-generated chain | 2 insns | `vbpermq` is **v2.07**, already encoded in `Emitter.h`, never emitted |
-| 3 | Hardware AES / PCLMUL / SHA | FABI software helper calls, ~50+ insns with spill/fill | 1–3 insns | `vcipher`, `vncipher`, `vpmsumd/w`, `vshasigmaw/d` all **v2.07** |
-| 4 | `xvcvspdp` / `xvcvdpsp` for CVTPS2PD/PD2PS | 9–12 insn per-lane stack loop (`VectorOps.cpp:4513-4551`) | 2–3 insns | **v2.06**, absent from emitter |
-| 5 | `mfocrf` / `mtocrf` in hot flag paths | `mfcr` = 3-iop crack | uncracked, lat 2 | **v2.01**. UM §4.1.5.6: "software should use the single-field variants" |
-| 6 | `VExtr` N<16 → single `vsldoi` | 13-insn stack-materialised perm control | 1 insn | `vsldoi` is v2.03; this is pure oversight |
-| 7 | Restripe split-lock mutex table at 128 B | `addr >> 6` false-shares adjacent stripes | — | UM §4.6.1 / §4.6.2.12: coherence block **and** reservation granule are 128 B |
-| 8 | Fix `HostFeatures.DCacheLineSize` fallback (64 → 128) | wrong on all POWER | — | UM Table 4-3 |
-| 9 | Route misaligned `CMPXCHG8B` through the split-lock helper | plain **non-atomic** ld/cmp/std | mutex-atomic | `AtomicOps.cpp:743-755`, comment admits it |
+### 1.1 `lqarx`/`stqcx.` containment for misaligned atomics — **the biggest miss of revision 1**
 
-### 10. The PAUSE regression — root cause identified
+Revision 1 recorded "ISA 3.0 relaxes no alignment requirement for atomics, so the split-lock
+apparatus must survive intact" and treated that as a dead end. It is only half true.
 
-Commit `60718954e` introduced an SMT priority hint for x86 `PAUSE`; it hung every SDL2/Vulkan game
-and was backed out in `88d1c4f7b`, leaving only a counter-gated `sched_yield`.
+Any misaligned k-byte LOCK RMW **whose bytes lie within one aligned 16-byte block** can be done
+entirely in hardware:
 
-The POWER9 UM explains why (power9um §5, PPR discussion):
+```
+EA_q = EA & ~15
+lqarx  on EA_q                  # aligned by construction — no alignment interrupt
+extract / modify the k bytes    # shifts + mask-insert
+stqcx. the whole quadword       # retry on failure
+```
+
+Soundness:
+
+- `lqarx`/`stqcx.` on `EA_q` is aligned by construction, so no alignment interrupt (Book II §4.6.2),
+  and is single-copy atomic across all 16 bytes (Book II §1.4 p.817).
+- Writing back the **unmodified neighbour bytes** is safe under reservation semantics: any
+  intervening store anywhere in the 128-byte reservation granule (UM §4.6.1) kills the reservation
+  and fails the `stqcx.`, so no lost update. This is precisely how RISC-V lowers sub-word AMOs onto
+  `lr.w`/`sc.w`.
+- The same transform applies one level down: a misaligned halfword or word contained in an aligned
+  word/doubleword can use `lwarx`/`ldarx` on the container.
+
+Coverage under uniform offsets: misaligned 2-byte **15/16**, 4-byte **9/12**, 8-byte **7/14**. Only
+accesses crossing an aligned 16-byte boundary still need the mutex helper. Real packed-struct
+misalignment clusters at small offsets, so practical coverage is higher.
+
+**This is a correctness fix, not only a performance one.** `PPC64_SplitLockEmulate` is atomic only
+against other mutex users — it does not compose with a concurrent *aligned* `larx` RMW touching the
+same bytes from another thread (admitted at `FEXCore/include/FEXCore/Utils/ArchHelpers/PPC64.h:37-39`).
+The `lqarx` container path is coherent with aligned hardware atomics through the reservation
+granule. It also properly fixes the non-atomic misaligned `CMPXCHG8B` (`AtomicOps.cpp:743-755`): a
+misaligned-but-contained 8-byte CAS becomes a real `lqarx`/`stqcx.` CAS with no mutex at all.
+
+Cost: the inline alignment tests already exist, so this substitutes ~8–12 inline instructions for a
+spill + C-helper call. `lqarx` on POWER9 is cracked C2, latency ~6 (UM Table A-1).
+
+**`lqarx`/`stqcx.` are v2.07 — this is POWER8 work, ungated.**
+
+### 1.2 Two-instruction CA save/restore
+
+Revision 1 stated that restoring XER.CA "still requires `mtxer`". False. CA round-trips through a
+GPR in two base-ISA ALU instructions, no SPR access:
+
+```
+addze  Rt, r0          # save:    Rt = CA   (r0 is the port's invariant zero)
+addic  Rscratch, Rt, -1 # restore: CA = (Rt != 0)
+```
+
+For `Rt ∈ {0,1}`: `1 + 0xFFFF…F` carries (CA=1); `0 − 1` does not (CA=0). This beats both the
+`mfspr`/`mtspr XER` round-trip (cracked, latency 3) and `mcrxrx` (which can read CA but never
+restore it). It applies anywhere the backend brackets a CA-clobbering instruction with XER traffic —
+there are 27 `mfspr` and 21 `mtspr` sites in `ALUOps.cpp` alone. **Base ISA; Tier 1.**
+
+### 1.3 Scalar-into-VSR load family
+
+§2.1's `lxvx` fix addresses only the 16-byte path. `LoadFPRSized` (`PPC64Emitter.cpp:365-401`) burns
+~9 instructions for 1/2/4/8-byte FPR loads, and the TSO FPR load path (`MemoryOps.cpp:678`) pays it
+on every guest `movsd`/`movss`. `lxsdx`/`lxsiwzx` are **v2.06/2.07** and usable now;
+`lxsd`/`lxssp`/`lxsibzx`/`lxsihzx` are v3.0 and extend the coverage.
+
+### 1.4 Remaining Tier 1 items
+
+| # | Change | Current cost | Notes |
+|---|---|---|---|
+| a | `isel` for `CMOVcc` / selects | 3 insns + branch, 25 `bc` sites | **v2.03**; emitter has no encoding at all. **Not unconditionally free** — see below |
+| b | Hardware AES / PCLMUL / SHA | FABI helper, ~50 insns with spill/fill | **v2.07**. Realistic cost **3–8 insns**, not 1–3 — see below |
+| c | `vbpermq` + `mfvsrd` for `PMOVMSKB` | dispatcher's 16-iteration extract/shift/or chain | **v2.07**, already encoded, never emitted. **3+ insns and needs a new IR op** — see below |
+| d | `xvcvspdp` / `xvcvdpsp` for CVTPS2PD/PD2PS | 9–12 insn per-lane stack loop (`VectorOps.cpp:4513-4551`) | **v2.06**, absent from emitter |
+| e | `mfocrf` / `mtocrf` in hot flag paths | `mfcr` is a 3-iop crack | **v2.01**. UM §4.1.5.6 recommends the single-field variants. **See the zeroing trap below** |
+| f | `VExtr` N<16 → single `vsldoi` | 13-insn stack-materialised perm control | v2.03; pure oversight |
+| g | Restripe split-lock mutex table at 128 B | `addr >> 6` false-shares adjacent stripes | UM §4.6.1/§4.6.2.12: coherence block and reservation granule are both 128 B |
+| h | Fix `HostFeatures.DCacheLineSize` fallback 64 → 128 | wrong on all POWER | UM Table 4-3 |
+
+Qualifications the adversarial pass forced:
+
+- **(a) `isel` is not unconditionally free.** UM Table A-1: latency 2 **plus 3 cycles additional
+  latency for the CR source**, so `cmp → isel` is ~7 cycles on the dependent chain, while a
+  correctly-predicted `bc` resolves off the critical path. With P9's ~16-cycle redirect penalty,
+  break-even is roughly a 25–30% mispredict rate. `isel` wins for genuinely unpredictable selects —
+  which guest `CMOVcc` usually is — and shrinks code, but lengthens the chain for predictable ones.
+  Microbenchmark before converting all 25 sites. Note `isel`'s `RA=0` reads literal zero, which is
+  coincidentally consistent with the port's r0-is-zero convention; assert it.
+- **(b) AES is 3–8 instructions, not 1–3.** FEX's register image holds guest byte *j* at BE element
+  15−*j*, i.e. the block byte-reversed. `SubBytes` commutes with reversal; `ShiftRows` and
+  `MixColumns` do not, so each op needs reversal fixups (`xxbrq` on P9; `vperm` with a materialised
+  constant on P8). `vncipher` adds the key **before** `InvMixColumns` where AESDEC adds it after, so
+  AESDEC needs a MixColumns-transformed key (`MixColumns(k) = vcipher(vncipherlast(k,0),0)`, or
+  cache per key). AESIMC has no direct instruction; AESKEYGENASSIST has no counterpart. Still a
+  large win over a ~50-instruction helper call. PCLMULQDQ via `vpmsumd` needs ~3 instructions
+  (`vpmsumd` is a *sum* of two 64×64 products, so the unselected doubleword must be zeroed) and
+  requires no byte swap. **CRC32 is 8–12 instructions** — the Barrett reduction dominates
+  per-instruction, and the classic `vpmsum` win is bulk folding, which FEX's instruction-at-a-time
+  model cannot exploit.
+- **(c) `vbpermq` needs plumbing.** The correct sequence is `vbpermq` with a BE-order index constant
+  `{0,8,16,…,120}`, then `mfvsrd` (result lands in bits 48:63 of doubleword 0) — **3+ instructions**
+  once the constant is materialised. More importantly **there is no `MoveMask` IR op**; PMOVMSKB
+  reaches the backend as the dispatcher's generic 16-iteration chain
+  (`OpcodeDispatcher/Vector.cpp:785-833`). This needs a new IR op or dispatcher hook, not a
+  backend-local patch.
+- **(e) `mfocrf` collides with its own trap.** Pre-3.0C processors — **including both POWER8 and
+  POWER9** — leave non-selected bits undefined or only partially zeroed. Naive substitution in hot
+  flag paths is a latent corruption bug. Cross-reference
+  [Traps and invariants](#traps-and-invariants).
+
+### 1.5 The PAUSE / PPR regression — root cause identified, **highest regression risk**
+
+`60718954e` introduced an SMT priority hint for x86 `PAUSE`; it hung every SDL2/Vulkan game and was
+backed out in `88d1c4f7b`. The POWER9 UM explains why:
 
 > "Hardware typically does not change the thread priority value in the PPR, unless an `mtPPR` or one
 > of the priority changing NOP instructions is committed."
 
-Thread priority is **never automatically restored**. The hint dropped priority permanently. The
-async-interrupt boost the UM describes is internal and "does not affect the actual architected
-thread priority value."
+Priority is **never automatically restored**; the hint dropped it permanently. The fix is the hint
+plus an explicit restore — `or 31,31,31` (very low) or `or 1,1,1` (low), then `or 2,2,2`
+(medium/normal) at the end of the spin block. Problem-state-legal forms per UM Table 5-4:
+`or 31,31,31`, `or 1,1,1`, `or 6,6,6`, `or 2,2,2`. (`or 5,5,5` needs PSPB≠0; `or 3,3,3` and
+`or 7,7,7` are privileged.)
 
-The fix is the hint plus an **explicit restore**: `or 31,31,31` (very low) or `or 1,1,1` (low),
-followed by `or 2,2,2` (medium/normal) at the end of the spin block. Problem-state-legal nop forms
-per UM Table 5-4: `or 31,31,31`, `or 1,1,1`, `or 6,6,6`, `or 2,2,2`. (`or 5,5,5` requires PSPB≠0;
-`or 3,3,3` and `or 7,7,7` are privileged.)
-
-This is a POWER8-and-POWER9 fix — the PPR behaviour is not new in v3.0.
+**Land this behind a config flag, defaulting off.** The restore-fix is a theory built on one UM
+paragraph; if the real hang mechanism was something else, reintroducing the hint regresses FTL — the
+only fully working configuration the port has.
 
 ---
 
 ## Tier 2 — POWER9-gated wins
 
-Gate all of these behind `getauxval(AT_HWCAP2) & PPC_FEATURE2_ARCH_3_00` so the POWER8 box remains
-a valid regression baseline.
+Gate behind `getauxval(AT_HWCAP2) & PPC_FEATURE2_ARCH_3_00`.
 
-**Prerequisite:** there is currently **no host feature detection for PPC at all**
-(`Source/Common/HostFeatures.cpp:787-788` leaves ARM defaults; no `AT_HWCAP` / `AT_HWCAP2` read, no
-`/proc/cpuinfo` model parse). POWER8 and POWER9 are indistinguishable at runtime today. Adding that
-probe is the natural first commit on this branch, since everything below keys off it.
+**Prerequisite:** there is **no host feature detection for PPC at all** today
+(`Source/Common/HostFeatures.cpp:787-788`); POWER8 and POWER9 are indistinguishable at runtime.
+Adding that probe, plus `AT_DCACHEBSIZE`, is the first commit on this branch.
 
 ### 2.1 `lxvx` / `stxvx` — 7 instructions to 1
 
-The single largest codegen win in the port. Every 128-bit vector load and store currently performs a
-red-zone bounce (`PPC64Emitter.cpp:285-318`, `LoadUnalignedV128` / `StoreUnalignedV128`): two `ld`s,
-two `std`s to a stack slot, then `lvx`. Sub-16-byte FPR loads run ~9 instructions
-(`LoadFPRSized`, `:365-401`). This guarantees a store-forwarding stall on *every SSE memory
-operation*. The ARM64 backend emits one `ldr q`.
+Every 128-bit vector load/store performs a red-zone bounce (`PPC64Emitter.cpp:285-318`): two `ld`s,
+two `std`s to a stack slot, then `lvx`. The ARM64 backend emits one `ldr q`.
 
-**Why the bounce exists:** `lvx` masks the effective address to a 16-byte boundary
-(ISA Book I §6.7.1 p.241: `VRT ← MEM(EA & 0xFFFF_FFFF_FFFF_FFF0, 16)`) and therefore silently loads
-the *wrong* quadword for an unaligned address, with no fault.
+**Why the bounce exists:** `lvx` masks EA to a 16-byte boundary
+(`VRT ← MEM(EA & 0xFFFF_FFFF_FFFF_FFF0, 16)`, Book I §6.7.1 p.241) and silently loads the *wrong*
+quadword for an unaligned address, with no fault.
 
-**Verified equivalence.** The `ld/ld → std/std` pair is a byte-exact 16-byte copy, so
-`slot[i] = m[i]`; `lvx` on the aligned slot then yields VRT byte `15−i = m[i]`. A single `lxvx` on
-the original, arbitrary, possibly-unaligned address yields byte `15−i = m[i]` — **bit-for-bit
-identical**. Confirmed against the worked example on ISA p.497.
+**Equivalence, independently re-derived twice.** `lxvx` in LE places `mem[EA+i]` into byte element
+`15−i` — so `phys[15−i] = m[i]`, EA arbitrary. The `ld/ld → std/std` pair is a byte-exact copy
+(`slot[i] = m[i]`); `lvx` on the aligned slot gives `phys[15−i] = slot[i] = m[i]`. **Identical
+register images.** Confirmed against the worked example on ISA p.497. The reviewer also *proved* the
+stack slot is 16-byte aligned — every `r1` adjustment in the backend is a multiple of 16
+(`PPC64Emitter.cpp:183`, `:244`, `:266`; `BranchOps.cpp:219`; `AtomicOps.cpp:89`; `JIT.cpp:1055`) and
+ELFv2 guarantees 16-byte SP alignment on entry — so the baseline is not itself buggy. Red-zone
+signal safety is also fine: ELFv2 defines a 288-byte protected zone and Linux/ppc64 enforces 512.
 
-Consequences:
+**But the fault paths are not equivalent — this is a real caveat on the store side.**
 
-- `lxvx` / `stxvx` (**v3.0**) replace the bounce directly, for any EA.
-- `lxv` / `stxv` (**v3.0**, DQ-form) work where a **multiple-of-16 displacement** fits (±32 KiB);
-  the EA itself may still be unaligned. Useful for context/stack slots, killing the
-  `LoadImm32`+`lvx` pairs in register save/restore (`PPC64Emitter.cpp:273-274`).
-- `lxvd2x` (v2.06, POWER8) yields the **doubleword-swapped** image and needs an `xxpermdi` fixup —
-  this is the classic POWER8 pattern, and is the fallback if a P8 path is ever wanted.
-- `lxvb16x` yields the fully byte-reversed image. `lxvw4x` / `lxvh8x` yield per-element images.
-  None of these three match without a fixup.
+- DAR is only required to be "an effective address *associated with*" the access (Book III §7.2.3).
+  For a 16-byte `stxvx` crossing a page boundary where only the **second** page is write-protected,
+  `si_addr` may legally point into the first page. FEX's SMC handler unprotects
+  `AlignDown(si_addr, PAGE)` (`SyscallsSMCTracking.cpp:37`, `:76`) — wrong page means a refault
+  livelock. The current two-`std` bounce makes DAR precise whenever the split falls between them.
+  **Characterize on hardware before switching the store path.** (A narrower pre-existing version of
+  this window already exists for a single `std` spanning pages.)
+- Book II Ch. 2 permits a faulting load to have partially altered registers. The bounce writes the
+  guest VR only in the final `lvx`, after all storage accesses have succeeded, so the destination is
+  provably clean on fault. `lxvx` may legally partially write VRT. Real x86 leaves the destination
+  unmodified on `#PF`.
 
-**Blocking prerequisite:** two comments in the tree describe contradictory byte models —
-`VectorOps.cpp:3145` (`VInsGPR`) states `phys[i] = mem[ea+15-i]`, while `VectorOps.cpp:212`
-(`LoadNamedVectorConstant`) states byte 0 maps to physical byte 0. The code works, so one comment is
-simply wrong. Resolve and correct the comments *before* touching the load path.
+**Recommendation:** pursue `lxvx` for loads; treat `stxvx` as gated on the DAR experiment.
 
-### 2.2 Delete the shift-left-32 duplication for 32-bit flags
+`lxv`/`stxv` (DQ-form) also work where a **multiple-of-16 displacement** fits (12-bit DQ, ±32 KiB);
+the save/restore offsets at `PPC64Emitter.cpp:273-274` are well within range.
 
-The backend currently emulates x86 32-bit carry/overflow by shifting **both operands left by 32 and
-redoing the operation** so that CA/OV land at the 32-bit boundary
-(`ALUOps.cpp:1509-1546`, `:1600-1609`, `:1627-1671`).
+**Expected impact, tempered.** The mechanism is stronger than a mere stall: UM §25.1.7.6 states
+forwarding "from more than one store per LS slice" cannot happen, so the load "must wait for an
+overlapping store to drain from the STQ … and be written to and read from the cache hierarchy" —
+a pipeline drain the bounce hits on every execution. But every TSO vector load *also* pays the
+cmp/bc/isync acquire idiom (`MemoryOps.cpp:664-684`) and stores pay `lwsync`, neither of which
+`lxvx` removes; and the gain scales with vector-memory-op density. **Expect 5–20% on SSE-heavy
+titles, far less elsewhere.** A 7→1 instruction ratio does not translate to 7× anything.
 
-ISA 3.0 makes this unnecessary. Book I §3.3.9:
+### 2.2 `mcrxrx` for carry/overflow extraction
 
-> "addic, addic., subfic, addc, subfc, adde, subfe, addme, subfme, addze, and subfze always set CA
-> … **These instructions also always set CA32 to reflect the carry out of bit 32.**"
+`ProjectXERToCR1()` (`JIT.cpp:1303-1307`) is `mfspr XER; rlwinm; mtcrf` — 3 instructions, 4 iops
+(`mtcrf` is itself cracked). `mcrxrx` is 1 iop, uncracked, latency 2, no dispatch rule (UM Table
+A-1), against `mfspr_xer`'s cracked C2 latency 3. Both pay the same +3 CR/XER-source forwarding
+penalty, so that is a wash; the win is 3 iops and one cycle of chain.
 
-and §3.2.2 (XER): OV32 "is set whenever OV is implicitly set", with "OV32 reflects overflow of the
-low-order 32-bit result independent of the mode".
-
-Carry out of bit 32 (BE numbering) depends only on the low 32 bits plus carry-in, so garbage in the
-upper halves is harmless. **Sound for ADD, SUB, ADC and SBB at 32-bit width.**
-
-Extraction is via `mcrxrx` (**v3.0**), which copies `OV, OV32, CA, CA32` into a CR field in that
-exact order → `(LT, GT, EQ, SO)`. UM Table A-1: plain ALU op, CR destination, latency 2, not
-cracked — cheaper than `mfspr XER` (cracked C2, latency 3). This replaces `ProjectXERToCR1()`
-(`JIT.cpp:1303-1307`) on every carry/overflow-involving `Jcc`, `SETcc` and `CMOVcc`.
-
-Given 27 `mfspr` and 21 `mtspr` sites in `ALUOps.cpp` alone, this is the largest scalar win.
+**Silent-corruption hazard — must be handled in the same commit.** The pseudocode is
+`CR[4×BF+32:35] ← OV || OV32 || CA || CA32`, i.e. LT=OV, GT=**OV32**, EQ=CA, SO=CA32. The current
+CR1 layout is LT=SO, GT=**OV**, EQ=CA (`JIT.cpp:1295-1300`). CA stays in EQ by luck, but every
+overflow-consuming condition in `MapNZCVCC` reads bit 5 (GT) and would silently receive **OV32
+instead of OV** — wrong for every 64-bit operation. The bit indices must move 5→4 alongside the
+substitution.
 
 ### 2.3 Three-instruction icache flush
 
-POWER9 UM §4.6.2.2:
+UM §4.6.2.2: `icbi` is converted to a NOP after translation, and
 
 > "instead of requiring the instruction sequence specified by the Power ISA to be executed on a
 > **per cache-line basis**, software must only execute a **single sequence of three instructions**:
 > `sync`, `icbi` (to any address), `isync`."
 
-(`icbi` is converted to a NOP after translation on POWER9.)
-
-FEX currently loops over the range stepping **32 bytes**, with a full `sync` + `isync` *inside* each
-iteration (`PPC64Dispatcher.cpp:643-645`). That is architecturally safe but pathological: the stride
-is 4× redundant even on POWER8 (128 B cache blocks), and the interior barriers are unnecessary. ISA
-Book II §1.8 gives the correct general form — all `dcbst`, one `sync`, all `icbi`, one `isync`.
-
-This lands directly on the Mono path: every translation flush pays it.
+FEX loops over the range stepping **32 bytes**, with a full `sync` + `isync` *inside* each iteration
+(`PPC64Dispatcher.cpp:643-645`). The stride is 4× redundant even on POWER8 (128 B blocks) and the
+interior barriers are unnecessary. ISA Book II §1.8 gives the correct general form: all `dcbst`, one
+`sync`, all `icbi`, one `isync`.
 
 ### 2.4 Remaining ISA 3.0 codegen items
 
-| Instruction | Replaces | Current cost | Notes |
-|---|---|---|---|
-| `modsd` / `modud` | `divd` + `mulld` + `subf` for DIV/IDIV remainder | 3 insns, serially dependent | Runs in parallel with the divide. 12–24 cyc (UM Table A-1). **Word forms leave `RT[0:31]` undefined**; use doubleword forms |
-| `cnttzd` / `cnttzw` | `neg;and;cntlz;li;subf` (BSF) | 5 insns | `cnttzw` returns **32** on zero input, matching the TZCNT contract exactly; `cnttzd` returns 64 |
-| `setb` | `li 0; bc; li 1` (SETcc) | 3 insns + branch | Examines **only LT and GT** of the CR field, yields −1/0/1. 1 insn if the condition sits in GT; 2 if in LT (`setb`+`neg`); EQ/SO need a `crmove` fixup first |
-| `darn` | full spill / C-call / fill PRNG helper | ~30 insns | L=0 32-bit, L=1 64-bit conditioned, L=2 raw. `0xFFFF_FFFF_FFFF_FFFF` = error; ISA says retry, "ten attempts should be adequate", then fall back to software |
-| `addex` | ADCX/ADOX dual carry chains | currently suppressed in CPUID | Uses **OV** as an independent carry chain, never touches CA, and never pollutes SO. **v3.0B**, not v3.0 base — but UM Table A-1 confirms POWER9 implements it |
-| `extswsli` | `extsw` + `sldi` | 2 insns | SH range 0–63, no CA side effect |
-| `mtvsrdd` / `mfvsrld` | 6-insn stack bounce for dword splat; `vsldoi`+`mfvsrd` for extract | 6 / 2 insns | `mtvsrdd v,rs,rs` = 1-insn dword splat. **`RA=0` means literal zero** — cannot splat from r0. `mfvsrld` reads `dword[1]` = guest low qword |
-| `xxbrq` / `xxbrd` / `xxbrw` / `xxbrh` | vperm-based byte reversal with materialised control | ~14 insns | Endian-agnostic register-to-register |
-| `vpermr` | `vperm` + XOR-0x0F index fixup in PSHUFB | 6 insns | Uses byte element `31-index`, performing the LE index flip inherently. Note: high-bit-set⇒zero is **not** provided; the zeroing select is still needed |
-| `xxspltib` | multi-insn immediate splat | varies | Full 8-bit immediate 0–255, vs `vspltisb`'s ±16 |
-| `xxinsertw` / `xxextractuw`, `vinsertb/h/w/d`, `vextu[bhw][lr]x` | 13–17 insn stack-materialised perm control for PINSR/PEXTR/INSERTPS | 13–17 insns | **Two footguns — see [Traps and invariants](#traps-and-invariants)** |
-| `xscvhpdp` / `xscvdphp` / `xvcvhpsp` / `xvcvsphp` | F16C via FABI helper | 30+ insns | Not drop-in: sparse hword-1,3,5,7 layout needs pack/unpack; VCVTPS2PH's imm8 static rounding must be emulated via FPSCR.RN |
-| `cmprb` / `cmpeqb` | byte-range / byte-equal tests | — | Result lands in GT (setb-friendly). **Undefined in 32-bit mode** |
-| `addpcis` | PC-relative address materialisation | `LoadImm64` up to 5 insns | `lnia Rx` is an **extended mnemonic** for `addpcis Rx,0`. Deferred: `RELOC_NAMED_THUNK_MOVE` patching assumes the 5-insn shape (`JIT.cpp:1231-1245`) |
+| Instruction | Replaces | Notes |
+|---|---|---|
+| `modsd` / `modud` | `divd` + `mulld` + `subf` for the DIV/IDIV remainder | **Conditional win.** POWER9 has a DIV engine per superslice and the UM recommends pairing such instructions, so `divd`/`modsd` overlap **only when scheduled to different superslices**; same-superslice they serialize on an 8-cycle busy offset, giving parity. Each is dispatch-rule E (consumes both slots), so the pair costs 4 dispatch slots vs 3 iops today. Best case ~7 dependent cycles saved; worst case a wash. **Word forms leave `RT[0:31]` undefined**; use doubleword forms. Never traps — x86 `#DE` checks stay explicit |
+| `cnttzd` / `cnttzw` | `neg;and;cntlz;li;subf` (BSF) | 5 insns → 1. `cnttzw` returns **32** on zero, matching TZCNT exactly; `cnttzd` returns 64 |
+| `setb` | `li 0; bc; li 1` (SETcc) | Reads **only LT and GT**, yields −1/0/1. Against `MapNZCVCC`'s 20 conditions: **4/20** get 1 insn, **5/20** need `setb`+`neg`, **11/20** need a cr-logical first (2–3 insns). Real value is branch elimination, not instruction count |
+| `darn` | spill / C-call / fill PRNG helper | L=0 32-bit, L=1 64-bit conditioned, L=2 raw. `0xFFFF…FF` = error; retry, "ten attempts should be adequate", then software fallback |
+| `mtvsrdd` / `mfvsrld` | 6-insn stack bounce for dword splat; `vsldoi`+`mfvsrd` for extract | `mtvsrdd v,rs,rs` = 1-insn dword splat. **`RA=0` means literal zero** — cannot splat from r0. `mfvsrld` reads `dword[1]` = guest low qword |
+| `xxbrq` / `xxbrd` / `xxbrw` / `xxbrh` | vperm byte reversal with materialised control | Endian-agnostic; also the enabler for cheap AES state reversal |
+| `vpermr` | `vperm` + XOR-0x0F index fixup in PSHUFB | Uses byte element `31-index`. High-bit⇒zero is **not** provided; the zeroing select remains |
+| `xxspltib` | multi-insn immediate splat | Full 8-bit immediate 0–255 vs `vspltisb`'s ±16 |
+| `xxinsertw`/`xxextractuw`, `vinsertb/h/w/d`, `vextu[bhw][lr]x` | 13–17 insn perm-control materialisation for PINSR/PEXTR/INSERTPS | **Two footguns** — see [Traps and invariants](#traps-and-invariants) |
+| `xscvhpdp` / `xvcvsphp` etc. | F16C via FABI helper | Not drop-in: sparse hword-1,3,5,7 layout needs pack/unpack; VCVTPS2PH's imm8 static rounding needs FPSCR.RN manipulation (see `mffscrn` below) |
+| `extswsli` | `extsw` + `sldi` | SH 0–63, no CA side effect |
+| `cmprb` / `cmpeqb` | byte-range / byte-equal tests | Result lands in GT (setb-friendly). **Undefined in 32-bit mode** |
+| `addex` | ADCX/ADOX dual carry chains | Uses OV as an independent chain, never touches CA, exempt from SO. **v3.0B**, not v3.0 base; UM Table A-1 confirms POWER9 implements it. **Does not fix why ADX is suppressed** — see below |
+| `addpcis` / `lnia` | PC-relative materialisation | `lnia Rx` is an extended mnemonic for `addpcis Rx,0`. Deferred: `RELOC_NAMED_THUNK_MOVE` assumes `LoadConstant`'s 5-insn shape (`JIT.cpp:1231-1245`) |
+
+**`addex` does not address the ADX suppression.** Commit `39f664bd9` places that bug in the
+*frontend* `OpDispatchBuilder::ADXOp` fallback (the CFInverted × OldNZCV re-injection), reproduced by
+OpenSSL's `x25519_fe64_mul`. `addex` helps only if a native backend ADX path is plumbed through
+HostFeatures to bypass that fallback. Also note the OV chain is destroyed by **any** OE=1
+instruction, and this backend emits `addco_`/`subfco_`/`addeo_`/`subfeo_` for nearly every
+flag-producing op. It is safe only because real ADX sequences generate no intervening flag ops —
+correct but fragile; document the invariant explicitly.
 
 ---
 
-## Negative results — do not budget for these
+## Bugs found in the current backend
 
-Confirmed against the ISA. Recording these explicitly so they are not re-investigated later.
+Discovered incidentally during the audit. None are POWER9-related.
 
-1. **ISA 3.0 does not relax alignment for any atomic.** All `larx`/`stcx.` forms require natural
-   alignment (Book II §4.6.2); the AMOs additionally require the accessed portion of `mem(EA-4,12)`
-   to lie within an aligned 32-byte block, and invoke the alignment error handler otherwise
-   (§4.5.1 p.862, §4.5.2 p.864). **The entire split-lock / SIGBUS apparatus must survive onto
-   POWER9 intact.**
+1. **Stale `XER.OV` on 64-bit inline-immediate arithmetic.** `AddWithFlags` (`ALUOps.cpp:1526`),
+   `SubWithFlags` (`:1580`, `:1591`), `AddNZCV` (`:1645`) and `SubNZCV` (`:1686`) take an
+   `addic_`/`subfic` fast path for small constants, which sets CA but **not OV** — the comment says
+   so — and at 64-bit width there is no redo to fix it. The 32-bit paths are rescued by the shifted
+   `addco_` redo; 64-bit is exposed. Repro:
+   `mov rax,0x7FFFFFFFFFFFFFFF; add rax,1; jo` should take the branch but will read whatever set OV
+   previously. No existing test appears to cover this. **Unverified on hardware** — this checkout is
+   on aarch64.
+2. **Factually wrong comment justifying the software crypto path.** `JIT.cpp:88-92` states "POWER8
+   lacks AES, SHA, CRC32C, and PMULL128 instructions (these arrived in POWER9…)". Wrong for three of
+   four: `vcipher`, `vshasigmaw/d` and `vpmsumw/d` are all **ISA 2.07 — POWER8**. Only CRC32C is
+   genuinely absent. The entire FABI software fallback path exists because of this misconception.
+3. **SMC `si_addr` imprecision window.** A single 8-byte `std` spanning a page boundary into a
+   write-protected page may report a first-page DAR, causing the handler to unprotect the wrong
+   page. Narrow today; §2.1's `stxvx` would widen it to every crossing.
+4. Minor: `SbbWithFlags`-32's manual CF extraction (`ALUOps.cpp:1886-1888`) duplicates what
+   `subfe`'s own CA-out already provides. Harmless, wasteful. The comment at `:1601` claiming the
+   32-bit sub redo is needed for CA is also wrong — only OV needs it.
 
-2. **There is no compare-and-swap-EQUAL atomic memory operation.** The FC table provides only
-   *Compare and Swap Not Equal* (FC 10000). x86 `CMPXCHG` cannot lower to a single AMO; `larx`/`stcx.`
-   remains required. (Full FC table in [Instruction availability tables](#instruction-availability-tables).)
+---
 
-3. **AMOs are word/doubleword only** — no byte or halfword forms exist. 8- and 16-bit x86 `LOCK` ops
-   stay on `lbarx`/`lharx` loops.
+## Negative results
 
-4. **AMOs carry no acquire/release semantics** (§4.5 intro p.859) — the surrounding `hwsync`/`isync`
-   brackets must remain, which substantially shrinks the AMO opportunity. Whether AMOs beat an
-   L1-hit `larx`/`stcx.` loop when *uncontended* is unmeasured; they execute near the coherence
-   point, so they may well be slower. Benchmark before adopting.
+Post-review. Three items from revision 1 were overturned; those now appear in
+[Tier 1](#tier-1--power8-legal-available-today) and [Additional opportunities](#additional-opportunities).
 
-5. **`wait` is unusable as a PAUSE lowering.** WC=0b00 resumes only on "an exception, an event-based
-   branch exception, or a platform notify" (Book II §4.6.4 p.878). No memory-change wake, no
-   timeout — a thread could stall until the next timer tick. It *is* problem-state legal, which is
-   the tempting part. Use the PPR nop idiom instead (Tier 1 item 10).
+**Still standing:**
 
-6. **`copy` / `paste.` are not a general memcpy primitive.** "if the `paste.` specifies normal
-   storage, the data storage error handler is invoked" (Book II §4.4 p.857). They address
-   accelerators via VAS, require 128-byte alignment, and are irrelevant to `REP MOVS`.
+1. **No compare-and-swap-EQUAL AMO exists.** Only *Compare and Swap Not Equal* (FC 10000). Every
+   attempted inversion fails: setting the comparand to the desired new value makes it an
+   unconditional swap that stores even when memory ≠ expected, which CMPXCHG forbids and no retry
+   can repair — the wrong store already happened. `larx`/`stcx.` stands. The AMOs also lack
+   acquire/release (§4.5 p.859), so this is doubly safe.
+2. **AMOs are word/doubleword only, strictly aligned, with no ordering semantics.** 8/16-bit x86
+   `LOCK` ops stay on `lbarx`/`lharx`; barriers stay. Whether AMOs beat an L1-hit `larx`/`stcx.`
+   loop when uncontended is unmeasured — they execute near the coherence point and may lose.
+3. **Cross-arch thunk/callback blockers are architecture-neutral.** A dedicated attempt to find any
+   ISA 3.0 facility touching ELFv2, r2/TOC, or the r11 static-chain hazard found nothing. One minor
+   performance note: the UM's 32-entry count cache means a single shared `bctr` dispatch trampoline
+   with many live targets will mispredict chronically — an argument for per-callback inline-target
+   trampolines, but that is performance, not the blocker.
+4. **`copy`/`paste.` are not a general memcpy primitive** — "if the `paste.` specifies normal
+   storage, the data storage error handler is invoked" (Book II §4.4 p.857). Accelerator/VAS only.
+5. **`lqarx`/`stqcx.` are ISA 2.07, not a POWER9 delta** — but see Tier 1.1: that is an argument for
+   using them *now*, not for ignoring them.
+6. **Timebase is 512 MHz on both POWER8 and POWER9**; the `rdtsc` scaling in `a331160bb` carries over.
+7. **"POWER8 trapped on unaligned accesses where POWER9 does not" is unsupported** by either
+   document. Both handle most unaligned access in hardware; only the enumerated cases trap.
+8. **The 128 TB address-space figure is Linux mm policy**, not architecture (hardware: 52-bit EA,
+   4 PB, Book III §6.7.10).
+9. **HTM is not an option** for misaligned atomics — POWER9 TM is errata-laden, deprecated, and
+   disabled on most kernels.
 
-7. **No CA-free arithmetic right shift exists in ISA 3.0.** `sraw`/`srawi`/`srad`/`sradi` all alter
-   CA and CA32; §3.3.14 confirms algebraic right shifts are the sole shift exception. The only new
-   3.0 shift is `extswsli`, a *left* shift. The up-to-10-instruction SAR emulation
-   (`ALUOps.cpp:834-912`) stands. Mitigation is limited to cheaper CA *reads* via `mcrxrx`; restoring
-   still requires `mtxer`.
+---
 
-8. **"POWER8 trapped on unaligned accesses, POWER9 does not" is unsupported** by either document.
-   The UM states most unaligned accesses execute in hardware (§4.1.5), but contains no POWER8
-   comparison, and POWER8 also handled most unaligned accesses in hardware. Only the enumerated
-   cases trap on POWER9: natural-alignment violations on `larx`/`stcx.`/AMOs, quadword ops
-   (`lq`/`stq`/`lqarx`/`stqcx.`), `copy`/`paste.` (128 B), LE-mode `lmw`/`stmw`/string ops, and any
-   unaligned access to caching-inhibited storage.
+## Additional opportunities
 
-9. **`lqarx` / `stqcx.` are ISA 2.07**, already in use for `CMPXCHG16B` (`AtomicOps.cpp:809`, `:822`).
-   No POWER9 delta.
+Found by the adversarial sweep of the v3.0 opcode list; not evaluated in revision 1. Ranked.
 
-10. **The 128 TB address-space figure is Linux mm policy, not architecture.** Book III §6.7.10
-    requires support for Radix configurations mapping **52-bit effective addresses** (4 PB). The
-    128 TB default `TASK_SIZE` is a kernel choice, extensible via mmap hint.
+| # | Facility | ISA | Use |
+|---|---|---|---|
+| 1 | `xsaddqp`/`xsmulqp`/`xsdivqp` binary128 | v3.0 | Hardware quad float for x87 80-bit. Far faster than softfloat helpers, more accurate than the reduced-precision float64 mode. **Not bit-exact** (113→64-bit double rounding; exactness needs ≥130 bits) — an intermediate fidelity/speed mode. Latencies 12/24/56–58 (UM Table A-1) |
+| 2 | `mffscrn` / `mffscrni` / `mffsl` | v3.0 | Lightweight rounding-mode read-modify without full FPSCR serialization. Directly services the F16C imm8-rounding problem and guest MXCSR.RC switches |
+| 3 | `vcmpneb[.]` / `vcmpnezb[.]` | v3.0 | "Not equal or zero" is purpose-built for null-terminated scans — accelerates `PPC64_VPCMPISTRX` (`VectorOps.cpp:3570`) and REP SCAS/CMPS |
+| 4 | `maddld` / `maddhd` / `maddhdu` | v3.0 | Fused 64×64+64: IMUL+ADD chains, address arithmetic, 128-bit multiply-accumulate |
+| 5 | `xststdcdp` / `xvtstdcsp/dp` | v3.0 | One-instruction NaN/Inf/denorm/zero classification → x87 `FXAM`, DAZ/FTZ, NaN canonicalization |
+| 6 | `xscmpeqdp` / `xscmpgtdp` / `xscmpgedp` | v3.0 | Scalar CMPSD/CMPSS mask in a register, no CR traffic, no full-vector op |
+| 7 | `lxvwsx`, `xxperm`, `vextsb2w/d`, `vextsh2w/d` | v3.0 | VBROADCASTSS-style splats; copy-free permutes; PMOVSX assists |
+| 8 | `lxvl` / `stxvl` | v3.0 | Length-governed 0–16-byte vector ops: REP MOVS tails, page-boundary-safe partial loads |
+| 9 | EBB-bounded `wait` | v3.0 | See negative-result reversal below — high engineering cost |
 
-11. **Timebase is 512 MHz on both POWER8 and POWER9** — the `rdtsc` scaling in `a331160bb` carries
-    over unchanged.
+**`wait` is not strictly unusable.** Revision 1 called it useless for PAUSE because it resumes only
+on "an exception, an event-based branch exception, or a platform notify". But the **EBB facility is
+problem-state**: with `MMCR0[PMCC]` configured via Linux `perf_event_open` EBB events (supported
+since POWER8), userspace owns a PMC and the `BESCR`/`EBBHR`/`EBBRR` SPRs. A bounded pause is
+therefore constructible entirely in problem state — program a cycle-counting PMC to overflow in ~N
+cycles, `wait`, take the EBB, `rfebb`. Unlike the PPR nop idiom, `wait` actually stops dispatch and
+cedes SMT resources. Caveats: per-thread perf-fd setup, an EBB handler in the dispatcher, conflicts
+with any profiling of the process, unknown re-arm cost. **Verdict: usable only with an EBB timeout
+harness; high engineering cost; the PPR idiom remains the default.**
 
-Additionally, from the archaeology pass: every cross-arch thunk/callback item, the libxshmfence heap
-corruption, the Steam TLS/vfork/UAF cluster, the SIGABRT on exit, the 31 skipped tests
-(`cb3851cb4`, a cross-sysroot toolchain gap) and the 6 SSSE3 PSIGN diffs are **architecture-neutral**.
-POWER9 changes none of them.
+Considered and rejected: `stop` (privileged), DFP/BCD/`vmul10*` (no x86 analogue worth wiring),
+`scv` (the backend emits no raw `sc`; glibc ≥2.33 already uses it).
 
 ---
 
 ## Traps and invariants
 
-Things that will silently break a POWER9 rewrite.
-
 ### Latent SIGILL: `vabsdub` / `vabsduh` / `vabsduw`
 
-These are **v3.0-only** (ISA pp.296-297) but are **already encoded in `CodeEmitter/PPC64LE/Emitter.h`**
-and never emitted. Any future code path that starts emitting them will take an
-illegal-instruction interrupt on POWER8. Gate before use.
+**v3.0-only** (ISA pp.296-297) but **already encoded** in `CodeEmitter/PPC64LE/Emitter.h:1093-1095`
+and never emitted. Confirmed zero emission sites, so nothing reaches them today — but any future
+path that does will take an illegal-instruction interrupt on POWER8. Gate before use.
 
-### `xsmincdp` / `xsmaxcdp` are not drop-in replacements for MINSD/MAXSD
+### `xsmincdp` / `xsmaxcdp` are not drop-in MINSD/MAXSD
 
-Value semantics match exactly — every QNaN/SNaN row and every signed-zero cross-cell yields
-`T(src2)`, and the raw src2 doubleword is forwarded so NaN payloads pass through unquieted
-(ISA p.592, Table 76 p.593). But:
+Values match exactly — every QNaN/SNaN row and signed-zero cross-cell yields `T(src2)`, with raw
+payload forwarding (ISA p.592, Table 76 p.593). But:
 
-- **Exception behaviour differs.** `xsmincdp` raises VXSNAN only for **SNaN** inputs. x86 signals
-  #IA for SNaN *and* QNaN sources. Guest `MXCSR.IE` emulation will under-report. (Under-reporting
-  is the safer direction, but it is a divergence.)
-- **`dword[1]` is zeroed**; `MINSD` preserves the upper destination bits. A merge is still required.
-- **`FPSCR.VE` must be 0**, or a trap-enabled invalid operation suppresses the write entirely
-  ("If a trap-enabled Invalid Operation occurs, VSR[XT] is not modified").
-- **`xsminjdp` / `xsmaxjdp` use the opposite NaN convention** ("If src1 is a NaN, result is src1")
-  and do **not** match x86. Easy to grab the wrong one.
+- **Exception behaviour differs**: `xsmincdp` raises VXSNAN only for **SNaN**; x86 signals `#IA` for
+  SNaN *and* QNaN sources. Guest `MXCSR.IE` emulation under-reports.
+- **`dword[1]` is zeroed**; MINSD preserves upper destination bits. A merge is still required.
+- **`FPSCR.VE` must be 0**, or a trap-enabled invalid operation suppresses the write entirely.
+- **`xsminjdp`/`xsmaxjdp` use the opposite NaN convention** and do **not** match x86.
 
-### Two independent footguns in the insert/extract family
+### Two footguns in the insert/extract family
 
-1. **`UIM` is always the big-endian byte-element number.** There is no little-endian
-   reinterpretation. Under the `lxvx` register image, guest word *w* (w=0 = lowest) occupies byte
-   elements `12−4w .. 15−4w`, so **`UIM = 12−4w`**. ISA: "If the value of UIM is greater than 12,
-   the results are undefined."
-2. **The implicit data lane is not element 0.** `xxinsertw`/`xxextractuw` use word element **1**
-   (bits 32:63). `vinsertb`/`h`/`w`/`d` use byte element 7 / halfword element 3 / word element 1 /
-   dword element 0 respectively.
+1. **`UIM` is always the big-endian byte-element number** — no LE reinterpretation. Under the `lxvx`
+   image, guest word *w* occupies byte elements `12−4w .. 15−4w`, so **`UIM = 12−4w`**. Results are
+   undefined for `UIM > 12`.
+2. **The implicit data lane is not element 0**: `xxinsertw`/`xxextractuw` use word element **1**
+   (bits 32:63); `vinsertb/h/w/d` use byte element 7 / halfword 3 / word 1 / dword 0.
 
-Also: `vextubrx` (right-indexed, "byte element 15-index") is the guest-index-friendly form;
-`vextublx` is not.
+`vextubrx` (right-indexed) is the guest-index-friendly form; `vextublx` is not.
+
+### `mfocrf` zeroing
+
+ISA 3.0C changed `mfocrf` so non-selected bits are zeroed, but **pre-3.0C processors — including
+POWER8 and POWER9 — leave them undefined or only partially zeroed.** Do not rely on the zeroing.
 
 ### Codegen shape dependencies
 
-- `RELOC_NAMED_THUNK_MOVE` patching assumes `LoadConstant`'s exact **5-instruction** form
-  (`JIT.cpp:1231-1245`). Any shortening breaks relocation.
-- Explicit CR0/XER preservation contracts are documented at `ALUOps.cpp:2552-2554` and
-  `BranchOps.cpp:121-129`. Any instruction substitution with an `Rc` or CA side effect can violate
-  them silently.
-- CR0 is the canonical spilled-NZCV; comparisons deliberately target CR7 (`BranchOps.cpp:90-141`)
-  and CR2 for FPR loads (`MemoryOps.cpp:676-683`). Do not repurpose those fields.
+- `RELOC_NAMED_THUNK_MOVE` assumes `LoadConstant`'s exact **5-instruction** form (`JIT.cpp:1231-1245`).
+- CR0/XER preservation contracts documented at `ALUOps.cpp:2552-2554`, `BranchOps.cpp:121-129`. Any
+  substitution with an `Rc` or CA side effect can violate them silently.
+- CR0 is the canonical spilled-NZCV; comparisons deliberately target CR7 (`BranchOps.cpp:90-141`),
+  CR2 for FPR loads (`MemoryOps.cpp:676-683`). Do not repurpose.
 - `r0` is an invariant zero for `ldx`/`stdx` indexing, re-established after every C call
-  (`BranchOps.cpp:277-280`, `ALUOps.cpp:2973`), and must never be used as a discard destination.
-- Guest RSP is pinned to **r11**, the ELFv2 static-chain / small-TOC register — the root cause of
-  the callback trouble that `62ea24ce4` routed around via TLS. Do not assume r11 survives a PLT stub.
-- `mfcr` writes r4 = TMP2 = the incoming RIP argument in `PushCalleeSavedRegisters`; this was the
-  `State.rip=0xC0` keystone bug (`b21ee0205`). The stash-via-r0/r7 workaround must be preserved.
+  (`BranchOps.cpp:277-280`, `ALUOps.cpp:2973`); never a discard destination.
+- Guest RSP is pinned to **r11**, the ELFv2 static-chain / small-TOC register — the root of the
+  callback trouble `62ea24ce4` routed around via TLS. Repicking r11 is arch-neutral remediation
+  worth considering on its own merits.
+- `mfcr` writes r4 = TMP2 = the incoming RIP argument in `PushCalleeSavedRegisters` — the
+  `State.rip=0xC0` keystone bug (`b21ee0205`). Preserve the stash-via-r0/r7 workaround.
+- **`Ashr` is already CA-free** (`ALUOps.cpp:834-912`), using only `rldic*`/`rlwinm`/`srd`/`srw`/
+  `neg`/`or_`/`sldi`. Do not "optimize" it back onto `sraw`/`srad`.
 
-### `mfocrf` zeroing caveat
+---
 
-ISA 3.0C changed `mfocrf` so non-selected bits are zeroed, but **pre-3.0C processors, including
-POWER8 and POWER9, leave them undefined or only partially zeroed**. Do not rely on the zeroing.
+## Refuted and corrected
+
+Revision 1 claims that did not survive review. Recorded so they are not rediscovered.
+
+| Claim (rev 1) | Verdict | Correction |
+|---|---|---|
+| 64 KB host pages break SMC tracking and explain the Mono spins | **REFUTED** | FEX reports `AT_PAGESZ=4096` unconditionally and passes guest `mprotect` through; a 64 KB host breaks every dynamically-linked guest in `ld.so`. The host is 4 KB and the mechanism never fired |
+| Mono-specific workarounds corroborate the SMC theory | **REFUTED** | `ForceFullSMCDetection`, the Unity ringbuffer FORCE_TSO offsets and `MonoBackpatcherBlock` are **upstream commits by Billy Laws** (2025) targeting ARM64/Wine. Only Mono *detection* (`a37a65f17`) is the port author's. `MonoBackpatcherBlock`'s only caller is Windows-side — inert on Linux |
+| "Coherence rules out data staleness, so it must be code staleness" | **REFUTED** | False dichotomy. A stale translation still contains a real load. Persistent `EAGAIN` indicates a wrong computed `val` — codegen or ordering |
+| CA32/OV32 let the shift-left-32 duplication be **deleted** | **REFUTED** | Values are correct, but consumers are width-agnostic (`MapNZCVCC` reads CA with no knowledge of producer width, and after a 64-bit op CA32 ≠ CF); hardware carry-in consumes CA, never CA32; CA32 goes stale at all 48 manual XER patch sites; and ADC/SBB never used the shift trick anyway. Adoption would require a produce-time normalization redesign, not a deletion. *Smaller real finding inside it:* for subtract-family on zero-extended operands, 64-bit CA already equals the 32-bit no-borrow, so the redo is needed only for OV |
+| "Restoring CA still requires `mtxer`" | **OVERTURNED** | `addze Rt,r0` / `addic Rs,Rt,-1` — two base-ISA ALU instructions. Now Tier 1.2 |
+| "The 10-instruction SAR emulation stands" | **STALE** | `Ashr` is already CA-free at ~4–8 instructions |
+| "The split-lock apparatus must survive intact" | **PARTIALLY OVERTURNED** | True only for accesses crossing an aligned 16-byte boundary. The `lqarx` containment transform covers the rest — now Tier 1.1 |
+| "`wait` is unusable as a PAUSE lowering" | **PARTIALLY OVERTURNED** | Usable with a problem-state EBB timeout harness; high cost, PPR idiom still preferred |
+| `vbpermq`+`mfvsrd` = 2 instructions | **CORRECTED** | 3+, and needs a new IR op — no `MoveMask` IR exists |
+| Hardware AES/PCLMUL/SHA = 1–3 instructions | **CORRECTED** | 3–8 with byte-order fixups; AESDEC needs a transformed key; AESIMC/AESKEYGENASSIST need synthesis; CRC32 is 8–12 |
+| `isel` is a free branch-free win | **CORRECTED** | +3-cycle CR-source latency; break-even ≈ 25–30% mispredict rate |
+| `modsd` runs in parallel with the divide | **CORRECTED** | Only across superslices; same-superslice serializes to parity |
+| `setb` gives SETcc in 1–2 instructions | **CORRECTED** | 4/20 conditions in 1; 5/20 in 2; 11/20 need a cr-logical first |
+| `mcrxrx` is a drop-in for `ProjectXERToCR1` | **CORRECTED** | Requires remapping `MapNZCVCC` bit 5→4, else every overflow condition silently reads OV32 |
+| `lxvx` "can replace the bounce directly for any EA" | **CORRECTED** | True on the success path; `stxvx` cross-page DAR imprecision can break SMC `si_addr` targeting, and `lxvx` may partially write VRT on fault |
+| Tier 1 items are uniformly correctness-neutral | **CORRECTED** | The PAUSE/PPR item is the highest-regression-risk change in the plan; `mfocrf` collides with its own zeroing trap |
 
 ---
 
 ## Hardware probe checklist
 
-Run on the POWER9 box before writing any code. The first command is also worth running on the
-**POWER8** box — it is the single experiment that confirms or kills the Tier 0 theory.
+Run on the POWER9 box. Note that the first item is **no longer decisive** — it is a sanity check, not
+an experiment.
 
 ```bash
-# ---- THE decisive one. Run on BOTH boxes. 65536 on the P8 box confirms Tier 0. ----
-getconf PAGESIZE                                  # POWER9 must print 4096
-
-# ---- CPU / MMU identification ----
+getconf PAGESIZE                                   # expect 4096 (custom kernel on most distros)
 grep -E 'cpu|MMU|platform|revision' /proc/cpuinfo  # expect POWER9, MMU: Radix
-dmesg | grep -i -E 'radix|hash-mmu'                # confirm radix at boot
+dmesg | grep -i -E 'radix|hash-mmu'
 
-# ---- auxv: feature bits and cache geometry ----
 LD_SHOW_AUXV=1 /bin/true | grep -E 'HWCAP|DCACHEBSIZE|ICACHEBSIZE'
-#   AT_HWCAP2 must contain arch_3_00
-#   AT_DCACHEBSIZE expected 128  (HostFeatures currently falls back to 64 — wrong)
+#   AT_HWCAP2 must contain arch_3_00; AT_DCACHEBSIZE expected 128 (code assumes 64 — wrong)
 python3 -c "import ctypes; l=ctypes.CDLL(None); print(hex(l.getauxval(26)))"
 #   AT_HWCAP2 = 26; PPC_FEATURE2_ARCH_3_00 = 0x00800000
-#   (Confirm the constant against arch/powerpc/include/uapi/asm/cputable.h — it is a Linux
-#    ABI value, defined in neither the ISA nor the UM.)
+#   Confirm the constant against arch/powerpc/include/uapi/asm/cputable.h — it is a Linux ABI
+#   value, defined in neither the ISA nor the UM.
 
-# ---- address space / mm policy ----
-cat /proc/sys/vm/mmap_min_addr                     # 32-bit guest low-VA mapping
-cat /sys/kernel/mm/transparent_hugepage/enabled    # THP vs SMC mprotect churn
-grep MemTotal /proc/meminfo; ulimit -v
-
-# ---- empirical: 4K-but-not-64K-aligned fixed mapping must succeed ----
-cat > /tmp/pgtest.c <<'EOF'
-#include <sys/mman.h>
-#include <stdio.h>
-int main(void) {
-  void *p = mmap((void*)0x10001000, 4096, PROT_READ|PROT_WRITE,
-                 MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE, -1, 0);
-  printf("mmap -> %p\n", p);
-  if (p != MAP_FAILED) {
-    printf("mprotect -> %d\n", mprotect(p, 4096, PROT_READ));
-  }
-  return 0;
-}
-EOF
-gcc -O0 -o /tmp/pgtest /tmp/pgtest.c && /tmp/pgtest
+cat /proc/sys/vm/mmap_min_addr
+cat /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-Also worth capturing once the branch is live: the `g_SplitLockDetectedCount` telemetry counter
-(`FEXCore/Source/Utils/ArchHelpers/PPC64.cpp:64`) and `AccumulatedSIGBUSCount` under a real workload,
-to size the actual split-lock exposure before optimising that path.
+**Experiments that actually decide something:**
+
+1. **`stxvx` cross-page DAR precision** (gates §2.1's store half). `mprotect` the second of two
+   adjacent pages read-only; execute a 16-byte `stxvx` straddling the boundary; catch SIGSEGV and
+   print `si_addr`. If it reports the *first* page, the store path cannot move to `stxvx` without
+   reworking the SMC fault handler.
+2. **Faulting `lxvx` destination preservation**: same setup for a load into a known-valued VR;
+   check whether the VR was partially written.
+3. **`isel` vs `bc` microbenchmark** at 0 / 5 / 30 / 50% mispredict rates, before converting 25 sites.
+4. **AMO vs `larx`/`stcx.`**, uncontended and 4-thread contended, to decide Tier 2 AMO adoption.
+5. **`lqarx` containment prototype** (Tier 1.1): correctness first via a two-thread test mixing a
+   misaligned contained RMW against an aligned hardware atomic on overlapping bytes — the case the
+   mutex helper gets wrong today.
+6. **The stale-OV bug**: `mov rax,0x7FFFFFFFFFFFFFFF; add rax,1; jo`.
+7. `g_SplitLockDetectedCount` (`PPC64.cpp:64`) and `AccumulatedSIGBUSCount` under a real workload, to
+   size split-lock exposure before optimising it.
 
 ---
 
-## Mono debug plan
+## Mono / spin debug plan
 
-Ordered. Stop as soon as a step gives a clear answer.
+The page-size theory is dead; this is the replacement, ordered.
 
-1. **`getconf PAGESIZE` on the POWER8 box.** `65536` → Tier 0 trigger confirmed immediately.
-   Ensure the POWER9 kernel is Radix 4 K before comparing anything.
-2. **Rebuild with `-DCMAKE_BUILD_TYPE=Debug`** (or otherwise define `ASSERTIONS_ENABLED=1`) so
-   `LogMan::Throw::AFmt` actually fires. Any failing SMC `mprotect` becomes loud instantly.
-3. **Run Ziggurat / Stardew with `FEX_SMCCHECKS=full`.** Spin disappears (at heavy slowdown) →
-   stale translations confirmed. Spin persists → Tier 0 is dead for this symptom; pivot to step 6.
-4. **Watch `AccumulatedSMCCount` / `AccumulatedSIGBUSCount`** while Mono JITs. Mono active with SMC
-   count pinned at zero means invalidation is never firing.
-5. **`FEX_LOG_UNEXPECTED_FUTEX=1`** (from `c031b7657`) — note that as shipped it deliberately
-   **ignores `EAGAIN`**, so it is blind to this exact symptom. A ~2-line patch to log `EAGAIN` with
-   `uaddr` and `val` makes it useful: an identical stale `val` every iteration indicates stale code;
-   a moving `val` indicates a livelock elsewhere. Also enable the `cf17977e8` stale-compile byte log.
-6. **If step 3 failed:** investigate the guest-signal absorber stubs. `PPC64Dispatcher.cpp:488-522`
-   spills and `blr`s for SIGILL/SIGTRAP/SIGSEGV without delivering to the guest — the comments admit
-   this is temporary. Genuine hardware faults *do* reach guest handlers via
-   `SignalDelegator.cpp:1224-1230` → `HandleGuestSignal`, so Mono's null-check and GC-poll diet is
-   served; but guest `ud2` / `int3` / `int imm8` / `into` / `hlt` are swallowed. Mono embeds
-   `ud2`-class traps as unreachable markers and for some runtime checks.
-7. **`strace -f -e trace=futex,mprotect,mmap`**, diffed against a working title — look for missing
-   `PROT_READ` re-arms after Mono's `mmap(PROT_EXEC)` and code writes.
-8. **`gdb` the spinning thread**, dump the translation at PC against the current guest bytes
-   (`FEX_X86DISASSEMBLE`). A mismatch is the smoking gun regardless of which path leaked it.
+1. **Run Ziggurat / Stardew with `FEX_SMCCHECKS=full`.** Full mode byte-compares before every
+   instruction (`Core.cpp:646-667`), bypassing mprotect/mtrack arming entirely. **If the spin
+   persists, every stale-translation theory dies in one run** — pivot to ordering/codegen. If it
+   disappears, SMC invalidation *scope* is implicated (not page size).
+2. **Log `val` against `*uaddr` at each `EAGAIN`.** The hook exists at
+   `LinuxSyscalls/Syscalls/Passthrough.cpp:355-383` (`FEX_LOG_UNEXPECTED_FUTEX`) but **as shipped it
+   deliberately ignores `EAGAIN`** — a ~2-line patch makes it useful. A constant `val` against a
+   changing `*uaddr` indicates a hoisted or stale *register value*, i.e. codegen. A moving `val`
+   indicates livelock elsewhere.
+3. **Audit SMC re-arming.** `MarkGuestExecutableRange` runs only when a page newly contains code
+   (`Core.cpp:934-936`); after a fault unprotects a page (`SyscallsSMCTracking.cpp:79`), confirm it
+   is ever re-protected. Page-size independent, POWER9-independent.
+4. **Audit the emulated wait loop's ordering.** Given upstream needed acquire/release forcing on
+   plain MOVs for these workloads, check the TSO lowering of the glibc condvar sequence-word
+   accesses specifically.
+5. `strace -f -e trace=futex,mprotect,mmap` diffed against a working title.
+6. `gdb` the spinning thread; dump the translation at PC against current guest bytes
+   (`FEX_X86DISASSEMBLE`).
 
-### Minimal reproducer
-
-Does not require Unity or Mono. A ~50-line **static x86-64** binary:
-
-- Thread A: `mmap` RWX; emit a small stub; execute it; **patch the stub in place**; execute again and
-  assert the new behaviour is observed.
-- Thread B: `FUTEX_WAIT` on a word that only the *patched* stub updates.
-
-Under broken mtrack this spins on `EAGAIN` exactly as the games do, in a few hundred lines of total
-system state rather than a whole game engine.
+**Minimal reproducer** (no Unity needed) — a ~50-line **static x86-64** binary: thread A `mmap`s RWX,
+emits a stub, executes it, patches it in place, re-executes and asserts the new behaviour; thread B
+`FUTEX_WAIT`s on a word only the patched stub updates. Under broken invalidation this spins on
+`EAGAIN` exactly as the games do.
 
 ---
 
@@ -482,13 +590,15 @@ Gate = `PPC_FEATURE2_ARCH_3_00` unless marked POWER8-legal.
 
 | POWER8-legal (≤ v2.07) | POWER9-only (v3.0) |
 |---|---|
-| `lvx`/`stvx` (2.03), `vperm` (2.03), `vsldoi` (2.03) | `lxvx`, `stxvx`, `lxv`, `stxv`, `lxvb16x`, `stxvb16x`, `lxvh8x`, `stxvh8x`, `lxvl`, `lxvll`, `stxvl`, `stxvll` |
+| `lvx`/`stvx`, `vperm`, `vsldoi` (2.03) | `lxvx`, `stxvx`, `lxv`, `stxv`, `lxvb16x`, `lxvh8x`, `lxvl`, `lxvll`, `stxvl`, `stxvll`, `lxvwsx` |
 | `lxvd2x`, `stxvd2x`, `lxvw4x`, `stxvw4x` (2.06) | `mtvsrdd`, `mfvsrld`, `mtvsrws` |
 | `mtvsrd`, `mfvsrd`, `mfvsrwz`, `mtvsrwa`, `mtvsrwz` (2.07) | `xxbrq`, `xxbrd`, `xxbrw`, `xxbrh` |
-| `xvcvspdp`, `xvcvdpsp` (2.06) | `xxinsertw`, `xxextractuw`, `vinsertb/h/w/d`, `vextublx/brx`, `vextuhlx/hrx`, `vextuwlx/wrx` |
+| `xvcvspdp`, `xvcvdpsp` (2.06) | `xxinsertw`, `xxextractuw`, `vinsertb/h/w/d`, `vextu[bhw][lr]x` |
+| `lxsdx` (2.06), `lxsiwzx` (2.07) | `lxsd`, `lxssp`, `lxsibzx`, `lxsihzx`, `stxsibx`, `stxsihx` |
 | `vcipher`, `vcipherlast`, `vncipher`, `vncipherlast` (2.07) | `xsmincdp`, `xsmaxcdp`, `xsminjdp`, `xsmaxjdp` |
-| `vpmsumd`, `vpmsumw`, `vshasigmaw`, `vshasigmad` (2.07) | `vpermr`, `xxspltib`, `vabsdub/h/w` |
+| `vpmsumd`, `vpmsumw`, `vshasigmaw`, `vshasigmad` (2.07) | `vpermr`, `xxspltib`, `vabsdub/h/w`, `xxperm` |
 | `vbpermq` (2.07) | `xscvhpdp`, `xscvdphp`, `xvcvhpsp`, `xvcvsphp`, `vbpermd`, `vslv`, `vsrv` |
+| `lqarx`, `stqcx.`, `lq`, `stq` (2.07, problem-state) | `xsaddqp`/`xsmulqp`/`xsdivqp`, `xststdc*`, `xscmpeqdp` family, `vcmpneb`/`vcmpnezb`, `vextsb2w/d`, `vextsh2w/d` |
 
 ### Scalar
 
@@ -496,71 +606,52 @@ Gate = `PPC_FEATURE2_ARCH_3_00` unless marked POWER8-legal.
 |---|---|
 | `isel` (**2.03**) | `mcrxrx`, CA32/OV32 semantics |
 | `mfocrf`, `mtocrf` (2.01) | `modsw`, `moduw`, `modsd`, `modud` |
-| `sraw`, `srad`, `srawi`, `sradi`, `addic`, `subfic` (P1) | `cnttzw`, `cnttzd`, `setb`, `darn` |
-| `lqarx`, `stqcx.`, `lq`, `stq` (2.07, problem-state since 2.07) | `extswsli`, `addpcis`/`lnia`, `cmprb`, `cmpeqb` |
-| | `addex` (**v3.0B**, not v3.0 base; UM Table A-1 confirms POWER9 implements it) |
+| `addze`, `addic` (base — the CA round-trip) | `cnttzw`, `cnttzd`, `setb`, `darn` |
+| `sraw`, `srad`, `srawi`, `sradi`, `addic`, `subfic` (P1) | `extswsli`, `addpcis`/`lnia`, `cmprb`, `cmpeqb` |
+| | `maddld`, `maddhd`, `maddhdu`, `mffscrn`, `mffscrni`, `mffsl` |
+| | `addex` (**v3.0B**; POWER9 implements it per UM Table A-1) |
 
-### Atomic Memory Operation function codes (ISA Book II §4.5, Fig. 3–4)
+### AMO function codes (Book II §4.5, Fig. 3–4)
 
-`lwat`/`ldat` (s = 4 or 8):
+`lwat`/`ldat` (s = 4 or 8): 00000 Fetch and Add · 00001 Fetch and XOR · 00010 Fetch and OR ·
+00011 Fetch and AND · 00100/00101 Fetch and Max Unsigned/Signed · 00110/00111 Fetch and Min
+Unsigned/Signed · 01000 Swap · **10000 Compare and Swap Not Equal** · 11000/11001 Fetch and Increment
+Bounded/Equal · 11100 Fetch and Decrement Bounded.
 
-| FC | Operation |
-|---|---|
-| 00000 | Fetch and Add |
-| 00001 | Fetch and XOR |
-| 00010 | Fetch and OR |
-| 00011 | Fetch and AND |
-| 00100 / 00101 | Fetch and Maximum Unsigned / Signed |
-| 00110 / 00111 | Fetch and Minimum Unsigned / Signed |
-| 01000 | Swap |
-| 10000 | **Compare and Swap Not Equal** |
-| 11000 / 11001 | Fetch and Increment Bounded / Equal |
-| 11100 | Fetch and Decrement Bounded |
+`stwat`/`stdat`: 00000 Store Add · 00001 Store XOR · 00010 Store OR · 00011 Store AND ·
+00100/00101 Store Max Unsigned/Signed · 00110/00111 Store Min Unsigned/Signed · 11000 Store Twin.
 
-`stwat`/`stdat`: 00000 Store Add, 00001 Store XOR, 00010 Store OR, 00011 Store AND,
-00100/00101 Store Max Unsigned/Signed, 00110/00111 Store Min Unsigned/Signed, 11000 Store Twin.
-
-"Function codes not listed in this table are considered invalid" — an invalid FC invokes the system
-data storage error handler (DSISR bit 61).
-
-**Note the absence of a compare-and-swap-EQUAL.**
+"Function codes not listed in this table are considered invalid" — invalid FC invokes the system data
+storage error handler (DSISR bit 61). **Note the absence of a compare-and-swap-EQUAL.**
 
 ### Other confirmed constants
 
-- Reservation granule: **128 bytes**; coherence block: **128 bytes** (UM §4.6.1, §4.6.2.12).
-  "There is at most one reservation per thread."
-- POWER9 Radix supported page sizes: **4 KB, 64 KB, 2 MB, 1 GB** — and only those
-  (UM §4.10.4.1 Table 4-17).
-- DSISR store-vs-load discrimination: ISA bit 38 = mask **0x02000000**. FEX's mask is **correct**
-  (`MContext_ppc64le.h:189-197`). Nuance: also set for `dcbz` and for Load Atomic.
-- `EH` on load-and-reserve is a **hint only**, no semantic effect. ISA programming note: EH=1 for
-  lock acquisition, EH=0 for fetch-and-op emulation. Every current call site passes `eh=0`
-  (`Emitter.h:1311-1314`, `:1325`).
-- Aligned quadword `lq`/`stq`/`lqarx`/`stqcx.` are guaranteed single-copy atomic (Book II §1.4
-  p.817) and problem-state legal ("In versions of the architecture prior to V. 2.07, this
-  instruction was privileged").
+- Reservation granule **128 bytes**; coherence block **128 bytes** (UM §4.6.1, §4.6.2.12). At most
+  one reservation per thread.
+- POWER9 Radix supported page sizes: **4 KB, 64 KB, 2 MB, 1 GB**, and only those (UM Table 4-17).
+- DSISR store-vs-load: ISA bit 38 = mask **0x02000000** — FEX's mask is correct
+  (`MContext_ppc64le.h:189-197`). Also set for `dcbz` and Load Atomic.
+- `EH` on load-and-reserve is a **hint only**. Programming note: EH=1 for lock acquisition, EH=0 for
+  fetch-and-op. All current call sites pass `eh=0` (`Emitter.h:1311-1314`).
+- Aligned quadword `lq`/`stq`/`lqarx`/`stqcx.` are single-copy atomic (Book II §1.4 p.817) and
+  problem-state legal since 2.07.
 
 ---
 
 ## Open questions needing hardware
 
-1. **Does the POWER8 box run a 64 KB kernel?** Decides whether Tier 0 is a real historical
-   root-cause or a non-event. One command.
-2. **AMO latency/throughput vs `larx`/`stcx.` loops**, uncontended and contended. AMOs execute near
-   the coherence point and may lose to an L1-hit reservation loop when uncontended. Neither document
-   gives figures.
+1. **`stxvx` cross-page DAR precision** — gates half of the largest Tier 2 win.
+2. **AMO latency/throughput vs `larx`/`stcx.`**, contended and uncontended.
 3. **Unaligned `lxvx` penalty boundaries** (64 B / 128 B / page crossings). The UM gives throughput
-   ("one unaligned 8-byte load and one unaligned 8-byte store per cycle per LS-slice pair",
-   §25.1.7.9) but not crossing penalties. Measure before removing any alignment fast path.
-4. **Does `xsmincdp` on real silicon forward SNaN payloads raw?** The pseudocode says raw
-   (`result ← VSR[XB].dword[0]`), but the prose table contains a known typo mislabelling src2's
-   source register. One test vector settles it.
-5. **NaN payload width / denormal (DAZ-like) behaviour of `xscvdphp` / `xvcvsphp`** vs x86 F16C.
-6. **Whether ISA 2.07B's `lq`/`stq` LE wording** matches the "restriction lifted in 3.0C" narrative.
-   2.07B was not among the consulted sources; the delta is inferred from its absence in 3.0C plus
-   3.0C's explicit LE definition (Book I §3.3.4 p.56).
-7. **`PPC_FEATURE2_ARCH_3_00`'s value** — a Linux HWCAP2 ABI constant, defined in neither document.
-   Confirm against `arch/powerpc/include/uapi/asm/cputable.h`.
+   (§25.1.7.9) but not crossing penalties.
+4. **`isel` vs predicted-branch break-even** on real silicon.
+5. **Does `xsmincdp` forward SNaN payloads raw?** Pseudocode says yes; the prose table has a known
+   typo mislabelling src2's source register.
+6. **NaN payload width / denormal behaviour of `xscvdphp`/`xvcvsphp`** vs x86 F16C.
+7. **The stale-OV bug** (repro above) — needs a POWER8 or POWER9 run to confirm.
+8. **`PPC_FEATURE2_ARCH_3_00`'s value** — Linux ABI, defined in neither document.
+9. **Whether ISA 2.07B's `lq`/`stq` LE wording** matches the "restriction lifted in 3.0C" narrative;
+   2.07B was not consulted.
 
 ---
 
@@ -571,28 +662,21 @@ Primary sources, in `docs/` (git-ignored; ~16 MB, not committed):
 - `PowerISA_public.v3.0C.pdf` — Power ISA Version 3.0C
 - `POWER9_um_OpenPOWER_v20GA_09APR2018_pub.pdf` — POWER9 Processor User's Manual, OpenPOWER v2.0 GA
 
-Method: nine agent passes. Five subsystem audits of the existing port (atomics/memory model,
-VSX/SIMD, scalar ALU/flags, runtime/dispatcher/MMU, and commit archaeology), one targeted
-investigation of the Mono failure class, and three adjudication passes that re-checked every
-ISA-level claim from the audits against the documents above, marking each CONFIRMED / REFUTED /
-NUANCED / NOT-IN-DOCS with a citation.
+Method, thirteen agent passes in four rounds:
 
-Claims corrected during adjudication — recorded here because the original versions are plausible
-and may otherwise be rediscovered:
+1. **Audit** — five subsystem passes over the existing port: atomics/memory model, VSX/SIMD, scalar
+   ALU/flags, runtime/dispatcher/MMU, and commit archaeology.
+2. **Targeted investigation** — one pass on the Mono/managed-runtime failure class.
+3. **Adjudication** — three passes re-checking every ISA-level claim against the primary sources,
+   marking each CONFIRMED / REFUTED / NUANCED / NOT-IN-DOCS with citation.
+4. **Adversarial review** — four passes instructed to *refute* rather than confirm, defaulting to
+   "refuted" on ambiguous evidence: one attacking the page-size theory, one attacking the VSX and
+   availability claims, one attacking the flag rework, and one attacking the document's pessimism
+   from the opposite direction (hunting missed opportunities and overturned negative results).
 
-- `isel` is **v2.03**, not v2.06 (conclusion unchanged, but it has been available even longer).
-- `vbpermq` is **v2.07**, not a POWER9 feature — the `PMOVMSKB` win needs no branch gate.
-- `addex` is **v3.0B**, not v3.0 base.
-- `setb` examines **only LT and GT**, not any CR bit — it is not a general condition materialiser.
-- `modsw`/`moduw` leave `RT[0:31]` **undefined**; modulo and divide never trap on divide-by-zero or
-  signed overflow, they produce undefined results (x86 #DE checks must remain explicit).
-- `mfspr XER` on POWER9 is cracked but *cheap* (latency 3), not a hard serialisation — `mcrxrx`
-  still wins at latency 2, uncracked.
-- Reservation granule is **128 B**, not the 64 B the split-lock striping assumes.
-- The icache flush situation is *better* than first assessed: POWER9 needs one three-instruction
-  sequence for any range, not a per-line loop.
-- The "POWER8 took alignment interrupts where POWER9 does not" premise is **unsupported**.
-- The 128 TB VA figure is **Linux policy**, not an architectural limit (hardware: 52-bit EA, 4 PB).
+Round 4 destroyed the revision-1 headline, corrected roughly half the Tier 1/2 rankings, found two
+significant missed opportunities, and surfaced four bugs in the existing backend. See
+[Refuted and corrected](#refuted-and-corrected).
 
 ### Provenance warning
 
@@ -603,10 +687,14 @@ are the **primary surviving design documentation**.
 
 Several commit bodies reference the original author's private analysis notes —
 `project_stardew_main_thread_spin`, `project_vfork_clone_vm.md`,
-`project_steam_manifest_tls_handshake.md`, `project_ftl_grimrock_renderpath` — **none of which are
-in this repository**. `d91959d2f` also references a WIP `stash@{0}` that no longer exists. Assume
-that analysis is lost.
+`project_steam_manifest_tls_handshake.md`, `project_ftl_grimrock_renderpath` — **none of which are in
+this repository**. `d91959d2f` also references a WIP `stash@{0}` that no longer exists. Assume that
+analysis is lost.
 
-Note also that `README.md` line 25 still advertises `c8dab0af3` (dladdr-based host-vs-guest pointer
-discrimination) as a headline win, but it was **reverted 11 minutes later** by `439f8fe4e` with no
-reason recorded. The README is stale on that point.
+`README.md` line 25 still advertises `c8dab0af3` (dladdr-based host-vs-guest pointer discrimination)
+as a headline win; it was **reverted 11 minutes later** by `439f8fe4e` with no reason recorded. The
+README is stale on that point.
+
+Note also that upstream FEX commits present in this tree (e.g. Billy Laws' Mono/Unity work from
+2025) are easily mistaken for port-author work when reading `git log` without `--author`. Revision 1
+made exactly that error.
