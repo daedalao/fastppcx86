@@ -124,7 +124,10 @@ uint64_t MemAllocator32Bit::FindPageRange_TopDown(uint64_t Start, size_t Pages) 
     }
 
     if (Free) {
-      return Start - Offset;
+      // The pages tested free are [Start - Pages + 1, Start]; return the lowest.
+      // Returning `Start - Offset` (== Start - Pages here) would hand back a
+      // range shifted down one page, whose bottom page was never tested.
+      return Start - (Pages - 1);
     }
     Start -= Offset + 1;
   }
@@ -173,8 +176,12 @@ void* MemAllocator32Bit::Mmap(void* addr, size_t length, int prot, int flags, in
   // Remove the MAP_32BIT flag if it exists now
   flags &= ~FEX::HLE::X86_64_MAP_32BIT;
 
+  // FEX_A32_TRACE: stderr trace of every no-hint allocation failure and every
+  // EEXIST collision recovery, for diagnosing 32-bit address-space issues.
+  static const bool A32Trace = getenv("FEX_A32_TRACE") != nullptr;
+
   auto AllocateNoHint = [&]() -> void* {
-    bool Wrapped = false;
+    uint32_t Collisions = 0;
     uint64_t BottomPage = Map32Bit && (LastScanLocation >= LastKeyLocation32Bit) ? LastKeyLocation32Bit : LastScanLocation;
 restart: {
   // Linear range scan
@@ -187,6 +194,12 @@ restart: {
 
   uint64_t UpperPage = LowerPage + PagesLength;
   if (LowerPage == 0) {
+    if (A32Trace) {
+      char Buf[192];
+      int N = snprintf(Buf, sizeof(Buf), "[A32] tid=%d ENOMEM len=0x%zx pages=0x%zx collisions=%u map32=%d\n", FHU::Syscalls::gettid(),
+                       length, PagesLength, Collisions, Map32Bit ? 1 : 0);
+      [[maybe_unused]] auto _ = write(2, Buf, N);
+    }
     return reinterpret_cast<void*>(-ENOMEM);
   }
   {
@@ -195,24 +208,35 @@ restart: {
       ::mmap(reinterpret_cast<void*>(LowerPage << FEXCore::Utils::FEX_PAGE_SHIFT), length, prot, flags | FEX_MAP_FIXED_NOREPLACE, fd, offset);
 
     if (MappedPtr == MAP_FAILED && errno != EEXIST) {
+      if (A32Trace) {
+        char Buf[192];
+        int N = snprintf(Buf, sizeof(Buf), "[A32] tid=%d mmap errno=%d len=0x%zx lower=0x%lx collisions=%u\n", FHU::Syscalls::gettid(), errno,
+                         length, LowerPage << FEXCore::Utils::FEX_PAGE_SHIFT, Collisions);
+        [[maybe_unused]] auto _ = write(2, Buf, N);
+      }
       return reinterpret_cast<void*>(-errno);
     } else if (MappedPtr == MAP_FAILED) {
-      if (UpperPage == TOP_KEY) {
-        BottomPage = BASE_KEY;
-        Wrapped = true;
-        goto restart;
-      } else if (Wrapped && LowerPage >= LastScanLocation) {
-        // We linear scanned the entire memory range. Give up
-        return (void*)(uintptr_t)-errno;
-      } else {
-        // Try again
-        if (SearchDown) {
-          --BottomPage;
-        } else {
-          ++BottomPage;
+      ++Collisions;
+      // EEXIST: the host has a mapping in this range that MappedPages doesn't
+      // know about. Probe the range and record the colliding pages so the next
+      // scan skips them, rather than re-proposing overlapping ranges one page
+      // at a time and eventually giving up with -EEXIST — an errno mmap can't
+      // legally return, which guest allocators mishandle (steamrt libelf turns
+      // it into a NULL elf_strptr and libcapsule crashes in strstr).
+      bool MarkedAny = false;
+      for (uint64_t Page = LowerPage; Page < UpperPage; ++Page) {
+        unsigned char Vec;
+        if (::mincore(reinterpret_cast<void*>(Page << FEXCore::Utils::FEX_PAGE_SHIFT), FEXCore::Utils::FEX_PAGE_SIZE, &Vec) == 0) {
+          MappedPages.set(Page);
+          MarkedAny = true;
         }
-        goto restart;
       }
+      if (!MarkedAny) {
+        // Lost a race with a concurrent unmap; burn one page so every restart
+        // makes forward progress and the scan is guaranteed to terminate.
+        MappedPages.set(LowerPage);
+      }
+      goto restart;
     } else {
       if (SearchDown) {
         LastScanLocation = LowerPage;
@@ -220,6 +244,12 @@ restart: {
         LastScanLocation = UpperPage;
       }
       SetUsedPages(LowerPage, PagesLength);
+      if (A32Trace && Collisions != 0) {
+        char Buf[192];
+        int N = snprintf(Buf, sizeof(Buf), "[A32] tid=%d recovered len=0x%zx lower=0x%lx collisions=%u\n", FHU::Syscalls::gettid(), length,
+                         LowerPage << FEXCore::Utils::FEX_PAGE_SHIFT, Collisions);
+        [[maybe_unused]] auto _ = write(2, Buf, N);
+      }
       return MappedPtr;
     }
   }
@@ -252,12 +282,15 @@ int MemAllocator32Bit::Munmap(void* addr, size_t length) {
 
   uintptr_t PageEnd = PageAddr + PagesLength;
 
-  // Both Addr and length must be page aligned
+  // Addr must be page aligned; length may be anything non-zero and is rounded
+  // up to a page multiple, matching the kernel (mm/mmap.c: len = PAGE_ALIGN(len)).
+  // Rejecting unaligned lengths here made every libelf ELF_C_READ_MMAP unmap
+  // (raw file size) fail with EINVAL, silently leaking the whole file mapping.
   if (Addr & ~FEXCore::Utils::FEX_PAGE_MASK) {
     return -EINVAL;
   }
 
-  if (length & ~FEXCore::Utils::FEX_PAGE_MASK) {
+  if (length == 0) {
     return -EINVAL;
   }
 

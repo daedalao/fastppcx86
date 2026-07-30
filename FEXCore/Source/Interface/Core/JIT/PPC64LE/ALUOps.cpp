@@ -1981,11 +1981,12 @@ DEF_OP(AdcZeroWithFlags) {
 
   if (IROp->Size == IR::OpSize::i64Bit) {
     // addco_(Dst, Src, TMP4): Dst = Src + x86_CF, CA = carry-out, OV = ovf, CR0 from Dst.
+    // CA-out is left in DIRECT (CFInverted=false) form: the dispatcher's ADCOp
+    // sets `CFInverted = false` after emitting this op. Flipping it here (as an
+    // earlier revision did) made every carry consumer after an `adc $0` read
+    // !CF — BoringSSL's p256 point-add computed X/Y off by 2^192 and every
+    // Steam TLS handshake died with BAD_SIGNATURE.
     addco_(Dst, Src, TMP4);
-    // Flip CA-out to CFInverted convention.
-    mfspr(TMP1, 1);
-    xoris(TMP1, TMP1, 0x2000);
-    mtspr(1, TMP1);
     return;
   }
 
@@ -1995,9 +1996,10 @@ DEF_OP(AdcZeroWithFlags) {
   rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
 
-  // CFInverted CA = !bit-32 of TMP3.
+  // CA = bit-32 of TMP3 = x86_CF_out, stored DIRECT (CFInverted=false) to match
+  // the dispatcher's `CFInverted = false` after this op — same convention as
+  // the 64-bit path above and AdcWithFlags' i32 path.
   rldicl(TMP3, TMP3, 32, 63);
-  xori(TMP3, TMP3, 1);
 
   // OF for ADC-with-zero (TMP4 ∈ {0,1}, sign-bit always 0):
   // OF = !Src[31] AND Dst[31]

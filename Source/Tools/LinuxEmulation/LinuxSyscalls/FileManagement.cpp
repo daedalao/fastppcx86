@@ -746,15 +746,34 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
     auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
       OverlayAttempted = true;
+      // Never CREATE new files inside the rootfs overlay: probe with O_CREAT
+      // (and O_EXCL) masked so existing rootfs files still open in place, and
+      // let genuinely-new files fall through to the host create below. The
+      // overlay only virtualizes what exists; syscalls that bypass it (mount,
+      // rename across trees) see the real namespace — bwrap creates its
+      // bind-mount source files at / and then mount()s them, which returned
+      // ENOENT when the creation had been diverted into <rootfs>/.
+      const bool WantsCreate = (flags & O_CREAT) && !(flags & O_TMPFILE);
+      uint64_t ProbeFlags = (uint64_t)flags;
+      if (WantsCreate) {
+        ProbeFlags &= ~(uint64_t)(O_CREAT | O_EXCL);
+      }
       FEX::HLE::open_how how = {
-        .flags = (uint64_t)flags,
-        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .flags = ProbeFlags,
+        .mode = (ProbeFlags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
       if (fd == -1 && errno == EXDEV) {
         // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
-        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, (int)ProbeFlags, mode);
+      }
+      if (fd != -1 && WantsCreate && (flags & O_EXCL)) {
+        // O_CREAT|O_EXCL on a file that already exists in the rootfs.
+        ::close(fd);
+        errno = EEXIST;
+        fd = -1;
+        return -1;
       }
     }
   }
@@ -1112,15 +1131,38 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
       OverlayAttempted = true;
+      // open()/openat() silently ignore access modes and most other flags when
+      // O_PATH is set, but openat2() rejects them with EINVAL. Since the guest
+      // called the lenient syscall, apply the kernel's own open() masking
+      // before upgrading to openat2, or sloppy-but-legal guest opens fail.
+      // Seen live: libcapsule's capture-libs (Steam pressure-vessel) opens its
+      // --dest with O_RDWR|O_DIRECTORY|O_CLOEXEC|O_PATH.
+      uint64_t How_flags = (uint64_t)flags;
+      if (How_flags & O_PATH) {
+        How_flags &= (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+      }
+      // Never CREATE new files inside the rootfs overlay (see Open() above):
+      // probe with O_CREAT/O_EXCL masked; a genuine ENOENT falls through to
+      // the host create in the fallback below.
+      const bool WantsCreate = (How_flags & O_CREAT) && !(How_flags & O_TMPFILE);
+      if (WantsCreate) {
+        How_flags &= ~(uint64_t)(O_CREAT | O_EXCL);
+      }
       FEX::HLE::open_how how = {
-        .flags = (uint64_t)flags,
-        .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .flags = How_flags,
+        .mode = (How_flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
       if (fd == -1 && errno == EXDEV) {
         // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
-        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, (int)How_flags, mode);
+      }
+      if (fd != -1 && WantsCreate && (flags & O_EXCL)) {
+        // O_CREAT|O_EXCL on a file that already exists in the rootfs.
+        ::close(fd);
+        errno = EEXIST;
+        return -1;
       }
     }
   }
@@ -1221,16 +1263,13 @@ uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
+  // Node creation belongs to the real filesystem — never create inside the
+  // rootfs overlay (see Mkdirat()). Overlay consulted for EEXIST only.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
-  if (Path.FD != -1) {
-    uint64_t Result = ::mknodat(Path.FD, Path.Path, mode, dev);
-    // Only fall back when the parent path was genuinely absent from rootfs.
-    // EEXIST/EPERM/EACCES/etc. are semantic results that must propagate to the
-    // guest as-is rather than being re-answered against the host filesystem.
-    if (Result != -1 || errno != ENOENT) {
-      return Result;
-    }
+  if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST;
+    return -1;
   }
   return ::mknod(SelfPath, mode, dev);
 }
@@ -1361,16 +1400,17 @@ uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
+  // Directory creation belongs to the real filesystem — never create inside
+  // the rootfs overlay (see Openat()). Repeated guest runs were growing a
+  // /home/<user> skeleton inside the rootfs, which pressure-vessel then
+  // bind-mounted over the container's real /home, hiding the Steam install.
+  // The overlay is still consulted for EEXIST fidelity: a directory that
+  // exists only in the rootfs must not be shadow-created on the host.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, false, TmpFilename);
-  if (Path.FD != -1) {
-    uint64_t Result = ::syscall(SYSCALL_DEF(mkdirat), Path.FD, Path.Path, mode);
-    // Only fall back when the path was genuinely absent from rootfs.
-    // EACCES/EPERM/EISDIR/EEXIST/etc. are semantic results that must
-    // propagate to the guest as-is.
-    if (Result != -1 || errno != ENOENT) {
-      return Result;
-    }
+  if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST;
+    return -1;
   }
   return ::syscall(SYSCALL_DEF(mkdirat), dirfd, SelfPath, mode);
 }
@@ -1413,19 +1453,15 @@ uint64_t FileManager::Symlinkat(const char* target, int newdirfd, const char* li
   auto NewLink = GetSelf(linkpath);
   const char* SelfLink = NewLink ? NewLink->data() : nullptr;
 
+  // Symlink creation belongs to the real filesystem — never create inside
+  // the rootfs overlay (see Mkdirat()). Overlay consulted for EEXIST only.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(newdirfd, SelfLink, false, TmpFilename);
-  int eff_newdirfd = (Path.FD != -1) ? Path.FD : newdirfd;
-  const char* eff_linkpath = (Path.FD != -1) ? Path.Path : SelfLink;
-
-  uint64_t Result = ::syscall(SYSCALL_DEF(symlinkat), target, eff_newdirfd, eff_linkpath);
-  // If translation produced an unsuitable target (EXDEV / EROFS) or the
-  // rootfs leg doesn't exist (ENOENT), retry with the caller's literal
-  // path.
-  if (Result == -1 && (errno == EXDEV || errno == EROFS || errno == ENOENT) && Path.FD != -1) {
-    Result = ::syscall(SYSCALL_DEF(symlinkat), target, newdirfd, SelfLink);
+  if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST;
+    return -1;
   }
-  return Result;
+  return ::syscall(SYSCALL_DEF(symlinkat), target, newdirfd, SelfLink);
 }
 
 uint64_t FileManager::Renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
@@ -1480,17 +1516,25 @@ uint64_t FileManager::Chdir(const char* path) {
   auto NewPath = GetSelf(path);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
-  auto Path = GetEmulatedPath(SelfPath, true);
-  if (!Path.empty()) {
-    uint64_t Result = ::chdir(Path.c_str());
-    // Only fall back when the rootfs-scoped path was genuinely absent. EACCES
-    // and friends are semantic results the guest must see.
-    if (Result != -1 || errno != ENOENT) {
-      return Result;
-    }
+  // Host first, rootfs only when the host genuinely lacks the directory.
+  // The other order broke Steam: almost every absolute chdir target ("/",
+  // "/usr", "/tmp") exists inside the rootfs, so preferring it parked the
+  // host-visible cwd inside the overlay and pressure-vessel's relative-path
+  // re-exec of the client escaped FEX to the system binfmt handler
+  // (qemu-x86_64) and died. Host-first still covers the dpkg case that
+  // motivated the translation: dpkg-deb's workdir exists only in the rootfs,
+  // so the host chdir ENOENTs and the rootfs branch below takes it.
+  uint64_t Result = ::chdir(SelfPath);
+  if (Result != uint64_t(-1) || errno != ENOENT) {
+    return Result;
   }
 
-  return ::chdir(SelfPath);
+  auto Path = GetEmulatedPath(SelfPath, true);
+  if (!Path.empty()) {
+    return ::chdir(Path.c_str());
+  }
+  errno = ENOENT;
+  return -1;
 }
 
 uint64_t FileManager::Lchown(const char* pathname, uid_t owner, gid_t group) {

@@ -39,6 +39,67 @@ __attribute__((weak)) void* GetGuestStack();
 __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
 } // namespace FEX::HLE
 
+#ifdef IS_32BIT_THUNK
+#include <mutex>
+#include <sys/mman.h>
+#include <unordered_map>
+
+// Host function pointers handed to a 32-bit guest must fit in 32 bits: the
+// value doubles as the fake guest address the thunk machinery links
+// (LinkAddressToFunction) and as the host callee the invoker calls back
+// through (AddThunkTrampolineIRHandler forwards the linked address via mm0).
+// Host VAs on ppc64le live at 0x3fff'xxxx'xxxx, so hand out a low-4GB
+// executable host trampoline instead: `ld r0,16(r12); mtctr r0; mr r12,r0;
+// bctr; .quad target` (ELFv2 indirect calls set r12 = entry, so the literal
+// is reachable r12-relative and the real callee sees its own entry in r12).
+// Cached per target so repeated queries return pointer-identical results.
+// The pool page is invisible to MemAllocator32Bit's bitmap, but its
+// MAP_FIXED_NOREPLACE + mincore-resync EEXIST path absorbs the collision if
+// the guest allocator ever proposes this page.
+inline void* MakeLow32HostTrampoline(void* Target) {
+#ifdef __powerpc64__
+  static std::mutex Mutex;
+  static std::unordered_map<void*, void*> Cache;
+  static uint8_t* Pool = nullptr;
+  static size_t PoolOff = 0;
+  constexpr size_t PoolSize = 0x10000;
+  constexpr size_t TrampSize = 24;
+
+  std::lock_guard lk {Mutex};
+  if (auto It = Cache.find(Target); It != Cache.end()) {
+    return It->second;
+  }
+  if (!Pool || PoolOff + TrampSize > PoolSize) {
+    for (uintptr_t Addr = 0x7000'0000; Addr >= 0x1000'0000; Addr -= 0x100'0000) {
+      void* P = ::mmap(reinterpret_cast<void*>(Addr), PoolSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+      if (P != MAP_FAILED) {
+        Pool = static_cast<uint8_t*>(P);
+        PoolOff = 0;
+        break;
+      }
+    }
+    if (!Pool) {
+      return nullptr;
+    }
+  }
+  uint8_t* Tramp = Pool + PoolOff;
+  PoolOff += TrampSize;
+  uint32_t* Insns = reinterpret_cast<uint32_t*>(Tramp);
+  Insns[0] = 0xE80C0010; // ld    r0, 16(r12)
+  Insns[1] = 0x7C0903A6; // mtctr r0
+  Insns[2] = 0x7C0C0378; // mr    r12, r0   (or r12, r0, r0)
+  Insns[3] = 0x4E800420; // bctr
+  memcpy(Tramp + 16, &Target, 8);
+  __builtin___clear_cache(reinterpret_cast<char*>(Tramp), reinterpret_cast<char*>(Tramp + 16));
+  Cache.emplace(Target, Tramp);
+  return Tramp;
+#else
+  return nullptr;
+#endif
+}
+#endif
+
 template<typename Fn>
 struct function_traits;
 template<typename Result, typename Arg>
@@ -184,19 +245,26 @@ struct guest_layout<T*> {
   // Allow implicit conversion for function pointers, since they disallow use of host_layout
   guest_layout& operator=(const T* from) requires (std::is_function_v<T>)
   {
-    // For 32-bit thunks, guest_layout's data field is uint32_t and we must
-    // verify the host VA fits.  A host pointer above 4 GiB silently truncated
-    // here would land in a downstream guest dispatch as a garbage address.
-    if constexpr (sizeof(data) == 4) {
-      // Plain fprintf+abort because LOGMAN_THROW headers aren't in this TU.
-      // Triggers ONLY on host VA above 4 GiB which is fatal anyway in a
-      // 32-bit thunk — silent truncation produces undebuggable downstream
-      // crashes.  Better to die at the obvious spot.
-      if ((reinterpret_cast<uintptr_t>(from) >> 32) != 0) {
+#ifdef IS_32BIT_THUNK
+    // guest_layout's data field is uint32_t here: the value must be
+    // representable as a 32-bit guest address AND callable host-side (the
+    // thunk trampoline machinery forwards it back as the host callee).
+    // Host VAs sit above 4 GiB on ppc64le, so substitute a low-4GB host
+    // trampoline that tail-calls the real function. Identity is preserved
+    // per target, so guest-side pointer comparisons stay stable.
+    if ((reinterpret_cast<uintptr_t>(from) >> 32) != 0) {
+      void* Tramp = MakeLow32HostTrampoline(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(from)));
+      if (!Tramp) {
+        // Plain fprintf+abort because LOGMAN_THROW headers aren't in this
+        // TU. Silent truncation produces undebuggable downstream crashes —
+        // better to die at the obvious spot.
         fprintf(stderr, "FEX FATAL: guest_layout<T*> 32-bit truncation: host VA %p does not fit in 32 bits\n", (void*)from);
         std::abort();
       }
+      data = static_cast<type>(reinterpret_cast<uintptr_t>(Tramp));
+      return *this;
     }
+#endif
     data = reinterpret_cast<uintptr_t>(from);
     return *this;
   }
@@ -230,7 +298,18 @@ struct guest_layout<T* const> {
   // Allow implicit conversion for function pointers, since they disallow use of host_layout
   guest_layout& operator=(const T* from) requires (std::is_function_v<T>)
   {
-    // TODO: Assert upper 32 bits are zero
+#ifdef IS_32BIT_THUNK
+    // Same low-4GB host trampoline substitution as guest_layout<T*> above.
+    if ((reinterpret_cast<uintptr_t>(from) >> 32) != 0) {
+      void* Tramp = MakeLow32HostTrampoline(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(from)));
+      if (!Tramp) {
+        fprintf(stderr, "FEX FATAL: guest_layout<T* const> 32-bit truncation: host VA %p does not fit in 32 bits\n", (void*)from);
+        std::abort();
+      }
+      data = static_cast<type>(reinterpret_cast<uintptr_t>(Tramp));
+      return *this;
+    }
+#endif
     data = reinterpret_cast<uintptr_t>(from);
     return *this;
   }

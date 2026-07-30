@@ -1012,10 +1012,28 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   if ((Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) && !IsAsyncSignal(&SigInfo, Signal)) {
     static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
     if (trip) {
-      char buf[224];
+      char buf[1024];
       int n = snprintf(buf, sizeof(buf), "[GSIG] tid=%d sig=%d si_code=%d si_addr=0x%lx guest_rip=0x%lx\n",
                        FHU::Syscalls::gettid(), Signal, SigInfo.si_code, reinterpret_cast<unsigned long>(SigInfo.si_addr),
                        (unsigned long)Thread->CurrentFrame->State.rip);
+      const auto& St = Thread->CurrentFrame->State;
+      n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  rax=%lx rcx=%lx rdx=%lx rbx=%lx rsp=%lx rbp=%lx rsi=%lx rdi=%lx\n",
+                    St.gregs[0], St.gregs[1], St.gregs[2], St.gregs[3], St.gregs[4], St.gregs[5], St.gregs[6], St.gregs[7]);
+      // 32-bit guests keep a walkable EBP chain: ebp -> {saved ebp, ret}.
+      // Reads are within our own address space; bound them to the low 4GB and
+      // require monotonically increasing frame pointers to stay fault-free.
+      uint64_t bp = St.gregs[5];
+      for (int i = 0; i < 8 && bp >= 0x1000 && bp < 0xFFFFF000ULL && (bp & 3) == 0; ++i) {
+        uint32_t SavedBP = 0;
+        uint32_t RetAddr = 0;
+        memcpy(&SavedBP, reinterpret_cast<void*>(bp), 4);
+        memcpy(&RetAddr, reinterpret_cast<void*>(bp + 4), 4);
+        n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  frame[%d] ebp=%lx ret=0x%x\n", i, bp, RetAddr);
+        if (SavedBP <= bp) {
+          break;
+        }
+        bp = SavedBP;
+      }
       [[maybe_unused]] auto _ = write(2, buf, n);
     }
   }
