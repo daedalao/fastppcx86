@@ -9,6 +9,7 @@ $end_info$
 #pragma once
 
 #include <FEXCore/Utils/CompilerDefs.h>
+#include <atomic>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/string.h>
@@ -85,6 +86,16 @@ namespace CPU {
 
     // Protects writes to the latest CodeBuffer and changes to LatestOffset
     FEXCore::ForkableUniqueMutex CodeBufferWriteMutex;
+
+    // TID of the thread currently holding CodeBufferWriteMutex, 0 when free.
+    // CodeBufferWriteMutex is non-recursive, so a thread that re-enters while
+    // already holding it deadlocks against itself.  On PPC64LE this is a live
+    // hazard because the backend emits directly into the shared CurrentCodeBuffer
+    // and holds the lock across the whole emission window (arm64 stages into a
+    // per-thread TempCodeBuffer instead), so any control-flow escape from that
+    // window leaves the mutex held forever.  Track the owner so the re-entry can
+    // be detected and reported instead of silently hanging every thread.
+    std::atomic<uint64_t> CodeBufferWriteOwner {0};
 
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 

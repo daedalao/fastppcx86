@@ -1146,16 +1146,29 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0001h(uint32_t Leaf) con
 }
 
 // Processor brand string
+//
+// GetCPUID() returns the *host* CPU number, which has no relation to the size
+// of PerCPUData. On ARM hosts PerCPUData has one entry per core discovered via
+// CPUMIDRs, but on every other host SetupHostHybridFlag() sizes it to exactly
+// one. Indexing it by an unclamped host CPU number therefore reads off the end
+// of the vector on any core but 0, and the brand-string leaves immediately
+// strlen() the garbage ProductName pointer they find there.
+//
+// On an 80-core POWER8 that is a 79-in-80 chance of a SIGSEGV inside FEX the
+// first time a guest asks for its CPU name -- which looked for a long time like
+// a flaky, cache-dependent crash (Legend of Grimrock died this way on most
+// launches). Clamp like RunFunctionName in the header already does;
+// SetupHostHybridFlag guarantees size() >= 1.
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf) const {
-  return Function_8000_0002h(Leaf, GetCPUID());
+  return Function_8000_0002h(Leaf, GetCPUID() % PerCPUData.size());
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf) const {
-  return Function_8000_0003h(Leaf, GetCPUID());
+  return Function_8000_0003h(Leaf, GetCPUID() % PerCPUData.size());
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) const {
-  return Function_8000_0004h(Leaf, GetCPUID());
+  return Function_8000_0004h(Leaf, GetCPUID() % PerCPUData.size());
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const {

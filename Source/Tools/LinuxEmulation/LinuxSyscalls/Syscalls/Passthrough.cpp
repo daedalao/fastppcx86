@@ -15,6 +15,9 @@ $end_info$
 
 #include <stdint.h>
 #include <sched.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <termios.h>  // PPC TCGETS family expands to use sizeof(struct termios)
@@ -341,6 +344,31 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 // short-circuit -- essentially free.
 static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
                                      uint64_t tgid, uint64_t tid, uint64_t sig) {
+  // Diagnostic tripwire: a guest raising SIGABRT at itself is abort(). The
+  // abort reason is frequently silent (mono/FMOD/Unity route their logs away
+  // from stderr), so dump the guest RIP/RSP and a raw stack window here --
+  // return addresses in the dump can be symbolized offline against the guest
+  // libraries. Gated on FEX_ABORT_TRIPWIRE=1.
+  if (sig == SIGABRT) {
+    static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
+    if (trip) {
+      char buf[256];
+      const uint64_t rip = Frame->State.rip;
+      const uint64_t rsp = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+      int n = snprintf(buf, sizeof(buf), "[ABRT] tid=%d tgkill(%lu,%lu,SIGABRT) guest rip=0x%lx rsp=0x%lx stack:\n",
+                       static_cast<int>(::syscall(SYS_gettid)), (unsigned long)tgid, (unsigned long)tid,
+                       (unsigned long)rip, (unsigned long)rsp);
+      [[maybe_unused]] auto _ = write(2, buf, n);
+      if (rsp >= 0x10000ULL && rsp <= 0x00007FFFFFFFFFFFULL) {
+        const uint64_t* sp = reinterpret_cast<const uint64_t*>(rsp);
+        for (int i = 0; i < 96; i += 4) {
+          n = snprintf(buf, sizeof(buf), "[ABRT] +%03x: %016lx %016lx %016lx %016lx\n", i * 8,
+                       (unsigned long)sp[i], (unsigned long)sp[i + 1], (unsigned long)sp[i + 2], (unsigned long)sp[i + 3]);
+          [[maybe_unused]] auto _2 = write(2, buf, n);
+        }
+      }
+    }
+  }
   FEX::HLE::SyscallObserver::OnTgkillCall(tgid, tid, sig);
   return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
 }
@@ -376,6 +404,32 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
                          (unsigned long)timeout, (unsigned long)uaddr2, (unsigned long)val3, err);
         [[maybe_unused]] auto _ = write(2, buf, n);
       }
+    }
+  }
+
+  // Diagnostic: full futex traffic trace, for chasing lost-wakeup livelocks.
+  // Two-stage arming so it costs one bool load until wanted and can be turned
+  // on mid-run once a wedge is established: run with FEX_FUTEX_TRACE=1, then
+  // `touch /tmp/ftx_on` to start logging (rm to stop). Logs every futex call:
+  // tid, op, uaddr, val, kernel result, and the futex word's live value after
+  // return -- enough to see a WAIT that never blocks and whether any WAKE
+  // targets the same uaddr.
+  {
+    static const bool trace_futex = (getenv("FEX_FUTEX_TRACE") != nullptr);
+    if (trace_futex && access("/tmp/ftx_on", F_OK) == 0) {
+      static thread_local pid_t tls_tid = 0;
+      if (tls_tid == 0) {
+        tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
+      }
+      uint32_t cur = 0xdeadbeef;
+      if (uaddr && signed_result != -EFAULT) {
+        memcpy(&cur, reinterpret_cast<const void*>(uaddr), sizeof(cur));
+      }
+      char buf[192];
+      int n = snprintf(buf, sizeof(buf), "[FTX] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
+                       static_cast<int>(tls_tid), (unsigned long)futex_op, (unsigned long)uaddr, (unsigned long)val,
+                       (unsigned long)timeout, (long)signed_result, cur);
+      [[maybe_unused]] auto _ = write(2, buf, n);
     }
   }
 

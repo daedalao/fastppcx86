@@ -24,6 +24,8 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <cstdio>
+#include <cstring>
+#include <string_view>
 #include <unistd.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -106,6 +108,11 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
 
+    // Mirror of InvalidationTracker::HandleRWXAccessViolation's tail on Windows:
+    // once the page has been invalidated and made writable again, see whether
+    // this fault is the mono backpatcher announcing itself.
+    _SyscallHandler->DetectMonoBackpatcherBlock(Thread, ArchHelpers::Context::GetPc(ucontext));
+
     auto CTX = Thread->CTX;
     if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !CTX->IsCurrentBlockSingleInst(Thread) &&
         CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
@@ -177,6 +184,16 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           } while ((VMA = VMA->ResourceNextVMA));
 
         } else if (Mapping->second.Prot.Writable) {
+          // Once the mono backpatcher hook is installed, writable+executable
+          // mappings (mono's JIT arenas) are covered by MonoBackpatcherWrite and
+          // per-instruction validation on tailcall sites instead of by faulting,
+          // so leave them alone.  Everything else (W^X libraries, the loader)
+          // keeps normal mtrack behaviour -- deliberately narrower than the
+          // Windows version, which drops tracking for all RWX intervals.
+          if (SMCDetectionDisabled.load(std::memory_order_relaxed) && Mapping->second.Prot.Executable) {
+            continue;
+          }
+
           int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
 
           LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
@@ -184,6 +201,115 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
       }
     }
   }
+}
+
+void SyscallHandler::MaybeRecordMonoMapping(std::string_view Path, uint64_t Base, uint64_t End) {
+  if (!IsMonoRuntimeLibraryPath(Path)) {
+    return;
+  }
+
+  // Mapping the library is a stronger signal than merely opening it, so drive
+  // the same detection from here.  No-op if openat already did it.
+  MaybeDetectMonoFromPath(Path);
+
+  // If the config gate rejected the hacks there is nothing to hook, so don't
+  // track a range or arm the fault-path check.
+  if (!MonoHacksActive.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  // Grow [MonoBase, MonoEnd) across the library's several PT_LOAD mappings.
+  uint64_t OldBase = MonoBase.load(std::memory_order_relaxed);
+  while (OldBase == 0 || Base < OldBase) {
+    if (MonoBase.compare_exchange_weak(OldBase, Base, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  uint64_t OldEnd = MonoEnd.load(std::memory_order_relaxed);
+  while (End > OldEnd) {
+    if (MonoEnd.compare_exchange_weak(OldEnd, End, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+
+  if (!MonoBackpatcherDetectionPending.exchange(true, std::memory_order_release)) {
+    LogMan::Msg::IFmt("Mono runtime mapped at {:#x}-{:#x} ({}) — watching for the backpatcher block.", Base, End, Path);
+  }
+}
+
+void SyscallHandler::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
+  // Cheap relaxed gate: false for every process that isn't mono, and for every
+  // fault after the backpatcher has been found.
+  if (!MonoBackpatcherDetectionPending.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  auto CTX = Thread->CTX;
+  if (!CTX->IsAddressInCodeBuffer(Thread, HostPC)) {
+    return;
+  }
+
+  const uint64_t Base = MonoBase.load(std::memory_order_relaxed);
+  const uint64_t End = MonoEnd.load(std::memory_order_relaxed);
+  const uint64_t RIP = CTX->RestoreRIPFromHostPC(Thread, HostPC);
+  if (!RIP || RIP < Base || RIP >= End) {
+    return;
+  }
+
+  // The backpatcher's store is an XCHG (0x87).  Accept a one-byte prefix (REX,
+  // operand-size) before it, exactly as the Windows side does.
+  static constexpr uint8_t XChgOp = 0x87;
+  if (*reinterpret_cast<uint8_t*>(RIP) != XChgOp && *reinterpret_cast<uint8_t*>(RIP + 1) != XChgOp) {
+    return;
+  }
+
+  // Claim the one-shot.  A racing thread that also faulted on an XCHG loses here
+  // and simply takes the normal SMC path for that one write.
+  if (!MonoBackpatcherDetectionPending.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread);
+  LogMan::Msg::IFmt("Detected mono backpatcher at {:#x} (faulting RIP {:#x}) — installing write hook, "
+                    "disabling fault-based SMC detection for writable+executable mappings.",
+                    BlockEntry, RIP);
+
+  DisableSMCDetectionLocked(Thread);
+
+  {
+    std::scoped_lock CodeLock(CTX->GetCodeInvalidationMutex());
+    CTX->MarkMonoBackpatcherBlock(BlockEntry);
+  }
+
+  // Drop the block so it recompiles with IsMonoBackpatcherBlock set (Core.cpp
+  // keys the flag off the block entry RIP at BeginFunction time).
+  TM.InvalidateGuestCodeRange(Thread, BlockEntry & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+}
+
+void SyscallHandler::DisableSMCDetectionLocked(FEXCore::Core::InternalThreadState* Thread) {
+  if (SMCDetectionDisabled.exchange(true, std::memory_order_release)) {
+    return;
+  }
+
+  // One-time sweep: anything we already write-protected that the guest asked to
+  // be both writable and executable goes back to its requested protection.
+  // NOTE: the caller holds VMATracking.Mutex (shared).  We only mprotect here;
+  // the tracking structures record the guest's requested protection and are
+  // unchanged by mtrack's write-protection, so there is nothing to mutate.
+  size_t Restored = 0;
+  for (const auto& [MapBase, Entry] : VMATracking.VMAs) {
+    if (!Entry.Prot.Writable || !Entry.Prot.Executable) {
+      continue;
+    }
+
+    const int Prot = (Entry.Prot.Readable ? PROT_READ : 0) | PROT_WRITE | PROT_EXEC;
+    if (mprotect(reinterpret_cast<void*>(MapBase), Entry.Length, Prot) == 0) {
+      ++Restored;
+    } else {
+      LogMan::Msg::EFmt("Mono: failed to restore protection on {:#x}-{:#x}: {}", MapBase, MapBase + Entry.Length, strerror(errno));
+    }
+  }
+  LogMan::Msg::IFmt("Mono: restored write+exec protection on {} mapping(s).", Restored);
 }
 
 void SyscallHandler::InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
@@ -549,6 +675,14 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
       Inserted = true;
     }
     Resource = &ResourceIt->second;
+
+    // Record the mono runtime's code range for the backpatcher hook.  This is
+    // the Linux stand-in for the PE-module-load path Windows uses, and it is a
+    // stronger signal than the openat-based detection in MaybeDetectMonoFromPath
+    // because it also gives us [MonoBase, MonoEnd).
+    if (PathLength != -1 && ProtMapping.Executable) {
+      MaybeRecordMonoMapping(std::string_view(Tmp, PathLength), addr, addr + Size);
+    }
 
     // Only handle FDs that are backed by regular files that are executable
     if (PathLength != -1 && S_ISREG(buf.st_mode) && (buf.st_mode & S_IXUSR)) {

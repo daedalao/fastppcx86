@@ -355,27 +355,24 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
     return guest_layout<XVisualInfo*> {.data = 0};
   }
 
-  // The historical implementation called GuestXGetVisualInfo as a guest
-  // callback to relocate the visual into guest-owned memory. That round-
-  // trip is unreliable on cross-arch hosts (project_2026-05-17_trampoline_
-  // yield_bypass + Grimrock). GuestMalloc is also a guest-callback so we
-  // can't use it as a substitute either — it returns garbage on the same
-  // broken path.
+  // This buffer must come from the *guest* heap.
   //
-  // Use host malloc() directly: the guest and host share the same process
-  // VA (FEX maps the guest binary in-process), so a host-allocated 0x3fff…
-  // pointer is dereferenceable by guest JIT code. The guest's eventual
-  // XFree(visualinfo) routes through the thunked XFree → HostXFree →
-  // libX11 XFree → host free(), which matches the host malloc. Safe.
-  guest_layout<XVisualInfo*> GuestRet;
-  GuestRet.data = reinterpret_cast<uintptr_t>(std::malloc(sizeof(guest_layout<XVisualInfo>)));
-  if (!GuestRet.data) {
-    fprintf(stderr, "MapToGuestVisualInfo: host malloc failed\n");
-    std::abort();
-  }
-  *reinterpret_cast<guest_layout<XVisualInfo>*>(GuestRet.data) = to_guest(to_host_layout(*HostInfo));
-  x11_manager.HostXFree(HostInfo);
-  return GuestRet;
+  // 41d9771a1 switched it to host std::malloc() on the reasoning that the
+  // guest's XFree() would route back through the thunked XFree -> HostXFree ->
+  // host free(). That is not what happens: libGL-guest.so has a DT_NEEDED on
+  // the guest's own libX11.so.6, so XFree() is resolved inside the guest and
+  // calls the *guest* allocator's free() on a host-heap pointer. Guest glibc
+  // then walks a chunk header that was never its own and aborts with
+  //   double free or corruption (out)
+  // right after glXCreateContext. Whether it aborts at all depends only on
+  // what the host pointer happens to alias, so it looked intermittent and got
+  // misfiled as guest/host thunk interface drift.
+  //
+  // The guest-callback path that made GuestMalloc unusable back in May was
+  // fixed afterwards (f34dbdb9d, 62ea24ce4, b21ee0205, 58973e69e), and
+  // RelocateArrayToGuestHeap has been using GuestMalloc successfully since.
+  // Use it here too - a single-element relocation is exactly what it does.
+  return RelocateArrayToGuestHeap(HostInfo, 1);
 }
 
 guest_layout<GLXFBConfig*> fexfn_impl_libGL_glXChooseFBConfig(Display* Display, int Screen, const int* Attributes, int* NumItems) {

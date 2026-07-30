@@ -158,11 +158,17 @@ fextl::vector<FEXCore::Allocator::MemoryRegion> InitMemoryRegions(bool Is64Bit) 
 }
 
 fextl::unique_ptr<FEX::HLE::MemAllocator> InitAllocator(bool Is64Bit) {
+  const auto PageSize = sysconf(_SC_PAGESIZE);
+
   if (Is64Bit) {
+    // A 64-bit guest doesn't need the 4 GiB-constrained allocator, but the
+    // bundled allocator still has to be configured: without this rpmalloc uses
+    // its own mapper, ignores FEX's placement hint, and strews its arenas
+    // (~45 GiB under Unity) through the guest's address space.
+    FEXCore::Allocator::InitializeAllocator(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
     return {};
   }
 
-  const auto PageSize = sysconf(_SC_PAGESIZE);
 
   // Setup our userspace allocator
   FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);

@@ -29,6 +29,10 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <cfenv>
 #include <cstdio>
 #include <cstring>
@@ -1858,8 +1862,17 @@ bypass_diagnose:
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
 
-  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
-  uintptr_t HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
+  uintptr_t HostCode;
+  {
+    // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking.
+    // This MUST be dropped before calling CompileBlock: CompileBlock takes the same shared lock,
+    // and WritePriorityMutex is non-recursive. Recursive read acquisition looks harmless until an
+    // exclusive waiter queues up (e.g. GuestMunmap invalidating a code range) — write-priority then
+    // blocks the inner lock_shared while this thread still owns the outer read slot, deadlocking the
+    // thread against itself and stalling every other reader behind the pending writer.
+    auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
+    HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
+  }
   if (!HostCode) {
     HostCode = CTX->CompileBlock(Frame, GuestRIP, 0);
   }
@@ -1974,6 +1987,23 @@ void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF
   }
 }
 
+void PPC64JITCore::EmitSuspendInterruptCheck() {
+  // Single byte-store poke of the InterruptFaultPage (see JITClass.h and the
+  // matching drain logic in SignalDelegator::HandleGuestSignal). The stored
+  // value is irrelevant -- the page carries no data, it exists to fault when
+  // a deferred signal is pending. r0 is architecturally safe as the source
+  // (the r0==0 block invariant makes it dead here, and stb only reads it).
+  // The SEGV handler's nested-deferral path skips a faulting store by
+  // advancing NIP by 4, which this single fixed-size stb satisfies.
+  constexpr int32_t FaultOff = static_cast<int32_t>(
+    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
+    offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+  static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) >=
+                offsetof(FEXCore::Core::InternalThreadState, BaseFrameState),
+                "InterruptFaultPage must lie at or after BaseFrameState");
+  stb(r(0), FaultOff, STATE);
+}
+
 // -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
@@ -1991,7 +2021,67 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // garbage host instructions. Hold the write mutex for the whole emission
   // window — including the icache flush — so other threads see a coherent
   // buffer state.
+  // Diagnostic: CodeBufferWriteMutex is non-recursive.  If this thread already
+  // owns it we are about to deadlock against ourselves and take every other
+  // thread down with us (they all block here on the next compile).  Report the
+  // re-entry with a host backtrace instead of hanging silently.
+  const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
+  if (CodeBuffers.CodeBufferWriteOwner.load(std::memory_order_relaxed) == SelfTID) {
+    LogMan::Msg::EFmt("PPC64 JIT: re-entrant CompileCode on tid {} for Entry {:#x} -- "
+                      "CodeBufferWriteMutex is already held by this thread. Host backtrace:",
+                      SelfTID, Entry);
+    void* Frames[32];
+    const int Count = ::backtrace(Frames, 32);
+    ::backtrace_symbols_fd(Frames, Count, 2);
+  }
+
   std::unique_lock CodeBufferLock {CodeBuffers.CodeBufferWriteMutex};
+
+  // Clear the owner on every exit path, including the unlock/lock dance in the
+  // capacity guard below.
+  struct OwnerTracker {
+    std::atomic<uint64_t>& Owner;
+    uint64_t TID;
+    OwnerTracker(std::atomic<uint64_t>& O, uint64_t T)
+      : Owner(O)
+      , TID(T) {
+      Owner.store(TID, std::memory_order_relaxed);
+    }
+    ~OwnerTracker() {
+      Owner.store(0, std::memory_order_relaxed);
+    }
+  } OwnerGuard {CodeBuffers.CodeBufferWriteOwner, SelfTID};
+
+  // ------------------------------------------------------------------
+  // Pick up a code-buffer rotation performed by another thread
+  // ------------------------------------------------------------------
+  // Another thread's ClearCache() may have rotated CodeBuffers to a new buffer
+  // since this thread last compiled. ClearCache only migrates the *rotating*
+  // thread's lookup cache, so without this handshake this thread is left with
+  // CurrentCodeBuffer pointing at the old buffer while CodeBuffers.LatestOffset
+  // (shared, and reset to 0 by the rotation) describes the new one. We would
+  // then emit at old_base + new_offset and publish L1/L2 entries for it, while
+  // ThreadState->LookupCache->Shared still refers to the old buffer's map.
+  //
+  // The observable failure is a guest RIP whose L1 entry resolves into the
+  // middle of an unrelated block. Dispatch lands past that block's RIP store,
+  // so the block spills and returns to DispatcherLoopTop with State.rip
+  // unchanged -- the same lookup hits the same bad pointer forever. Ziggurat
+  // wedged exactly this way at 100% CPU on one thread after mono finished
+  // loading assemblies.
+  //
+  // Arm64JITCore does the same handshake before copying its staging buffer out
+  // (JIT/JIT.cpp:1085); it matters more here because PPC64 emits directly into
+  // the shared buffer rather than staging per-thread. No CallRetStack reset is
+  // needed alongside it: the PPC64LE backend does not use the call-return
+  // predictor stack.
+  if (auto Prev = CheckCodeBufferUpdate()) {
+    auto CacheLock = ThreadState->LookupCache->AcquireWriteLock();
+    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, CacheLock);
+  }
+
+  LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared,
+                     "INVARIANT VIOLATED: SharedLookupCache doesn't match the current code buffer!");
 
   this->Entry    = Entry;
   this->IR       = IRView;
@@ -2014,24 +2104,51 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // PPC64 emits directly into the shared CurrentCodeBuffer, so we must
   // pre-check that enough headroom remains for this CompileCode.
   //
-  // kBlockHeadroom is a worst-case conservative bound. A single IR op
-  // typically expands to <= 80 host bytes (SpillStaticRegs + flag pack
-  // / unpack is the heaviest), and IRView->SSACount() bounds the IR-op
-  // count, but we don't want to walk the IR twice. 1 MiB is comfortable
-  // for any real x86 block (post-frontend block cap is well under that
-  // even after host-side expansion); rotating early is cheap because
-  // the new buffer is geometrically larger up to MAX_CODE_SIZE (128 MiB).
+  // The requirement MUST scale with the IR size. A fixed bound (this used to be
+  // a flat 1 MiB) is unsafe: with a large MaxInst -- the Unity/mono app configs
+  // in the wild use 50000 against a default of 5000 -- the frontend produces
+  // blocks of hundreds of KiB of guest code whose host expansion exceeds any
+  // constant we could pick. Overrunning is not merely wasted space: emission
+  // walks off the end into the PROT_NONE guard page, the SIGSEGV handler
+  // redirects this thread back into the dispatcher, and this stack frame is
+  // abandoned with CodeBufferWriteMutex still held. The next compile on this
+  // thread then deadlocks against itself and every other thread piles up behind
+  // it -- the whole process wedges with all threads parked in futex waits.
+  //
+  // A single IR op expands to at most ~80 host bytes today (SpillStaticRegs plus
+  // flag pack/unpack is the heaviest); 128 gives margin without walking the IR
+  // twice. GetSSACount() bounds the IR-op count. Keep 1 MiB as a floor.
   //
   // When the buffer is too full, drop the lock and call ClearCache().
   // ClearCache acquires its own LookupCache write lock and allocates a
   // fresh, larger CodeBuffer via GetEmptyCodeBuffer/StartLargerCodeBuffer,
   // migrating the L1/L2 mapping via ChangeGuestToHostMapping. After
   // re-acquiring CodeBufferLock, LatestOffset is 0 in the new buffer.
-  constexpr size_t kBlockHeadroom = 1u << 20;  // 1 MiB
-  if (CodeBuffers.LatestOffset + kBlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+  // Loop, because one rotation only grows the buffer geometrically and a very
+  // large block may need several before it fits.
+  constexpr size_t kMaxHostBytesPerIROp = 128;
+  const size_t BlockHeadroom = std::max<size_t>(1u << 20, IRView->GetSSACount() * kMaxHostBytesPerIROp);
+
+  while (CodeBuffers.LatestOffset + BlockHeadroom > CurrentCodeBuffer->UsableSize()) {
+    const size_t PrevUsable = CurrentCodeBuffer->UsableSize();
+
+    // Drop ownership across the unlock window so a nested compile from
+    // ClearCache() isn't misreported as a re-entrant deadlock.
+    CodeBuffers.CodeBufferWriteOwner.store(0, std::memory_order_relaxed);
     CodeBufferLock.unlock();
     ClearCache();
     CodeBufferLock.lock();
+    CodeBuffers.CodeBufferWriteOwner.store(SelfTID, std::memory_order_relaxed);
+
+    // ClearCache resets LatestOffset to 0 in the new buffer. If the buffer also
+    // stopped growing (MAX_CODE_SIZE reached) and the block still doesn't fit,
+    // another rotation will never help -- bail out loudly rather than spin, or
+    // silently overrun and reproduce the deadlock described above.
+    if (CodeBuffers.LatestOffset + BlockHeadroom > CurrentCodeBuffer->UsableSize() && CurrentCodeBuffer->UsableSize() <= PrevUsable) {
+      ERROR_AND_DIE_FMT("PPC64 JIT: block at {:#x} needs {} bytes of code buffer but the maximum buffer only has {}. "
+                        "Lower MaxInst (currently producing {} IR ops).",
+                        Entry, BlockHeadroom, CurrentCodeBuffer->UsableSize(), IRView->GetSSACount());
+    }
   }
 
   // Use the current code buffer at the current write offset
@@ -2191,6 +2308,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+      // Drain any deferred async signal at this guest instruction boundary.
+      // Every dispatcher hit and linked block-to-block jump lands here, so a
+      // guest loop spanning compile units cannot orbit without passing a
+      // fault-page poke. Placed before the stdu so intra-unit jumps (bound
+      // below) skip it -- backward intra-unit edges emit their own poke in
+      // DEF_OP(Jump)/DEF_OP(CondJump).
+      EmitSuspendInterruptCheck();
       if (SpillFrameSize) {
         // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
         // For larger frames, emit the equivalent of stdu manually so callers

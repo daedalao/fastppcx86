@@ -84,7 +84,14 @@ DEF_OP(ExitFunction) {
 
 DEF_OP(Jump) {
   auto Op = IROp->C<IR::IROp_Jump>();
-  b(JumpTarget(Op->TargetBlock));
+  auto Target = JumpTarget(Op->TargetBlock);
+  // A bound label means the target block was already emitted, i.e. this is a
+  // backward edge -- a potential guest loop that must pass a deferred-signal
+  // drain point (see EmitSuspendInterruptCheck).
+  if (Target->bound) {
+    EmitSuspendInterruptCheck();
+  }
+  b(Target);
 }
 
 DEF_OP(CondJump) {
@@ -135,9 +142,20 @@ DEF_OP(CondJump) {
   }
   Label Skip;
   bc(InvertCond(CC), &Skip);
-  b(JumpTarget(Op->TrueBlock));
+  // Backward edges (bound labels) must pass a deferred-signal drain point;
+  // see DEF_OP(Jump). Each leg pokes independently so the forward leg stays
+  // poke-free.
+  auto TrueTarget = JumpTarget(Op->TrueBlock);
+  if (TrueTarget->bound) {
+    EmitSuspendInterruptCheck();
+  }
+  b(TrueTarget);
   Bind(&Skip);
-  b(JumpTarget(Op->FalseBlock));
+  auto FalseTarget = JumpTarget(Op->FalseBlock);
+  if (FalseTarget->bound) {
+    EmitSuspendInterruptCheck();
+  }
+  b(FalseTarget);
 }
 
 DEF_OP(Break) {

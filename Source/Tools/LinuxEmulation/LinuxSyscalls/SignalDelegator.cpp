@@ -928,6 +928,22 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     return;
   }
 
+  // Diagnostic (FEX_ABORT_TRIPWIRE=1): log every guest-delivered fatal-class
+  // sync signal with its si_addr/si_code and the guest RIP. Paired with the
+  // tgkill(SIGABRT) tripwire in Passthrough.cpp -- together they show what
+  // fault preceded a guest abort(). Unity redirects guest stderr to
+  // Player.log, so that is where these lines land.
+  if ((Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) && !IsAsyncSignal(&SigInfo, Signal)) {
+    static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
+    if (trip) {
+      char buf[224];
+      int n = snprintf(buf, sizeof(buf), "[GSIG] tid=%d sig=%d si_code=%d si_addr=0x%lx guest_rip=0x%lx\n",
+                       FHU::Syscalls::gettid(), Signal, SigInfo.si_code, reinterpret_cast<unsigned long>(SigInfo.si_addr),
+                       (unsigned long)Thread->CurrentFrame->State.rip);
+      [[maybe_unused]] auto _ = write(2, buf, n);
+    }
+  }
+
   // Check for masked signals
   if (ThreadObject->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1)) && IsAsyncSignal(&SigInfo, Signal)) {
     // This signal is masked, must defer until the guest updates the signal mask.
@@ -1057,6 +1073,24 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
   // SA_RESTORER : We always need our host side restorer on x86-64, Couldn't use guest restorer anyway
   SignalHandler.HostAction.sa_flags = CheckAndAddFlags(SignalHandler.HostAction.sa_flags, SignalHandler.GuestAction.sa_flags,
                                                        SA_NOCLDSTOP | SA_NOCLDWAIT | SA_NODEFER | SA_RESTART);
+
+#if defined(ARCHITECTURE_ppc64le)
+  // PPC64LE defers async signals for the whole of HandleSyscall (9560b3c8e), which
+  // only works because the interrupted host ::syscall returns -EINTR: that return is
+  // what unwinds to the guard's destructor, which is what drains the deferred queue.
+  //
+  // SA_RESTART on the *host* action defeats that. The kernel runs our thunk, we queue
+  // the signal, and then the kernel silently restarts the syscall instead of returning
+  // -EINTR -- so HandleSyscall never returns, the guard never destructs, and the queued
+  // guest signal is never delivered. A guest thread blocked in futex() when it gets a
+  // suspend signal is then unwakeable. Observed on Ziggurat: mono's GC stop-the-world
+  // handshake wedges permanently at assembly load, one thread holding a PROT_NONE
+  // InterruptFaultPage with nothing left to deliver it.
+  //
+  // Keep the guest's SA_RESTART recorded in GuestAction (it still drives guest-visible
+  // behaviour); just never let the host thunk carry it.
+  SignalHandler.HostAction.sa_flags &= ~SA_RESTART;
+#endif
 
 #ifdef ARCHITECTURE_x86_64
 #define SA_RESTORER 0x04000000

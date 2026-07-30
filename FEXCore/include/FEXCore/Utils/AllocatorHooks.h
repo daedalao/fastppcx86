@@ -34,6 +34,12 @@ enum class THPControl {
 
 #ifndef _WIN32
 FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize);
+// Configures the bundled allocator (page size, naming, and the map/unmap hooks
+// that apply FEX's placement hint). SetupHooks calls this, but SetupHooks only
+// runs for 32-bit guests -- 64-bit guests must call this directly or rpmalloc
+// falls back to its internal mapper and scatters its arenas through the guest's
+// address space.
+FEX_DEFAULT_VISIBILITY void InitializeAllocator(size_t PageSize);
 #else
 using VirtualNamePtr = void (*)(const char*, const void*, size_t);
 using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
@@ -110,10 +116,16 @@ FEX_DEFAULT_VISIBILITY extern MMAP_Hook mmap;
 FEX_DEFAULT_VISIBILITY extern MUNMAP_Hook munmap;
 FEX_DEFAULT_VISIBILITY extern void VirtualName(const char* Name, void* Ptr, size_t Size);
 
+// Returns a placement hint for one of FEX's own anonymous reservations, keeping
+// them clustered away from the guest's address space. See the definition in
+// AllocatorHooks.cpp for why this matters. Hint only -- never MAP_FIXED.
+FEX_DEFAULT_VISIBILITY void* GetInternalPlacementHint(size_t Size);
+
 // All commit parameters are ignored here, they are unnecessary as Linux supports overcommit
 
 inline void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true) {
-  return FEXCore::Allocator::mmap(nullptr, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return FEXCore::Allocator::mmap(GetInternalPlacementHint(Size), Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0),
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
 
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #ifdef _WIN32
 #include <thread>
 #else
@@ -16,6 +17,34 @@
 #endif
 
 namespace FEX::CPUInfo {
+// Optional override for the core count reported to the guest.
+//
+// Each guest thread costs FEX a large chunk of *address space*: a per-thread
+// LookupCache (VirtualMemSize/PAGE_SIZE*8 + CODE_SIZE + L1, 272 MiB with the
+// defaults) plus allocator arenas, and those reservations are interleaved with
+// the guest's own mappings. On a machine with many cores this is severe: on an
+// 80-core POWER8, Unity 4.x sizes its job pool from the reported core count,
+// FEX ends up holding ~69 GiB of reservations against the guest's ~6 GiB, and
+// the guest's heaps get scattered across ~20 different 4 GiB regions.
+// Applications that index their own allocator metadata by (address >> 32) --
+// Unity does, with a fixed 5-entry table -- then overflow that table and fail.
+//
+// Reporting fewer cores keeps the guest's thread count, and therefore FEX's
+// address-space footprint, under control. Note taskset/affinity does NOT help
+// here, because this count feeds the emulated /proc/cpuinfo the guest reads.
+static uint32_t GetCPUCountOverride() {
+  const char* Env = getenv("FEX_REPORTED_CPUS");
+  if (!Env) {
+    return 0;
+  }
+  const uint32_t Value = std::strtoul(Env, nullptr, 10);
+  // Clamp to something sane; 0 or garbage means "no override".
+  if (Value == 0 || Value > 4096) {
+    return 0;
+  }
+  return Value;
+}
+
 #ifndef _WIN32
 // Parse a Linux CPU-list string like "0-3,8-11,16" and count members.
 // Returns 0 if the string is malformed.
@@ -51,6 +80,9 @@ static uint32_t ParseCPUList(const char* s) {
 }
 
 uint32_t CalculateNumberOfCPUs() {
+  if (const uint32_t Override = GetCPUCountOverride()) {
+    return Override;
+  }
   // Prefer /sys/devices/system/cpu/online — this reports only CPUs that are
   // actually online for scheduling. The legacy approach of counting
   // /sys/devices/system/cpu/cpu{N} directory entries incorrectly returns
@@ -93,6 +125,9 @@ uint32_t CalculateNumberOfCPUs() {
 }
 #else
 uint32_t CalculateNumberOfCPUs() {
+  if (const uint32_t Override = GetCPUCountOverride()) {
+    return Override;
+  }
   // May not return correct number of cores if some are parked.
   return std::thread::hardware_concurrency();
 }

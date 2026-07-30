@@ -654,13 +654,41 @@ if (BUILD_THUNKS)
   # Thunk targets for both host libraries and IDE integration
   add_subdirectory(ThunkLibs/HostLibs)
 
-  # Thunk targets for IDE integration of guest code, only
-  add_subdirectory(ThunkLibs/GuestLibs)
+  # Thunk targets for IDE integration of guest code, only.
+  #
+  # These compile the guest stub sources with the *host* toolchain. The stubs
+  # contain the x86 `0f 3f` thunk trampolines, so on a non-x86 host the host
+  # assembler rejects them outright ("branch target not a multiple of four" on
+  # PPC64LE). They are only ever built for editor/IDE indexing, so skip them
+  # rather than let them break `ninja all`. The real guest stubs are built by
+  # the guest-libs ExternalProject below.
+  if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+    add_subdirectory(ThunkLibs/GuestLibs)
+  else()
+    message(STATUS "Skipping guest-thunk IDE targets: host ${CMAKE_HOST_SYSTEM_PROCESSOR} cannot assemble x86 thunk trampolines")
+  endif()
 
   # Optionally cross-build the actual guest-side stub libraries. Disable on
-  # hosts without an x86_64 cross-compile chain (e.g. POWER8) and ship in
-  # pre-built guest stubs separately.
-  option(BUILD_GUEST_THUNKS "Build x86_64 (and 32-bit) guest stub libraries via ExternalProject" ON)
+  # hosts without an x86_64 cross-compile chain and ship in pre-built guest
+  # stubs separately.
+  option(BUILD_GUEST_THUNKS "Build x86_64 guest stub libraries via ExternalProject" ON)
+  # The 32-bit stubs need a separate i686 cross chain, which is far less widely
+  # packaged than the x86_64 one (e.g. Arch on POWER8 ships x86_64-pc-linux-gnu
+  # but no i686-linux-gnu). Keep it independently switchable so a missing i686
+  # chain doesn't take the 64-bit thunks down with it.
+  option(BUILD_GUEST_THUNKS_32 "Build 32-bit guest stub libraries via ExternalProject" ON)
+
+  # The guest stubs are built with gcc even when the host thunks use clang.
+  #
+  # ThunkLibs/include/common/Guest.h has to make the generated fexfn_pack_
+  # symbols non-static under clang (it can't alias to a static function), so a
+  # clang-built stub exports ~2400 extra symbols -- every fexfn_pack_gl*, plus
+  # bcmp, __cxa_begin_catch and assorted libstdc++ instantiations. The stub is
+  # dlopen'd as libGL.so.1 with RTLD_GLOBAL, so those land in the guest's
+  # global symbol namespace and Grimrock segfaults during GL setup. The
+  # gcc-built stub keeps them static and runs fine. Decouple the two rather
+  # than force the host thunks off clang as well.
+  option(ENABLE_CLANG_GUEST_THUNKS "Build the guest stub libraries with clang instead of gcc" OFF)
   if (BUILD_GUEST_THUNKS)
     # Thunk targets for guest libraries
     include(ExternalProject)
@@ -672,7 +700,7 @@ if (BUILD_THUNKS)
         "-DBITNESS=64"
         "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
         "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_GUEST_THUNKS}"
         "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
         "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
@@ -683,7 +711,7 @@ if (BUILD_THUNKS)
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
 
-    if (BUILD_THUNKS_32BIT)
+    if (BUILD_GUEST_THUNKS_32)
     ExternalProject_Add(guest-libs-32
       PREFIX guest-libs-32
       SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
@@ -692,7 +720,7 @@ if (BUILD_THUNKS)
         "-DBITNESS=32"
         "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
         "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_GUEST_THUNKS}"
         "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
         "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
@@ -712,24 +740,25 @@ if (BUILD_THUNKS)
       DEPENDS guest-libs
       COMPONENT Runtime)
 
-    install(
-      CODE "message(\"-- Installing: guest-libs-32\")"
-      CODE "
-        execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
-          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
-      DEPENDS guest-libs-32
-      COMPONENT Runtime)
-
     add_custom_target(uninstall_guest-libs
       COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
-
-    add_custom_target(uninstall_guest-libs-32
-      COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
-      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
-
     add_dependencies(uninstall uninstall_guest-libs)
-    add_dependencies(uninstall uninstall_guest-libs-32)
+
+    if (BUILD_GUEST_THUNKS_32)
+      install(
+        CODE "message(\"-- Installing: guest-libs-32\")"
+        CODE "
+          execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
+        DEPENDS guest-libs-32
+        COMPONENT Runtime)
+
+      add_custom_target(uninstall_guest-libs-32
+        COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
+      add_dependencies(uninstall uninstall_guest-libs-32)
+    endif()
   endif()
 endif()
 
