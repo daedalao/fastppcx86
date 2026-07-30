@@ -477,7 +477,11 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
   REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
-  REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
+  // chdir goes through FileManager for path translation — the raw passthrough
+  // that used to live here missed the rootfs remap and broke dpkg -i, which
+  // creates its workdir via mkdirat(rootfs_dirfd, "var/lib/dpkg/tmp.ci", ...)
+  // and then chdir("/var/lib/dpkg/tmp.ci"). fchdir takes a bare fd and needs
+  // no translation, so it stays a raw passthrough.
   REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
   REGISTER_SYSCALL_IMPL(fchmod, SyscallPassthrough2<SYSCALL_DEF(fchmod)>);
   REGISTER_SYSCALL_IMPL(fchown, SyscallPassthrough3<SYSCALL_DEF(fchown)>);

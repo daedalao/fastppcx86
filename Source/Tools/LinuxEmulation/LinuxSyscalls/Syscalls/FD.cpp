@@ -66,6 +66,11 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
     SYSCALL_ERRNO();
   });
 
+  REGISTER_SYSCALL_IMPL(chdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* path) -> uint64_t {
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chdir(path);
+    SYSCALL_ERRNO();
+  });
+
   REGISTER_SYSCALL_IMPL(pipe, [](FEXCore::Core::CpuStateFrame* Frame, int pipefd[2]) -> uint64_t {
     uint64_t Result = ::pipe(pipefd);
     SYSCALL_ERRNO();

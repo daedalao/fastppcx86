@@ -66,6 +66,7 @@ public:
   uint64_t Chmod(const char* pathname, mode_t mode);
   uint64_t Chown(const char* pathname, uid_t owner, gid_t group);
   uint64_t Lchown(const char* pathname, uid_t owner, gid_t group);
+  uint64_t Chdir(const char* path);
   uint64_t Unlink(const char* pathname);
   uint64_t Mkdir(const char* pathname, mode_t mode);
   uint64_t Rmdir(const char* pathname);

@@ -1470,6 +1470,29 @@ uint64_t FileManager::Chown(const char* pathname, uid_t owner, gid_t group) {
   return Fchownat(AT_FDCWD, pathname, owner, group, 0);
 }
 
+uint64_t FileManager::Chdir(const char* path) {
+  // chdir was a raw passthrough alongside utimensat until dpkg -i tripped it:
+  // dpkg-deb creates its extraction workdir via `mkdirat(rootfs_dirfd,
+  // "var/lib/dpkg/tmp.ci", 0777)` which lands in the rootfs, then chdir()s to
+  // the absolute path "/var/lib/dpkg/tmp.ci". Without translation the host
+  // kernel sees a path that only exists inside the rootfs and returns ENOENT
+  // — the "dpkg-deb (subprocess): failed to chdir to directory" symptom.
+  auto NewPath = GetSelf(path);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  auto Path = GetEmulatedPath(SelfPath, true);
+  if (!Path.empty()) {
+    uint64_t Result = ::chdir(Path.c_str());
+    // Only fall back when the rootfs-scoped path was genuinely absent. EACCES
+    // and friends are semantic results the guest must see.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+
+  return ::chdir(SelfPath);
+}
+
 uint64_t FileManager::Lchown(const char* pathname, uid_t owner, gid_t group) {
   return Fchownat(AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
 }
