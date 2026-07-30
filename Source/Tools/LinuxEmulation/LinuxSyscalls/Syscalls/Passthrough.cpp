@@ -673,22 +673,33 @@ namespace x64 {
       // PPC values because <sys/ioctl.h> pulls in asm/ioctls.h on this
       // host. Fixes the gvisor socket_unix_*_test TIOCOUTQ failures and
       // any guest x86 binary that calls TTY ioctls on sockets/files.
-      case 0x5400u: return TCGETS;
-      case 0x5401u: return TCSETS;
-      case 0x5402u: return TCSETSW;
-      case 0x5403u: return TCSETSF;
-      case 0x5404u: return TCGETA;
-      case 0x5405u: return TCSETA;
-      case 0x5406u: return TCSETAW;
-      case 0x5407u: return TCSETAF;
-      case 0x5408u: return TCSBRK;
-      case 0x5409u: return TCXONC;
-      case 0x540Au: return TCFLSH;
-      case 0x540Bu: return TIOCEXCL;
-      case 0x540Cu: return TIOCNXCL;
-      case 0x540Du: return TIOCSCTTY;
-      case 0x540Eu: return TIOCGPGRP;
-      case 0x540Fu: return TIOCSPGRP;
+      // NOTE: this run was previously off by one — it began at 0x5400, which is
+      // not a defined x86 ioctl, so every entry through 0x540F named the wrong
+      // command. The critical case was 0x5401: x86's TCGETS was being
+      // translated to the host's TCSETS, turning "read the terminal settings"
+      // into "WRITE the terminal settings" from whatever the caller's buffer
+      // happened to hold. That silently reconfigured the user's terminal on any
+      // interactive program — observed as all output turning UPPERCASE (a
+      // garbage c_oflag with PPC's OLCUC bit set) and apt's progress redraw
+      // breaking (ONLCR cleared), persisting after exit because the tty really
+      // had been reprogrammed. Piped output was unaffected, which is why every
+      // automated test missed it: they all redirect.
+      case 0x5401u: return TCGETS;
+      case 0x5402u: return TCSETS;
+      case 0x5403u: return TCSETSW;
+      case 0x5404u: return TCSETSF;
+      case 0x5405u: return TCGETA;
+      case 0x5406u: return TCSETA;
+      case 0x5407u: return TCSETAW;
+      case 0x5408u: return TCSETAF;
+      case 0x5409u: return TCSBRK;
+      case 0x540Au: return TCXONC;
+      case 0x540Bu: return TCFLSH;
+      case 0x540Cu: return TIOCEXCL;
+      case 0x540Du: return TIOCNXCL;
+      case 0x540Eu: return TIOCSCTTY;
+      case 0x540Fu: return TIOCGPGRP;
+      case 0x5410u: return TIOCSPGRP;
       case 0x5411u: return TIOCOUTQ;
       case 0x5412u: return TIOCSTI;
       case 0x5413u: return TIOCGWINSZ;
