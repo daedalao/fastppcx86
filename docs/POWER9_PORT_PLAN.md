@@ -1,6 +1,20 @@
 # FEX-PPC64LE — POWER9 Port Plan
 
-Status: **planning document, no code changes yet.** Branch `power9-support`, forked from `main` at `0f17626ac`.
+Status: **living document.** Branch `power9`, forked from `main` at `0f17626ac`. It began as a pure
+planning document; code has since landed, and the sections below are a mix of plan, measured result
+and recorded negative result. Each claim states which it is.
+
+> **Note on probe references.** This document cites several probes by filename —
+> `probe_tso_litmus.c`, `probe_vecops.c`, `probe_vecpressure.c`, `probe_r0_index.c`,
+> `probe_jit_futex.c`, `probe_file_lookup.c` and `run_tso_litmus.sh`. Those were throwaway
+> instruments for testing our own assumptions, and they are not in this branch. Their **results are
+> preserved here**, which is the part worth keeping; the scaffolding that produced them is not. The
+> probes that remain under `build-probes/` are the ones still worth re-running.
+>
+> One of those results is a warning rather than a finding: every `probe_tso_litmus.c` run was
+> **void**, because the test binaries died early on a missing rootfs library and produced a complete,
+> self-consistent, entirely meaningless matrix. See
+> [Refuted and corrected](#refuted-and-corrected).
 
 Revision 2. Every claim in revision 1 was put through an adversarial review pass whose reviewers
 were instructed to refute rather than confirm. **One headline finding was destroyed, two rankings
