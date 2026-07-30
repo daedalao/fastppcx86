@@ -124,7 +124,10 @@ uint64_t MemAllocator32Bit::FindPageRange_TopDown(uint64_t Start, size_t Pages) 
     }
 
     if (Free) {
-      return Start - Offset;
+      // The pages tested free are [Start - Pages + 1, Start]; return the lowest.
+      // Returning `Start - Offset` (== Start - Pages here) would hand back a
+      // range shifted down one page, whose bottom page was never tested.
+      return Start - (Pages - 1);
     }
     Start -= Offset + 1;
   }
@@ -174,7 +177,6 @@ void* MemAllocator32Bit::Mmap(void* addr, size_t length, int prot, int flags, in
   flags &= ~FEX::HLE::X86_64_MAP_32BIT;
 
   auto AllocateNoHint = [&]() -> void* {
-    bool Wrapped = false;
     uint64_t BottomPage = Map32Bit && (LastScanLocation >= LastKeyLocation32Bit) ? LastKeyLocation32Bit : LastScanLocation;
 restart: {
   // Linear range scan
@@ -197,22 +199,26 @@ restart: {
     if (MappedPtr == MAP_FAILED && errno != EEXIST) {
       return reinterpret_cast<void*>(-errno);
     } else if (MappedPtr == MAP_FAILED) {
-      if (UpperPage == TOP_KEY) {
-        BottomPage = BASE_KEY;
-        Wrapped = true;
-        goto restart;
-      } else if (Wrapped && LowerPage >= LastScanLocation) {
-        // We linear scanned the entire memory range. Give up
-        return (void*)(uintptr_t)-errno;
-      } else {
-        // Try again
-        if (SearchDown) {
-          --BottomPage;
-        } else {
-          ++BottomPage;
+      // EEXIST: the host has a mapping in this range that MappedPages doesn't
+      // know about. Probe the range and record the colliding pages so the next
+      // scan skips them, rather than re-proposing overlapping ranges one page
+      // at a time and eventually giving up with -EEXIST — an errno mmap can't
+      // legally return, which guest allocators mishandle (steamrt libelf turns
+      // it into a NULL elf_strptr and libcapsule crashes in strstr).
+      bool MarkedAny = false;
+      for (uint64_t Page = LowerPage; Page < UpperPage; ++Page) {
+        unsigned char Vec;
+        if (::mincore(reinterpret_cast<void*>(Page << FEXCore::Utils::FEX_PAGE_SHIFT), FEXCore::Utils::FEX_PAGE_SIZE, &Vec) == 0) {
+          MappedPages.set(Page);
+          MarkedAny = true;
         }
-        goto restart;
       }
+      if (!MarkedAny) {
+        // Lost a race with a concurrent unmap; burn one page so every restart
+        // makes forward progress and the scan is guaranteed to terminate.
+        MappedPages.set(LowerPage);
+      }
+      goto restart;
     } else {
       if (SearchDown) {
         LastScanLocation = LowerPage;
