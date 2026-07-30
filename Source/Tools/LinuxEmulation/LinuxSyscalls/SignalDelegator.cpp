@@ -906,23 +906,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   // drains the queued signal at a guaranteed-coherent boundary. Synchronous
   // signals (SIGSEGV/SIGBUS/SIGILL/SIGFPE — IsAsyncSignal is false) still go
   // through their normal handlers, so a real guest fault is not affected.
-  // Defer inside the dispatcher too, not just JIT blocks. Blocks exit to the
-  // dispatcher loop-top/L1-probe with the SRA registers live and dirty (no
-  // spill on the block->dispatcher edge -- that is the SRA design), but the
-  // host PC is no longer in the code buffer, so an eager delivery there goes
-  // through HandleDispatcherGuestSignal's outside-JIT branch: no SpillSRA,
-  // guest frame built from STALE State.gregs, and the handler's sigreturn
-  // restores those stale values into the resumed context. Observed live on
-  // Ziggurat dungeon generation (compilation storm + Boehm GC signal storm):
-  // guest rbx came back holding an old heap pointer and the 0x934d00 scan
-  // loop wedged with rbx billions past its r15=4 limit -- the same corrupted
-  // register signature as the InSyscallInfo leak, via a different door.
-  // Every dispatcher path reaches a block-entry fault-page poke (L1 hit ->
-  // block entry; miss -> linker/compile, which is already refcount-deferred,
-  // then block entry), so a deferred signal always drains at a boundary
-  // where the register state is coherent.
-  const uint64_t DeferPc = ArchHelpers::Context::GetPc(UContext);
-  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, DeferPc) || IsAddressInDispatcher(DeferPc);
+  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(UContext));
   const bool MustDeferAsync = MustDeferSignal || InJIT_ForDefer;
   SIGTRACE("GUEST sig=%d code=%d pc=0x%lx rip=0x%lx defer=%d injit=%d q=%zu", Signal, SigInfo.si_code,
            ArchHelpers::Context::GetPc(UContext), (unsigned long)Thread->CurrentFrame->State.rip, MustDeferSignal ? 1 : 0,
