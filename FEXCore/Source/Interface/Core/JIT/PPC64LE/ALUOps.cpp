@@ -433,14 +433,44 @@ DEF_OP(UDiv) {
     divdeu(TMP1, Upper, Divisor);            // q1 = floor(Upper * 2^64 / Divisor)
     divdu(TMP2, Lower, Divisor);              // q2 = floor(Lower / Divisor)
     add(TMP1, TMP1, TMP2);                    // tentative = q1 + q2
-    mulld(TMP4, TMP1, Divisor);               // (tentative * Divisor) low 64
-    subf(TMP4, TMP4, Lower);                  // rem_lo (mod 2^64) = Lower - mul_lo
 
-    // Conditional correction: if rem_lo >= Divisor, tentative was Q-1, so
-    // increment quotient and subtract Divisor from remainder.
-    Label NoCorrection;
+    // The remainder MUST be computed as a full 128-bit subtract. Computing it
+    // in 64 bits is wrong for large divisors and was a live bug: guest
+    // `__uint128_t % v` returned a quotient exactly one too low.
+    //
+    // Why. When tentative == Q-1 the pre-correction remainder is R + Divisor,
+    // and since R < Divisor that is bounded only by 2*Divisor. For any
+    // Divisor > 2^63 that exceeds 2^64 and wraps, so a 64-bit
+    // `Lower - (tentative*Divisor mod 2^64)` produces a small value, the
+    // `rem >= Divisor` test reads false, the correction is skipped, and both
+    // outputs are wrong. Concretely Divisor = 2^63+1 with a true remainder of
+    // 2^63-1 gives R+Divisor = 2^64, which wraps to 0.
+    //
+    // This is reachable from ordinary guest code. libgcc's __udivmodti4
+    // NORMALISES the divisor so its high bit is set before dividing, which
+    // puts the effective 64-bit divisor above 2^63 by construction — so every
+    // 128-bit divide or modulo through the general path hit it. Found via
+    // stress-ng --vecmath, isolated to `a %= v23` on __uint128_t.
+    //
+    // Not a problem on the signed path above: a signed 64-bit divisor has
+    // magnitude <= 2^63, so R + |Divisor| < 2^64 and cannot wrap.
+    //
+    // Fix: compute the 128-bit product and subtract with borrow. Because x86
+    // guarantees Upper < Divisor for a non-#DE divide, the true remainder is
+    // < 2*Divisor < 2^65, so rem_hi is exactly 0 or 1 — a non-zero high word
+    // means the remainder already exceeds 2^64 > Divisor and correction is
+    // required without inspecting rem_lo at all.
+    mulld (TMP4, TMP1, Divisor);              // prod_lo = (tentative*Divisor) low
+    mulhdu(TMP3, TMP1, Divisor);              // prod_hi = (tentative*Divisor) high
+    subfc (TMP4, TMP4, Lower);                // rem_lo = Lower - prod_lo, sets CA
+    subfe (TMP3, TMP3, Upper);                // rem_hi = Upper - prod_hi - borrow
+
+    Label DoCorrection, NoCorrection;
+    cmpldi(TMP3, 0);
+    bc(CC_NE, &DoCorrection);                 // rem_hi != 0 -> rem >= 2^64 > Divisor
     cmpld(TMP4, Divisor);
     bc(CC_ULT, &NoCorrection);
+    Bind(&DoCorrection);
     addi(TMP1, TMP1, 1);
     subf(TMP4, Divisor, TMP4);
     Bind(&NoCorrection);
