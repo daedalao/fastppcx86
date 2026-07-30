@@ -72,7 +72,11 @@ private:
   // Exit / link path
   uint64_t ExitFunctionLinkerAddress {};
 
-  // Thread stop: spill SRA, pop callee-saved regs, blr
+  // Thread stop: pop callee-saved regs, blr.
+  //   *SpillSRA entry runs SpillStaticRegs first (thread was in JIT);
+  //   *Address entry skips the spill (thread was in host C++, SRA already
+  //   saved by whatever pushed it onto STATE).
+  uint64_t ThreadStopHandlerAddressSpillSRA {};
   uint64_t ThreadStopHandlerAddress {};
 
   // Thread pause: spill SRA, call SleepThread, then illegal-instruction trap

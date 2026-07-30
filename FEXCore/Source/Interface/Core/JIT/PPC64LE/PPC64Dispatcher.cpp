@@ -101,7 +101,7 @@ void PPC64Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thr
   Ptrs.DispatcherLoopTop         = DispatcherLoopTopAddress;
   Ptrs.DispatcherLoopTopFillSRA  = DispatcherLoopTopFillSRAAddress;
   Ptrs.ExitFunctionLinker        = ExitFunctionLinkerAddress;
-  Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddress;
+  Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
   Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
   Ptrs.GuestSignal_SIGILL        = GuestSignal_SIGILL_Address;
   Ptrs.GuestSignal_SIGTRAP       = GuestSignal_SIGTRAP_Address;
@@ -475,10 +475,27 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   // ==============================================================
   // ThreadStopHandler — unwind JIT and return to C++ caller
+  // ThreadStopHandlerAddressSpillSRA: entered when in JIT (spill first)
+  // ThreadStopHandlerAddress:         entered when already spilled
+  //
+  // SignalDelegator::HandleSignalDeferred picks between the two based on
+  // whether the interrupted PC was inside the JIT code buffer
+  // (SignalDelegator.cpp:717-728). On the outside-JIT branch — thread
+  // interrupted in host C++ — r27 is an ELFv2 non-volatile register
+  // OWNED BY THE C++ FRAME and is NOT `STATE`. Running SpillStaticRegs
+  // there emits ~34 stores at [r27 + offset], which land at wild
+  // addresses (whatever the C++ code had put in r27) and can silently
+  // corrupt another thread's CpuStateFrame if the alias falls that way.
+  //
+  // ThreadPauseHandler above has always split its two entry points
+  // correctly (:490 / :493); ThreadStopHandler used to alias both
+  // pointers to the same body (see ContextConfig at :1163). Adding
+  // the second entry point makes the outside-JIT path skip the spill.
   // ==============================================================
-  ThreadStopHandlerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
-
+  ThreadStopHandlerAddressSpillSRA = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
+
+  ThreadStopHandlerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   PopCalleeSavedRegisters();
   blr();
 
@@ -1176,7 +1193,7 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
     .ThreadPauseHandlerAddressSpillSRA = ThreadPauseHandlerAddressSpillSRA,
     .ThreadPauseHandlerAddress         = ThreadPauseHandlerAddress,
 
-    .ThreadStopHandlerAddressSpillSRA = ThreadStopHandlerAddress,
+    .ThreadStopHandlerAddressSpillSRA = ThreadStopHandlerAddressSpillSRA,
     .ThreadStopHandlerAddress         = ThreadStopHandlerAddress,
 
     .SRAGPRCount = GPRCount,
