@@ -300,20 +300,6 @@ private:
   // a RELOC_NAMED_THUNK_MOVE relocation for code-cache patching.
   void InsertNamedThunkRelocation(GPR Reg, const IR::SHA256Sum& Sum);
 
-  // Load a 64-bit function pointer into CTR and branch to it via bctrl
-  void CallCFunction(void* Fn) {
-    LoadConstant(TMP1, reinterpret_cast<uint64_t>(Fn));
-    mtctr(TMP1);
-    bctrl();
-  }
-
-  // Load a 64-bit function pointer into CTR and branch to it via bctr (no link)
-  void JumpCFunction(void* Fn) {
-    LoadConstant(TMP1, reinterpret_cast<uint64_t>(Fn));
-    mtctr(TMP1);
-    bctr();
-  }
-
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);
 

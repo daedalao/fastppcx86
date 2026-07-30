@@ -3139,12 +3139,16 @@ DEF_OP(Print) {
   auto Op  = IROp->C<IR::IROp_Print>();
   auto Src = GetReg(Op->Value);
   SpillForABICall(TMP1);
-  mr(r3, Src);
-  // Load PrintValue function pointer from STATE->Pointers.PrintValue
+  // ELFv2 §2.2.1.2 requires r12 == callee entry address for indirect calls
+  // (the callee's TOC prologue computes its GOT from r12). Load the fn
+  // pointer into r12 first, THEN set r3 = Src -- do not load into TMP1
+  // (== r3) or r3 would carry the fn pointer address into PrintValue
+  // instead of the value the JIT wanted to print.
   static const int32_t PrintValueOff = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, Pointers.PrintValue));
-  ld(TMP1, PrintValueOff, STATE);
-  mtctr(TMP1);
+  ld(r(12), PrintValueOff, STATE);
+  mr(r3, Src);
+  mtctr(r(12));
   bctrl();
   FillForABICall();
 }
@@ -3152,12 +3156,13 @@ DEF_OP(Print) {
 DEF_OP(PrintMsg) {
   auto Op  = IROp->C<IR::IROp_PrintMsg>();
   SpillForABICall(TMP1);
-  LoadConstant(r3, reinterpret_cast<uint64_t>(Op->Value));
-  // Load PrintMsgValue function pointer from STATE->Pointers.PrintMsgValue
+  // Same ELFv2 r12 discipline as Print above; load fn pointer into r12
+  // first, then LoadConstant into r3.
   static const int32_t PrintMsgOff = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, Pointers.PrintMsgValue));
-  ld(TMP1, PrintMsgOff, STATE);
-  mtctr(TMP1);
+  ld(r(12), PrintMsgOff, STATE);
+  LoadConstant(r3, reinterpret_cast<uint64_t>(Op->Value));
+  mtctr(r(12));
   bctrl();
   FillForABICall();
 }
