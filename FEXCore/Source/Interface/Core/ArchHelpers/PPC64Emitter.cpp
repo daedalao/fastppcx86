@@ -247,28 +247,47 @@ void PPC64EmitterBase::FillStaticRegs() {
 //   [old_SP + 8]  CR save (4 bytes)
 //   [old_SP + 16] LR save (8 bytes)
 //   [old_SP + 24] TOC save (8 bytes; only used by the callee around indirect calls)
-// After `stdu r1, -512, r1` these become [r1+520], [r1+528], [r1+536] respectively.
+// After `stdu r1, -576, r1` these become [r1+584], [r1+592], [r1+600] respectively.
 //
-// Local-frame layout (grows down from old_r1, 16-byte aligned, 512 bytes total).
-// Offsets shown are from old_r1; after stdu r1, -512, r1 the same offsets
-// expressed from the NEW r1 add 512 (so the back-chain at [old_r1-512] is
-// [r1+0] post-stdu).  The save areas are ordered with GPRs CLOSEST to
-// old_r1 (= shallowest stack), then FPRs, then VMX:
-//   [old_r1 -  16 .. -160]: GPR r14..r31  (18 × 8 = 144 bytes)
-//   [old_r1 - 160 .. -304]: FPR f14..f31  (18 × 8 = 144 bytes)
-//   [old_r1 - 304 .. -496]: VMX v20..v31  (12 × 16 = 192 bytes)
-//   [old_r1 - 496 .. -512]: 16 bytes padding (back-chain alignment)
-//   [old_r1 - 512] = [new_r1 + 0]: back chain (= old_r1)
-// The FRAME_GPR_SAVE / FRAME_FPR_SAVE / FRAME_VMX_SAVE constants below give
-// the FIRST (lowest-numbered-reg) slot's offset from old_r1: -160 / -304 / -496.
-static constexpr int32_t FRAME_GPR_SAVE   = -(16 + 8 * 18);   // -160
-static constexpr int32_t FRAME_FPR_SAVE   = FRAME_GPR_SAVE - 8 * 18;  // -304
-static constexpr int32_t FRAME_VMX_SAVE   = FRAME_FPR_SAVE - 16 * 12; // -496
-static constexpr int32_t FRAME_TOTAL      = -512;
+// Local-frame layout (grows down from old_r1, 16-byte aligned, 576 bytes total).
+// Offsets shown are from old_r1; after stdu r1, -576, r1 the same offsets
+// expressed from the NEW r1 add 576 (so the back-chain at [old_r1-576] is
+// [r1+0] post-stdu).
+//
+// This frame MUST reserve the ELFv2 96-byte linkage + parameter-save block at
+// the bottom, because the dispatcher issues several ELFv2 C-ABI bctrls out of
+// it (SleepThread, CompileSingleStep, ExitFunctionLink, ThreadPauseHandler,
+// and the C++ signal-restart trampoline).  Any of those callees will write
+// LR into [caller_r1+16] and CR into [caller_r1+8]; the dispatcher itself
+// writes TOC into [caller_r1+24] at :391/:465 around every bctrl.
+// PPC64Dispatcher.cpp:391 in particular runs on every L1 miss.
+//
+// The earlier 512-byte frame put VMX v20 at [new_r1+16], directly on top of
+// the callee's LR save slot.  On return from any bctrl, PopCalleeSavedRegisters'
+// `lvx v20, [r1+16]` reloaded {orig_v20_lo, callee_LR_or_TOC} into v20, silently
+// corrupting a live host non-volatile vector register that C++ callers of the
+// dispatcher (typically libstdc++/libc paths during thread bring-up) can rely on.
+//
+// New layout:
+//   [new_r1 +   0]:            back chain (= old_r1)
+//   [new_r1 +   8]: (CR)       our callee's CR save slot per ELFv2
+//   [new_r1 +  16]: (LR)       our callee's LR save slot per ELFv2
+//   [new_r1 +  24]: (TOC)      our callee's TOC save slot (dispatcher writes r2 here)
+//   [new_r1 +  32.. 95]:       parameter save area (8 doublewords, for our callees)
+//   [old_r1 - 480..-288]:      VMX v20..v31  (12 × 16 = 192 bytes)  — [new_r1 +  96..287]
+//   [old_r1 - 288..-144]:      FPR f14..f31  (18 ×  8 = 144 bytes)  — [new_r1 + 288..431]
+//   [old_r1 - 144..   0]:      GPR r14..r31  (18 ×  8 = 144 bytes)  — [new_r1 + 432..575]
+//
+// The FRAME_GPR_SAVE / FRAME_FPR_SAVE / FRAME_VMX_SAVE constants give the FIRST
+// (lowest-numbered-reg) slot's offset FROM OLD_R1: -144 / -288 / -480.
+static constexpr int32_t FRAME_GPR_SAVE   = -(8 * 18);                  // -144
+static constexpr int32_t FRAME_FPR_SAVE   = FRAME_GPR_SAVE - 8 * 18;    // -288
+static constexpr int32_t FRAME_VMX_SAVE   = FRAME_FPR_SAVE - 16 * 12;   // -480
+static constexpr int32_t FRAME_TOTAL      = -576;
 // ABI save slots in the caller's linkage area, expressed as offsets from r1
-// after the stdu has decremented r1 by FRAME_TOTAL (512 bytes).
-static constexpr int16_t LR_SAVE_OFFSET   = -FRAME_TOTAL + 16;  //  528
-static constexpr int16_t CR_SAVE_OFFSET   = -FRAME_TOTAL + 8;   //  520
+// after the stdu has decremented r1 by FRAME_TOTAL (576 bytes).
+static constexpr int16_t LR_SAVE_OFFSET   = -FRAME_TOTAL + 16;  //  592
+static constexpr int16_t CR_SAVE_OFFSET   = -FRAME_TOTAL + 8;   //  584
 
 void PPC64EmitterBase::PushCalleeSavedRegisters() {
   // Use r0 for LR save: TMP1=r3 is the first C-ABI argument and must not be clobbered.
