@@ -344,6 +344,31 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 // short-circuit -- essentially free.
 static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
                                      uint64_t tgid, uint64_t tid, uint64_t sig) {
+  // Diagnostic tripwire: a guest raising SIGABRT at itself is abort(). The
+  // abort reason is frequently silent (mono/FMOD/Unity route their logs away
+  // from stderr), so dump the guest RIP/RSP and a raw stack window here --
+  // return addresses in the dump can be symbolized offline against the guest
+  // libraries. Gated on FEX_ABORT_TRIPWIRE=1.
+  if (sig == SIGABRT) {
+    static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
+    if (trip) {
+      char buf[256];
+      const uint64_t rip = Frame->State.rip;
+      const uint64_t rsp = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+      int n = snprintf(buf, sizeof(buf), "[ABRT] tid=%d tgkill(%lu,%lu,SIGABRT) guest rip=0x%lx rsp=0x%lx stack:\n",
+                       static_cast<int>(::syscall(SYS_gettid)), (unsigned long)tgid, (unsigned long)tid,
+                       (unsigned long)rip, (unsigned long)rsp);
+      [[maybe_unused]] auto _ = write(2, buf, n);
+      if (rsp >= 0x10000ULL && rsp <= 0x00007FFFFFFFFFFFULL) {
+        const uint64_t* sp = reinterpret_cast<const uint64_t*>(rsp);
+        for (int i = 0; i < 96; i += 4) {
+          n = snprintf(buf, sizeof(buf), "[ABRT] +%03x: %016lx %016lx %016lx %016lx\n", i * 8,
+                       (unsigned long)sp[i], (unsigned long)sp[i + 1], (unsigned long)sp[i + 2], (unsigned long)sp[i + 3]);
+          [[maybe_unused]] auto _2 = write(2, buf, n);
+        }
+      }
+    }
+  }
   FEX::HLE::SyscallObserver::OnTgkillCall(tgid, tid, sig);
   return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
 }
