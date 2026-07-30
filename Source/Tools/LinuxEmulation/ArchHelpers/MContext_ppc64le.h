@@ -85,7 +85,6 @@ struct PPC64ContextBackup {
   uint64_t SigInfoLocation;
   FEXCore::Core::CPUState GuestState;
 
-  // ppc64le ELFv2 ABI has no red zone
   static constexpr int RedZoneSize = 0;
 };
 

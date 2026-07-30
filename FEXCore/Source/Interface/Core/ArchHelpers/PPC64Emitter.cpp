@@ -121,10 +121,12 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   // dispatch when SpillForABICall returns.
   //
   // Save TMP2 through FPR f0 via mtfprd/mffprd. Why f0:
-  //   * PPC64 ELFv2 has NO red zone, so the previous `std TMP2, -8(r1)` save
-  //     faulted whenever r1 sat at a stack-mapping boundary (Steam bash
-  //     subshells with tight clone()-allocated stacks SEGV'd here at
-  //     si_addr = r1-8, one byte past the [stack] mapping).
+  //   * ELFv2 nominally reserves a 288B red zone below r1, but a
+  //     previous `std TMP2, -8(r1)` save faulted whenever r1 sat within
+  //     8 bytes of a stack-mapping boundary (Steam bash subshells with
+  //     tight clone()-allocated stacks SEGV'd here at si_addr = r1-8,
+  //     one byte past the [stack] mapping -- the caller's mapping was
+  //     smaller than the ABI red zone.)
   //   * f0 is volatile (caller-saved) per ELFv2 FP register conventions, and
   //     not in any FEX SRA/RA pool — it is used only as an op-local scratch
   //     by a few VectorOps emitters (lfd/fdiv/fsqrt sequences) and is
@@ -454,9 +456,10 @@ void PPC64EmitterBase::StoreUnalignedV128(VR src, GPR ea) {
 // `size` bytes and the load form zero-extends the upper bits. Naively using
 // stvx/lvx writes/reads 16 bytes and corrupts adjacent stack/structure slots
 // (root cause of hello_static SEGV at __tls_init_tp). The store bounces
-// through STATE+JITScratch (16 bytes, alignas(16) in CpuStateFrame — PPC64
-// ELFv2 has NO red zone below r1, and an r1-relative slot faulted whenever
-// r1 sat at a stack-mapping boundary): spill the V128 there with stvx, then
+// through STATE+JITScratch (16 bytes, alignas(16) in CpuStateFrame -- ELFv2
+// nominally has a 288B red zone below r1, but an r1-relative slot faulted
+// on tight clone-allocated stacks where the mapping ended before the ABI
+// red zone did): spill the V128 there with stvx, then
 // emit a size-correct GPR store from the slot to *ea. The load form has
 // scalar-VSX fast paths (see LoadFPRSized) and falls back to the mirrored
 // bounce. CRITICAL: the bounce paths clobber TMP1/TMP2/TMP3, so capture

@@ -446,10 +446,11 @@ struct CpuStateFrame {
 #ifdef ARCHITECTURE_ppc64le
   // 16-byte aligned scratch slot used by JIT-emitted helpers that need a
   // bounce buffer for unaligned vector loads/stores or to spill a GPR around
-  // mfcr/mfxer. Previously the emitter used r1-relative negative offsets as
-  // an implicit red zone -- but PPC64 ELFv2 has NO red zone, so those stores
-  // faulted whenever r1 sat at a stack-mapping boundary (observed on Steam's
-  // bash subshells with tight clone()-allocated stacks). Address as
+  // mfcr/mfxer. Previously the emitter used r1-relative negative offsets in
+  // the ELFv2 288B red zone -- but that fell inside the [stack] mapping only
+  // when the mapping was large enough. On Steam's bash subshells with tight
+  // clone()-allocated stacks the mapping ended before the ABI red zone did
+  // and those stores SEGV'd. Address as
   // `[STATE + offsetof(CpuStateFrame, JITScratch)]`.
   alignas(16) uint64_t JITScratch[2] {};
 
