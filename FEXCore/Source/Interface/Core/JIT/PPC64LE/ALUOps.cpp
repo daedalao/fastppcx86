@@ -358,15 +358,26 @@ DEF_OP(Div) {
     Bind(&AfterAbs);
 
     // Unsigned 128/64 via POWER8 divdeu + divdu + at-most-one correction.
+    // As in UDiv's long path, the correction test must consult the 65-bit
+    // remainder's high bit, not just the low 64 (see comment there).
+    // abs_Upper is still needed at correction time but TMP2 gets clobbered
+    // by q2; park it in the red zone (-56; -40/-48 hold the sign masks).
     divdeu(TMP1, TMP2, TMP3);                 // q1 = (abs_Upper * 2^64) / abs_Div
+    std(TMP2, -56, r1);                       // save abs_Upper
     divdu(TMP2, TMP4, TMP3);                  // q2 = abs_Lower / abs_Div
     add(TMP1, TMP1, TMP2);                    // tentative quotient
     mulld(TMP2, TMP1, TMP3);                  // (tentative * abs_Div) low 64
-    subf(TMP2, TMP2, TMP4);                   // rem_lo = abs_Lower - mul_lo
+    subfc(TMP2, TMP2, TMP4);                  // rem_lo = abs_Lower - mul_lo, CA = !borrow
+    mulhdu(TMP4, TMP1, TMP3);                 // (tentative * abs_Div) high 64
+    ld(Remainder, -56, r1);                   // abs_Upper (Remainder as scratch; ld keeps CA)
+    subfe(TMP4, TMP4, Remainder);             // rem_hi = abs_Upper - mul_hi - borrow
 
-    Label NoCorrection;
+    Label NoCorrection, DoCorrect;
+    cmpldi(TMP4, 0);
+    bc(CC_NE, &DoCorrect);
     cmpld(TMP2, TMP3);
     bc(CC_ULT, &NoCorrection);
+    Bind(&DoCorrect);
     addi(TMP1, TMP1, 1);
     subf(TMP2, TMP3, TMP2);
     Bind(&NoCorrection);
@@ -427,22 +438,31 @@ DEF_OP(UDiv) {
     // PPC has no native 128/64 divide, but POWER8 has divdeu (extended
     // unsigned divide) which computes (rA << 64) / rB. Combined with
     // divdu(Lower, Divisor) the sum q1+q2 lands within {Q, Q-1} of the true
-    // quotient. One correction step (compare remainder against Divisor)
-    // recovers the exact answer.
+    // quotient (r1+r2 <= 2*Divisor-2). One correction step recovers the
+    // exact answer — but the residual remainder is up to 65 bits, so the
+    // test must consult its high bit too: with only the low-64 compare, a
+    // residual of 2^64+small wrapped to "small < Divisor" and the needed
+    // increment was skipped (seen live as libgcc __udivti3 quotients off by
+    // one — stress-ng vecmath's 128-bit lane checksum).
     auto Upper = GetReg(Op->Upper);
     divdeu(TMP1, Upper, Divisor);            // q1 = floor(Upper * 2^64 / Divisor)
     divdu(TMP2, Lower, Divisor);              // q2 = floor(Lower / Divisor)
     add(TMP1, TMP1, TMP2);                    // tentative = q1 + q2
     mulld(TMP4, TMP1, Divisor);               // (tentative * Divisor) low 64
-    subf(TMP4, TMP4, Lower);                  // rem_lo (mod 2^64) = Lower - mul_lo
+    subfc(TMP4, TMP4, Lower);                 // rem_lo = Lower - mul_lo, CA = !borrow
+    mulhdu(TMP3, TMP1, Divisor);              // (tentative * Divisor) high 64
+    subfe(TMP3, TMP3, Upper);                 // rem_hi = Upper - mul_hi - borrow
 
-    // Conditional correction: if rem_lo >= Divisor, tentative was Q-1, so
-    // increment quotient and subtract Divisor from remainder.
-    Label NoCorrection;
+    // Correct iff the 65-bit remainder >= Divisor: rem_hi != 0 (remainder
+    // has bit 64 set) or rem_lo >= Divisor.
+    Label NoCorrection, DoCorrect;
+    cmpldi(TMP3, 0);
+    bc(CC_NE, &DoCorrect);
     cmpld(TMP4, Divisor);
     bc(CC_ULT, &NoCorrection);
+    Bind(&DoCorrect);
     addi(TMP1, TMP1, 1);
-    subf(TMP4, Divisor, TMP4);
+    subf(TMP4, Divisor, TMP4);                // mod-2^64 subtract folds bit 64 away
     Bind(&NoCorrection);
 
     or_(Quotient,  TMP1, TMP1);               // mr Quotient,  TMP1
