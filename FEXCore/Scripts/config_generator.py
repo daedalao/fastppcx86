@@ -363,6 +363,17 @@ def print_parse_jsonloader_options(options):
                 output_argloader.write("else if (KeyName == \"{0}\") {{\n".format(op_key))
                 output_argloader.write("\tAppendStrArrayValue(KeyOption, ConfigString);\n")
                 output_argloader.write("}\n")
+            elif ("ArgumentHandler" in op_vals):
+                # Options with a text ArgumentHandler (e.g. SMCChecks "mtrack")
+                # must convert here too, not just in the env/commandline
+                # loaders — otherwise the raw text is strtoul'd later and every
+                # non-numeric value silently parses as 0.
+                conversion_func = "FEXCore::Config::Handler::{0}".format(op_vals["ArgumentHandler"])
+                output_argloader.write("else if (KeyName == \"{0}\") {{\n".format(op_key))
+                output_argloader.write("\tif (auto Converted = {0}(Value_View)) {{\n".format(conversion_func))
+                output_argloader.write("\t\tSet(KeyOption, *Converted);\n")
+                output_argloader.write("\t}\n")
+                output_argloader.write("}\n")
     assert op_key is not None, "No options found in JSONLOADER"
     output_argloader.write("else {\n")
     output_argloader.write("\tSet(KeyOption, ConfigString);\n")
