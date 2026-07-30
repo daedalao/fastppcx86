@@ -1516,17 +1516,25 @@ uint64_t FileManager::Chdir(const char* path) {
   auto NewPath = GetSelf(path);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
-  auto Path = GetEmulatedPath(SelfPath, true);
-  if (!Path.empty()) {
-    uint64_t Result = ::chdir(Path.c_str());
-    // Only fall back when the rootfs-scoped path was genuinely absent. EACCES
-    // and friends are semantic results the guest must see.
-    if (Result != -1 || errno != ENOENT) {
-      return Result;
-    }
+  // Host first, rootfs only when the host genuinely lacks the directory.
+  // The other order broke Steam: almost every absolute chdir target ("/",
+  // "/usr", "/tmp") exists inside the rootfs, so preferring it parked the
+  // host-visible cwd inside the overlay and pressure-vessel's relative-path
+  // re-exec of the client escaped FEX to the system binfmt handler
+  // (qemu-x86_64) and died. Host-first still covers the dpkg case that
+  // motivated the translation: dpkg-deb's workdir exists only in the rootfs,
+  // so the host chdir ENOENTs and the rootfs branch below takes it.
+  uint64_t Result = ::chdir(SelfPath);
+  if (Result != uint64_t(-1) || errno != ENOENT) {
+    return Result;
   }
 
-  return ::chdir(SelfPath);
+  auto Path = GetEmulatedPath(SelfPath, true);
+  if (!Path.empty()) {
+    return ::chdir(Path.c_str());
+  }
+  errno = ENOENT;
+  return -1;
 }
 
 uint64_t FileManager::Lchown(const char* pathname, uid_t owner, gid_t group) {
