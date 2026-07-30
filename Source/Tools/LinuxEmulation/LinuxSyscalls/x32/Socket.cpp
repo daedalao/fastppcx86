@@ -420,6 +420,10 @@ static uint64_t SendMMsg(int sockfd, auto_compat_ptr<mmsghdr_32> msgvec, uint32_
 
 static uint64_t SetSockOpt(int sockfd, int level, int optname, auto_compat_ptr<void> optval, int optlen) {
   uint64_t Result {};
+  // Map the guest's x86 SOL_SOCKET option numbers to the host's before the
+  // switch below — its cases are compiled with host constants, so the
+  // translation makes both the dispatch and the passthrough correct.
+  optname = FEX::HLE::TranslateGuestSockOptName(level, optname);
 
   if (level == SOL_SOCKET) {
     switch (optname) {
@@ -546,6 +550,8 @@ static uint64_t SetSockOpt(int sockfd, int level, int optname, auto_compat_ptr<v
 }
 
 static uint64_t GetSockOpt(int sockfd, int level, int optname, auto_compat_ptr<void> optval, auto_compat_ptr<socklen_t> optlen) {
+  // See SetSockOpt: translate guest x86 option numbers to host powerpc ones.
+  optname = FEX::HLE::TranslateGuestSockOptName(level, optname);
   uint64_t Result {};
   if (level == SOL_SOCKET) {
     switch (optname) {

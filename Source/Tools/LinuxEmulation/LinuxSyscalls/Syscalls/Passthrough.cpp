@@ -756,8 +756,23 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(accept, SyscallPassthrough3<SYSCALL_DEF(accept)>);
     REGISTER_SYSCALL_IMPL_X64(sendmsg, SyscallPassthrough3<SYSCALL_DEF(sendmsg)>);
     REGISTER_SYSCALL_IMPL_X64(recvmsg, SyscallPassthrough3<SYSCALL_DEF(recvmsg)>);
-    REGISTER_SYSCALL_IMPL_X64(setsockopt, SyscallPassthrough5<SYSCALL_DEF(setsockopt)>);
-    REGISTER_SYSCALL_IMPL_X64(getsockopt, SyscallPassthrough5<SYSCALL_DEF(getsockopt)>);
+    // Not passthrough: powerpc hosts use legacy SOL_SOCKET option numbers for
+    // six options; the guest's x86 numbering must be translated (see
+    // TranslateGuestSockOptName). Everything else is unchanged passthrough.
+    REGISTER_SYSCALL_IMPL_X64(setsockopt,
+                              [](FEXCore::Core::CpuStateFrame* Frame, int sockfd, int level, int optname, const void* optval,
+                                 socklen_t optlen) -> uint64_t {
+                                uint64_t Result = ::syscall(SYSCALL_DEF(setsockopt), sockfd, level,
+                                                            FEX::HLE::TranslateGuestSockOptName(level, optname), optval, optlen);
+                                SYSCALL_ERRNO();
+                              });
+    REGISTER_SYSCALL_IMPL_X64(getsockopt,
+                              [](FEXCore::Core::CpuStateFrame* Frame, int sockfd, int level, int optname, void* optval,
+                                 socklen_t* optlen) -> uint64_t {
+                                uint64_t Result = ::syscall(SYSCALL_DEF(getsockopt), sockfd, level,
+                                                            FEX::HLE::TranslateGuestSockOptName(level, optname), optval, optlen);
+                                SYSCALL_ERRNO();
+                              });
     REGISTER_SYSCALL_IMPL_X64(wait4, SyscallPassthrough4<SYSCALL_DEF(wait4)>);
 #ifdef ARCHITECTURE_ppc64le
     REGISTER_SYSCALL_IMPL_X64(semop, UnimplementedSyscallSafe);

@@ -36,6 +36,7 @@ $end_info$
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sys/socket.h>
 #include <type_traits>
 #include <list>
 #ifdef ARCHITECTURE_x86_64
@@ -90,6 +91,29 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler);
 
 uint64_t UnimplementedSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 uint64_t UnimplementedSyscallSafe(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
+
+// x86 guests use the asm-generic SOL_SOCKET option numbering; powerpc is one
+// of the legacy architectures with its own numbers for six of them. Translate
+// the guest's optname before handing it to the host kernel — without this,
+// e.g. a guest SO_PASSCRED (16) lands as host SO_RCVLOWAT (16), credentials
+// never get attached, and Chromium/CEF's unix-socket IPC bootstrap fails
+// with "missing credentials" (seen live: steamwebhelper restart loop).
+inline int TranslateGuestSockOptName(int level, int optname) {
+#ifdef __powerpc64__
+  if (level == SOL_SOCKET) {
+    switch (optname) {
+    case 16: return 20; // x86 SO_PASSCRED     -> ppc SO_PASSCRED
+    case 17: return 21; // x86 SO_PEERCRED     -> ppc SO_PEERCRED
+    case 18: return 16; // x86 SO_RCVLOWAT     -> ppc SO_RCVLOWAT
+    case 19: return 17; // x86 SO_SNDLOWAT     -> ppc SO_SNDLOWAT
+    case 20: return 18; // x86 SO_RCVTIMEO_OLD -> ppc SO_RCVTIMEO_OLD
+    case 21: return 19; // x86 SO_SNDTIMEO_OLD -> ppc SO_SNDTIMEO_OLD
+    default: break;
+    }
+  }
+#endif
+  return optname;
+}
 
 struct ExecveAtArgs {
   int dirfd;
