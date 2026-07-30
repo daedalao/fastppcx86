@@ -1357,6 +1357,29 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
   RegisterHostSignalHandler(SIGILL, SigillHandler, true);
   RegisterHostSignalHandler(SIGSEGV, SigsegvHandler, true);
 
+  // SIGTRAP needs a host thunk for the same reason SIGILL does, and until now
+  // it never had one. Host thunks were installed only for SIGILL, SIGSEGV,
+  // SIGBUS and the pause signal; the all-signals loop below calls
+  // RegisterHostSignalHandlerForGuest, which assigns a GuestHandler but never
+  // calls InstallHostThunk. So a SIGTRAP-producing instruction reached FEX only
+  // if the guest itself had called sigaction(SIGTRAP, ...) — otherwise the
+  // process died on the host default disposition with FEX bypassed entirely:
+  // no CleanupForExit, no telemetry, and a NIP inside the dispatcher mmap.
+  //
+  // This is already a live defect independent of any Break-op work. X87Ops.cpp
+  // emits `trap` (0x7FE00008) for unsupported fstp conversion paths, with a
+  // comment promising "a clear SIGILL". Without a thunk that path core-dumps
+  // instead of failing loudly, and it is reachable by any guest doing
+  // `fstp dword`/`fstp qword` from a non-80-bit stack value.
+  //
+  // Required=true matters: it blocks both downgrades in UpdateHostThunk, so a
+  // guest setting SIG_DFL or SIG_IGN cannot strip our thunk and leave the
+  // sentinel or a Break-generated trap unhandled.
+  const auto SigtrapHandler = [](FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) -> bool {
+    return FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread)->SignalInfo.Delegator->HandleSIGILL(Thread, Signal, info, ucontext);
+  };
+  RegisterHostSignalHandler(SIGTRAP, SigtrapHandler, true);
+
 #ifdef ARCHITECTURE_arm64
   // Register SIGBUS signal handler.
   const auto SigbusHandler = [](FEXCore::Core::InternalThreadState* Thread, int Signal, void* _info, void* ucontext) -> bool {

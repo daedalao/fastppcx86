@@ -508,37 +508,73 @@ void PPC64Dispatcher::EmitDispatcher() {
   // ExitOnHLTEnabled() keeps the old clean-exit behavior for unit tests
   // that intentionally trigger faults.
   // ==============================================================
-  // SIGILL/SIGTRAP stubs kept as clean-blr (silent absorption).
+  // SIGILL/SIGTRAP stubs — raise the matching host fault.
   //
-  // Guest x86 UD2 (0x0F 0x0B) lowers to BreakOp(SIGILL) and INT3 (0xCC) to
-  // BreakOp(SIGTRAP). Both are commonly embedded in real-world software:
-  // glibc pthread assertions, anti-debug stubs, Wine's compatibility hooks.
-  // Firing real host SIGILL/SIGTRAP for these surprises programs that don't
-  // expect the signal to actually reach their handlers (FEX has been
-  // silently NOPing them historically). Until we audit and instrument what
-  // each caller expects, treat these as "JIT-absorbed" rather than
-  // "delivered to guest". The Break op's IR side-effect (storing the fault
-  // data) is still emitted; only the host-fault generation is suppressed.
-  // SIGSEGV stub below DOES fault because its only common caller is NoExec
-  // which we want guests to actually see.
+  // These used to be `SpillStaticRegs; PopCalleeSavedRegisters; blr`, on the
+  // stated grounds that FEX "has been silently NOPing" guest UD2/INT3 and that
+  // firing a real signal would surprise callers. **That premise was measured
+  // and is false.** `blr` here is the dispatcher's *epilogue*: it returns out
+  // of ExecuteThread, after which Syscalls/Thread.cpp runs
+  // ReleaseAllPendingSharedLocks, UninstallTLSState and DestroyThread. So the
+  // old behaviour was not absorption — it silently **destroyed the guest
+  // thread**, with any guest-side locks it held left held forever, no handler
+  // run and nothing logged. A probe confirmed this at runtime for both INT3
+  // and UD2: the thread executed the instruction and never returned, and its
+  // peers then blocked indefinitely.
+  //
+  // Delivering the signal is therefore strictly better than the status quo for
+  // every caller the old comment worried about. A guest whose handler catches
+  // SIGILL/SIGTRAP now gets to run it; a guest without one dies loudly instead
+  // of losing one thread invisibly.
+  //
+  // Mechanism: spill guest state, then execute a genuinely faulting word so the
+  // host kernel raises the signal and SignalDelegator → GuestFramesManagement
+  // synthesises delivery with correct si_addr. State reconstruction already
+  // works on this path — IsAddressInCodeBuffer is false for the dispatcher
+  // mmap, so SpillSRA is skipped and State.rip survives.
+  //
+  // SIGTRAP additionally required a host thunk, which FEX never installed; see
+  // the registration added in LinuxSyscalls/SignalDelegator.cpp.
+  //
+  // KNOWN LIMITATION: UD2 and UnimplementedOp emit byte-identical
+  // BreakDefinitions (OpcodeDispatcher.cpp), so the backend cannot tell a
+  // deliberate guest trap from a FEX codegen gap. After this change an
+  // unimplemented op surfaces as a guest SIGILL rather than something
+  // diagnosable. Separating them needs a new IR field; recorded, not fixed.
   GuestSignal_SIGILL_Address = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
-  PopCalleeSavedRegisters();
-  blr();
+  // All-zero word: not a valid PowerPC encoding, so the kernel raises SIGILL
+  // with si_code ILL_ILLOPC. Same construct SignalHandlerReturnAddress uses
+  // below; the two are distinguished by PC, which HandleSIGILL compares.
+  Emit32(0x00000000u);
 
   GuestSignal_SIGTRAP_Address = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
-  PopCalleeSavedRegisters();
-  blr();
+  // `trap` = tw 31,r0,r0 — unconditional program check, raises SIGTRAP.
+  // Same encoding X87Ops.cpp already emits for unsupported fstp conversions.
+  tw(31, r0, r0);
 
-  // SIGSEGV stub also kept silent for now. Guest x86 ops that produce
-  // BreakOp(SIGSEGV) include NoExec (entry-block fault on non-PROT_EXEC
-  // page — what we want guests to actually see for the Steam 0xB40 wave)
-  // but ALSO INT imm8, INTO, and HLT. Steam early-startup hits one of the
-  // latter benignly; pre-fix FEX silently absorbed it, post-fix it
-  // becomes a real fault that breaks the worker pool init. Until we can
-  // selectively raise the host fault only for NoExec entry blocks, the
-  // silent stub is the safer behavior.
+  // SIGSEGV stub DELIBERATELY stays silent — do not "fix" it to match the two
+  // above without reading this.
+  //
+  // Guest HLT lowers to BreakOp(SIGSEGV), and HLT is how the ~2200 ASM tests
+  // terminate: silent stub → blr out of ExecuteThread → FEXInterpreter runs its
+  // normal teardown and returns StatusCode. Making this fault would change how
+  // roughly 6672 of the 7011 ctest cases end, which is why the 6/7011 gate has
+  // no bearing on the SIGILL/SIGTRAP change above — no ASM test uses UD2 or
+  // INT3, verified by search.
+  //
+  // The same stub also serves NoExec entry-block faults, which guests *should*
+  // see, so this is genuinely two behaviours sharing one stub. Separating them
+  // needs the Break op to distinguish its callers — the same missing IR field
+  // noted above. Until then silence is the safer default here and delivery is
+  // the safer default there.
+  //
+  // (The prior comment claimed a real fault "breaks the worker pool init" for
+  // Steam. That claim traces to f78e0613d, which is a pure comment diff whose
+  // own message calls it "exploration that got reverted to a clean blr" — no
+  // code ever implemented or tested it. Treated as an untested hypothesis, not
+  // a finding.)
   GuestSignal_SIGSEGV_Address = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   SpillStaticRegs(TMP1);
   PopCalleeSavedRegisters();

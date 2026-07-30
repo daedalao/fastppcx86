@@ -69,7 +69,12 @@ namespace FEXCore::CPU {
 // with a call into PPC64_SplitLockEmulate (process-wide mutex-serialized),
 // which is correct across cores.
 //
-// Frame layout (64 bytes, allocated via stdu r1, -64, r1):
+// Frame layout (80 bytes, allocated via stdu r1, -80, r1):
+//
+// NOTE the size: the caller stashes CR0 at [original_r1 - 8], which lands at
+// [mini_r1 + 72]. SplitLockSlotExpectedSave + 8 == SplitLockMiniFrameSize - 8
+// (the static_assert below) is what pins that doubleword as reserved. Nothing
+// in either helper may write offset 72.
 //   [r1+0]:  back-chain (auto-written by stdu)
 //   [r1+8]:  CR save area (ELFv2 reserves; unused)
 //   [r1+16]: LR save area (helper prologue writes incoming LR here)
@@ -207,7 +212,10 @@ DEF_OP(AtomicSwap) {
   // where a flag-setter follows and fully overwrites CR0, XCHG has no
   // such follower — any leaked CR0 state from the andi_/stdcx_ would
   // contaminate downstream NZCVSelect / LAHF / Jcc reads.
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
 
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
@@ -235,7 +243,7 @@ DEF_OP(AtomicSwap) {
   Bind(&done);
   // Restore CR0 — XCHG preserves flags.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +274,10 @@ DEF_OP(AtomicFetchAdd) {
   // used since f6db15238; the seven Fetch* ops in 8743eb4f5 originally used
   // TMP3 and corrupted the address whenever RA aliased Dst onto Addr — which
   // happens routinely in jit_500/jit_500_m blocks (e.g. `lock not [r15+1]`).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -295,7 +306,7 @@ DEF_OP(AtomicFetchAdd) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +326,10 @@ DEF_OP(AtomicFetchSub) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -344,7 +358,7 @@ DEF_OP(AtomicFetchSub) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +378,10 @@ DEF_OP(AtomicFetchAnd) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -393,7 +410,7 @@ DEF_OP(AtomicFetchAnd) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +430,10 @@ DEF_OP(AtomicFetchCLR) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -442,7 +462,7 @@ DEF_OP(AtomicFetchCLR) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +482,10 @@ DEF_OP(AtomicFetchOr) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -491,7 +514,7 @@ DEF_OP(AtomicFetchOr) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +534,10 @@ DEF_OP(AtomicFetchXor) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -540,7 +566,7 @@ DEF_OP(AtomicFetchXor) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +584,10 @@ DEF_OP(AtomicFetchNeg) {
   // x86 LOCK ops set flags via a SEPARATE IR op after the atomic.  Save CR0
   // here to defend against any IR-pipeline path that inserts a CR0-reader
   // between the atomic and the flag-setter (Select01, branch fold, etc.).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
@@ -587,7 +616,7 @@ DEF_OP(AtomicFetchNeg) {
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +748,10 @@ DEF_OP(CASPair) {
   // via XER, though stdcx_ doesn't touch XER). Save CR0 to red zone on entry
   // and restore on exit so CmpPairZ's crmove(CR0.EQ ← CR1.EQ) is the only
   // visible CR0 change. -8(r1) is reserved within this op (no recursion).
-  mfcr(TMP4);
+  // mfocrf 0x80 (single-field, uncracked; ISA 2.01): only the CR0 nibble is
+  // defined pre-3.0C — sufficient, the sole consumer is the mtocrf(0x80)
+  // restore at op end.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
 
   if (Sz == IR::OpSize::i32Bit) {
@@ -774,9 +806,9 @@ DEF_OP(CASPair) {
     rldicl(DstLo, TMP2, 0, 32);
     srdi  (DstHi, TMP2, 32);
 
-    // Restore CR0 (entry-save above). mtcrf 0x80 writes only field 0.
+    // Restore CR0 (entry-save above). mtocrf 0x80 writes only field 0.
     ld(TMP4, -8, r1);
-    mtcrf(0x80, TMP4);
+    mtocrf(0x80, TMP4);
     return;
   }
 
@@ -834,7 +866,7 @@ DEF_OP(CASPair) {
   // Restore CR0 (entry-save in the 128-bit body shares the same red-zone slot).
   // TMP4 is free here — the 128-bit body's SaveDesHi(=TMP4) is dead after stqcx_.
   ld(TMP4, -8, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
 }
 
 #undef LOAD_RESERVED

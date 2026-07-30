@@ -80,7 +80,8 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
     DEPENDS thunkgen
-    COMMAND thunkgen "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
+    COMMAND ${CMAKE_COMMAND} -E env "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+      "$<TARGET_FILE:thunkgen>" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -152,7 +153,14 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   add_host_lib(xshmfence ${GUEST_BITNESS})
 endforeach()
 
-set(BITNESS_LIST "32;64")
+# These libs support both guest bitnesses. Generating the 32-bit variants requires thunkgen to parse
+# the interface headers as i686, which needs an i686 sysroot — hosts with only an x86_64
+# cross-toolchain cannot do it, and nothing 64-bit-guest-only depends on the result.
+if (BUILD_THUNKS_32BIT)
+  set(BITNESS_LIST "32;64")
+else()
+  set(BITNESS_LIST "64")
+endif()
 foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (BUILD_FEX_LINUX_TESTS)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})

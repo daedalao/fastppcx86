@@ -608,20 +608,46 @@ int FileManager::OpenPathInRootFS(const EmulatedFDPathResult& Path, bool FollowS
     .resolve = RESOLVE_IN_ROOT,
   };
 
-  int fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+  // EAGAIN is not a failure: openat2(2) documents that RESOLVE_IN_ROOT may
+  // return it when the kernel spots a concurrent rename or mount that could
+  // break the scoping guarantee, and expects the caller to retry. Bounded so a
+  // pathological rename storm can't spin here forever; callers treat the
+  // eventual -1/EAGAIN as a semantic error, which is the honest answer.
+  int fd = -1;
+  for (int Attempt = 0; Attempt < 16; ++Attempt) {
+    fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+    if (fd != -1 || errno != EAGAIN) {
+      break;
+    }
+  }
+
   if (fd != -1) {
     return fd;
   }
 
+  const int SavedErrno = errno;
+
   // EXDEV: a magic /proc symlink (or similar) crossed the rootfs boundary.
-  // Fall back to a plain openat() so callers can still see the file; we
-  // accept the (small) risk of a host leak in that narrow case, matching
-  // the existing Openat() fallback policy.
-  if (errno == EXDEV) {
+  // ENOSYS: no openat2(2) at all (pre-5.6 kernel), so RESOLVE_IN_ROOT scoping
+  // is simply unavailable rather than the path being unreachable.
+  // In both cases fall back to a plain openat() so callers can still see the
+  // file; we accept the (small) risk of a host leak in those narrow cases,
+  // matching the existing Openat() fallback policy. Every other errno is a
+  // real answer about the path and is returned as-is — degrading those to a
+  // host lookup is precisely the containment breach this function exists to
+  // prevent.
+  if (SavedErrno == EXDEV || SavedErrno == ENOSYS) {
     int OpenFlags = O_PATH | O_CLOEXEC | (FollowSymlink ? 0 : O_NOFOLLOW);
-    return ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, OpenFlags);
+    int Fallback = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, OpenFlags);
+    if (Fallback == -1 && errno == ENOSYS) {
+      // Shouldn't happen (openat predates every kernel we support), but don't
+      // report a missing syscall as a missing file.
+      errno = SavedErrno;
+    }
+    return Fallback;
   }
 
+  errno = SavedErrno;
   return -1;
 }
 
@@ -858,10 +884,19 @@ uint64_t FileManager::Access(const char* pathname, [[maybe_unused]] int mode) {
     uint64_t Result = ::syscall(SYSCALL_DEF(faccessat2), RootScopedFD, "", mode, AT_EMPTY_PATH);
     int SavedErrno = errno;
     ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
+    // Propagate semantic errors as-is; only fall back if the file is
+    // genuinely missing from rootfs (ENOENT). An EACCES answered out of the
+    // rootfs is the correct answer about the file the guest can see; asking
+    // the host path instead answers out of host permissions, or worse out of
+    // a different file that happens to live at the same host path.
+    if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+      errno = SavedErrno;
       return Result;
     }
-    errno = SavedErrno;
+  } else if (errno != ENOENT) {
+    // OpenPathInRootFS itself failed with a non-ENOENT semantic result
+    // (e.g. EACCES when parent perms forbid search). Propagate.
+    return -1;
   }
   return ::access(SelfPath, mode);
 }
@@ -879,10 +914,14 @@ uint64_t FileManager::FAccessat(int dirfd, const char* pathname, int mode) {
     uint64_t Result = ::syscall(SYSCALL_DEF(faccessat2), RootScopedFD, "", mode, AT_EMPTY_PATH);
     int SavedErrno = errno;
     ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
+    // See FM.Access: only a genuinely absent rootfs entry justifies re-asking
+    // the host.
+    if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+      errno = SavedErrno;
       return Result;
     }
-    errno = SavedErrno;
+  } else if (errno != ENOENT) {
+    return -1;
   }
 
   return ::syscall(SYS_faccessat, dirfd, SelfPath, mode);
@@ -899,10 +938,14 @@ uint64_t FileManager::FAccessat2(int dirfd, const char* pathname, int mode, int 
     uint64_t Result = ::syscall(SYSCALL_DEF(faccessat2), RootScopedFD, "", mode, flags | AT_EMPTY_PATH);
     int SavedErrno = errno;
     ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
+    // See FM.Access: only a genuinely absent rootfs entry justifies re-asking
+    // the host.
+    if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+      errno = SavedErrno;
       return Result;
     }
-    errno = SavedErrno;
+  } else if (errno != ENOENT) {
+    return -1;
   }
 
   return ::syscall(SYSCALL_DEF(faccessat2), dirfd, SelfPath, mode, flags);
@@ -929,16 +972,32 @@ uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {
     int SavedErrno = errno;
     ::close(RootScopedFD);
 
-    if (Result == static_cast<uint64_t>(-1) && SavedErrno == EINVAL) {
-      // This means that the file wasn't a symlink
-      // This is expected behaviour
-      errno = SavedErrno;
+    if (Result == static_cast<uint64_t>(-1)) {
+      // The fd resolved, so the file does exist in the RootFS and this is a
+      // semantic result about it. Propagate it as-is; retrying against the
+      // host path would answer out of host permissions instead (a guest
+      // /root/... lookup came back EACCES from the host's mode-700 /root).
+      //
+      // One translation is needed: readlinkat(2) with an empty pathname
+      // reports "not a symlink" as ENOENT rather than the EINVAL that
+      // readlink(2) gives for a named non-symlink (fs/stat.c do_readlinkat:
+      // `error = empty ? -ENOENT : -EINVAL`). Both mean the same thing here,
+      // and the guest must see EINVAL because realpath(3) reads EINVAL as
+      // "this component is not a symlink, keep walking" while any other
+      // errno is a hard failure.
+      errno = (SavedErrno == ENOENT) ? EINVAL : SavedErrno;
       return -1;
     }
-    if (Result == static_cast<uint64_t>(-1)) {
-      errno = SavedErrno;
-    }
+  } else if (errno != ENOENT) {
+    // OpenPathInRootFS itself failed with a non-ENOENT semantic result
+    // (e.g. EACCES when parent perms forbid search). Propagate.
+    return -1;
   }
+
+  // Still -1 only when the RootFS lookup found nothing (or there was no RootFS
+  // translation at all, which OpenPathInRootFS also reports as ENOENT). Fall
+  // back to the host path so genuinely host-resident paths the guest can
+  // legitimately reach still work.
   if (Result == static_cast<uint64_t>(-1)) {
     Result = ::readlink(pathname, buf, bufsiz);
   }
@@ -962,10 +1021,17 @@ uint64_t FileManager::Chmod(const char* pathname, mode_t mode) {
     uint64_t Result = ::chmod(ProcSelfFd, mode);
     int SavedErrno = errno;
     ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
+    // Propagate semantic errors (EPERM on a file we don't own, EROFS, ...)
+    // as-is; only fall back when nothing was there to chmod. Note ENOENT here
+    // also covers /proc not being mounted, in which case the host path is
+    // genuinely the only way to service the call.
+    if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+      errno = SavedErrno;
       return Result;
     }
-    errno = SavedErrno;
+  } else if (errno != ENOENT) {
+    // OpenPathInRootFS itself failed with a non-ENOENT semantic result. Propagate.
+    return -1;
   }
   return ::chmod(SelfPath, mode);
 }
@@ -1022,17 +1088,22 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
     int SavedErrno = errno;
     ::close(RootScopedFD);
 
-    if (Result == static_cast<uint64_t>(-1) && SavedErrno == EINVAL) {
-      // This means that the file wasn't a symlink
-      // This is expected behaviour
-      errno = SavedErrno;
+    if (Result == static_cast<uint64_t>(-1)) {
+      // See FM.Readlink: the fd resolved, so this is a semantic result about a
+      // file that does exist in the RootFS and must be propagated rather than
+      // re-asked of the host path. ENOENT out of an empty-pathname
+      // readlinkat(2) is the kernel's "not a symlink" and has to reach the
+      // guest as EINVAL.
+      errno = (SavedErrno == ENOENT) ? EINVAL : SavedErrno;
       return -1;
     }
-    if (Result == static_cast<uint64_t>(-1)) {
-      errno = SavedErrno;
-    }
+  } else if (errno != ENOENT) {
+    // OpenPathInRootFS itself failed with a non-ENOENT semantic result. Propagate.
+    return -1;
   }
 
+  // Still -1 only when the RootFS lookup found nothing, so the caller's
+  // literal dirfd/pathname is the remaining candidate.
   if (Result == static_cast<uint64_t>(-1)) {
     Result = ::readlinkat(dirfd, pathname, buf, bufsiz);
   }
@@ -1122,11 +1193,13 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
   int32_t fd = -1;
+  bool OverlayAttempted = false;
 
   if (!ShouldSkipOpenInEmu(how->flags)) {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1 && !(how->resolve & RESOLVE_IN_ROOT)) {
+      OverlayAttempted = true;
       // AT_FDCWD means it's a thunk and not via RootFS
       if (Path.FD != AT_FDCWD) {
         how->resolve |= RESOLVE_IN_ROOT;
@@ -1140,8 +1213,12 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
       }
     }
 
-    // Open through RootFS failed (probably nonexistent), so open directly.
-    if (fd == -1) {
+    // Same policy as FM.Openat: fall back to the caller's literal dirfd/path
+    // only when the overlay was never attempted (errno is stale then, so it
+    // must not be inspected) or the path was genuinely absent from rootfs.
+    // Other errnos are semantic results about a RootFS-resident file and must
+    // not be re-answered against the host filesystem.
+    if (fd == -1 && (!OverlayAttempted || errno == ENOENT)) {
       fd = ::syscall(SYSCALL_DEF(openat2), dirfs, SelfPath, how, usize);
     }
 
@@ -1235,7 +1312,9 @@ uint64_t FileManager::Fchmodat2(int dirfd, const char* pathname, mode_t mode, un
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
   if (Path.FD != -1) {
     uint64_t Result = ::syscall(SYS_fchmodat2, Path.FD, Path.Path, mode, flags);
-    if (Result != -1) {
+    // Same policy as FM.Fchmodat: only fall back when the path was genuinely
+    // absent from rootfs.
+    if (Result != -1 || errno != ENOENT) {
       return Result;
     }
   }
@@ -1277,6 +1356,44 @@ uint64_t FileManager::Unlinkat(int dirfd, const char* pathname, int flags) {
     }
   }
   return ::syscall(SYSCALL_DEF(unlinkat), dirfd, SelfPath, flags);
+}
+
+uint64_t FileManager::Utimensat(int dirfd, const char* pathname, const struct timespec* times, int flags) {
+  // utimensat was the ONLY path-taking syscall still registered as a raw
+  // passthrough (Syscalls/Passthrough.cpp), so the RootFS translation never ran
+  // and the guest path went straight to the host kernel.
+  //
+  // Measured consequence: `apt update` emitted 36 instances of
+  // "Failed to set modification time - utimes (2: No such file or directory)".
+  // apt downloads an index into /var/lib/apt/lists/partial/, then stamps its
+  // mtime; the stamp hit the *host* filesystem where that path does not exist,
+  // returned ENOENT, and apt treated every download as failed — re-fetching,
+  // retrying, and eventually timing out. The downloads themselves were fine.
+  //
+  // A NULL pathname is legal here and means "operate on dirfd itself", which is
+  // how futimens() is implemented. There is nothing to translate in that case,
+  // so pass it straight through.
+  if (!pathname) {
+    return ::syscall(SYSCALL_DEF(utimensat), dirfd, nullptr, times, flags);
+  }
+
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  // AT_SYMLINK_NOFOLLOW means stamp the link itself rather than its target.
+  const bool FollowSymlink = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, FollowSymlink, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), Path.FD, Path.Path, times, flags);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EROFS/etc. are semantic results that must propagate to the
+    // guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(utimensat), dirfd, SelfPath, times, flags);
 }
 
 uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
@@ -1389,6 +1506,29 @@ uint64_t FileManager::Chown(const char* pathname, uid_t owner, gid_t group) {
   return Fchownat(AT_FDCWD, pathname, owner, group, 0);
 }
 
+uint64_t FileManager::Chdir(const char* path) {
+  // chdir was a raw passthrough alongside utimensat until dpkg -i tripped it:
+  // dpkg-deb creates its extraction workdir via `mkdirat(rootfs_dirfd,
+  // "var/lib/dpkg/tmp.ci", 0777)` which lands in the rootfs, then chdir()s to
+  // the absolute path "/var/lib/dpkg/tmp.ci". Without translation the host
+  // kernel sees a path that only exists inside the rootfs and returns ENOENT
+  // — the "dpkg-deb (subprocess): failed to chdir to directory" symptom.
+  auto NewPath = GetSelf(path);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  auto Path = GetEmulatedPath(SelfPath, true);
+  if (!Path.empty()) {
+    uint64_t Result = ::chdir(Path.c_str());
+    // Only fall back when the rootfs-scoped path was genuinely absent. EACCES
+    // and friends are semantic results the guest must see.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+
+  return ::chdir(SelfPath);
+}
+
 uint64_t FileManager::Lchown(const char* pathname, uid_t owner, gid_t group) {
   return Fchownat(AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
 }
@@ -1459,7 +1599,12 @@ uint64_t FileManager::Statfs(const char* path, void* buf) {
   auto Path = GetEmulatedPath(path);
   if (!Path.empty()) {
     uint64_t Result = ::statfs(Path.c_str(), reinterpret_cast<struct statfs*>(buf));
-    if (Result != -1) {
+    // Only fall back when the path is genuinely absent from the RootFS.
+    // GetEmulatedPath does no existence check, so ENOENT here is the normal
+    // "this is a host path" signal; anything else is a semantic result about a
+    // RootFS-resident path and must not be replaced by an answer describing the
+    // host filesystem.
+    if (Result != -1 || errno != ENOENT) {
       return Result;
     }
   }
@@ -1510,10 +1655,14 @@ uint64_t FileManager::NewFSStatAt64(int dirfd, const char* pathname, struct stat
     uint64_t Result = ::fstatat64(RootScopedFD, "", buf, flag | AT_EMPTY_PATH);
     int SavedErrno = errno;
     ::close(RootScopedFD);
-    if (static_cast<int64_t>(Result) != -1) {
+    // Same policy as FM.NewFSStatAt, which this is the 64-bit twin of:
+    // propagate semantic errors, fall back only on a genuinely absent entry.
+    if (static_cast<int64_t>(Result) != -1 || SavedErrno != ENOENT) {
+      errno = SavedErrno;
       return Result;
     }
-    errno = SavedErrno;
+  } else if (errno != ENOENT) {
+    return -1;
   }
   return ::fstatat64(dirfd, SelfPath, buf, flag);
 }

@@ -62,7 +62,7 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   endif()
 else()
   # We've been included using add_subdirectory, so set up targets for IDE integration using the host toolchain
-  set(GENERATOR_EXE thunkgen)
+  set(GENERATOR_EXE "$<TARGET_FILE:thunkgen>")
   set(TARGET_TYPE OBJECT)
   set(GENERATE_GUEST_INSTALL_TARGETS FALSE)
   set(BITNESS 64)
@@ -90,19 +90,50 @@ function(generate NAME SOURCE_FILE)
 
   file(MAKE_DIRECTORY "${OUTFOLDER}")
 
+  # Target selection for thunkgen's clang parse. The header search path is
+  # supplied one of two ways:
+  #
+  #  * X86_DEV_ROOTFS == "/" (the default): fall back to Debian/Ubuntu's
+  #    multilib convention, /usr/{i686,x86_64}-linux-gnu/include/. This is the
+  #    historical behaviour and is preserved for hosts that provide it.
+  #
+  #  * X86_DEV_ROOTFS set to a real sysroot: pass --sysroot instead. Required on
+  #    any host that does not ship Debian's multilib layout — e.g. Arch, and
+  #    every non-x86 host cross-building these, where those paths simply do not
+  #    exist and clang silently falls through to the *host* glibc's
+  #    /usr/include/gnu/stubs.h, which then #includes a gnu/stubs-32.h that is
+  #    not present. The resulting error names stubs-32.h and looks like a
+  #    missing 32-bit package rather than a wrong search path.
+  #
+  # X86_DEV_GCC_TOOLCHAIN is separate and usually also needed with a sysroot: a
+  # cross-toolchain keeps its libstdc++ headers beside the compiler rather than
+  # inside the sysroot, so --sysroot alone finds libc but not <type_traits>.
   if (BITNESS EQUAL 32)
     set(BITNESS_FLAGS "-for-32bit-guest")
-    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu" "-isystem" "/usr/i686-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu")
+    set(_FALLBACK_ISYSTEM "/usr/i686-linux-gnu/include/")
   else()
     set(BITNESS_FLAGS "")
-    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu" "-isystem" "/usr/x86_64-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu")
+    set(_FALLBACK_ISYSTEM "/usr/x86_64-linux-gnu/include/")
+  endif()
+
+  if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
+    list(APPEND BITNESS_FLAGS2 "--sysroot=${X86_DEV_ROOTFS}")
+  else()
+    list(APPEND BITNESS_FLAGS2 "-isystem" "${_FALLBACK_ISYSTEM}")
+  endif()
+
+  if (X86_DEV_GCC_TOOLCHAIN)
+    list(APPEND BITNESS_FLAGS2 "--gcc-toolchain=${X86_DEV_GCC_TOOLCHAIN}")
   endif()
 
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
-    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+    COMMAND ${CMAKE_COMMAND} -E env "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+      "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -143,6 +174,15 @@ function(add_guest_lib NAME SONAME)
     ## Compile for SSE2
     ## Compile with fpmath=sse to remove x87 usage
     target_compile_options(${NAME}-guest PRIVATE -msse2 -mfpmath=sse)
+
+    # When cross-compiling against a dedicated sysroot, that sysroot generally contains only libc
+    # and the C++ standard library. Thunk sources also include ordinary library headers — X11,
+    # libdrm, alsa — which are architecture-agnostic and only exist under the host prefix. Search
+    # there last, so the sysroot still wins for anything platform-specific. This mirrors what
+    # thunkgen already does for its own parse (ThunkLibs/Generator/main.cpp).
+    if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
+      target_compile_options(${NAME}-guest PRIVATE -idirafter /usr/include)
+    endif()
   endif()
 
   if (BITNESS EQUAL 32)

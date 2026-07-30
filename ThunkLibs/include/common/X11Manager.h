@@ -66,6 +66,29 @@ struct X11Manager {
     //     to XOpenDisplay which uses $DISPLAY — usually the same target as
     //     the guest's connection (single-display systems are by far the norm
     //     for the game workloads this path serves)
+    // Opt-in diagnostic: FEX_X11MANAGER_DEBUG=1.
+    //
+    // The nullptr guards below mean a *silent registration failure* and a *working callback* both
+    // produce a successful call, which is exactly the ambiguity that matters when deciding whether
+    // the cross-arch guest-callback path is genuinely working or merely being skipped. Log which
+    // one actually happened. Costs one getenv on first use.
+    {
+      static const bool Debug = [] {
+        const char* e = getenv("FEX_X11MANAGER_DEBUG");
+        return e && *e == '1';
+      }();
+      if (Debug) {
+        static thread_local unsigned Count = 0;
+        fprintf(stderr, "[X11Manager] GuestToHostDisplay(%p) #%u  GuestXSync=%p  GuestXDisplayString=%p  GuestXGetVisualInfo=%p\n",
+                (void*)GuestDisplay, ++Count, (void*)GuestXSync, (void*)GuestXDisplayString, (void*)GuestXGetVisualInfo);
+        if (!GuestXSync) {
+          fprintf(stderr, "[X11Manager]   GuestXSync is NULL — guest callback NOT registered; the "
+                          "graceful-degradation path is being taken, so this call proves nothing "
+                          "about cross-arch callback dispatch.\n");
+        }
+      }
+    }
+
     if (GuestXSync) {
       GuestXSync(GuestDisplay, 0);
     }

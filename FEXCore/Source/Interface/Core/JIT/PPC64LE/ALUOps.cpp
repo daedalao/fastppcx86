@@ -358,26 +358,15 @@ DEF_OP(Div) {
     Bind(&AfterAbs);
 
     // Unsigned 128/64 via POWER8 divdeu + divdu + at-most-one correction.
-    // As in UDiv's long path, the correction test must consult the 65-bit
-    // remainder's high bit, not just the low 64 (see comment there).
-    // abs_Upper is still needed at correction time but TMP2 gets clobbered
-    // by q2; park it in the red zone (-56; -40/-48 hold the sign masks).
     divdeu(TMP1, TMP2, TMP3);                 // q1 = (abs_Upper * 2^64) / abs_Div
-    std(TMP2, -56, r1);                       // save abs_Upper
     divdu(TMP2, TMP4, TMP3);                  // q2 = abs_Lower / abs_Div
     add(TMP1, TMP1, TMP2);                    // tentative quotient
     mulld(TMP2, TMP1, TMP3);                  // (tentative * abs_Div) low 64
-    subfc(TMP2, TMP2, TMP4);                  // rem_lo = abs_Lower - mul_lo, CA = !borrow
-    mulhdu(TMP4, TMP1, TMP3);                 // (tentative * abs_Div) high 64
-    ld(Remainder, -56, r1);                   // abs_Upper (Remainder as scratch; ld keeps CA)
-    subfe(TMP4, TMP4, Remainder);             // rem_hi = abs_Upper - mul_hi - borrow
+    subf(TMP2, TMP2, TMP4);                   // rem_lo = abs_Lower - mul_lo
 
-    Label NoCorrection, DoCorrect;
-    cmpldi(TMP4, 0);
-    bc(CC_NE, &DoCorrect);
+    Label NoCorrection;
     cmpld(TMP2, TMP3);
     bc(CC_ULT, &NoCorrection);
-    Bind(&DoCorrect);
     addi(TMP1, TMP1, 1);
     subf(TMP2, TMP3, TMP2);
     Bind(&NoCorrection);
@@ -438,31 +427,52 @@ DEF_OP(UDiv) {
     // PPC has no native 128/64 divide, but POWER8 has divdeu (extended
     // unsigned divide) which computes (rA << 64) / rB. Combined with
     // divdu(Lower, Divisor) the sum q1+q2 lands within {Q, Q-1} of the true
-    // quotient (r1+r2 <= 2*Divisor-2). One correction step recovers the
-    // exact answer — but the residual remainder is up to 65 bits, so the
-    // test must consult its high bit too: with only the low-64 compare, a
-    // residual of 2^64+small wrapped to "small < Divisor" and the needed
-    // increment was skipped (seen live as libgcc __udivti3 quotients off by
-    // one — stress-ng vecmath's 128-bit lane checksum).
+    // quotient. One correction step (compare remainder against Divisor)
+    // recovers the exact answer.
     auto Upper = GetReg(Op->Upper);
     divdeu(TMP1, Upper, Divisor);            // q1 = floor(Upper * 2^64 / Divisor)
     divdu(TMP2, Lower, Divisor);              // q2 = floor(Lower / Divisor)
     add(TMP1, TMP1, TMP2);                    // tentative = q1 + q2
-    mulld(TMP4, TMP1, Divisor);               // (tentative * Divisor) low 64
-    subfc(TMP4, TMP4, Lower);                 // rem_lo = Lower - mul_lo, CA = !borrow
-    mulhdu(TMP3, TMP1, Divisor);              // (tentative * Divisor) high 64
-    subfe(TMP3, TMP3, Upper);                 // rem_hi = Upper - mul_hi - borrow
 
-    // Correct iff the 65-bit remainder >= Divisor: rem_hi != 0 (remainder
-    // has bit 64 set) or rem_lo >= Divisor.
-    Label NoCorrection, DoCorrect;
+    // The remainder MUST be computed as a full 128-bit subtract. Computing it
+    // in 64 bits is wrong for large divisors and was a live bug: guest
+    // `__uint128_t % v` returned a quotient exactly one too low.
+    //
+    // Why. When tentative == Q-1 the pre-correction remainder is R + Divisor,
+    // and since R < Divisor that is bounded only by 2*Divisor. For any
+    // Divisor > 2^63 that exceeds 2^64 and wraps, so a 64-bit
+    // `Lower - (tentative*Divisor mod 2^64)` produces a small value, the
+    // `rem >= Divisor` test reads false, the correction is skipped, and both
+    // outputs are wrong. Concretely Divisor = 2^63+1 with a true remainder of
+    // 2^63-1 gives R+Divisor = 2^64, which wraps to 0.
+    //
+    // This is reachable from ordinary guest code. libgcc's __udivmodti4
+    // NORMALISES the divisor so its high bit is set before dividing, which
+    // puts the effective 64-bit divisor above 2^63 by construction — so every
+    // 128-bit divide or modulo through the general path hit it. Found via
+    // stress-ng --vecmath, isolated to `a %= v23` on __uint128_t.
+    //
+    // Not a problem on the signed path above: a signed 64-bit divisor has
+    // magnitude <= 2^63, so R + |Divisor| < 2^64 and cannot wrap.
+    //
+    // Fix: compute the 128-bit product and subtract with borrow. Because x86
+    // guarantees Upper < Divisor for a non-#DE divide, the true remainder is
+    // < 2*Divisor < 2^65, so rem_hi is exactly 0 or 1 — a non-zero high word
+    // means the remainder already exceeds 2^64 > Divisor and correction is
+    // required without inspecting rem_lo at all.
+    mulld (TMP4, TMP1, Divisor);              // prod_lo = (tentative*Divisor) low
+    mulhdu(TMP3, TMP1, Divisor);              // prod_hi = (tentative*Divisor) high
+    subfc (TMP4, TMP4, Lower);                // rem_lo = Lower - prod_lo, sets CA
+    subfe (TMP3, TMP3, Upper);                // rem_hi = Upper - prod_hi - borrow
+
+    Label DoCorrection, NoCorrection;
     cmpldi(TMP3, 0);
-    bc(CC_NE, &DoCorrect);
+    bc(CC_NE, &DoCorrection);                 // rem_hi != 0 -> rem >= 2^64 > Divisor
     cmpld(TMP4, Divisor);
     bc(CC_ULT, &NoCorrection);
-    Bind(&DoCorrect);
+    Bind(&DoCorrection);
     addi(TMP1, TMP1, 1);
-    subf(TMP4, Divisor, TMP4);                // mod-2^64 subtract folds bit 64 away
+    subf(TMP4, Divisor, TMP4);
     Bind(&NoCorrection);
 
     or_(Quotient,  TMP1, TMP1);               // mr Quotient,  TMP1
@@ -1430,7 +1440,10 @@ DEF_OP(PDep) {
   // x86 BMI2 PDEP preserves flags per Intel SDM ("Flags Affected: None").
   // CR0 here is the canonical packed-NZCV scratch — save it to a red-zone
   // slot before the loop and restore at the end so flags survive the op.
-  mfcr(T0);                    // T0 = full CR snapshot (using T0 briefly)
+  // mfocrf 0x80: CR0 nibble valid in T0 bits 31:28 (LSB), all other bits
+  // UNDEFINED pre-ISA-3.0C — safe because the only consumer is the
+  // mtocrf(0x80) restore below, which reads exactly that nibble.
+  mfocrf(T0, 0x80);            // T0 = CR0 snapshot (using T0 briefly)
   std(T0, -16, r1);            // stash to red zone
   cmpdi(Mask, 0);              // read snapshot (Dest may alias OrigMask)
   bc(CC_EQ, &Done);
@@ -1452,7 +1465,7 @@ DEF_OP(PDep) {
   // Restore CR0 (only — mtocrf field 0 mask = 0x80) so any packed-NZCV
   // held there pre-PDep survives.
   ld(T0, -16, r1);
-  mtcrf(0x80, T0);
+  mtocrf(0x80, T0);
 }
 
 DEF_OP(PExt) {
@@ -1472,7 +1485,9 @@ DEF_OP(PExt) {
   li(Dest, 0);
   // x86 BMI2 PEXT preserves flags per Intel SDM.  Save CR0 (the canonical
   // packed-NZCV scratch) to a red-zone slot and restore at op end.
-  mfcr(Scratch);
+  // mfocrf 0x80: only the CR0 nibble is defined pre-3.0C; the sole consumer
+  // is the mtocrf(0x80) restore, which reads only that nibble.
+  mfocrf(Scratch, 0x80);
   std(Scratch, -16, r1);
   cmpdi(Mask, 0);
   bc(CC_EQ, &Done);
@@ -1507,7 +1522,7 @@ DEF_OP(PExt) {
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
   // Restore CR0 so the packed-NZCV scratch held there pre-PExt survives.
   ld(Scratch, -16, r1);
-  mtcrf(0x80, Scratch);
+  mtocrf(0x80, Scratch);
 }
 
 // =========================================================================
@@ -1542,8 +1557,17 @@ DEF_OP(AddWithFlags) {
   }
 
   if (S2Inline) {
-    if (static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(Const));  // addic. sets CA + CR0 (no OV)
+    // addic. sets CA + CR0 but NOT OV. That is only tolerable at 32-bit,
+    // where the shifted addco_ redo below rewrites CA/OV anyway; at 64-bit
+    // there is no redo, so the stale XER.OV leaked straight through to x86 OF
+    // (FEX_bugs/add_sub_inline_imm_of.asm). Gate the fast path on i32Bit.
+    // Tradeoff considered: keeping addic_ at 64-bit and appending an
+    // OV-setting redo (addco_ into a scratch) costs the same two instructions
+    // as li+addco_ while executing the addition twice — materialising the
+    // constant is strictly no worse, and simpler.
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
+      addic_(Dst, S1, static_cast<int16_t>(Const));  // CA + CR0; OV fixed by the i32 redo below
     } else {
       LoadConstant(TMP4, Const);
       addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
@@ -1596,18 +1620,27 @@ DEF_OP(SubWithFlags) {
     // FEX's subtract convention (CFInverted=true downstream) needs CA=1
     // (no-borrow) for x-0. Force subfco_ path for C2=0 to match the SUB-style
     // carry semantic. Same pitfall as the CondSubNZCV fix earlier today.
-    if (C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(NegC));  // sets CA + CR0
+    // ALSO: addic_ never writes OV, so the fast path is only legal at 32-bit
+    // where the shifted subfco_ redo below rewrites CA/OV (stale-OF bug,
+    // FEX_bugs/add_sub_inline_imm_of.asm). At 64-bit materialise C2 and use
+    // subfco_: for C2 != 0 its CA (carry of S1 + ~C2 + 1) is identical to
+    // addic_'s carry of S1 + (-C2), so the CF semantics documented above are
+    // preserved — subfco_ is the canonical sub-form carry either way.
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        C2 != 0 && NegC >= -32768 && NegC <= 32767) {
+      addic_(Dst, S1, static_cast<int16_t>(NegC));  // CA + CR0; OV fixed by the i32 redo below
     } else {
       LoadConstant(TMP4, C2);
       subfco_(Dst, TMP4, S1);  // sets CA + SO/OV + CR0
     }
   } else if (S1Inline) {
     // Dst = C1 - Src2 with flags. subfic computes the value and sets CA but
-    // doesn't set CR0; pair with cmpwi/cmpdi after to produce SF/ZF.
+    // doesn't set CR0 or OV, so it is likewise only usable at 32-bit where
+    // the redo fixes both (and cmpwi provides SF/ZF).
     auto S2 = GetReg(Op->Src2);
     int64_t SignedC = static_cast<int64_t>(C1);
-    if (SignedC >= -32768 && SignedC <= 32767) {
+    if (IROp->Size == IR::OpSize::i32Bit &&
+        SignedC >= -32768 && SignedC <= 32767) {
       subfic(Dst, S2, static_cast<int16_t>(SignedC));
     } else {
       LoadConstant(TMP4, C1);
@@ -1627,9 +1660,10 @@ DEF_OP(SubWithFlags) {
     subfco_(TMP1, TMP2, TMP1);   // CA/OV reflect 32-bit borrow / overflow
     rldicl(Dst, Dst, 0, 32);     // zero-extend writeback
     cmpwi(Dst, 0);
-  } else if (S1Inline && static_cast<int64_t>(C1) >= -32768 && static_cast<int64_t>(C1) <= 32767) {
-    cmpdi(Dst, 0);  // subfic didn't set CR0; do it now for the 64-bit path
   }
+  // (No trailing cmpdi needed any more: the 64-bit S1Inline case now goes
+  // through subfco_, which sets CR0 itself; subfic survives only at 32-bit,
+  // where the cmpwi above supplies SF/ZF.)
 }
 
 // IMPORTANT: never use r0 as the destination of *NZCV / Test ops. r0 is the
@@ -1661,12 +1695,15 @@ DEF_OP(AddNZCV) {
   }
 
   if (S2Inline) {
-    if (static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(TMP3, S1, static_cast<int16_t>(Const));   // CA + CR0 (no OV)
-    } else {
-      LoadConstant(TMP4, Const);
-      addco_(TMP3, S1, TMP4);                          // CA + SO/OV + CR0
-    }
+    // Only the 64-bit size reaches this point (<= i32Bit returned above), and
+    // at 64-bit there is no shifted redo to repair XER.OV — so the former
+    // addic_ int16 fast path left OF stale (same defect as AddWithFlags,
+    // FEX_bugs/add_sub_inline_imm_of.asm). Materialise the constant and use
+    // addco_, which writes CA + SO/OV + CR0. Costs one extra instruction
+    // (li/LoadConstant) over addic_; an addic_-plus-OV-redo alternative would
+    // cost the same two instructions while executing the add twice.
+    LoadConstant(TMP4, Const);
+    addco_(TMP3, S1, TMP4);                            // CA + SO/OV + CR0
   } else {
     addco_(TMP3, S1, GetReg(Op->Src2));
   }
@@ -1693,31 +1730,27 @@ DEF_OP(SubNZCV) {
 
   if (S2Inline) {
     auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
-    // C2 == 0 cannot use the addic. shortcut: PPC `addic.` sets CA from
-    // S1 + (-C2). For C2==0 that's S1 + 0 → CA=0 (no carry from a +0). But
-    // sub-by-0 has no borrow, so the SUB-form CA must be 1. The bug masks
-    // CFInverted=true downstream: !CA reads as x86 CF=1 instead of CF=0,
-    // and PUSHF / LAHF / Jcc on carry all see a phantom CF=1 across the
-    // ENTIRE block (every shared "no flag change" path that flows through
-    // SubNZCV with imm 0 — popfq init, shl-by-0, test_NZ, etc.). Stay on
-    // subfco_ for that case so the CA semantics match PPC's sub form.
-    if (C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(TMP3, S1, static_cast<int16_t>(NegC));    // CA + CR0
-    } else {
-      LoadConstant(TMP4, C2);
-      subfco_(TMP3, TMP4, S1);                         // CA + SO/OV + CR0
-    }
+    // Historical note — two independent reasons the addic. int16 shortcut is
+    // gone from this (64-bit-only) path:
+    //  1. C2 == 0: PPC `addic.` sets CA from S1 + (-C2). For C2==0 that's
+    //     S1 + 0 → CA=0 (no carry from a +0). But sub-by-0 has no borrow, so
+    //     the SUB-form CA must be 1. The bug masks CFInverted=true downstream:
+    //     !CA reads as x86 CF=1 instead of CF=0, and PUSHF / LAHF / Jcc on
+    //     carry all see a phantom CF=1 across the ENTIRE block.
+    //  2. addic. never writes OV, and only sizes > i32Bit reach here — there
+    //     is no shifted redo to repair it, so x86 OF went stale
+    //     (FEX_bugs/add_sub_inline_imm_of.asm).
+    // subfco_ preserves the CF semantics the C2 != 0 shortcut was chosen for:
+    // its CA (carry of S1 + ~C2 + 1) equals addic_'s carry of S1 + (-C2)
+    // whenever C2 != 0, and is the correct no-borrow=1 for C2 == 0 too.
+    LoadConstant(TMP4, C2);
+    subfco_(TMP3, TMP4, S1);                           // CA + SO/OV + CR0
   } else if (S1Inline) {
     auto S2 = GetReg(Op->Src2);
-    int64_t SignedC = static_cast<int64_t>(C1);
-    if (SignedC >= -32768 && SignedC <= 32767) {
-      subfic(TMP3, S2, static_cast<int16_t>(SignedC)); // CA only, no CR0
-      cmpdi(TMP3, 0);                                  // subfic didn't set CR0
-    } else {
-      LoadConstant(TMP4, C1);
-      subfco_(TMP3, S2, TMP4);                         // CA + SO/OV + CR0
-    }
+    // subfic sets CA but neither CR0 nor OV; with no 64-bit redo available,
+    // materialise C1 and use subfco_ (same stale-OV defect class as above).
+    LoadConstant(TMP4, C1);
+    subfco_(TMP3, S2, TMP4);                           // CA + SO/OV + CR0
   } else {
     auto S1 = GetReg(Op->Src1);
     subfco_(TMP3, GetReg(Op->Src2), S1);
@@ -2135,42 +2168,40 @@ DEF_OP(Select) {
     }
     CC = MapCC(Op->Cond);
   }
-  PPC64Emitter::Label Done{};
-
-  // Aliasing guard: if Dst aliases the True register, materialising False
-  // into Dst would wipe True before we could read it on the taken branch.
-  // (Mirrors NZCVSelect.) Inline constants don't need this since they don't
-  // resolve to a register.
-  GPR True_reg = GPR{0};
-  bool stashed_true = false;
-  if (!is_const_true) {
-    True_reg = GetReg(Op->TrueVal);
-    if (True_reg == Dst) {
-      mr(TMP2, True_reg);
-      True_reg = TMP2;
-      stashed_true = true;
-    }
-  }
-  (void)stashed_true;
-
-  // Materialise False default into Dst, then conditionally overwrite with True.
-  // For each side, prefer `li` for inline constants (avoids GetReg-on-inline-const
-  // which returns an uninitialised register).
-  if (is_const_false) {
-    li(Dst, static_cast<int16_t>(const_false));
-  } else {
-    auto False = GetReg(Op->FalseVal);
-    if (Dst != False) mr(Dst, False);
-  }
-
-  bc(InvertCond(CC), &Done);
-
+  // Branch-free select via isel (ISA 2.03). isel reads both sources before
+  // writing RT, so the old Dst-aliases-True stash and the mr/bc/mr dance are
+  // both unnecessary. The compare/bit-test above has already set the CR bit
+  // that CC names (CC.BI is an absolute CR bit index — CR0-relative 0..3
+  // for every path through this op).
+  //
+  // SETTLED — keep isel here too, and do not make the constant form branchy.
+  // This op was flagged as a candidate for a branchy constant form on the same reasoning that
+  // motivated the NZCVSelect change below. That reasoning was wrong at the premise and the change
+  // was measured as a net 5.7 ns/op loss; see the comment in DEF_OP(NZCVSelect) for the numbers and
+  // for why the "constant form == SETcc" assumption does not hold. The argument transfers directly:
+  // a constant-form select on a data-dependent condition feeding pure dataflow is exactly where an
+  // unpredictable branch is worst. Unmeasured here, but there is now no hypothesis motivating the
+  // change, so leaving it alone is the position rather than the deferral it was before.
+  //
+  // Materialise inline constants into TMPs first (GetReg on an InlineConstant
+  // returns garbage — same hazard the old code documented). TMP1 may have
+  // been used by the TSTZ/TSTNZ rldicl_ and TMP4 by EmitCompare's constant
+  // path, but both are dead once the compare has executed; TMP2/TMP3 are free
+  // on every path here.
+  GPR True_reg = GPR{0}, False_reg = GPR{0};
   if (is_const_true) {
-    li(Dst, static_cast<int16_t>(const_true));
+    li(TMP2, static_cast<int16_t>(const_true));
+    True_reg = TMP2;
   } else {
-    if (Dst != True_reg) mr(Dst, True_reg);
+    True_reg = GetReg(Op->TrueVal);
   }
-  Bind(&Done);
+  if (is_const_false) {
+    li(TMP3, static_cast<int16_t>(const_false));
+    False_reg = TMP3;
+  } else {
+    False_reg = GetReg(Op->FalseVal);
+  }
+  iselcc(Dst, CC, True_reg, False_reg);
 }
 
 DEF_OP(NZCVSelect) {
@@ -2185,39 +2216,62 @@ DEF_OP(NZCVSelect) {
   const uint64_t all_ones = IROp->Size == IR::OpSize::i64Bit
     ? 0xFFFFFFFFFFFFFFFFull : 0xFFFFFFFFull;
 
+  // BOTH forms use isel. Do not make the constant form branchy — that was tried and measured, and
+  // it is a net loss. The history matters because the reasoning that motivated it was wrong at the
+  // premise, not merely wrong in degree.
+  //
+  // The claim was that the constant form is "the SETcc archetype", so a branch keeps isel's latency
+  // off a dependent chain. It is not. Grep `_NZCVSelect01`: SETccOp (OpcodeDispatcher.cpp) is ONE
+  // caller. The dominant caller is per-flag-bit materialisation in OpcodeDispatcher.h — the
+  // `!NZCVDirty` path that reconstructs a single RFLAGS bit (CF/OF/ZF) into a GPR — plus
+  // ConvertNZCVToX87. An IR dump of bench_select's `main` found 15 constant-form NZCVSelects against
+  // 3 register-form, and the constant-form conditions were UGE/ULT/SGT clustered around the compare
+  // sites: flag reconstruction, not SETcc.
+  //
+  // That distinction decides the codegen. Flag-bit materialisation selects on a *data-dependent*
+  // condition and feeds pure dataflow, so a branch there is an unpredictable branch that buys
+  // nothing. Making these branchy cost, on bench_select over random data:
+  //
+  //     cmov-unpredictable  8.20 -> 13.87 ns/op   +69%
+  //     control             7.69 -> 12.28 ns/op   +60%
+  //     adc-chain          19.53 -> 24.67 ns/op   +26%
+  //     setcc              17.88 ->  8.29 ns/op   -54%   (the one intended win)
+  //     cmov-predictable    8.21 ->  8.12 ns/op     0%   (predictable data — pays nothing)
+  //
+  // Summed, branchy is 5.7 ns/op WORSE. The tell is cmov-predictable: same guest instruction
+  // sequence as cmov-unpredictable, differing only in whether its data makes the condition
+  // predictable, and it is the only case that did not regress. The penalty is ~5 ns/op ≈ 20 cycles,
+  // one POWER9 mispredict per iteration, and it is additive rather than proportional to op count.
+  //
+  // The setcc win is real but cannot be captured here, because at this level SETccOp and flag
+  // materialisation are indistinguishable — both arrive as NZCVSelect(cond, 1, 0). Capturing it
+  // needs a distinct IR op emitted only from SETccOp so this backend can lower that one branchy.
+  // Until that exists, isel everywhere is the better trade by a wide margin.
   if (is_const_true) {
     // Only forms generated by the IR frontend: (True=1, False=0) or (True=all_ones, False=0).
     LOGMAN_THROW_A_FMT(is_const_false && const_false == 0 &&
                          (const_true == 1 || const_true == all_ones),
                        "NZCVSelect: unsupported constant pair ({}, {})", const_true, const_false);
-    li(Dst, 0);
-    PPC64Emitter::Label Done{};
-    bc(InvertCond(CC), &Done);
-    li(Dst, const_true == all_ones ? -1 : 1);
-    Bind(&Done);
+    // isel's rA=0 encoding supplies a literal zero, so only the true value needs materialising.
+    LoadConstant(TMP1, const_true == all_ones ? ~0ull : 1);
+    iselcc(Dst, CC, TMP1, GPR{0});
     return;
   }
 
+  // Branch-free select via isel (ISA 2.03) for the register form — the guest CMOVcc archetype.
+  // MapNZCVCC above has already projected XER→CR1 / composed CR3 bits as needed, and returns CC.BI
+  // as an absolute CR bit index, so it can be passed straight to isel.
+
   GPR True = GetReg(Op->TrueVal);
-
-  // Aliasing guard: if RA tied Dst to True, the `mr Dst, False` below would
-  // wipe True before the conditional `mr Dst, True` could read it. Stash it.
-  if (True == Dst) {
-    mr(TMP2, True);
-    True = TMP2;
-  }
-
+  // No Dst-aliases-True stash needed: isel reads both sources before writing.
+  GPR False_ = GPR{0};
   if (is_const_false) {
     LoadConstant(TMP1, const_false);
-    if (Dst != TMP1) mr(Dst, TMP1);
+    False_ = TMP1;
   } else {
-    auto False_ = GetReg(Op->FalseVal);
-    if (Dst != False_) mr(Dst, False_);
+    False_ = GetReg(Op->FalseVal);
   }
-  PPC64Emitter::Label Done{};
-  bc(InvertCond(CC), &Done);
-  mr(Dst, True);
-  Bind(&Done);
+  iselcc(Dst, CC, True, False_);
 }
 
 DEF_OP(NZCVSelectV) {
@@ -2227,10 +2281,12 @@ DEF_OP(NZCVSelectV) {
   auto False_= GetVReg(Op->FalseVal);
   auto CC   = MapNZCVCC(IntegerNZCVCond(Op->Cond));
 
-  // Aliasing guard (mirrors NZCVSelect above): if RA tied Dst to True, the
-  // `vmr Dst, False` below would wipe True before the conditional `vmr Dst,
-  // True` could read it.  Hit by X87 F64 FXTRACT, which emits two back-to-back
-  // NZCVSelectV ops whose first dest aliases its own TrueVal.
+  // Aliasing guard: if RA tied Dst to True, the `vmr Dst, False` below would
+  // wipe True before the conditional `vmr Dst, True` could read it.  Hit by
+  // X87 F64 FXTRACT, which emits two back-to-back NZCVSelectV ops whose first
+  // dest aliases its own TrueVal.  (The GPR NZCVSelect above no longer needs
+  // this guard — it moved to isel, which has no vector equivalent on ≤2.07,
+  // so this op keeps the branchy materialise-then-overwrite form.)
   if (True == Dst) {
     vmr(VTMP1, True);
     True = VTMP1;
@@ -2253,25 +2309,28 @@ DEF_OP(NZCVSelectIncrement) {
   bool is_const_true  = IsInlineConstant(Op->TrueVal,  &const_true);
   bool is_const_false = IsInlineConstant(Op->FalseVal, &const_false);
 
-  // Compute FalseVal+1 into TMP2 (r4) first to avoid aliasing with Dst.
-  // TMP2 is not in SRA or RA, so GetReg never returns it.
+  // Branch-free via isel (ISA 2.03). Sole producer is IncrementByCarry
+  // (Flags.cpp:266), i.e. the ADC/SBB "+carry" select — carry of arbitrary
+  // arithmetic is data, and bignum-style ADC chains mispredict a branch
+  // ~50% of the time, so this is squarely in the isel-wins class.
+  //
+  // Compute FalseVal+1 into TMP2 (r4) first. TMP2 is not in SRA or RA, so
+  // GetReg never returns it; MapNZCVCC's projection code above also ran
+  // before this point, so its TMP1/TMP2 clobbers are already done.
   if (is_const_false)
     LoadConstant(TMP2, const_false + 1);
   else
     addi(TMP2, GetReg(Op->FalseVal), 1);
 
-  // Set Dst = TrueVal (the "taken" result).
-  if (is_const_true)
-    LoadConstant(Dst, const_true);
-  else {
-    GPR TrueReg = GetReg(Op->TrueVal);
-    if (Dst != TrueReg) mr(Dst, TrueReg);
+  GPR TrueReg = GPR{0};
+  if (is_const_true) {
+    LoadConstant(TMP1, const_true);
+    TrueReg = TMP1;
+  } else {
+    TrueReg = GetReg(Op->TrueVal);
   }
 
-  PPC64Emitter::Label Done{};
-  bc(CC, &Done);       // condition met → keep Dst = TrueVal
-  mr(Dst, TMP2);       // condition not met → Dst = FalseVal + 1
-  Bind(&Done);
+  iselcc(Dst, CC, TrueReg, TMP2);  // cond met → TrueVal, else FalseVal+1
 }
 
 DEF_OP(MaskGenerateFromBitWidth) {
@@ -2334,12 +2393,14 @@ DEF_OP(AXFlag) {
   or_(TMP1, TMP1, TMP3);                 // TMP1 = XER with new CA
   mtspr(1, TMP1);                        // write back XER
 
-  // Read CR0 (via mfcr), compute new EQ = old EQ OR old V, clear LT/GT/SO.
+  // Read CR0 (mfocrf 0x80 — single-field form; the rlwinm mask keeps only
+  // CR0.EQ at LSB 29, discarding the bits mfocrf leaves undefined pre-3.0C),
+  // compute new EQ = old EQ OR old V, clear LT/GT/SO.
   // TMP4 still holds V_old at LSB 29.
-  mfcr(TMP3);
+  mfocrf(TMP3, 0x80);
   rlwinm(TMP3, TMP3, 0, 2, 2);           // TMP3 = old CR0.EQ isolated at LSB 29
   or_(TMP3, TMP3, TMP4);                 // TMP3 |= V_old at LSB 29
-  mtcrf(0x80, TMP3);                     // CR0 = {LT=0, GT=0, EQ=Z|V, SO=0}
+  mtocrf(0x80, TMP3);                    // CR0 = {LT=0, GT=0, EQ=Z|V, SO=0}
 }
 DEF_OP(Parity) {
   // PF stored "raw" = inverted x86 PF: 1 if odd parity of low byte, 0 if even.
@@ -2378,8 +2439,10 @@ DEF_OP(RmifNZCV) {
 
   // ---- N / Z (CR0.LT, CR0.EQ) ----
   if (TouchN || TouchZ) {
-    // Read current CR into TMP3.
-    mfcr(TMP3);
+    // Read current CR0 into TMP3 (mfocrf 0x80: the whole field-0 nibble at
+    // LSB 31:28 is defined; every bit this block reads or passes through to
+    // the mtocrf(0x80) below — LT/GT/EQ/SO — is inside that nibble).
+    mfocrf(TMP3, 0x80);
     // CR0 occupies bits 0..3 of CR (PPC MSB), which is LSB bits 31..28 in the
     // GPR result of mfcr. CR0.LT=PPC bit 0=LSB 31; CR0.EQ=PPC bit 2=LSB 29.
     // We need to optionally overwrite LSB 31 (N) and LSB 29 (Z).
@@ -2406,8 +2469,8 @@ DEF_OP(RmifNZCV) {
       and_(TMP2, TMP2, TMP4);
       or_(TMP3, TMP3, TMP2);
     }
-    // Write back only CR0 (mtcrf 0x80 = field 0).
-    mtcrf(0x80, TMP3);
+    // Write back only CR0 (mtocrf 0x80 = field 0, single-field form).
+    mtocrf(0x80, TMP3);
   }
 
   // ---- C / V (XER.CA, XER.OV) ----
@@ -2452,7 +2515,10 @@ DEF_OP(RmifNZCV) {
 // Other CR0/XER bits preserved.
 void PPC64JITCore::SetNZCVConstant(uint8_t NZCV) {
   // CR0: clear LT+EQ (LSB 31 + 29 = 0xA0000000), OR in N/Z bits.
-  mfcr(TMP1);
+  // mfocrf 0x80: all bits consumed here (LT/GT/EQ/SO, LSB 31:28) are inside
+  // field 0, which is defined; the pre-3.0C-undefined bits are masked out
+  // by mtocrf(0x80) reading only bits 31:28.
+  mfocrf(TMP1, 0x80);
   LoadConstant(TMP2, 0xA0000000ULL);
   andc(TMP1, TMP1, TMP2);
   uint32_t CR0Bits = 0;
@@ -2462,7 +2528,7 @@ void PPC64JITCore::SetNZCVConstant(uint8_t NZCV) {
     LoadConstant(TMP2, CR0Bits);
     or_(TMP1, TMP1, TMP2);
   }
-  mtcrf(0x80, TMP1);
+  mtocrf(0x80, TMP1);
 
   // XER: clear OV+CA (LSB 30 + 29 = 0x60000000), OR in C/V bits.
   mfspr(TMP1, 1);
@@ -2590,7 +2656,12 @@ DEF_OP(ShiftFlags) {
   // op left CA in a meaningful state). Restore on the noShift path.
   // Active-shift path drops the save (it overwrites CR0+XER anyway).
   addi(r1, r1, -16);
-  mfcr (TMP4); std(TMP4, 0, r1);
+  // Single-field CR0 save (was a full mfcr + mtcrf 0xff round-trip): the only
+  // CR writer between this save and the noShift restore is the andi_ below,
+  // which touches CR0 alone — so saving/restoring just field 0 is exact.
+  // mfocrf's non-field-0 bits are undefined pre-3.0C; the mtocrf(0x80)
+  // restore reads only bits 31:28, which are defined.
+  mfocrf(TMP4, 0x80); std(TMP4, 0, r1);
   mfspr(TMP4, 1); std(TMP4, 8, r1);
 
   andi_(TMP1, Src2, Mask);
@@ -2653,8 +2724,9 @@ DEF_OP(ShiftFlags) {
 
   b(&done);
   Bind(&noShift);
-  // Restore CR + XER to the values they held before the andi_ above.
-  ld   (TMP4, 0, r1); mtcrf(0xff, TMP4);
+  // Restore CR0 + XER to the values they held before the andi_ above
+  // (only CR0 was clobbered; see the save-site comment).
+  ld   (TMP4, 0, r1); mtocrf(0x80, TMP4);
   ld   (TMP4, 8, r1); mtspr(1, TMP4);
   addi (r1,   r1, 16);
   if (Dst != PFIn) mr(Dst, PFIn);
@@ -2691,7 +2763,9 @@ DEF_OP(RotateFlags) {
   // scratch) to the red zone before andi_ which would otherwise clobber it
   // for both the rotate-body and rotate-by-0-fallthrough paths.  Restore
   // at the noRotate label so the prior compare's NZCV survives the op.
-  mfcr(TMP4);
+  // mfocrf 0x80: only field 0 is defined pre-3.0C — sufficient, since the
+  // sole consumer is the mtocrf(0x80) restore at noRotate.
+  mfocrf(TMP4, 0x80);
   std(TMP4, -16, r1);
   andi_(TMP1, Shift, Mask);
   bc(CC_EQ, &noRotate);
@@ -2731,7 +2805,7 @@ DEF_OP(RotateFlags) {
   Bind(&noRotate);
   // Restore CR0 (packed-NZCV) saved before the andi_ above.
   ld(TMP4, -16, r1);
-  mtcrf(0x80, TMP4);
+  mtocrf(0x80, TMP4);
   Bind(&done);
 }
 DEF_OP(CmpPairZ) {
@@ -3359,7 +3433,11 @@ DEF_OP(ThreadRemoveCodeEntry) {
 // =========================================================================
 DEF_OP(LoadNZCV) {
   auto Dst = GetReg(Node);
-  mfcr(TMP1);
+  // mfocrf 0x80 (single-field form — uncracked where mfcr is a 3-iop crack,
+  // POWER9 UM §4.1.5.6): the rlwinm extracts below read only CR0.LT (PPC
+  // bit 0) and CR0.EQ (PPC bit 2), both inside the defined field-0 nibble;
+  // the rlwinm masks discard every pre-3.0C-undefined bit.
+  mfocrf(TMP1, 0x80);
   mfspr(TMP2, 1);
 
   // rlwinm rotate-left sh, mask mb..me (PPC MSB=0). After rotate, PPC bit p
@@ -3396,7 +3474,7 @@ DEF_OP(StoreNZCV) {
   rlwinm(TMP1, Src, 0,  0, 0);   // N → CR0.LT
   rlwinm(TMP3, Src, 31, 2, 2);   // Z → CR0.EQ
   or_(TMP1, TMP1, TMP3);
-  mtcrf(0x80, TMP1);
+  mtocrf(0x80, TMP1);
 
   // XER: clear OV+CA (LSB bits 30+29 = 0x60000000), OR in new bits.
   mfspr(TMP1, 1);
@@ -3671,7 +3749,9 @@ DEF_OP(FCmp) {
 
   // Lift CR0.SO and !CR0.LT into XER.OV/CA.
   // PPC bits (in 32-bit-low view): CR0.LT=0, CR0.SO=3; XER.OV=1, XER.CA=2.
-  mfcr(TMP1);
+  // mfocrf 0x80: both bits read (CR0.LT, CR0.SO) are inside the defined
+  // field-0 nibble; the rlwinm masks discard the undefined remainder.
+  mfocrf(TMP1, 0x80);
   rlwinm(TMP2, TMP1, 2, 1, 1);     // V (CR0.SO at PPC 3) → PPC 1 (XER.OV slot)
   rlwinm(TMP3, TMP1, 1, 31, 31);   // LT (PPC 0) → LSB 0
   xori(TMP3, TMP3, 1);             // !LT at LSB 0

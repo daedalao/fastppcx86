@@ -14,6 +14,11 @@
 #include "Common/X86Features.h"
 #endif
 
+#ifdef ARCHITECTURE_ppc64le
+// getauxval for AT_HWCAP2 / AT_*CACHEBSIZE feature and cache-geometry detection.
+#include <sys/auxv.h>
+#endif
+
 namespace FEX {
 
 void FillMIDRInformationViaLinux(FEXCore::HostFeatures* Features) {
@@ -482,6 +487,7 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
   const bool Enable##name = (HostFeatures() & FEXCore::Config::HostFeatures::ENABLE##enum_name) != 0;   \
   LogMan::Throw::AFmt(!(Disable##name && Enable##name), "Disabling and Enabling CPU feature (" #name ") is mutually exclusive");
 
+  ENABLE_DISABLE_OPTION(SupportsISA30, ISA30, ISA30);
   ENABLE_DISABLE_OPTION(SupportsAVX, AVX, AVX);
   ENABLE_DISABLE_OPTION(SupportsSVE128, SVE, SVE);
   ENABLE_DISABLE_OPTION(SupportsAFP, AFP, AFP);
@@ -702,6 +708,32 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     HostFeatures.DCacheLineSize = 64;
     HostFeatures.ICacheLineSize = 64;
   }
+
+#ifdef ARCHITECTURE_ppc64le
+  // Until now there was no host feature detection for PPC at all: POWER8 and POWER9 were
+  // indistinguishable at runtime and the cache line sizes fell through to the ARM default of 64,
+  // which is wrong on every POWER part (they are 128). Measured 128 on the POWER9 target.
+  {
+    // Linux ABI constant from arch/powerpc/include/uapi/asm/cputable.h. Defined locally rather
+    // than including <asm/cputable.h>, which is not reliably present in userspace sysroots.
+    constexpr unsigned long PPC_FEATURE2_ARCH_3_00_ = 0x00800000UL;
+
+    const unsigned long HWCAP2 = getauxval(AT_HWCAP2);
+    HostFeatures.SupportsISA30 = (HWCAP2 & PPC_FEATURE2_ARCH_3_00_) != 0;
+
+    // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
+    if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
+      HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);
+    } else {
+      HostFeatures.DCacheLineSize = 128;
+    }
+    if (const unsigned long ICache = getauxval(AT_ICACHEBSIZE); ICache) {
+      HostFeatures.ICacheLineSize = static_cast<uint32_t>(ICache);
+    } else {
+      HostFeatures.ICacheLineSize = 128;
+    }
+  }
+#endif
 
 #ifdef ARCHITECTURE_ppc64le
   // POWER8 has lwarx/stwcx. (and byte/halfword variants on POWER8+) with

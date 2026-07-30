@@ -176,6 +176,12 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
     SYSCALL_ERRNO();
   });
 
+  REGISTER_SYSCALL_IMPL(utimensat,
+                        [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, const struct timespec* times, int flags) -> uint64_t {
+                          uint64_t Result = FEX::HLE::_SyscallHandler->FM.Utimensat(dirfd, pathname, times, flags);
+                          SYSCALL_ERRNO();
+                        });
+
   REGISTER_SYSCALL_IMPL(linkat,
                         [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) -> uint64_t {
                           uint64_t Result = FEX::HLE::_SyscallHandler->FM.Linkat(olddirfd, oldpath, newdirfd, newpath, flags);

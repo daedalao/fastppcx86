@@ -66,6 +66,7 @@ public:
   uint64_t Chmod(const char* pathname, mode_t mode);
   uint64_t Chown(const char* pathname, uid_t owner, gid_t group);
   uint64_t Lchown(const char* pathname, uid_t owner, gid_t group);
+  uint64_t Chdir(const char* path);
   uint64_t Unlink(const char* pathname);
   uint64_t Mkdir(const char* pathname, mode_t mode);
   uint64_t Rmdir(const char* pathname);
@@ -78,6 +79,7 @@ public:
   uint64_t Fchmodat2(int dirfd, const char* pathname, mode_t mode, unsigned int flags);
   uint64_t Fchownat(int dirfd, const char* pathname, uid_t owner, gid_t group, int flags);
   uint64_t Unlinkat(int dirfd, const char* pathname, int flags);
+  uint64_t Utimensat(int dirfd, const char* pathname, const struct timespec* times, int flags);
   uint64_t Mkdirat(int dirfd, const char* pathname, mode_t mode);
   uint64_t Linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags);
   uint64_t Symlinkat(const char* target, int newdirfd, const char* linkpath);

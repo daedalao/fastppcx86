@@ -661,41 +661,64 @@ DEF_OP(LoadMemTSO) {
   // the +0x4 in `mov %fs:0x4(%r8), …`), producing a bad effective address.
   GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
-  // FPR/vector path: TSO load. Use the size-aware FPR helper (so vmovd/vmovq
-  // don't over-read), then an isync-anchoring barrier.
+  // Acquire barrier: `lwsync` AFTER the load.
   //
-  // The self-compare/branch/isync sequence is the canonical PPC load-acquire
-  // idiom: it creates a control dependency on the loaded value and anchors
-  // the isync. The CR field used is irrelevant for ordering, but it MUST NOT
-  // be CR0 — a flag-setting IR op (subfco. etc.) may have already populated
-  // CR0 for a downstream NZCVSelect / CondJump, and a subsequent x86 cmov
-  // memory operand lifts to LoadMemTSO BETWEEN the flag-set and flag-use.
-  // Self-comparing into CR0 would force EQ=1 and silently flip ULE/UGT, etc.
-  // Use CR2 (bits 8..11; CR2.EQ = bit 10). CR1 is reserved for XER projection;
-  // CR3 is reserved as scratch for composite NZCV bits in MapNZCVCC.
+  // This is kept on ARCHITECTURAL grounds, not measured ones. `lwsync` after a
+  // load is the plainest correct load-acquire on POWER, and it is the simpler of
+  // two valid constructs. It replaced a self-compare / never-taken-branch /
+  // `isync` sequence — also a documented and valid load-acquire, and cheaper,
+  // which is why the port originally chose it. `LockOnlyTSO` exists in the config
+  // precisely because per-load acquire cost "cumulatively dominates runtime in
+  // libc / pthread tight loops", so the cheap construct had a real motivation.
+  //
+  // HONEST STATUS OF THE EVIDENCE, because an earlier version of this comment
+  // overstated it twice and the corrections matter more than the conclusion:
+  //
+  //   * A campaign of ~240 runs appeared to show this change roughly halving a
+  //     memory-corruption rate (~30% to 13.3%) in a Mono `mcs` workload. Those
+  //     numbers do not survive. Every run in that campaign died early on an
+  //     unrelated failure — a missing rootfs library, diagnosed later — so the
+  //     whole matrix measured crash behaviour on an error path rather than on
+  //     real work. It does not establish that this construct is better, or that
+  //     the previous one was defective.
+  //   * A 15-run sample of this change once read 0/15, which was luck rather
+  //     than a result: at a 13% rate, P(0 in 15) is about 12%.
+  //
+  // So: no verified defect is fixed here, and no verified regression is
+  // introduced. The change stands because it is the more obviously-correct of
+  // two correct options, and the performance cost of choosing it is UNMEASURED
+  // — SMT was misconfigured for every attempt at a comparable number.
+  //
+  // What is owed, for whoever picks this up:
+  //   1. Re-measure with a workload that actually runs, now that the rootfs
+  //      library gap is closed. That decides whether either construct matters.
+  //   2. Get a recipe-compliant benchmark (SMT2, node-pinned) for the cost of
+  //      `lwsync` per guest load. If it is significant and neither construct
+  //      affects correctness, the cheap one should come back — or `LockOnlyTSO`
+  //      becomes the better lever than either.
+  //   3. Do not accept a zero-event run as proof of anything: at these rates 15
+  //      trials cannot establish a zero, and 30 only rules out a true rate above
+  //      about 10%.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
-    PPC64Emitter::Label Done{};
-    cmpd(cr(2), EA, EA);
-    bc({4, 10}, &Done);
-    isync();
-    Bind(&Done);
+    lwsync();
     return;
   }
 
   auto GDst = GetReg(Dst);
-  PPC64Emitter::Label Done{};
   switch (IROp->Size) {
+  // NOTE the operand order: address in RA, r0 in RB. Power's literal-zero rule
+  // covers RA only, so this reads GPR0's *contents* as the index and depends on
+  // an r0==0 invariant. Nothing in this backend writes r0, so the invariant
+  // holds — but it is an invariant, not an architectural guarantee. Contrast
+  // `PPC64.cpp:222-224`, which puts r0 in RA where the rule genuinely applies.
   case IR::OpSize::i8Bit:  lbzx(GDst, EA, r0); break;
   case IR::OpSize::i16Bit: lhzx(GDst, EA, r0); break;
   case IR::OpSize::i32Bit: lwzx(GDst, EA, r0); break;
   case IR::OpSize::i64Bit: ldx(GDst, EA, r0);  break;
   default: break;
   }
-  cmpd(cr(2), GDst, GDst);
-  bc({4, 10}, &Done);
-  isync();
-  Bind(&Done);
+  lwsync();
 }
 
 DEF_OP(StoreMemTSO) {
@@ -939,7 +962,9 @@ DEF_OP(MemSet) {
   // to the red zone before the loop's cmpdi clobbers it; restore after
   // the loop.  TMP3 is overwritten below by the direction-step setup, so
   // we use it briefly here as a transit before the std to memory.
-  mfcr(TMP3);
+  // mfocrf 0x80 (single-field): only the CR0 nibble is defined pre-3.0C —
+  // sufficient, the sole consumer is the mtocrf(0x80) restore below.
+  mfocrf(TMP3, 0x80);
   std(TMP3, -8, r1);
   GPR AddrIn = GetReg(Op->Addr);
   // Op->Value is annotated "Inline: Any" in IR.json — IsInlineConstant may
@@ -1013,7 +1038,7 @@ DEF_OP(MemSet) {
 
   // Restore CR0 (saved at op entry) — REP STOS preserves flags.
   ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  mtocrf(0x80, TMP3);
 
   // Final pointer may sit in upper-half-dirty form for 32-bit guest; mask
   // before writing back to the SSA destination.
@@ -1025,8 +1050,10 @@ DEF_OP(MemCpy) {
   // x86 REP MOVS preserves flags per Intel SDM.  Save CR0 (packed-NZCV)
   // to the red zone before the loop's cmpdi clobbers it; restore after.
   // TMP3 is overwritten below by the direction-step setup — that's fine,
-  // we've already stashed the mfcr result to memory.
-  mfcr(TMP3);
+  // we've already stashed the CR0 snapshot to memory.
+  // mfocrf 0x80 (single-field): only the CR0 nibble is defined pre-3.0C —
+  // sufficient, the sole consumer is the mtocrf(0x80) restore below.
+  mfocrf(TMP3, 0x80);
   std(TMP3, -8, r1);
   auto Op = IROp->C<IR::IROp_MemCpy>();
   GPR DestIn = GetReg(Op->Dest);
@@ -1095,7 +1122,7 @@ DEF_OP(MemCpy) {
   li(r(0), 0);
   // Restore CR0 (saved at op entry) — REP MOVS preserves flags.
   ld(TMP3, -8, r1);
-  mtcrf(0x80, TMP3);
+  mtocrf(0x80, TMP3);
 }
 
 // =========================================================================

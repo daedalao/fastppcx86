@@ -1381,30 +1381,58 @@ extern "C" {
   alignas(64) uint64_t g_compile_log_count = 0;
 }
 
+// OFF by default. This log reads guest bytes on the compile hot path; leaving it
+// enabled cost us a reliable Mono crash (see DecodeInstructionsAtEntry below for
+// the mechanism and the measurement). Flip to true only while actively chasing a
+// stale-compile mismatch, and revert when done.
+//
+// It is a `constexpr bool` rather than an `#ifdef` on purpose: the body still has
+// to compile, so it cannot rot while disabled.
+static constexpr bool kEnableCompileByteLog = false;
+
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
-  // Log this compile attempt. The copy MUST NOT cross the page the entry
-  // point lives on: a block entry in the last 15 bytes of a mapping is
-  // legal x86 (the guarded PeekByte path decodes it fine), but this raw
-  // read would fault on the following page if it is unmapped. That was not
-  // hypothetical: mono's trampoline arenas are 64K chunks each followed by
-  // a 4K guard hole, and trampolines allocated at chunk_end-12 made this
-  // very loop SIGSEGV in host code — misdelivered to the guest at the
-  // trampoline RIP, mono classified it as a native-code fault and
-  // abort()ed (the recurring Ziggurat "trampoline SIGSEGV" crash, guest
-  // rips 0x7ff30ff4/0x7ff41ff4 == page_end-12; repros/trampedge.c).
-  {
+
+  // Compile-attempt byte log — OPT-IN, and clamped so it cannot cross a page.
+  //
+  // This was a hard defect. The previous version read 16 bytes from _InstStream
+  // unconditionally on every compile attempt, with three comments asserting that
+  // faults were "tolerated" / handled "in a SIGSEGV-tolerant way". Nothing
+  // tolerated them: there is no handler, no sigsetjmp, and it did not use memcpy
+  // either. So any guest instruction beginning within 16 bytes of the end of a
+  // mapped region faulted during decode, on the hot path, for every host.
+  //
+  // Measured consequence: Mono allocates JIT arenas as a 64 KiB payload followed
+  // by a deliberate 4 KiB guard page (19 of them, MAP_FIXED_NOREPLACE, walking
+  // down from ~2 GiB). That geometry guarantees instructions land near an arena
+  // end, so this reliably killed Mono during startup. A guest RIP of
+  // 0x7feddff2 — 14 bytes below its arena end — produced SEGV_MAPERR at exactly
+  // 0x7fede000, which is byte 14 of this loop's 16-byte read.
+  //
+  // Two changes. It is disabled by default, because it exists to test one
+  // specific stale-compile hypothesis and should not sit on every compile. And
+  // when enabled it stops at the page boundary, so it can never reach into an
+  // unmapped neighbour. Clamping to 4 KiB is deliberately conservative: guest
+  // mappings are 4 KiB-granular even where the host page is larger, so this is
+  // safe on both.
+  if constexpr (kEnableCompileByteLog) {
+    constexpr uint64_t kLogPageSize = 4096;
+    constexpr uint64_t kLogBytes = sizeof(g_compile_log[0].bytes);
+
     uint64_t idx = g_compile_log_count++ & 255;
-    g_compile_log[idx].guest_rip   = PC;
+    g_compile_log[idx].guest_rip = PC;
     g_compile_log[idx].src_host_va = reinterpret_cast<uint64_t>(_InstStream);
-    for (int b = 0; b < 16; ++b) {
-      g_compile_log[idx].bytes[b] = 0;  // pre-zero
+    for (uint64_t b = 0; b < kLogBytes; ++b) {
+      g_compile_log[idx].bytes[b] = 0;
     }
+
     if (_InstStream) {
-      const uint64_t Addr = reinterpret_cast<uint64_t>(_InstStream);
-      const uint64_t ToPageEnd = FEXCore::Utils::FEX_PAGE_SIZE - (Addr & (FEXCore::Utils::FEX_PAGE_SIZE - 1));
-      const int CopyLen = static_cast<int>(std::min<uint64_t>(16, ToPageEnd));
-      for (int b = 0; b < CopyLen; ++b) {
+      // Bytes remaining in the page that holds the first byte. Never zero, so
+      // we always capture at least one byte when the stream is non-null.
+      const uint64_t Base = reinterpret_cast<uint64_t>(_InstStream);
+      const uint64_t InPage = kLogPageSize - (Base & (kLogPageSize - 1));
+      const uint64_t Count = InPage < kLogBytes ? InPage : kLogBytes;
+      for (uint64_t b = 0; b < Count; ++b) {
         g_compile_log[idx].bytes[b] = _InstStream[b];
       }
     }

@@ -11,6 +11,10 @@ $end_info$
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
 
+#ifdef ARCHITECTURE_ppc64le
+#include "LinuxSyscalls/PPC64LE/TermiosTranslation.h"
+#endif
+
 #include <FEXCore/IR/IR.h>
 
 #include <errno.h>
@@ -474,7 +478,11 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
   REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
-  REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
+  // chdir goes through FileManager for path translation — the raw passthrough
+  // that used to live here missed the rootfs remap and broke dpkg -i, which
+  // creates its workdir via mkdirat(rootfs_dirfd, "var/lib/dpkg/tmp.ci", ...)
+  // and then chdir("/var/lib/dpkg/tmp.ci"). fchdir takes a bare fd and needs
+  // no translation, so it stays a raw passthrough.
   REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
   REGISTER_SYSCALL_IMPL(fchmod, SyscallPassthrough2<SYSCALL_DEF(fchmod)>);
   REGISTER_SYSCALL_IMPL(fchown, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
@@ -693,22 +701,33 @@ namespace x64 {
       // PPC values because <sys/ioctl.h> pulls in asm/ioctls.h on this
       // host. Fixes the gvisor socket_unix_*_test TIOCOUTQ failures and
       // any guest x86 binary that calls TTY ioctls on sockets/files.
-      case 0x5400u: return TCGETS;
-      case 0x5401u: return TCSETS;
-      case 0x5402u: return TCSETSW;
-      case 0x5403u: return TCSETSF;
-      case 0x5404u: return TCGETA;
-      case 0x5405u: return TCSETA;
-      case 0x5406u: return TCSETAW;
-      case 0x5407u: return TCSETAF;
-      case 0x5408u: return TCSBRK;
-      case 0x5409u: return TCXONC;
-      case 0x540Au: return TCFLSH;
-      case 0x540Bu: return TIOCEXCL;
-      case 0x540Cu: return TIOCNXCL;
-      case 0x540Du: return TIOCSCTTY;
-      case 0x540Eu: return TIOCGPGRP;
-      case 0x540Fu: return TIOCSPGRP;
+      // NOTE: this run was previously off by one — it began at 0x5400, which is
+      // not a defined x86 ioctl, so every entry through 0x540F named the wrong
+      // command. The critical case was 0x5401: x86's TCGETS was being
+      // translated to the host's TCSETS, turning "read the terminal settings"
+      // into "WRITE the terminal settings" from whatever the caller's buffer
+      // happened to hold. That silently reconfigured the user's terminal on any
+      // interactive program — observed as all output turning UPPERCASE (a
+      // garbage c_oflag with PPC's OLCUC bit set) and apt's progress redraw
+      // breaking (ONLCR cleared), persisting after exit because the tty really
+      // had been reprogrammed. Piped output was unaffected, which is why every
+      // automated test missed it: they all redirect.
+      case 0x5401u: return TCGETS;
+      case 0x5402u: return TCSETS;
+      case 0x5403u: return TCSETSW;
+      case 0x5404u: return TCSETSF;
+      case 0x5405u: return TCGETA;
+      case 0x5406u: return TCSETA;
+      case 0x5407u: return TCSETAW;
+      case 0x5408u: return TCSETAF;
+      case 0x5409u: return TCSBRK;
+      case 0x540Au: return TCXONC;
+      case 0x540Bu: return TCFLSH;
+      case 0x540Cu: return TIOCEXCL;
+      case 0x540Du: return TIOCNXCL;
+      case 0x540Eu: return TIOCSCTTY;
+      case 0x540Fu: return TIOCGPGRP;
+      case 0x5410u: return TIOCSPGRP;
       case 0x5411u: return TIOCOUTQ;
       case 0x5412u: return TIOCSTI;
       case 0x5413u: return TIOCGWINSZ;
@@ -757,6 +776,42 @@ namespace x64 {
     };
 
     REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+      // termios needs its payload marshalled, not just its command number
+      // remapped. Guest x86 struct is 36 bytes; the buffer we hand `::ioctl`
+      // on PowerPC must be glibc's own 60-byte `struct termios`, because the
+      // glibc ioctl wrapper writes 60 bytes into it regardless of the caller's
+      // declared size — the "*** stack smashing detected ***" on stty/apt.
+      // Field order and every flag-bit value differ as well; see
+      // PPC64LE/TermiosTranslation.h.
+      switch (cmd) {
+      case 0x5401u: { // x86 TCGETS
+        struct termios HostT {};
+        uint64_t Result = ::ioctl(fd, TCGETS, &HostT);
+        if (Result == 0) {
+          FEX::HLE::PPC64::HostToGuest(HostT, *reinterpret_cast<FEX::HLE::PPC64::GuestTermios*>(arg));
+        }
+        SYSCALL_ERRNO();
+      }
+      case 0x5402u:   // x86 TCSETS
+      case 0x5403u:   // x86 TCSETSW
+      case 0x5404u: { // x86 TCSETSF
+        // Array literal cannot live inline here — the C preprocessor's
+        // comma-splitting sees {a, b, c} as extra macro arguments to
+        // REGISTER_SYSCALL_IMPL_X64. Pick via switch instead.
+        uint32_t host_cmd;
+        switch (cmd) {
+          case 0x5402u: host_cmd = TCSETS;  break;
+          case 0x5403u: host_cmd = TCSETSW; break;
+          default:      host_cmd = TCSETSF; break;
+        }
+        struct termios HostT {};
+        FEX::HLE::PPC64::GuestToHost(*reinterpret_cast<const FEX::HLE::PPC64::GuestTermios*>(arg), HostT);
+        uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
+        SYSCALL_ERRNO();
+      }
+      default: break;
+      }
+
       cmd = RemapIoctlForPPC(cmd);
       uint64_t Result = ::ioctl(fd, cmd, arg);
       SYSCALL_ERRNO();
@@ -835,7 +890,8 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
     REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
     REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
-    REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
+    // utimensat is NOT a passthrough: it takes a path and needs RootFS translation.
+    // Handled by FileManager::Utimensat, registered in Syscalls/FS.cpp.
     REGISTER_SYSCALL_IMPL_X64(fallocate, SyscallPassthrough4<SYSCALL_DEF(fallocate)>);
     REGISTER_SYSCALL_IMPL_X64(timerfd_settime, SyscallPassthrough4<SYSCALL_DEF(timerfd_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timerfd_gettime, SyscallPassthrough2<SYSCALL_DEF(timerfd_gettime)>);
