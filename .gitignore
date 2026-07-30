@@ -5,9 +5,9 @@ vim_rc
 Config.json
 
 [Bb]uild*
-# ...but the build-agent docs are not build output
-![Dd]ocs/build-agent.md
-![Dd]ocs/build-agent-notes.md
+# build-agent.md / build-agent-notes.md are caught by [Bb]uild* above, which is
+# intended: they are the local planning<->build agent channel over the shared
+# mount, not repo content. Durable findings get lifted into POWER9_PORT_PLAN.md.
 # ...and probe sources are worth keeping; their binaries are not
 !build-probes/
 build-probes/*
