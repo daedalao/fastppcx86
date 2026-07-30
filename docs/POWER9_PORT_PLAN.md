@@ -1305,6 +1305,75 @@ Discovered incidentally during the audit. None are POWER9-related.
 
 ---
 
+## Target: Steam launching, with games installable
+
+The first goal derived from what the user actually wants rather than inherited from the port's history. It is
+deliberately not a specific game: **Steam starts, you can log in, browse, and install a title.** That is
+binary, it exercises the whole stack at once, and it unblocks every game-level target after it.
+
+### What we already have
+
+Not starting cold. Established on this hardware:
+
+- **Graphics.** All three Vulkan WSIs work (xcb, Xlib, Wayland); `vkcube` renders on screen; `vkmark` scores
+  8730 pinned-SMT2, beating the POWER8 note's 7245. GL thunks carried FTL to a playable menu for ~13 minutes.
+- **Thunks.** 15 guest/host thunk pairs build; `ThunksDB` deployment is understood, and its absence was the
+  cause of two withdrawn measurements, so that trap is known.
+- **Signals.** Guest `int3`/`ud2` now deliver instead of destroying the thread, and async signals drain in hot
+  loops post-merge. Both matter for a multi-process, heavily-threaded client.
+- **Filesystem.** RootFS containment fixed for `readlink`/`realpath`; `apt` works, so packages install normally.
+
+### The two structural unknowns, and one is already a known defect
+
+1. **Steam needs 32-bit x86.** The bootstrapper and much of the client are i386. Every measurement on this
+   project so far has been 64-bit — the ASM suite's 32-bit failures (`32bit_syscall.asm` ×3) are half of our
+   standing 6/7011, both `build-thunks` and `build-linuxtests` were configured with 32-bit thunks **off**, and
+   the FEXLinuxTests 32-bit set has never been run. **This is the largest untested surface in the project.**
+   Note also that the `SignalHandlerReturnAddress`/`...RT` alias — deprioritised because `RestoreType` only
+   affects 32-bit guests — becomes live here. It stops being a latent bug the moment Steam runs.
+2. **Multi-process with an embedded browser.** `steamwebhelper` is CEF; the client spawns many processes and
+   uses its own signal handling and shared memory. That is precisely the machinery the ASM suite never
+   touched, and where every defect we confirmed this week has lived.
+
+Also relevant: `Data/AppConfig/steamwebhelper.json` already exists in-tree, and the `Break` stub comment we
+overturned was specifically about Steam's worker-pool init — so the original author was working this path, and
+his conclusion about it was an untested hypothesis.
+
+### The ladder — stop at the first rung that fails
+
+Same shape as the pointer-integrity ladder, for the same reason: the first failing rung localises the problem
+without a debugger.
+
+| Rung | Test | Why it is separate |
+|---|---|---|
+| 0 | Preflight recorded; 32-bit guest support confirmed working at all | Everything above depends on it and none of it is tested |
+| 1 | A trivial **32-bit** guest binary runs under FEX | Isolates 32-bit from Steam entirely |
+| 2 | FEXLinuxTests **32-bit** suite baseline | Gives 32-bit its own numbers before Steam muddies them |
+| 3 | Steam's dependency tree installs into the rootfs | `apt` works now; this should be mechanical |
+| 4 | `steam.sh` bootstrap runs and self-updates | First real multi-process step |
+| 5 | `steamwebhelper` starts | The known-hard rung; CEF, sandboxing, many processes |
+| 6 | Client UI renders | Brings the graphics stack in |
+| 7 | Log in, browse the store | Network plus UI |
+| 8 | Install a game | The stated goal |
+
+### Rules carried forward
+
+- **Preflight before any rung** — build dir and binary mtime, SMT read from the machine, live `Config.json`
+  and `FEX_*` vars, rootfs permissions.
+- **Record the complete result before fixing anything.** Steam will fail in several places at once; discovery
+  order is not fix order.
+- **A stopping rule per rung.** If three observations do not localise a failure, park it with notes and move
+  on rather than opening another multi-day chase.
+- **Ask what a fix nets the goal before pulling the thread.** The rule that was missing when we spent a day on
+  `mcs`, a compiler no target workload invokes.
+
+### What would make this fail as a target
+
+Being honest up front: Steam is a large, closed, multi-process application, and if it fails at rung 5 with no
+diagnosable output we could burn days for nothing. If that happens, the fallback is a smaller managed
+workload — a precompiled Mono/XNA game, which exercises the same JIT, SMC, signal and threading paths with
+far better observability and no CEF.
+
 ## First quantified before/after — the upstream merge, measured
 
 2026-07-30. The first time this project measured a change against a general-purpose workload rather than
