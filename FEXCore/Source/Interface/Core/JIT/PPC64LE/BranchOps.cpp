@@ -227,20 +227,27 @@ DEF_OP(Syscall) {
     std(TMP1, static_cast<int16_t>(isi_off), STATE);
   }
 
-  // Create a mini-frame for the C call.  Layout (96 bytes, 16-byte aligned):
-  //   [r1+ 0]: back chain (old r1)
-  //   [r1+ 8]: empty
-  //   [r1+16]: empty
-  //   [r1+24]: TOC save (r2)
-  //   [r1+32 .. r1+87]: SyscallArguments (7 × 8 = 56 bytes)
+  // Create a mini-frame for the C call.  Layout (160 bytes, 16-byte aligned):
+  //   [r1+ 0]:                 back chain (old r1)
+  //   [r1+ 8..31]:             ELFv2 linkage area (CR/LR/TOC save for HandleSyscall)
+  //   [r1+32..95]:             ELFv2 parameter save area (8 doublewords, callee-scratch)
+  //   [r1+96..151]:            SyscallArguments (7 × 8 = 56 bytes)
+  //   [r1+152..159]:           padding
+  //
+  // SyscallArguments MUST live above the 96-byte ELFv2 linkage+param block:
+  // the parameter save area is defined by ELFv2 §2.2.2 as callee-scratch --
+  // HandleSyscall or any of its transitive callees can overwrite [r1+32..95]
+  // freely, so putting SyscallArguments there and handing HandleSyscall an
+  // r5 pointer into it was a data hazard. Move the SSA-source pack to +96
+  // and grow the frame to 160B to keep 16B alignment.
   static_assert(FEXCore::HLE::SyscallArguments::MAX_ARGS == 7);
-  stdu(r1, -96, r1);
+  stdu(r1, -160, r1);
 
   // Fill SyscallArguments from the IR op's source nodes.
   // After SpillStaticRegs the physical SRA registers still hold the live values.
   for (uint32_t i = 0; i < FEXCore::HLE::SyscallArguments::MAX_ARGS; ++i) {
     if (Op->Header.Args[i].IsInvalid()) continue;
-    const int16_t slot_off = static_cast<int16_t>(32 + i * 8);
+    const int16_t slot_off = static_cast<int16_t>(96 + i * 8);
     uint64_t Const;
     if (IsInlineConstant(Op->Header.Args[i], &Const)) {
       LoadConstant(TMP1, Const);
@@ -253,7 +260,7 @@ DEF_OP(Syscall) {
   // Call: SyscallHandler::HandleSyscall(this, Frame*, SyscallArguments*)
   //   r3 = SyscallHandlerObj (this)
   //   r4 = Frame* (CpuStateFrame*)
-  //   r5 = SyscallArguments* (at [r1+32])
+  //   r5 = SyscallArguments* (at [r1+96])
   //   r12 = callee address (ELFv2 indirect-call requirement)
   {
     const int32_t obj_off = static_cast<int32_t>(
@@ -264,10 +271,10 @@ DEF_OP(Syscall) {
     ld(r3,    obj_off, STATE);   // r3  = this
     ld(r(12), fn_off,  STATE);   // r12 = fn ptr
     mr(r4, STATE);               // r4  = Frame
-    addi(r5, r1, 32);            // r5  = &SyscallArguments
+    addi(r5, r1, 96);            // r5  = &SyscallArguments
   }
 
-  std(r2, 24, r1);     // save TOC
+  std(r2, 24, r1);     // save TOC (ELFv2 linkage area, unchanged offset)
   mtctr(r(12));
   bctrl();
   ld(r2, 24, r1);      // restore TOC
@@ -290,7 +297,7 @@ DEF_OP(Syscall) {
   mr(GetReg(Node), r3);
 
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
-  addi(r1, r1, 96);
+  addi(r1, r1, 160);
   FillStaticRegs();
   // HandleSyscall is a host C function; r0 was clobbered. Restore the JIT's
   // r0=0 zero-index invariant before falling back into JIT code that uses
