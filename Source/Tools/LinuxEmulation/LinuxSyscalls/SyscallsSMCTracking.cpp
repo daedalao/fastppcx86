@@ -31,9 +31,33 @@ $end_info$
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
+#include <FEXHeaderUtils/Syscalls.h>
+#include <fcntl.h>
 #include <Linux/Utils/ELFParser.h>
 
 namespace FEX::HLE {
+
+// FEX_SMC_AUDIT: append-only raw-fd trace of the SMC tracking pipeline
+// (compile-time page registration lives in Core.cpp with its own copy).
+// Raw open/dprintf so the fault-handler call sites stay signal-tolerable.
+int SMCAuditFD() {
+  static int fd = [] {
+    const char* p = getenv("FEX_SMC_AUDIT");
+    if (!p) {
+      return -1;
+    }
+    return ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  }();
+  return fd;
+}
+#define SMC_AUDIT(...) \
+  do { \
+    int fd_ = SMCAuditFD(); \
+    if (fd_ >= 0) { \
+      dprintf(fd_, __VA_ARGS__); \
+    } \
+  } while (0)
+
 // SMC interactions
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
@@ -72,6 +96,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
     // If an untracked address, or the mapping wasn't writable, it can't be handled here
     if (Entry == VMATracking->VMAs.end() || !Entry->second.Prot.Writable) {
+      SMC_AUDIT("[%d] fault addr=%lx UNHANDLED %s\n", FHU::Syscalls::gettid(), FaultAddress,
+                Entry == VMATracking->VMAs.end() ? "untracked" : "vma-not-writable");
       return false;
     }
 
@@ -105,6 +131,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     } else {
       _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
+
+    SMC_AUDIT("[%d] fault addr=%lx INVALIDATED page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase,
+              Entry->second.Flags.Shared ? 1 : 0);
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
 
@@ -146,6 +175,16 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
     // Top points to the address after the end of the range
     auto Mapping = VMATracking.VMAs.lower_bound(Top);
 
+    if (SMCAuditFD() >= 0) {
+      if (Mapping == VMATracking.VMAs.begin()) {
+        SMC_AUDIT("[%d] mark CALL base=%lx AT-BEGIN\n", FHU::Syscalls::gettid(), Base);
+      } else {
+        auto Prev = std::prev(Mapping);
+        SMC_AUDIT("[%d] mark CALL base=%lx prev-vma=%lx+%lx w=%d\n", FHU::Syscalls::gettid(), Base, Prev->first, Prev->second.Length,
+                  Prev->second.Prot.Writable ? 1 : 0);
+      }
+    }
+
     while (Mapping != VMATracking.VMAs.begin()) {
       Mapping--;
 
@@ -179,6 +218,8 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
               const auto MirroredSize = std::min(OffsetTop, VMAOffsetTop) - MirroredBase;
 
               auto rv = mprotect((void*)(MirroredBase - VMAOffsetBase + VMABase), MirroredSize, PROT_READ);
+              SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(),
+                        MirroredBase - VMAOffsetBase + VMABase, MirroredSize);
               LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", MirroredBase, MirroredSize);
             }
           } while ((VMA = VMA->ResourceNextVMA));
@@ -191,12 +232,17 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           // keeps normal mtrack behaviour -- deliberately narrower than the
           // Windows version, which drops tracking for all RWX intervals.
           if (SMCDetectionDisabled.load(std::memory_order_relaxed) && Mapping->second.Prot.Executable) {
+            SMC_AUDIT("[%d] mark SKIP-smcdisabled base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
             continue;
           }
 
           int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
 
+          SMC_AUDIT("[%d] mark PROTECT base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
           LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
+        } else {
+          SMC_AUDIT("[%d] mark SKIP base=%lx size=%lx shared=%d writable=%d\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize,
+                    Mapping->second.Flags.Shared ? 1 : 0, Mapping->second.Prot.Writable ? 1 : 0);
         }
       }
     }
@@ -432,6 +478,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       }
     }
 
+    SMC_AUDIT("[%d] guest-mmap addr=%lx len=%lx prot=%x flags=%x fd=%d\n", FHU::Syscalls::gettid(), Result, length, prot, flags, fd);
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
   }
 
@@ -553,6 +600,7 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
       return -errno;
     }
 
+    SMC_AUDIT("[%d] guest-mprotect addr=%lx len=%lx prot=%x\n", FHU::Syscalls::gettid(), reinterpret_cast<uint64_t>(addr), len, prot);
     TrackMprotect(Thread, addr, len, prot);
   }
 

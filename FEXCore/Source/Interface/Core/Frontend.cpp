@@ -1402,21 +1402,24 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   // either. So any guest instruction beginning within 16 bytes of the end of a
   // mapped region faulted during decode, on the hot path, for every host.
   //
-  // Measured consequence: Mono allocates JIT arenas as a 64 KiB payload followed
-  // by a deliberate 4 KiB guard page (19 of them, MAP_FIXED_NOREPLACE, walking
-  // down from ~2 GiB). That geometry guarantees instructions land near an arena
-  // end, so this reliably killed Mono during startup. A guest RIP of
-  // 0x7feddff2 — 14 bytes below its arena end — produced SEGV_MAPERR at exactly
-  // 0x7fede000, which is byte 14 of this loop's 16-byte read.
+  // Measured consequences from two independent workloads:
+  //   - Mono JIT arenas are a 64 KiB payload plus a deliberate 4 KiB guard page
+  //     (19 of them, MAP_FIXED_NOREPLACE, walking down from ~2 GiB). A guest
+  //     RIP of 0x7feddff2 — 14 bytes below its arena end — produced SEGV_MAPERR
+  //     at exactly 0x7fede000, which is byte 14 of the 16-byte read.
+  //   - Mono trampoline arenas: 64K chunks each followed by a 4K guard hole,
+  //     trampolines at chunk_end-12 made this loop SIGSEGV in host code —
+  //     misdelivered to the guest at the trampoline RIP, mono classified it as
+  //     a native-code fault and abort()ed (the recurring Ziggurat "trampoline
+  //     SIGSEGV" crash, guest rips 0x7ff30ff4/0x7ff41ff4 == page_end-12;
+  //     repros/trampedge.c).
   //
   // Two changes. It is disabled by default, because it exists to test one
   // specific stale-compile hypothesis and should not sit on every compile. And
   // when enabled it stops at the page boundary, so it can never reach into an
-  // unmapped neighbour. Clamping to 4 KiB is deliberately conservative: guest
-  // mappings are 4 KiB-granular even where the host page is larger, so this is
-  // safe on both.
+  // unmapped neighbour. Uses FEXCore::Utils::FEX_PAGE_SIZE so the clamp tracks
+  // the guest page granularity.
   if constexpr (kEnableCompileByteLog) {
-    constexpr uint64_t kLogPageSize = 4096;
     constexpr uint64_t kLogBytes = sizeof(g_compile_log[0].bytes);
 
     uint64_t idx = g_compile_log_count++ & 255;
@@ -1430,7 +1433,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
       // Bytes remaining in the page that holds the first byte. Never zero, so
       // we always capture at least one byte when the stream is non-null.
       const uint64_t Base = reinterpret_cast<uint64_t>(_InstStream);
-      const uint64_t InPage = kLogPageSize - (Base & (kLogPageSize - 1));
+      const uint64_t InPage = FEXCore::Utils::FEX_PAGE_SIZE - (Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1));
       const uint64_t Count = InPage < kLogBytes ? InPage : kLogBytes;
       for (uint64_t b = 0; b < Count; ++b) {
         g_compile_log[idx].bytes[b] = _InstStream[b];
