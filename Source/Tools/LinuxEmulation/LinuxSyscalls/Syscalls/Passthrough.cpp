@@ -800,7 +800,8 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
     REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
     REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
-    REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
+    // utimensat is NOT a passthrough: it takes a path and needs RootFS translation.
+    // Handled by FileManager::Utimensat, registered in Syscalls/FS.cpp.
     REGISTER_SYSCALL_IMPL_X64(fallocate, SyscallPassthrough4<SYSCALL_DEF(fallocate)>);
     REGISTER_SYSCALL_IMPL_X64(timerfd_settime, SyscallPassthrough4<SYSCALL_DEF(timerfd_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timerfd_gettime, SyscallPassthrough2<SYSCALL_DEF(timerfd_gettime)>);

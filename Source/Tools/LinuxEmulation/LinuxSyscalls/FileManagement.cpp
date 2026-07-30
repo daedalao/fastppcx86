@@ -1319,6 +1319,44 @@ uint64_t FileManager::Unlinkat(int dirfd, const char* pathname, int flags) {
   return ::syscall(SYSCALL_DEF(unlinkat), dirfd, SelfPath, flags);
 }
 
+uint64_t FileManager::Utimensat(int dirfd, const char* pathname, const struct timespec* times, int flags) {
+  // utimensat was the ONLY path-taking syscall still registered as a raw
+  // passthrough (Syscalls/Passthrough.cpp), so the RootFS translation never ran
+  // and the guest path went straight to the host kernel.
+  //
+  // Measured consequence: `apt update` emitted 36 instances of
+  // "Failed to set modification time - utimes (2: No such file or directory)".
+  // apt downloads an index into /var/lib/apt/lists/partial/, then stamps its
+  // mtime; the stamp hit the *host* filesystem where that path does not exist,
+  // returned ENOENT, and apt treated every download as failed — re-fetching,
+  // retrying, and eventually timing out. The downloads themselves were fine.
+  //
+  // A NULL pathname is legal here and means "operate on dirfd itself", which is
+  // how futimens() is implemented. There is nothing to translate in that case,
+  // so pass it straight through.
+  if (!pathname) {
+    return ::syscall(SYSCALL_DEF(utimensat), dirfd, nullptr, times, flags);
+  }
+
+  auto NewPath = GetSelf(pathname);
+  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+
+  FDPathTmpData TmpFilename;
+  // AT_SYMLINK_NOFOLLOW means stamp the link itself rather than its target.
+  const bool FollowSymlink = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+  auto Path = GetEmulatedFDPath(dirfd, SelfPath, FollowSymlink, TmpFilename);
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), Path.FD, Path.Path, times, flags);
+    // Only fall back when the path was genuinely absent from rootfs.
+    // EACCES/EPERM/EROFS/etc. are semantic results that must propagate to the
+    // guest as-is.
+    if (Result != -1 || errno != ENOENT) {
+      return Result;
+    }
+  }
+  return ::syscall(SYSCALL_DEF(utimensat), dirfd, SelfPath, times, flags);
+}
+
 uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
