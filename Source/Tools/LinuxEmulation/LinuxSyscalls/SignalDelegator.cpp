@@ -928,6 +928,22 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     return;
   }
 
+  // Diagnostic (FEX_ABORT_TRIPWIRE=1): log every guest-delivered fatal-class
+  // sync signal with its si_addr/si_code and the guest RIP. Paired with the
+  // tgkill(SIGABRT) tripwire in Passthrough.cpp -- together they show what
+  // fault preceded a guest abort(). Unity redirects guest stderr to
+  // Player.log, so that is where these lines land.
+  if ((Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) && !IsAsyncSignal(&SigInfo, Signal)) {
+    static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
+    if (trip) {
+      char buf[224];
+      int n = snprintf(buf, sizeof(buf), "[GSIG] tid=%d sig=%d si_code=%d si_addr=0x%lx guest_rip=0x%lx\n",
+                       FHU::Syscalls::gettid(), Signal, SigInfo.si_code, reinterpret_cast<unsigned long>(SigInfo.si_addr),
+                       (unsigned long)Thread->CurrentFrame->State.rip);
+      [[maybe_unused]] auto _ = write(2, buf, n);
+    }
+  }
+
   // Check for masked signals
   if (ThreadObject->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1)) && IsAsyncSignal(&SigInfo, Signal)) {
     // This signal is masked, must defer until the guest updates the signal mask.
