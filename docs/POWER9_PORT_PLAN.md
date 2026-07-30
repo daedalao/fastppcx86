@@ -1303,17 +1303,63 @@ Discovered incidentally during the audit. None are POWER9-related.
 
 ---
 
+## Validation strategy — three layers, and the rule that stops them scattering
+
+Settled 2026-07-30 after two measurement campaigns were voided. The layers exist because each one checks a
+different failure mode, and the third checks *us*.
+
+**Layer 1 — tiered tests we write.** Graduated so the first failing tier localises the defect by itself:
+same-block → across a branch → across a call → across an indirect call → across a signal return → with
+`PAUSE` interleaved → multi-threaded. Small enough to audit by reading in a minute, duplication preferred
+over a shared engine, and each carrying a dated baseline with the config it was taken under. These *localise*.
+
+**Layer 2 — a SIMD/FP correctness reference.** `checkasm` (dav1d is the cheap start, FFmpeg the breadth
+option) validates each kernel against its own C implementation and has a `--bench` mode, so one tool gives
+per-kernel correctness *and* per-kernel throughput. A failure is a named function, not a crash. Berkeley
+TestFloat plays the same role for x87. These *prove*, at function granularity.
+
+**Layer 3 — known-good off-the-shelf workloads, as calibration.** **`stress-ng`** primarily —
+`vecmath`, `memcpy`, `matrix`, `pointer`, `cpu --cpu-method all` — because it has per-stressor pass/fail plus
+bogo-ops/sec, is packaged everywhere, and is explicitly built to break things. **`openssl speed` plus its
+self-tests** as a stretch goal, chosen deliberately: this port implements AES, SHA, PCLMUL and CRC32 as
+*software helpers* on the strength of a comment that is factually wrong about POWER8 lacking the hardware, so
+that workload leans directly on the code we most suspect and has published throughput expectations.
+
+**Layer 3's real job is to validate layers 1 and 2.** If a known-good workload fails where all our tests
+pass, our tests are blind. That is the only external check we have against the failure mode already hit twice:
+a probe running 1M single-address `cmpxchg` operations that could not detect ordering by construction, and a
+litmus suite whose opportunity metric was inverted in three tests. Both would have reported clean.
+
+### The triage rule — read this before acting on a wall of failures
+
+`stress-ng` will likely fail in many places at once, and chasing them in discovery order is how a day
+disappears. So:
+
+1. **Record the complete result as a baseline first.** Every stressor, pass or fail, with the config. No
+   fixing during discovery.
+2. **For each failure, ask whether a layer-1 or layer-2 test explains it.** If nothing does, that gap is the
+   finding — write the missing test before touching FEX.
+3. **Then rank by whether the fix is general**, not by how interesting the failure looks. Host-neutral and
+   guest-arch defects outrank ppc64le-specific ones; anything affecting one workload only goes last.
+4. **Ask what a fix nets the larger goal before pulling the thread.** Running x86 software on POWER9 is the
+   goal. A defect that no realistic workload reaches is a note in this register, not a cycle of work.
+
+Rule 4 is the one that was missing today. We debugged `mcs` — a C# *compiler*, which no real target workload
+invokes, since shipped managed games ship precompiled assemblies — because the workload was chosen for
+convenience rather than derived from the goal. It produced a real, general, upstream-affecting fix
+incidentally, but at retail cost.
+
 ## Open defect register — as of 2026-07-30
 
 Consolidated so nothing lives only in the build-agent log. Ordered by my judgement of value.
 
 | # | Defect | Status | Notes |
 |---|---|---|---|
-| 0 | **`openat(dirfd, name, O_PATH\|O_NOFOLLOW)` returns EACCES on rootfs-view dir fds** | Confirmed, unfixed | Survived the `ce7f0fd1c` fix unchanged, correctly — out of scope. Same unguarded-fallback class; `GetEmulatedFDPath` returns NoEntry for relative paths and for `"/"`, so the chain goes bare to the host. Not currently blocking anything |
+| 0 | **fd-relative path resolution never consults the RootFS** | Diagnosed, unfixed | **Structural, not an unguarded fallback.** `GetEmulatedFDPath` (`FileManagement.cpp:503-507`) returns `NoEntry` when the path is relative, when it is exactly `"/"`, or when `dirfd != AT_FDCWD` — so RootFS redirection applies **only to absolute paths other than root itself**. Every `openat(dirfd, "relative", …)` walk therefore resolves against the *host* filesystem. FEX keeps no guest-dirfd → RootFS-path mapping, so it cannot scope the walk. See the write-up below |
 | 0b | **Mono `CS2001` is not a filesystem bug** | Root-caused, unfixed | An strace shows `mcs` **never opens the source file** — the path appears once, in the `write(2)` emitting the error. Preceded by repeated failed `dlopen` of **`libSystem.Native.so`**, absent from the hand-assembled rootfs. Note classic Mono ships `libmono-native.so` while `libSystem.Native.so` is the .NET Core name, so this may be a **mismatched assembly graph** rather than a plain omission. The 40+ SIGSEGVs alongside it are expected Mono behaviour — `mono --version` reports `SIGSEGV: altstack`, i.e. hardware null checks — and are not a defect |
 | 1 | ~~**`readlink` returns EACCES for rootfs-view paths**~~ | **FIXED** — `ce7f0fd1c` | Root cause was not what I predicted. `OpenPathInRootFS` *succeeds*; `readlinkat(fd, "")` then fails with **ENOENT**, not EINVAL, because `fs/stat.c do_readlinkat` does `error = empty ? -ENOENT : -EINVAL`. The EINVAL "not a symlink" early return was therefore **dead code** for every rootfs file and control always reached an unguarded host fallback, which answered out of the host's mode-700 `/root`. **The fix I originally proposed — guard the fallback on ENOENT — would have fixed nothing**, since ENOENT is the trigger; it needed the guard *and* an ENOENT→EINVAL translation scoped to where the fd resolved. Verified 14/14 with value assertions, ctest held 6/7011. Host-neutral, so upstream ARM64 has the same defect — **upstream candidate** |
 | 1b | *(superseded row, kept for the record)* | | | `probe_file_lookup.c` isolates it: `stat`/`statx`/path-based `open`/`access` all succeed, `readlink` and `realpath` fail. Root cause almost certainly the **EXDEV-only fallback** at `FileManagement.cpp:604-625` combined with callers propagating any non-`ENOENT` errno as fatal. **Recommended next fix** — see the instrument note below |
-| 2 | **TSO-path memory corruption** | Partially reduced, mechanism unknown | Full matrix below. `lwsync` both sides landed; `LOCKONLYTSO=1` measures best at 0/30 |
+| 2 | **TSO-path "memory corruption"** | **Entire matrix invalidated — re-measure from scratch** | Every one of the ~240 runs died early on the missing `libmono-native.so`, diagnosed later, so the whole campaign measured crash behaviour on an error path. Six hypotheses were refuted against an instrument that could not have shown the truth. The `lwsync` change stands on architectural grounds only; see the note below. **Nothing in the old matrix should be cited** |
 | 3 | **Guest `int3`/`ud2` silently destroy the thread** | Designed + adversarially reviewed, **not landed** | Phase 1 as designed would core-dump on the missing host SIGTRAP thunk. `trap_flag.64` is its acceptance test |
 | 4 | **Mono HANG class** | Untouched | `LOCKONLYTSO=1` floors it at 10%; every other config 37–63%. Last thing between the port and Mono |
 | 5 | **NoExec entry-block forensic abort** | Unfixed | One root cause, four FEXLinuxTests symptoms: `sigill_flags.64`, `smc-exec-stack.64`, `smc-missing-gnustack.64`, `smc-unexec-stack.64` |
@@ -1324,7 +1370,77 @@ Consolidated so nothing lives only in the build-agent log. Ordered by my judgeme
 | 10 | README:11 SIGABRT-on-exit in FTL | Never reproduced | Both play sessions were SIGKILLed, so the natural exit path never ran |
 | 11 | `syscalls_efault.64` | **Not a defect** | Expected-fail test that unexpectedly passes — metadata mismatch |
 
-### The TSO matrix, and why I distrust it
+### Defect 0 in full: fd-relative walks escape the RootFS
+
+Worth writing out because the symptom (one EACCES in a probe) badly understates it, and because
+filesystem gaps that lie in wait are expensive.
+
+**The gate.** `FileManagement.cpp:498-507`:
+
+```cpp
+if (pathname[0] == '/') {
+  dirfd = AT_FDCWD;          // absolute paths ignore dirfd
+}
+if (pathname[0] != '/' ||    // If relative
+    pathname[1] == 0 ||      // If we are getting root
+    dirfd != AT_FDCWD) {     // If dirfd isn't special FDCWD
+  return NoEntry;
+}
+```
+
+`NoEntry` means "no RootFS translation", and every caller then falls through to the host path. So the
+translation applies to **absolute paths only, excluding `"/"` itself.** Note the first clause makes the
+third unreachable for absolute paths, so in practice the gate is: *relative path, or bare root → host.*
+
+**Why it matters more than the symptom suggests.** Open-a-directory-then-walk-relative is the modern,
+recommended idiom — it is what `fts`, `openat`-based traversal, and glibc's own internals use, precisely
+because it is immune to TOCTOU races on the parent path. Under emulation that idiom currently gets **host
+filesystem semantics**, which is both a containment breach and a correctness hazard: a host file at the
+same relative position answers for a guest file that should have come from the RootFS. It goes largely
+unnoticed because ordinary programs pass absolute paths.
+
+**Why a fix is not trivial.** FEX has no guest-dirfd → RootFS-relative-path mapping, so it cannot rebuild
+an absolute path to re-scope the walk. Two shapes worth evaluating:
+
+1. **Track dirfds.** Record, per guest fd, whether it was produced by a RootFS-scoped open, and if so its
+   RootFS-relative path. Then fd-relative calls can be re-expressed as a scoped `openat2` against
+   `RootFSFD`. Costs bookkeeping on every open/close/dup and has to survive `fork`/`exec`.
+2. **Trust the fd.** A dirfd that FEX itself produced from a RootFS open *already points inside the RootFS
+   tree*, so passing it to the host `openat` should resolve correctly without any mapping. This is much
+   cheaper and may be most of the answer — it would explain why `openat(fd_of_/, "root", …)` succeeded in
+   the probe while the next level down did not. If it is nearly right, the remaining question is only
+   which fds are trustworthy.
+
+**The open question, and it is one cheap command.** The probe's EACCES may not be a FEX bug at all: an
+extracted Ubuntu rootfs normally has `/root` at mode 700 owned by root, and we run as a normal user. If
+`<rootfs>/root` is 700, the host-side walk legitimately fails and the "defect" at that path is a
+permissions artifact sitting on top of the real structural gap. **Check `ls -ld <rootfs>/root
+<rootfs>/root/csharp` before designing anything.** That also explains the asymmetry with the path-based
+route only if the two take different code paths, so if the modes are permissive the structural reading
+stands alone.
+
+### The TSO matrix is void. Kept only as a methodology record.
+
+**Do not cite any number below.** The workload every one of these runs used — Mono's `mcs` — never
+reached real work: it failed early on a missing `libmono-native.so`, which was not diagnosed until after
+the campaign ended. So the matrix measures how FEX crashes while unwinding from a library-load failure.
+Six hypotheses were refuted against it, which was effort spent characterising an artifact.
+
+The `lwsync` change in `DEF_OP(LoadMemTSO)` is retained on **architectural** grounds: it is the plainest
+correct load-acquire on POWER and the simpler of two valid constructs. It is not a verified fix, it did
+not verifiably repair a defect, and its performance cost is unmeasured because SMT was misconfigured for
+every attempt at a comparable number. The source comment states this. Re-measurement is owed on all three
+counts.
+
+**What actually survives from the campaign** is process, not findings:
+
+- Barrier *strength* was indistinguishable (`lwsync` versus full `sync`) — but on the void instrument.
+- The sample-size rule: 15 trials cannot establish a zero at a double-digit rate; 30 rules out only ~10%.
+- The preflight rule, which exists because this campaign is what it would have prevented.
+
+The table below is retained solely so nobody re-runs it thinking it is new information.
+
+### The old matrix, for the record only
 
 | Load barrier | Store barrier | Corruption | HANG | Sample |
 |---|---|---:|---:|---:|

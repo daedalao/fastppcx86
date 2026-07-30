@@ -9,7 +9,7 @@ macro(LinkerGC target)
   if (CMAKE_BUILD_TYPE MATCHES "RELEASE")
     target_link_options(${target} PRIVATE
       "LINKER:--gc-sections"
-      "LINKER:--strip-all"
+      # "LINKER:--strip-all"  # temporarily disabled: need symbols to resolve SIGILL frames
       "LINKER:--as-needed")
   endif()
 endmacro()

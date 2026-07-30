@@ -661,42 +661,44 @@ DEF_OP(LoadMemTSO) {
   // the +0x4 in `mov %fs:0x4(%r8), …`), producing a bad effective address.
   GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
-  // Acquire barrier: `lwsync` AFTER the load. Do not replace this with the
-  // self-compare/branch/isync construct that used to be here — it was MEASURED
-  // to corrupt memory, and this is the fix for that.
+  // Acquire barrier: `lwsync` AFTER the load.
   //
-  // History, because the construct is textbook and looks safe. The previous code
-  // emitted, per TSO load: `cmpd cr2, Rd, Rd` / `bc(never-taken) -> Done` /
-  // `isync` / `Done:`. That is the documented PPC load-acquire idiom — a control
-  // dependency on the loaded value anchoring an isync — and it is cheaper than a
-  // barrier, which is why it was chosen: `LockOnlyTSO` exists in the config
+  // This is kept on ARCHITECTURAL grounds, not measured ones. `lwsync` after a
+  // load is the plainest correct load-acquire on POWER, and it is the simpler of
+  // two valid constructs. It replaced a self-compare / never-taken-branch /
+  // `isync` sequence — also a documented and valid load-acquire, and cheaper,
+  // which is why the port originally chose it. `LockOnlyTSO` exists in the config
   // precisely because per-load acquire cost "cumulatively dominates runtime in
-  // libc / pthread tight loops".
+  // libc / pthread tight loops", so the cheap construct had a real motivation.
   //
-  // It is *a* source of the port's memory corruption, and this change reduces
-  // that corruption without eliminating it. Measured on POWER9 against a Mono
-  // `mcs` invocation, corruption = SIGSEGV or glibc pthread mutex assertion:
+  // HONEST STATUS OF THE EVIDENCE, because an earlier version of this comment
+  // overstated it twice and the corrections matter more than the conclusion:
   //
-  //     idiom (before)     ~30%   (10 runs)
-  //     lwsync  (after)     13.3% (4/30 runs)
+  //   * A campaign of ~240 runs appeared to show this change roughly halving a
+  //     memory-corruption rate (~30% to 13.3%) in a Mono `mcs` workload. Those
+  //     numbers do not survive. Every run in that campaign died early on an
+  //     unrelated failure — a missing rootfs library, diagnosed later — so the
+  //     whole matrix measured crash behaviour on an error path rather than on
+  //     real work. It does not establish that this construct is better, or that
+  //     the previous one was defective.
+  //   * A 15-run sample of this change once read 0/15, which was luck rather
+  //     than a result: at a 13% rate, P(0 in 15) is about 12%.
   //
-  // An earlier 15-run sample of this change read 0/15 and that was luck, not a
-  // result: at a 13% true rate, P(0 events in 15 trials) is about 12%. **A
-  // residual ~13% means a SECOND corruption path exists** that this does not
-  // touch. Do not read this fix as closing the issue.
+  // So: no verified defect is fixed here, and no verified regression is
+  // introduced. The change stands because it is the more obviously-correct of
+  // two correct options, and the performance cost of choosing it is UNMEASURED
+  // — SMT was misconfigured for every attempt at a comparable number.
   //
-  // WHY the idiom corrupts at all is also still open — see the plan's TSO
-  // section. The leading candidates both involve code that reads a fixed
-  // instruction window around a load: `HandleUnalignedAtomicSIGBUS`
-  // (`Utils/ArchHelpers/PPC64.cpp:199`) requires primary-31 at PC+0 *and* PC+4
-  // and then advances a hardcoded 12 bytes, and `HalfBarrierTSOEnabled` (default
-  // true) backpatches faulting unaligned accesses into atomic sequences in place.
-  // Either could mis-target when three extra instructions sit behind every load.
-  //
-  // Two warnings for whoever touches this next. Do not restore the cheap idiom on
-  // the strength of an argument — it needs a measurement. And do not accept a
-  // zero-event run as proof: at these rates 15 trials cannot establish a zero,
-  // and 30 only rules out a true rate above ~10%.
+  // What is owed, for whoever picks this up:
+  //   1. Re-measure with a workload that actually runs, now that the rootfs
+  //      library gap is closed. That decides whether either construct matters.
+  //   2. Get a recipe-compliant benchmark (SMT2, node-pinned) for the cost of
+  //      `lwsync` per guest load. If it is significant and neither construct
+  //      affects correctness, the cheap one should come back — or `LockOnlyTSO`
+  //      becomes the better lever than either.
+  //   3. Do not accept a zero-event run as proof of anything: at these rates 15
+  //      trials cannot establish a zero, and 30 only rules out a true rate above
+  //      about 10%.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
     lwsync();
