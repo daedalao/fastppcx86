@@ -1,0 +1,7 @@
+# Executing a 32-bit `int 0x80` syscall from a 64-bit process is unimplemented
+# in FEXCore common code, not in any backend -- OpcodeDispatcher.cpp rejects it
+# with "[Unsupported] Trying to execute 32-bit syscall from a 64-bit process."
+# Upstream added this test already quarantined (4f028b861, 2024-02-25) and has
+# left the feature open since. Restoring parity with upstream: this is not a
+# ppc64le defect and reporting it as a standing failure hides real regressions.
+Test_FEX_bugs/32bit_syscall.asm

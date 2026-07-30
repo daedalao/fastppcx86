@@ -4879,8 +4879,61 @@ static double F64CosImpl(double x)  { return std::cos(x); }
 static double F64TanImpl(double x)  { return std::tan(x); }
 static double F64AtanImpl(double y, double x) { return std::atan2(y, x); }
 static double F64FYL2XImpl(double x, double y) { return y * std::log2(x); }
-static double F64ScaleImpl(double x, double n) { return std::ldexp(x, static_cast<int>(n)); }
-static double F64F2XM1Impl(double x) { return std::exp2(x) - 1.0; }
+// x87 FSCALE computes x * 2^trunc(n).
+//
+// `std::ldexp(x, static_cast<int>(n))` is undefined behaviour when n is NaN or
+// |n| > INT_MAX -- the float-to-int conversion, not ldexp, is the problem.
+// Measured consequence on this backend: FSCALE with a NaN exponent returned
+// 1.0 where upstream returns NaN. Huge |n| happened to saturate to Inf on the
+// compilers tested, but that is UB, not a guarantee.
+//
+// Use upstream's fallback form (F80Fallbacks.h:421-430), which has no integer
+// conversion at all: NaN propagates through trunc/exp2, huge |n| overflows to
+// Inf as required, and the zero early-out preserves the sign of x.
+static double F64ScaleImpl(double x, double n) {
+  if (x == 0.0) {
+    return x;
+  }
+  return x * std::exp2(std::trunc(n));
+}
+// x87 F2XM1 computes 2^x - 1 over the architectural domain |x| <= 1, and exists
+// specifically for x near zero.
+//
+// Do NOT write the in-domain case as `std::exp2(x) - 1.0`. exp2 returns a
+// correctly rounded result carrying up to 0.5 ULP of error *at its own
+// magnitude*; for x near zero that magnitude is ~1.0 while the true result is
+// near zero. The subtraction is exact by Sterbenz, so the whole absolute error
+// is inherited into a result whose ULP is far smaller. Measured against a
+// 70-digit reference over 120k in-domain points, that form is off by more than
+// 1 ULP on 44.6% of inputs, with unbounded relative error near zero: every
+// denormal and every |x| < ~2^-27 returns exactly 0.0. At x=0.5 it is 1.74 ULP
+// out, which is the D9_F0_02_F64 failure.
+//
+// expm1 computes e^y - 1 without ever forming an intermediate 1+something, so
+// no cancellation occurs. 2^x - 1 = e^(x*ln2) - 1.
+//
+// This is NOT correctly rounded -- the x*kLn2 product is itself inexact, so
+// about a third of in-domain results are 1 ULP off. It puts ppc64le in the same
+// ~1-2 ULP class as ARM64's inline polynomial (Dispatcher.cpp:1301-1424), which
+// is the bar. A Dekker split of ln2 would recover ~0.35 ULP if that is ever
+// wanted. It also fixes a signed-zero bug the ARM64 path still has: Intel SDM
+// requires F2XM1(-0) = -0, and only this form delivers it.
+//
+// Outside |x| <= 1 the result is architecturally undefined, but ARM64 defines
+// it as exp2(x)-1 via its out-of-domain fallback, so match that exactly. Left
+// unguarded, expm1(x*ln2) amplifies the product's rounding by |x*ln2| and
+// diverges badly -- 404 ULP at x=1023.9, and at x=1024 it returns a finite
+// value just under DBL_MAX where +Inf is required.
+static double F64F2XM1Impl(double x) {
+  // ln(2), correctly rounded: 0x3FE62E42FEFA39EF. Bit-identical to ARM64's C1.
+  constexpr double kLn2 = 0.6931471805599453094172321214581766;
+  // Written as !(fabs(x) <= 1.0) so NaN routes to the fallback, matching the
+  // `b.hi` sense of ARM64's range check at Dispatcher.cpp:1324-1327.
+  if (!(std::fabs(x) <= 1.0)) {
+    return std::exp2(x) - 1.0;
+  }
+  return std::expm1(x * kLn2);
+}
 } // namespace
 
 // Emit code to transfer VR element 0 (double) → f1 using slot A (r1-16).
