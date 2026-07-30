@@ -1048,14 +1048,13 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   // Using TMP2 for LR save ensures TMP1=r3 is free to hold the integer result
   // returned by FillIntResult() in the stub.
 
-  // Save LR via TMP2; allocate a 4096-byte frame to protect JIT spill slots.
-  // The ELFv2 ABI only guarantees 288 bytes of red zone for leaf functions.
-  // Op_Unhandled emits bctrl calls (non-leaf), so any spill slot beyond -288
-  // from the current r1 can be overwritten by the callee's call chain.  Large
-  // JIT blocks place spill slots at -700+ bytes from r1 (many live IR values).
-  // With a 4096-byte frame the callee's entire accessible range (its own stack
-  // plus its red zone) stays below our spill area — SoftFloat and friends use
-  // far less than 4096 bytes of stack.
+  // Save LR at the top of a 4096-byte scratch/link frame for the callee.
+  // The frame gives HandleFallback's callees (softfloat etc.) headroom
+  // for their own stack use without touching the JIT block's spill area
+  // above -- that area lives at [r1 + kSpillSlotPrefix + slot*32] and is
+  // already above the ELFv2 96B linkage+param block; the additional 4096
+  // is defensive against unusually deep callee chains, not required for
+  // ABI correctness.
   mflr(TMP2); addi(r1, r1, -4096); std(TMP2, 0, r1);
 
   // Load ABIHandler into r0, Func into TMP4
@@ -2089,9 +2088,10 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   // Sample SpillSlots from the post-RA IR and compute the per-block
   // spill-frame size. align16() is implicit because MaxSpillSlotSize=32
-  // is already a multiple of 16, keeping the PPC ELFv2 stack alignment.
+  // and kSpillSlotPrefix=96 are both multiples of 16, keeping the PPC
+  // ELFv2 stack alignment.
   SpillSlots     = IRView->SpillSlots();
-  SpillFrameSize = SpillSlots * MaxSpillSlotSize;
+  SpillFrameSize = SpillSlots ? (kSpillSlotPrefix + SpillSlots * MaxSpillSlotSize) : 0;
 
   // ------------------------------------------------------------------
   // Code-buffer capacity guard

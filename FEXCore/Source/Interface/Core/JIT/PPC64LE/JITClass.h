@@ -83,20 +83,31 @@ private:
   // SpillSlots is sampled from IR->SpillSlots() at the top of CompileCode.
   // EmitEntryPoint allocates `SpillFrameSize` bytes below the dispatcher
   // frame via stdu r1, -SpillFrameSize, r1. SpillRegister/FillRegister then
-  // address slots at POSITIVE offsets from the new r1: slot 0 at [r1+0],
-  // slot 1 at [r1+32], etc. Every block-exit emit site calls ResetStack()
-  // to undo the frame extension before transferring control out of the JIT.
+  // address slots at POSITIVE offsets from the new r1, starting ABOVE the
+  // ELFv2 96-byte linkage + parameter save block: slot 0 at [r1+96],
+  // slot 1 at [r1+128], slot k at [r1 + 96 + k * 32]. Every block-exit
+  // emit site calls ResetStack() to undo the frame extension before
+  // transferring control out of the JIT.
   //
   // Mirrors Arm64JITCore::CompileCode + ResetStack (gemini-fex JIT.cpp:804
   // and JIT.cpp:1157). The previous fixed `SpillBase = -768` formula went
   // positive after slot 24 and silently walked off the top of r1; observed
   // as a SIGSEGV in add_sub_carry_2.asm.jit_500 where the RA spilled 200+
   // NZCV temps from 256 unrolled SBBs in a single IR block.
+  //
+  // The +96 prefix is the ELFv2 reservation: any bctrl issued from inside
+  // the JIT block (Op_Unhandled, DEF_OP(Thunk), DEF_OP(Print)) allows the
+  // callee to write LR/CR/TOC at [r1+8..31] and to use [r1+32..95] as its
+  // parameter save area. Starting spill slots at [r1+0] like the old
+  // formula did put slot 0 on top of the back chain, and slots 1-3 inside
+  // the callee-scratch parameter area.
   uint32_t SpillSlots {};
   uint32_t SpillFrameSize {};
 
+  static constexpr uint32_t kSpillSlotPrefix = 96;
+
   int32_t SpillOffset(uint32_t slot) const {
-    return static_cast<int32_t>(slot * MaxSpillSlotSize);
+    return static_cast<int32_t>(kSpillSlotPrefix + slot * MaxSpillSlotSize);
   }
 
   // -----------------------------------------------------------------------

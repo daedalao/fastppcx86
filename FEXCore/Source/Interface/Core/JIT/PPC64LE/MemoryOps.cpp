@@ -325,11 +325,6 @@ DEF_OP(SpillRegister) {
 
   if (IsFPR(Src)) {
     auto VSrc = GetVReg(Src);
-    // SlotOffset is negative (spill slots live below the JIT frame at r1).
-    // Cast to uint32_t silently zero-extends the negative value to a large
-    // positive 64-bit number, so stvx(VSrc, r1, TMP1) stores to r1 + ~4GB
-    // instead of r1 - N, corrupting arbitrary host memory.
-    // Sign-extend to int64_t first so the loaded 64-bit value is r1 - N.
     LoadConstant(TMP1, static_cast<uint64_t>(static_cast<int64_t>(SlotOffset)));
     stvx(VSrc, r1, TMP1);
   } else {
@@ -358,8 +353,6 @@ DEF_OP(FillRegister) {
 
   if (IsFPR(DstRef)) {
     auto VDst = GetVReg(DstRef);
-    // Same sign-extension fix as SpillRegister: SlotOffset is negative, must
-    // be sign-extended to 64 bits so lvx sees r1 - N not r1 + ~4GB.
     LoadConstant(TMP1, static_cast<uint64_t>(static_cast<int64_t>(SlotOffset)));
     lvx(VDst, r1, TMP1);
   } else {
