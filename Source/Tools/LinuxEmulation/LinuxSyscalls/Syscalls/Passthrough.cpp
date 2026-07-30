@@ -13,6 +13,7 @@ $end_info$
 
 #include <FEXCore/IR/IR.h>
 
+#include <errno.h>
 #include <stdint.h>
 #include <sched.h>
 #include <string.h>
@@ -574,9 +575,28 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(membarrier, SyscallPassthrough2<SYSCALL_DEF(membarrier)>);
   REGISTER_SYSCALL_IMPL(mlock2, SyscallPassthrough3<SYSCALL_DEF(mlock2)>);
   REGISTER_SYSCALL_IMPL(copy_file_range, SyscallPassthrough6<SYSCALL_DEF(copy_file_range)>);
-  REGISTER_SYSCALL_IMPL(pkey_mprotect, SyscallPassthrough4<SYSCALL_DEF(pkey_mprotect)>);
-  REGISTER_SYSCALL_IMPL(pkey_alloc, SyscallPassthrough2<SYSCALL_DEF(pkey_alloc)>);
-  REGISTER_SYSCALL_IMPL(pkey_free, SyscallPassthrough1<SYSCALL_DEF(pkey_free)>);
+  // Memory protection keys must not pass through to the host. The host kernel
+  // (POWER) can hand out a real pkey, which makes the guest believe x86 PKU is
+  // usable and start executing RDPKRU/WRPKRU — instructions the JIT does not
+  // implement (Chromium's zygote dies this way). Report "no keys available"
+  // so guests take their no-PKU fallback paths.
+  REGISTER_SYSCALL_IMPL(pkey_mprotect,
+                        [](FEXCore::Core::CpuStateFrame* Frame, void* addr, size_t len, int prot, int pkey) -> uint64_t {
+                          // pkey == -1 is defined to behave exactly like mprotect(2); it also must
+                          // go through GuestMprotect so SMC tracking sees the permission change.
+                          if (pkey == -1) {
+                            return FEX::HLE::_SyscallHandler->GuestMprotect(Frame->Thread, addr, len, prot);
+                          }
+                          return -EINVAL;
+                        });
+  REGISTER_SYSCALL_IMPL(pkey_alloc, [](FEXCore::Core::CpuStateFrame* Frame, unsigned int flags, unsigned int access_rights) -> uint64_t {
+    // flags is reserved and access_rights only has two defined bits.
+    if (flags != 0 || (access_rights & ~3U) != 0) {
+      return -EINVAL;
+    }
+    return -ENOSPC;
+  });
+  REGISTER_SYSCALL_IMPL(pkey_free, [](FEXCore::Core::CpuStateFrame* Frame, int pkey) -> uint64_t { return -EINVAL; });
   // io_uring can't be emulated as it can pass `epoll_event` objects around.
   // These are 12-byte packed structs on x86/x86-64, but on other architectures are 16-byte.
   // This means the `data` member is at offset 4 on x86, but offset 8 on other architectures, corrupting the data.
