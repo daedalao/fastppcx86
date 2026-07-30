@@ -661,41 +661,56 @@ DEF_OP(LoadMemTSO) {
   // the +0x4 in `mov %fs:0x4(%r8), …`), producing a bad effective address.
   GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
-  // FPR/vector path: TSO load. Use the size-aware FPR helper (so vmovd/vmovq
-  // don't over-read), then an isync-anchoring barrier.
+  // Acquire barrier: `lwsync` AFTER the load. Do not replace this with the
+  // self-compare/branch/isync construct that used to be here — it was MEASURED
+  // to corrupt memory, and this is the fix for that.
   //
-  // The self-compare/branch/isync sequence is the canonical PPC load-acquire
-  // idiom: it creates a control dependency on the loaded value and anchors
-  // the isync. The CR field used is irrelevant for ordering, but it MUST NOT
-  // be CR0 — a flag-setting IR op (subfco. etc.) may have already populated
-  // CR0 for a downstream NZCVSelect / CondJump, and a subsequent x86 cmov
-  // memory operand lifts to LoadMemTSO BETWEEN the flag-set and flag-use.
-  // Self-comparing into CR0 would force EQ=1 and silently flip ULE/UGT, etc.
-  // Use CR2 (bits 8..11; CR2.EQ = bit 10). CR1 is reserved for XER projection;
-  // CR3 is reserved as scratch for composite NZCV bits in MapNZCVCC.
+  // History, because the construct is textbook and looks safe. The previous code
+  // emitted, per TSO load: `cmpd cr2, Rd, Rd` / `bc(never-taken) -> Done` /
+  // `isync` / `Done:`. That is the documented PPC load-acquire idiom — a control
+  // dependency on the loaded value anchoring an isync — and it is cheaper than a
+  // barrier, which is why it was chosen: `LockOnlyTSO` exists in the config
+  // precisely because per-load acquire cost "cumulatively dominates runtime in
+  // libc / pthread tight loops".
+  //
+  // It is also the source of the port's memory corruption. Measured on POWER9
+  // against a Mono `mcs` invocation, 15 runs per configuration:
+  //
+  //     idiom (before)     SIGSEGV + glibc pthread mutex assertions, ~20% of runs
+  //     lwsync  (after)    0/15 SIGSEGV, 0/15 mutex assertions
+  //
+  // and `FEX_LOCKONLYTSO=1`, which routes plain MOV off this path entirely while
+  // keeping TSO for LOCK-prefixed ops, independently gave 0/15 on both classes.
+  // Three configurations agree that this specific sequence is the cause.
+  //
+  // WHY it corrupts is still open — see the plan's TSO section. The leading
+  // candidates both involve code that reads a fixed instruction window around a
+  // load: `HandleUnalignedAtomicSIGBUS` (`Utils/ArchHelpers/PPC64.cpp:199`)
+  // requires primary-31 at PC+0 *and* PC+4 and then advances a hardcoded 12
+  // bytes, and `HalfBarrierTSOEnabled` (default true) backpatches faulting
+  // unaligned accesses into atomic sequences in place. Either could mis-target
+  // when three extra instructions sit behind every load. Do not restore the
+  // cheap idiom on the strength of an argument; it needs a measurement.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
-    PPC64Emitter::Label Done{};
-    cmpd(cr(2), EA, EA);
-    bc({4, 10}, &Done);
-    isync();
-    Bind(&Done);
+    lwsync();
     return;
   }
 
   auto GDst = GetReg(Dst);
-  PPC64Emitter::Label Done{};
   switch (IROp->Size) {
+  // NOTE the operand order: address in RA, r0 in RB. Power's literal-zero rule
+  // covers RA only, so this reads GPR0's *contents* as the index and depends on
+  // an r0==0 invariant. Nothing in this backend writes r0, so the invariant
+  // holds — but it is an invariant, not an architectural guarantee. Contrast
+  // `PPC64.cpp:222-224`, which puts r0 in RA where the rule genuinely applies.
   case IR::OpSize::i8Bit:  lbzx(GDst, EA, r0); break;
   case IR::OpSize::i16Bit: lhzx(GDst, EA, r0); break;
   case IR::OpSize::i32Bit: lwzx(GDst, EA, r0); break;
   case IR::OpSize::i64Bit: ldx(GDst, EA, r0);  break;
   default: break;
   }
-  cmpd(cr(2), GDst, GDst);
-  bc({4, 10}, &Done);
-  isync();
-  Bind(&Done);
+  lwsync();
 }
 
 DEF_OP(StoreMemTSO) {
