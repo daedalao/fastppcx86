@@ -154,6 +154,19 @@ void PPC64Dispatcher::EmitDispatcher() {
   // Mirrors ARM64's ENTRY_FILL_SRA_SINGLE_INST_REG / cbnz pattern
   // (Dispatcher.cpp:89-94). Check BEFORE FillStaticRegs because PPC's
   // FillStaticRegs uses TMP2 (=r4) as scratch in its NZCV unpack stage.
+  //
+  // The C++ fall-through path (main dispatcher entry from `ExecuteDispatch`)
+  // must arrive here with r4 == 0, or the compare-and-branch below will
+  // always take the CompileSingleStep exit. `PushCalleeSavedRegisters` at :129
+  // clobbers TMP2 (== r4) twice: once via `mfcr(TMP2)` (PPC64Emitter.cpp:279),
+  // then finally via `LoadImm32(TMP2, 192)` in the VMX save loop
+  // (PPC64Emitter.cpp:298). So on fall-through, r4 is DETERMINISTICALLY 192,
+  // and the branch fires on every dispatcher entry — one wasted compile per
+  // call, self-corrected by the SingleStep tail's fallback to normal
+  // compilation but pure waste. The `li(r4, 0)` below is emitted BEFORE the
+  // label, so the fall-through path clears r4 while signal/SMC arrivals jump
+  // TO the label and keep whatever the kernel set in the ucontext r4.
+  li(r4, 0);
   PPC64Emitter::Label CompileSingleStepLabel{};
   DispatcherLoopTopFillSRAAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   cmpdi(r4, 0);
@@ -598,14 +611,17 @@ void PPC64Dispatcher::EmitDispatcher() {
   CallbackPtr = reinterpret_cast<JITCallback>(GetCursorAddress<uint8_t*>());
 
   // CRITICAL ORDERING: stash incoming RIP (r4) BEFORE PushCalleeSavedRegisters.
-  // PushCalleeSavedRegisters() emits `mfcr(TMP2)` where TMP2==r4 (see
-  // PPC64Emitter.cpp:272), which destroys the C-ABI second argument before
-  // we get a chance to save it. The previous "save r4 early" comment below
-  // referred to scratch usage AFTER the prologue, not the prologue itself --
-  // by then r4 already held CR, not RIP. Symptom: State.rip ends up = CR
-  // (a small value, e.g. 0xC0 when CR6 has bits set), the dispatcher loads
-  // garbage as the next guest PC, and the suspect-RIP bypass fires on every
-  // single host->guest callback (libGL XSync, libvulkan X11Manager.*, etc.).
+  // PushCalleeSavedRegisters() clobbers TMP2 (== r4) twice in its prologue:
+  // first `mfcr(TMP2)` at PPC64Emitter.cpp:279 (which the earlier version of
+  // this comment blamed), and then FINALLY `LoadImm32(TMP2, 192)` inside the
+  // VMX save loop at :298. That last write is the one that survives — r4
+  // holds 192 (= 0xC0, the byte offset of v31's stvx slot in the frame) at
+  // every return from PushCalleeSavedRegisters, on every entry. Symptom:
+  // State.rip ends up = 0xC0, the dispatcher loads garbage as the next
+  // guest PC, and the suspect-RIP bypass fires on every single host->guest
+  // callback (libGL XSync, libvulkan X11Manager.*, etc.). The mfcr framing
+  // in the earlier comment was arithmetically wrong; the fix was right for
+  // the wrong reason.
   //
   // r7 is volatile per ELFv2 ABI -- the C++ caller has either spilled it
   // or doesn't care -- and PushCalleeSavedRegisters only touches r0, r1,
