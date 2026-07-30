@@ -84,6 +84,19 @@ $end_info$
 #include <utility>
 #include <xxhash.h>
 
+// FEX_SMC_AUDIT compile-side sibling of the logger in SyscallsSMCTracking.cpp
+// (same env var, same file, opened O_APPEND so lines from both interleave).
+static int SMCAuditCompileFD() {
+  static int fd = [] {
+    const char* p = getenv("FEX_SMC_AUDIT");
+    if (!p) {
+      return -1;
+    }
+    return ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  }();
+  return fd;
+}
+
 namespace FEXCore::Context {
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
@@ -932,9 +945,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     CodePages.reserve(BlockInfo->CodePages.size());
     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
     for (auto CodePage : BlockInfo->CodePages) {
-      if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+      const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      if (NewPage) {
         SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
       }
+      if (SMCAuditCompileFD() >= 0) {
+        dprintf(SMCAuditCompileFD(), "compile rip=%lx page=%lx newpage=%d nentry=%zu\n", GuestRIP, CodePage, NewPage ? 1 : 0,
+                BlockInfo->EntryPoints.size());
+      }
+    }
+    if (SMCAuditCompileFD() >= 0 && BlockInfo->CodePages.empty()) {
+      dprintf(SMCAuditCompileFD(), "compile rip=%lx NO-PAGES\n", GuestRIP);
     }
   }
 
