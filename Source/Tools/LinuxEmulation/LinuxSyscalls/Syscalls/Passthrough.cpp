@@ -11,6 +11,10 @@ $end_info$
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
 
+#ifdef ARCHITECTURE_ppc64le
+#include "LinuxSyscalls/PPC64LE/TermiosTranslation.h"
+#endif
+
 #include <FEXCore/IR/IR.h>
 
 #include <stdint.h>
@@ -748,6 +752,42 @@ namespace x64 {
     };
 
     REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+      // termios needs its payload marshalled, not just its command number
+      // remapped. Guest x86 struct is 36 bytes; the buffer we hand `::ioctl`
+      // on PowerPC must be glibc's own 60-byte `struct termios`, because the
+      // glibc ioctl wrapper writes 60 bytes into it regardless of the caller's
+      // declared size — the "*** stack smashing detected ***" on stty/apt.
+      // Field order and every flag-bit value differ as well; see
+      // PPC64LE/TermiosTranslation.h.
+      switch (cmd) {
+      case 0x5401u: { // x86 TCGETS
+        struct termios HostT {};
+        uint64_t Result = ::ioctl(fd, TCGETS, &HostT);
+        if (Result == 0) {
+          FEX::HLE::PPC64::HostToGuest(HostT, *reinterpret_cast<FEX::HLE::PPC64::GuestTermios*>(arg));
+        }
+        SYSCALL_ERRNO();
+      }
+      case 0x5402u:   // x86 TCSETS
+      case 0x5403u:   // x86 TCSETSW
+      case 0x5404u: { // x86 TCSETSF
+        // Array literal cannot live inline here — the C preprocessor's
+        // comma-splitting sees {a, b, c} as extra macro arguments to
+        // REGISTER_SYSCALL_IMPL_X64. Pick via switch instead.
+        uint32_t host_cmd;
+        switch (cmd) {
+          case 0x5402u: host_cmd = TCSETS;  break;
+          case 0x5403u: host_cmd = TCSETSW; break;
+          default:      host_cmd = TCSETSF; break;
+        }
+        struct termios HostT {};
+        FEX::HLE::PPC64::GuestToHost(*reinterpret_cast<const FEX::HLE::PPC64::GuestTermios*>(arg), HostT);
+        uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
+        SYSCALL_ERRNO();
+      }
+      default: break;
+      }
+
       cmd = RemapIoctlForPPC(cmd);
       uint64_t Result = ::ioctl(fd, cmd, arg);
       SYSCALL_ERRNO();
