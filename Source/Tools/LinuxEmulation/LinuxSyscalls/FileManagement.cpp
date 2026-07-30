@@ -1041,8 +1041,18 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
       OverlayAttempted = true;
+      // open()/openat() silently ignore access modes and most other flags when
+      // O_PATH is set, but openat2() rejects them with EINVAL. Since the guest
+      // called the lenient syscall, apply the kernel's own open() masking
+      // before upgrading to openat2, or sloppy-but-legal guest opens fail.
+      // Seen live: libcapsule's capture-libs (Steam pressure-vessel) opens its
+      // --dest with O_RDWR|O_DIRECTORY|O_CLOEXEC|O_PATH.
+      uint64_t How_flags = (uint64_t)flags;
+      if (How_flags & O_PATH) {
+        How_flags &= (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+      }
       FEX::HLE::open_how how = {
-        .flags = (uint64_t)flags,
+        .flags = How_flags,
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
