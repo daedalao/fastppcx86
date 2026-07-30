@@ -1305,6 +1305,45 @@ Discovered incidentally during the audit. None are POWER9-related.
 
 ---
 
+## First quantified before/after — the upstream merge, measured
+
+2026-07-30. The first time this project measured a change against a general-purpose workload rather than
+inferring from a single application. Method: full `stress-ng` baseline recorded at `f90e520b5`, then the
+22-commit merge from `origin/main` (`7c1ddfc74`), then the **identical** sweep re-run — same 18 stressors,
+same single worker, same `--timeout 10s` with an external `timeout 20s` wrapper.
+
+| | pre-merge | post-merge |
+|---|---:|---:|
+| PASS | 6 | **15** |
+| FAIL (deterministic) | 1 | 1 |
+| HANG (timer never delivered) | **9** | **0** |
+| INVALID (stressor absent in 0.18.11) | 2 | 2 |
+
+**All nine timer-hangs cleared.** Every stressor that ignored its own `SIGALRM`-driven `--timeout` now
+honours it. The predicted cause was `57ebd5252` — "emit the deferred-signal fault-page poke the dispatcher
+assumed", where async signals otherwise never drained in hot loops — and the population fits exactly: every
+hanger was a tight loop with no syscall checkpoints (`bsearch`, `tsearch`, `hash` and `atomic` are not
+vectorised, so "vector loops" was the wrong reading), while `cpu`, `memfd` and `memrate` passed throughout
+because they make syscalls or have call boundaries.
+
+**This class matters well beyond stress-ng:** with async signals not draining in compute loops, Ctrl-C does
+not work in a busy loop, `SIGALRM` timeouts never fire, profiling signals never arrive, and watchdogs
+silently fail.
+
+**The control held.** `vecmath` failed **byte-identically** before and after —
+`got=0x0cd267e85e7f9ad7:131dc26043d29f40` against
+`expected=0x0625922a4b5da4bb10afc58fa61974cc`. It was predicted to be unaffected because no upstream commit
+touches it, and an unchanged failure is what confirms the merge did not perturb the 128-bit vector path.
+Without that control, "9 things got better" would have been unfalsifiable.
+
+`ctest` held 6/7011 on both the default and `disableisa30` paths.
+
+**Caveat on the throughput column, stated because this project has been burned by unprovenanced numbers:**
+those runs were **single, unpinned, un-medianed**, and therefore *not* compliant with the standing
+measurement recipe. The pass/fail deltas are solid — nine hangs becoming nine passes is not noise. The
+percentage drifts (`matrix-3d` −11%, `memrate` −37% off a 2-bogo-op base) are **not** trustworthy as
+performance data and must not be cited as such.
+
 ## Validation strategy — three layers, and the rule that stops them scattering
 
 Settled 2026-07-30 after two measurement campaigns were voided. The layers exist because each one checks a
