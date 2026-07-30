@@ -15,12 +15,63 @@ $end_info$
 #include "common/Host.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+namespace {
+// The guest's Vulkan loader configuration must never reach the host loader.
+//
+// These variables name ICD/layer *manifests* and the shared objects they
+// point at. Under a thunk those always describe guest-architecture files, so
+// letting the host loader read them makes it try to load x86 objects into a
+// PPC64LE process. It cannot, and reports the failure as though no usable
+// driver existed at all.
+//
+// This was not hypothetical. Steam's pressure-vessel exports
+//   VK_DRIVER_FILES=.../radeon_icd.i686.json:.../amd_icd32.json:...
+// (i686 only, because those are the ICD manifests present in the FEX RootFS),
+// the host loader found nothing loadable in that list, and every
+// vkCreateInstance from inside the container returned -9
+// VK_ERROR_INCOMPATIBLE_DRIVER — the Steam client's "CVulkanTopology: failed
+// create vulkan instance: -9", and its GPU process aborting on startup.
+// Outside the container, where these variables are unset, the very same thunk
+// enumerated every GPU correctly.
+//
+// The host loader's own default search path is the right answer here: driver
+// selection on the host side is precisely what the thunk exists to delegate.
+// FEX_HOST_<VAR> is honoured first so a host ICD/layer set can still be aimed
+// deliberately (e.g. to pick one of several host drivers for testing).
+//
+// Guest semantics are unaffected: the guest's environment block was
+// materialised into guest memory at exec time, long before this host library
+// is dlopen()ed, so the guest still sees its own values and passes them to
+// any children it spawns.
+__attribute__((constructor)) void SanitizeHostVulkanEnvironment() {
+  for (const char* Var : {
+         "VK_ICD_FILENAMES",
+         "VK_DRIVER_FILES",
+         "VK_ADD_DRIVER_FILES",
+         "VK_LAYER_PATH",
+         "VK_ADD_LAYER_PATH",
+         "VK_IMPLICIT_LAYER_PATH",
+         "VK_ADD_IMPLICIT_LAYER_PATH",
+         "VK_INSTANCE_LAYERS",
+       }) {
+    const auto Override = std::string("FEX_HOST_") + Var;
+    if (const char* Value = getenv(Override.c_str())) {
+      setenv(Var, Value, 1);
+    } else {
+      unsetenv(Var);
+    }
+  }
+}
+} // namespace
 
 #ifdef IS_32BIT_THUNK
 // Union type embedded in VkDescriptorGetInfoEXT
