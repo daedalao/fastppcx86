@@ -33,6 +33,8 @@ endforeach()
 
 target_link_libraries(pthread_cancel.${BITNESS} PRIVATE pthread)
 
+target_link_libraries(ptr_integrity_mt.${BITNESS} PRIVATE pthread)
+
 target_link_options(smc-1-dynamic.${BITNESS} PRIVATE -z execstack)
 
 target_link_libraries(smc-mt-1.${BITNESS} PRIVATE pthread)
