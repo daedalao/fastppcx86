@@ -176,7 +176,16 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
     SYSCALL_ERRNO();
   });
 
-  REGISTER_SYSCALL_IMPL(utimensat,
+  // X64 only: x32 already registers its own utimensat in x32/Time.cpp, which
+  // converts the guest's 32-bit timespec pair before the call. REGISTER_SYSCALL_IMPL
+  // writes BOTH tables (Syscalls.h:704-708), so using it here double-registers:
+  // x32/Time.cpp runs later (x32/Syscalls.cpp:81 vs :56) and wins, so this
+  // handler never applied to 32-bit anyway -- and on an assertions build the
+  // duplicate trips LOGMAN_THROW_A_FMT in x32/Syscalls.h:62, aborting every
+  // 32-bit process at startup.
+  // The 32-bit path still needs RootFS translation; tracked separately so the
+  // timespec32 conversion is not lost.
+  REGISTER_SYSCALL_IMPL_X64(utimensat,
                         [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, const struct timespec* times, int flags) -> uint64_t {
                           uint64_t Result = FEX::HLE::_SyscallHandler->FM.Utimensat(dirfd, pathname, times, flags);
                           SYSCALL_ERRNO();
