@@ -1374,6 +1374,51 @@ diagnosable output we could burn days for nothing. If that happens, the fallback
 workload — a precompiled Mono/XNA game, which exercises the same JIT, SMC, signal and threading paths with
 far better observability and no CEF.
 
+## `stress-ng` end state — 16/16, and how it got there
+
+| | pre-merge `f90e520b5` | post-merge `7c1ddfc74` | post-divide-fix `c1ad823a9` |
+|---|---:|---:|---:|
+| PASS | 6 | 15 | **16** |
+| FAIL | 1 | 1 | **0** |
+| HANG | 9 | 0 | **0** |
+
+Two defects, found in opposite ways and both closed:
+
+**The 9 hangs** came from upstream `57ebd5252` — the deferred-signal fault-page poke the dispatcher assumed
+but never emitted, so async signals never drained in hot loops. Every hanger was a tight loop with no syscall
+checkpoints. Beyond stress-ng that class means Ctrl-C does not work in a busy loop and `SIGALRM` timeouts never
+fire.
+
+**The `vecmath` failure was ours** and had no upstream candidate. Chain of narrowing, each step cheap:
+
+1. `probe_vecops` cleared all 78 individual vector operations, native and under FEX — so the bug was in
+   composition, not any single op.
+2. `probe_vecpressure` cleared register pressure at every N from 4 to 32 — so not spilling either.
+3. **Reading `stress-vecmath.c`** showed the OPS macro contains `%` and `/` on integer vectors, the only two
+   operations neither probe covered. Twenty minutes of reading after two probe cycles — it should have come
+   first.
+4. `stress_vint128_t` is a vector of **one** `__uint128_t`, and GCC has no SIMD 128-bit divide, so those
+   compile to libgcc's `__udivmodti4`/`__umodti3`: **scalar** soft-division. Never a vector bug at all.
+5. A 15-line reproducer gave `q_native = 7, q_fex = 6` — off by exactly one, the signature of a skipped
+   correction step.
+
+**Root cause,** fixed in `c1ad823a9`: the `divdeu + divdu + correct` idiom for 128/64 unsigned divide decided
+its correction using a **64-bit** remainder. When the tentative quotient is `Q-1` the pre-correction remainder
+is `R + Divisor`, bounded only by `2·Divisor` — so any divisor above 2⁶³ wraps past 2⁶⁴, the `rem >= Divisor`
+test reads a wrapped value, and the correction is skipped. Reachable from ordinary guest code because
+`__udivmodti4` **normalises** the divisor so its high bit is set, putting every general-path 128-bit divide
+above the threshold by construction. Now computes the full 128-bit product with `mulhdu` and subtracts with
+borrow; the high word is 0 or 1, and non-zero forces correction without inspecting the low word.
+
+**Caveat on throughput, again:** these remain single unpinned un-medianed runs and are not recipe-compliant.
+Note `vecfp` reads 322.61 → 451.01 across the fix, which a divide correction cannot plausibly explain — treat
+it as unexplained variance, not a gain, unless someone re-measures it properly.
+
+**Method note worth keeping.** Two purpose-built probes were needed to *eliminate* hypotheses, and neither
+found the bug; reading the failing workload's source did, in twenty minutes. Both probes remain valuable as
+permanent coverage — but the order was wrong, and reading what the failing thing actually does should precede
+building instruments to guess at it.
+
 ## First quantified before/after — the upstream merge, measured
 
 2026-07-30. The first time this project measured a change against a general-purpose workload rather than
