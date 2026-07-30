@@ -54,6 +54,22 @@ __attribute__((naked)) static void sigrestore() {
 
 constexpr static uint32_t X86_MINSIGSTKSZ = 2048;
 
+// FEX_SIGTRACE=1: raw write() tracing of the signal delivery/defer/drain/
+// sigreturn flow. Diagnostic-only; snprintf in signal context matches the
+// existing FEX_ABORT_TRIPWIRE precedent.
+static bool SigTraceEnabled() {
+  static const bool on = getenv("FEX_SIGTRACE") != nullptr;
+  return on;
+}
+#define SIGTRACE(fmt, ...) \
+  do { \
+    if (SigTraceEnabled()) { \
+      char _stbuf[256]; \
+      int _stn = snprintf(_stbuf, sizeof(_stbuf), "[ST %d] " fmt "\n", FHU::Syscalls::gettid(), ##__VA_ARGS__); \
+      [[maybe_unused]] auto _stw = write(2, _stbuf, _stn); \
+    } \
+  } while (0)
+
 static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_stack) {
   // The thread object lives just before the alt-stack begin. If the alt-stack
   // is disabled or has no base (signal arrived during thread teardown after
@@ -399,6 +415,13 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   uintptr_t NewSP = OldSP;
   auto Context = reinterpret_cast<ArchHelpers::Context::ContextBackup*>(NewSP);
 
+#ifdef ARCHITECTURE_ppc64le
+  SIGTRACE("RESTORE type=%d guest_rsp=0x%lx backup=0x%lx nip=0x%lx lr=0x%lx flags=0x%x isi=0x%x sig=%d",
+           (int)Type, (unsigned long)Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP], (unsigned long)NewSP,
+           (unsigned long)Context->GPRs[32], (unsigned long)Context->GPRs[36], Context->Flags, (unsigned)Context->InSyscallInfo,
+           Context->Signal);
+#endif
+
   // Restore host state
   ArchHelpers::Context::RestoreContext(ucontext, Context);
 
@@ -419,6 +442,12 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
       // resume at the original NIP like ARM64 -- the kernel's RestoreContext
       // path runs, RestoreContext puts V0..V31 back, and execution continues
       // mid-block with the live pre-signal register file.
+      Frame->InSyscallInfo = Context->InSyscallInfo;
+    } else {
+      // Outside-JIT deliveries stash InSyscallInfo too (a thread blocked in a
+      // guest syscall like sigsuspend has 0xFFFF set while sitting in host C).
+      // Reinstate it with the resumed context so the interrupted syscall op's
+      // tail sees the state it left behind; while the handler ran it was 0.
       Frame->InSyscallInfo = Context->InSyscallInfo;
     }
 
@@ -483,7 +512,28 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     // We are leaving the syscall information behind. Make sure to store the previous state.
     ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
     Thread->CurrentFrame->InSyscallInfo = 0;
+    SIGTRACE("DELIVER sig=%d injit pc=0x%lx rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
+             (unsigned long)Frame->State.rip, (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP],
+             (unsigned long)(uintptr_t)ContextBackup, (unsigned)ContextBackup->InSyscallInfo);
   } else {
+    // The interrupted context can still be mid-syscall even though the host
+    // PC is outside the JIT: DEF_OP(Syscall) sets Frame->InSyscallInfo=0xFFFF
+    // before bctrl'ing into C, so a thread blocked in e.g. sigsuspend carries
+    // the in-syscall spill mask while it waits. The guest handler we are about
+    // to dispatch runs fresh JIT blocks; if the stale mask is left set, any
+    // nested mid-JIT delivery (deferred-signal drain at a poke, another GC
+    // suspend) takes SpillSRA's partial-spill path at a boundary that is NOT
+    // the syscall window and freezes guest RAX..RDI at stale memory values.
+    // That was the Ziggurat "SRA corruption" wedge: Boehm GC's SIGPWR/SIGXCPU
+    // storm nests exactly this way (stop handler parked in sigsuspend).
+    // Scope it like the InJIT branch does: stash in the backup, clear for the
+    // handler, and RestoreThreadState reinstates it with the resumed context.
+    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
+    Thread->CurrentFrame->InSyscallInfo = 0;
+    SIGTRACE("DELIVER sig=%d outside pc=0x%lx indisp=%d rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
+             IsAddressInDispatcher(OldPC) ? 1 : 0, (unsigned long)Frame->State.rip,
+             (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP], (unsigned long)(uintptr_t)ContextBackup,
+             (unsigned)ContextBackup->InSyscallInfo);
     if (!IsAddressInDispatcher(OldPC)) {
       // This is likely to cause issues but in some cases it isn't fatal
       // This can also happen if we have put a signal on hold, then we just reenabled the signal
@@ -642,6 +692,10 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 }
 
 bool SignalDelegator::HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
+  SIGTRACE("SIGILL pc=0x%lx sentinel=%d pause=%d", ArchHelpers::Context::GetPc(ucontext),
+           (ArchHelpers::Context::GetPc(ucontext) == Config.SignalHandlerReturnAddress ||
+            ArchHelpers::Context::GetPc(ucontext) == Config.SignalHandlerReturnAddressRT) ? 1 : 0,
+           ArchHelpers::Context::GetPc(ucontext) == Config.PauseReturnInstruction ? 1 : 0);
   if (ArchHelpers::Context::GetPc(ucontext) == Config.SignalHandlerReturnAddress ||
       ArchHelpers::Context::GetPc(ucontext) == Config.SignalHandlerReturnAddressRT) {
     auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
@@ -854,6 +908,9 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   // through their normal handlers, so a real guest fault is not affected.
   const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(UContext));
   const bool MustDeferAsync = MustDeferSignal || InJIT_ForDefer;
+  SIGTRACE("GUEST sig=%d code=%d pc=0x%lx rip=0x%lx defer=%d injit=%d q=%zu", Signal, SigInfo.si_code,
+           ArchHelpers::Context::GetPc(UContext), (unsigned long)Thread->CurrentFrame->State.rip, MustDeferSignal ? 1 : 0,
+           InJIT_ForDefer ? 1 : 0, ThreadObject->SignalInfo.DeferredSignalFrames.size());
 #else
   const bool MustDeferAsync = MustDeferSignal;
 #endif
@@ -877,6 +934,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // sig mask has been updated at the defer time, recover the original mask
       memcpy(&_context->uc_sigmask, &Top.SigMask, sizeof(uint64_t));
       ThreadObject->SignalInfo.DeferredSignalFrames.pop_back();
+      SIGTRACE("DRAIN sig=%d mask=0x%lx qleft=%zu", Signal, Top.SigMask, ThreadObject->SignalInfo.DeferredSignalFrames.size());
 
       // Until we re-protect the page to PROT_NONE, FEX will now *permanently* defer signals and /not/ check them.
       //
@@ -923,6 +981,8 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
     // Now update the faulting page permissions so it will fault on write.
     mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    SIGTRACE("DEFER sig=%d pc=0x%lx newmask=0x%lx q=%zu", Signal, ArchHelpers::Context::GetPc(UContext), NewMask,
+             ThreadObject->SignalInfo.DeferredSignalFrames.size());
 
     // Postpone the remainder of signal handling logic until we process the SIGSEGV triggered by writing to InterruptFaultPage.
     return;
