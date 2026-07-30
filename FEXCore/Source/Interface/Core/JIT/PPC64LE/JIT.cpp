@@ -1985,6 +1985,23 @@ void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF
   }
 }
 
+void PPC64JITCore::EmitSuspendInterruptCheck() {
+  // Single byte-store poke of the InterruptFaultPage (see JITClass.h and the
+  // matching drain logic in SignalDelegator::HandleGuestSignal). The stored
+  // value is irrelevant -- the page carries no data, it exists to fault when
+  // a deferred signal is pending. r0 is architecturally safe as the source
+  // (the r0==0 block invariant makes it dead here, and stb only reads it).
+  // The SEGV handler's nested-deferral path skips a faulting store by
+  // advancing NIP by 4, which this single fixed-size stb satisfies.
+  constexpr int32_t FaultOff = static_cast<int32_t>(
+    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
+    offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+  static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) >=
+                offsetof(FEXCore::Core::InternalThreadState, BaseFrameState),
+                "InterruptFaultPage must lie at or after BaseFrameState");
+  stb(r(0), FaultOff, STATE);
+}
+
 // -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
@@ -2289,6 +2306,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+      // Drain any deferred async signal at this guest instruction boundary.
+      // Every dispatcher hit and linked block-to-block jump lands here, so a
+      // guest loop spanning compile units cannot orbit without passing a
+      // fault-page poke. Placed before the stdu so intra-unit jumps (bound
+      // below) skip it -- backward intra-unit edges emit their own poke in
+      // DEF_OP(Jump)/DEF_OP(CondJump).
+      EmitSuspendInterruptCheck();
       if (SpillFrameSize) {
         // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
         // For larger frames, emit the equivalent of stdu manually so callers

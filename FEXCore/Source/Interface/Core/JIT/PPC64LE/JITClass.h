@@ -306,6 +306,16 @@ private:
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);
 
+  // Emit a one-instruction poke of the thread's InterruptFaultPage. PPC64LE
+  // treats the whole JIT code buffer as an async-signal deferral region
+  // (SignalDelegator's InJIT_ForDefer): a deferred signal mprotects the page
+  // PROT_NONE and relies on this store faulting at the next guaranteed-
+  // coherent guest boundary to drain the queue. Emitted at every dispatcher-
+  // reachable EntryPoint and before every backward intra-unit branch so a
+  // hot guest loop of fully-linked blocks cannot spin forever with the
+  // signal queued (and the host mask left at the handler's sa_mask).
+  void EmitSuspendInterruptCheck();
+
   // -----------------------------------------------------------------------
   // Memory operation helpers (defined in MemoryOps.cpp)
   // -----------------------------------------------------------------------
