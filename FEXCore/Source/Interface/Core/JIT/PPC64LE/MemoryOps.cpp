@@ -673,24 +673,30 @@ DEF_OP(LoadMemTSO) {
   // precisely because per-load acquire cost "cumulatively dominates runtime in
   // libc / pthread tight loops".
   //
-  // It is also the source of the port's memory corruption. Measured on POWER9
-  // against a Mono `mcs` invocation, 15 runs per configuration:
+  // It is *a* source of the port's memory corruption, and this change reduces
+  // that corruption without eliminating it. Measured on POWER9 against a Mono
+  // `mcs` invocation, corruption = SIGSEGV or glibc pthread mutex assertion:
   //
-  //     idiom (before)     SIGSEGV + glibc pthread mutex assertions, ~20% of runs
-  //     lwsync  (after)    0/15 SIGSEGV, 0/15 mutex assertions
+  //     idiom (before)     ~30%   (10 runs)
+  //     lwsync  (after)     13.3% (4/30 runs)
   //
-  // and `FEX_LOCKONLYTSO=1`, which routes plain MOV off this path entirely while
-  // keeping TSO for LOCK-prefixed ops, independently gave 0/15 on both classes.
-  // Three configurations agree that this specific sequence is the cause.
+  // An earlier 15-run sample of this change read 0/15 and that was luck, not a
+  // result: at a 13% true rate, P(0 events in 15 trials) is about 12%. **A
+  // residual ~13% means a SECOND corruption path exists** that this does not
+  // touch. Do not read this fix as closing the issue.
   //
-  // WHY it corrupts is still open — see the plan's TSO section. The leading
-  // candidates both involve code that reads a fixed instruction window around a
-  // load: `HandleUnalignedAtomicSIGBUS` (`Utils/ArchHelpers/PPC64.cpp:199`)
-  // requires primary-31 at PC+0 *and* PC+4 and then advances a hardcoded 12
-  // bytes, and `HalfBarrierTSOEnabled` (default true) backpatches faulting
-  // unaligned accesses into atomic sequences in place. Either could mis-target
-  // when three extra instructions sit behind every load. Do not restore the
-  // cheap idiom on the strength of an argument; it needs a measurement.
+  // WHY the idiom corrupts at all is also still open — see the plan's TSO
+  // section. The leading candidates both involve code that reads a fixed
+  // instruction window around a load: `HandleUnalignedAtomicSIGBUS`
+  // (`Utils/ArchHelpers/PPC64.cpp:199`) requires primary-31 at PC+0 *and* PC+4
+  // and then advances a hardcoded 12 bytes, and `HalfBarrierTSOEnabled` (default
+  // true) backpatches faulting unaligned accesses into atomic sequences in place.
+  // Either could mis-target when three extra instructions sit behind every load.
+  //
+  // Two warnings for whoever touches this next. Do not restore the cheap idiom on
+  // the strength of an argument — it needs a measurement. And do not accept a
+  // zero-event run as proof: at these rates 15 trials cannot establish a zero,
+  // and 30 only rules out a true rate above ~10%.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
     lwsync();
