@@ -80,12 +80,27 @@ namespace x64 {
   };
 
   // PushDynamicRegs/PopDynamicRegs spill-frame layout (ELFv2, x64 guest).
-  // 32-byte link area at bottom, then GPRs, then 16-byte-aligned FPRs.
-  static constexpr size_t kDynLinkArea  = 32;
-  static constexpr size_t kDynGPRStart  = kDynLinkArea;                               // 32
-  static constexpr size_t kDynFPRStart  = (kDynGPRStart + RA.size() * 8 + 15u) & ~15u; // 80
+  //
+  // ELFv2 requires the CALLER to reserve 32 bytes of linkage area + 64 bytes
+  // of parameter save area = 96 bytes at the BOTTOM of any frame from which
+  // it issues a bctrl. A gcc-emitted callee writes its saved LR at
+  // [caller_r1+16] unconditionally, and any callee that spills its incoming
+  // argument registers writes [caller_r1+32 .. caller_r1+96) without a frame
+  // of its own -- verified against gcc 14.2 output.
+  //
+  // Was 32 bytes. That put the FIRST dynamic FPR slot at [r1+80], which is
+  // parameter slots 6 and 7 (the r9/r10 homes). A callee that spilled its
+  // incoming args issued `std r9,80(r1); std r10,88(r1)`, and PopDynamicRegs'
+  // `lvx v16, [r1+80]` then loaded {r9_value, r10_value} into RAFPR[0] --
+  // a live guest vector SSA value. The next StoreMem of it wrote 16 bytes
+  // (two adjacent qwords, 16-byte aligned) of the wrong pointer values into
+  // guest memory, third qword intact. That is the +0/+8 clobbered / +16
+  // intact fingerprint observed in the std::thread bring-up SIGSEGV.
+  static constexpr size_t kDynLinkArea  = 96;
+  static constexpr size_t kDynGPRStart  = kDynLinkArea;                               // 96
+  static constexpr size_t kDynFPRStart  = (kDynGPRStart + RA.size() * 8 + 15u) & ~15u; // 144
   static constexpr size_t kDynRegSaveSize =
-      (kDynFPRStart + RAFPR.size() * 16 + 15u) & ~15u;                                // 304
+      (kDynFPRStart + RAFPR.size() * 16 + 15u) & ~15u;                                // 368
 }
 
 // -------------------------------------------------------------------------
@@ -108,11 +123,13 @@ namespace x32 {
     VR{24}, VR{25}, VR{26}, VR{27}, VR{28}, VR{29},
   };
 
-  static constexpr size_t kDynLinkArea  = 32;
+  // ELFv2 96-byte reservation as x64 above. Same reasoning; the x32 numbers
+  // work out to 208 for kDynFPRStart and 560 for kDynRegSaveSize.
+  static constexpr size_t kDynLinkArea  = 96;
   static constexpr size_t kDynGPRStart  = kDynLinkArea;
-  static constexpr size_t kDynFPRStart  = (kDynGPRStart + RA.size() * 8 + 15u) & ~15u; // 144
+  static constexpr size_t kDynFPRStart  = (kDynGPRStart + RA.size() * 8 + 15u) & ~15u; // 208
   static constexpr size_t kDynRegSaveSize =
-      (kDynFPRStart + RAFPR.size() * 16 + 15u) & ~15u;                                // 496
+      (kDynFPRStart + RAFPR.size() * 16 + 15u) & ~15u;                                // 560
 }
 
 // Caller-saved GPR mask: r3-r12 (bits 3..12 set)
