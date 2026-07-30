@@ -1303,6 +1303,74 @@ Discovered incidentally during the audit. None are POWER9-related.
 
 ---
 
+## Open defect register — as of 2026-07-30
+
+Consolidated so nothing lives only in the build-agent log. Ordered by my judgement of value.
+
+| # | Defect | Status | Notes |
+|---|---|---|---|
+| 1 | **`readlink`/`openat2` returns EACCES for rootfs-view paths** | Characterised, unfixed | `probe_file_lookup.c` isolates it: `stat`/`statx`/path-based `open`/`access` all succeed, `readlink` and `realpath` fail. Root cause almost certainly the **EXDEV-only fallback** at `FileManagement.cpp:604-625` combined with callers propagating any non-`ENOENT` errno as fatal. **Recommended next fix** — see the instrument note below |
+| 2 | **TSO-path memory corruption** | Partially reduced, mechanism unknown | Full matrix below. `lwsync` both sides landed; `LOCKONLYTSO=1` measures best at 0/30 |
+| 3 | **Guest `int3`/`ud2` silently destroy the thread** | Designed + adversarially reviewed, **not landed** | Phase 1 as designed would core-dump on the missing host SIGTRAP thunk. `trap_flag.64` is its acceptance test |
+| 4 | **Mono HANG class** | Untouched | `LOCKONLYTSO=1` floors it at 10%; every other config 37–63%. Last thing between the port and Mono |
+| 5 | **NoExec entry-block forensic abort** | Unfixed | One root cause, four FEXLinuxTests symptoms: `sigill_flags.64`, `smc-exec-stack.64`, `smc-missing-gnustack.64`, `smc-unexec-stack.64` |
+| 6 | `execveat_memfd.64` dies with signal 5 | Unfixed | FEXLinuxTests |
+| 7 | `cpu_count.64` — 16 max addressable IDs vs 128 `hw_concurrency` | Unfixed | POWER9 topology; may be an x86 semantic difference rather than a bug |
+| 8 | **Perf cost of the landed TSO fix** | Unmeasured | vkmark 1364 at SMT4 is not recipe-comparable. Blocked on the SMT2 flip (user action) |
+| 9 | `r0` zero-on-entry residual | Unchecked | ELFv2 makes `r0` volatile; `PushCalleeSavedRegisters` touches it. One code read |
+| 10 | README:11 SIGABRT-on-exit in FTL | Never reproduced | Both play sessions were SIGKILLed, so the natural exit path never ran |
+| 11 | `syscalls_efault.64` | **Not a defect** | Expected-fail test that unexpectedly passes — metadata mismatch |
+
+### The TSO matrix, and why I distrust it
+
+| Load barrier | Store barrier | Corruption | HANG | Sample |
+|---|---|---:|---:|---:|
+| none | none | 3.3% | 46.7% | 30 |
+| `lwsync` | `lwsync` (landed) | 13.3% | 56.7% | 30 |
+| 4×`nop` | 4×`nop` | 13.3% | 63.3% | 30 |
+| **none** | **`lwsync`** | **40.0%** | 36.7% | 30 |
+| `lwsync` | none | 16.7% | 56.7% | 30 |
+| *bypassed* (`LOCKONLYTSO=1`) | *bypassed* | **0.0%** | **10.0%** | 30 |
+
+**Established:** barrier *strength* is irrelevant (`lwsync` and `sync` measure identically); `nop`s
+behave like barriers, so this is not about ordering; **mismatched sides are far worse than either
+matched configuration.**
+
+**Not established:** any mechanism. Six hypotheses have been refuted by measurement — dose-response on
+word count, code-buffer overflow past `kBlockHeadroom`, the ARM64 unaligned handler, an
+`HandleUnalignedAtomicSIGBUS` mis-parse, the four-outcome load/store isolation table, and a discarded
+`[[nodiscard]]` on `GetEmptyCodeBuffer`. That refutation rate is itself the finding: the mechanism is
+somewhere we do not currently have visibility, and the next step should add instrumentation rather than
+another hypothesis.
+
+**A correction to record.** I earlier concluded that IR op identity "contributes nothing measurable,"
+from the corruption column alone (1/30 against 0/30). The **HANG** column contradicts that — 46.7%
+against 10% at n=30 each, on configurations whose emitted code is supposedly byte-identical. Either the
+emission is not identical or op identity matters. One column was compared and the conclusion
+generalised.
+
+**The one structural divergence worth investigating next.** `JIT.cpp:1987-1988` records that PPC64
+**emits directly into the shared `CurrentCodeBuffer`**, where Arm64JITCore stages into a per-thread
+`TempCodeBuffer` and copies under the lock. Combined with `CPUBackend.h:199` ("old CodeBuffer generations
+required to be valid until returning from signal handlers") and buffer swaps via
+`GetEmptyCodeBuffer`/`StartLargerCodeBuffer`, that is a plausible neighbourhood for size-sensitive
+corruption: inflating every block makes buffer exhaustion and swaps more frequent. Flagged as a lead, not
+a finding — and given the refutation record above, it needs instrumentation before belief.
+
+### Why the instrument is the real problem
+
+**Every `mcs` run in all 240+ trials failed with `CS2001` because of defect 1.** So the entire TSO matrix
+measures crash behaviour on an *error path*, never on real compilation, in a workload that carries at
+least two other unfixed defects. The HANG rate swinging 10–63% across supposedly near-equivalent
+configurations is consistent with that.
+
+**Fix defect 1 first.** It is the most tractable, it is independent of the others, and it converts `mcs`
+from a degenerate error-path exerciser into a workload that actually compiles something. Re-measure TSO
+against that. Continuing to bisect against the current instrument risks several more cycles
+characterising an artifact.
+
+---
+
 ## Negative results
 
 Post-review. Three items from revision 1 were overturned; those now appear in
