@@ -1383,21 +1383,28 @@ extern "C" {
 
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
-  // Log this compile attempt (best-effort; faults on _InstStream read are
-  // tolerated — the caller is about to fail anyway in that case).
+  // Log this compile attempt. The copy MUST NOT cross the page the entry
+  // point lives on: a block entry in the last 15 bytes of a mapping is
+  // legal x86 (the guarded PeekByte path decodes it fine), but this raw
+  // read would fault on the following page if it is unmapped. That was not
+  // hypothetical: mono's trampoline arenas are 64K chunks each followed by
+  // a 4K guard hole, and trampolines allocated at chunk_end-12 made this
+  // very loop SIGSEGV in host code — misdelivered to the guest at the
+  // trampoline RIP, mono classified it as a native-code fault and
+  // abort()ed (the recurring Ziggurat "trampoline SIGSEGV" crash, guest
+  // rips 0x7ff30ff4/0x7ff41ff4 == page_end-12; repros/trampedge.c).
   {
     uint64_t idx = g_compile_log_count++ & 255;
     g_compile_log[idx].guest_rip   = PC;
     g_compile_log[idx].src_host_va = reinterpret_cast<uint64_t>(_InstStream);
-    // Try to read 16 bytes. We use memcpy in a SIGSEGV-tolerant way (best
-    // effort — if the read faults the entry's bytes stay zeroed).
     for (int b = 0; b < 16; ++b) {
       g_compile_log[idx].bytes[b] = 0;  // pre-zero
     }
     if (_InstStream) {
-      // Don't use memcpy directly; some pages may not be readable.
-      // We just bulk-copy and accept faults.
-      for (int b = 0; b < 16; ++b) {
+      const uint64_t Addr = reinterpret_cast<uint64_t>(_InstStream);
+      const uint64_t ToPageEnd = FEXCore::Utils::FEX_PAGE_SIZE - (Addr & (FEXCore::Utils::FEX_PAGE_SIZE - 1));
+      const int CopyLen = static_cast<int>(std::min<uint64_t>(16, ToPageEnd));
+      for (int b = 0; b < CopyLen; ++b) {
         g_compile_log[idx].bytes[b] = _InstStream[b];
       }
     }
