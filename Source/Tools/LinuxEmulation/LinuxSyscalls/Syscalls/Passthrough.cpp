@@ -15,6 +15,9 @@ $end_info$
 
 #include <stdint.h>
 #include <sched.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <termios.h>  // PPC TCGETS family expands to use sizeof(struct termios)
@@ -376,6 +379,32 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
                          (unsigned long)timeout, (unsigned long)uaddr2, (unsigned long)val3, err);
         [[maybe_unused]] auto _ = write(2, buf, n);
       }
+    }
+  }
+
+  // Diagnostic: full futex traffic trace, for chasing lost-wakeup livelocks.
+  // Two-stage arming so it costs one bool load until wanted and can be turned
+  // on mid-run once a wedge is established: run with FEX_FUTEX_TRACE=1, then
+  // `touch /tmp/ftx_on` to start logging (rm to stop). Logs every futex call:
+  // tid, op, uaddr, val, kernel result, and the futex word's live value after
+  // return -- enough to see a WAIT that never blocks and whether any WAKE
+  // targets the same uaddr.
+  {
+    static const bool trace_futex = (getenv("FEX_FUTEX_TRACE") != nullptr);
+    if (trace_futex && access("/tmp/ftx_on", F_OK) == 0) {
+      static thread_local pid_t tls_tid = 0;
+      if (tls_tid == 0) {
+        tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
+      }
+      uint32_t cur = 0xdeadbeef;
+      if (uaddr && signed_result != -EFAULT) {
+        memcpy(&cur, reinterpret_cast<const void*>(uaddr), sizeof(cur));
+      }
+      char buf[192];
+      int n = snprintf(buf, sizeof(buf), "[FTX] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
+                       static_cast<int>(tls_tid), (unsigned long)futex_op, (unsigned long)uaddr, (unsigned long)val,
+                       (unsigned long)timeout, (long)signed_result, cur);
+      [[maybe_unused]] auto _ = write(2, buf, n);
     }
   }
 
