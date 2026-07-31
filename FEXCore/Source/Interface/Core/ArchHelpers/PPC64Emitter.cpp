@@ -602,41 +602,30 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
 void PPC64EmitterBase::SpillForABICall(GPR tmp, bool FPRs) {
   SpillStaticRegs(tmp);
   PushDynamicRegs(tmp);
-  // Mark InSyscallInfo=0xFFFF so SignalDelegator's SpillSRA path uses the
-  // bits as an IgnoreMask and skips re-spilling SRA gprs from
-  // volatile-clobbered host registers during the host C call. Mirrors the
-  // DEF_OP(Syscall) site in BranchOps.cpp and the ARM64 MiscOps.cpp:260
-  // pattern. Required for signal safety across every spill+host-call+fill
-  // sequence; without it, async signal arrival during the call has its
-  // handler clobber State.gregs with junk from post-call volatile regs.
-  LoadConstant(tmp, 0xFFFFu);
-  std(tmp,
-      static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)),
-      STATE);
+  // NB. Do NOT set InSyscallInfo=0xFFFF here. That marker means "we are
+  // currently in a JIT-emitted Syscall op" and only DEF_OP(Syscall) is
+  // allowed to raise it (ARM64 parity: `JIT/BranchOps.cpp:278`, plus
+  // ARM64's DEF_OP(ProcessorID) which is a real getcpu syscall at
+  // `JIT/MiscOps.cpp:260`; ppc64le's DEF_OP(ProcessorID) does `li r,0`
+  // and needs no marker). SpillForABICall serves every host-C-call site
+  // in the backend (thunks, CPUID, atomic helpers, AES/SHA/CRC32
+  // helpers, x87 fallbacks) and thunks in particular RE-ENTER the guest
+  // via CallbackPtr -- with the marker set, callback code runs with
+  // SpillSRA IgnoreMask=0xFFFF, so any signal arriving in the callback
+  // skips all 16 x86-64 SRA GPR spills. State.rip then gets a
+  // ContextBackup* interpreted as guest-stack, and the guest resumes
+  // with a garbage RIP. That was the 2026-07-31 Factorio crash
+  // (SIGTRACE showed isi=0xffff on every DELIVER; PC=0xaacb584c2489d700).
 }
 
 void PPC64EmitterBase::FillForABICall(bool FPRs) {
   PopDynamicRegs();
-  // Order matters: FillStaticRegs FIRST, THEN clear InSyscallInfo.
-  // Mirrors the ARM64 reference pattern at MiscOps.cpp:280-299 — "Now that
-  // we are done in the syscall we need to carefully peel back the state.
-  // First unspill the registers from before. Now the registers we've spilled
-  // are back in their original host registers. We can safely claim we are no
-  // longer in a syscall."
-  //
-  // If we clear InSyscallInfo first (the WRONG order), an async signal
-  // arriving between the clear and FillStaticRegs sees IgnoreMask=0 and runs
-  // a FULL SpillSRA from host registers that are still in volatile-clobbered
-  // (post-host-call) state — overwriting State.gregs with junk. The handler
-  // then returns via rt_sigreturn and the JIT resumes with corrupted gregs
-  // (most visibly: guest EBX=0 → next [ebx + disp] access SEGVs near NULL).
   FillStaticRegs();
+  // Paired clear removed with the set above. r0 is volatile per the ELFv2
+  // ABI; the JIT relies on r0=0 as the zero-index for `ldx`/`stdx`-style
+  // instructions, so restore that invariant explicitly. Not a store to
+  // InSyscallInfo any more.
   li(GPRegs::r0, 0);
-  std(GPRegs::r0,
-      static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)),
-      STATE);
-  // r0 is volatile per the C ABI; the JIT relies on r0=0 as a "zero index" for
-  // stdx/ldx-style instructions. Already 0 from the InSyscallInfo clear above.
 }
 
 } // namespace FEXCore::CPU
