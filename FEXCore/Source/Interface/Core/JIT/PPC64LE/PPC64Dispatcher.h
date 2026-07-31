@@ -84,8 +84,17 @@ private:
   uint64_t ThreadPauseHandlerAddress {};
   uint64_t PauseReturnInstruction {};
 
-  // Signal return handler address (shared for both RT and non-RT)
+  // Signal return handler addresses. Two distinct sentinel words: the
+  // non-RT and RT sigreturn paths call different function pointers so
+  // HandleSIGILL can distinguish RestoreType::TYPE_NONREALTIME from
+  // TYPE_REALTIME by comparing ucontext PC. Aliasing them caused every
+  // signal return to be torn down as REALTIME regardless of which frame
+  // was actually built -- a 64-bit-multithreaded-workload crasher
+  // (surfaced by Factorio 2026-07-31, LR pointing at
+  // HandleSignalHandlerReturn(RT=true) on the SIGILL). Mirrors ARM64
+  // Dispatcher.cpp:379,387 which emits two hlt(0) sentinels.
   uint64_t SignalHandlerReturnAddress {};
+  uint64_t SignalHandlerReturnAddressRT {};
 
   // Guest signal stubs
   uint64_t GuestSignal_SIGILL_Address {};

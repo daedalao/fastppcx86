@@ -107,7 +107,7 @@ void PPC64Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thr
   Ptrs.GuestSignal_SIGTRAP       = GuestSignal_SIGTRAP_Address;
   Ptrs.GuestSignal_SIGSEGV       = GuestSignal_SIGSEGV_Address;
   Ptrs.SignalReturnHandler       = SignalHandlerReturnAddress;
-  Ptrs.SignalReturnHandlerRT     = SignalHandlerReturnAddress;
+  Ptrs.SignalReturnHandlerRT     = SignalHandlerReturnAddressRT;
   Ptrs.PPC64_PauseSchedYield     = reinterpret_cast<uint64_t>(&PPC64_PauseSchedYield);
 
   InterpreterOps::FillFallbackIndexPointers(Ptrs.FallbackHandlerPointers, &ABIPointers[0]);
@@ -615,10 +615,21 @@ void PPC64Dispatcher::EmitDispatcher() {
   // Called from C++ as a function pointer (rt_sigreturn syscall handler);
   // must NOT actually return. Faulting here makes the host kernel raise
   // SIGILL, and SignalDelegator::HandleSIGILL detects PC ==
-  // SignalHandlerReturnAddress and runs RestoreThreadState. Same trick
-  // PauseReturnInstruction uses above. arm64 emits hlt(0) for this.
+  // SignalHandlerReturnAddress{,RT} and runs RestoreThreadState. Same
+  // trick PauseReturnInstruction uses above. arm64 emits hlt(0) for
+  // this.
+  //
+  // TWO distinct sentinels: HandleSignalHandlerReturn(RT) picks which
+  // to call, and HandleSIGILL compares the trapped PC against both to
+  // decide RestoreType (REALTIME vs NONREALTIME). If they share an
+  // address the ternary at SignalDelegator.cpp:704 always picks RT and
+  // 64-bit sigreturn tears the wrong frame -- the Factorio SIGILL on
+  // pthread's SIGRTMIN handler was this defect (2026-07-31).
   // ==============================================================
   SignalHandlerReturnAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  Emit32(0x00000000u);
+
+  SignalHandlerReturnAddressRT = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   Emit32(0x00000000u);
 
   // ==============================================================
@@ -1205,7 +1216,7 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
     .AbsoluteLoopTopAddress        = DispatcherLoopTopAddress,
     .AbsoluteLoopTopAddressFillSRA = DispatcherLoopTopFillSRAAddress,
     .SignalHandlerReturnAddress     = SignalHandlerReturnAddress,
-    .SignalHandlerReturnAddressRT   = SignalHandlerReturnAddress,  // same on ppc64le
+    .SignalHandlerReturnAddressRT   = SignalHandlerReturnAddressRT,
 
     .PauseReturnInstruction            = PauseReturnInstruction,
     .ThreadPauseHandlerAddressSpillSRA = ThreadPauseHandlerAddressSpillSRA,
