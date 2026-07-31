@@ -667,10 +667,24 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   // Push ThunkCallbackRet onto the guest stack so the guest callback's ret
   // lands on the 0F3E trampoline, which triggers CallbackReturn IR op.
-  // Mirrors the ARM64 dispatcher: decrement guest RSP by 16 (maintains
-  // x86-64 stack alignment), store ThunkCallbackRet at [new_RSP+0].
-  // CallbackReturn subsequently does RSP += 8 to undo the net -8 effect.
+  // Mirrors the ARM64 dispatcher.
+  //
+  // Invariant: push == retaddr_size + 8, because CallbackReturn's `+8` is
+  // unconditional and correct on both backends. So:
+  //   x86-64: push 16, guest `ret` pops 8, CallbackReturn adds 8 -> net 0
+  //   i386  : push 12, guest `ret` pops 4, CallbackReturn adds 8 -> net 0
+  //
+  // Was hard-coded to -16 + std(8-byte), which leaked -4 per callback under
+  // an i386 guest. Not visible today because GuestStackBumpAllocator
+  // (ThunkLibs/include/common/Host.h:674-706, active whenever
+  // THUNK_HOST_NOT_X86_64 is defined -- true for every thunk lib on this
+  // host, see ThunkLibs/HostLibs/CMakeLists.txt:49-51) snapshots guest RSP
+  // before each callback and restores it after, so the leak never
+  // accumulates. But it goes live the moment anything reaches CallbackPtr
+  // outside that wrapper.
   {
+    const bool Is64Bit = CTX->Config.Is64BitMode();
+    const int16_t PushBytes = Is64Bit ? -16 : -12;
     int32_t ret_off = static_cast<int32_t>(
       offsetof(CpuStateFrame, Pointers.ThunkCallbackRet));
     int32_t rsp_off = static_cast<int32_t>(
@@ -681,13 +695,17 @@ void PPC64Dispatcher::EmitDispatcher() {
     // 64-bit storage, and while SpillStaticRegs masks on the way out, host C++
     // code paths (RestoreFrame_ia32, CallCallback, etc.) can write gregs as
     // 64-bit values whose upper bits leak host pointers. Without this mask,
-    // "addi -16; std TMP1, 0(TMP2)" stores ThunkCallbackRet to a host stack
+    // "addi -N; store TMP1, 0(TMP2)" stores ThunkCallbackRet to a host stack
     // address — observed in Steam-with-Vulkan-thunk as NoExec crashes when
     // the guest later derefs the corrupted RSP.
     MaybeClrUpper32(TMP2);
-    addi(TMP2, TMP2, -16);        // RSP -= 16 (stack grows down, 16-byte align)
+    addi(TMP2, TMP2, PushBytes);  // RSP -= 16 (x86-64) / 12 (i386)
     MaybeClrUpper32(TMP2);        // re-mask after addi in case borrow extended high bits
-    std(TMP1, 0, TMP2);           // [RSP+0] = ThunkCallbackRet
+    if (Is64Bit) {
+      std(TMP1, 0, TMP2);         // [RSP+0] = ThunkCallbackRet (8B x86-64)
+    } else {
+      stw(TMP1, 0, TMP2);         // [RSP+0] = ThunkCallbackRet (4B i386)
+    }
     std(TMP2, rsp_off, STATE);    // write back new RSP to state
   }
 
