@@ -85,7 +85,24 @@ struct PPC64ContextBackup {
   uint64_t SigInfoLocation;
   FEXCore::Core::CPUState GuestState;
 
-  static constexpr int RedZoneSize = 0;
+  // ELFv2 ABI §2.2.2.4 mandates a 288-byte red zone below the stack
+  // pointer -- accessible without adjusting r1. StoreThreadState at
+  // SignalDelegator.cpp:304-318 subtracts RedZoneSize from OldSP before
+  // stamping ContextBackup, so RedZoneSize=0 causes every signal
+  // delivery to overwrite [OldSP-288, OldSP) with a ContextBackup whose
+  // GuestState tail sits exactly at OldSP. The JIT uses r1-negative
+  // scratch in ~250 places (JIT.cpp, ALUOps.cpp, AtomicOps.cpp,
+  // VectorOps.cpp, MemoryOps.cpp; e.g. ALUOps.cpp:3629 does
+  // `addi(TMP1, r1, -32); stvx(...); lfd(..., -32, r1)`), so any block
+  // holding scratch in the red zone across a signal delivery gets its
+  // scratch replaced with the tail of a guest CPUState, and the block
+  // resumes reading corruption. This is guest-state corruption from an
+  // ordinary signal with no thread race required.
+  //
+  // Corresponds to MContext_x86_64.h:25 which sets 128 for x86-64's red
+  // zone. MContext_arm64.h:49 correctly sets 0 (AArch64 Linux has no
+  // red zone) -- ppc64le originally copied that.
+  static constexpr int RedZoneSize = 288;
 };
 
 using ContextBackup = PPC64ContextBackup;
