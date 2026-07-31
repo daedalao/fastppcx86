@@ -297,7 +297,17 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
         auto ThunkPath = fextl::fmt::format("{}/{}", ThunkGuestPath, DBDepend.LibraryName);
         if (!FHU::Filesystem::Exists(ThunkPath)) {
           if (!Is64BitMode) {
-            // Guest libraries not existing is expected since not all libraries are thunked on 32-bit
+            // Not every guest library is thunked on 32-bit; the whole thunk
+            // set may also simply not have been built (BUILD_THUNKS_32BIT=OFF
+            // is the default when the toolchain lacks 32-bit multilib). Log
+            // so an unbuilt thunk set does not fail silently -- the guest
+            // silently loads its own rootfs library instead, which for
+            // libGL/libvulkan means never reaching the host GPU and no
+            // symptom other than "gldriverquery returns nothing".
+            LogMan::Msg::DFmt("32-bit thunk not present: {} (guest will use its "
+                              "own copy in the rootfs; host acceleration not "
+                              "available for this library)",
+                              ThunkPath);
             return;
           }
           ERROR_AND_DIE_FMT("Requested thunking via guest library \"{}\" that does not exist", ThunkPath);
@@ -828,7 +838,7 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
   // f674ed515's motivating cases (bwrap writing bind-mount source files at /
   // that mount() then reads through the real namespace) resolve on the host
   // first and never reach this branch, so containment holds.
-  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !(flags & O_TMPFILE)) {
+  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !IsTmpFile((uint64_t)flags)) {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
@@ -1234,7 +1244,7 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
   // Host create returned ENOENT because the parent only exists in the rootfs
   // (Factorio's /opt/factorio/.lock, apt's /var/cache/apt/*). Same host-first/
   // rootfs-on-ENOENT pattern as FM.Open above (mirroring chdir 6c79ed559).
-  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !(flags & O_TMPFILE)) {
+  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !IsTmpFile((uint64_t)flags)) {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
