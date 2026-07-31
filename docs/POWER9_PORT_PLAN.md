@@ -41,21 +41,119 @@ Headline conclusions, post-review:
 
 ## Contents
 
+- [Running privileged operations under FEX](#running-privileged-operations-under-fex)
 - [Applicability ledger — keeping POWER8 recoverable](#applicability-ledger--keeping-power8-recoverable)
 - [Tier 0 — SMC hardening (theory refuted)](#tier-0--smc-hardening-theory-refuted)
 - [Tier 1 — POWER8-legal, available today](#tier-1--power8-legal-available-today)
 - [Tier 2 — POWER9-gated wins](#tier-2--power9-gated-wins)
 - [The graphics path (architecture-neutral)](#the-graphics-path-architecture-neutral)
 - [Bugs found in the current backend](#bugs-found-in-the-current-backend)
+- [Landed cycle 2026-07-31 — five real defects, no crash-rate movement](#landed-cycle-2026-07-31--five-real-defects-no-crash-rate-movement)
 - [Negative results](#negative-results)
 - [Additional opportunities](#additional-opportunities)
 - [Traps and invariants](#traps-and-invariants)
 - [Refuted and corrected](#refuted-and-corrected)
+- [Operational gotchas — the setup traps that cost real time](#operational-gotchas--the-setup-traps-that-cost-real-time)
+- [Measurement recipe — SMT2 pinned, WOF uncontrolled](#measurement-recipe--smt2-pinned-wof-uncontrolled)
 - [Hardware probe checklist](#hardware-probe-checklist)
 - [Mono / spin debug plan](#mono--spin-debug-plan)
 - [Instruction availability tables](#instruction-availability-tables)
 - [Open questions needing hardware](#open-questions-needing-hardware)
 - [Sources and method](#sources-and-method)
+
+---
+
+## Running privileged operations under FEX
+
+For anything inside the guest that needs root (apt install, dpkg -i,
+mount, useradd, and so on) use a **user namespace**, not `sudo`.
+Long-form skill lives in `.claude/skills/fex-superuser/SKILL.md`; the
+essentials below must not be lost.
+
+### Working invocation
+
+```
+unshare -Ur --map-users=auto --map-groups=auto FEX <command>
+```
+
+`--map-users=auto` reads `/etc/subuid` and maps a range so that
+`setuid(N)` calls inside the guest (dpkg drops to `_apt` uid 42,
+pacman post-install hooks, etc.) land on real host uids. Plain
+`unshare -Ur` maps ONLY uid 0 -> $UID and breaks on the first uid
+drop with EPERM. **Do not use plain `-Ur` for real work.**
+
+Package manager depends on the rootfs distro:
+
+- Arch: `unshare ... FEX /usr/bin/pacman -Sy <pkg>`
+- Ubuntu/Debian: `unshare ... FEX /usr/bin/apt install -y <pkg>`
+
+### Do not use `sudo`
+
+`sudo` re-execs FEX as root. Root's `HOME` differs, so FEX reads a
+different `~/.fex-emu`. `sudo` strips `FEX_APP_DATA_LOCATION` from
+env, so FEX cannot locate the rootfs base directory even with a
+config file present -- `/usr/bin/apt` becomes "command not found"
+inside the escalated shell. FEXServer's socket path is keyed on
+`getuid()` (`FEXServerClient.cpp:135`), so root spawns a **second**
+FEXServer that pollutes state the user cannot clean up. Every one
+of these bit us in the 2026-07-30 session for an hour combined
+before the working invocation above was rediscovered.
+
+### Rootfs preconditions
+
+The rootfs at `$FEX_APP_DATA_LOCATION/RootFS/<name>/` must be an
+extracted writable directory tree, and **every file must be owned
+by `$USER`**, not a `.sqsh`/`.ero` squashfs image.
+
+The `$USER`-ownership requirement is subtle: an Ubuntu tarball or
+squashfs stores files as `root:root`; extracting as `$USER`
+preserves that from the archive metadata; under `--map-users=auto`
+the real host `root` uid is outside the mapping range, so those
+files appear as `nobody` and even guest-root cannot chown or
+overwrite them. `FEXRootFSFetcher`-installed Arch rootfs is
+`$USER`-owned by construction; extracted Ubuntu needs a one-time
+`sudo chown -R $USER:$USER <rootfs>` after extraction.
+
+Verify:
+
+```
+stat -c '%U:%G %A %n' /home/$USER/Development/fexrootfs/RootFS/<name>
+find /home/$USER/Development/fexrootfs/RootFS/<name> ! -user $USER | head
+```
+
+Expect `$USER:$USER drwxr-xr-x ...` and find producing no output.
+
+### Behaviour that looks broken but is not
+
+- **`ln`/`link()` across the rootfs boundary returns EXDEV.** Rootfs
+  and host `/tmp` are separate filesystems; hardlink cannot cross.
+  `eb0fd8388` deliberately makes FEX return EXDEV so apt/dpkg fall
+  back to copy. `bf30e9f82` goes further -- Linkat/Renameat2 do the
+  copy inside FEX when the two paths straddle the boundary, since apt
+  itself does not fall back on EXDEV in every path. Do not "fix" the
+  EXDEV; it is the intended semantic.
+
+### Historical rootfs-setup traps
+
+Kept here so we do not re-derive them.
+
+- **`chroot.py` needs FEX and FEXServer on PATH.** Both are looked up
+  via `shutil.which()`; if either is missing the script logs one INFO
+  line ("FEX not installed. This chroot may not work!") and continues,
+  producing a chroot with no FEX plumbing whose failures look like
+  rootfs bugs. Run with
+  `PATH=$HOME/Development/fex-ppc64le/build-baseline/Bin:$PATH`.
+- **`break` / `unbreak` are inverted.** `unbreak` mounts + populates
+  the chroot; `break` unmounts and cleans. Running `chroot` after
+  `unbreak` fails with `CRITICAL: Stale mount found`.
+- **`chroot.py` used to patchelf the dynamic loader itself**, which
+  SIGSEGV'd `ld64.so.2` at address 8 before FEX main(). The interpreter
+  exclusion in `GetProgramInterpreter` was string-based and missed
+  symlink/realpath mismatches. Fixed in-tree with belt-and-braces
+  (string + realpath + basename `ld64.so*`/`ld-linux*`). This was NOT
+  a FEX bug, NOT a rootfs bug, and NOT a regression from anything we
+  landed -- it was in the rootfs's own setup script and would bite
+  every ppc64le user without the fix.
 
 ---
 
@@ -1319,7 +1417,80 @@ Discovered incidentally during the audit. None are POWER9-related.
 
 ---
 
-## Target: Steam launching, with games installable
+## Landed cycle 2026-07-31 — five real defects, no crash-rate movement
+
+Cycle summary because these commits are independently useful and it is worth stating up front that
+they close real bugs while **not** moving the row-13 corruption rate. Both facts matter and neither
+should be inferred from the other.
+
+### Three JIT fixes for 32-bit-guest correctness
+
+Discovered by code read, verified by ctest ×2 and the standard validation set (Factorio checksums,
+vkcube xcb+xlib, vecmath) before/after each. All three are real defects that no existing
+FEXLinuxTests case triggered — the 32-bit guest surface is under-tested.
+
+1. **`4abfa2558`** ppc64le/CodeEmitter: hard-trap `EmitM` on out-of-range `SH`/`MB`/`ME`.
+   `LOGMAN_THROW_A_FMT` (assert is dead in Release). Zero callsites in the ctest suite trip it,
+   which was the concern: no false positives on established code. Diagnostic value: names the
+   miscompiling `DEF_OP` when a real out-of-range operand appears — which is exactly what a bitfield
+   codegen bug in a Mono/JIT'd path or in an obscure guest op would produce. `power8+power9`.
+2. **`e5c7d48db`** ppc64le/JIT: `ExitFunctionLink`'s callback-sentinel scan is mode-aware.
+   `PtrShift`, `SlotStride`, compare width, and TCR-masking all derive from
+   `Frame->Thread->CTX->Config.Is64BitMode()`. Fixes `(RIP >> 47) != 0` canonical check to
+   `>> 32` for i386. Recovery-bypass on 32-bit guests now works instead of degrading to `abort()`.
+   `power8+power9`.
+3. **`b3f8dbe66`** ppc64le/JIT: `CallbackPtr` push/store width mode-dependent. `-16 + std` →
+   `-12 + stw` under i386 to satisfy `push == retaddr_size + 8`. Currently masked by
+   `GuestStackBumpAllocator` (thunk wrapper saves/restores RSP per callback), so no user-facing
+   symptom expected — but a latent -4-bytes-per-call leak the moment any code path reaches
+   `CallbackPtr` outside the wrapper. Land now while the analysis is fresh. `power8+power9`.
+
+**Crash-rate outcome:** the row-13 `probe_thread_spawn` rate did not move measurably at HEAD
+(pooled 10/60 pre → 6/30 = 20 % post; p ≈ 0.77). So the three fixes are real defects with **no
+observed effect on the current corruption rate**. Do not write them up as "the corruption fix" —
+they are their own thing. Row 13 is still open.
+
+### GL/GLX driver-string truncation on 32-bit guests — `91811e666`
+
+Upstream defect. `Host.h:551-557`'s pointer `to_guest` on a `guest_layout<T*>` silently truncates
+host addresses to 32 bits under `IS_32BIT_THUNK` (upstream even flags it `// TODO: Assert upper 32
+bits are zero`). Host Mesa's `.rodata` sits at `~0x3fff'xxxx'xxxx`, so `glGetString`,
+`glGetStringi`, and the `glX*String` trio hand back garbage to i386 guests. `gldriverquery` and any
+other driver-string consumer reads that garbage without noticing.
+
+Fix: `custom_host_impl` + `fex_gen_param<Fn, -1, T*> : ptr_passthrough` for the five string
+returns, gated on `IS_32BIT_THUNK`. `RelocateStringToGuestHeap` copies onto the guest heap via the
+GL thunk's already-bound `GuestMalloc`. Results are interned in a per-process map so repeat calls
+return identity-stable pointers (applications compare `s == prev_s`). Never freed by design (driver
+strings are `.rodata` for process lifetime).
+
+Same shape as the existing `_XDisplay*` tripwire: a `guest_layout<const GLubyte*> to_guest(...)
+= delete` under `IS_32BIT_THUNK` makes any future unannotated `GLubyte*` return a compile error
+rather than silent truncation. `Host.h` gained a narrow `char*`/`uint8_t*` interop specialisation
+on `guest_layout<T*>` to bridge the type asymmetry between thunkgen's impl-forward decl and
+packed-args `rv` field — mirrors the existing `host_to_guest_convertible` char/uint8 specialisation.
+
+Verified with a new 32-bit i386 probe (`build-probes/probe_gl_strings.c`, added in the same commit):
+`GL_VENDOR=AMD`, `GL_RENDERER=AMD Radeon RX 7900 XTX (radeonsi, navi31, LLVM 21.1.6, ...)`, 319
+extensions, plus stable-pointer identity across three back-to-back `glGetString(GL_VENDOR)` calls.
+64-bit `glxinfo` unchanged (regression check). Applicability: `any-host` — the defect is upstream
+and affects every 32-bit guest on any FEX host. Upstream candidate.
+
+### Test infrastructure that dropped out of this cycle
+
+- **`build-probes/probe_gl_strings.c`** — i386 ELF driver-string probe. Serves as reproducer AND
+  regression test for the Host.h fix. Committed with `91811e666`.
+- **`build-probes/probe_https.c`** — i386 ELF HTTPS fetch via system libcurl+libssl. Diagnostic for
+  isolating FEX 32-bit network stack from Steam's httplib. Committed as `38ef6a89c`.
+- **`build-probes/probe_ossl11.c`** — i386 ELF minimal SSL_connect against Debian's
+  `libssl1.1_1.1.1i-3_i386.deb` (matching Steam's bundled version). Discriminates FEX-vs-Steam for
+  TLS 1.3 handshake failures. Committed as `9f7750c27`.
+
+**Cross-compile recipe for all three:** `clang -m32 --target=i386-linux-gnu -fuse-ld=lld
+--sysroot=$ROOTFS ...`. Host binutils on ppc64le only emits ppc emulations (`elf_i386` unknown), so
+`lld` is required, not the system `ld`. Documented in `.claude/skills/fex-superuser/SKILL.md`.
+
+---
 
 The first goal derived from what the user actually wants rather than inherited from the port's history. It is
 deliberately not a specific game: **Steam starts, you can log in, browse, and install a title.** That is
@@ -1387,6 +1558,93 @@ Being honest up front: Steam is a large, closed, multi-process application, and 
 diagnosable output we could burn days for nothing. If that happens, the fallback is a smaller managed
 workload — a precompiled Mono/XNA game, which exercises the same JIT, SMC, signal and threading paths with
 far better observability and no CEF.
+
+### Bootstrap outcome — 2026-07-31, closed as unresolved-not-attributable-to-FEX
+
+Steam bootstrap runs, shows the update UI, downloads the 9866-byte
+`steam_client_ubuntu12` manifest, and rejects it with **`Download failed: http error 0`**. Same
+result over three attempts with three different mitigations tried
+(`SSL_CERT_FILE`/`SSL_CERT_DIR`, `OPENSSL_CONF MaxProtocol=TLSv1.2`, `OPENSSL_ia32cap=0`). The
+bootstrap does not proceed past this point, so **rung 4 is where Steam gets stuck today** and the
+rungs above (webhelper, UI, login, install) remain untested.
+
+**What actually happens on the wire** (from `strace -f -s 2000 -e trace=network`):
+
+1. Steam's ClientHello: **517 bytes**, TLS 1.3-capable (`supported_versions = 0x0304, 0x0303,
+   0x0302, 0x0301`), `supported_groups = {secp521r1, secp384r1, secp256r1}` (no X25519), single
+   pre-shared `key_share` for secp521r1.
+2. Server ServerHello: **93 bytes**. ServerRandom = `CF 21 AD 74 E5 9A 61 11 BE 1D 8C 02 1E 65 B8
+   91 C2 A2 11 16 7A BB 8C 5E 07 9E 09 E2 C8 A8 33 9C` — the RFC 8446 §4.1.4 HelloRetryRequest
+   magic constant, byte-exact. Cipher = 0x1301 `TLS_AES_128_GCM_SHA256`. Extensions:
+   `supported_versions = 0x0304`, `key_share group = secp384r1`. Legitimate HRR asking Steam to
+   retry with a P-384 key_share (secp384r1 is in Steam's `supported_groups`).
+3. Steam's response: **fatal `protocol_version` alert (70)**, `\x15\x03\x01\x00\x02\x02\x46`.
+4. Connection dropped. Steam reports "http error 0" (Valve's internal EHTTPStatusCodeInvalid) and
+   the bootstrap exits.
+
+Same alert-70 fires on the TLS 1.2 path too (with `MaxProtocol=TLSv1.2`): server chooses TLS 1.2
+and includes the RFC 8446 §4.1.3 downgrade signal `44 4F 57 4E 47 52 44 01` in the last 8 bytes of
+ServerRandom; Steam sends fatal `protocol_version` (70) rather than the RFC-specified
+`illegal_parameter` (47). Both TLS 1.3 (HRR) and TLS 1.2 (DOWNGRD) paths produce the same wrong
+alert -- unusual, since these are different checks in 1.1.1i's state machine.
+
+**Debian's build of the same OpenSSL 1.1.1i** handles all four endpoints (Valve CDN, Cloudflare,
+Google, `tls-v1-2.badssl.com:1012` control) correctly under FEX, and handles a forced HRR with
+Steam's exact P-521-first key_share ordering. FEX is confirmed to **not** be corrupting TLS on the
+wire — ClientHello `supported_groups` and HRR `supported_versions` both verified byte-exact from
+strace payloads.
+
+**Refutation ledger, so the same experiments are not re-run:**
+
+- **CPUID-selected asm miscompile.** `OPENSSL_ia32cap=0` (all asm off) and `~0x200000200000000`
+  (AVX/AVX2 off) both leave the failure unchanged. Steam's OpenSSL does honour the env var
+  (`OPENSSL_ia32cap` string is present in the binary). Refuted.
+- **FEX 32-bit HTTPS stack broken.** `build-probes/probe_https` fetches the exact same manifest URL
+  via system libcurl+libssl 3.x cleanly (HTTP 200, 9866 bytes) under FEX 32-bit. Also works against
+  `cloudflare.com/cdn-cgi/trace` and `tls13.1d.pw` (TLS-1.3-only). Refuted.
+- **TLS wire byte corruption in either direction.** strace payloads with `-s 2000` show the
+  ClientHello and HRR are byte-exact and RFC-conformant. Refuted.
+- **OpenSSL 1.1.1i under FEX generally broken.** `build-probes/probe_ossl11` (built against Debian
+  `libssl1.1_1.1.1i-3_i386.deb`) succeeds against all four endpoints. Even with `FORCE_HRR=1` set
+  (Steam's exact key_share pattern) Valve's CDN handshakes cleanly. Refuted.
+- **TLS 1.3 path in FEX 32-bit broken.** probes above negotiate TLSv1.3 on Cloudflare, Google, and
+  Valve. Refuted.
+- **`OPENSSL_CONF MaxProtocol=TLSv1.2` client-side workaround.** ClientHello did drop to 230 bytes
+  and TLS 1.2 only (config took effect at the wire level), but the alert-70 still fired.
+  Refuted as a mitigation.
+- **JIT anomaly on Steam's specific code paths.** Ran Steam under the `EmitM` hard trap
+  (`4abfa2558`, always-on) + `FEX_DUMPIR`. **Zero traps** across 10,876 compiled and executed
+  blocks; only trap-adjacent entries in the log are Steam's own `ILocalize::AddFile()` warnings
+  about missing translation files. Refuted.
+- **LD_PRELOAD interposer on Steam's SSL_CTX_* calls.** Physically not possible: Steam's OpenSSL
+  1.1.1i is fully statically linked into `ubuntu12_32/steam` with zero SSL_* dynamic exports
+  (`nm --defined-only` = 444 total, none SSL_*). No PLT indirection to hook. Only dynamic deps are
+  libdl/librt/libm/libpthread/libc/ld-linux. Not attemptable.
+
+**Where this leaves the finding.** Steam's statically-linked build of OpenSSL 1.1.1i, invoked
+through Steam's own httplib, produces the wrong alert on both TLS 1.3 and TLS 1.2 paths under FEX.
+The same library version (from Debian) handles both cleanly. The failure is inside Steam's
+statically-linked blob or its httplib wrapper — not observable from outside without Steam source or
+symbol-matched debug info, both of which are unavailable. Native x86 Steam works with the same
+static blob, so under emulation *something* diverges enough to tip the state machine — possibly
+signal delivery, possibly timing in the httplib's async I/O loop, possibly nondeterministic. This
+is speculation without evidence and is not being chased further.
+
+**Tag: unresolved, not attributable to FEX on current evidence.**
+
+Practical consequences:
+
+- `gldriverquery` cannot be tested against the row-1 Host.h fix — it ships in Steam's update
+  payload which does not download. `build-probes/probe_gl_strings` is the equivalent regression
+  test and proves the fix cleanly.
+- Steam is not a viable rung-5 target on current evidence. **The Mono/XNA fallback in the "What
+  would make this fail as a target" note becomes the next candidate**, since the machinery below
+  Steam (32-bit thunks, GL string returns, network stack, TLS) is now demonstrated to work
+  independently.
+
+If someone re-opens this, the wire capture is in `docs/build-agent-notes.md` under
+`2026-07-31 With -s 2000 I have the full bytes` and later entries. Everything above is derived from
+that capture plus the four `build-probes/probe_ossl11` runs, all reproducible in under a minute.
 
 ## `stress-ng` end state — 16/16, and how it got there
 
@@ -1540,6 +1798,23 @@ Consolidated so nothing lives only in the build-agent log. Ordered by my judgeme
 | 9 | `r0` zero-on-entry residual | Unchecked | ELFv2 makes `r0` volatile; `PushCalleeSavedRegisters` touches it. One code read |
 | 10 | README:11 SIGABRT-on-exit in FTL | Never reproduced | Both play sessions were SIGKILLed, so the natural exit path never ran |
 | 11 | `syscalls_efault.64` | **Not a defect** | Expected-fail test that unexpectedly passes — metadata mismatch |
+| 12 | **Path-taking syscalls still registered as raw passthroughs** | Partially fixed | `chdir` (fixed `9e89dc6de`), `utimensat` (fixed `116b7c6ca`) were both raw passthroughs discovered by workload — apt update, then dpkg -i. Grep of `Syscalls/Passthrough.cpp` shows the class is not closed: `chroot` (524), `name_to_handle_at` (572), plus `open_by_handle_at` (573), and the whole `mount`/`umount2`/`pivot_root`/`swapon`/`swapoff`/`acct` group (523,526–530). The new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `statmount`, `listmount` — 596–631) also passes through without RootFS translation. Some were previously unreachable (`geteuid()==0` needed) but `unshare -Ur` now makes the guest namespace root, so they can fire. See write-up below |
+| 13 | **`std::thread` bring-up SIGSEGV — thread-startup hazard, TSO-independent** | Reproducer landed, unfixed. Rate steady across all-fix HEAD: **~17-20 %** post-`b3f8dbe66` merge (pooled 10/60 pre-JIT-fixes → 6/30 = 20 % at HEAD). No detected movement from the JIT commits. Single defect confirmed (see split note below). | 20-line `std::thread` reproducer (`build-probes/probe_thread_spawn.cpp`) at N=8 × 64 trials × 30 runs = 15,360 spawns per config: **default 10/30, `FEX_LOCKONLYTSO=1` 10/30, `FEX_PARANOIDTSO=1` 10/30 — identical to the sample**. TSO knob has no signal at proper power. `LoadMemTSO` corruption class refuted for this defect. Fault fingerprint: `GuestRIP=0x0` or `GuestRIP=0x141` (null / near-null indirect jump), with `*RSI=0xfffffffeffffffff` recycled-pthread-control-block marker in every capture. Crash rate is **not** a simple function of total thread creations — internally inconsistent across the N-sweep (N=32×30 with 15,360 spawns → 0/30, N=8×64×30 with same 15,360 → 9/30) so a single per-creation p does not fit; cause of that inconsistency is not yet understood. Working hypothesis (untested): control-block RECYCLING race — the `0xfffffffe…` marker + the cycle-count-vs-batch-size asymmetry both point at reuse rather than fresh allocation. **Split test 2026-07-31:** 60× `probe_thread_spawn 1 1` = 0 startup deaths, so the `spawns=0` SIGSEGVs (a subset of 6/30 crashes) still need the 8-thread configuration — single defect with two presentations (SIGABRT with fingerprint, SIGSEGV without), not a separate startup bug. **Next instrument:** guest-side canary (uncoded) — write a marker into a known guest-heap address at pthread creation, verify FEX's view matches before consuming, so we see *when* the write lands rather than inferring from the null-RIP victim. Cycles-vs-threads sweep holding total constant is a cheaper first step if the canary is too much work. Seven mechanisms refuted so far — see notes-file entry `2026-07-31 probe_thread_spawn` for the full ledger; nothing left to try in the "just measure differently" bucket. |
+
+### Defect 12 in full: raw-passthrough path-taking syscalls
+
+The `chdir` fix in `9e89dc6de` proved the earlier "isolated omission, not a class" reading of the utimensat miss (`116b7c6ca`) wrong. There is a class. `chdir` was found because dpkg-deb tripped over it; `utimensat` because apt update did. Every path-taking syscall wired as `SyscallPassthrough<N><SYSCALL_DEF(name)>` in `Syscalls/Passthrough.cpp` has the same shape — the guest path goes to the host kernel with no rootfs translation. Grepping the file with the mask "these take a path and have no `FileManager` wrapper" gives:
+
+- `chroot` (524). Real gap. Whether it should scope the new root to the RootFS or to a subtree of it is a design question, but the current behaviour is to `chroot` the host process to whatever guest path the caller supplied, which is either a security escape (guest hands host an absolute path) or a functional break (guest hands a rootfs-relative path that doesn't exist on host).
+- `name_to_handle_at` (572) and `open_by_handle_at` (573). Real gap. The path form is `name_to_handle_at(dirfd, path, handle, mnt_id, flags)`; without translation the returned `file_handle` refers to a host inode that a later `open_by_handle_at` cannot re-open through the RootFS mount.
+- `mount` / `umount2` / `pivot_root` / `swapon` / `swapoff` / `acct` (523,526–530). All take at least one path. Previously unreachable to a normal-user guest — the host kernel rejects on `CAP_SYS_ADMIN` before FEX even mattered — but `unshare -Ur` gives the guest namespace root, at which point these are *usable* and their paths need RootFS scoping. Realistically dpkg's postinst scripts and container-management tooling will hit this in the next month.
+- The new-style mount API — `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `statmount`, `listmount` (596–631). Same story; less used in older userspace, but modern systemd and container tools call them.
+
+`fchdir` remains a legitimate raw passthrough because it takes a bare fd — resolved against whichever filesystem the `openat` targeted. Same reasoning applies to any pure-fd syscall in the list.
+
+Recommend addressing them in the same shape as `Chdir` and `Utimensat`: a `FileManager::<Name>` wrapper that does `GetEmulatedPath` or `GetEmulatedFDPath`, calls the host syscall on the translated path, and falls back only on `ENOENT` so semantic errno (`EACCES`, `ENOTDIR`, `EROFS`, `EPERM`) propagates.
+
+**Priority ordering.** `chroot` first — it is a security escape once a guest can hand the host process an absolute path that isn't validated against the rootfs. Then `name_to_handle_at`/`open_by_handle_at` — file-handle-based reopen is used by `find -newer`, `nfs-utils`, `stat --file-system`, and a handful of daemons. The mount family is fine at the bottom until something workload-visible needs it.
 
 ### Defect 0 in full: fd-relative walks escape the RootFS
 
@@ -1872,6 +2147,76 @@ Revision 1 claims that did not survive review. Recorded so they are not rediscov
 
 ---
 
+## Operational gotchas — the setup traps that cost real time
+
+Not codegen or algorithm — build-environment and runtime-invocation traps that we hit and paid for.
+Documented so nobody does the same.
+
+- **`ninja` parallelism.** Use `ninja -j128` (or the natural default), **not** `ninja --target
+  FEX`. `--target` builds only the named target and silently skips dependent tests and thunk
+  outputs; `-j128` uses the machine's full 128 threads for a plain default build. If your build
+  finishes suspiciously fast, you probably used `--target`.
+- **`break`/`unbreak` inversion.** The convenience aliases in this repo are named opposite to what
+  first-read suggests: `break` **installs** the break-on-trap shim, `unbreak` removes it. Read the
+  aliases before invoking either — several hours of the Mono debug session are attributable to
+  running them the wrong way.
+- **`FEX_THUNKHOSTLIBS` must point at the base directory, NOT a bitness-suffixed one.** FEX
+  derives the 32-bit path by appending `_32` to whatever the env var says. So:
+  - `FEX_THUNKHOSTLIBS=…/build-thunks/HostLibs` → 64-bit uses `HostLibs/`, 32-bit uses
+    `HostLibs_32/`. Only 32-bit works because CMake produces `HostLibs_32` and `HostLibs_64` but
+    not bare `HostLibs`.
+  - `FEX_THUNKHOSTLIBS=…/build-thunks/HostLibs_64` (as `.bashrc` currently has it) → 64-bit uses
+    `HostLibs_64/`, 32-bit tries `HostLibs_64_32/` and fails silently.
+  - Symlink `HostLibs → HostLibs_64` and point the env at the base to make both work. Or set the
+    env per-invocation. For 64-bit-only work the current setting is fine; for 32-bit tests it must
+    be overridden.
+- **chroot.py loader-patchelf trap.** The rootfs setup script `chroot.py` will `patchelf --add-rpath`
+  on the dynamic loader itself unless three-way excluded (string discard + realpath match +
+  basename `ld64.so*`/`ld-linux*` match). Patchelfing the loader produces a silent SIGSEGV at
+  address 8 that looks like a JIT bug. The current script excludes correctly; if someone rewrites
+  it, this test is what caught the regression.
+- **`sudo` breaks FEX.** `sudo` re-execs FEX as root: different `HOME` → different
+  `~/.fex-emu/Config.json`, `FEX_APP_DATA_LOCATION` stripped from env → rootfs not found,
+  FEXServer socket path keyed on `getuid()` (`FEXServerClient.cpp:135`) → root spawns a **second**
+  FEXServer polluting state. For anything needing guest-side root, use
+  `unshare -Ur --map-users=auto --map-groups=auto FEX <cmd>`. The `--map-users=auto` bit matters:
+  plain `-Ur` maps only uid 0 → your uid and breaks on the first setuid inside the guest (dpkg's
+  drop to `_apt` uid 42, etc.).
+- **32-bit i386 cross-compile on ppc64le needs `-fuse-ld=lld`.** Host binutils only produces ppc
+  emulations (`elf_i386` is unrecognised by the system `ld`). clang can generate x86 code, but the
+  linker step needs `lld`. Full recipe:
+  `clang -m32 --target=i386-linux-gnu -fuse-ld=lld --sysroot=$ROOTFS
+   -Wl,-dynamic-linker=/lib/ld-linux.so.2 <sources> -lfoo`.
+- **Steam refuses to run as root.** `id -u == 0` hard-refused by Steam. Use the chroot for
+  installing packages into the rootfs (as guest-root); use plain user (no unshare) for launching
+  Steam itself.
+
+---
+
+## Measurement recipe — SMT2 pinned, WOF uncontrolled
+
+Any perf number from 2026-07-30 onward is at **SMT=2**. The user sets the machine before a session
+now; earlier numbers at SMT=4 are not comparable and should not be cited alongside SMT=2 results.
+
+**Established:**
+- SMT=2 gives every hardware thread a larger share of issue queues, reservation stations and L1 —
+  and shows less variance than SMT=4 on the FEX workloads we care about (JIT compile + guest
+  hot-loop). See the `Realistic throughput ceiling` section for numbers.
+- Determinism at SMT=2 has settled to Factorio 500-tick and 1000-tick byte-exact across six runs
+  and 0.06 % spread on wall time.
+
+**Uncontrolled:**
+- **WOF (Workload-Optimized Frequency) has never been controlled for.** `/proc/cpuinfo` reports 3.3
+  GHz for the cores, but WOF permits opportunistic frequency scaling above the nominal within
+  thermal/power envelope. No fixed-frequency governor is set. This means the 0.06 % spread has an
+  uncontrolled variable behind it, so it is a floor, not a ceiling.
+- The consequence for methodology: for a run to be **quoted as a comparison**, the delta must be
+  large enough to survive WOF drift. Rule of thumb from the runs so far: absolute-percentage
+  deltas below ~2 % are indistinguishable from WOF noise. Anything smaller needs the fixed-freq
+  governor, which is deferred pending user action.
+
+---
+
 ## Confirmed on target hardware
 
 Measured 2026-07-28 on the target machine (build agent task T1; raw output in
@@ -1891,6 +2236,42 @@ ninja 1.13.2.
 | `AT_HWCAP` | 0xdc0065c2 | Not yet decoded; altivec + VSX present |
 | `mmap_min_addr` | 4096 | Guest low-VA region starts at page 1 |
 | x86_64 cross toolchain | **absent** | No `x86_64-linux-gnu-*`. Guest thunk stubs cannot currently be rebuilt on this host — see [The graphics path](#the-graphics-path-architecture-neutral) |
+
+### Real-workload determinism — measured 2026-07-30
+
+Two workloads reach real work under FEX on this box and produce byte-deterministic output across
+independent JIT compilations. Both are worth stating with the run count so we do not have to
+re-argue whether emulation is functionally usable.
+
+- **Factorio 2.0.77 headless benchmark.** `--benchmark <save> --benchmark-ticks N`, driven off a
+  fresh `--create` save. Determinism holds byte-exactly across independent JIT compilations, which
+  is stronger evidence of correctness than any FEXLinuxTests pass. **Guest CPUID probe correctly
+  reports `CPU: FEX-Emu`** in `System info` — vendor string reaches guest via CPUID and Factorio
+  surfaces it.
+
+  **Two independent baselines exist because the rootfs and save file both changed.** They are not
+  directly comparable, they only both establish "runs are byte-deterministic within a given save"
+  and neither is a regression relative to the other:
+
+  | Rootfs | Save | 500-tick sum | 1000-tick sum | Runs used |
+  |---|---|---|---|---|
+  | Ubuntu (pre-Arch migration) — **VOID, save file lost** | original | `4193744430` | `3387173916` | 20+ across three TSO settings, 2026-07-30 |
+  | Arch (current, `~/Development/fexrootfs/RootFS/ArchLinux`) | regenerated by `--create` on 2026-07-31, 671 KB | `2906423070` | `3225967658` | 3 + 3 at 500t / 1000t, 2026-07-31 |
+
+  Anyone re-measuring today uses the Arch baseline. The old checksums are recorded only so that a
+  future reader running an ArchLinux + regenerated-save rig does not conclude they hit a regression
+  when their sums disagree with the old numbers.
+- **`apt install` end-to-end.** `hello_2.10-3build1_amd64.deb` unpacks, `Setting up hello`,
+  `hello` binary runs afterwards and prints "Hello, world!". Requires `unshare -Ur
+  --map-users=auto --map-groups=auto` for the userspace-root layer and the chdir + termios +
+  ioctl-remap fixes in this branch (`9e89dc6de`, `21fadb842`, `f4c80b0c9`, `116b7c6ca`).
+  Multi-package fetch/unpack works to the point that in-package postinst permissions become the
+  limit (bsdgames /var/games, cowsay gtk-update-icon-cache) — those are rootfs data issues, not
+  emulation. See defect register row 12 for the raw-passthrough sibling defects still open.
+
+Both results predate the reproducer landing for row 13 and neither depends on the crash being
+fixed — Factorio's determinism is measured on the runs that *did* complete, and `apt install`
+does not chain enough `std::thread` spawns to hit the hazard.
 
 ### `AT_HWCAP2` decode — several plan items confirmed live
 
