@@ -1794,17 +1794,25 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
 }
 
 uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  // Mode-dependent widths for the whole routine below. i386 guests have a
+  // 4-byte return-address sentinel at 4-byte granularity, and a 32-bit
+  // pointer canonical range (top 32 bits zero, not top 17). ExitFunctionLink
+  // is a static member so CTX is not directly accessible; walk through Frame->
+  // Thread->CTX, matching the pattern at :1880 below.
+  auto ExitCTX = static_cast<Context::ContextImpl*>(Frame->Thread->CTX);
+  const bool Is64Bit = ExitCTX->Config.Is64BitMode();
+  const int  PtrShift = Is64Bit ? 47 : 32;
+  const int  SlotStride = Is64Bit ? 8 : 4;
+
   // Suspect-RIP filter:
   //   1. Near-NULL (within first page) — can't be valid PIE-loaded x86 code
   //   2. All-CC pattern (0xCCCCCCCCCCCCCCCC) — typical "uninitialized" value
-  //   3. Outside the 47-bit user-space canonical range — guest RIP must be
-  //      in low canonical addresses (top 17 bits zero) since FEX maps guest
-  //      VAs without using the non-canonical region.
-  // If any of these fire, dump diagnostic + abort.
-  auto LooksSuspect = [GuestRIP]() {
+  //   3. Outside the guest's canonical range — top (64-PtrShift) bits zero.
+  //      64-bit: top 17 bits (>>47); 32-bit: top 32 bits (>>32).
+  auto LooksSuspect = [GuestRIP, PtrShift]() {
     if (GuestRIP < 0x1000) return true;                  // near-NULL
     if (GuestRIP == 0xCCCCCCCCCCCCCCCCULL) return true;  // all-CC
-    if ((GuestRIP >> 47) != 0) return true;              // beyond user canonical
+    if ((GuestRIP >> PtrShift) != 0) return true;        // beyond user canonical
     return false;
   };
   if (LooksSuspect()) {
@@ -1819,24 +1827,37 @@ uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uin
     // games where the guest will retry or treat absence-of-error as success.
     //
     // Suppress via FEX_EXITLINK_NOBYPASS=1 to fall through to the diagnostic.
+    //
+    // Mode dependence: the sentinel is pointer-sized (8 bytes on x86_64,
+    // 4 bytes on i386). Walk at the correct stride and compare at the
+    // correct width, or the search cannot find it and the fallback below
+    // degrades to abort(). 32-bit was silently broken here since forever.
     static const bool no_bypass = (getenv("FEX_EXITLINK_NOBYPASS") != nullptr);
     if (!no_bypass) {
       uint64_t TCR = Frame->Pointers.ThunkCallbackRet;
       uint64_t RSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
-      if (TCR && RSP >= 0x1000 && (RSP >> 47) == 0) {
-        // Walk up to 128 bytes (16 slots) above current RSP looking for
-        // ThunkCallbackRet. Bounded to avoid runaway reads.
+      if (TCR && RSP >= 0x1000 && (RSP >> PtrShift) == 0) {
+        // Walk up to 128 bytes above current RSP looking for
+        // ThunkCallbackRet. Bounded to avoid runaway reads. Slot count
+        // stays 16 -- 128/8 in 64-bit, 128/4 = 32 more slots in 32-bit
+        // if we wanted to cover the same distance, but 16*4 = 64 bytes
+        // is enough for the callback frames we see in practice.
         for (int i = 0; i < 16; ++i) {
-          uint64_t slot_addr = RSP + i * 8;
+          uint64_t slot_addr = RSP + i * SlotStride;
           // Guard the read with a heuristic: only deref if slot_addr looks
           // like a valid guest VA (within the same canonical range as RSP).
-          if ((slot_addr >> 47) != 0) break;
-          uint64_t slot_val = *reinterpret_cast<volatile uint64_t*>(slot_addr);
-          if (slot_val == TCR) {
+          if ((slot_addr >> PtrShift) != 0) break;
+          uint64_t slot_val = Is64Bit
+              ? *reinterpret_cast<volatile uint64_t*>(slot_addr)
+              : *reinterpret_cast<volatile uint32_t*>(slot_addr);
+          // TCR is stored as full uint64_t but on i386 only its low 32 bits
+          // are actually placed on the guest stack -- so mask before compare.
+          const uint64_t TCR_cmp = Is64Bit ? TCR : (TCR & 0xFFFFFFFFULL);
+          if (slot_val == TCR_cmp) {
             // Found callback sentinel. Adjust RSP to just past the sentinel
             // (it will be popped by CallbackReturn IR) and redirect to TCR.
-            // i*8 below the sentinel is the "stack frame" the failed callback
-            // built — discard it by walking RSP up to the sentinel slot.
+            // slot_addr below the sentinel is the "stack frame" the failed
+            // callback built -- discard it by walking RSP up to the sentinel.
             Frame->State.gregs[FEXCore::X86State::REG_RSP] = slot_addr;
             char buf[256];
             int n = snprintf(buf, sizeof(buf),
