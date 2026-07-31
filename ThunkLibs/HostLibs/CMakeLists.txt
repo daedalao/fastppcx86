@@ -76,11 +76,20 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(BITNESS_FLAGS "-for-32bit-guest")
   endif()
 
+  # Only pass X86_DEV_GCC_TOOLCHAIN for 64-bit guest thunks. For 32-bit the
+  # ct-ng x86_64 crosstool has no i686 libstdc++, and pointing thunkgen's
+  # clang at it forces the header search there and skips the perfectly good
+  # i686-compatible headers inside X86_DEV_ROOTFS.
+  set(THUNKGEN_GCC_TOOLCHAIN_ENV "")
+  if (GUEST_BITNESS EQUAL 64)
+    set(THUNKGEN_GCC_TOOLCHAIN_ENV "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}")
+  endif()
+
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
     DEPENDS thunkgen
-    COMMAND ${CMAKE_COMMAND} -E env "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+    COMMAND ${CMAKE_COMMAND} -E env ${THUNKGEN_GCC_TOOLCHAIN_ENV}
       "$<TARGET_FILE:thunkgen>" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"

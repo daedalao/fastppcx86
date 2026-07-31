@@ -3,6 +3,11 @@ option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
+# Propagate the option through try_compile()'s inner CMake invocation, else
+# the compiler-ABI probe re-loads this toolchain with the option defaulted to
+# FALSE and hits the "No x86_64 cross gcc" fatal below.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES ENABLE_CLANG_THUNKS X86_DEV_ROOTFS X86_DEV_GCC_TOOLCHAIN X86_64_CROSS_SYSROOT)
+
 # Locate an x86_64 cross sysroot.
 #
 # On a non-x86 host (POWER8, aarch64) clang resolves Scrt1.o/crti.o/crtn.o

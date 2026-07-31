@@ -124,15 +124,27 @@ function(generate NAME SOURCE_FILE)
     list(APPEND BITNESS_FLAGS2 "-isystem" "${_FALLBACK_ISYSTEM}")
   endif()
 
-  if (X86_DEV_GCC_TOOLCHAIN)
+  # --gcc-toolchain wins over --sysroot for C++ header search. Only pass it
+  # when it can genuinely serve the target: for 32-bit the ct-ng x86_64
+  # crosstool at X86_DEV_GCC_TOOLCHAIN has no i686 libstdc++ headers (no
+  # multilib on this host), and specifying it forces clang to look there and
+  # miss the perfectly good headers inside the rootfs sysroot.
+  if (X86_DEV_GCC_TOOLCHAIN AND BITNESS EQUAL 64)
     list(APPEND BITNESS_FLAGS2 "--gcc-toolchain=${X86_DEV_GCC_TOOLCHAIN}")
+  endif()
+
+  # Only pass X86_DEV_GCC_TOOLCHAIN for 64-bit guest thunks (see HostLibs
+   # CMakeLists.txt for the same reasoning).
+  set(THUNKGEN_GCC_TOOLCHAIN_ENV "")
+  if (BITNESS EQUAL 64)
+    set(THUNKGEN_GCC_TOOLCHAIN_ENV "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}")
   endif()
 
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
-    COMMAND ${CMAKE_COMMAND} -E env "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+    COMMAND ${CMAKE_COMMAND} -E env ${THUNKGEN_GCC_TOOLCHAIN_ENV}
       "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
