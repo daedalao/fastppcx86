@@ -684,6 +684,40 @@ std::optional<std::string_view> FileManager::GetSelf(const char* Pathname) const
   return Pathname;
 }
 
+// O_TMPFILE is a *composite*: __O_TMPFILE | O_DIRECTORY. A bare `flags &
+// O_TMPFILE` is therefore true for any ordinary O_DIRECTORY open, so it must
+// be tested for containment.
+static bool IsTmpFile(uint64_t flags) {
+  return (flags & O_TMPFILE) == O_TMPFILE;
+}
+
+// Normalize guest open flags before handing them to openat2().
+//
+// The guest called open()/openat(), which are lenient: the kernel ignores the
+// access mode and most other bits when O_PATH is set, and ignores `mode`
+// entirely unless the open actually creates something. openat2() is strict and
+// answers EINVAL instead. Since FEX upgrades overlay probes to openat2() to get
+// RESOLVE_IN_ROOT scoping, it has to apply the leniency the guest was promised,
+// or legal guest opens fail with an errno they can never see natively.
+//
+// Seen live: libcapsule's capture-libs (Steam pressure-vessel) opens directories
+// with O_RDWR|O_DIRECTORY|O_CLOEXEC|O_PATH; the unmasked O_RDWR made openat2()
+// return EINVAL, which aborted container setup (2026-07-30).
+static uint64_t SanitizeOpenat2Flags(uint64_t flags) {
+  if (flags & O_PATH) {
+    // Under O_PATH only these bits are meaningful; the rest are ignored by
+    // open() but rejected by openat2().
+    flags &= (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+  }
+  return flags;
+}
+
+// openat2() requires mode == 0 unless the open can create a file.
+static uint64_t Openat2Mode(uint64_t flags, uint32_t mode) {
+  const bool Creates = (flags & O_CREAT) || IsTmpFile(flags);
+  return Creates ? (mode & 07777) : 0;
+}
+
 static bool ShouldSkipOpenInEmu(int flags) {
   if (flags & O_CREAT) {
     // If trying to create a file then skip checking in emufd
@@ -753,19 +787,22 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
       // rename across trees) see the real namespace — bwrap creates its
       // bind-mount source files at / and then mount()s them, which returned
       // ENOENT when the creation had been diverted into <rootfs>/.
-      const bool WantsCreate = (flags & O_CREAT) && !(flags & O_TMPFILE);
-      uint64_t ProbeFlags = (uint64_t)flags;
+      const bool WantsCreate = (flags & O_CREAT) && !IsTmpFile((uint64_t)flags);
+      uint64_t ProbeFlags = SanitizeOpenat2Flags((uint64_t)flags);
       if (WantsCreate) {
         ProbeFlags &= ~(uint64_t)(O_CREAT | O_EXCL);
       }
       FEX::HLE::open_how how = {
         .flags = ProbeFlags,
-        .mode = (ProbeFlags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .mode = Openat2Mode(ProbeFlags, mode),
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
-      if (fd == -1 && errno == EXDEV) {
-        // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
+      if (fd == -1 && (errno == EXDEV || errno == EINVAL)) {
+        // EXDEV: magic symlink (/proc/foo) crossed the rootfs boundary.
+        // EINVAL: openat2() rejected a flag combination that open() accepts.
+        // Both punt to the lenient syscall the guest actually called, which
+        // gives up RESOLVE_IN_ROOT scoping but keeps the overlay dirfd.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, (int)ProbeFlags, mode);
       }
       if (fd != -1 && WantsCreate && (flags & O_EXCL)) {
@@ -1131,31 +1168,23 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
       OverlayAttempted = true;
-      // open()/openat() silently ignore access modes and most other flags when
-      // O_PATH is set, but openat2() rejects them with EINVAL. Since the guest
-      // called the lenient syscall, apply the kernel's own open() masking
-      // before upgrading to openat2, or sloppy-but-legal guest opens fail.
-      // Seen live: libcapsule's capture-libs (Steam pressure-vessel) opens its
-      // --dest with O_RDWR|O_DIRECTORY|O_CLOEXEC|O_PATH.
-      uint64_t How_flags = (uint64_t)flags;
-      if (How_flags & O_PATH) {
-        How_flags &= (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-      }
+      uint64_t How_flags = SanitizeOpenat2Flags((uint64_t)flags);
       // Never CREATE new files inside the rootfs overlay (see Open() above):
       // probe with O_CREAT/O_EXCL masked; a genuine ENOENT falls through to
       // the host create in the fallback below.
-      const bool WantsCreate = (How_flags & O_CREAT) && !(How_flags & O_TMPFILE);
+      const bool WantsCreate = (How_flags & O_CREAT) && !IsTmpFile(How_flags);
       if (WantsCreate) {
         How_flags &= ~(uint64_t)(O_CREAT | O_EXCL);
       }
       FEX::HLE::open_how how = {
         .flags = How_flags,
-        .mode = (How_flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0,
+        .mode = Openat2Mode(How_flags, mode),
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
       };
       fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
-      if (fd == -1 && errno == EXDEV) {
-        // Magic symlink (/proc/foo) — punt to openat without RESOLVE_IN_ROOT.
+      if (fd == -1 && (errno == EXDEV || errno == EINVAL)) {
+        // See Open(): EXDEV is a magic symlink, EINVAL an openat2()-only flag
+        // rejection. Both fall back to the lenient syscall the guest called.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, (int)How_flags, mode);
       }
       if (fd != -1 && WantsCreate && (flags & O_EXCL)) {
