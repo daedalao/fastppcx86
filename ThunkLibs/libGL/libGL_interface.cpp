@@ -160,12 +160,29 @@ template<>
 struct fex_gen_config<glXGetVisualFromFBConfigSGIX> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<glXGetVisualFromFBConfigSGIX, -1, XVisualInfo*> : fexgen::ptr_passthrough {};
+#if defined(IS_32BIT_THUNK)
+// glX*String trio returns host `const char*` -- default `to_guest` truncates
+// to 32 bits. See RelocateStringToGuestHeap in libGL_Host.cpp.
+template<>
+struct fex_gen_config<glXGetClientString> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glXGetClientString, -1, const char*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glXQueryExtensionsString> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glXQueryExtensionsString, -1, const char*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glXQueryServerString> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glXQueryServerString, -1, const char*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glXGetClientString> {};
 template<>
 struct fex_gen_config<glXQueryExtensionsString> {};
 template<>
 struct fex_gen_config<glXQueryServerString> {};
+#endif
 template<>
 struct fex_gen_config<glXGetCurrentDisplay> : fexgen::custom_host_impl {};
 template<>
@@ -454,10 +471,24 @@ template<>
 struct fex_gen_config<glWindowPos3s> {};
 template<>
 struct fex_gen_config<glWindowPos3sv> {};
+#if defined(IS_32BIT_THUNK)
+// See glX*String block above -- same story for glGetString/glGetStringi.
+// Returns are host `const GLubyte*` pointers into Mesa's `.rodata` at
+// `0x3fff'xxxx'xxxx`; default `to_guest` truncates on i386.
+template<>
+struct fex_gen_config<glGetString> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glGetString, -1, const GLubyte*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glGetStringi> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glGetStringi, -1, const GLubyte*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glGetString> {};
 template<>
 struct fex_gen_config<glGetStringi> {};
+#endif
 template<>
 struct fex_gen_config<glQueryMatrixxOES> {};
 template<>

@@ -7,7 +7,10 @@ $end_info$
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <string_view>
+#include <unordered_map>
 
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
@@ -77,6 +80,14 @@ host_layout<_XDisplay*>::~host_layout() {
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
 guest_layout<_XDisplay*> to_guest(host_layout<_XDisplay*>) = delete;
+
+#if defined(IS_32BIT_THUNK)
+// Same tripwire discipline for the GL/GLX string-return family. Any *future*
+// function that returns a `const GLubyte*` / `const char*` without an
+// explicit `ptr_passthrough` annotation becomes a compile error rather than
+// silent 32-bit truncation of a host `.rodata` address.
+guest_layout<const GLubyte*> to_guest(host_layout<const GLubyte*>) = delete;
+#endif
 
 static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &GuestMalloc);
@@ -332,6 +343,81 @@ guest_layout<T*> RelocateArrayToGuestHeap(T* Data, int NumItems) {
   x11_manager.HostXFree(Data);
   return GuestData;
 }
+
+#if defined(IS_32BIT_THUNK)
+// Copies a NUL-terminated host string onto the guest heap and returns a guest
+// pointer to it. GL/GLX driver strings (`glGetString`, `glGetStringi`, and
+// the `glX*String` trio) all return host `.rodata` pointers at
+// `0x3fff'xxxx'xxxx`. The default `to_guest` on that pointer silently
+// truncates to 32 bits on an i386 guest (`Host.h:551-557` -- upstream's own
+// `// TODO: Assert upper 32 bits are zero`), producing garbage that
+// `gldriverquery` and every driver-info consumer reads without noticing.
+//
+// Unlike `RelocateArrayToGuestHeap` this MUST NOT free the source. GL driver
+// strings live in the driver's `.rodata` for the process lifetime; calling
+// `HostXFree` on them would corrupt Mesa.
+//
+// Results are interned. GL strings are static, and applications compare
+// returned pointers for identity (`s == prev_s` as a cheap "still the same
+// driver?" check). Never freed by design -- the total is a small fixed set
+// per process (VENDOR, RENDERER, VERSION, EXTENSIONS, one GLSL_VERSION,
+// plus per-index EXTENSIONS strings, and a handful of GLX server/client
+// strings). Under a busy application it stays well under 100 entries.
+static guest_layout<const GLubyte*> RelocateStringToGuestHeap(const GLubyte* Str) {
+  if (!Str) {
+    return guest_layout<const GLubyte*> {.data = 0};
+  }
+
+  static std::mutex InternMutex;
+  static std::unordered_map<const void*, uintptr_t> Interned;
+
+  std::lock_guard<std::mutex> Lock(InternMutex);
+  auto It = Interned.find(Str);
+  if (It == Interned.end()) {
+    const size_t Size = std::strlen(reinterpret_cast<const char*>(Str)) + 1;
+    void* GuestBuf = GuestMalloc(Size);
+    if (!GuestBuf) {
+      // Guest OOM. Returning null is honest -- the alternative is handing
+      // back a truncated host pointer, which is the bug we are fixing.
+      return guest_layout<const GLubyte*> {.data = 0};
+    }
+    std::memcpy(GuestBuf, Str, Size);
+    It = Interned.emplace(Str, reinterpret_cast<uintptr_t>(GuestBuf)).first;
+  }
+  using GuestPtr = decltype(guest_layout<const GLubyte*>::data);
+  return guest_layout<const GLubyte*> {.data = static_cast<GuestPtr>(It->second)};
+}
+
+guest_layout<const GLubyte*> fexfn_impl_libGL_glGetString(GLenum name) {
+  return RelocateStringToGuestHeap(fexldr_ptr_libGL_glGetString(name));
+}
+
+guest_layout<const GLubyte*> fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
+  return RelocateStringToGuestHeap(fexldr_ptr_libGL_glGetStringi(name, index));
+}
+
+// The glX*String trio's public signature is `const char*` (not `const
+// GLubyte*` like the GL ones), and thunkgen declares the custom_host_impl
+// forward with that type. The narrow char*/uint8_t* pointer-flavor interop
+// on guest_layout<T*> (Host.h) bridges the assignment to the packed-args
+// `rv` (which is `guest_layout<const uint8_t*>`).
+static guest_layout<const char*> RelocateCharStringToGuestHeap(const char* Str) {
+  auto Result = RelocateStringToGuestHeap(reinterpret_cast<const GLubyte*>(Str));
+  return guest_layout<const char*> {.data = Result.data};
+}
+
+guest_layout<const char*> fexfn_impl_libGL_glXQueryExtensionsString(Display* dpy, int screen) {
+  return RelocateCharStringToGuestHeap(fexldr_ptr_libGL_glXQueryExtensionsString(dpy, screen));
+}
+
+guest_layout<const char*> fexfn_impl_libGL_glXGetClientString(Display* dpy, int name) {
+  return RelocateCharStringToGuestHeap(fexldr_ptr_libGL_glXGetClientString(dpy, name));
+}
+
+guest_layout<const char*> fexfn_impl_libGL_glXQueryServerString(Display* dpy, int screen, int name) {
+  return RelocateCharStringToGuestHeap(fexldr_ptr_libGL_glXQueryServerString(dpy, screen, name));
+}
+#endif // IS_32BIT_THUNK
 
 // Maps to a host-side XVisualInfo, which must be XFree'ed by the caller.
 static XVisualInfo* LookupHostVisualInfo(Display* HostDisplay, guest_layout<XVisualInfo*> GuestInfo) {

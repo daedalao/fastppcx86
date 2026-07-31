@@ -284,6 +284,24 @@ struct guest_layout<T*> {
   const T* force_get_host_pointer() const {
     return reinterpret_cast<const T*>(uintptr_t {data});
   }
+
+  // char*/uint8_t* pointer-flavor interop for custom_host_impl functions.
+  // Mirrors host_to_guest_convertible's operator guest_layout<const uint8_t*>()
+  // (Host.h ~581). thunkgen declares impl returns as `guest_layout<const
+  // char*>` (matching the source C signature) but declares the packed-args
+  // `rv` field as `guest_layout<const uint8_t*>` (its canonicalised byte-ptr
+  // form). Auto-generated unpackers bridge that via `to_guest(to_host_layout(...))`;
+  // custom_host_impl assignments need this conversion instead.
+  operator guest_layout<const uint8_t*>() const
+    requires (std::is_same_v<T, const char>)
+  {
+    return guest_layout<const uint8_t*> {.data = data};
+  }
+  operator guest_layout<uint8_t*>() const
+    requires (std::is_same_v<T, char>)
+  {
+    return guest_layout<uint8_t*> {.data = data};
+  }
 };
 
 template<typename T>
