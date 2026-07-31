@@ -37,6 +37,7 @@ $end_info$
 #include <syscall.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
 
@@ -1012,13 +1013,61 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   if ((Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) && !IsAsyncSignal(&SigInfo, Signal)) {
     static const bool trip = (getenv("FEX_ABORT_TRIPWIRE") != nullptr);
     if (trip) {
-      char buf[1024];
+      char buf[2048];
       int n = snprintf(buf, sizeof(buf), "[GSIG] tid=%d sig=%d si_code=%d si_addr=0x%lx guest_rip=0x%lx\n",
                        FHU::Syscalls::gettid(), Signal, SigInfo.si_code, reinterpret_cast<unsigned long>(SigInfo.si_addr),
                        (unsigned long)Thread->CurrentFrame->State.rip);
       const auto& St = Thread->CurrentFrame->State;
       n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  rax=%lx rcx=%lx rdx=%lx rbx=%lx rsp=%lx rbp=%lx rsi=%lx rdi=%lx\n",
                     St.gregs[0], St.gregs[1], St.gregs[2], St.gregs[3], St.gregs[4], St.gregs[5], St.gregs[6], St.gregs[7]);
+
+      // FEX_TRIPWIRE_PROBE="<reg>:<off>[,<off>...]" — dump guest memory at
+      // fixed offsets from one register, e.g. "rdi:0x0,0x28,0x490". The dumped
+      // GPRs are SRA-reconstructed block-entry state, so probing memory they
+      // point at is how a suspect object is inspected post-mortem (RimWorld's
+      // UnityPlayer+0x1aa3ba0 NULL-field crash is the motivating case).
+      // Reads go through process_vm_readv: the register value is untrusted and
+      // a raw dereference here would turn a bad reconstruction into a
+      // recursive SIGSEGV inside the signal handler, losing the whole dump.
+      static const char* ProbeSpec = getenv("FEX_TRIPWIRE_PROBE");
+      if (ProbeSpec) {
+        static constexpr std::pair<const char*, int> RegNames[] = {
+          {"rax", 0}, {"rcx", 1}, {"rdx", 2}, {"rbx", 3}, {"rsp", 4}, {"rbp", 5}, {"rsi", 6}, {"rdi", 7},
+          {"r8", 8},  {"r9", 9},  {"r10", 10}, {"r11", 11}, {"r12", 12}, {"r13", 13}, {"r14", 14}, {"r15", 15},
+        };
+        const char* Colon = strchr(ProbeSpec, ':');
+        int RegIdx = -1;
+        if (Colon) {
+          for (auto& [Name, Idx] : RegNames) {
+            if (strlen(Name) == static_cast<size_t>(Colon - ProbeSpec) && !memcmp(ProbeSpec, Name, Colon - ProbeSpec)) {
+              RegIdx = Idx;
+              break;
+            }
+          }
+        }
+        if (RegIdx >= 0) {
+          const uint64_t Base = St.gregs[RegIdx];
+          const char* p = Colon + 1;
+          for (int i = 0; i < 16 && *p; ++i) {
+            char* End = nullptr;
+            const uint64_t Off = strtoul(p, &End, 0);
+            if (End == p) {
+              break;
+            }
+            uint64_t Val = 0;
+            struct iovec Local {&Val, sizeof(Val)};
+            struct iovec Remote {reinterpret_cast<void*>(Base + Off), sizeof(Val)};
+            if (process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0) == sizeof(Val)) {
+              n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  probe [%.*s+0x%lx] = 0x%lx\n", static_cast<int>(Colon - ProbeSpec),
+                            ProbeSpec, Off, Val);
+            } else {
+              n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  probe [%.*s+0x%lx] = <unreadable>\n",
+                            static_cast<int>(Colon - ProbeSpec), ProbeSpec, Off);
+            }
+            p = (*End == ',') ? End + 1 : End;
+          }
+        }
+      }
       // 32-bit guests keep a walkable EBP chain: ebp -> {saved ebp, ret}.
       // Reads are within our own address space; bound them to the low 4GB and
       // require monotonically increasing frame pointers to stay fault-free.
