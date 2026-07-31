@@ -311,6 +311,19 @@ private:
 };
 
 void ThunkHandler_impl::LoadLib(std::string_view Name) {
+  {
+    // Guest dlclose+dlopen of a thunked library re-runs the guest thunk's
+    // ELF constructor and lands here again. Reloading is idempotent but
+    // wasteful (a second host dlopen refcount that is never dropped plus
+    // ~1000 redundant dlsyms) and makes the debug log read as if something
+    // new happened. First load wins.
+    std::lock_guard lk(ThunksMutex);
+    if (Libs.contains(fextl::string {Name})) {
+      LogMan::Msg::DFmt("LoadLib: {} already loaded, skipping reload", Name);
+      return;
+    }
+  }
+
   auto SOName = ThunkHostLibsPath();
   while (SOName.ends_with('/')) {
     SOName.pop_back();
