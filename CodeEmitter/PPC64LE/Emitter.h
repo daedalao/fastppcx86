@@ -6,6 +6,8 @@
 
 #include "Registers.h"
 
+#include <FEXCore/Utils/LogManager.h>
+
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -1594,7 +1596,28 @@ private:
   }
 
   // M-form: op(6) | RS(5) | RA(5) | SH(5) | MB(5) | ME(5) | Rc(1)
+  //
+  // Diagnostic hard trap for oversized SH/MB/ME.  These fields are 5 bits each
+  // in the M-form; passing anything with bit 5 (0x20) set silently corrupts
+  // the neighbouring register field.  For SH the neighbour is RA -- the
+  // destination register -- so `SH >= 32` emits an instruction that writes a
+  // different register than the caller intended (`ra |= 1` in the x32 SRA map
+  // aliases e.g. r8->r9 = ECX->EDX, matching a live gldriverquery symptom).
+  // MB and ME overflow smears into the adjacent field or opcode bits, giving
+  // arbitrary-but-emit-time-constant miscodings that look like miscompiles
+  // rather than encoder bugs.
+  //
+  // Not `assert()`: Release builds have `-DNDEBUG` so every asserted range
+  // guard in this header is inert in the crashing binary.  Use LOGMAN_MSG_A_FMT
+  // which is preserved in all build modes and names the caller in the log.
+  //
+  // ALUOps.cpp:841-845 documents an earlier bite of this exact shape --
+  // `SH=32` corrupting r8->r9 in AddNZCV/SubNZCV -- caught by hand rather
+  // than an emit-time guard.  This puts the guard where it belongs.
   void EmitM(uint32_t op, uint32_t rs, uint32_t ra, uint32_t sh, uint32_t mb, uint32_t me, uint32_t rc) {
+    LOGMAN_THROW_A_FMT(sh < 32, "PPC64 EmitM: SH out of range (0x{:x}); would bleed into RA and change destination register", sh);
+    LOGMAN_THROW_A_FMT(mb < 32, "PPC64 EmitM: MB out of range (0x{:x}); would bleed into SH", mb);
+    LOGMAN_THROW_A_FMT(me < 32, "PPC64 EmitM: ME out of range (0x{:x}); would smear across RA/RS/opcode", me);
     Emit32((op << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1) | rc);
   }
 
