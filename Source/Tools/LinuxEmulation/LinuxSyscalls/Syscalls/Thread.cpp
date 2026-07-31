@@ -294,113 +294,32 @@ static int CloneFork(uint32_t flags, uint64_t exit_signal) {
   return ::syscall(SYSCALL_DEF(clone), (flags & ~StripFlags) | exit_signal, nullptr, nullptr, nullptr, nullptr);
 }
 
-// Real-vfork path: CLONE_VM + CLONE_VFORK preserved so that pressure-vessel
-// / glibc posix_spawn child setup writes to shared memory are visible to
-// the parent, as real vfork() guarantees.  The previous "fake vfork"
-// (fork + ppoll) stripped CLONE_VM and silently broke any caller relying
-// on shared-memory child writes.
-//
-// Why the IsChild branch is empty:
-//   With CLONE_VM, the child shares ALL memory with parent — heap, .bss,
-//   .data, TLS, mutex state.  ANY C++ in the child that touches these
-//   would corrupt parent (which is suspended in kernel, waiting).  The
-//   contract of vfork is that the child only execve()s or _exit()s.  We
-//   ride that contract: child returns 0, JIT writes RAX=0 to the shared
-//   Frame->State, guest immediately exec/exits.
-//
-// Why we snapshot Frame->State in parent:
-//   Each guest syscall the child runs during its vfork window (typically
-//   dup2/close/sigaction/execve) goes through FEX's syscall dispatcher
-//   which mutates Frame->State.gregs[REG_RAX].  By execve, State holds
-//   child's last syscall result, not parent's pre-vfork register file.
-//   We snapshot to a stack-local that lives at parent_SP+offset; child's
-//   post-clone frames allocate at addresses below parent_SP and cannot
-//   reach this region.
-//
-// Why we don't Lock/UnlockBeforeFork:
-//   Those acquire FEXCore's process-wide mutexes.  Under CLONE_VM the
-//   mutex state is shared with child; if child unlocked, parent would
-//   wake to released mutexes it thought it held.  Worse, child cannot
-//   acquire any of them without deadlock.  Real vfork doesn't need this
-//   protection because parent is suspended in kernel: no parent code
-//   runs concurrently with child userspace.
-static uint64_t RealVForkGuest(FEXCore::Core::InternalThreadState* Thread,
-                               FEXCore::Core::CpuStateFrame* Frame,
-                               FEX::HLE::clone3_args* args) {
-  const uint64_t flags = args->args.flags;
-  const uint64_t exit_signal = args->args.exit_signal;
-  auto parent_tid = reinterpret_cast<pid_t*>(args->args.parent_tid);
-
-  // Block all signals around the vfork window.  Saved/restored on parent
-  // side after wake.  Child path skips the restore: it execs/exits before
-  // any signal handler could matter.
-  uint64_t Mask{~0ULL};
-  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &Mask, sizeof(Mask));
-
-  // Snapshot the guest register file to parent's stack frame.  Lives above
-  // SP_clone; child's frames allocate below SP_clone and cannot touch this
-  // region.  CPUState is trivially_copyable and 64-byte aligned, see
-  // FEXCore/include/FEXCore/Core/CoreState.h:252.
-  // CPUState has deleted copy ops (atomic / nontrivial members) but is
-  // is_trivially_copyable; use a raw byte buffer + memcpy for the snapshot.
-  alignas(64) unsigned char SavedStateBuf[sizeof(FEXCore::Core::CPUState)];
-  memcpy(SavedStateBuf, &Frame->State, sizeof(FEXCore::Core::CPUState));
-
-  // CLONE_VM is intentionally STRIPPED here.  We tried passing it through
-  // (commit history: c00997674, then a follow-up that forced it on for
-  // SYS_vfork callers) — both crashed parent on wake.  Root cause: ANY
-  // FEX C++ that child runs between clone() and the kernel execve syscall
-  // mutates shared heap.  In particular, FEX's execve handler walks/unmaps
-  // VMA regions, zeroing parent's PLT GOT slots.  Upstream FEX author
-  // documented the same limitation in commit d97fa9af1 (2023-05-26):
-  // "we can't emulate vfork correctly because we need to do other work
-  // before this process terminates or executes a new process".  A real
-  // fix requires either an asm-only child path that bypasses every FEX
-  // C++ frame, or a per-syscall-dispatcher vfork-window minimal mode.
-  // Both are multi-week reworks.  For now, fake-vfork (parent blocks on
-  // a pipe poll() until child exits or execs) is the best we can do.
-  // RealVForkGuest still exists as a cleaner code path: it avoids the
-  // LockBeforeFork/UnlockAfterFork dance that fork() requires, since
-  // there is genuinely nothing to snapshot under fake-vfork.
-  const uint64_t vfork_flags =
-      (flags & ~(uint64_t)(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND | CLONE_SETTLS))
-      | exit_signal;
-
-  const long Result = ::syscall(SYSCALL_DEF(clone), vfork_flags, nullptr,
-                                nullptr, nullptr, nullptr);
-
-  if (Result == 0) {
-    // CHILD: NO FEX state mutation.  Caller's syscall-return path will
-    // write 0 to Frame->State.gregs[REG_RAX]; that's a shared-memory write
-    // but parent overwrites it via SavedState restore below.  Guest sees
-    // vfork()=0 and execve()s.
-    return 0;
-  }
-
-  // PARENT: kernel resumed us after child exec/_exit.  Restore everything.
-  memcpy(&Frame->State, SavedStateBuf, sizeof(FEXCore::Core::CPUState));
-  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, nullptr, sizeof(Mask));
-
-  if (Result == -1) {
-    // clone() failed in kernel (e.g. ENOMEM, EAGAIN).  Mirror normal
-    // SYSCALL_ERRNO behavior: return -errno.
-    return -errno;
-  }
-
-  if (flags & CLONE_PARENT_SETTID) {
-    *parent_tid = static_cast<pid_t>(Result);
-  }
-  if (flags & CLONE_PIDFD) {
-    const int pidfd = ::syscall(SYSCALL_DEF(pidfd_open), Result, 0);
-    if (pidfd >= 0) {
-      *reinterpret_cast<int*>(args->args.pidfd) = pidfd;
-    } else {
-      LogMan::Msg::EFmt("vfork CLONE_PIDFD: pidfd_open(pid={}) failed (errno {})", Result, errno);
-    }
-  }
-
-  return Result;
-}
+// vfork/posix_spawn history — three attempts, keep for archaeology:
+//   1. Real vfork (CLONE_VM|CLONE_VFORK passed through, c00997674 + follow-up):
+//      crashed parent on wake.  ANY FEX C++ the child runs between clone()
+//      and execve mutates the shared heap; FEX's execve handler walks/unmaps
+//      VMA regions, zeroing parent's PLT GOT slots.  Upstream hit the same
+//      wall (d97fa9af1, 2023-05-26).  A real fix needs an asm-only child
+//      path or a vfork-window minimal dispatcher mode — multi-week reworks.
+//   2. Lock-free downgrade ("RealVForkGuest", removed 2026-07-30): stripped
+//      CLONE_VM but KEPT CLONE_VFORK and skipped LockBeforeFork/atfork
+//      entirely, on the reasoning that vfork's suspended parent made locks
+//      unnecessary.  That reasoning only holds when the VM is shared.  With
+//      a copied address space, the child inherits a snapshot in which locks
+//      held by OTHER running threads (FEX mutexes, allocator state, guest
+//      libc locks) are frozen locked; the first pre-execve guest syscall
+//      that needs one wedges the child, and CLONE_VFORK then suspends the
+//      parent in the kernel forever while it holds the guest libc lock it
+//      took around the spawn.  Deterministic repro: Ziggurat (FMOD) with the
+//      asound thunk enabled — host pipewire threads allocate constantly, so
+//      the fork always catches a held lock (2026-07-30).
+//   3. Current: route CLONE_VFORK through the ordinary locked fork path
+//      below, with CLONE_VFORK itself stripped from the host clone.  The
+//      parent waits for child exec/_exit on the pipe instead of in the
+//      kernel, AFTER releasing the fork locks — so a wedged or crashed
+//      child leaves the process debuggable instead of frozen.  Child-writes-
+//      through-shared-VM semantics remain unimplemented (see
+//      vfork-no-vm-sharing notes); exit-status/ordering semantics hold.
 
 uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
   const uint64_t flags = args->args.flags;
@@ -419,14 +338,6 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
     }
   }
 
-  // Real vfork: CLONE_VM is preserved so child's writes to shared memory
-  // (pressure-vessel / glibc posix_spawn helpers) are visible to parent.
-  // The vfork path is structured so child does NO FEX state mutation
-  // between clone() and exec/_exit.  See RealVForkGuest comment above.
-  if (flags & CLONE_VFORK) {
-    return RealVForkGuest(Thread, Frame, args);
-  }
-
   // Just before we fork, we lock all syscall mutexes so that both processes will end up with a locked mutex
   uint64_t Mask {~0ULL};
   ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &Mask, sizeof(Mask));
@@ -442,9 +353,15 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
     // If we use `waitpid` then the kernel won't return the same data if asked again.
     pipe2(VForkFDs, O_CLOEXEC);
 
-    // XXX: We don't currently support a real `vfork` as it causes problems.
-    // Currently behaves like a fork (with wait after the fact), which isn't correct. Need to find where the problem is
-    Result = CloneFork(flags, exit_signal);
+    // Strip CLONE_VFORK from the host clone: since CLONE_VM cannot be
+    // honored, a kernel-level vfork suspension would park the parent —
+    // holding the guest-side locks it took around the spawn — until a child
+    // that inherited a COPIED address space (including any locks other
+    // threads held at clone time) manages to exec.  If that child wedges,
+    // the whole process freezes undebuggably.  The pipe below provides the
+    // parent-waits-until-exec ordering instead, entered only after
+    // UnlockAfterFork.  See the vfork history comment above ForkGuest.
+    Result = CloneFork(flags & ~static_cast<uint64_t>(CLONE_VFORK), exit_signal);
 
     if (Result == 0) {
       // Close the read end of the pipe.
