@@ -1483,24 +1483,36 @@ uint64_t FileManager::Linkat(int olddirfd, const char* oldpath, int newdirfd, co
   auto OldPath = GetEmulatedFDPath(olddirfd, OldSelfPath, (flags & AT_SYMLINK_FOLLOW) != 0, OldTmp);
   auto NewPath = GetEmulatedFDPath(newdirfd, NewSelfPath, false, NewTmp);
 
-  // Per-leg translation: substitute (rootfsFD, relpath) for legs where
-  // GetEmulatedFDPath returned a translation. The other leg keeps the
-  // caller-supplied dirfd/path. This matters when one side is a real
-  // dirfd (NoEntry) but the other is an absolute path under /tmp that
-  // we've been routing to rootfs — without translation the kernel saw
-  // dirfd-on-rootfs-fs and newpath-on-tmpfs and returned EXDEV.
-  int eff_olddirfd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
-  const char* eff_oldpath = (OldPath.FD != -1) ? OldPath.Path : OldSelfPath;
-  int eff_newdirfd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
-  const char* eff_newpath = (NewPath.FD != -1) ? NewPath.Path : NewSelfPath;
+  // Resolve each leg independently so a rootfs-only source and a host-only
+  // destination (or vice versa) both land at the tree that actually holds
+  // them. Previous logic picked one tree per call and applied it to both
+  // legs, which broke apt's dpkg staging: `.deb` at
+  // /var/cache/apt/archives/* is rootfs-only, /tmp/apt-dpkg-install-*/ is
+  // host-only (my f168b3101 puts mkdirs there because host /tmp exists).
+  // Old:  (rootfs_src, rootfs_dst) then (host_src, host_dst) -- both
+  //       trees miss the mixed case, so link() returned ENOENT.
+  // New:  each leg keeps its host effect if the host path exists (source
+  //       leg) or the host parent exists (destination leg), else falls
+  //       back to rootfs. If the resolved combination crosses filesystem
+  //       boundaries, the kernel returns EXDEV and apt/dpkg copies. That
+  //       is the intended semantic per POSIX; the EXDEV path is well-
+  //       exercised by every apt install.
+  int eff_olddirfd = olddirfd;
+  const char* eff_oldpath = OldSelfPath;
+  if (OldPath.FD != -1 && OldSelfPath && ::faccessat(AT_FDCWD, OldSelfPath, F_OK, 0) != 0) {
+    // Host doesn't have the source; use rootfs.
+    eff_olddirfd = OldPath.FD;
+    eff_oldpath = OldPath.Path;
+  }
+
+  int eff_newdirfd = newdirfd;
+  const char* eff_newpath = NewSelfPath;
+  // Destination: use host first (host-create discipline from f168b3101).
+  // If the host attempt returns ENOENT below, retry against the rootfs.
 
   uint64_t Result = ::syscall(SYSCALL_DEF(linkat), eff_olddirfd, eff_oldpath, eff_newdirfd, eff_newpath, flags);
-  // EXDEV with at least one translated leg means our rootfs-substitution
-  // crossed a real filesystem boundary; fall back to the caller's literal
-  // paths. ENOENT with translation means the rootfs leg simply doesn't
-  // exist there; same fallback.
-  if (Result == -1 && (errno == EXDEV || errno == ENOENT) && (OldPath.FD != -1 || NewPath.FD != -1)) {
-    Result = ::syscall(SYSCALL_DEF(linkat), olddirfd, OldSelfPath, newdirfd, NewSelfPath, flags);
+  if (Result == -1 && errno == ENOENT && NewPath.FD != -1) {
+    Result = ::syscall(SYSCALL_DEF(linkat), eff_olddirfd, eff_oldpath, NewPath.FD, NewPath.Path, flags);
   }
   return Result;
 }
@@ -1542,19 +1554,22 @@ uint64_t FileManager::Renameat2(int olddirfd, const char* oldpath, int newdirfd,
   auto OldPath = GetEmulatedFDPath(olddirfd, OldSelfPath, false, OldTmp);
   auto NewPath = GetEmulatedFDPath(newdirfd, NewSelfPath, false, NewTmp);
 
-  // Per-leg translation (see FM.Linkat for rationale): substitute
-  // (rootfsFD, relpath) on legs that translate, keep the caller's
-  // dirfd/path on legs that don't.
-  int eff_olddirfd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
-  const char* eff_oldpath = (OldPath.FD != -1) ? OldPath.Path : OldSelfPath;
-  int eff_newdirfd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
-  const char* eff_newpath = (NewPath.FD != -1) ? NewPath.Path : NewSelfPath;
+  // Independent per-leg resolution -- same shape as FM.Linkat. Old code
+  // picked one tree per call and applied it to both legs, breaking apt's
+  // dpkg staging: rootfs-source + host-destination never got tried.
+  int eff_olddirfd = olddirfd;
+  const char* eff_oldpath = OldSelfPath;
+  if (OldPath.FD != -1 && OldSelfPath && ::faccessat(AT_FDCWD, OldSelfPath, F_OK, 0) != 0) {
+    eff_olddirfd = OldPath.FD;
+    eff_oldpath = OldPath.Path;
+  }
+
+  int eff_newdirfd = newdirfd;
+  const char* eff_newpath = NewSelfPath;
 
   uint64_t Result = ::syscall(SYSCALL_DEF(renameat2), eff_olddirfd, eff_oldpath, eff_newdirfd, eff_newpath, flags);
-  // Fall back to literal paths when our translation crossed filesystems
-  // (EXDEV) or the rootfs leg doesn't exist (ENOENT).
-  if (Result == -1 && (errno == EXDEV || errno == ENOENT) && (OldPath.FD != -1 || NewPath.FD != -1)) {
-    Result = ::syscall(SYSCALL_DEF(renameat2), olddirfd, OldSelfPath, newdirfd, NewSelfPath, flags);
+  if (Result == -1 && errno == ENOENT && NewPath.FD != -1) {
+    Result = ::syscall(SYSCALL_DEF(renameat2), eff_olddirfd, eff_oldpath, NewPath.FD, NewPath.Path, flags);
   }
   return Result;
 }
