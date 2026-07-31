@@ -7,7 +7,18 @@ check_include_files("gdb/jit-reader.h" HAVE_GDB_JIT_READER_H)
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
-option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
+# Building guest thunks with clang cross-targeting x86_64 was chosen because it
+# does not require a per-triple cross-gcc install. It corrupts the guest/host
+# ABI boundary though: clang's layout of the generated packed-args structs
+# disagrees with what the ppc64le-clang-built host thunks marshal, and calls
+# with structurally-richer arguments (glGenFramebuffers, VkImageCreateInfo,
+# etc.) crash the moment the layouts disagree. Simple string queries survive.
+# Reproduced on this host with FTL segfaulting at "Creating FBO..." and
+# Factorio dying ~2s after "OpenGL initialized" — both go away when this is
+# OFF and the ct-ng-built x86_64 cross-gcc compiles the guest stubs instead.
+# Default OFF until the layout divergence is fixed upstream; hosts without an
+# x86_64 cross-gcc need -DENABLE_CLANG_THUNKS=ON and accept the regression.
+option(ENABLE_CLANG_THUNKS "Build thunks with clang" FALSE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
 option(ENABLE_LTO "Enable LTO with compilation" TRUE)
 option(ENABLE_XRAY "Enable building with LLVM X-Ray" FALSE)
