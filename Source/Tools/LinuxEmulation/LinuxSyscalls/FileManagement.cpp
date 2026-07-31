@@ -784,6 +784,29 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
     fd = ::open(SelfPath, flags, mode);
   }
 
+  // Host create returned ENOENT because the parent only exists in the rootfs
+  // (Factorio's /opt/factorio/.lock, apt's /var/cache/apt/*). Mirror the
+  // chdir host-first/rootfs-on-ENOENT pattern from 6c79ed559: fall back to
+  // creating inside the rootfs when the host tree has no such parent.
+  // f674ed515's motivating cases (bwrap writing bind-mount source files at /
+  // that mount() then reads through the real namespace) resolve on the host
+  // first and never reach this branch, so containment holds.
+  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !(flags & O_TMPFILE)) {
+    FDPathTmpData TmpFilename;
+    auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
+    if (Path.FD != -1) {
+      FEX::HLE::open_how how = {
+        .flags = (uint64_t)flags,
+        .mode = mode & 07777,
+        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
+      };
+      fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+      if (fd == -1 && errno == EXDEV) {
+        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+      }
+    }
+  }
+
   // EmuFD overlay (read-only mocks of /proc/cpuinfo etc.) only applies to
   // non-write opens; this is the original ShouldSkipOpenInEmu intent.
   if (!ShouldSkipOpenInEmu(flags)) {
@@ -1179,6 +1202,29 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
     fd = ::syscall(SYSCALL_DEF(openat), dirfs, SelfPath, flags, mode);
   }
 
+  // Host create returned ENOENT because the parent only exists in the rootfs
+  // (Factorio's /opt/factorio/.lock, apt's /var/cache/apt/*). Same host-first/
+  // rootfs-on-ENOENT pattern as FM.Open above (mirroring chdir 6c79ed559).
+  if (fd == -1 && errno == ENOENT && (flags & O_CREAT) && !(flags & O_TMPFILE)) {
+    FDPathTmpData TmpFilename;
+    auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
+    if (Path.FD != -1) {
+      uint64_t How_flags = (uint64_t)flags;
+      if (How_flags & O_PATH) {
+        How_flags &= (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+      }
+      FEX::HLE::open_how how = {
+        .flags = How_flags,
+        .mode = mode & 07777,
+        .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,
+      };
+      fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+      if (fd == -1 && errno == EXDEV) {
+        fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, (int)How_flags, mode);
+      }
+    }
+  }
+
   // EmuFD overlay (read-only mocks of /proc/cpuinfo etc.) only applies for
   // non-write opens. This is the original ShouldSkipOpenInEmu intent.
   if (!ShouldSkipOpenInEmu(flags)) {
@@ -1265,13 +1311,19 @@ uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
 
   // Node creation belongs to the real filesystem — never create inside the
   // rootfs overlay (see Mkdirat()). Overlay consulted for EEXIST only.
+  // Host-first / rootfs-on-ENOENT: if the host tree has no such parent
+  // (path only exists in rootfs) fall back to rootfs creation.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
   if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
     errno = EEXIST;
     return -1;
   }
-  return ::mknod(SelfPath, mode, dev);
+  uint64_t Result = ::mknod(SelfPath, mode, dev);
+  if (Result == -1 && errno == ENOENT && Path.FD != -1) {
+    Result = ::mknodat(Path.FD, Path.Path, mode, dev);
+  }
+  return Result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,13 +1458,19 @@ uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
   // bind-mounted over the container's real /home, hiding the Steam install.
   // The overlay is still consulted for EEXIST fidelity: a directory that
   // exists only in the rootfs must not be shadow-created on the host.
+  // Host-first / rootfs-on-ENOENT: if the host has no such parent (path
+  // only exists in rootfs) fall back to rootfs creation.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, false, TmpFilename);
   if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
     errno = EEXIST;
     return -1;
   }
-  return ::syscall(SYSCALL_DEF(mkdirat), dirfd, SelfPath, mode);
+  uint64_t Result = ::syscall(SYSCALL_DEF(mkdirat), dirfd, SelfPath, mode);
+  if (Result == -1 && errno == ENOENT && Path.FD != -1) {
+    Result = ::syscall(SYSCALL_DEF(mkdirat), Path.FD, Path.Path, mode);
+  }
+  return Result;
 }
 
 uint64_t FileManager::Linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
@@ -1455,13 +1513,19 @@ uint64_t FileManager::Symlinkat(const char* target, int newdirfd, const char* li
 
   // Symlink creation belongs to the real filesystem — never create inside
   // the rootfs overlay (see Mkdirat()). Overlay consulted for EEXIST only.
+  // Host-first / rootfs-on-ENOENT: if the host has no such parent (path
+  // only exists in rootfs) fall back to rootfs creation.
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(newdirfd, SelfLink, false, TmpFilename);
   if (Path.FD != -1 && ::faccessat(Path.FD, Path.Path, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
     errno = EEXIST;
     return -1;
   }
-  return ::syscall(SYSCALL_DEF(symlinkat), target, newdirfd, SelfLink);
+  uint64_t Result = ::syscall(SYSCALL_DEF(symlinkat), target, newdirfd, SelfLink);
+  if (Result == -1 && errno == ENOENT && Path.FD != -1) {
+    Result = ::syscall(SYSCALL_DEF(symlinkat), target, Path.FD, Path.Path);
+  }
+  return Result;
 }
 
 uint64_t FileManager::Renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
