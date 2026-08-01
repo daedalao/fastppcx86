@@ -4620,7 +4620,7 @@ DEF_OP(VFCVTL2) {
     ld(TMP1, 16, r1); std(TMP1, PostSpill(CryptoSlotR26), r1);
     addi(r3, r1, PostSpill(CryptoSlotA));
     addi(r4, r1, PostSpill(CryptoSlotA));
-    LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_F16HiToF32x4));
+    EmitLoadPPC64Helper(r(12), PPC64_HELPER_F16HiToF32x4);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
@@ -4673,7 +4673,7 @@ DEF_OP(VFCVTN2) {
     ld(TMP1, 16, r1); std(TMP1, PostSpill(CryptoSlotR26), r1);
     addi(r3, r1, PostSpill(CryptoSlotA));   // dst (= VL spill, helper writes upper half)
     addi(r4, r1, PostSpill(CryptoSlotB));   // f32 source (VU)
-    LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16Hi));
+    EmitLoadPPC64Helper(r(12), PPC64_HELPER_F32x4ToF16Hi);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
