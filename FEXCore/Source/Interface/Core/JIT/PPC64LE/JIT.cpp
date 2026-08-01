@@ -1962,8 +1962,12 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
     FEXCore::Utils::MemberFunctionToPointerCast PMF(&FEXCore::CPUIDEmu::RunXCRFunction);
     Ptrs.XCRFunction = PMF.GetConvertedPointer();
   }
-  Ptrs.LUDIV            = reinterpret_cast<uint64_t>(LUDIV);
-  Ptrs.LDIV             = reinterpret_cast<uint64_t>(LDIV);
+  // Note: Ptrs.LUDIV / Ptrs.LDIV are intentionally NOT set. Those slots
+  // are read by the arm64/x86_64 Dispatcher.cpp EmitLongALUOpHandler
+  // trampolines; ppc64le has its own dispatcher (PPC64Dispatcher.cpp)
+  // and no JIT emit site reads Pointers.LUDIV/LDIV — grep confirms.
+  // The setters ran at every JIT-core construction (per guest thread)
+  // to no observable effect. Deletion is safe (P2.1 C6).
   Ptrs.PrintValue       = reinterpret_cast<uint64_t>(PrintValue);
   Ptrs.PrintMsgValue    = reinterpret_cast<uint64_t>(PrintMsg);
   Ptrs.MonoBackpatcherWrite =
