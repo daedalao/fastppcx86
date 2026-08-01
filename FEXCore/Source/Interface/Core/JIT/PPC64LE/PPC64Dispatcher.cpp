@@ -53,15 +53,28 @@ extern "C" void PPC64_PauseSchedYield() {
 
 // DEBUG: visible to gdb post-mortem. Updated at every dispatcher fast-path
 // entry with the guest RIP being dispatched.
+//
+// This is port-local scaffolding with no ARM64 equivalent, and it is not free:
+// the emit in DispatcherLoopTop below costs 23 instructions (3 stores + 1 load)
+// on EVERY guest block transition, and ppc64le has no block-to-block linking so
+// every guest block exit pays it. These are alignas(64) process-globals written
+// by every guest thread, so on a multithreaded guest the cost is cross-core
+// cacheline coherence traffic, not just wasted instructions.
+//
+// Note for anyone tempted to re-enable this by default: the ring buffer was
+// ALREADY unreliable on multithreaded guests. g_dispatch_count is a racing
+// non-atomic read-modify-write shared by all guest threads, so threads read the
+// same index and store into the same slot; the recorded history is an
+// interleaved mix with silent collisions.
+//
+// Build with -DENABLE_ASSERTIONS=TRUE to get the trace back.
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
 extern "C" {
   alignas(64) uint64_t g_last_dispatched_rip = 0;
   alignas(64) uint64_t g_dispatch_count = 0;
   alignas(64) uint64_t g_recent_rips[16] = {};   // ring buffer (count & 15)
-  // Push debug: ring buffer of (Src, Dst-after-store, [Dst]) triples.
-  alignas(64) uint64_t g_push_count = 0;
-  alignas(64) uint64_t g_push_log[8][3] = {};
-  // Slow-path SRA-fill debug: capture r14 (= R6 = RSI) at three points.
 }
+#endif
 
 namespace FEXCore::CPU {
 
@@ -213,8 +226,12 @@ void PPC64Dispatcher::EmitDispatcher() {
     // analogous `and_(VirtualMemorySize-1)` (Dispatcher.cpp:188-191).
     MaybeClrUpper32(TMP1);
 
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
     // DEBUG: log RIP to globals so gdb post-mortem can see the dispatch trail.
-    // Use TMP2 as scratch (reload from STATE below).
+    // Assertions-only: see the note on the globals above for why this must not
+    // run in Release. TMP2/TMP3 are clobbered here but both are unconditionally
+    // reloaded from STATE immediately below, so removal needs no fixups.
+    // Each LoadConstant of a global is 5 instructions (PIE, load base > 32 bits).
     LoadConstant(TMP2, reinterpret_cast<uint64_t>(&g_last_dispatched_rip));
     std(TMP1, 0, TMP2);
     LoadConstant(TMP2, reinterpret_cast<uint64_t>(&g_dispatch_count));
@@ -227,6 +244,7 @@ void PPC64Dispatcher::EmitDispatcher() {
     sldi(TMP3, TMP3, 3);          // *8 for uint64 stride
     add(TMP2, TMP2, TMP3);
     std(TMP1, 0, TMP2);
+#endif
 
     // Load L1Pointer and L1Mask from Frame->State.L1Pointer / L1Mask
     // These are adjacent: L1Pointer at offset X, L1Mask at X+8.

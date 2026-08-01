@@ -26,11 +26,19 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/fextl/set.h>
 
-// Debug RIP tracing from PPC64LE dispatcher
+// Debug RIP tracing from the PPC64LE dispatcher. These are defined in
+// PPC64Dispatcher.cpp and only maintained by the emitted dispatcher in
+// assertions builds, so both the arch and the assertions guard are required —
+// this file is arch-generic and must not reference a ppc64le-only symbol.
+#if defined(ARCHITECTURE_ppc64le) && defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+#define FEX_PPC64_RIP_TRACE 1
 extern "C" {
   extern uint64_t g_dispatch_count;
   extern uint64_t g_recent_rips[16];
 }
+#else
+#define FEX_PPC64_RIP_TRACE 0
+#endif
 
 namespace FEXCore::Frontend {
 #include "Interface/Core/VSyscall/VSyscall.inc"
@@ -1591,16 +1599,24 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           EraseBlock = true;
         } else {
           {
-            uint64_t _dcount = g_dispatch_count;
-            LogMan::Msg::EFmt("{} instruction in entry block: {:X} (dispatch={})",
+            const char* const StatusStr =
                               BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST   ? "Invalid" :
                               BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST    ? "NoExec" :
                               BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION ? "BadRelocation" :
-                                                                                           "PartialDecode",
-                              OpAddress, _dcount);
+                                                                                           "PartialDecode";
+#if FEX_PPC64_RIP_TRACE
+            uint64_t _dcount = g_dispatch_count;
+            LogMan::Msg::EFmt("{} instruction in entry block: {:X} (dispatch={})",
+                              StatusStr, OpAddress, _dcount);
             for (int _ri = 1; _ri <= 8 && _ri <= (int)_dcount; ++_ri) {
               LogMan::Msg::EFmt("  rip[-{}] = {:X}", _ri, g_recent_rips[(_dcount - _ri) & 15]);
             }
+#else
+            // No zeroed rip[-N] lines here: printing a fabricated dispatch
+            // history is worse than reporting its absence.
+            LogMan::Msg::EFmt("{} instruction in entry block: {:X}", StatusStr, OpAddress);
+            LogMan::Msg::EFmt("  (RIP trace unavailable - build with -DENABLE_ASSERTIONS=TRUE)");
+#endif
             // Dump guest register state to diagnose stack corruption
             {
               auto& S = Thread->CurrentFrame->State;

@@ -1513,9 +1513,31 @@ void PPC64JITCore::ResetStack() {
 // Looks up or compiles the block at GuestRIP and returns its host code address.
 // Returns DispatcherLoopTop if compilation fails (dispatcher will spin and recheck).
 // Forward-declare the dispatcher's ring buffer (defined in PPC64Dispatcher.cpp).
+// It only exists — and is only maintained by the emitted dispatcher — in
+// assertions builds; in Release the dispatcher does not pay for it.
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
 extern "C" {
   extern uint64_t g_dispatch_count;
   extern uint64_t g_recent_rips[16];
+}
+#define FEX_PPC64_RIP_TRACE 1
+#else
+#define FEX_PPC64_RIP_TRACE 0
+#endif
+
+// Nth-most-recent dispatched guest RIP (N >= 1), or 0 if unavailable — either
+// because the trace is compiled out or because fewer than N blocks have been
+// dispatched. Callers must treat 0 as "no data", never as a real RIP.
+[[maybe_unused]] static uint64_t RecentDispatchedRIP([[maybe_unused]] int N) {
+#if FEX_PPC64_RIP_TRACE
+  const uint64_t Count = g_dispatch_count;
+  if (N < 1 || static_cast<uint64_t>(N) > Count) {
+    return 0;
+  }
+  return g_recent_rips[(Count - static_cast<uint64_t>(N)) & 15];
+#else
+  return 0;
+#endif
 }
 
 // Forward-declare the compile-log ring buffer (defined in Frontend.cpp).
@@ -1556,19 +1578,31 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
     uint64_t RAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
     uint64_t TCR = Frame->Pointers.ThunkCallbackRet;
     int n = snprintf(buf, sizeof(buf),
-                     "[FEX] suspect GuestRIP=0x%lx HostLR=0x%lx\n"
-                     "[FEX]   recent: [-1]=0x%lx [-2]=0x%lx [-3]=0x%lx [-4]=0x%lx [-5]=0x%lx [-6]=0x%lx\n"
-                     "[FEX]   RSP=0x%lx RDI=0x%lx RSI=0x%lx RAX=0x%lx ThunkCallbackRet=0x%lx\n",
-                     (unsigned long)GuestRIP, (unsigned long)HostLR,
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 1) & 15],
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 2) & 15],
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 3) & 15],
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 4) & 15],
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 5) & 15],
-                     (unsigned long)g_recent_rips[(g_dispatch_count - 6) & 15],
-                     (unsigned long)RSP, (unsigned long)RDI, (unsigned long)RSI,
-                     (unsigned long)RAX, (unsigned long)TCR);
+                     "[FEX] suspect GuestRIP=0x%lx HostLR=0x%lx\n",
+                     (unsigned long)GuestRIP, (unsigned long)HostLR);
     [[maybe_unused]] auto _ = write(2, buf, n);
+#if FEX_PPC64_RIP_TRACE
+    n = snprintf(buf, sizeof(buf),
+                 "[FEX]   recent: [-1]=0x%lx [-2]=0x%lx [-3]=0x%lx [-4]=0x%lx [-5]=0x%lx [-6]=0x%lx\n",
+                 (unsigned long)RecentDispatchedRIP(1),
+                 (unsigned long)RecentDispatchedRIP(2),
+                 (unsigned long)RecentDispatchedRIP(3),
+                 (unsigned long)RecentDispatchedRIP(4),
+                 (unsigned long)RecentDispatchedRIP(5),
+                 (unsigned long)RecentDispatchedRIP(6));
+#else
+    // Print the absence explicitly. Emitting zeroes here would fabricate a
+    // dispatch history during a corruption investigation, which is worse than
+    // having none.
+    n = snprintf(buf, sizeof(buf),
+                 "[FEX]   recent: (RIP trace unavailable - build with -DENABLE_ASSERTIONS=TRUE)\n");
+#endif
+    _ = write(2, buf, n);
+    n = snprintf(buf, sizeof(buf),
+                 "[FEX]   RSP=0x%lx RDI=0x%lx RSI=0x%lx RAX=0x%lx ThunkCallbackRet=0x%lx\n",
+                 (unsigned long)RSP, (unsigned long)RDI, (unsigned long)RSI,
+                 (unsigned long)RAX, (unsigned long)TCR);
+    _ = write(2, buf, n);
     // Try to peek at first 8 bytes of RSP and RSI as guest memory
     auto peek8 = [](uint64_t addr) -> uint64_t {
       if (addr < 0x1000 || (addr >> 47) != 0) return 0xDEADBEEFDEADBEEF;
@@ -1586,6 +1620,7 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   }
   LogMan::Msg::EFmt("=== ExitFunctionLink: suspect GuestRIP=0x{:x} ===", GuestRIP);
   LogMan::Msg::EFmt("    Host LR (JIT block tail that called us) = 0x{:x}", HostLR);
+#if FEX_PPC64_RIP_TRACE
   LogMan::Msg::EFmt("    Recent dispatched guest RIPs (g_recent_rips):");
   {
     uint64_t _dcount = g_dispatch_count;
@@ -1593,6 +1628,11 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
       LogMan::Msg::EFmt("      rip[-{}] = 0x{:x}", _ri, g_recent_rips[(_dcount - _ri) & 15]);
     }
   }
+#else
+  LogMan::Msg::EFmt("    Recent dispatched guest RIPs: (RIP trace unavailable - build with -DENABLE_ASSERTIONS=TRUE)");
+  LogMan::Msg::EFmt("    Everything below that is derived from rip[-1] -- the GOT/PLT probe, the compile-log");
+  LogMan::Msg::EFmt("    comparison, and the previous-JIT-block disasm -- is SKIPPED, not empty.");
+#endif
   LogMan::Msg::EFmt("    Disasm of JIT block at Host LR-512 .. LR+32 (PPC64 instructions):");
   LogMan::Msg::EFmt("    (Look for `std rX, 0x18(rRR)` = the state.rip store, and "
                     "`ldx rX, rA, r0` / `lis;ori;sldi;oris;ori` = the LoadConstant+ldx for malloc GOT)");
@@ -1634,13 +1674,9 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   // the 8 bytes at that slot. This disambiguates "GOT was actually
   // corrupted to GuestRIP value" from "JIT read from wrong VA".
   {
-    uint64_t prev_rip = 0;
-    {
-      uint64_t _dcount = g_dispatch_count;
-      if (_dcount >= 1) {
-        prev_rip = g_recent_rips[(_dcount - 1) & 15];
-      }
-    }
+    // 0 when the RIP trace is compiled out; the block below is then skipped
+    // (the skip is announced once, above).
+    const uint64_t prev_rip = RecentDispatchedRIP(1);
     if (prev_rip) {
       // sanity-bounded read of 8 bytes at prev_rip
       const uint8_t* p = reinterpret_cast<const uint8_t*>(prev_rip);
@@ -1692,13 +1728,9 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   // FIRST compiled the block, vs what's there NOW? Stale-compile bug
   // confirmed if they differ.
   {
-    uint64_t prev_rip = 0;
-    {
-      uint64_t _dcount = g_dispatch_count;
-      if (_dcount >= 1) {
-        prev_rip = g_recent_rips[(_dcount - 1) & 15];
-      }
-    }
+    // 0 when the RIP trace is compiled out; the block below is then skipped
+    // (the skip is announced once, above).
+    const uint64_t prev_rip = RecentDispatchedRIP(1);
     if (prev_rip) {
       // Walk g_compile_log backward looking for the most recent entry with
       // guest_rip == prev_rip
@@ -1742,13 +1774,9 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   // into State.rip via its ExitFunction emit. The previous guest RIP is
   // rip[-1]; we look it up in the L1 lookup cache to find its host code.
   {
-    uint64_t prev_rip = 0;
-    {
-      uint64_t _dcount = g_dispatch_count;
-      if (_dcount >= 1) {
-        prev_rip = g_recent_rips[(_dcount - 1) & 15];
-      }
-    }
+    // 0 when the RIP trace is compiled out; the block below is then skipped
+    // (the skip is announced once, above).
+    const uint64_t prev_rip = RecentDispatchedRIP(1);
     if (prev_rip && Frame && Frame->Thread) {
       auto Thread = Frame->Thread;
       uintptr_t PrevBlockHostPC = Thread->LookupCache->FindBlock(Thread, prev_rip);
