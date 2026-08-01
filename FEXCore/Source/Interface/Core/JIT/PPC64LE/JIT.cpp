@@ -1989,10 +1989,51 @@ void PPC64JITCore::ClearCache() {
 }
 
 // -------------------------------------------------------------------------
+// EmitStoreBlockBeginToInlineHeader
+// -------------------------------------------------------------------------
+// PPC64LE equivalent of the ARM64 sequence
+//     adr TMP1, &HeaderLabel
+//     str TMP1, State.InlineJITBlockHeader(STATE)
+// PPC64 has no direct PC-relative address load: `bcl 20,31,$+4` puts NIA
+// into LR (the CPU does not push to the link-stack for this exact form),
+// mflr copies it into TMP1, then we subtract the emit-time delta from
+// mflr's location to HeaderLabel to recover the header's absolute address.
+// LoadImm32 handles the delta so blocks of any size work (a naked int16
+// addi would break past 32 KB, which MAXINST=500 readily produces).
+//
+// LR is dead at any dispatcher/link entry into a ppc64le block (blocks are
+// entered via bctr), and we call this in the entry-point prologue before
+// any IR op runs, so clobbering LR/TMP1/TMP2 here is safe.
+void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel) {
+  LOGMAN_THROW_A_FMT(HeaderLabel.bound, "HeaderLabel must be bound before this call");
+  const int64_t HeaderOffset = HeaderLabel.offset;
+  bcl(20, 31, 4);                                    // LR = &mflr (NIA)
+  mflr(TMP1);                                        // TMP1 = &mflr
+  const int64_t MFLROffset = static_cast<int64_t>(GetOffset()) - 4;  // mflr's byte offset
+  const int64_t Delta = MFLROffset - HeaderOffset;
+  LOGMAN_THROW_A_FMT(Delta >= 0 && Delta < (int64_t{1} << 31),
+                     "InlineHeader delta out of int32_t range: {}", Delta);
+  LoadImm32(TMP2, static_cast<uint32_t>(Delta));     // TMP2 = mflr - HeaderLabel
+  subf(TMP1, TMP2, TMP1);                            // TMP1 = HeaderLabel address
+  std(TMP1,
+      static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.InlineJITBlockHeader)),
+      STATE);
+}
+
+// -------------------------------------------------------------------------
 // EmitEntryPoint: prologue emitted at the start of each JIT block
 // -------------------------------------------------------------------------
+// The caller binds HeaderLabel and reserves the JITCodeHeader before calling
+// us. We emit the InlineJITBlockHeader store for the cold path (first entry
+// via ExecuteThread, before FillStaticRegs runs), then FillStaticRegs, then
+// the optional TF check. Warm dispatcher entries skip FillStaticRegs but
+// still emit their own store in the per-block loop.
 void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF) {
-  Bind(&HeaderLabel);
+  // Cold-path store — first execution enters here after FillStaticRegs is
+  // needed. Emitting the store here means any signal during FillStaticRegs
+  // finds a valid InlineJITBlockHeader pointing at this block's header
+  // rather than a stale one from the previous block.
+  EmitStoreBlockBeginToInlineHeader(HeaderLabel);
 
   // Fill SRA registers from the CpuStateFrame. NOTE: this only runs on the
   // cold path (ExitFunctionLink slow return). The dispatcher's L1-hit path
@@ -2187,6 +2228,19 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
 
   // -------------------------------------------------------------------------
+  // JITCodeHeader (4 bytes, at BlockBegin)
+  // -------------------------------------------------------------------------
+  // Bind the label at BlockBegin, then reserve 4 bytes for the header. The
+  // OffsetToBlockTail field is backpatched after the tail is placed. The
+  // cold-path entry (FillStaticRegs) starts at BlockBegin+4; dispatcher
+  // entries land past that. See CPUBackend::JITCodeHeader / JITCodeTail for
+  // the layout GetFrameBlockInfo (Core.cpp:132) consumes.
+  PPC64Emitter::Label HeaderLabel{};
+  Bind(&HeaderLabel);
+  auto* CodeHeader = GetCursorAddress<CPUBackend::JITCodeHeader*>();
+  Emit32(0);  // placeholder — backpatched below
+
+  // -------------------------------------------------------------------------
   // Build jump target labels for all blocks
   // -------------------------------------------------------------------------
   // IMPORTANT: clear() first so resize() actually default-constructs fresh
@@ -2206,7 +2260,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // -------------------------------------------------------------------------
   // Emit entry point
   // -------------------------------------------------------------------------
-  PPC64Emitter::Label HeaderLabel{};
+  // HeaderLabel is already bound above. EmitEntryPoint emits the cold-path
+  // InlineJITBlockHeader store, then FillStaticRegs / TF check.
   EmitEntryPoint(HeaderLabel, CheckTF);
 
   // The entry point map: guest RIP -> host code address.
@@ -2335,6 +2390,9 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+      // Warm-path store: dispatcher L1 hits land here, skipping FillStaticRegs
+      // above. Re-emit so InlineJITBlockHeader is refreshed on every entry.
+      EmitStoreBlockBeginToInlineHeader(HeaderLabel);
       // Drain any deferred async signal at this guest instruction boundary.
       // Every dispatcher hit and linked block-to-block jump lands here, so a
       // guest loop spanning compile units cannot orbit without passing a
@@ -2410,6 +2468,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   Tail->SpinLockFutex      = 0;
   Tail->SingleInst         = SingleInst;
   CodeBuffers.LatestOffset += sizeof(CPUBackend::JITCodeTail);
+
+  // Backpatch the JITCodeHeader reserved at BlockBegin. The tail was just
+  // written at BlockBegin + CodeSize (Align16B has already run, so CodeSize
+  // is the aligned pre-tail total). Cast is safe: the code buffer is
+  // capacity-checked against BlockHeadroom above so no compile can exceed
+  // 4 GiB.
+  CodeHeader->OffsetToBlockTail = static_cast<uint32_t>(CodeSize);
 
   return CodeData;
 }

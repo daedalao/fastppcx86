@@ -303,6 +303,17 @@ private:
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);
 
+  // Store the address of the JITCodeHeader (bound at HeaderLabel) into
+  // CpuStateFrame::State.InlineJITBlockHeader so RestoreRIPFromHostPC and the
+  // other GetFrameBlockInfo consumers can find the tail. Emitted at every
+  // dispatcher-reachable entry so any signal fault into this block finds a
+  // fresh header pointer regardless of which entry point the dispatcher used.
+  // Uses `bcl 20,31,$+4; mflr` (LK=1 form the CPU does not push to the link
+  // stack) to load PC then subtracts the emit-time delta to recover BlockBegin.
+  // Clobbers TMP1 and TMP2 — safe: only called during entry-point prologue
+  // before any IR op writes to SRA/spill state.
+  void EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel);
+
   // Emit a one-instruction poke of the thread's InterruptFaultPage. PPC64LE
   // treats the whole JIT code buffer as an async-signal deferral region
   // (SignalDelegator's InJIT_ForDefer): a deferred signal mprotects the page

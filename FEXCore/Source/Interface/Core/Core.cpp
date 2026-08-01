@@ -167,6 +167,16 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
     // This is currently as close as FEX can get RIP reconstructions.
     if (HostPC >= reinterpret_cast<uint64_t>(BlockBegin) && HostPC < reinterpret_cast<uint64_t>(BlockBegin + InlineTail->Size)) {
 
+      // If the block did not emit a per-instruction RIP table, fall through
+      // to Frame->State.rip. Without this guard the reconstruction would
+      // return the block-entry RIP, which is coarser than the syscall-site
+      // RIP that Frame->State.rip already stores today (SeccompEmulator
+      // reads .instruction_pointer via this path). Ppc64le currently emits
+      // zero RIP entries, so any header-only block hits this branch.
+      if (InlineTail->NumberOfRIPEntries == 0) {
+        return Frame->State.rip;
+      }
+
       auto RIPEntry =
         reinterpret_cast<const uint8_t*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
 

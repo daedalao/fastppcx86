@@ -1313,6 +1313,18 @@ public:
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 0u);
   }
 
+  // bcl BO, BI, offset — conditional branch and link (B-form, LK=1).
+  // Used specifically as `bcl 20, 31, $+4` to load NIA into LR without
+  // pushing to the POWER link stack (BO=20 always-taken with BI=31 is the
+  // exact encoding the CPU's link-stack predictor does *not* push, per
+  // POWER ISA; GCC emits it for PIC prologues for the same reason).
+  void bcl(uint32_t bo, uint32_t bi, int32_t offset) {
+    assert((offset & 3) == 0);
+    assert(offset >= -32768 && offset <= 32764 && "bcl offset out of 14-bit signed range");
+    uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
+    Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 1u);
+  }
+
   // Conditional branch with label
   void bc(Cond cond, Label* lbl) {
     if (lbl->bound) {
