@@ -170,10 +170,19 @@ public:
     // store-pair instruction.
     //
     // Readers must use either:
-    //   (a) load GuestCode, conditional branch on the compare, then load
-    //       HostCode on the success path (control-dependency-ordered, free
-    //       on PPC), OR
+    //   (a) load GuestCode, then load HostCode through an address or data
+    //       dependency carried from the GuestCode value (e.g. add a
+    //       provably-zero `GuestCode ^ GuestCode` into the HostCode load's
+    //       base register), OR
     //   (b) load GuestCode with acquire ordering, then load HostCode.
+    //
+    // NOT sufficient: "load GuestCode, conditional branch on the compare,
+    // then load HostCode on the success path".  This comment used to claim
+    // that was control-dependency-ordered and free on PPC.  It is not.
+    // Power orders load->load only on address/data dependencies; a control
+    // dependency orders load->store only, and the second load may be issued
+    // speculatively before the branch resolves.  Every ppc64le L1 probe
+    // therefore uses form (a); FindBlock below uses form (b).
     void Publish(uintptr_t NewHostCode, uintptr_t NewGuestCode) {
       HostCode = NewHostCode;
       std::atomic_thread_fence(std::memory_order_release);

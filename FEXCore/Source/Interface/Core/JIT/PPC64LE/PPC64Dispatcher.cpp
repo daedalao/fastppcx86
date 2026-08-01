@@ -181,6 +181,14 @@ void PPC64Dispatcher::EmitDispatcher() {
   // TO the label and keep whatever the kernel set in the ucontext r4.
   li(r4, 0);
   PPC64Emitter::Label CompileSingleStepLabel{};
+  // Failure-exit forward-branch target for the CompileSingleStep body below.
+  // Bound at ThreadStopHandlerAddress (post-SpillStaticRegs) because SRA was
+  // already spilled by the SMC SIGSEGV handler and the current host r7-r12
+  // hold ELFv2-volatile garbage after the C++ `bctrl` — SpillStaticRegs here
+  // would clobber the correct spilled state. Only `Pointers.ThreadStopHandlerSpillSRA`
+  // is exposed via CoreState.h; the no-spill entry is reachable only in-emitter,
+  // hence this label.
+  PPC64Emitter::Label ThreadStopNoSpillLabel{};
   DispatcherLoopTopFillSRAAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   cmpdi(r4, 0);
   bc(CC_NE, &CompileSingleStepLabel);
@@ -266,19 +274,29 @@ void PPC64Dispatcher::EmitDispatcher() {
     // Load L1Entry: {HostCode (8 bytes), GuestCode (8 bytes)}.
     //
     // ORDERING NOTE (paired with LookupCacheEntry::Publish on the writer
-    // side): we MUST load GuestCode FIRST, branch on the compare, then load
-    // HostCode only on the success path.  The conditional branch establishes
-    // a control dependency that the PPC memory model honors as a load-load
-    // barrier for free, ensuring we don't observe a torn entry where
-    // GuestCode is the new value but HostCode is still stale.
+    // side): we MUST load GuestCode FIRST and only then load HostCode, or a
+    // concurrent writer mid-Publish leaves us with {stale_HostCode,
+    // new_GuestCode}, we pass the cmpd, and we jump into a half-installed /
+    // invalidated block -- the recurring zero-IR-block spin observed at
+    // Steam's PLT-to-malloc stub.  ARM64 sidesteps this entirely with `stp`
+    // (atomic store-pair); PPC64LE has no equivalent, hence the writer-side
+    // release fence and the reader-side ordering below.
     //
-    // Loading HostCode first (the original code) was racy: a concurrent
-    // writer mid-Publish could leave us with {stale_HostCode, new_GuestCode},
-    // pass the cmpd, and jump into a half-installed / invalidated block --
-    // the recurring zero-IR-block spin observed at Steam's PLT-to-malloc
-    // stub.  ARM64 sidesteps this entirely by using `stp` (store-pair) for
-    // atomic publish; PPC64LE has no equivalent, hence the release-fence /
-    // control-dep pattern.
+    // CORRECTION (this used to claim the conditional branch was enough):
+    // a CONTROL dependency does NOT order load->load on Power.  The branch
+    // only orders load->store.  A load after a conditional branch may be
+    // executed speculatively before the branch resolves, so `ld GuestCode;
+    // cmpd; bc; ld HostCode` permits exactly the torn read this code exists
+    // to prevent.  Power orders load->load only on an ADDRESS or DATA
+    // dependency, and TMP2 (the entry address) is fully computed before both
+    // loads, so there was no dependency to fall back on.
+    //
+    // Fix: manufacture a real address dependency from the GuestCode value
+    // into the HostCode load's address (see below).  Two ALU ops, no barrier.
+    // Power ISA Book II honors a register dependency even when the computed
+    // value cannot actually vary, so `xor rX, rY, rY` (always 0) is a valid
+    // ordering primitive here; `lwsync` between the two loads is the
+    // conservative alternative.
     ld(TMP4, 8, TMP2);   // TMP4 = GuestCode (the "key")
 
     // Compare GuestCode with current RIP — into CR7, NOT CR0.
@@ -321,11 +339,15 @@ void PPC64Dispatcher::EmitDispatcher() {
     }
 
     Bind(&match_label);
-    // Fast path: JIT block found.  Load HostCode AFTER the conditional
-    // branch — the control dependency on the GuestCode==RIP check provides
-    // load-load ordering on PPC, so this load is guaranteed to see the
-    // HostCode that was published alongside the matched GuestCode.
-    ld(TMP3, 0, TMP2);   // TMP3 = HostCode (loaded under control-dep)
+    // Fast path: JIT block found.  Feed the GuestCode VALUE into the address
+    // of the HostCode load so the hardware cannot hoist the HostCode load
+    // above the GuestCode load.  TMP3 is 0 by construction (x ^ x), so TMP2
+    // is unchanged, but the load's address now carries a data dependency on
+    // TMP4 -- which is what Power's memory model actually orders on.  The
+    // conditional branch above is NOT sufficient (see the ORDERING NOTE).
+    xor_(TMP3, TMP4, TMP4);   // TMP3 = 0, data-dependent on the GuestCode load
+    add(TMP2, TMP2, TMP3);    // address of the HostCode load now depends on it
+    ld(TMP3, 0, TMP2);   // TMP3 = HostCode (loaded under address-dep)
     mtctr(TMP3);
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();
@@ -463,6 +485,13 @@ void PPC64Dispatcher::EmitDispatcher() {
   // ==============================================================
   Bind(&CompileSingleStepLabel);
   {
+    // Deferred-signal guard around the C++ CompileSingleStep call. Mirror of
+    // the ExitFunctionLinker pattern above (see comments there) and the
+    // contract in docs/DeferredSignals.md — the dispatcher-resident C++ call
+    // must run uninterruptibly so async signals stay queued until decrement +
+    // fault-page store drains them.
+    EmitDeferredSignalEnter();
+
     // ContextImpl::CompileSingleStep is a non-static member.
     // ELFv2 calling convention: r3 = this (CTX), r4 = Frame, r5 = RIP.
     LoadConstant(r3, reinterpret_cast<uint64_t>(CTX));
@@ -482,10 +511,31 @@ void PPC64Dispatcher::EmitDispatcher() {
     std(r2, 24, r1);
     bctrl();
     ld(r2, 24, r1);
+
+    // Failure guard: CompileSingleStep returns 0 (uintptr_t) if the block
+    // cannot be compiled (`Core.cpp:999-1001`). Without this check we would
+    // `bctr` to address 0 and take an unrelated crash. Fall through on
+    // success, branch to the non-spilling thread-stop on failure.
+    cmpdi(r3, 0);
+    auto ok_label = PPC64Emitter::Label{};
+    bc(CC_NE, &ok_label);
+
+    // Failure path: balance the deferred-signal counter (else refcount stays
+    // elevated and every future signal in this thread silently defers), then
+    // reach the *non-spilling* ThreadStopHandler entry. SRA was already
+    // spilled by SyscallsSMCTracking.cpp:151 before it redirected here; host
+    // r7-r12 currently hold ELFv2-volatile garbage from the CompileSingleStep
+    // call, so SpillStaticRegs would clobber the correct spilled state.
+    EmitDeferredSignalExit();
+    b(&ThreadStopNoSpillLabel);
+
+    Bind(&ok_label);
+    // Success path: save r3 (host code pointer) into r0 BEFORE
+    // EmitDeferredSignalExit clobbers TMP1=r3. r0 is not touched by Exit and
+    // is also safe across FillStaticRegs (which uses TMP1=r3 as XMM scratch).
+    mr(r(0), r3);
+    EmitDeferredSignalExit();
   }
-  // CompileSingleStep returned the host code ptr in r3. Save it past
-  // FillStaticRegs (which uses TMP1=r3 as scratch for XMM fills).
-  mr(r(0), r3);
   FillStaticRegs();
   mtctr(r(0));
   li(r(0), 0);  // restore r0=0 zero-index invariant
@@ -514,6 +564,10 @@ void PPC64Dispatcher::EmitDispatcher() {
   SpillStaticRegs(TMP1);
 
   ThreadStopHandlerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  // Bound here (immediately after SpillStaticRegs at ThreadStopHandlerAddressSpillSRA)
+  // so the SMC single-step failure path can reach the no-spill entry via a
+  // forward branch — see the label declaration near CompileSingleStepLabel.
+  Bind(&ThreadStopNoSpillLabel);
   PopCalleeSavedRegisters();
   blr();
 
