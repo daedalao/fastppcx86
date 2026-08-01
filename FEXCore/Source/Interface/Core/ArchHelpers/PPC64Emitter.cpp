@@ -98,60 +98,13 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   stw(REG_AF, static_cast<int16_t>(af_off), STATE);
 
   // Spill SRA FPRs (XMM0-XMM15 in 64-bit, XMM0-XMM7 in 32-bit) to State.xmm.sse.data
-  //
-  // POWER9 (ISA 3.0) uses DQ-form `stxv XS, DQ(RA)`, which carries the offset
-  // as an immediate — ONE instruction per register instead of the LoadImm32 +
-  // indexed `stvx` pair the VMX-only path needs (stvx is X-form indexed and has
-  // no displacement form).  16 registers × 1 instruction saved, on a path that
-  // runs on EVERY guest block transition (the ppc64le backend has no direct
-  // block-to-block linking; DEF_OP(ExitFunction) always returns through
-  // DispatcherLoopTop and spills).  Calibration: removing 23 instructions per
-  // block transition from the dispatcher measured a 35% cpu-frame improvement
-  // in Factorio, checksum-identical.
-  //
-  // BYTE ORDER IS UNCHANGED — this is not a representation change:
-  //   * In LE mode `stvx` (VMX) and `stxv`/`stxvx` (VSX 16-byte) are all single
-  //     16-byte storage accesses, so all three write register BE-byte-element
-  //     15-i to mem[EA+i].  The forms that DIFFER are the element-wise ones —
-  //     `stxvd2x`/`lxvd2x` (two 8-byte accesses -> doubleword-swapped image)
-  //     and `stxvw4x` (word-permuted); neither is used on this path.
-  //   * Confirmed by GCC's PowerPC backend: at -mcpu=power9 a `vec_ld` (lvx)
-  //     feeding a natural vector store compiles to `lvx` + `stxv` with NO
-  //     permute between them, and a natural load feeding `vec_st` compiles to
-  //     `lxv` + `xxlor` + `stvx` (xxlor is a bitwise move, not a permute).  At
-  //     -mcpu=power8 the same sources require `xxpermdi DM=2` around
-  //     `stxvd2x`.  GCC treats lvx/stvx and lxv/stxv as byte-order-identical,
-  //     and the d2x family as the odd one out.
-  //   * These exact 16-byte slots are ALREADY written by one family and read by
-  //     the other, today, on hardware: the kernel's VMX signal save area is
-  //     filled with `stvx` (SAVE_32VRS) and memcpy'd verbatim into
-  //     State.xmm.sse.data by MContext_ppc64le.h GetArmFPR, while every FPR
-  //     LoadContext/StoreContext on the same slots goes through
-  //     Load/StoreFPRSized -> Load/StoreUnalignedV128 -> `lxvx`/`stxvx`.  No
-  //     swap anywhere between them.
-  //
-  // The one real semantic difference is addressing, not data: `lvx`/`stvx`
-  // silently mask EA to a 16-byte boundary; `lxv`/`stxv` do not.  That makes
-  // the substitution exact only for 16-byte-aligned EAs.  It is exact here:
-  // CpuStateFrame is alignas(128) and CPUState::xmm is 32-byte aligned within
-  // it (CoreState.h static_assert), so STATE is 16-byte aligned and every
-  // sse.data[i] offset is a multiple of 16 — the mask was always a no-op.
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data[0][0]) % 16 == 0,
-                "stxv/lxv (DQ-form) require a 16-byte-multiple displacement, and rely on the "
-                "EA being 16-byte aligned to match the EA masking that stvx/lvx used to do");
   const auto& SRAFPR = Is64Bit ? std::span<const VR>(x64::SRAFPR)
                                : std::span<const VR>(x32::SRAFPR);
-  const bool ISA30 = EmitterCTX->HostFeatures.SupportsISA30;
   for (size_t i = 0; i < SRAFPR.size(); ++i) {
     int32_t xmm_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data[i][0]));
-    if (ISA30 && FitsDQ(xmm_off)) {
-      stxv(SRAFPR[i], xmm_off, STATE);
-    } else {
-      // POWER8 and earlier: unchanged, byte-for-byte, from the original.
-      LoadImm32(tmp, static_cast<uint32_t>(xmm_off));
-      stvx(SRAFPR[i], STATE, tmp);
-    }
+    LoadImm32(tmp, static_cast<uint32_t>(xmm_off));
+    stvx(SRAFPR[i], STATE, tmp);
   }
 
   // Save NZCV across the dispatcher / C++ slow paths. Pack CR0 + XER into the
@@ -252,28 +205,13 @@ void PPC64EmitterBase::FillStaticRegs() {
   lwz(REG_AF, static_cast<int16_t>(af_off), STATE);
 
   // Fill SRA FPRs (XMM0-XMM15 in 64-bit, XMM0-XMM7 in 32-bit)
-  //
-  // Mirror of the stxv path in SpillStaticRegs — see the byte-order and
-  // alignment analysis there.  DQ-form `lxv XT, DQ(RA)` folds the offset into
-  // the instruction, so this is 1 instruction per register on POWER9 instead
-  // of LoadImm32 + indexed lvx.  POWER8 keeps the original sequence.
-  //
-  // The ISA30 path additionally stops clobbering TMP1 here.  That only REMOVES
-  // a clobber, so no caller can regress; the NZCV unpack below writes TMP1
-  // before reading it either way.  r0 is still untouched, preserving the
-  // ExitFunctionLinker contract documented at the end of this function.
   const auto& SRAFPR = Is64Bit ? std::span<const VR>(x64::SRAFPR)
                                : std::span<const VR>(x32::SRAFPR);
-  const bool ISA30 = EmitterCTX->HostFeatures.SupportsISA30;
   for (size_t i = 0; i < SRAFPR.size(); ++i) {
     int32_t xmm_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data[i][0]));
-    if (ISA30 && FitsDQ(xmm_off)) {
-      lxv(SRAFPR[i], xmm_off, STATE);
-    } else {
-      LoadImm32(TMP1, static_cast<uint32_t>(xmm_off));
-      lvx(SRAFPR[i], STATE, TMP1);
-    }
+    LoadImm32(TMP1, static_cast<uint32_t>(xmm_off));
+    lvx(SRAFPR[i], STATE, TMP1);
   }
 
   // Restore NZCV across the dispatcher / C++ slow paths. Inverse of the

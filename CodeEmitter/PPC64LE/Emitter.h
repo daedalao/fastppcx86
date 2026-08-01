@@ -1005,44 +1005,6 @@ public:
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
   void stxvd2x(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 972, 1); }
 
-  // -------------------------------------------------------------------------
-  // DQ-form VSX 16-byte load/store — **ISA 3.0 (POWER9)**.
-  //
-  // Same data mapping as lxvx/stxvx (LE: mem[EA+i] → BE byte elem 15-i, i.e.
-  // byte-for-byte identical to lvx/stvx), but the address comes from a
-  // displacement instead of an index register:  EA = (RA|0) + (DQ << 4).
-  // That removes the LoadImm32 needed to materialise the offset for the
-  // X-form/VMX indexed forms — 1 instruction instead of 2.
-  //
-  // Differences vs lvx/stvx that callers MUST respect:
-  //   * lvx/stvx silently mask EA to a 16-byte boundary (`EA & ~0xF`); lxv/stxv
-  //     do NOT.  Only substitute where the address is known 16-byte aligned,
-  //     otherwise the two are not equivalent for misaligned EAs.
-  //   * RA=0 in the encoding means literal zero, not GPR[r0].
-  //
-  // Encoding (Power ISA 3.0C Book I, DQ-form; lxv p.495, stxv p.513):
-  //     0    5 6    10 11  15 16        27 28  29  31
-  //   | PO=61 |  T   |  RA  |     DQ     | TX |  XO |
-  //   PO = 61, XO = 0b001 for lxv, 0b101 for stxv, TX/SX = high bit of the
-  //   VSR number (always 1 here — VR{i} is VSR{32+i}), T = low 5 bits.
-  //   DQ is a SIGNED 12-bit quantity scaled by 16: displacement range
-  //   -32768..+32752 in steps of 16.
-  //
-  // Verified against binutils (powerpc64le-linux-gnu-as -mpower9):
-  //   lxv  vs0,0(r3)      -> 0xF4030001     stxv vs0,0(r3)      -> 0xF4030005
-  //   lxv  vs0,16(r3)     -> 0xF4030011     stxv vs32,16(r3)    -> 0xF403001D
-  //   lxv  vs32,16(r3)    -> 0xF4030019     stxv vs63,16(r3)    -> 0xF7E3001D
-  //   lxv  vs63,16(r3)    -> 0xF7E30019     stxv vs0,-32768(r3) -> 0xF4038005
-  //   lxv  vs0,32752(r3)  -> 0xF4037FF1     stxv vs0,32752(r3)  -> 0xF4037FF5
-  //   lxv  vs0,-32768(r3) -> 0xF4038001     lxv  vs0,-16(r3)    -> 0xF403FFF1
-  void lxv(VR vrt, int32_t disp, GPR ra)  { EmitDQ(vrt.idx, ra.idx, disp, 1, 0b001); }
-  void stxv(VR vrs, int32_t disp, GPR ra) { EmitDQ(vrs.idx, ra.idx, disp, 1, 0b101); }
-
-  // True when `disp` is encodable in a DQ-form displacement field.
-  static constexpr bool FitsDQ(int32_t disp) {
-    return (disp & 0xF) == 0 && disp >= -32768 && disp <= 32752;
-  }
-
   // Scalar loads into dword[0].  CAUTION: ISA 3.0 defines dword[1] ← 0 for
   // all four, but on ISA 2.06/2.07 hardware (POWER7/POWER8) lxsdx/lxsiwzx
   // leave dword[1] UNDEFINED — never rely on the zeroing in an ungated path.
@@ -1631,21 +1593,6 @@ private:
   // D-form: op(6) | RT/RS(5) | RA(5) | D/SI/UI(16)
   void EmitD(uint32_t op, uint32_t rt, uint32_t ra, uint16_t d) {
     Emit32((op << 26) | (rt << 21) | (ra << 16) | d);
-  }
-
-  // DQ-form (ISA 3.0 lxv/stxv): PO=61(6) | T/S(5) | RA(5) | DQ(12) | TX/SX(1) | XO(3)
-  //
-  // `disp` is the BYTE displacement; it is encoded as disp/16 in the 12-bit DQ
-  // field, so it must be a multiple of 16 in [-32768, 32752].  Out-of-range or
-  // unaligned values would silently truncate into the neighbouring TX/XO bits
-  // — which would change the destination register and even the opcode — so
-  // this is a hard LOGMAN_THROW rather than an assert (Release builds define
-  // NDEBUG; see the EmitM commentary above for the same reasoning).
-  void EmitDQ(uint32_t rt_rs, uint32_t ra, int32_t disp, uint32_t tx_sx, uint32_t xo) {
-    LOGMAN_THROW_A_FMT((disp & 0xF) == 0, "PPC64 EmitDQ: displacement 0x{:x} is not a multiple of 16", disp);
-    LOGMAN_THROW_A_FMT(disp >= -32768 && disp <= 32752, "PPC64 EmitDQ: displacement 0x{:x} out of DQ range", disp);
-    const uint32_t dq = (static_cast<uint32_t>(disp) >> 4) & 0xFFF;
-    Emit32((61u << 26) | (rt_rs << 21) | (ra << 16) | (dq << 4) | (tx_sx << 3) | xo);
   }
 
   // M-form: op(6) | RS(5) | RA(5) | SH(5) | MB(5) | ME(5) | Rc(1)
