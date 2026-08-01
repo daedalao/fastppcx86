@@ -129,7 +129,7 @@ void PPC64JITCore::EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLoc
   addi(r(6), r1, PostSpill(SplitLockSlotResult));
   li(r(7), static_cast<int>(IR::OpSizeToSize(Sz)));
 
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_SplitLockEmulate);
   std(r(2), PostSpill(SplitLockSlotTOC), r1);
   mtctr(r(12));
   bctrl();
@@ -176,7 +176,7 @@ void PPC64JITCore::EmitSplitLockCASCall(PPC64Emitter::GPR Addr, PPC64Emitter::GP
   addi(r(6), r1, PostSpill(SplitLockSlotResult));
   li(r(7), static_cast<int>(IR::OpSizeToSize(Sz)));
 
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_SplitLockEmulate);
   std(r(2), PostSpill(SplitLockSlotTOC), r1);
   mtctr(r(12));
   bctrl();

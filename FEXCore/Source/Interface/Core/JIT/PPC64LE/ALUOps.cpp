@@ -3053,7 +3053,7 @@ DEF_OP(RDRAND) {
   SpillForABICall(TMP1);
 
   // Load helper address into r12 (ELFv2 indirect-call req) and call.
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_RDRAND));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_RDRAND);
   std(r2, 8 + kABISpill, r1);
   mtctr(r(12));
   bctrl();
@@ -3838,7 +3838,7 @@ DEF_OP(CRC32) {
   default:                 li(r5, 4); break;            // matches i32 fallthrough
   }
 
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_CRC32));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_CRC32);
   std(r2, 8 + kABISpill, r1);
   mtctr(r(12)); bctrl();
   ld(r2, 8 + kABISpill, r1);

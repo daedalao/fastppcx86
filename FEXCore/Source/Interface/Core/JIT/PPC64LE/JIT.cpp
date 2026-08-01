@@ -990,10 +990,10 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
       ld(r5, Post(SlotRAX), r1);          // r5 = RAX
       ld(r6, Post(SlotRDX), r1);          // r6 = RDX
       LoadConstant(r7, Control);          // r7 = Control (uint16_t in 64-bit slot)
-      LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX));
+      EmitLoadPPC64Helper(r(12), PPC64_HELPER_VPCMPESTRX);
     } else {
       LoadConstant(r5, Control);          // r5 = Control
-      LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX));
+      EmitLoadPPC64Helper(r(12), PPC64_HELPER_VPCMPISTRX);
     }
 
     std(r2, Post(24), r1);                // save TOC (helper is intra-DSO,
