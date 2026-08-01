@@ -440,9 +440,17 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   MappedCacheFile += header.CodeBufferSize;
   CTX.LatestOffset += header.CodeBufferSize;
 
-  // Apply FEX relocations
-  auto Ret = ApplyCodeRelocations(BinarySection.FileStartVA, CodeBufferRange, Relocations, false);
-  LOGMAN_THROW_A_FMT(Ret == true, "Failed to apply code cache relocations");
+  // Apply FEX relocations. B2 (S3-REVISED): must check the return value with a
+  // real branch, not LOGMAN_THROW_A_FMT — the latter expands to `(void)(pred)`
+  // in Release, so a mid-loop failure (e.g. a thunk symbol Lookup returns ~0ULL
+  // at ApplyCodeRelocations :671) would silently skip every later relocation and
+  // fall through to the block-registration loop below, which then marks a
+  // partially-patched buffer executable. SaveData at :315-318 handles the same
+  // call correctly; mirror its shape.
+  if (!ApplyCodeRelocations(BinarySection.FileStartVA, CodeBufferRange, Relocations, false)) {
+    LogMan::Msg::EFmt("Failed to apply code cache relocations for {} — rejecting cache", BinarySection.FileInfo.Filename);
+    return false;
+  }
 
   {
     auto& LookupCache = *CodeBuffer->LookupCache;
