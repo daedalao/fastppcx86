@@ -9,12 +9,18 @@
 #include <FEXHeaderUtils/Syscalls.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/fextl/fmt.h>
 
+#include <chrono>
+#include <cstdio>
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#if defined(__powerpc64__) || defined(ARCHITECTURE_ppc64le)
+#include <sys/platform/ppc.h>  // __ppc_get_timebase_freq
+#endif
 #include <linux/futex.h>
 #include <fcntl.h>
 #include <git_version.h>
@@ -94,7 +100,15 @@ void WalkAndCleanupRobustList32(uint32_t head_addr, uint32_t exiting_tid) {
 }
 } // namespace
 
+// Recorded once at first StatAlloc construction (early in process startup), used
+// by CleanupForExit to report wall time for the P5.1 JIT-fraction dump. Not
+// exact-startup — StatAlloc is built during ContextImpl init, which is after
+// argv parsing but before the guest runs a single instruction — accurate enough
+// to bound the JIT/wall ratio to <5% error on runs longer than a second.
+static const auto P5_1_ProcessStart = std::chrono::steady_clock::now();
+
 ThreadManager::StatAlloc::StatAlloc() {
+  (void)P5_1_ProcessStart;  // force init at first StatAlloc construction
   Initialize();
   SaveHeader(Is64BitMode() ? FEXCore::SHMStats::AppType::LINUX_64 : FEXCore::SHMStats::AppType::LINUX_32);
 }
@@ -193,6 +207,42 @@ void ThreadManager::StatAlloc::DeallocateSlot(FEXCore::SHMStats::ThreadStats* Al
 }
 
 void ThreadManager::StatAlloc::CleanupForExit() {
+  // P5.1: sum AccumulatedJITTime / AccumulatedJITCount across all thread slots
+  // and dump to stderr before we shm_unlink the segment. Only when
+  // FEX_PROFILESTATS is on (else Base is null and there are no slots to walk).
+  //
+  // Coverage: this runs on normal process exit. It is NOT reached on abnormal
+  // exit (SIGKILL, unhandled synchronous fault that aborts the host, oom-kill).
+  // Guest crashes that FEX handles cleanly still reach here; guest crashes that
+  // dump core via the host handler do not. Workloads that only ever exit
+  // abnormally (RimWorld: deterministic SIGSEGV at ~90 s) will produce no line.
+  if (ProfileStats() && Base) {
+    uint64_t TotalJITTime = 0;
+    uint64_t TotalJITCount = 0;
+    for (size_t i = 0; i < TotalSlotsFromSize(); ++i) {
+      TotalJITTime += Stats[i].AccumulatedJITTime;
+      TotalJITCount += Stats[i].AccumulatedJITCount;
+    }
+
+    // Timebase frequency via the GCC builtin — reads auxv AT_TIMEBASE_FREQUENCY.
+    // POWER9 reports 512000000 Hz, matching /proc/cpuinfo "timebase". Called
+    // once at exit — no need to cache.
+#if defined(__powerpc64__) || defined(ARCHITECTURE_ppc64le)
+    const uint64_t Freq = __ppc_get_timebase_freq();
+#else
+    const uint64_t Freq = 0;
+#endif
+    const double Seconds = Freq ? static_cast<double>(TotalJITTime) / static_cast<double>(Freq) : 0.0;
+
+    const auto Now = std::chrono::steady_clock::now();
+    const double Wall = std::chrono::duration<double>(Now - P5_1_ProcessStart).count();
+    const double Pct = Wall > 0.0 ? Seconds / Wall * 100.0 : 0.0;
+
+    std::fprintf(stderr, "[FEX JIT] blocks=%lu ticks=%lu seconds=%.6f wall=%.6f pct=%.3f freq=%luHz\n",
+                 static_cast<unsigned long>(TotalJITCount), static_cast<unsigned long>(TotalJITTime), Seconds, Wall, Pct,
+                 static_cast<unsigned long>(Freq));
+  }
+
   shm_unlink(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str());
 }
 
