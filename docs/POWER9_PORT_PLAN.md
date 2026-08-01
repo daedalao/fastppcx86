@@ -2194,6 +2194,73 @@ Revision 1 claims that did not survive review. Recorded so they are not rediscov
 
 ---
 
+## Debugging games under FEX — what works as of 2026-08-01
+
+We now have per-instruction guest RIP reconstruction. Before this, a crash gave a host PC inside a JIT
+buffer and nothing else; that is what "diagnosing the engine through the exhaust pipe" meant.
+
+### What landed
+
+- **`667b59685`** — emits a `JITCodeHeader` at block start and stores its address to
+  `State.InlineJITBlockHeader` at every entry point. Revives `GetGuestBlockEntry`,
+  `IsAddressInCurrentBlock`, `IsCurrentBlockSingleInst`, all of which returned 0/false for the entire
+  life of the port.
+- **`244075383`** — emits the `vl64pair` RIP-entry table, so `RestoreRIPFromHostPC` reconstructs a
+  guest RIP from a host PC instead of short-circuiting to `Frame->State.rip`.
+
+### Verified working, not assumed
+
+One RimWorld run to its fatal signal 11 produced **11,899 reconstructions**. `delta_from_entry` ranged
+0x21–0x534 and was non-zero in essentially every sample, so the table is genuinely walked rather than
+short-circuited. Reconstructed RIPs land in the guest `0x3ffe…`/`0x3fff…` range.
+
+**The confirming detail:** `ReconstructedRIP` frequently *exceeds* `Frame->State.rip` — mid-block
+execution further along than the last sync point. That is exactly the case where `State.rip` was the only
+signal and was strictly coarser than the fault site.
+
+Blocks carry 47–332 entries each. Dense, which is why `BlockHeadroom` needed the `SSA_count × 16` bump —
+and worth watching as workloads grow, since block size interacts with the `bc` ±32 KiB displacement limit.
+
+### Three traps that cost time, in order of nastiness
+
+1. **`stderr` is not reliable inside game guests.** Unity redirects fd 2 to its own log routing
+   (`Player.log`, crash logs), so `fprintf(stderr, …)` from FEX C++ produces *nothing*. Use a dedicated
+   file:
+   ```cpp
+   static FILE* log = fopen("/tmp/probe.log", "w");
+   if (log) { fprintf(log, "…"); fflush(log); }
+   ```
+   The `fflush` matters — a crashing process will not flush for you.
+2. **`nip=` in `FEX_TRACE_SIGNALS` output is the HOST PC, not the reconstructed guest RIP.** Grepping the
+   signal trace cannot answer "where was the guest?" — it answers "where was the JIT?". You have to
+   instrument `RestoreRIPFromHostPC`'s return path, or read guest state after `SpillSRA`.
+3. **`FEX_OUTPUTLOG` with an absolute path may silently produce no file** (see `TASK_QUEUE.md` P0.5 —
+   root cause disputed, needs a recheck). `FEX_OUTPUTLOG=stderr` or a `~/`-relative path work, but see
+   trap 1 before relying on stderr under a game.
+
+### The probe pattern that worked
+
+Temporary instrumentation inside `FEXCore/Source/Interface/Core/Core.cpp`, in `RestoreRIPFromHostPC`
+immediately before the `return StartingGuestRIP;` after the vl64pair walk, logging `HostPC`,
+`BlockBegin`, `InlineTail->RIP`, the reconstructed RIP, `Frame->State.rip`, `NumberOfRIPEntries`, and the
+delta. Reverted after the run.
+
+Logging all six is what made it verifiable: block-entry RIP and reconstructed RIP being *different* is
+the proof the table is consulted, and reconstructed-versus-`State.rip` is the proof it beats what we had.
+A probe that logged only the final answer would not have distinguished a working walk from a
+short-circuit.
+
+### What this enables
+
+A crash now yields a specific guest instruction address in a specific mapping, rather than "somewhere in
+Mono". For RimWorld's deterministic signal 11 at ~90 s, the next step is concrete: capture the
+reconstructed RIP at the fault and disassemble the guest instruction there.
+
+Not yet done: translating a reconstructed RIP back to a guest ELF offset and symbol automatically. Today
+that is manual against `/proc/<pid>/maps`.
+
+---
+
 ## Operational gotchas — the setup traps that cost real time
 
 Not codegen or algorithm — build-environment and runtime-invocation traps that we hit and paid for.

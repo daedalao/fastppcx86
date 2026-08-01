@@ -23,13 +23,81 @@ zero `Unknown error` / `apt-key` / `ENOEXEC`. apt-key is closed.
 dispatcher code and is gone; the `rip[-1]` LookupCache disassembly is retained. `HostLR` relabelled
 `DispatcherRetAddr`.
 
-### New: P0.5 — `FEX_OUTPUTLOG` silently ignores absolute paths
+## Staged low-hanging fruit — design pass done 2026-08-01, ordered by value ÷ effort
+
+1. **Shebang crash + host fallback** (~40 lines, upstream). `Syscalls.cpp:155-158` indexes `[0]` on a
+   possibly-empty vector — `#!\n` is 3 bytes so it passes the size guard. `FEXInterpreter.cpp:247` throws
+   on the same input. And `Syscalls.cpp:162-168` hand-rolls `RootFSPath() + path`; **the correct idiom
+   already exists 20 lines below at `:223-229`** — using `FM.GetEmulatedPath` closes three divergences at
+   once (host fallback, thunk overlays, symlink following). Land together.
+2. **SMC single-step safety** (~35 lines). Template is in the same file: `ExitFunctionLinker`
+   (`PPC64Dispatcher.cpp:383-448`) has the right shape, and the `EmitDeferredSignalEnter/Exit` lambdas at
+   `:364-381` are already in scope. **Do not `SpillStaticRegs` on the failure path** — SRA was already
+   spilled by the handler and `FillStaticRegs` skipped, so host r7-r12 hold garbage; spilling would write
+   it over live guest state. Branch to a forward label bound at `:516` instead.
+   Correction to an earlier brief: the `SetArmReg` r4 mapping is **already fixed**, don't re-fix it. And
+   removing `li(r4,0)` does *not* restore the argument — `PushCalleeSavedRegisters` clobbers r4 first.
+3. **`CodeCache::Validate` de-ARM64-ing** (~60 lines + format bump). Cheaper than expected:
+   **`CompiledCode` already carries `BlockBegin`** (`CPUBackend.h:115-121`), it is simply never
+   propagated into `LookupCache::BlockEntry`. Doing so makes `:502` arithmetic-free and **deletes** the
+   AArch64 `ADR` decode at `:573-575` rather than adding a second arch case. Note `:576` is fine on its
+   own now that `667b59685` backpatches `OffsetToBlockTail`.
+   **Separate blocker found:** `PPC64LE/JIT.cpp:2489` stores `Tail->RIP` as a plain value where ARM64
+   emits a relocatable literal — ppc64le cached code is not relocatable across runs. Fixing `Validate`
+   unblocks the *gate*, not the *feature*.
+4. **Shebang parser kernel semantics + 8 tests** (~30 lines, upstream). Tab is not a separator; `\r` is
+   never stripped (**CRLF scripts are the likeliest real-world hit** — they fail `Exists()` → `-ENOEXEC`);
+   no 2-argument cap. **Land separately from item 1** — the cap changes argv for working scripts and could
+   regress `env`-based shebangs; the crash fixes must not wait on it.
+
+### CORRECTED: ASN.1 DST — FEX is probably innocent, and the blast radius was overstated
+Mechanism located, and it is in **OpenSSL's own test helper**: `test/testutil/helper.c:83-84` does
+`mktime(local) - timezone`, broken by construction (`mktime` honours DST, `timezone` is the standard
+offset). The recipe pins no `TZ`, so the result depends on ambient timezone.
+
+**My earlier "X.509 certificate validity" claim was wrong.** `X509_cmp_time` / `ASN1_TIME_compare` use
+OpenSSL's own julian-day math with no libc TZ involvement; that `mktime` construct appears only in the
+test helper. Re-ranked down accordingly.
+
+Not fully closed: observed is **+3600** where this host's zone (America/Edmonton) predicts **−3600**, so
+it does not cleanly fit the ambient-TZ story either. A ~25-line reproducer printing `tzname`, `timezone`,
+`daylight`, `readlink(/etc/localtime)`, and `mktime` with `tm_isdst` forced to −1/0/1 — run natively, then
+as a guest with `TZ` pinned, then with `TZ` unset — settles it. Host-vs-guest disagreement with identical
+`TZ` would be a real FEX bug in a 25-line file with debug info.
+
+### CORRECTED: flush-to-zero — recommend NOT implementing
+`FPSCR[NI]` is the nearest bit, but the semantics do not match in three ways, and the third is decisive:
+**the backend emits both VSX and VMX float ops** (`VectorOps.cpp`, 8 VSX sites and 6 VMX). VSX honours
+`FPSCR[NI]`; VMX honours `VSCR[NJ]`, a different register set by `mtvscr`. Setting only NI gives
+**inconsistent denormal behaviour between two SSE ops in the same guest block**, depending on which family
+the backend picked — worse than the current uniform no-op.
+
+Also: NI fuses FTZ and DAZ, which x86 keeps separate (`MXCSR.FZ` bit 15 output-only, `MXCSR.DAZ` bit 6
+input-only), and the ISA declares NI's effect implementation-defined.
+
+**Keep `c04687fc4` and leave the gap.** If it is ever wanted, the prerequisite is empirically
+characterising NI and `VSCR[NJ]` on POWER9 — not an implementation task.
+
+### RECHECK NEEDED: P0.5 — `FEX_OUTPUTLOG` silently ignores absolute paths
 **Size:** small. **Found:** while doing P0.1.
 
-`FEXCore/Source/Interface/Config/Config.cpp:393-395` calls `ExpandPathIfExists(CONFIG_OUTPUTLOG, ...)`;
-`ExpandPath` (`:255`) falls through to `return {}` for an absolute path with no `ContainerPrefix`. The
-empty result makes `ExpandPathIfExists` skip the `Set`, so `CONFIG_OUTPUTLOG` silently stays at its
-default `"server"` and no file is created.
+**The stated root cause probably does not hold.** `ExpandPath` (`Config.cpp:255-303`) does return `{}`
+for an absolute path with no `ContainerPrefix` — but `ExpandPathIfExists` (`:339-344`) then merely skips
+the `Set`, which is a **no-op**: the user's path is already in the Meta layer from `Meta->Load()`, so
+`Get(CONFIG_OUTPUTLOG)` still returns it. It does not revert to `"server"`. Init order is fine too.
+
+**Five-minute recheck on the POWER9 box before any code is written:**
+`FEX_OUTPUTLOG=/tmp/fexlog.txt FEXLoader … /bin/true; ls -la /tmp/fexlog.txt`. If the file appears, close
+this item. If not, the cause is elsewhere — `SilentLog`, the FEXServer log-FD path, or `open()` failing.
+
+**Two genuine defects found in that code regardless, independent of the above:**
+- `Config.cpp:261-280` — a *relative* `FEX_OUTPUTLOG` that does not yet exist fails both the
+  `Absolute`+`Exists` and the `Exists` checks, so it is never expanded and the file lands relative to the
+  guest's cwd at `open()` time rather than the shell's. A log file legitimately does not exist yet.
+- `FEXInterpreter.cpp:130` — `open(…, O_CREAT|O_CLOEXEC|O_WRONLY)` with neither `O_TRUNC` nor `O_APPEND`,
+  so re-running leaves stale trailing bytes from a longer previous log. One word.
+
+`ExpandPath` has exactly five call sites, all in `ReloadMetaLayer` — small blast radius.
 
 Workarounds: `FEX_OUTPUTLOG=stderr` (special-cased earlier) or a `~/`-relative path. Real fix: let
 `ExpandPath` return absolute paths unchanged when there is no container prefix. Upstream code.
@@ -277,12 +345,77 @@ executed** — inline SMC is entirely unhandled on ppc64le. P1.1 makes it live. 
 
 ---
 
+## PRIORITY RESET — 2026-08-01
+
+**Foundational implements first: proper tracing, then the code cache.** Stop diagnosing the engine
+through the exhaust pipe. Symptom-chasing (RimWorld, `probe_thread_spawn`, Factorio's load crash) waits
+until the tools exist to look at it directly.
+
+The order is now: **P3.1 → P2.1 → P3.2 → P3.3.** Everything else is parked.
+
+### New: P4.1 — block linking. Probably the largest remaining performance item, and it was dropped.
+
+ppc64le has **no block linking at all**. Every guest block exit runs a full `SpillStaticRegs`, branches to
+`DispatcherLoopTop`, does an L1 lookup, and refills. ARM64 backpatches a direct branch between blocks, and
+for returns pops a `<GuestRIP, HostPC>` pair off a `REG_CALLRET_SP` shadow stack in ~3 instructions,
+skipping the lookup entirely.
+
+Original estimate from the thunk-overhead research: **~125 instructions and 792 bytes per block
+transition** — larger than everything else in that report combined. It was shelved as "structural, high
+risk", and then we spent a night proving that **block transitions are exactly where cost lives**: 23
+instructions removed from that path was worth 35%.
+
+**The open question the design must answer honestly:** the 23 instructions that bought 35% included
+stores to *contended, process-global* cachelines. Block linking removes spill/fill traffic to
+*thread-private* STATE. Those are different cost buckets, and the 32-pure-ALU experiment that bought 0%
+is the cautionary case. Do not assume the magnitude transfers.
+
+Known complications: SRA must stay live across a link or you still spill and fill (this may be the real
+blocker, not the branch mechanics); backpatching executable code that another thread may be running, on a
+host with non-coherent split I/D caches; and a linked branch that skips the entry-point prologue would
+skip the `InlineJITBlockHeader` store that `667b59685` just added, leaving the header stale.
+
+Design in progress. Adversarial review before any implementation.
+
+### Testing gap being closed: x87 workload
+Quake 2 (id Tech 2, 1997, pre-SSE, float-heavy, `timedemo 1` with `demo1.dm2`) is being brought into the
+pipeline. Build `-m32 -mfpmath=387` and verify with `objdump -d | grep -c 'fsin\|fpatan\|fyl2x'` before
+trusting it — a build that turned out to be SSE throughout would measure nothing and we would not know.
+Needed before P2.1's hot half means anything.
+
+### Process: directives must carry the design
+Anything sent to the build agent needs the design or implementation plan **inline**, not a pointer to a
+document. It runs a smaller model; it should be executing a plan, not making architectural judgement
+calls or reconstructing context. P3.1's directive does this correctly; P2.1's currently points at this
+file and must be expanded before it is released.
+
+Both P3.1 and the caching chain sat in the deferred pile. That was a misjudgement: "we don't yet know the
+full implications" was a good reason to scope them, and stopped being a reason once the scoping and
+adversarial reviews were done. Deferring the *implements* while chasing the *symptoms* is backwards —
+the implements are what make the symptoms tractable.
+
+---
+
 ## P3 — deferred. Real work, no near-term payoff.
 
-### P3.1 — RIP-entry table (`vl64pair`)
-Gives sub-block guest-RIP reconstruction. Small (markers and encoder already exist;
-`DEF_OP(GuestOpcode)` is an empty stub on ppc64le) but **not required** for P1.1 given the one-line
-`Core.cpp` guard. Land separately and measure.
+### P3.1 — RIP-entry table (`vl64pair`) — **PROMOTED TO TOP PRIORITY**
+
+**This is the half of P1.1 that pays out.** As landed, P1.1 is plumbing: `RestoreRIPFromHostPC` still
+short-circuits to `Frame->State.rip` because ppc64le emits zero RIP entries, so signal frames and crash
+reports still carry block-entry granularity. Of the four functions P1.1 revived, `GetGuestBlockEntry`,
+`IsAddressInCurrentBlock` and `IsCurrentBlockSingleInst` work — but the one that reconstructs a guest RIP
+from a host PC does not.
+
+P3.1 is what turns "somewhere in this block" into "at this guest instruction".
+
+**Small, because most of it exists:** the arch-neutral frontend already emits `_GuestOpcode` markers for
+every instruction that can fault (`Core.cpp:654-656`, gated on `CanHaveSideEffects`), the `vl64pair`
+encoder already exists, and `DEF_OP(GuestOpcode)` on ppc64le is a literal empty stub
+(`PPC64LE/ALUOps.cpp:3403`). We are discarding data we already generate. Body for the stub, one
+`push_back` per entry point, ~20 lines emitting the array, and extend `BlockHeadroom`.
+
+Keep the `Core.cpp` guard — it stops short-circuiting once `NumberOfRIPEntries > 0` and remains correct
+for blocks emitting none.
 
 ### P3.2 — Fixed-width constant emission
 `LoadConstant` emits 1–5 instructions by value; relocation patch sites need fixed width. Design and
