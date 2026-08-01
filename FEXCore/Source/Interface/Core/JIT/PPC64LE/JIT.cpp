@@ -1057,11 +1057,18 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   // ABI correctness.
   mflr(TMP2); addi(r1, r1, -4096); std(TMP2, 0, r1);
 
-  // Load ABIHandler into r0, Func into TMP4
-  LoadImm32(TMP2, ABIHandlerOff);
-  ldx(r(0), STATE, TMP2);
-  LoadImm32(TMP2, FuncOff);
-  ldx(TMP4, STATE, TMP2);
+  // Load ABIHandler into r0, Func into TMP4.
+  // Both offsets are FallbackHandlerPointers base + Idx*sizeof(FallbackABIInfo) + (0|8) —
+  // 8-byte aligned by construction and bounded well below INT16_MAX (see static_assert), so
+  // d-form `ld` is safe. The prior LoadImm32+ldx pair carried a silent uint32_t→int16_t hazard
+  // (`ld`'s only assert checks alignment, not range) and serialised TMP2 in front of mtctr/bctrl.
+  static_assert(
+    ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, Pointers.FallbackHandlerPointers,
+                   FEXCore::Core::FallbackHandlerIndex::OPINDEX_MAX - 1)
+      + offsetof(FEXCore::Core::FallbackABIInfo, Func) <= INT16_MAX,
+    "FABI helper offsets must fit int16_t for d-form ld");
+  ld(r(0), static_cast<int16_t>(ABIHandlerOff), STATE);
+  ld(TMP4, static_cast<int16_t>(FuncOff), STATE);
   // TMP2 is now free to reuse for source setup
 
   switch (Info.ABI) {

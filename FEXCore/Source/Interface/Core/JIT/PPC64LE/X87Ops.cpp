@@ -429,10 +429,15 @@ static inline void EmitFABICall(PPC64JITCore* self, FEXCore::Core::FallbackHandl
 
   // Save LR via TMP2; use 512-byte frame to protect JIT spill slots.
   self->mflr(TMP2); self->addi(r1, r1, -512); self->std(TMP2, 0, r1);
-  self->LoadImm32(TMP2, ABIHandlerOff);
-  self->ldx(r(0), STATE, TMP2);
-  self->LoadImm32(TMP2, FuncOff);
-  self->ldx(TMP4, STATE, TMP2);
+  // See JIT.cpp Op_Unhandled for the identical rationale; d-form `ld` here removes a silent
+  // uint32_t→int16_t hazard and the TMP2 serialisation in front of mtctr/bctrl.
+  static_assert(
+    ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, Pointers.FallbackHandlerPointers,
+                   FEXCore::Core::FallbackHandlerIndex::OPINDEX_MAX - 1)
+      + offsetof(FEXCore::Core::FallbackABIInfo, Func) <= INT16_MAX,
+    "FABI helper offsets must fit int16_t for d-form ld");
+  self->ld(r(0), static_cast<int16_t>(ABIHandlerOff), STATE);
+  self->ld(TMP4, static_cast<int16_t>(FuncOff), STATE);
   // Sources are already in VTMP1 / (VTMP2 for binary) per the contract above.
   self->mtctr(r(0)); self->bctrl();
   self->ld(TMP2, 0, r1); self->mtlr(TMP2); self->addi(r1, r1, 512); self->li(r(0), 0);
