@@ -3092,14 +3092,27 @@ DEF_OP(GetRoundingMode) {
 DEF_OP(SetRoundingMode) {
   auto Op  = IROp->C<IR::IROp_SetRoundingMode>();
   auto Src = GetReg(Op->RoundMode);
+  // Src is NOT limited to 0-3. The feeding IR is _Bfe(i32Bit, 3, 13, MXCSR)
+  // (Vector.cpp RestoreMXCSRState) and _Bfe(i32Bit, 3, 10, NewFCW) (X87F64.cpp)
+  // — width 3, so Src spans 0-7. Bit 2 is MXCSR.FZ / FCW bit 12, not part of the
+  // rounding-control field. Mask it off before using it as a map index.
+  //
   // x86: 0=near, 1=down, 2=up, 3=trunc; PPC FPSCR RN: 0=near, 1=trunc, 2=up, 3=down
-  static const uint8_t MapTable[4] = { 0, 3, 2, 1 };
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(MapTable));
-  lbzx(TMP2, TMP1, Src);
+  // The map {0,1,2,3} -> {0,3,2,1} is the packed-nibble constant 0x1230, where
+  // nibble i = (0x1230 >> (i*4)) & 0xF. Computing it in-register avoids both the
+  // table and its load.
+  //
+  // andi. would clobber CR0; Rc-free rldicl preserves NZCV state for the
+  // flag-sensitive paths that may sit between this and a downstream Jcc.
+  rldicl(TMP2, Src, 0, 62);   // TMP2 = Src & 3 (drop FZ and anything above it)
+  sldi(TMP2, TMP2, 2);        // TMP2 = index * 4 (nibble shift amount)
+  li(TMP1, 0x1230);           // packed x86 -> PPC RN map
+  srd(TMP1, TMP1, TMP2);      // 64-bit shift; shift amount is 0-12
+  rldicl(TMP1, TMP1, 0, 60);  // isolate the low nibble = new RN
   mffs(f(0));
   mffprd(TMP3, f(0));
   rldicr(TMP3, TMP3, 0, 61);  // clear C bits 0-1 (= FPSCR RN field)
-  or_(TMP3, TMP3, TMP2);
+  or_(TMP3, TMP3, TMP1);
   mtfprd(f(0), TMP3);
   mtfsf(0xFF, f(0));
 }
