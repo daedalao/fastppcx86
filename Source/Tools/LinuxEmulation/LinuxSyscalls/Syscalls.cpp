@@ -154,13 +154,21 @@ static fextl::string GetShebangInterpFile(std::span<char> Data) {
                                    std::find(Data.begin(), Data.end(), '\n')};
     fextl::vector<std::string_view> ShebangArguments = FHU::ParseArgumentsFromString(InterpreterLine);
 
+    if (ShebangArguments.empty()) {
+      return {};
+    }
+
     // Executable argument
     fextl::string ShebangProgram(ShebangArguments[0]);
 
-    // If the filename is absolute then prepend the rootfs
-    // If it is relative then don't append the rootfs
+    // For absolute interpreter paths, prefer the emulated path (rootfs / thunk overlay,
+    // with symlink resolution) and fall back to the host path if the interpreter is
+    // present only there. This mirrors the execve pathname lookup in ExecveHandler.
     if (ShebangProgram[0] == '/') {
-      ShebangProgram = FEX::HLE::_SyscallHandler->RootFSPath() + ShebangProgram;
+      auto Path = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(ShebangProgram.c_str(), true);
+      if (!Path.empty() && FHU::Filesystem::Exists(Path)) {
+        return Path;
+      }
     }
 
     if (FHU::Filesystem::Exists(ShebangProgram)) {

@@ -243,6 +243,10 @@ bool InterpreterHandler(fextl::string* Filename, const fextl::string& RootFS, fe
                                       std::find(Data.begin(), Data.end(), '\n')};
     const auto ShebangArguments = FHU::ParseArgumentsFromString(InterpreterLine);
 
+    if (ShebangArguments.empty()) {
+      return false;
+    }
+
     // Executable argument
     *Filename = ShebangArguments.at(0);
 
