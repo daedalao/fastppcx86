@@ -1578,7 +1578,7 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
     uint64_t RAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
     uint64_t TCR = Frame->Pointers.ThunkCallbackRet;
     int n = snprintf(buf, sizeof(buf),
-                     "[FEX] suspect GuestRIP=0x%lx HostLR=0x%lx\n",
+                     "[FEX] suspect GuestRIP=0x%lx DispatcherRetAddr=0x%lx (const, not the JIT block)\n",
                      (unsigned long)GuestRIP, (unsigned long)HostLR);
     [[maybe_unused]] auto _ = write(2, buf, n);
 #if FEX_PPC64_RIP_TRACE
@@ -1619,7 +1619,12 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
     fsync(2);
   }
   LogMan::Msg::EFmt("=== ExitFunctionLink: suspect GuestRIP=0x{:x} ===", GuestRIP);
-  LogMan::Msg::EFmt("    Host LR (JIT block tail that called us) = 0x{:x}", HostLR);
+  // HostLR is __builtin_return_address(0) taken inside ExitFunctionLink, whose only caller is the
+  // dispatcher stub — so this is a fixed dispatcher address, NOT the JIT block that produced the bad
+  // exit. Every capture will share the same low bits (0x3cc/0x3d0). Do not disassemble around it —
+  // that dumps dispatcher code, not the faulting block. The meaningful disassembly is the previous
+  // JIT block's host code, looked up from rip[-1] further down.
+  LogMan::Msg::EFmt("    Dispatcher return addr (const, NOT the JIT block) = 0x{:x}", HostLR);
 #if FEX_PPC64_RIP_TRACE
   LogMan::Msg::EFmt("    Recent dispatched guest RIPs (g_recent_rips):");
   {
@@ -1633,40 +1638,6 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   LogMan::Msg::EFmt("    Everything below that is derived from rip[-1] -- the GOT/PLT probe, the compile-log");
   LogMan::Msg::EFmt("    comparison, and the previous-JIT-block disasm -- is SKIPPED, not empty.");
 #endif
-  LogMan::Msg::EFmt("    Disasm of JIT block at Host LR-512 .. LR+32 (PPC64 instructions):");
-  LogMan::Msg::EFmt("    (Look for `std rX, 0x18(rRR)` = the state.rip store, and "
-                    "`ldx rX, rA, r0` / `lis;ori;sldi;oris;ori` = the LoadConstant+ldx for malloc GOT)");
-  {
-    // Widened window: LR-128 misses the actual `ldx` and earlier LoadConstant.
-    // Bump to LR-512 (128 words) to catch the full x86-op translation
-    // (LoadConstant of GOT VA + ldx + std to State.rip + SpillStaticRegs).
-    const uint32_t* base = reinterpret_cast<const uint32_t*>(HostLR);
-    for (int i = -128; i <= 8; ++i) {
-      const uint32_t* addr = base + i;
-      uint32_t insn = *addr;
-      // Annotate any std/ldx/lis instructions inline so easier to scan.
-      const char* note = "";
-      uint32_t opcode = insn >> 26;
-      if (opcode == 62) note = "  ; std/stdx (store double)";
-      else if (opcode == 58) note = "  ; ld/ldx (load double)";
-      else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 21) note = "  ; ldx (X-form load doubleword)";
-      else if (opcode == 31 && ((insn >> 1) & 0x3ff) == 149) note = "  ; stdx (X-form store doubleword)";
-      else if (opcode == 15) note = "  ; lis (load immed shifted)";
-      else if (opcode == 24) note = "  ; ori (or immediate)";
-      else if (opcode == 25) note = "  ; oris (or immed shifted)";
-      else if (opcode == 30) note = "  ; rldicl/rldicr (rotate-left-double-immed)";
-      if (i == 0) {
-        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}  <-- LR (return-to here from call)",
-                          reinterpret_cast<uint64_t>(addr), insn, note);
-      } else if (i == -1) {
-        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}  <-- call (bctrl)",
-                          reinterpret_cast<uint64_t>(addr), insn, note);
-      } else {
-        LogMan::Msg::EFmt("      0x{:x} = 0x{:08x}{}",
-                          reinterpret_cast<uint64_t>(addr), insn, note);
-      }
-    }
-  }
 
   // If rip[-1] looks like it points into a mapped x86_64 region, try to
   // read the bytes there. If it's an x86 `ff 25 disp32` instruction
