@@ -537,7 +537,9 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
           .Header {
             .Type = FEXServerClient::PacketType::TYPE_GET_ROOTFS_PATH,
           },
-          .Length = MountFolder.size() + 1,
+          // Ship Length == 0 for an empty MountFolder so the client's `Length > 0` guard actually fires;
+          // otherwise `size() + 1` sends 1 even for empty and the client silently accepts a null path.
+          .Length = MountFolder.empty() ? size_t{0} : (MountFolder.size() + 1),
         },
       };
 

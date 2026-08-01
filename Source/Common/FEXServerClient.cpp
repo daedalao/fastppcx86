@@ -232,8 +232,14 @@ bool SetupClient(std::string_view InterpreterPath) {
   if (FEXCore::Config::FindContainer() != "pressure-vessel") {
     fextl::string RootFSPath = FEXServerClient::RequestRootFSPath(ServerFD);
 
-    //// If everything has passed then we can now update the rootfs path
-    FEXCore::Config::Set(FEXCore::Config::CONFIG_ROOTFS, RootFSPath);
+    // Only overwrite the configured rootfs if the server returned a non-empty path. An empty response
+    // can come from a fresh per-uid FEXServer (e.g. one spawned as `_apt`) that has no MountFolder yet,
+    // and clobbering CONFIG_ROOTFS with "" makes every subsequent guest ELF fail to load.
+    if (!RootFSPath.empty()) {
+      FEXCore::Config::Set(FEXCore::Config::CONFIG_ROOTFS, RootFSPath);
+    } else {
+      LogMan::Msg::EFmt("FEXServer returned empty rootfs path; keeping configured value");
+    }
   }
 
   return true;
