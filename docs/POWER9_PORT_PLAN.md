@@ -362,6 +362,53 @@ been exercised through it. If it works, it removes most JIT latency from repeat 
 that can afford to compile at scale. If it does not, that is a bug worth knowing about early rather
 than discovering later. Cheap to test once the smoke ladder is up.
 
+#### ANSWERED 2026-07-31 — the prediction above was right, and it is worse than "untested"
+
+The cache is opt-in behind `FEX_ENABLECODECACHINGWIP` (`Config.json.in:19-25`, default `false`, and
+upstream's own `WIP` suffix is a warning). There is no ppc64le-specific guard — an empty
+`~/.cache/fex-emu` is what a default build produces on any host. **But enabling it here would execute
+corrupt code rather than fail cleanly**, because the port implements only half the subsystem.
+
+The asymmetry is the tell: the **load/apply** side handles all four relocation types for ppc64le
+(`CodeCache.cpp:613-694`, added in `e1f83d4c4`), while the **emit** side implements exactly one. So
+the consuming half was written speculatively and has never executed — it may carry its own bugs.
+
+Three gaps, all verified by reading, none of them ppc64le-specific *design* problems — just unfinished
+port work:
+
+1. **Relocations: 1 of 4 emitted.** Only `RELOC_NAMED_THUNK_MOVE` (`PPC64LE/JIT.cpp:1234-1249`). At the
+   four sites where ARM64 calls `InsertGuestRIPMove`/`InsertGuestRIPLiteral`, ppc64le calls plain
+   `LoadConstant` — `PPC64LE/ALUOps.cpp:42-46`, `PPC64LE/BranchOps.cpp:59`, `PPC64LE/JIT.cpp:2428`.
+   Guest RIPs therefore serialize unrebased, and `TakeRelocations` (`PPC64LE/JITClass.h:58-60`) is a
+   bare `std::move` that ignores its `GuestBaseAddress` argument where ARM64's subtracts it.
+2. **~9 absolute host pointers baked into block code with no relocation record** —
+   `PPC64_SplitLockEmulate`, `PPC64_VPCMPESTRX`/`ISTRX`, `PPC64_RDRAND`, `PPC64_CRC32`, the F16
+   converters, `F64SinImpl`. ARM64 has one such site and routes the rest through the thread-state
+   fallback-handler table, which is position-independent. Under PIE these differ between the offline
+   compiler process and the runtime process, so a cache hit branches into garbage.
+3. **`LoadConstant` is variable width** — 1 to 5 instructions depending on value
+   (`Emitter.h:1529-1556`), with no padding concept. ARM64 added fixed-width NOP padding *specifically*
+   for the code cache (`Arm64Emitter.cpp:428`, upstream `d2b9bfd6e`). Without it, in-place patching
+   overwrites following instructions — which breaks even the one relocation ppc64le does emit.
+
+**Worth doing.** Eliminating JIT compilation from repeat runs is the same mechanism as shader
+precompilation and removes in-game stutter for the same reason; the absence of a benchmark number
+in-tree is not evidence against a well-understood effect. It also fixes a real hole in the port.
+
+**Order of work:** (1) fixed-width constant emission — nothing is patchable until it exists;
+(2) route the baked helper pointers through thread state — largest correctness item, touches several
+op files; (3) emit the three missing relocation types and fix `TakeRelocations`. Then enable with
+`FEX_ENABLECODECACHINGWIP=1 FEX_ENABLECODECACHEVALIDATION=1` — the validation path
+(`CodeCache.cpp:540-611`) recompiles and byte-compares against fresh output and `ERROR_AND_DIE`s on
+mismatch, so it converts all three failure modes into hard errors instead of wild branches. **Use it
+as the gate; do not enable without it.**
+
+**Two traps to record now.** `CodeCacheConfigId` is hardcoded `0` with a `TODO` (`Syscalls.h:396`), so
+changing `FEX_HOSTFEATURES`, SMC checks or bitness does *not* invalidate a cache — that will silently
+poison benchmarking before it poisons anything else. And the local dirty-tree `GIT_HASH` derivation
+(`6e8009903`, `CMakeLists.txt:559-593`) only refreshes at **cmake configure time**, so an incremental
+`ninja` after a source edit can load a cache built from different codegen.
+
 **2. Give the guest dedicated cores, and consider *lowering* SMT.** SMT4 does not multiply vector
 throughput — four threads share the same two superslices. For a guest that is effectively 1-4 threads,
 SMT2 or SMT1 gives each thread a larger share of issue queues, reservation stations and L1.
