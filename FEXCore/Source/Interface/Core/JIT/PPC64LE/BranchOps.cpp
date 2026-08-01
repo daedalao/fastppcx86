@@ -35,18 +35,61 @@ DEF_OP(CallbackReturn) {
   blr();
 }
 
+// Inlined L1 lookup at every block exit.
+//
+// Previously this op stored State.rip, ran SpillStaticRegs (62 instructions),
+// and jumped to Pointers.DispatcherLoopTop, which then did the ~15-instruction
+// L1 probe and bctr'd to the block. On an L1 hit that whole spill was pure
+// waste: ppc64le SRA registers are FIXED physical assignments (PPC64Emitter.h
+// x64::SRA / x32::SRA), disjoint from the dynamic RA pool, so no SSA value is
+// ever allocated to one and guest state is live in registers unconditionally.
+// The dispatcher's hit leg branches to CodeData.EntryPoints[GuestEntry], which
+// JIT.cpp records AFTER EmitEntryPoint's FillStaticRegs, so the warm target
+// never refills — meaning the spill was written and then immediately made
+// redundant by registers that were never disturbed.
+//
+// So: do the probe here and jump straight to the target, and pay the spill
+// only on the miss leg.
+//
+// Register / flag discipline this sequence must honour:
+//
+//   CR7, never CR0. CR0 carries the block's live packed-NZCV (FillStaticRegs
+//   sets it, downstream FromNZCV consumers read it) and SpillStaticRegs on the
+//   miss leg packs CR0+XER into flags[RFLAG_NZCV_LOC]. Every instruction below
+//   is a no-Rc form and the compare targets cr7, so both CR0 and XER reach the
+//   miss-leg spill exactly as the block left them.
+//
+//   r0 stays 0. Guest loads/stores are X-form with r0 in the rB slot (where
+//   PPC does NOT substitute literal zero), so a nonzero r0 silently offsets
+//   every memory access in the target block. Nothing here writes r0, and no
+//   rB=r0 form is used; the invariant simply carries through, which is why the
+//   dispatcher's `li r0, 0` has no counterpart on the inlined hit leg.
+//
+//   Address dependency on the HostCode load. See the ORDERING NOTE in
+//   PPC64Dispatcher.cpp and LookupCacheEntry::Publish: the conditional branch
+//   does NOT order load->load on Power, so the GuestCode value is fed into the
+//   HostCode load's base register.
+//
+// NOT block linking. There is no backpatching, no jump thunk, no
+// ExitFunctionLinkData and no shadow stack here — every exit still goes
+// through the L1 table. Those are a later stage.
 DEF_OP(ExitFunction) {
-  // ORDERING NOTE: when NewRIP is a register (e.g. popped return address from
-  // `ret`), it lives in a host GPR allocated by RA. SpillStaticRegs clobbers
-  // TMP1/TMP3/TMP4 (and TMP2 inside the NZCV-save block); if RA happened to
-  // assign that host reg to NewRIP we'd wipe the return address before storing
-  // it. So: snapshot NewRIP into State.rip *first*, then spill.
   auto Op = IROp->C<IR::IROp_ExitFunction>();
   ResetStack();
 
-  int32_t rip_off = static_cast<int32_t>(
+  const int32_t rip_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
+  // ---------------------------------------------------------------------
+  // Materialise the destination RIP into a register.
+  //
+  // TMP1 is the staging register: the probe below uses only TMP2/TMP3/TMP4,
+  // and in the register case RIPReg is an RA- or SRA-allocated GPR (r7-r26,
+  // r30, r31 across both guest modes) which is disjoint from TMP1-TMP4, so
+  // nothing here can clobber a still-live SSA value. ResetStack may itself
+  // use TMP1 for oversized frames, hence this comes after it.
+  // ---------------------------------------------------------------------
+  GPR RIPReg = TMP1;
   uint64_t NewRIP;
   if (IsInlineConstant(Op->NewRIP, &NewRIP) ||
       IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
@@ -57,27 +100,91 @@ DEF_OP(ExitFunction) {
     if (!CTX->Config.Is64BitMode()) {
       NewRIP &= 0xFFFFFFFFull;
     }
-    LoadConstant(TMP2, NewRIP);
-    std(TMP2, rip_off, STATE);
-    SpillStaticRegs(TMP1);
+    LoadConstant(TMP1, NewRIP);
+    RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);
-    // 32-bit guest: stash a 32-bit-masked RIP into TMP2 first so we don't
-    // mutate the SSA-allocated NewRIPReg (which may still be live elsewhere).
     if (!CTX->Config.Is64BitMode()) {
-      rldicl(TMP2, NewRIPReg, 0, 32);
-      std(TMP2, rip_off, STATE);
+      // 32-bit guest: mask into TMP1 rather than mutating the SSA-allocated
+      // NewRIPReg, which may still be live elsewhere.
+      rldicl(TMP1, NewRIPReg, 0, 32);
+      RIPReg = TMP1;
     } else {
-      std(NewRIPReg, rip_off, STATE);   // save BEFORE spill clobbers temps
+      RIPReg = NewRIPReg;
     }
-    SpillStaticRegs(TMP1);
   }
 
-  // Jump to the dispatcher loop top. After spilling SRA, the dispatcher will
-  // look up the new RIP in the lookup cache and dispatch to the target block.
-  int32_t loop_off = static_cast<int32_t>(
-    offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
-  ld(TMP1, loop_off, STATE);
+  // ---------------------------------------------------------------------
+  // L1 probe. Mirrors the dispatcher's arithmetic exactly (PPC64Dispatcher.cpp
+  // DispatcherLoopTop): L1Mask is pre-scaled by sizeof(LookupCacheEntry)=16,
+  // so the index is (RIP << 4) & L1Mask.
+  // ---------------------------------------------------------------------
+  const int32_t l1_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+  const int32_t l1mask_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+
+  auto MissLabel = PPC64Emitter::Label{};
+
+  ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
+  ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled)
+  sldi(TMP4, RIPReg, 4);         // log2(sizeof(LookupCacheEntry)) == 4
+  and_(TMP4, TMP4, TMP3);
+  add(TMP2, TMP2, TMP4);         // TMP2 = &L1[hash]
+
+  ld(TMP4, 8, TMP2);             // TMP4 = GuestCode (the "key"), loaded FIRST
+  if (CTX->Config.Is64BitMode()) {
+    cmpd(cr(7), TMP4, RIPReg);
+  } else {
+    // 32-bit guest: compare only the low 32 so a publisher that left junk in
+    // the upper half cannot force a spurious miss. Matches the dispatcher.
+    cmpw(cr(7), TMP4, RIPReg);
+  }
+  // BO=4 (branch if false), BI=30 (CR7.EQ at PPC bit 4*7+2). i.e. bne cr7.
+  bc({4, 30}, &MissLabel);
+
+  // Hit. Carry the GuestCode value into the HostCode load's address so the
+  // hardware cannot hoist it above the GuestCode load and observe
+  // {stale HostCode, new GuestCode} mid-Publish. TMP3 is 0 by construction.
+  xor_(TMP3, TMP4, TMP4);
+  add(TMP2, TMP2, TMP3);
+  ld(TMP3, 0, TMP2);             // TMP3 = HostCode (loaded under address-dep)
+  mtctr(TMP3);
+  // No State.rip store on this leg: the target block does not read it (its
+  // prologue is EmitStoreBlockBeginToInlineHeader / EmitSuspendInterruptCheck
+  // / stdu), and RestoreRIPFromHostPC resolves a fault inside the target from
+  // its InlineJITBlockHeader + RIP-entry table rather than from State.rip.
+  // ARM64's inline probe omits the store for the same reason.
+  bctr();
+
+  // ---------------------------------------------------------------------
+  // Miss. This is where the spill lives now.
+  //
+  // It is RELOCATED, not deleted. SignalDelegator's SIGNAL_FOR_PAUSE (and
+  // Stop) handling gates only on IsAddressInCodeBuffer, which excludes the
+  // dispatcher's separate mmap — so a dispatcher PC always takes the
+  // "non-jit, SRA is already spilled" branch and reads guest state that only
+  // a completed spill makes valid. (The LOGMAN_THROW_A_FMT that would catch a
+  // dispatcher PC there is inside #if ASSERTIONS_ENABLED and inert in
+  // Release, and the async-signal deferral does not cover it because
+  // PauseHandler is a host handler.) Spilling here, inside the code buffer
+  // and before the branch out, keeps IsAddressInCodeBuffer a valid proxy and
+  // needs no signal-delegator change.
+  //
+  // Extending the delegator to IsAddressInDispatcher instead would be
+  // actively unsafe: ExitFunctionLinker continues past a bctrl, after which
+  // r7-r12 (SRA-mapped, ELFv2-volatile) hold garbage.
+  //
+  // Correspondingly, Pointers.ExitFunctionLinker no longer spills; the
+  // dispatcher's own L1 miss branches to a second, SRA-spilling entry.
+  // ---------------------------------------------------------------------
+  Bind(&MissLabel);
+  std(RIPReg, rip_off, STATE);   // BEFORE the spill clobbers TMP1-TMP4
+  SpillStaticRegs(TMP1);
+
+  const int32_t exit_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
+  ld(TMP1, exit_off, STATE);
   mtctr(TMP1);
   bctr();
 }

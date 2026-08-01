@@ -55,11 +55,16 @@ extern "C" void PPC64_PauseSchedYield() {
 // entry with the guest RIP being dispatched.
 //
 // This is port-local scaffolding with no ARM64 equivalent, and it is not free:
-// the emit in DispatcherLoopTop below costs 23 instructions (3 stores + 1 load)
-// on EVERY guest block transition, and ppc64le has no block-to-block linking so
-// every guest block exit pays it. These are alignas(64) process-globals written
-// by every guest thread, so on a multithreaded guest the cost is cross-core
-// cacheline coherence traffic, not just wasted instructions.
+// the emit in DispatcherLoopTop below costs 23 instructions (3 stores + 1 load).
+// These are alignas(64) process-globals written by every guest thread, so on a
+// multithreaded guest the cost is cross-core cacheline coherence traffic, not
+// just wasted instructions.
+//
+// Coverage note: since DEF_OP(ExitFunction) inlined the L1 probe, a JIT block
+// exit that HITS in L1 never reaches DispatcherLoopTop, so it is not recorded
+// here. What still passes through is L1 misses (via the linker's re-dispatch),
+// signal/pause resumes, thread starts and callback entries. The trail is a
+// dispatch-slow-path log now, not a block-transition log.
 //
 // Note for anyone tempted to re-enable this by default: the ring buffer was
 // ALREADY unreliable on multithreaded guests. g_dispatch_count is a racing
@@ -181,6 +186,9 @@ void PPC64Dispatcher::EmitDispatcher() {
   // TO the label and keep whatever the kernel set in the ucontext r4.
   li(r4, 0);
   PPC64Emitter::Label CompileSingleStepLabel{};
+  // Dispatcher-internal second entry to ExitFunctionLinker; see the slow-path
+  // branch in DispatcherLoopTop below and the linker's prologue.
+  PPC64Emitter::Label exit_linker_spill_sra{};
   // Failure-exit forward-branch target for the CompileSingleStep body below.
   // Bound at ThreadStopHandlerAddress (post-SpillStaticRegs) because SRA was
   // already spilled by the SMC SIGSEGV handler and the current host r7-r12
@@ -301,8 +309,9 @@ void PPC64Dispatcher::EmitDispatcher() {
 
     // Compare GuestCode with current RIP — into CR7, NOT CR0.
     //
-    // Why CR7: SpillStaticRegs (called below in ExitFunctionLinker on L1
-    // miss) packs CR0 + XER into flags[RFLAG_NZCV_LOC] as the canonical
+    // Why CR7: SpillStaticRegs (run on the L1-miss leg below, at
+    // ExitFunctionLinker's spilling entry) packs CR0 + XER into
+    // flags[RFLAG_NZCV_LOC] as the canonical
     // NZCV storage for cross-block transfer. If we used the default CR0
     // here, any L1 miss would overwrite the correct (just-spilled-by-the-
     // JIT-block's-ExitFunction) NZCV with garbage from this lookup compare.
@@ -329,14 +338,17 @@ void PPC64Dispatcher::EmitDispatcher() {
     auto match_label = PPC64Emitter::Label{};
     bc({12, 30}, &match_label);
 
-    // Slow path: store RIP, jump to ExitFunctionLinker
-    {
-      int32_t exit_off = static_cast<int32_t>(
-        offsetof(CpuStateFrame, Pointers.ExitFunctionLinker));
-      ld(TMP1, exit_off, STATE);
-      mtctr(TMP1);
-      bctr();
-    }
+    // Slow path: jump to ExitFunctionLinker's SRA-SPILLING entry.
+    //
+    // Every path that reaches DispatcherLoopTop arrives with guest state live
+    // in the SRA host registers and NOT yet written back to CpuStateFrame:
+    // DispatcherLoopTopFillSRA falls through after FillStaticRegs, CallbackPtr
+    // jumps here after FillStaticRegs, and ExitFunctionLinker's own
+    // re-dispatch runs FillStaticRegs before branching. So the linker must
+    // spill on this path. JIT blocks reach the linker by a different route --
+    // they spill inline (BranchOps.cpp DEF_OP(ExitFunction)) and enter at
+    // ExitFunctionLinkerAddress, which does not spill.
+    b(&exit_linker_spill_sra);
 
     Bind(&match_label);
     // Fast path: JIT block found.  Feed the GuestCode VALUE into the address
@@ -371,9 +383,31 @@ void PPC64Dispatcher::EmitDispatcher() {
   // FillStaticRegs reloads SRA (this bug caused a SIGSEGV on Steam launch
   // in commit-before-this; symptom was `ldx rX, r5, r0` after `addi r5,
   // r12, -120` crashing — guest RBP was the refcount value).
+  //
+  // TWO ENTRIES, distinguished by who owns the SRA spill:
+  //
+  //   exit_linker_spill_sra  (dispatcher-internal, not in Pointers)
+  //       Reached only from DispatcherLoopTop's L1 miss, where guest state is
+  //       live in host registers. Enters the deferred-signal guard, spills,
+  //       falls into the body.
+  //
+  //   ExitFunctionLinkerAddress  (Pointers.ExitFunctionLinker)
+  //       Reached from a JIT block's inlined L1 miss leg, which has ALREADY
+  //       run SpillStaticRegs in JIT code. Enters the guard only.
+  //
+  // Why the JIT spills before branching rather than letting the linker do it:
+  // SignalDelegator's SIGNAL_FOR_PAUSE / Stop handling picks the non-spilling
+  // handler entry whenever IsAddressInCodeBuffer(PC) is false, and the
+  // dispatcher lives in its own mmap, so a dispatcher PC always takes that
+  // branch and reads guest state that only a completed spill makes valid.
+  // (The LOGMAN_THROW_A_FMT that would catch this is inside
+  // #if ASSERTIONS_ENABLED and is inert in Release.) Spilling in JIT code
+  // keeps IsAddressInCodeBuffer a valid proxy for "SRA still in registers".
+  //
+  // The spill stays INSIDE the guard on the dispatcher entry: a guest signal
+  // taken mid-spill at a dispatcher PC would otherwise build its frame from
+  // half-written state.
   // ==============================================================
-  ExitFunctionLinkerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
-
   const int32_t deferred_refcount_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, State.DeferredSignalRefCount));
   const int32_t deferred_fault_off = static_cast<int32_t>(
@@ -385,8 +419,8 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   auto EmitDeferredSignalEnter = [&]() {
     // 3-instr non-atomic thread-local increment per docs/DeferredSignals.md.
-    // TMP1 is scratch; SpillStaticRegs(TMP1) below will clobber it again,
-    // so we can freely use it here.
+    // TMP1 is scratch — the spill and the C-call setup below clobber it
+    // again, so we can freely use it here.
     ld(TMP1, deferred_refcount_off, STATE);
     addi(TMP1, TMP1, 1);
     std(TMP1, deferred_refcount_off, STATE);
@@ -402,14 +436,23 @@ void PPC64Dispatcher::EmitDispatcher() {
     stb(TMP1, deferred_fault_off, STATE);
   };
 
+  // Entry 1: SRA still live in host registers (dispatcher-internal).
+  PPC64Emitter::Label exit_linker_body{};
+  Bind(&exit_linker_spill_sra);
   {
     // Enter uninterruptible region BEFORE SpillStaticRegs so the spill
     // itself runs under the guard. SRA is live; r12 is non-SRA scratch.
     EmitDeferredSignalEnter();
-
-    // Spill SRA before calling C++
     SpillStaticRegs(TMP1);
+    b(&exit_linker_body);
+  }
 
+  // Entry 2: caller (a JIT block) has already spilled.
+  ExitFunctionLinkerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  EmitDeferredSignalEnter();
+
+  Bind(&exit_linker_body);
+  {
     // Call PPC64JITCore::ExitFunctionLink(Frame, GuestRIP):
     //   r3 = Frame (CpuStateFrame*)
     //   r4 = current guest RIP
