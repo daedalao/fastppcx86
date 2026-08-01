@@ -79,6 +79,9 @@ enum PPC64HelperIndex : uint32_t {
 // VectorOps.cpp because most helpers only have file-scope visibility there.
 uint64_t* GetPPC64HelperTable();
 
+// Byte size of one PPC64HelperTable slot (a raw uint64_t function address).
+static constexpr int16_t PPC64HelperSlotSize = 8;
+
 class PPC64JITCore final : public CPUBackend, public PPC64EmitterBase {
 public:
   explicit PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
@@ -344,6 +347,24 @@ private:
 
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);
+
+  // Load a PPC64 helper's absolute host address into `dst` via the two
+  // ld-through-STATE dance:
+  //   ld dst, PPC64_HelperTable_off(STATE)   ; dst = HelperTable pointer
+  //   ld dst, IDX*8(dst)                     ; dst = helper address
+  // Two d-form loads instead of LoadConstant's 1-5 instructions per call
+  // site, and PIE-safe (no absolute address baked into JIT). Caller is
+  // responsible for the ELFv2 `mr r12, dst; mtctr dst; bctrl` postlude.
+  // Placed inline in the header so all JIT source files see the same body
+  // without cross-TU linkage games. See P2.1 C1/C2 in build-agent-notes.md.
+  void EmitLoadPPC64Helper(PPC64Emitter::GPR dst, FEXCore::CPU::PPC64HelperIndex idx) {
+    static_assert(offsetof(FEXCore::Core::CpuStateFrame, PPC64_HelperTable) <= INT16_MAX,
+                  "PPC64_HelperTable offset must fit int16_t for d-form ld");
+    ld(dst,
+       static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, PPC64_HelperTable)),
+       STATE);
+    ld(dst, static_cast<int16_t>(idx * PPC64HelperSlotSize), dst);
+  }
 
   // Store the address of the JITCodeHeader (bound at HeaderLabel) into
   // CpuStateFrame::State.InlineJITBlockHeader so RestoreRIPFromHostPC and the

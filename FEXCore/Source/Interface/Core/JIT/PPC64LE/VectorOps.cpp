@@ -4971,7 +4971,7 @@ DEF_OP(F64SIN) {
 
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64SinImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64Sin);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -4986,7 +4986,7 @@ DEF_OP(F64COS) {
 
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64CosImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64Cos);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -5001,7 +5001,7 @@ DEF_OP(F64TAN) {
 
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64TanImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64Tan);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -5020,7 +5020,7 @@ DEF_OP(F64ATAN) {
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src1);
   MARSHAL_VR_TO_F2(Src2);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64AtanImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64Atan);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -5039,7 +5039,7 @@ DEF_OP(F64FYL2X) {
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src);
   MARSHAL_VR_TO_F2(Src2);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64FYL2XImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64FYL2X);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -5058,7 +5058,7 @@ DEF_OP(F64SCALE) {
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src1);
   MARSHAL_VR_TO_F2(Src2);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64ScaleImpl));
+  EmitLoadPPC64Helper(TMP1, PPC64_HELPER_F64Scale);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
