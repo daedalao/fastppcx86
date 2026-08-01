@@ -37,6 +37,48 @@ namespace FEXCore::CPU {
 // RDRAND fallback (POWER8 has no `darn`); defined in JIT.cpp.
 extern "C" uint64_t PPC64_RDRAND();
 
+// Indices into the ppc64le helper-address table pointed at by
+// CpuStateFrame::PPC64_HelperTable. Each entry holds the absolute host
+// address of one JIT-callable C helper. The table itself is a static
+// namespace-scope array in JIT.cpp; the pointer to it is written to
+// CpuStateFrame in PPC64JITCore's constructor. Adding a new helper here
+// requires (a) a new PPC64_HELPER_* enumerator, (b) an initializer in the
+// same file's PPC64Helpers array, and (c) an emitter site that loads via
+// `ld TMP1, PPC64_HelperTable_off(STATE); ld TMP1, IDX*8(TMP1)`.
+// Enumerator order defines the offset — do not reorder without rebuilding
+// every code cache (P3.2/P3.3 will make this a hard cache invariant; today
+// no cache is live). Kept as scoped constants (not `enum class`) so the
+// arithmetic reads naturally at emit sites: `IDX * 8`.
+enum PPC64HelperIndex : uint32_t {
+  PPC64_HELPER_SplitLockEmulate = 0,
+  PPC64_HELPER_F16HiToF32x4,
+  PPC64_HELPER_F32x4ToF16Hi,
+  PPC64_HELPER_F64Sin,
+  PPC64_HELPER_F64Cos,
+  PPC64_HELPER_F64Tan,
+  PPC64_HELPER_F64Atan,
+  PPC64_HELPER_F64FYL2X,
+  PPC64_HELPER_F64Scale,
+  // Deliberately NO F64F2XM1 entry — F64F2XM1Impl diverges from the
+  // upstream F64F2XM1Handler slot (expm1(x*ln2) vs exp2(src)-1.0, off by
+  // >1 ULP on 44.6% of inputs); reusing that Pointers slot re-breaks
+  // D9_F0_02_F64. Its call site keeps LoadConstant for now.
+  PPC64_HELPER_VAESImc,
+  PPC64_HELPER_VAESKeyGenAssist,
+  PPC64_HELPER_VSha1H,
+  PPC64_HELPER_PCLMUL,
+  PPC64_HELPER_RDRAND,
+  PPC64_HELPER_CRC32,
+  PPC64_HELPER_VPCMPESTRX,
+  PPC64_HELPER_VPCMPISTRX,
+  PPC64_HELPER_MAX,
+};
+
+// Returns the process-lifetime helper-address table. Written into
+// CpuStateFrame::PPC64_HelperTable at PPC64JITCore construction. Defined in
+// VectorOps.cpp because most helpers only have file-scope visibility there.
+uint64_t* GetPPC64HelperTable();
+
 class PPC64JITCore final : public CPUBackend, public PPC64EmitterBase {
 public:
   explicit PPC64JITCore(FEXCore::Context::ContextImpl* ctx,

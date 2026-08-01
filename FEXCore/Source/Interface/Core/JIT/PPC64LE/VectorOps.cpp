@@ -5114,6 +5114,16 @@ extern "C" void PPC64_VAESKeyGenAssist(uint8_t*, const uint8_t*, uint64_t RCON);
 extern "C" uint64_t PPC64_CRC32(uint64_t Acc, uint64_t Val, uint64_t Bytes);
 extern "C" void PPC64_PCLMUL(uint8_t*, const uint8_t*, const uint8_t*, uint64_t Selector);
 extern "C" void PPC64_VSha1H(uint8_t*, const uint8_t*);
+// SSE4.2 string ops (implemented in JIT.cpp).
+extern "C" uint64_t PPC64_VPCMPESTRX(const uint8_t* lhs, const uint8_t* rhs,
+                                     uint64_t la, uint64_t ra, uint64_t imm);
+extern "C" uint64_t PPC64_VPCMPISTRX(const uint8_t* lhs, const uint8_t* rhs,
+                                     uint64_t imm);
+// Split-lock emulation (implemented in FEXCore/Source/Utils/ArchHelpers/PPC64.cpp).
+namespace FEXCore::ArchHelpers::PPC64 {
+extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* value,
+                                       uint64_t* result, uint32_t size);
+}
 extern "C" void PPC64_VSha1C(uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
 extern "C" void PPC64_VSha1M(uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
 extern "C" void PPC64_VSha1P(uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
@@ -5123,6 +5133,49 @@ extern "C" void PPC64_VSha256H2(uint8_t*, const uint8_t*, const uint8_t*, const 
 extern "C" void PPC64_VSha256U0(uint8_t*, const uint8_t*, const uint8_t*);
 extern "C" void PPC64_VSha256U1(uint8_t*, const uint8_t*, const uint8_t*);
 // (F16C externs are hoisted to the top of the file — see above.)
+
+// -------------------------------------------------------------------------
+// PPC64 helper-address table (P2.1 C1 — infrastructure only)
+// -------------------------------------------------------------------------
+// Static array of the host-function addresses that JIT-emitted call sites
+// need to reach. Sits at namespace-scope in this file because most helpers
+// (F64* impls in anon-ns above, plus the PPC64_V* crypto helpers whose
+// extern "C" prototypes are in this file) are only lookup-visible here.
+// A CpuStateFrame pointer field (CoreState.h::PPC64_HelperTable) is
+// initialised in PPC64JITCore's constructor via GetPPC64HelperTable() to
+// point at this array. JIT emitters replace absolute-address bakes with
+// `ld TMP1, PPC64_HelperTable_off(STATE); ld TMP1, IDX*8(TMP1); mtctr TMP1;
+// bctrl`.  Uses C99-style designated initializers to make the mapping
+// enum ↔ helper impossible to get subtly wrong. Enumerator additions
+// require a matching row here.
+namespace {
+static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
+  [::FEXCore::CPU::PPC64_HELPER_SplitLockEmulate] =
+      reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate),
+  [::FEXCore::CPU::PPC64_HELPER_F16HiToF32x4]     = reinterpret_cast<uint64_t>(&PPC64_F16HiToF32x4),
+  [::FEXCore::CPU::PPC64_HELPER_F32x4ToF16Hi]     = reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16Hi),
+  [::FEXCore::CPU::PPC64_HELPER_F64Sin]           = reinterpret_cast<uint64_t>(F64SinImpl),
+  [::FEXCore::CPU::PPC64_HELPER_F64Cos]           = reinterpret_cast<uint64_t>(F64CosImpl),
+  [::FEXCore::CPU::PPC64_HELPER_F64Tan]           = reinterpret_cast<uint64_t>(F64TanImpl),
+  [::FEXCore::CPU::PPC64_HELPER_F64Atan]          = reinterpret_cast<uint64_t>(F64AtanImpl),
+  [::FEXCore::CPU::PPC64_HELPER_F64FYL2X]         = reinterpret_cast<uint64_t>(F64FYL2XImpl),
+  [::FEXCore::CPU::PPC64_HELPER_F64Scale]         = reinterpret_cast<uint64_t>(F64ScaleImpl),
+  [::FEXCore::CPU::PPC64_HELPER_VAESImc]          = reinterpret_cast<uint64_t>(&PPC64_VAESImc),
+  [::FEXCore::CPU::PPC64_HELPER_VAESKeyGenAssist] = reinterpret_cast<uint64_t>(&PPC64_VAESKeyGenAssist),
+  [::FEXCore::CPU::PPC64_HELPER_VSha1H]           = reinterpret_cast<uint64_t>(&PPC64_VSha1H),
+  [::FEXCore::CPU::PPC64_HELPER_PCLMUL]           = reinterpret_cast<uint64_t>(&PPC64_PCLMUL),
+  [::FEXCore::CPU::PPC64_HELPER_RDRAND]           = reinterpret_cast<uint64_t>(&PPC64_RDRAND),
+  [::FEXCore::CPU::PPC64_HELPER_CRC32]            = reinterpret_cast<uint64_t>(&PPC64_CRC32),
+  [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
+  [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
+};
+} // namespace
+
+// Handed to CpuStateFrame::PPC64_HelperTable at thread-JIT construction.
+// The pointer is stable for program lifetime.
+uint64_t* GetPPC64HelperTable() {
+  return const_cast<uint64_t*>(PPC64Helpers);
+}
 
 // (Crypto FABI mini-frame constants are hoisted to the top of the file so
 // that DEF_OP(Vector_FToF)'s F16C path — which appears earlier in the file —

@@ -464,6 +464,16 @@ struct CpuStateFrame {
   // indefinitely. The counter gates how often we pay the syscall cost
   // (~100ns) vs the SMT-hint cost (1 cycle).
   uint32_t PauseCount {};
+
+  // Pointer to the ppc64le helper-address table. JIT-emitted call sites
+  // load `ld TMP1, PPC64_HelperTable_off(STATE); ld TMP1, HELPER*8(TMP1);
+  // mtctr TMP1; bctrl` to reach a host C helper (SplitLockEmulate, CRC32,
+  // RDRAND, VAES/VSha/PCLMUL, VPCMPESTRX/ISTRX, F64 impls, F16 converters)
+  // without baking that helper's absolute address into the block. Placed in
+  // the existing pad between PauseCount (uint32) and the 8-byte-aligned
+  // Pointers member so CpuStateFrame stays a multiple of 128 bytes and the
+  // ARM64 struct layout is unchanged. See P2.1 in docs/TASK_QUEUE.md.
+  uint64_t* PPC64_HelperTable {};
 #endif
 
   // Pointers that the JIT needs to load to remove relocations

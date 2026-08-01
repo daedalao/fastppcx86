@@ -1935,6 +1935,12 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   ThreadState->CurrentFrame->Pointers.ExitFunctionLink =
     reinterpret_cast<uintptr_t>(&PPC64JITCore::ExitFunctionLink);
 
+  // Point the JIT's helper-address table at the static array in VectorOps.cpp.
+  // JIT-emitted call sites will (in P2.1 C2..C5) reach C helpers via
+  // `ld TMP1, PPC64_HelperTable_off(STATE); ld TMP1, IDX*8(TMP1); mtctr TMP1`
+  // — position-independent, code-cache-safe. See CoreState.h and JITClass.h.
+  ThreadState->CurrentFrame->PPC64_HelperTable = GetPPC64HelperTable();
+
   // Wire up syscall handler — virtual dispatch via vtable entry extraction.
   {
     FEXCore::Utils::MemberFunctionToPointerCast PMF(&FEXCore::HLE::SyscallHandler::HandleSyscall);
