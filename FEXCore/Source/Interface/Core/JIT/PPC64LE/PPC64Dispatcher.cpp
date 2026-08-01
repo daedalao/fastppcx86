@@ -482,17 +482,18 @@ void PPC64Dispatcher::EmitDispatcher() {
     auto found_label = PPC64Emitter::Label{};
     bc(CC_NE, &found_label);
 
-    // Block not found/compilable: fall through to ThreadStopHandler.
-    // Balance the refcount + drain pending deferred signals before leaving
-    // the dispatcher region — otherwise the refcount stays elevated and
-    // every future signal in this thread silently defers forever.
+    // Block not found/compilable: reach the *non-spilling* ThreadStopHandler
+    // entry (P5.0.3). Symmetric with the SMC single-step failure path a few
+    // lines below: SRA was spilled before the C++ bctrl into ExitFunctionLink,
+    // and host r7-r12/v0-v19 now hold ELFv2-volatile garbage. The
+    // SpillSRA-entry variant would write that garbage over the already-correct
+    // spilled state. Balance the deferred-signal counter first, then branch
+    // to the label bound at ThreadStopHandlerAddress (post-SpillStaticRegs).
+    // Low severity in practice — the thread is terminating — but the pre-P5.0
+    // asymmetry with the SMC path was a correctness smell.
     {
       EmitDeferredSignalExit();
-      int32_t stop_off = static_cast<int32_t>(
-        offsetof(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
-      ld(TMP1, stop_off, STATE);
-      mtctr(TMP1);
-      bctr();
+      b(&ThreadStopNoSpillLabel);
     }
 
     Bind(&found_label);

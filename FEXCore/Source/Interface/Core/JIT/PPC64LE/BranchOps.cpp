@@ -150,11 +150,25 @@ DEF_OP(ExitFunction) {
   add(TMP2, TMP2, TMP3);
   ld(TMP3, 0, TMP2);             // TMP3 = HostCode (loaded under address-dep)
   mtctr(TMP3);
-  // No State.rip store on this leg: the target block does not read it (its
-  // prologue is EmitStoreBlockBeginToInlineHeader / EmitSuspendInterruptCheck
-  // / stdu), and RestoreRIPFromHostPC resolves a fault inside the target from
-  // its InlineJITBlockHeader + RIP-entry table rather than from State.rip.
-  // ARM64's inline probe omits the store for the same reason.
+  // P5.0.1: store the destination RIP into State.rip on the hit leg too.
+  // Rationale: RestoreRIPFromHostPC's fallback (Frame->State.rip) is invoked
+  // whenever a JIT block has no per-instruction RIP entries or the host PC
+  // sits outside a header'd block; without this store the fallback returns
+  // whatever the last L1 *miss* stored, which can be arbitrarily stale.
+  // Symptom (silent): guest signal frames carry wrong-but-plausible RIPs and
+  // sigreturn resumes at the wrong address. 1 instruction on a 14-instruction
+  // leg. Reviewed against Power ISA v3.0B — safe placement here (RIPReg is
+  // still live; no dependency on TMP1-TMP4 that could be misordered).
+  std(RIPReg, rip_off, STATE);
+  // P5.0.2: reset r0 to 0 before the bctr. JIT blocks emit X-form indexed
+  // memory ops with r0 in the rB slot (ldx/stdx and friends), which read r0
+  // as its actual value (not literal zero — the "r0 reads as zero" rule
+  // applies only to rA). A nonzero r0 silently offsets every load/store in
+  // the target block. Every mflr(r0) in the backend today is paired with a
+  // restore, so no bug is visible — but the invariant is currently globally
+  // assumed, and the failure mode is silent guest memory corruption. Make
+  // the local guarantee explicit for 1 extra instruction on this hot leg.
+  li(r(0), 0);
   bctr();
 
   // ---------------------------------------------------------------------

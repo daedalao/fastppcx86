@@ -171,8 +171,11 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
       // to Frame->State.rip. Without this guard the reconstruction would
       // return the block-entry RIP, which is coarser than the syscall-site
       // RIP that Frame->State.rip already stores today (SeccompEmulator
-      // reads .instruction_pointer via this path). Ppc64le currently emits
-      // zero RIP entries, so any header-only block hits this branch.
+      // reads .instruction_pointer via this path). Header-only blocks —
+      // e.g. blocks with no CanHaveSideEffects IR ops that would emit
+      // GuestOpcode markers — hit this branch. (Ppc64le emits entries since
+      // P3.1 landed as 244075383; the old comment claiming otherwise was
+      // stale, per P5.0 review.)
       if (InlineTail->NumberOfRIPEntries == 0) {
         return Frame->State.rip;
       }
