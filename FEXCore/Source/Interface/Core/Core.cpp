@@ -989,6 +989,10 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   FEXCORE_PROFILE_SCOPED("CompileSingleStep");
   auto Thread = Frame->Thread;
 
+  if (SMCAuditCompileFD() >= 0) {
+    dprintf(SMCAuditCompileFD(), "single-step rip=%lx tid=%d\n", GuestRIP, FHU::Syscalls::gettid());
+  }
+
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
@@ -997,6 +1001,9 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
+    if (SMCAuditCompileFD() >= 0) {
+      dprintf(SMCAuditCompileFD(), "single-step rip=%lx FAILED (nullptr)\n", GuestRIP);
+    }
     return 0;
   }
 
