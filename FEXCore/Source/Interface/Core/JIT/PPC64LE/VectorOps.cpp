@@ -5162,7 +5162,19 @@ static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
   [::FEXCore::CPU::PPC64_HELPER_F64Scale]         = reinterpret_cast<uint64_t>(F64ScaleImpl),
   [::FEXCore::CPU::PPC64_HELPER_VAESImc]          = reinterpret_cast<uint64_t>(&PPC64_VAESImc),
   [::FEXCore::CPU::PPC64_HELPER_VAESKeyGenAssist] = reinterpret_cast<uint64_t>(&PPC64_VAESKeyGenAssist),
+  [::FEXCore::CPU::PPC64_HELPER_VAESEnc]          = reinterpret_cast<uint64_t>(&PPC64_VAESEnc),
+  [::FEXCore::CPU::PPC64_HELPER_VAESEncLast]      = reinterpret_cast<uint64_t>(&PPC64_VAESEncLast),
+  [::FEXCore::CPU::PPC64_HELPER_VAESDec]          = reinterpret_cast<uint64_t>(&PPC64_VAESDec),
+  [::FEXCore::CPU::PPC64_HELPER_VAESDecLast]      = reinterpret_cast<uint64_t>(&PPC64_VAESDecLast),
   [::FEXCore::CPU::PPC64_HELPER_VSha1H]           = reinterpret_cast<uint64_t>(&PPC64_VSha1H),
+  [::FEXCore::CPU::PPC64_HELPER_VSha1C]           = reinterpret_cast<uint64_t>(&PPC64_VSha1C),
+  [::FEXCore::CPU::PPC64_HELPER_VSha1M]           = reinterpret_cast<uint64_t>(&PPC64_VSha1M),
+  [::FEXCore::CPU::PPC64_HELPER_VSha1P]           = reinterpret_cast<uint64_t>(&PPC64_VSha1P),
+  [::FEXCore::CPU::PPC64_HELPER_VSha1SU1]         = reinterpret_cast<uint64_t>(&PPC64_VSha1SU1),
+  [::FEXCore::CPU::PPC64_HELPER_VSha256H]         = reinterpret_cast<uint64_t>(&PPC64_VSha256H),
+  [::FEXCore::CPU::PPC64_HELPER_VSha256H2]        = reinterpret_cast<uint64_t>(&PPC64_VSha256H2),
+  [::FEXCore::CPU::PPC64_HELPER_VSha256U0]        = reinterpret_cast<uint64_t>(&PPC64_VSha256U0),
+  [::FEXCore::CPU::PPC64_HELPER_VSha256U1]        = reinterpret_cast<uint64_t>(&PPC64_VSha256U1),
   [::FEXCore::CPU::PPC64_HELPER_PCLMUL]           = reinterpret_cast<uint64_t>(&PPC64_PCLMUL),
   [::FEXCore::CPU::PPC64_HELPER_RDRAND]           = reinterpret_cast<uint64_t>(&PPC64_RDRAND),
   [::FEXCore::CPU::PPC64_HELPER_CRC32]            = reinterpret_cast<uint64_t>(&PPC64_CRC32),
@@ -5215,7 +5227,7 @@ DEF_OP(VAESImc) {
   // helper copies src→local before writing.
   addi(r3, r1, PostSpill(CryptoSlotA));
   addi(r4, r1, PostSpill(CryptoSlotA));
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_VAESImc));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VAESImc);
   std(r2, PostSpill(24), r1);
   mtctr(r(12)); bctrl();
   ld(r2, PostSpill(24), r1);
@@ -5234,7 +5246,8 @@ DEF_OP(VAESImc) {
 // Common emitter for the 3-VR-arg AES round ops (Enc/EncLast/Dec/DecLast).
 // Slot A: State→dst.  Slot B: Key.  ZeroReg is unused (helpers operate on
 // State directly; the ARM "aese with ZeroReg" pattern does state^0 = state).
-#define EMIT_AES_ROUND(HelperFn, StateReg, KeyReg, DstReg)                  \
+// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
+#define EMIT_AES_ROUND(HelperIdx, StateReg, KeyReg, DstReg)                  \
   do {                                                                       \
     const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
     const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
@@ -5246,7 +5259,7 @@ DEF_OP(VAESImc) {
     addi(r3, r1, PostSpill(CryptoSlotA));                                    \
     addi(r4, r1, PostSpill(CryptoSlotA));                                    \
     addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    LoadConstant(r(12), reinterpret_cast<uint64_t>(&HelperFn));              \
+    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
     std(r2, PostSpill(24), r1);                                              \
     mtctr(r(12)); bctrl();                                                   \
     ld(r2, PostSpill(24), r1);                                               \
@@ -5260,25 +5273,25 @@ DEF_OP(VAESImc) {
 DEF_OP(VAESEnc) {
   if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEnc>();
-  EMIT_AES_ROUND(PPC64_VAESEnc, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  EMIT_AES_ROUND(PPC64_HELPER_VAESEnc, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
 }
 
 DEF_OP(VAESEncLast) {
   if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEncLast>();
-  EMIT_AES_ROUND(PPC64_VAESEncLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  EMIT_AES_ROUND(PPC64_HELPER_VAESEncLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
 }
 
 DEF_OP(VAESDec) {
   if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDec>();
-  EMIT_AES_ROUND(PPC64_VAESDec, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  EMIT_AES_ROUND(PPC64_HELPER_VAESDec, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
 }
 
 DEF_OP(VAESDecLast) {
   if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDecLast>();
-  EMIT_AES_ROUND(PPC64_VAESDecLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  EMIT_AES_ROUND(PPC64_HELPER_VAESDecLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
 }
 #undef EMIT_AES_ROUND
 
@@ -5303,7 +5316,7 @@ DEF_OP(VAESKeyGenAssist) {
   addi(r3, r1, PostSpill(CryptoSlotA));
   addi(r4, r1, PostSpill(CryptoSlotA));
   LoadConstant(r5, RCON);
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_VAESKeyGenAssist));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VAESKeyGenAssist);
   std(r2, PostSpill(24), r1);
   mtctr(r(12)); bctrl();
   ld(r2, PostSpill(24), r1);
@@ -5336,7 +5349,7 @@ DEF_OP(VSha1H) {
 
   addi(r3, r1, PostSpill(CryptoSlotA));
   addi(r4, r1, PostSpill(CryptoSlotA));
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_VSha1H));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VSha1H);
   std(r2, PostSpill(24), r1);
   mtctr(r(12)); bctrl();
   ld(r2, PostSpill(24), r1);
@@ -5358,7 +5371,8 @@ DEF_OP(VSha1H) {
 // pre-shuffles inputs to the ARM lane layout (see Crypto.cpp).
 
 // 3-VR-arg SHA round-step emitter: A/B/C → slots, helper(dst=A, A, B, C).
-#define EMIT_SHA_3ARG(HelperFn, Src1Reg, Src2Reg, Src3Reg, DstReg)            \
+// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
+#define EMIT_SHA_3ARG(HelperIdx, Src1Reg, Src2Reg, Src3Reg, DstReg)           \
   do {                                                                       \
     const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
     const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
@@ -5374,7 +5388,7 @@ DEF_OP(VSha1H) {
     addi(r4, r1, PostSpill(CryptoSlotA));                                    \
     addi(r5, r1, PostSpill(CryptoSlotB));                                    \
     addi(r6, r1, PostSpill(CryptoSlotC));                                    \
-    LoadConstant(r(12), reinterpret_cast<uint64_t>(&HelperFn));              \
+    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
     std(r2, PostSpill(24), r1);                                              \
     mtctr(r(12)); bctrl();                                                   \
     ld(r2, PostSpill(24), r1);                                               \
@@ -5388,7 +5402,8 @@ DEF_OP(VSha1H) {
   } while (0)
 
 // 2-VR-arg SHA emitter: A/B → slots, helper(dst=A, A, B).
-#define EMIT_SHA_2ARG(HelperFn, Src1Reg, Src2Reg, DstReg)                     \
+// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
+#define EMIT_SHA_2ARG(HelperIdx, Src1Reg, Src2Reg, DstReg)                    \
   do {                                                                       \
     const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
     const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
@@ -5402,7 +5417,7 @@ DEF_OP(VSha1H) {
     addi(r3, r1, PostSpill(CryptoSlotA));                                    \
     addi(r4, r1, PostSpill(CryptoSlotA));                                    \
     addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    LoadConstant(r(12), reinterpret_cast<uint64_t>(&HelperFn));              \
+    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
     std(r2, PostSpill(24), r1);                                              \
     mtctr(r(12)); bctrl();                                                   \
     ld(r2, PostSpill(24), r1);                                               \
@@ -5417,35 +5432,35 @@ DEF_OP(VSha1H) {
 
 DEF_OP(VSha1C) {
   const auto Op = IROp->C<IR::IROp_VSha1C>();
-  EMIT_SHA_3ARG(PPC64_VSha1C, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EMIT_SHA_3ARG(PPC64_HELPER_VSha1C, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
 DEF_OP(VSha1M) {
   const auto Op = IROp->C<IR::IROp_VSha1M>();
-  EMIT_SHA_3ARG(PPC64_VSha1M, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EMIT_SHA_3ARG(PPC64_HELPER_VSha1M, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
 DEF_OP(VSha1P) {
   const auto Op = IROp->C<IR::IROp_VSha1P>();
-  EMIT_SHA_3ARG(PPC64_VSha1P, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EMIT_SHA_3ARG(PPC64_HELPER_VSha1P, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
 DEF_OP(VSha1SU1) {
   const auto Op = IROp->C<IR::IROp_VSha1SU1>();
-  EMIT_SHA_2ARG(PPC64_VSha1SU1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  EMIT_SHA_2ARG(PPC64_HELPER_VSha1SU1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
 }
 DEF_OP(VSha256H) {
   const auto Op = IROp->C<IR::IROp_VSha256H>();
-  EMIT_SHA_3ARG(PPC64_VSha256H, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
 DEF_OP(VSha256H2) {
   const auto Op = IROp->C<IR::IROp_VSha256H2>();
-  EMIT_SHA_3ARG(PPC64_VSha256H2, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H2, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
 DEF_OP(VSha256U0) {
   const auto Op = IROp->C<IR::IROp_VSha256U0>();
-  EMIT_SHA_2ARG(PPC64_VSha256U0, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U0, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
 }
 DEF_OP(VSha256U1) {
   const auto Op = IROp->C<IR::IROp_VSha256U1>();
-  EMIT_SHA_2ARG(PPC64_VSha256U1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
 }
 
 #undef EMIT_SHA_3ARG
@@ -5479,7 +5494,7 @@ DEF_OP(PCLMUL) {
   addi(r4, r1, PostSpill(CryptoSlotA));   // src1
   addi(r5, r1, PostSpill(CryptoSlotB));   // src2
   LoadConstant(r6, Selector);
-  LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64_PCLMUL));
+  EmitLoadPPC64Helper(r(12), PPC64_HELPER_PCLMUL);
   std(r2, PostSpill(24), r1);
   mtctr(r(12)); bctrl();
   ld(r2, PostSpill(24), r1);
