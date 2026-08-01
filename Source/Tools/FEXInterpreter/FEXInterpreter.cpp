@@ -504,12 +504,14 @@ int main(int argc, char** argv, char** const envp) {
   if (!Loader.ELFWasLoaded()) {
     // Loader couldn't load this program for some reason
     fextl::fmt::print(stderr, "Invalid or Unsupported elf file.\n");
-#ifdef ARCHITECTURE_arm64
+#ifndef ARCHITECTURE_x86_64
     fextl::fmt::print(stderr, "This is likely due to a misconfigured x86-64 RootFS\n");
     fextl::fmt::print(stderr, "Current RootFS path set to '{}'\n", LDPath());
     if (LDPath().empty() || FHU::Filesystem::Exists(LDPath()) == false) {
-      fextl::fmt::print(stderr, "RootFS path doesn't exist. This is required on AArch64 hosts\n");
+      fextl::fmt::print(stderr, "RootFS path doesn't exist. This is required on non-x86-64 hosts\n");
+#ifdef ARCHITECTURE_arm64
       fextl::fmt::print(stderr, "Use FEXRootFSFetcher to download a RootFS\n");
+#endif
     }
 #endif
     return -ENOEXEC;
