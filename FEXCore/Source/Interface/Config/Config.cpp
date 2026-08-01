@@ -267,14 +267,21 @@ fextl::string ExpandPath(const fextl::string& ContainerPrefix, const fextl::stri
       return Home;
     }
 
-    // Expand relative path to absolute
+    // Expand relative path to absolute, whether or not the file already
+    // exists. Prior behaviour returned {} for a not-yet-existing relative
+    // path, which left the config value as the raw relative string — so
+    // e.g. FEX_OUTPUTLOG=foo.log would resolve against the *guest's* cwd
+    // at open() time rather than against the launching shell's cwd where
+    // the user typed it. Absolute() writes into ExistsTempPath and doesn't
+    // hit the filesystem beyond a getcwd(), so this stays cheap.
     char ExistsTempPath[PATH_MAX];
     char* RealPath = FHU::Filesystem::Absolute(PathName.c_str(), ExistsTempPath);
-    if (RealPath && FHU::Filesystem::Exists(RealPath)) {
+    if (RealPath) {
       return RealPath;
     }
 
-    // Only return if it exists
+    // Absolute() may fail (e.g. cwd unreadable); fall back to returning the
+    // path as-typed if it happens to exist as-is.
     if (FHU::Filesystem::Exists(PathName)) {
       return PathName;
     }

@@ -127,7 +127,11 @@ void Init() {
       }
     } else if (!LogFile.empty()) {
       constexpr int USER_PERMS = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-      LogFD = open(LogFile.c_str(), O_CREAT | O_CLOEXEC | O_WRONLY, USER_PERMS);
+      // Add O_TRUNC so re-runs don't leave stale trailing bytes when the new
+      // run writes fewer bytes than the previous one. Alternative would be
+      // O_APPEND (accumulate across runs), but the historical shape here is
+      // "one log per run" — matches the stderr/stdout paths above.
+      LogFD = open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS);
     }
 
     if (LogFD == -1) {
