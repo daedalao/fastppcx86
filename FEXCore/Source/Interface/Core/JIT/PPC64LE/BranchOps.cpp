@@ -330,10 +330,21 @@ DEF_OP(Thunk) {
   // Load thunk function address into TMP2; record relocation for cache patching
   InsertNamedThunkRelocation(TMP2, Op->ThunkNameHash);
 
-  // Call: set r12 = callee GEP per ELFv2, then branch via CTR
+  // Call: set r12 = callee GEP per ELFv2, then branch via CTR.
+  //
+  // The thunk callee lives in a *different* DSO (libGL-host.so etc), so it is
+  // entered at its global entry point, overwrites r2 with its own TOC, and
+  // returns with r2 changed. ELFv2 (OpenPOWER 64-bit ELF V2 ABI 2.2.1.1)
+  // makes the *caller* responsible for preserving r2 across a call through a
+  // function pointer. Same idiom as DEF_OP(Syscall) above. r1 has already
+  // been lowered by SpillForABICall -> PushDynamicRegs, and kDynGPRStart ==
+  // kDynLinkArea == 96, so [r1+24] is this frame's own (unused) linkage-area
+  // TOC doubleword.
   mr(r(12), TMP2);
+  std(r2, 24, r1);     // save TOC (ELFv2 linkage area, unchanged offset)
   mtctr(TMP2);
   bctrl();
+  ld(r2, 24, r1);      // restore TOC
 
   FillForABICall();
 }
