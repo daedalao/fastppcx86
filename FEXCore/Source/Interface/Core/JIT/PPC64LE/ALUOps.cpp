@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // PPC64LE ALU operations for FEX JIT backend.
 #include "Interface/Context/Context.h"
+#include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
 namespace FEXCore::CPU {
@@ -3400,7 +3401,15 @@ DEF_OP(ValidateCode) {
   LoadConstant(Dst, UINT64_C(1));
   Bind(&End);
 }
-DEF_OP(GuestOpcode)          { /* nop — debug annotation */ }
+DEF_OP(GuestOpcode) {
+  // Record (guest RIP offset, host PC offset from BlockBegin) so the
+  // block-tail vl64pair table lets Core.cpp:RestoreRIPFromHostPC map a
+  // fault-time host PC back to the exact guest instruction. Mirrors
+  // Arm64JITCore's DEF_OP(GuestOpcode) at FEXCore/Source/Interface/Core/JIT/MiscOps.cpp:45.
+  auto Op = IROp->C<IR::IROp_GuestOpcode>();
+  DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset,
+                                     GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
+}
 
 // ThreadRemoveCodeEntry — invoked from the SMC validation tail emitted in
 // front of each instruction when CONFIG_SMC_FULL is in effect. When ValidateCode

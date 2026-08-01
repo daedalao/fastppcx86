@@ -9,10 +9,12 @@ $end_info$
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/Interpreter/InterpreterOps.h"
+#include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Core/JIT/Relocations.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Utils/MemberFunctionToPointer.h"
+#include "Utils/variable_length_integer.h"
 
 #include <FEXCore/Utils/SignalScopeGuards.h>
 
@@ -2187,6 +2189,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // flag pack/unpack is the heaviest); 128 gives margin without walking the IR
   // twice. GetSSACount() bounds the IR-op count. Keep 1 MiB as a floor.
   //
+  // The additional 16 bytes/IR-op covers the worst-case vl64pair RIP entry
+  // (sizeof(vl64_enc)) that P3.1's post-tail table can emit for each
+  // GuestOpcode marker in the stream. Only a subset of SSA nodes actually
+  // become GuestOpcode markers (frontend only emits them for ops with
+  // CanHaveSideEffects, per Core.cpp:654-656), so this is a loose upper
+  // bound. Adding one JITCodeTail explicitly guards the tail struct too.
+  //
   // When the buffer is too full, drop the lock and call ClearCache().
   // ClearCache acquires its own LookupCache write lock and allocates a
   // fresh, larger CodeBuffer via GetEmptyCodeBuffer/StartLargerCodeBuffer,
@@ -2195,7 +2204,10 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // Loop, because one rotation only grows the buffer geometrically and a very
   // large block may need several before it fits.
   constexpr size_t kMaxHostBytesPerIROp = 128;
-  const size_t BlockHeadroom = std::max<size_t>(1u << 20, IRView->GetSSACount() * kMaxHostBytesPerIROp);
+  constexpr size_t kMaxRIPEntryBytesPerIROp = 16;
+  const size_t BlockHeadroom = std::max<size_t>(
+    1u << 20,
+    IRView->GetSSACount() * (kMaxHostBytesPerIROp + kMaxRIPEntryBytesPerIROp) + sizeof(CPUBackend::JITCodeTail));
 
   while (CodeBuffers.LatestOffset + BlockHeadroom > CurrentCodeBuffer->UsableSize()) {
     const size_t PrevUsable = CurrentCodeBuffer->UsableSize();
@@ -2390,6 +2402,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+      // Seed the RIP-entry table with this entry-point's guest offset. Mirrors
+      // Arm64JITCore's push_back at JIT/JIT.cpp:939 — HostPCOffset here points
+      // at the entry-point prologue's first byte, which is what a signal fault
+      // in the prologue should map back to (block-entry guest RIP).
+      DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset,
+                                         GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
       // Warm-path store: dispatcher L1 hits land here, skipping FillStaticRegs
       // above. Re-emit so InlineJITBlockHeader is refreshed on every entry.
       EmitStoreBlockBeginToInlineHeader(HeaderLabel);
@@ -2457,17 +2475,51 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   CodeBuffers.LatestOffset += CodeSize;
 
-  // Write code tail
+  // Write code tail. Layout produced here:
+  //   [BlockBegin ..]                    header, code (Align16B'd), CodeSize bytes
+  //   [BlockBegin + CodeSize]            JITCodeTail (40 bytes; 4-byte aligned)
+  //   [BlockBegin + CodeSize + sizeof]   vl64pair entries (variable length, 1/2/9/17 bytes each)
+  //   [BlockBegin + CodeSize + sizeof + entries -> align to 16]
+  //
+  // Tail and entries are written via direct pointer arithmetic; the
+  // emitter's cursor is not advanced (we finalise the compile here and
+  // never GetCursorAddress again). CodeBuffers.LatestOffset is bumped for
+  // both regions PLUS a 16-byte alignment pad — vl64pair records are 1/2/9/17
+  // bytes each, so their sum is not instruction-aligned; the next compile's
+  // SetBuffer must land on a 16-byte boundary or its Emit32 writes are
+  // misaligned and every emitted instruction reads back as garbage.
   auto* Tail = reinterpret_cast<CPUBackend::JITCodeTail*>(
     GetCursorAddress<uint8_t*>());
-  Tail->Size      = CodeSize;
   Tail->RIP       = Entry;
   Tail->GuestSize = GuestSize;
-  Tail->NumberOfRIPEntries = 0;
-  Tail->OffsetToRIPEntries = 0;
+  Tail->NumberOfRIPEntries = static_cast<uint32_t>(DebugData->GuestOpcodes.size());
+  Tail->OffsetToRIPEntries = sizeof(CPUBackend::JITCodeTail);
   Tail->SpinLockFutex      = 0;
   Tail->SingleInst         = SingleInst;
-  CodeBuffers.LatestOffset += sizeof(CPUBackend::JITCodeTail);
+
+  auto* EntryLoc = reinterpret_cast<uint8_t*>(Tail) + sizeof(CPUBackend::JITCodeTail);
+  auto* EntryBase = EntryLoc;
+  uintptr_t PrevPCOffset  = 0;
+  uintptr_t PrevRIPOffset = 0;
+  for (const auto& GuestOpcode : DebugData->GuestOpcodes) {
+    LOGMAN_THROW_A_FMT(static_cast<uintptr_t>(GuestOpcode.HostEntryOffset) >= PrevPCOffset,
+                       "GuestOpcodes must be in ascending host order for vl64pair delta walk");
+    const uint64_t HostDelta  = static_cast<uintptr_t>(GuestOpcode.HostEntryOffset) - PrevPCOffset;
+    const uint64_t GuestDelta = static_cast<uintptr_t>(GuestOpcode.GuestEntryOffset) - PrevRIPOffset;
+    EntryLoc += FEXCore::Utils::vl64pair::Encode(EntryLoc, HostDelta, GuestDelta);
+    PrevPCOffset  = static_cast<uintptr_t>(GuestOpcode.HostEntryOffset);
+    PrevRIPOffset = static_cast<uintptr_t>(GuestOpcode.GuestEntryOffset);
+  }
+  const size_t EntriesSize = static_cast<size_t>(EntryLoc - EntryBase);
+  const size_t TailAndEntries = sizeof(CPUBackend::JITCodeTail) + EntriesSize;
+  // Round up to 16 bytes so the next block starts on a 16-byte boundary,
+  // matching Align16B() at the end of the code region above.
+  const size_t TailAndEntriesAligned = (TailAndEntries + 15) & ~size_t{15};
+
+  // Total block span from BlockBegin including tail + entries + padding. The
+  // range check in Core.cpp:RestoreRIPFromHostPC uses this to gate the walk.
+  Tail->Size = CodeSize + TailAndEntriesAligned;
+  CodeBuffers.LatestOffset += TailAndEntriesAligned;
 
   // Backpatch the JITCodeHeader reserved at BlockBegin. The tail was just
   // written at BlockBegin + CodeSize (Align16B has already run, so CodeSize
