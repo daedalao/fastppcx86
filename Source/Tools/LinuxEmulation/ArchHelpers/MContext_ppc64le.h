@@ -181,10 +181,26 @@ static inline void SetArmReg(void* ucontext, uint32_t id, uint64_t val) {
 }
 
 static inline uint64_t GetArmPState(void* ucontext) {
-  // CCR (condition register) contains the FEX NZCV-equivalent in bits [31:28]:
-  // StoreNZCV places N(SF)→bit31, Z(ZF)→bit30, C(~CF)→bit29, V(OF)→bit28,
-  // matching the ARM64 PSTATE bit positions that ReconstructCompactedEFLAGS expects.
-  return GetMContext(ucontext)->gp_regs[PPC_PT_CCR];
+  // Assemble the packed ARM-PSTATE word ReconstructCompactedEFLAGS expects.
+  // ppc64le maps guest NZCV across TWO host regs at JIT emission time (see
+  // FEXCore/Source/Interface/Core/ArchHelpers/PPC64Emitter.cpp:152-160 for the
+  // pack, :225-236 for the unpack): CR0 carries N/Z, XER carries C/V. The
+  // prior implementation returned raw CCR — that gave the right N by
+  // coincidence (CR0.LT@31 aliases N@31) but delivered CR0.GT as Z, CR0.EQ as
+  // ~C and CR0.SO as V, corrupting ZF/CF/OF on every in-JIT signal. Every
+  // guest signal, SMC single-step redirect and drained async signal (which
+  // ppc64le drains inside the code buffer via the fault-page poke, so
+  // WasInJIT is true there) went through this path.
+  //
+  //   Packed ARM-PSTATE word:  N @ bit31, Z @ bit30, C @ bit29, V @ bit28
+  //   From CCR (raw CR): LT@bit31, GT@bit30, EQ@bit29, SO@bit28
+  //   From XER:          SO@bit31, OV@bit30, CA@bit29
+  const uint64_t ccr = GetMContext(ucontext)->gp_regs[PPC_PT_CCR];
+  const uint64_t xer = GetMContext(ucontext)->gp_regs[PPC_PT_XER];
+  return  (ccr & (1ULL << 31))          // N ← CR0.LT
+        | ((ccr & (1ULL << 29)) << 1)   // Z ← CR0.EQ, shift into bit 30
+        | ( xer & (1ULL << 29))          // C ← XER.CA
+        | ((xer & (1ULL << 30)) >> 2);  // V ← XER.OV, shift into bit 28
 }
 
 static inline uint64_t* GetArmGPRs(void* ucontext) {
