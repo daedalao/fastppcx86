@@ -518,8 +518,20 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       MappedCacheFile += std::span {BlockPtr.second.CodePages}.size_bytes();
     }
 
-    // Constrain BlockList to the given ExecutableFileSectionInfo
-    LOGMAN_THROW_A_FMT(ranges::is_sorted(BlockList, [](auto& a, auto& b) { return a.first < b.first; }), "Expected sorted block list");
+    // Constrain BlockList to the given ExecutableFileSectionInfo.
+    //
+    // The lower_bound/upper_bound pair below only selects the right subset if
+    // the table is sorted by guest address. SaveData sorts it, so a cache this
+    // build wrote always is — but this used to be LOGMAN_THROW_A_FMT, which
+    // compiles to `(void)(pred)` in Release, so in a release build the ordering
+    // was simply assumed of a file nothing had validated. An unsorted table is
+    // not memory-unsafe (both bounds stay inside the vector), it silently loads
+    // an arbitrary wrong subset of blocks, which is the harder failure to
+    // notice. Same class as every other unvalidated field here: reject it.
+    if (!ranges::is_sorted(BlockList, std::less {}, &BlockListEntry::first)) {
+      LogMan::Msg::EFmt("Rejecting code cache for {}: block table is not sorted by guest address", BinarySection.FileInfo.Filename);
+      return false;
+    }
     auto begin = ranges::lower_bound(BlockList, BinarySection.BeginVA - BinarySection.FileStartVA, std::less {}, &BlockListEntry::first);
     auto end =
       ranges::upper_bound(begin, BlockList.end(), BinarySection.EndVA - BinarySection.FileStartVA - 1, std::less {}, &BlockListEntry::first);
