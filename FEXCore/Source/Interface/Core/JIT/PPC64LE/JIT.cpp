@@ -2540,6 +2540,17 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // misaligned and every emitted instruction reads back as garbage.
   auto* Tail = reinterpret_cast<CPUBackend::JITCodeTail*>(
     GetCursorAddress<uint8_t*>());
+  // Zero the whole struct before assigning fields. This is a raw cast over
+  // whatever the code buffer previously held, not a fresh aggregate, and
+  // JITCodeTail carries a `uint8_t _Pad[3]` that no assignment below touches.
+  // Leaving it as stale buffer bytes makes CodeCache::Validate compare
+  // nondeterministic data: the validation context reuses a single code buffer
+  // across Validate calls (its reset clears the offset, not the memory) while
+  // the cache side is always a fresh zero-filled mapping, so from the second
+  // call onward the reference side carries garbage where the cache has zeros.
+  // ARM64 gets this for free — it builds the tail as a designated-initialiser
+  // aggregate, which value-initialises _Pad.
+  ::memset(Tail, 0, sizeof(*Tail));
   Tail->RIP       = Entry;
   Tail->GuestSize = GuestSize;
   Tail->NumberOfRIPEntries = static_cast<uint32_t>(DebugData->GuestOpcodes.size());
@@ -2589,6 +2600,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // Round up to 16 bytes so the next block starts on a 16-byte boundary,
   // matching Align16B() at the end of the code region above.
   const size_t TailAndEntriesAligned = (TailAndEntries + 15) & ~size_t{15};
+  // Zero the 0-15 byte alignment pad. Nothing else writes it, yet
+  // LatestOffset advances past it below, so it is part of the block's byte
+  // range as far as CodeCache::Validate is concerned. Same reasoning as the
+  // struct memset above; ARM64's Align() memsets its equivalent gap.
+  ::memset(reinterpret_cast<uint8_t*>(Tail) + TailAndEntries, 0,
+           TailAndEntriesAligned - TailAndEntries);
 
   // Total block span from BlockBegin including tail + entries + padding. The
   // range check in Core.cpp:RestoreRIPFromHostPC uses this to gate the walk.
