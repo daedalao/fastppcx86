@@ -35,6 +35,7 @@
 
 #include <FEXCore/Utils/ArchHelpers/PPC64.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Telemetry.h>
 
 #include <array>
 #include <atomic>
@@ -86,6 +87,11 @@ inline uint64_t SizeMask(uint32_t size) {
 } // namespace
 
 extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* value, uint64_t* result, uint32_t size) {
+  // Counts every entry into the misaligned locked-operation path. The slot is
+  // shared with ARM64 (Arm64.cpp) and is dumped at process shutdown as
+  // "64byte Split Locks" (Telemetry.cpp:21). Telemetry is on by default.
+  FEXCORE_TELEMETRY_INC(TYPE_HAS_SPLIT_LOCKS);
+
   if (addr == nullptr || result == nullptr) {
     LogMan::Msg::EFmt("PPC64_SplitLockEmulate: null addr/result");
     return;

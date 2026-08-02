@@ -59,7 +59,13 @@ FEX_DEFAULT_VISIBILITY void Shutdown(const fextl::string& ApplicationName);
     auto& Name = FEXCore::Telemetry::TelemetryValues[FEXCore::Telemetry::Type]; \
     Name |= Value;                                                              \
   } while (0)
-#define FEXCORE_TELEMETRY_INC(Type, Value)                                      \
+// Takes only the type -- an increment has no operand. This previously
+// declared a second `Value` parameter that the body ignored, which did not
+// match the FEX_DISABLE_TELEMETRY definition below and so made the macro
+// uncallable: the one-argument form failed to compile with telemetry on, the
+// two-argument form failed with it off. It had no callers, so nothing had
+// forced the contradiction to the surface.
+#define FEXCORE_TELEMETRY_INC(Type)                                             \
   do {                                                                          \
     auto& Name = FEXCore::Telemetry::TelemetryValues[FEXCore::Telemetry::Type]; \
     Name++;                                                                     \
