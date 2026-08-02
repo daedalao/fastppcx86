@@ -192,6 +192,12 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
   // two disagree.  state_rip= is the raw Frame->State.rip and must ALWAYS be
   // read as "possibly stale" -- it is the value guest_rip= would have silently
   // degraded to on the fallback path.
+  //
+  // InJITCode is hoisted out of the block below because the GUEST GPR dump
+  // (second trace line, PPC64LE only) is gated on the exact same condition:
+  // the static register allocation only holds guest state while host execution
+  // is inside a JIT code buffer.
+  [[maybe_unused]] bool InJITCode = false;
 #if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_ppc64le)
   {
     // Re-entrancy guard.  Everything below dereferences JIT-owned memory
@@ -218,6 +224,7 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
         StateRIP = Thread->CurrentFrame->State.rip;
         HaveStateRIP = true;
         if (Thread->CTX->IsAddressInCodeBuffer(Thread, HostPC)) {
+          InJITCode = true;
           GuestRIP = Thread->CTX->RestoreRIPFromHostPC(Thread, HostPC);
           HaveGuestRIP = true;
           BlockRIP = Thread->CTX->GetGuestBlockEntry(Thread);
@@ -246,6 +253,115 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
 #endif
   buf[len++] = '\n';
   ::write(trace_fd, buf, len);
+
+#ifdef ARCHITECTURE_ppc64le
+  // ---------------------------------------------------------------------
+  // Second trace line: the GUEST general-purpose register file.
+  //
+  // A second line rather than more fields on the first: 16 labelled 64-bit
+  // hex fields is ~380 bytes on its own, and buf[512] above already carries
+  // ~300 bytes worst case.  Separate buffer, separate write(), so neither
+  // line can be truncated by the other.
+  //
+  // Emitted ONLY when the fault was taken inside a JIT code buffer.  The
+  // guest register file lives in host registers under FEX's static register
+  // allocation (SRA) while JIT code is executing; anywhere else those host
+  // registers hold whatever FEXCore's own C++ left in them, and printing
+  // that would look exactly like a plausible guest state.  Same
+  // IsAddressInCodeBuffer() gate as guest_rip= above.  When the gate fails
+  // an explicit marker is printed so "no register line" is never confused
+  // with "this build does not have the patch".
+  //
+  // MAPPING SOURCE (duplicated by necessity, see below):
+  //   FEXCore/Source/Interface/Core/ArchHelpers/PPC64Emitter.h
+  //     x64::SRA -- std::array<GPR, 18>  (16 guest GPRs, then PF, AF)
+  //     x32::SRA -- std::array<GPR, 10>  ( 8 guest GPRs, then PF, AF)
+  //   Both arrays are indexed by the FEXCore::X86State::X86Reg enum
+  //   (FEXCore/include/FEXCore/Core/X86Enums.h: RAX=0, RCX=1, RDX=2, RBX=3,
+  //   RSP=4, RBP=5, RSI=6, RDI=7, R8..R15=8..15), because SRA[i] is the host
+  //   register dedicated to CpuStateFrame::State.gregs[i] -- see
+  //   PPC64EmitterBase::SpillStaticRegs/FillStaticRegs in PPC64Emitter.cpp.
+  //
+  //   *** The prose comment sitting above x64::SRA in that header claims the
+  //   order is "RAX, RDX, RCX, ..." -- that comment is WRONG, RCX and RDX are
+  //   transposed in it.  Index by the enum, not by that comment. ***
+  //
+  //   Resulting guest -> host GPR mapping (note host r13 is skipped; it is
+  //   the ELFv2 thread pointer and is not in any FEX pool):
+  //     rax->r7  rcx->r8  rdx->r9  rbx->r10 rsp->r11 rbp->r12 rsi->r14 rdi->r15
+  //     r8 ->r16 r9 ->r17 r10->r18 r11->r19 r12->r20 r13->r21 r14->r22 r15->r23
+  //   Corroborated by the existing host r11= field on the first line, whose
+  //   observed value (0x3ffffffab78) is a plausible guest stack pointer.
+  //
+  // WHY DUPLICATED RATHER THAN DERIVED: PPC64Emitter.h is under
+  // FEXCore/Source/, and it pulls in <PPC64LE/Emitter.h> / <PPC64LE/Registers.h>
+  // from the external emitter.  Neither is on LinuxEmulation's include path
+  // (target_include_directories in Source/Tools/LinuxEmulation/CMakeLists.txt
+  // lists only ${CMAKE_BINARY_DIR}/generated, this directory, and the drm
+  // headers), so x64::SRA / x32::SRA are unreachable from this TU.  If those
+  // arrays ever change, this table must change with them.
+  //
+  // Names are printed with a leading '%' (%rax=, %r11=) to make it
+  // unmistakable that these are GUEST x86 registers and not the HOST PPC64
+  // registers printed on the first line -- which also carries an r11=.
+  {
+    struct GuestGPRMap {
+      const char* Name;
+      uint8_t HostGPR;
+    };
+    static constexpr GuestGPRMap Map64[] = {
+      {" %rax=", 7},  {" %rcx=", 8},  {" %rdx=", 9},  {" %rbx=", 10},
+      {" %rsp=", 11}, {" %rbp=", 12}, {" %rsi=", 14}, {" %rdi=", 15},
+      {" %r8=", 16},  {" %r9=", 17},  {" %r10=", 18}, {" %r11=", 19},
+      {" %r12=", 20}, {" %r13=", 21}, {" %r14=", 22}, {" %r15=", 23},
+    };
+    // x32::SRA's first 8 entries are the same host registers as x64::SRA's.
+    static constexpr GuestGPRMap Map32[] = {
+      {" %eax=", 7},  {" %ecx=", 8},  {" %edx=", 9},  {" %ebx=", 10},
+      {" %esp=", 11}, {" %ebp=", 12}, {" %esi=", 14}, {" %edi=", 15},
+    };
+
+    // 16 fields * (6 label + 18 hex) = 384, plus a ~40 byte prefix. 512 is
+    // enough; 640 leaves the same kind of headroom buf[512] has above.
+    char gbuf[640];
+    int glen = 0;
+    auto put = [&](const char* s) {
+      for (const char* p = s; *p; p++) {
+        gbuf[glen++] = *p;
+      }
+    };
+    put("FEX-SIG-GUEST tid=");
+    glen += write_hex(gbuf + glen, (uint64_t)::syscall(SYS_gettid));
+
+    // Guest bitness. _SyscallHandler is a process-global set during startup;
+    // Is64BitMode() is a cached config read (plain member load, no lock, no
+    // allocation), so it is safe here. If it is somehow null we must not
+    // guess -- printing x64 names for a 32-bit guest is exactly the kind of
+    // mislabelling this line exists to prevent.
+    if (!InJITCode) {
+      put(" <not-in-jit-code:sra-does-not-hold-guest-state>");
+    } else if (FEX::HLE::_SyscallHandler == nullptr) {
+      put(" <unknown-guest-bitness>");
+    } else {
+      const bool Is64Bit = FEX::HLE::_SyscallHandler->Is64BitMode();
+      const GuestGPRMap* Map = Is64Bit ? Map64 : Map32;
+      const size_t Count = Is64Bit ? 16u : 8u;
+      for (size_t i = 0; i < Count; ++i) {
+        put(Map[i].Name);
+        uint64_t Value = (uint64_t)_context->uc_mcontext.regs->gpr[Map[i].HostGPR];
+        if (!Is64Bit) {
+          // Only the low 32 bits are architecturally defined for an i686
+          // guest; FillStaticRegs zero-extends on entry but in-block results
+          // can leave junk in the upper half. Mask so it reads as x86 state.
+          Value &= 0xFFFF'FFFFULL;
+        }
+        glen += write_hex(gbuf + glen, Value);
+      }
+    }
+    gbuf[glen++] = '\n';
+    ::write(trace_fd, gbuf, glen);
+  }
+#endif
 }
 
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
