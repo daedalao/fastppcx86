@@ -83,6 +83,13 @@ enum PPC64HelperIndex : uint32_t {
   PPC64_HELPER_CRC32,
   PPC64_HELPER_VPCMPESTRX,
   PPC64_HELPER_VPCMPISTRX,
+  // S3.7-C5: appended AFTER existing entries so table offsets don't shift
+  // (any code cached against the old table layout would misresolve helpers
+  // if this reordered). MUST NOT reuse Pointers.F64F2XM1Handler — see the
+  // note above about D9_F0_02_F64 divergence. Distinct implementation
+  // (F64F2XM1Impl in VectorOps.cpp) with different semantics from
+  // F64F2XM1Handler; the helper table entry points at the local impl.
+  PPC64_HELPER_F64F2XM1,
   PPC64_HELPER_MAX,
 };
 

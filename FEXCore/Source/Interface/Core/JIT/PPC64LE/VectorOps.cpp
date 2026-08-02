@@ -5073,7 +5073,14 @@ DEF_OP(F64F2XM1) {
 
   SpillForABICall(TMP1);
   MARSHAL_VR_TO_F1(Src);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(F64F2XM1Impl));
+  // S3.7-C5: route via the PPC64_HelperTable so the F64F2XM1Impl pointer
+  // isn't baked into JIT code — under ASLR the impl address differs per
+  // process, and no relocation can rewrite a bare LoadConstant. Any
+  // cached block that reached this path would `bctrl` into a stale
+  // address. Uses the local F64F2XM1Impl (in the helper table array
+  // below), NOT Pointers.F64F2XM1Handler — the two have divergent
+  // semantics; see the note above PPC64_HELPER_F64F2XM1 in JITClass.h.
+  EmitLoadPPC64Helper(TMP1, ::FEXCore::CPU::PPC64_HELPER_F64F2XM1);
   mr(r(12), TMP1);
   mtctr(TMP1);
   bctrl();
@@ -5180,6 +5187,7 @@ static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
   [::FEXCore::CPU::PPC64_HELPER_CRC32]            = reinterpret_cast<uint64_t>(&PPC64_CRC32),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
+  [::FEXCore::CPU::PPC64_HELPER_F64F2XM1]         = reinterpret_cast<uint64_t>(F64F2XM1Impl),
 };
 } // namespace
 
