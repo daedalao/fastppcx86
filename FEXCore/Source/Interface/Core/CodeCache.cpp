@@ -482,7 +482,100 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   // call correctly; mirror its shape.
   if (!ApplyCodeRelocations(BinarySection.FileStartVA, CodeBufferRange, Relocations, false)) {
     LogMan::Msg::EFmt("Failed to apply code cache relocations for {} — rejecting cache", BinarySection.FileInfo.Filename);
+    // B1: give the bytes back. CTX.LatestOffset was advanced by
+    // header.CodeBufferSize just above, and nothing consumes the region we are
+    // now abandoning, so leaving the offset advanced permanently burns that much
+    // of the code buffer on every rejected cache.
+    CTX.LatestOffset -= header.CodeBufferSize;
     return false;
+  }
+
+  // B1: structural check of the guest -> host block mapping, before anything is
+  // registered as an executable entry point. Deliberately NOT gated on
+  // EnableCodeCacheValidation: this is a correctness gate on data that is about
+  // to be jumped into, not a debugging aid, so it runs on every load.
+  //
+  // For each entry, walk BlockBegin -> JITCodeHeader::OffsetToBlockTail ->
+  // JITCodeTail and require that the guest address the entry claims lies inside
+  // the guest range the tail records, and that the entry's host code lies inside
+  // the host block the tail sizes.
+  //
+  // This is a RANGE test, not an equality test: one BlockBegin and one tail
+  // serve every entry point of a multiblock compile, while Tail->RIP names only
+  // the primary entry.
+  //
+  // Portability: ARM64 has emitted the tail-RIP relocation since this cache
+  // format existed, so the check is immediately valid there. The ppc64le
+  // relocation work was catch-up, not a portability gate — this is not a
+  // ppc64le-specific check.
+  {
+    const uint64_t BufSize = CodeBufferRange.size_bytes();
+    constexpr uint64_t HeaderSize = sizeof(CPU::CPUBackend::JITCodeHeader);
+    constexpr uint64_t TailSize = sizeof(CPU::CPUBackend::JITCodeTail);
+    bool Rejected = false;
+
+    // Every bounds test below is written as `X > Limit - sizeof(...)` rather
+    // than `X + sizeof(...) > Limit`. These are file-controlled uint64_t values
+    // and this check is precisely the mitigation for that, so it must not itself
+    // be wrappable.
+    for (const auto& [Guest, Host] : BlockList) {
+      if (BufSize < HeaderSize || Host.BlockBegin > BufSize - HeaderSize) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} has out-of-range BlockBegin {:#x} (code buffer is {:#x} bytes)",
+                          BinarySection.FileInfo.Filename, Guest, Host.BlockBegin, BufSize);
+        Rejected = true;
+        break;
+      }
+
+      const auto* Header = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(CodeBufferRange.data() + Host.BlockBegin);
+      // BlockBegin is bounded by BufSize (<= 4 GiB, CodeBufferSize is uint32_t)
+      // and OffsetToBlockTail is uint32_t, so this sum cannot wrap.
+      const uint64_t TailOffset = Host.BlockBegin + Header->OffsetToBlockTail;
+      if (BufSize < TailSize || TailOffset > BufSize - TailSize) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} at {:#x} has out-of-range tail offset {:#x} (code buffer is {:#x} bytes)",
+                          BinarySection.FileInfo.Filename, Guest, Host.BlockBegin, TailOffset, BufSize);
+        Rejected = true;
+        break;
+      }
+
+      const auto* Tail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(CodeBufferRange.data() + TailOffset);
+
+      // MANDATORY skip, not a rejection. A block whose *entry* instruction fails
+      // to decode gets InstSize = 0, hence DecodedMax == DecodedMin, hence
+      // GuestSize == 0. It survives block erasure because it is the entry block,
+      // and it is still cacheable because the cacheability filter only looks for
+      // bad relocations. Its own guest address can never satisfy
+      // `RIP <= addr < RIP + 0`, so range-checking it would reject the entire
+      // file — on the main load path, on ARM64 as well. It is reachable in
+      // practice because the offline compiler re-maps the ELF statically, so an
+      // address that decoded at runtime can fail to decode offline.
+      if (Tail->GuestSize == 0) {
+        continue;
+      }
+
+      const uint64_t GuestAbs = Guest + BinarySection.FileStartVA;
+      if (GuestAbs < Tail->RIP || GuestAbs - Tail->RIP >= Tail->GuestSize) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block entry {:#x} is outside the guest range [{:#x}, {:#x}) recorded by the block it "
+                          "maps to",
+                          BinarySection.FileInfo.Filename, GuestAbs, Tail->RIP, Tail->RIP + Tail->GuestSize);
+        Rejected = true;
+        break;
+      }
+
+      if (Host.HostCode < Host.BlockBegin || Host.HostCode - Host.BlockBegin >= Tail->Size) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block entry {:#x} has host code {:#x} outside its block [{:#x}, {:#x})",
+                          BinarySection.FileInfo.Filename, GuestAbs, Host.HostCode, Host.BlockBegin, Host.BlockBegin + Tail->Size);
+        Rejected = true;
+        break;
+      }
+    }
+
+    if (Rejected) {
+      // See the rewind above: the file has already been memcpy'd into the code
+      // buffer and CTX.LatestOffset advanced past it. Nothing else will use that
+      // region, so hand it back rather than leaking it on every rejection.
+      CTX.LatestOffset -= header.CodeBufferSize;
+      return false;
+    }
   }
 
   {
