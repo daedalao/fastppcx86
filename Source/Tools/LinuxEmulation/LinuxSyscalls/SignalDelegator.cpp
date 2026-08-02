@@ -133,7 +133,9 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
   }
   if (trace_fd < 0) return;
   // Build line manually (no fprintf -- not async-signal-safe).
-  char buf[256];
+  // Worst case with every field present is ~300 bytes (11 hex fields at up to
+  // 18 chars each plus labels); 512 leaves headroom.
+  char buf[512];
   auto write_hex = [](char* dst, uint64_t v) -> int {
     int n = 0;
     char tmp[18];
@@ -166,6 +168,81 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
   // Also r11 (guest RSP per FEX SRA mapping on PPC64LE).
   const char* r11 = " r11="; for (const char* p = r11; *p; p++) buf[len++] = *p;
   len += write_hex(buf + len, (uint64_t)_context->uc_mcontext.regs->gpr[11]);
+#endif
+  // Reconstructed GUEST RIP.  `nip=` above is the HOST program counter -- on a
+  // fault taken inside JIT code it points into a code buffer that was mmap'd
+  // after DumpMapsOnce() ran, so it resolves against nothing in
+  // /tmp/fex_maps.log and it is NOT the guest instruction that faulted.  That
+  // trap is documented in docs/POWER9_PORT_PLAN.md.  RestoreRIPFromHostPC()
+  // maps the host PC back to the guest RIP via the block's inline RIP table.
+  //
+  // IMPORTANT: RestoreRIPFromHostPC() has no failure return.  When the host PC
+  // is not inside the current JIT block it silently returns Frame->State.rip
+  // (FEXCore/Source/Interface/Core/Core.cpp), which is a stale block-boundary
+  // value, not the fault site -- and printing that unqualified would be
+  // actively misleading here, since a stale zero would read as a null guest
+  // RIP in exactly the null-deref bug being chased.  So the call is gated on
+  // IsAddressInCodeBuffer(), the same guard SyscallHandler::
+  // DetectMonoBackpatcherBlock (SyscallsSMCTracking.cpp) puts in front of this
+  // exact call, and the field is printed as <none> when the guard fails.
+  //
+  // blk_rip= is the guest RIP of the current block's ENTRY (GetGuestBlockEntry,
+  // read straight out of the JITCodeTail).  Coarser than guest_rip=, but it
+  // does not depend on the per-instruction vl64pair table, so trust it if the
+  // two disagree.  state_rip= is the raw Frame->State.rip and must ALWAYS be
+  // read as "possibly stale" -- it is the value guest_rip= would have silently
+  // degraded to on the fallback path.
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_ppc64le)
+  {
+    // Re-entrancy guard.  Everything below dereferences JIT-owned memory
+    // reached through CpuStateFrame::State.InlineJITBlockHeader.  If that
+    // pointer is stale the deref faults *inside* this handler, re-enters
+    // SignalHandlerThunk, and loops until the alt stack overflows -- which
+    // would destroy the very trace we came here for.  A nested entry skips
+    // reconstruction and prints <none>.
+    static volatile sig_atomic_t InReconstruct = 0;
+    uint64_t GuestRIP = 0, BlockRIP = 0, StateRIP = 0;
+    bool HaveGuestRIP = false, HaveBlockRIP = false, HaveStateRIP = false;
+
+    auto* ThreadObject = GetThreadFromAltStack(_context->uc_stack);
+    if (ThreadObject && !InReconstruct) {
+      // Same zombie-ThreadStateObject guard SignalHandlerThunk applies below:
+      // after ThreadManager::DestroyThread zeroes ThreadInfo.TID the object is
+      // a leaked slab and ->Thread must not be dereferenced.
+      const uint32_t TraceHostTid = FHU::Syscalls::gettid();
+      const uint32_t ObjTid = ThreadObject->ThreadInfo.TID.load(std::memory_order_relaxed);
+      auto* Thread = ThreadObject->Thread;
+      if (Thread && ObjTid != 0 && ObjTid == TraceHostTid) {
+        InReconstruct = 1;
+        const uint64_t HostPC = ArchHelpers::Context::GetPc(_context);
+        StateRIP = Thread->CurrentFrame->State.rip;
+        HaveStateRIP = true;
+        if (Thread->CTX->IsAddressInCodeBuffer(Thread, HostPC)) {
+          GuestRIP = Thread->CTX->RestoreRIPFromHostPC(Thread, HostPC);
+          HaveGuestRIP = true;
+          BlockRIP = Thread->CTX->GetGuestBlockEntry(Thread);
+          HaveBlockRIP = BlockRIP != 0;
+        }
+        InReconstruct = 0;
+      }
+    }
+
+    auto write_field = [&](const char* Name, bool Have, uint64_t Value) {
+      for (const char* p = Name; *p; p++) {
+        buf[len++] = *p;
+      }
+      if (Have) {
+        len += write_hex(buf + len, Value);
+      } else {
+        for (const char* p = "<none>"; *p; p++) {
+          buf[len++] = *p;
+        }
+      }
+    };
+    write_field(" guest_rip=", HaveGuestRIP, GuestRIP);
+    write_field(" blk_rip=", HaveBlockRIP, BlockRIP);
+    write_field(" state_rip=", HaveStateRIP, StateRIP);
+  }
 #endif
   buf[len++] = '\n';
   ::write(trace_fd, buf, len);
