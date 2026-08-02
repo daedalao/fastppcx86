@@ -554,9 +554,12 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
   // Patch FEX-internal function addresses with values from the main Context to ensure the code blocks are comparable
   auto NewRelocations = ValidationThread->CPUBackend->TakeRelocations(Section.FileStartVA);
-  NewRelocations.erase(std::remove_if(NewRelocations.begin(), NewRelocations.end(), [](const CPU::Relocation& Reloc) {
-    return Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL && Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
-  }));
+  NewRelocations.erase(std::remove_if(NewRelocations.begin(), NewRelocations.end(),
+                                      [](const CPU::Relocation& Reloc) {
+                                        return Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL &&
+                                               Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
+                                      }),
+                       NewRelocations.end());
   (void)ApplyCodeRelocations(Section.FileStartVA, CodeBufferRangeRef, NewRelocations, false);
 
   if (ValidationCTX->LatestOffset <= CodeBufferRangeRef.size()) {
