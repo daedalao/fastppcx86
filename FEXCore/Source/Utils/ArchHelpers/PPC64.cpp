@@ -23,15 +23,17 @@
 //
 // This file builds the infrastructure half of that approach:
 //
-//   - PPC64_SplitLockEmulate(): a process-wide mutex-serialized RMW.
+//   - PPC64_SplitLockEmulate(): a process-wide striped-mutex-serialised RMW,
+//     wired in from `JIT/PPC64LE/AtomicOps.cpp` on every misaligned Fetch* /
+//     Swap / CAS path (Phase 3), and on misaligned `CMPXCHG8B` since
+//     `001b9afde` (Tier D atomics C2).
 //   - HandleUnalignedAtomicSIGBUS(): SIGBUS instruction decoder that
-//     recognizes a reservation-load opcode (primary=31, XO in
-//     {52, 116, 20, 84}) and increments telemetry.
-//
-// Plug-in (calling PPC64_SplitLockEmulate from the misaligned fallback in
-// AtomicOps.cpp) is intentionally deferred: it changes hot-path codegen
-// and must not be done while another agent is concurrently fixing failing
-// atomic tests in the same file.
+//     recognises a reservation-load opcode (primary=31, XO in
+//     {52, 116, 20, 84}) and increments telemetry. Currently has NO in-tree
+//     call site — the container loads are aligned by construction so the
+//     signal path is not hit. Kept for the eventual container-in-helper
+//     (Tier D atomics C3/C4) work; that fix must revisit its fixed
+//     `Advance = 12/16` before wiring it up.
 
 #include <FEXCore/Utils/ArchHelpers/PPC64.h>
 #include <FEXCore/Utils/LogManager.h>

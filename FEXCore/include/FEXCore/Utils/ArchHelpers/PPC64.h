@@ -34,9 +34,14 @@ enum class SplitLockOp : uint8_t {
  * `addr`, and writes the pre-RMW value (or CAS result) to `*result`.
  *
  * Genuinely atomic w.r.t. other threads going through this same helper.
- * Not atomic w.r.t. lock-free accesses to the same line from non-FEX code,
- * but x86 LOCK semantics on a misaligned cache-line-spanning EA are already
- * implementation-defined, so this matches the x86 contract closely enough.
+ * NOT atomic w.r.t. **FEX's own aligned LL/SC path on the same address in
+ * another FEX thread** — a common configuration in guest workloads where one
+ * translation happens to hit a naturally aligned EA and another happens to
+ * hit a misaligned one on the same word. The mutex and the LL/SC do not
+ * compose, so a lost update can occur (Tier D atomics defect 1). The
+ * container-in-helper series (Tier D atomics C3/C4 in `AtomicOps.cpp`) closes
+ * that gap. Earlier phrasing here misidentified the failure as *external*
+ * (non-FEX code) — that is wrong; the real exposure is FEX-internal.
  *
  * @param op     Which RMW operation to perform (see SplitLockOp).
  * @param addr   Host-virtual pointer to guest memory. May be misaligned.

@@ -66,8 +66,14 @@ namespace FEXCore::CPU {
 // ---------------------------------------------------------------------------
 // SplitLock mini-frame helper. The misaligned LOCK-RMW path used to inline a
 // non-atomic LD->op->ST (single-thread correct only). Phase 3 replaces it
-// with a call into PPC64_SplitLockEmulate (process-wide mutex-serialized),
-// which is correct across cores.
+// with a call into PPC64_SplitLockEmulate (process-wide striped-mutex
+// serialised). This composes correctly with other helper-serialised misaligned
+// ops on the same striped cacheline, **but not with the aligned LL/SC path on
+// the same address in another FEX thread** — the mutex and LL/SC do not
+// compose (Tier D atomics defect 1). The container-in-helper series
+// (Tier D atomics C3/C4) closes that gap. Tier D atomics C1 also brackets
+// the misaligned-helper call site with `hwsync`/`isync` in the same commit
+// as the code changes; the block comment there notes the hoist.
 //
 // Frame layout (80 bytes, allocated via stdu r1, -80, r1):
 //
@@ -86,10 +92,12 @@ namespace FEXCore::CPU {
 //
 // CR0 stash: callers save CR0 to [original_r1 - 8] before this helper fires.
 // stdu does NOT touch [original_r1 - 8] (it writes the back-chain to
-// [new_r1 + 0] = [original_r1 - 64]). The callee stack frame is allocated
-// BELOW new_r1 by its own prologue, so it cannot touch [original_r1 - 8]
-// either. After we tear down via addi r1, +64, r1 reverts to its original
-// value and the caller ld(TMP4, -8, r1) finds the stash intact.
+// [new_r1 + 0] = [original_r1 - SplitLockMiniFrameSize] = [original_r1 - 80]).
+// The callee stack frame is allocated BELOW new_r1 by its own prologue, so it
+// cannot touch [original_r1 - 8] either. After we tear down via
+// `addi r1, r1, SplitLockMiniFrameSize` (+80), r1 reverts to its original value
+// and the caller `ld(TMP4, -8, r1)` finds the stash intact. (Prior comment
+// hard-coded 64 — stale since the frame grew to accommodate SlotExpectedSave.)
 namespace {
 constexpr int SplitLockMiniFrameSize = 80;
 constexpr int SplitLockSlotValue       = 32;
@@ -731,11 +739,13 @@ DEF_OP(CAS) {
 // LL/SC and silently corrupted memory beyond the 8-byte target whenever
 // CMPXCHG8B was invoked.
 //
-// CMPXCHG16B path: lqarx/stqcx_. require an even/odd register pair RTp:RTp+1.
-// In LE storage: RTp <- mem[EA+8] (high half), RTp+1 <- mem[EA+0] (low half).
-// TMP1:TMP2 = r3:r4 is even:odd and lies outside the RA-allocated GPR pool
-// (which starts at r7), so we use it as the LL/SC pair and reuse it for the
-// store after capturing the loaded values into the caller-supplied Dst regs.
+// CMPXCHG16B path: lqarx/stqcx_. require an even/odd register pair RTp:RTp+1
+// where RTp is EVEN. r3 (TMP1) is ODD — attempting to use TMP1:TMP2 raises
+// SIGILL (see the "Earlier impl used r3:r4" note at the code site below). The
+// pair actually used is **TMP2:TMP3 = r4:r5**, which starts on an even
+// register and lies outside the RA-allocated GPR pool (which starts at r7).
+// In LE storage the load fills: RTp = TMP2 = r4 <- mem[EA+8..+15] (HIGH half),
+// RTp+1 = TMP3 = r5 <- mem[EA+0..+7] (LOW half).
 // ---------------------------------------------------------------------------
 DEF_OP(CASPair) {
   const auto Op      = IROp->C<IR::IROp_CASPair>();

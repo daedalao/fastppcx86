@@ -738,13 +738,15 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
 #ifdef ARCHITECTURE_ppc64le
   // POWER8 has lwarx/stwcx. (and byte/halfword variants on POWER8+) with
   // native LL/SC semantics. PPC64LE atomic codegen uses them for aligned
-  // EAs and falls back to PPC64_SplitLockEmulate (process-wide mutex
-  // serialization) for misaligned EAs; both paths are multi-thread
-  // correct across cores. The HostFeatures.SupportsAtomics flag does
-  // not gate any PPC64LE codegen today -- it is only consulted by the
-  // arm64-shared JIT/AtomicOps.cpp -- but we report it accurately so
-  // the warning below stops firing and any future arch-neutral consumer
-  // of the flag sees the truth.
+  // EAs and falls back to PPC64_SplitLockEmulate (process-wide striped-mutex
+  // serialisation) for misaligned EAs. Each path is internally correct across
+  // cores in isolation, but the two paths do NOT compose: an aligned LL/SC in
+  // one thread and a misaligned mutex-serialised RMW in another thread on the
+  // same address can produce a lost update (Tier D atomics defect 1; the
+  // container-in-helper series C3/C4 in `AtomicOps.cpp` closes the gap).
+  // Reporting `SupportsAtomics = true` regardless: the flag does not gate any
+  // PPC64LE codegen today -- it is only consulted by the arm64-shared
+  // JIT/AtomicOps.cpp -- but we set it so the warning below stops firing.
   HostFeatures.SupportsAtomics = true;
 #endif
 
