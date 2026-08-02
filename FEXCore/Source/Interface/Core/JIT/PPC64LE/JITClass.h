@@ -113,6 +113,22 @@ public:
   static uint64_t ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 
   fextl::vector<FEXCore::CPU::Relocation> TakeRelocations(uint64_t GuestBaseAddress) override {
+    // S3.7-C4: rebase RELOC_GUEST_RIP_* against the caller-supplied guest
+    // base. On-disk format stores GuestRIP.GuestRIP as a delta from that
+    // base, and ApplyCodeRelocations reconstructs the absolute value via
+    // `GuestEntry + delta` on load. Mirror of ARM64
+    // Arm64Relocations.cpp:105-119 including its non-idempotency — call at
+    // most once per compile.
+    for (auto& Reloc : Relocations) {
+      switch (Reloc.Header.Type) {
+      case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+      case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL:
+        Reloc.GuestRIP.GuestRIP -= GuestBaseAddress;
+        break;
+      default:
+        break;
+      }
+    }
     return std::move(Relocations);
   }
 
@@ -353,9 +369,29 @@ private:
   // -----------------------------------------------------------------------
   fextl::vector<FEXCore::CPU::Relocation> Relocations;
 
+  // S3.7-C0: byte offset of this block's BlockBegin within the whole
+  // CodeBuffer. Relocation Header.Offset must be WHOLE-BUFFER relative
+  // because ApplyCodeRelocations indexes from the buffer base, while
+  // GetOffset() is relative to the per-block SetBuffer at JIT.cpp:2246.
+  // Snapshotted just BEFORE SetBuffer opens the block's window because
+  // CodeBuffers.LatestOffset is advanced later at JIT.cpp:2486. Mirror
+  // of ARM64's fixup loop at JIT/JIT.cpp:1111 — ARM64 does the same
+  // offset += LatestOffset arithmetic in a post-loop pass; snapshotting
+  // once at the top of CompileCode is the same numerically and needs no
+  // post-loop walk.
+  uint64_t BlockBufferOffset {};
+
   // Load a named thunk's function pointer into Reg via LoadConstant, recording
   // a RELOC_NAMED_THUNK_MOVE relocation for code-cache patching.
   void InsertNamedThunkRelocation(GPR Reg, const IR::SHA256Sum& Sum);
+
+  // S3.7-C2: Load a guest-RIP-derived Constant into Reg via LoadConstantFixed
+  // and record a RELOC_GUEST_RIP_MOVE. Every site that used to emit a bare
+  // `LoadConstant(reg, Entry + Op->Offset)` must use this instead, or cached
+  // code loaded in a different ASLR session will jump to a stale address.
+  // TakeRelocations() rebases these against the caller-supplied guest base
+  // before serialization; the patcher adds the new base back on load.
+  void InsertGuestRIPMove(GPR Reg, uint64_t Constant);
 
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);

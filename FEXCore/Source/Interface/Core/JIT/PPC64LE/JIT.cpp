@@ -1243,7 +1243,11 @@ bool PPC64JITCore::IsInlineEntrypointOffset(const IR::OrderedNodeWrapper& WNode,
 void PPC64JITCore::InsertNamedThunkRelocation(GPR Reg, const IR::SHA256Sum& Sum) {
   Relocation Reloc {};
   Reloc.NamedThunkMove.Header = {
-    .Offset = static_cast<uint64_t>(GetOffset()),
+    // S3.7-C0: buffer-relative, not block-relative. GetOffset() is inside the
+    // per-block SetBuffer window at JIT.cpp:2250 but ApplyCodeRelocations
+    // indexes from CodeBuffer->Ptr. BlockBufferOffset is the snapshot from
+    // just before SetBuffer.
+    .Offset = BlockBufferOffset + static_cast<uint64_t>(GetOffset()),
     .Type   = FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE,
   };
   Reloc.NamedThunkMove.Symbol        = Sum;
@@ -1258,6 +1262,24 @@ void PPC64JITCore::InsertNamedThunkRelocation(GPR Reg, const IR::SHA256Sum& Sum)
   // the 1-instruction short-circuit when Pointer is 0 (thunk missing / not
   // registered), and the on-load patch would overrun the emitted window.
   LoadConstantFixed(Reg, Pointer);
+  Relocations.emplace_back(Reloc);
+}
+
+// S3.7-C2: guest-RIP-derived constant load with relocation record.
+// LoadConstantFixed reserves the 20-byte patch window; the recording captures
+// the ABSOLUTE guest RIP (TakeRelocations rebases against the section base at
+// serialization time). On load, ApplyCodeRelocations at
+// CodeCache.cpp::RELOC_GUEST_RIP_MOVE re-emits LoadConstantFixed with
+// `GuestEntry + delta` — i.e. the block's current-session guest RIP.
+void PPC64JITCore::InsertGuestRIPMove(GPR Reg, uint64_t Constant) {
+  Relocation Reloc {};
+  Reloc.GuestRIP.Header = {
+    .Offset = BlockBufferOffset + static_cast<uint64_t>(GetOffset()),
+    .Type   = FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE,
+  };
+  Reloc.GuestRIP.GuestRIP      = Constant;   // TakeRelocations subtracts base
+  Reloc.GuestRIP.RegisterIndex = Reg.idx;
+  LoadConstantFixed(Reg, Constant);
   Relocations.emplace_back(Reloc);
 }
 
@@ -2245,8 +2267,16 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     }
   }
 
-  // Use the current code buffer at the current write offset
+  // Use the current code buffer at the current write offset.
+  //
+  // S3.7-C0: snapshot BlockBufferOffset BEFORE SetBuffer opens the window.
+  // Relocations record `.Offset = BlockBufferOffset + GetOffset()` — buffer-
+  // relative, matching what CodeCache::ApplyCodeRelocations expects. Doing
+  // it here is stable across the LatestOffset bumps at :2486 / :2532.
+  // CodeData.BlockBegin down at Finalise (:2474) uses the same snapshot for
+  // the same reason.
   auto* CB = CurrentCodeBuffer.get();
+  BlockBufferOffset = CodeBuffers.LatestOffset;
   SetBuffer(CB->Ptr + CodeBuffers.LatestOffset,
             CB->UsableSize() - CodeBuffers.LatestOffset);
 
@@ -2471,7 +2501,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   Align16B();
 
   size_t CodeSize = GetOffset();
-  CodeData.BlockBegin = CB->Ptr + CodeBuffers.LatestOffset;
+  // S3.7-C0: use the block-start snapshot, not the live LatestOffset. The
+  // original recompute was numerically identical only because nothing else
+  // mutates LatestOffset between :2250 (SetBuffer) and this line — but
+  // that's an invariant nothing enforces, and reading the snapshot is
+  // strictly cleaner. Same rationale as the InsertNamedThunkRelocation
+  // change above.
+  CodeData.BlockBegin = CB->Ptr + BlockBufferOffset;
   CodeData.Size       = CodeSize;
 
   // Flush the freshly-emitted instructions out of the D-cache and invalidate

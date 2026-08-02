@@ -43,7 +43,10 @@ DEF_OP(Constant) {
 DEF_OP(EntrypointOffset) {
   auto Op       = IROp->C<IR::IROp_EntrypointOffset>();
   uint64_t Mask = (IROp->Size == IR::OpSize::i32Bit) ? 0xFFFF'FFFFull : ~0ULL;
-  LoadConstant(GetReg(Node), (Entry + Op->Offset) & Mask);
+  // S3.7-C2: `Entry + Op->Offset` is a guest RIP baked into 20 bytes of
+  // host constant-load; mirrors ARM64 JIT/ALUOps.cpp:67. The mask is
+  // applied at emit time so the recorded value equals the emitted value.
+  InsertGuestRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
 }
 
 DEF_OP(InlineConstant)         { /* nop — handled by IsInlineConstant */ }
@@ -3441,7 +3444,13 @@ DEF_OP(ThreadRemoveCodeEntry) {
   // Arguments (r3, r4). STATE (r27) is non-volatile in the ELFv2 ABI and is
   // not part of x64::SRA/RA, so it survives SpillForABICall untouched.
   mr(r3, STATE);
-  LoadConstant(TMP2, Entry);
+  // S3.7-C2: Entry is the block's guest RIP baked into a constant load.
+  // DELIBERATE DIVERGENCE FROM ARM64 — ARM64 has a `TODO: Relocations don't
+  // seem to be wired up to this...?` at JIT/BranchOps.cpp:414-415 and just
+  // pads the site instead of recording. Adding the relocation is correct;
+  // without it a cached CheckTF prologue would call CompileSingleStep with a
+  // stale RIP from the caching session.
+  InsertGuestRIPMove(TMP2, Entry);
 
   // ELFv2 indirect call: r12 must equal the callee entry-point at the moment
   // of the branch (used by the callee's global-entry prologue to recompute r2).

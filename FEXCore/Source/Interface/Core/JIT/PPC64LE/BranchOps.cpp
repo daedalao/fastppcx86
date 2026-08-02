@@ -100,7 +100,11 @@ DEF_OP(ExitFunction) {
     if (!CTX->Config.Is64BitMode()) {
       NewRIP &= 0xFFFFFFFFull;
     }
-    LoadConstant(TMP1, NewRIP);
+    // S3.7-C2: this constant is a guest RIP baked into host instruction bytes;
+    // a code cache saved in one ASLR session and loaded in another would jump
+    // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
+    // the 32-bit mask so the recorded value matches the emitted immediate.
+    InsertGuestRIPMove(TMP1, NewRIP);
     RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);
