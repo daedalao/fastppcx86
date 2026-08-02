@@ -1,0 +1,33 @@
+Minimal $ORIGIN-RPATH reproducer for the FEX_SMCCHECKS=full path-truncation bug.
+
+BUILD:
+  export PATH=/home/jbettcher/Development/fexrootfs/x-tools/x86_64-linux-gnu/bin:$PATH
+  x86_64-linux-gnu-gcc -shared -fPIC lib.c -o liborigin.so
+  x86_64-linux-gnu-gcc main.c -L. -lorigin -Wl,-rpath,'$ORIGIN' -o origin_test
+
+RUN:
+  # Baseline (default SMC) -- should print "f() = 42" exit 0
+  FEX ./origin_test
+
+  # SMC=full -- ld.so cannot find liborigin.so
+  FEX_SMCCHECKS=full FEX ./origin_test
+
+TRIGGER: only when the guest binary is loaded via a path where ld.so must
+resolve $ORIGIN (RPATH/RUNPATH). Simple binaries like /bin/echo, /bin/ls,
+/usr/bin/perl -e '...' all run cleanly under SMC=full because they don't
+exercise the affected ld.so path.
+
+OBSERVATION (via strace on the host FEX process): the openat path FEX passes
+to the host kernel is truncated. The truncated OUTPUT length is 8-byte
+aligned (or 8k+1). Truncation amount depends on input $ORIGIN length, with
+inputs of the same length always producing the same output length.
+
+Example: for /home/.../build-probes/game/ (57-char $ORIGIN) the truncation
+drops "e" -> 56-char output ".../gam". For /home/.../build-probes/gameyzab/
+(61-char $ORIGIN) it drops "eyzab" -> also 56-char output ".../gam".
+
+Full experimental grid captured in docs/build-agent-notes.md under the
+"minimal $ORIGIN reproducer" entry.
+
+NOT a general RPATH bug -- confined to SMC=full mode. Baseline (mtrack) and
+SMCCHECKS=none both handle the same binary correctly.

@@ -14,6 +14,9 @@ build-probes/*
 !build-probes/*.c
 !build-probes/*.sh
 !build-probes/*.pl
+!build-probes/origin/
+!build-probes/origin/*.c
+!build-probes/origin/README
 [Bb]in/
 out/
 .vscode/
