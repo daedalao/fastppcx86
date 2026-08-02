@@ -716,8 +716,15 @@ DEF_OP(CAS) {
 
 // ---------------------------------------------------------------------------
 // CASPair — paired CAS for CMPXCHG8B (Size=i32Bit, 64-bit memory) and
-// CMPXCHG16B (Size=i64Bit, 128-bit memory). x86 mandates natural alignment
-// (#GP on misuse) so no misalignment fallback is emitted.
+// CMPXCHG16B (Size=i64Bit, 128-bit memory).
+//
+// Alignment: CMPXCHG8B does NOT require natural alignment — x86 accepts any
+// EA and locks the bus/line(s). Only CMPXCHG16B #GPs on a misaligned operand.
+// The i386 ABI aligns 8-byte types to 4 bytes, so a 4-aligned (i.e. misaligned
+// for POWER's ldarx) CMPXCHG8B is the ORDINARY case in 32-bit guest code, not
+// an edge case; the 64-bit path below therefore emits a misalignment fallback
+// and routes it through the mutex-serialised split-lock helper. The 128-bit
+// path emits none, which is correct for CMPXCHG16B.
 //
 // CMPXCHG8B path: combine ExpHi:ExpLo and DesHi:DesLo into 64-bit values
 // and use ldarx/stdcx_. Earlier impl always used lqarx — that's a 16-byte
@@ -771,18 +778,41 @@ DEF_OP(CASPair) {
     auto fail = PPC64Emitter::Label{};
     auto done = PPC64Emitter::Label{};
 
-    // x86 cmpxchg8b ALLOWS misaligned addresses (locked bus on x86; we degrade
-    // to a non-atomic ld/cmp/conditional-std in that case — matches single-
-    // threaded semantics and avoids the POWER `ldarx` SIGBUS on unaligned EA).
+    // x86 cmpxchg8b ALLOWS misaligned addresses (locked bus on x86), and the
+    // i386 ABI's 4-byte alignment for 8-byte types makes that the common case.
+    // POWER's ldarx SIGBUSes on an unaligned EA, so we take a fallback — but it
+    // must still be atomic against other FEX threads. This used to be an inline
+    // ld/cmpd/conditional-std with no mutex, no reservation and no barrier: the
+    // only atomic path in the backend with nothing serialising it, and a lost
+    // update here lands a wrong value in guest EDX:EAX. Route it through the
+    // same process-wide striped-mutex helper every other misaligned RMW uses.
     andi_(TMP4, Addr, 7);
     bc(CC_EQ, &aligned);
     {
-      ld(TMP2, 0, Addr);            // TMP2 = current 8 bytes (non-atomic)
-      cmpd(TMP2, TMP1);
-      auto na_skip = PPC64Emitter::Label{};
-      bc(CC_NE, &na_skip);
-      std(TMP3, 0, Addr);           // store desired
-      Bind(&na_skip);
+      // SIZE: pass i64Bit explicitly — NOT `Sz`. For CMPXCHG8B `Sz` is i32Bit,
+      // which is the width of each *half* (ExpLo/ExpHi are 32-bit), while the
+      // memory operand is a full 8 bytes. PPC64_SplitLockEmulate takes a byte
+      // count and rejects anything outside {1,2,4,8} (PPC64.cpp size guard), so
+      // `Sz` would not be rejected — it would silently perform a 4-byte CAS on
+      // an 8-byte operand, tearing the guest's value.
+      //
+      // Operands: TMP1 = ExpFull, TMP3 = DesFull, Dst = TMP2 (the same register
+      // the aligned ldarx path leaves the observed old value in, and which the
+      // shared epilogue below splits into DstLo/DstHi). EmitSplitLockCASCall
+      // stages Desired/Expected/Addr into its mini-frame *before*
+      // SpillForABICall, so TMP1/TMP3 being spill-clobbered afterwards is fine.
+      //
+      // CR0: no compare is emitted on return (unlike DEF_OP(CAS), which needs
+      // CR0 for ZF). CASPair's ZF is produced downstream by CmpPairZ from the
+      // Dst pair, and this op restores CR0 from the [r1-8] stash at the end of
+      // the block regardless. That stash survives the call: the helper's
+      // mini-frame is sized so [orig_r1-8] maps to its reserved [r1+72] pad
+      // (static_assert at the top of this file), and the callee's own frame
+      // sits below the mini-frame.
+      //
+      // TMP4 is clobbered by the helper (it reloads Expected there); harmless,
+      // as the epilogue below reloads TMP4 from [r1-8] before using it.
+      EmitSplitLockCASCall(Addr, TMP1, TMP3, TMP2, IR::OpSize::i64Bit);
       b(&done);
     }
 
