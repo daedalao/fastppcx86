@@ -12,56 +12,23 @@ A SIGABRT on exit remains (deferred; not blocking gameplay).
 
 ## Milestone — POWER9: CPU frame time roughly halved
 
-On a POWER9 AC922, Factorio's `cpu-frame` median went **37.7 ms → 19.6 ms** across two changes. Both
-removed work from the block-transition path — the code that runs between every pair of translated blocks,
-millions of times a second.
+On a POWER9 AC922, Factorio's `cpu-frame` median went **37.7 ms → 19.6 ms**. Two changes, both removing
+work from the block-transition path:
 
-| Change | Effect | What it was |
-|---|---|---|
-| `36299af03` | **−35%** single-socket, up to **−57%** cross-socket | A debug RIP-trace counter in the dispatcher ran unconditionally in Release builds. 23 instructions plus 3 stores and 1 load on *every* block transition — and the counters were `alignas(64)` process-globals written by every guest thread, so the real cost was cross-core cache-coherence traffic rather than the instructions. Now behind `ASSERTIONS_ENABLED`. Port-local scaffolding; gating it *reduces* divergence from upstream. |
-| `c6c8d8dde` + `7f5e92bbb` | **−21%** on top | The dispatcher's L1 lookup is now inlined into `DEF_OP(ExitFunction)`, and the SRA spill moved to the miss leg. The hit path went from **84 instructions to 16**. The spill turned out to transfer nothing the target block reads — it existed solely to cover a signal arriving mid-lookup, which the miss leg now handles. Also fixes a latent ordering bug: the L1 probe relied on a *control* dependency to order two loads, which Power does not guarantee (Book II §1.7.1 orders address dependencies, not branches). |
+- **`36299af03`** — gated a debug RIP-trace counter that ran unconditionally in Release builds, writing
+  process-global counters from every guest thread on every block transition. **−35%** single-socket,
+  **−57%** cross-socket.
+- **`c6c8d8dde` + `7f5e92bbb`** — inlined the dispatcher's L1 lookup into `ExitFunction` and moved the SRA
+  spill to the miss leg. Hit path: **84 instructions → 16**. **−21%** on top.
 
 Verified by byte-identical Factorio map checksums, ctest 7024/7024, and FTL reaching "Running Game!".
-Measurements are medians on a pinned single socket; the distributions are heavy-tailed and means are not
-meaningful.
 
-**A negative result worth recording:** a third change removed 32 pure-ALU instructions per block transition
-and moved wall time by **+0.11%** — nothing. Reverted (`5bf6e5073`). The lesson generalises on this
-backend: *memory traffic to contended cache lines costs; instruction count does not convert to wall time.*
-The core runs at IPC ~1.0 with ~35% backend stalls, so it is memory-stalled, not issue-limited.
+Also landed: guest-RIP reconstruction, so crashes now resolve to a guest instruction rather than a host
+address in a JIT buffer; a fix for guest arithmetic flags being corrupted after every in-JIT signal; an
+out-of-bounds FPSCR write reachable from `_MM_SET_FLUSH_ZERO_MODE`; and ELFv2 r2/TOC preservation across
+cross-DSO thunk calls.
 
-## Milestone — guest-RIP reconstruction, and the GL regression cause
-
-**Crashes now report a guest instruction address.** ppc64le never wrote `State.InlineJITBlockHeader`, so
-four functions silently returned 0/false for the life of the port — including `RestoreRIPFromHostPC`, which
-turns a host PC into a guest RIP. Emitting a `JITCodeHeader` (`667b59685`) and the `vl64pair` RIP-entry
-table (`244075383`) fixed it: one RimWorld run produced **11,899 reconstructions**, with the recovered RIP
-frequently *ahead* of `State.rip` — i.e. genuinely mid-block, which is the case that was previously
-invisible.
-
-**The GL regression was a build-configuration bug, not code.** FTL and Factorio both crashed shortly after
-GL init for two days. Cause: `ENABLE_CLANG_THUNKS=ON`. clang and ppc64le-clang disagree on the layout of
-generated packed-args structs, so any thunk call richer than a scalar or a string pointer marshals at the
-wrong offsets — which is why `glGetString` survived and `glGenFramebuffers` did not. Proven by a 2×2
-isolation holding source constant while varying only the thunk toolchain, replicated on a fresh minimal
-rootfs. A CMake option is invisible to `git bisect`, to code review, and to ctest — which stayed at
-7014/7014 throughout.
-
-## Correctness fixes worth calling out
-
-- **Guest arithmetic flags were corrupted after every signal delivered in JIT.** `GetArmPState` returned raw
-  CCR to a consumer expecting a packed ARM-PSTATE word, so ZF read `CR0.GT` instead of `CR0.EQ`, and CF and
-  OF read CR0 bits where the real values live in **XER** — which was sitting in the ucontext, never read.
-  The wrong values were written *back* into guest state, so they persisted past the signal.
-- **`SetRoundingMode` read out of bounds.** The IR feeds it a 3-bit field (rounding control *plus* MXCSR's
-  flush-to-zero bit), so the index spans 0–7 while the lookup table has 4 entries. Any guest calling
-  `_MM_SET_FLUSH_ZERO_MODE` read past the end and could set FPSCR **NI** — non-IEEE mode. Replaced with
-  branch-free packed-nibble arithmetic; no table, no memory access.
-- **FEXServer could clobber `ROOTFS` with an empty string**, silently. This was one bug with two faces: it
-  broke `apt` entirely (via the uid-keyed FEXServer socket, when apt drops to `_apt`) *and* took OpenSSL's
-  test suite from 1 failure to 306. Both fixed by the same guard.
-- **ELFv2 ABI:** r2/TOC now preserved across the cross-DSO thunk `bctrl` — the one call site in the backend
-  where r2 genuinely returns changed. `RedZoneSize` corrected to 288.
+Detail is in the commit messages and `docs/POWER9_PORT_PLAN.md`.
 
 ## Headline wins on this branch
 
