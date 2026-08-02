@@ -84,6 +84,15 @@ struct GuestToHostMap {
 
   struct BlockEntry {
     uint64_t HostCode;
+    // Absolute pointer to the start of the JIT block (containing the
+    // JITCodeHeader). Symmetric with HostCode above — buffer-relative
+    // conversion happens only when the cache is serialized. Needed by
+    // CodeCache::Validate to locate the header on ppc64le, where
+    // BlockBegin != HostCode - sizeof(JITCodeHeader) (there is a
+    // FillStaticRegs / EmitEntryPoint sequence between them, ~200-270
+    // bytes). On ARM64 the two are exactly 4 bytes apart, but we store
+    // it explicitly rather than assuming.
+    uint64_t BlockBegin;
     fextl::vector<uint64_t> CodePages;
   };
 
@@ -94,13 +103,14 @@ struct GuestToHostMap {
   GuestToHostMap();
 
   // Adds to Guest -> Host code mapping
-  const BlockEntry& AddBlockMapping(uint64_t Address, const fextl::vector<uint64_t>& CodePages, void* HostCode, const LookupCacheWriteLockToken&) {
+  const BlockEntry& AddBlockMapping(uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages, void* HostCode,
+                                    const LookupCacheWriteLockToken&) {
     // This may replace an existing mapping
     // NOTE: Generally no previous entry should exist, however there is one exception:
     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
     //       may already contain the block address. Since is comparatively rare, we'll just leak
     //       one of the two blocks in this case.
-    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
+    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages}).first->second;
   }
 
   const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
@@ -316,13 +326,14 @@ public:
   }
 
   // Adds to Guest -> Host code mapping
-  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, const fextl::vector<uint64_t>& CodePages, void* HostCode) {
+  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages,
+                       void* HostCode) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
+    const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk);
 
     // There is no need to update L1 or L2, they will get updated on first lookup
     // However, adding to L1 here increases performance

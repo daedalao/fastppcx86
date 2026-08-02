@@ -235,7 +235,10 @@ uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
 
 struct CodeCacheHeader {
   std::array<char, 4> Magic = ExpectedMagic;
-  uint32_t FormatVersion = 1;
+  // Bump on any on-disk layout change so stale caches are rejected rather
+  // than misread. Bumped from 1 -> 2 by S3 (BlockBegin added to each
+  // BlockList entry between HostCode and NumGuestPages).
+  uint32_t FormatVersion = 2;
   uint8_t FEXVersion[20] = {};
   uint32_t NumBlocks;
   uint32_t NumCodePages;
@@ -287,6 +290,9 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
       ::write(fd, &Guest, sizeof(Guest));
       uint64_t HostCode = Host->HostCode - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
       ::write(fd, &HostCode, sizeof(HostCode));
+      // S3: write BlockBegin (buffer-relative) alongside HostCode. Format v2.
+      uint64_t BlockBegin = Host->BlockBegin - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
+      ::write(fd, &BlockBegin, sizeof(BlockBegin));
       uint64_t NumCodePages = Host->CodePages.size();
       ::write(fd, &NumCodePages, sizeof(NumCodePages));
       LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Host->CodePages), "Code pages aren't sorted");
@@ -355,6 +361,12 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     return false;
   }
 
+  if (header.FormatVersion != CodeCacheHeader {}.FormatVersion) {
+    LogMan::Msg::IFmt("Cache format version {} does not match expected {}, skipping", header.FormatVersion,
+                      CodeCacheHeader {}.FormatVersion);
+    return false;
+  }
+
   if (!ranges::equal(header.FEXVersion, GIT_HASH)) {
     LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
                       fmt::join(GIT_HASH, ""));
@@ -376,6 +388,11 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       MappedCacheFile += sizeof(BlockPtr.first);
       ::memcpy(&BlockPtr.second.HostCode, MappedCacheFile, sizeof(BlockPtr.second.HostCode));
       MappedCacheFile += sizeof(BlockPtr.second.HostCode);
+      // S3: BlockBegin follows HostCode in format v2. Still buffer-relative
+      // at this point; converted to an absolute pointer alongside HostCode
+      // in the register-blocks-to-LookupCache loop below.
+      ::memcpy(&BlockPtr.second.BlockBegin, MappedCacheFile, sizeof(BlockPtr.second.BlockBegin));
+      MappedCacheFile += sizeof(BlockPtr.second.BlockBegin);
       uint64_t NumGuestPages;
       ::memcpy(&NumGuestPages, MappedCacheFile, sizeof(NumGuestPages));
       MappedCacheFile += sizeof(NumGuestPages);
@@ -462,7 +479,9 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
         CodePage += BinarySection.FileStartVA;
       }
       auto HostCode = reinterpret_cast<void*>(Host.HostCode + reinterpret_cast<uintptr_t>(CodeBufferRange.data()));
-      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, std::move(Host.CodePages), HostCode, WriteLock);
+      // Convert BlockBegin to absolute alongside HostCode (S3).
+      auto BlockBeginAbs = Host.BlockBegin + reinterpret_cast<uintptr_t>(CodeBufferRange.data());
+      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, BlockBeginAbs, std::move(Host.CodePages), HostCode, WriteLock);
     }
 
     // Register loaded code ranges
@@ -491,23 +510,34 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   }
 
   if (EnableCodeCacheValidation) {
-    fextl::set<uint64_t> GuestBlocks, HostBlocks;
+    fextl::set<uint64_t> GuestBlocks, BlockBegins;
     for (auto& [Guest, Host] : BlockList) {
       GuestBlocks.insert(Guest + BinarySection.FileStartVA);
-      HostBlocks.insert(Host.HostCode);
+      // S3.6: pass BlockBegin (buffer-relative) instead of HostCode entry so
+      // Validate's subspan lands at the start of the JITCodeHeader on every
+      // arch. On ppc64le the entry point is ~200-270 bytes past BlockBegin
+      // (FillStaticRegs + EmitEntryPoint sits between them), so the old
+      // `HostBlocks.begin() - sizeof(JITCodeHeader)` arithmetic landed
+      // mid-prologue and the byte-compare failed at offset 0x0 comparing
+      // unrelated instructions. BlockBegin identifies the header directly.
+      BlockBegins.insert(Host.BlockBegin);
     }
 
-    Validate(BinarySection, std::move(GuestBlocks), HostBlocks, CodeBufferRange);
+    Validate(BinarySection, std::move(GuestBlocks), BlockBegins, CodeBufferRange);
   }
 
   return true;
 }
 
-void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& HostBlocks,
+void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& BlockBegins,
                          std::span<std::byte> CachedCode) {
-  LOGMAN_THROW_A_FMT(!HostBlocks.empty(), "Tried to validate without any host blocks");
-  // Skip any cached data before the first host block
-  CachedCode = CachedCode.subspan(*HostBlocks.begin() - sizeof(CPU::CPUBackend::JITCodeHeader));
+  LOGMAN_THROW_A_FMT(!BlockBegins.empty(), "Tried to validate without any host blocks");
+  // Skip any cached data before the first block begin. BlockBegin points at
+  // the JITCodeHeader on every arch (S3.6), so no per-arch arithmetic is
+  // needed here — this used to be
+  // `subspan(*HostBlocks.begin() - sizeof(JITCodeHeader))` which relied on
+  // the ARM64 invariant that the entry point sits 4 bytes past BlockBegin.
+  CachedCode = CachedCode.subspan(*BlockBegins.begin());
 
   if (!ValidationCTX) {
     ValidationCTX.reset(static_cast<ContextImpl*>(FEXCore::Context::Context::CreateNewContext(CTX.HostFeatures).release()));
@@ -573,17 +603,19 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     // Align down to instruction size
     auto Idx = AlignDown(std::distance(CodeBufferRangeRef.begin(), Mismatch), 4);
 
-    auto BlockIt = std::prev(HostBlocks.lower_bound(*HostBlocks.begin() + Idx + 1));
+    // S3.6: find the owning block by its BlockBegin (the greatest BlockBegin
+    // <= Idx-in-buffer). The prior form combined `HostBlocks.lower_bound` with
+    // an AArch64 ADR-immediate decode to hop from entry-point back to header;
+    // now that BlockBegin points directly at the header on every arch, the
+    // decode is gone.
+    auto BlockIt = std::prev(BlockBegins.lower_bound(*BlockBegins.begin() + Idx + 1));
     std::optional<uint64_t> GuestBlockAddr;
     std::optional<uint64_t> GuestBlockAddrRef;
-    if (BlockIt != HostBlocks.end()) {
+    if (BlockIt != BlockBegins.end()) {
       for (int i : {0, 1}) {
         std::span Buffer = (i == 0 ? CachedCode : CodeBufferRangeRef);
 
-        // Second instruction is always a constant load for relative offset to the (multi)block start
-        int32_t addr = (*reinterpret_cast<uint32_t*>(&Buffer[*BlockIt - *HostBlocks.begin() + 4]) & 0x3ff'ffe0) << 11;
-        addr >>= 14;
-        auto header = reinterpret_cast<CPU::CPUBackend::JITCodeHeader*>(&Buffer[*BlockIt - *HostBlocks.begin() + 4 + addr]);
+        auto header = reinterpret_cast<CPU::CPUBackend::JITCodeHeader*>(&Buffer[*BlockIt - *BlockBegins.begin()]);
         auto tail = reinterpret_cast<CPU::CPUBackend::JITCodeTail*>(reinterpret_cast<uintptr_t>(header) + header->OffsetToBlockTail);
         (i == 0 ? GuestBlockAddr : GuestBlockAddrRef) = tail->RIP - Section.FileStartVA;
         LogMan::Msg::EFmt("Recorded rip {}: {:#x} (offset {:#x})", i, tail->RIP, tail->RIP - Section.FileStartVA);

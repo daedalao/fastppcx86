@@ -974,8 +974,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Insert to lookup cache
 
+  // BlockBegin is shared across all EntryPoints of a single CompiledCode
+  // (each block has one begin, potentially multiple entry points).
+  const uint64_t BlockBegin = reinterpret_cast<uintptr_t>(CompiledCode.BlockBegin);
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
+    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr);
   }
 
   if (CodeMapWriter) {
