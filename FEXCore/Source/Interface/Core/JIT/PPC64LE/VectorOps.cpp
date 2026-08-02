@@ -640,10 +640,11 @@ extern "C" void PPC64_F32x4ToF16Hi(uint8_t*, const uint8_t*);
 
 namespace {
 // Crypto/F16C FABI mini-frame slot constants — bitness-independent. The
-// PushDynamicRegs spill size differs between x32 (496) and x64 (304) guest
-// modes, so CryptoSpillSaveSize and the PostSpill() helper are declared as
-// per-DEF_OP locals (CTX->Config.Is64BitMode()) rather than module-level
-// constexpr.
+// PushDynamicRegs spill size differs between guest modes (x64::kDynRegSaveSize
+// vs x32::kDynRegSaveSize, ArchHelpers/PPC64Emitter.h), so CryptoSpillSaveSize
+// and the PostSpill() helper are declared as per-DEF_OP locals
+// (CTX->Config.Is64BitMode()) rather than module-level constexpr. Never quote
+// the byte counts here — they are derived from the register pool sizes.
 constexpr int CryptoMiniFrameSize = 96;
 constexpr int CryptoSlotA = 32;
 constexpr int CryptoSlotB = 48;
@@ -5103,7 +5104,10 @@ DEF_OP(F64F2XM1) {
 //   [r1+64]  buf C (16-byte aligned, src3 — reserved for future use)
 //   [r1+80..95] pad
 //
-// SpillForABICall further drops r1 by 304, so post-spill offsets are +304.
+// SpillForABICall further drops r1 by the PushDynamicRegs frame size
+// (x64::kDynRegSaveSize / x32::kDynRegSaveSize, ArchHelpers/PPC64Emitter.h),
+// so post-spill offsets add that — see PostSpill() at each callsite. Do not
+// write the number here; it is derived from the register pool sizes.
 // Helpers in JIT.cpp are declared extern "C"; we materialise their address
 // as a 64-bit literal and call via r12 per ELFv2 indirect-call ABI.
 // =========================================================================

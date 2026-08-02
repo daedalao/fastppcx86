@@ -247,9 +247,14 @@ namespace PThreads {
       // `set_tid_address` address construct. If the stack is reused before the address is set to zero, then glibc won't initialize the new thread's
       // DTV/TLS region, resulting in TLS usage crashing.
       // FEX-PPC64LE 2026-05-16: bumped from PTHREAD_STACK_MIN (16KB) to 128KB.
-      // PTHREAD_STACK_MIN leaves no margin for the JIT prologue's red-zone
-      // writes (PushDynamicRegs -304, LoadPermCtrl -16) during the brief
-      // window before the stack-pivot to FEX's 8MB stack completes.
+      // PTHREAD_STACK_MIN leaves no margin for the JIT's stack traffic during
+      // the brief window before the stack-pivot to FEX's 8MB stack completes:
+      // every ABI call out of JIT code pushes a PushDynamicRegs frame of
+      // x64::kDynRegSaveSize / x32::kDynRegSaveSize bytes (ArchHelpers/
+      // PPC64Emitter.h) on top of whatever mini-frame the callsite already
+      // reserved, plus red-zone scratch below SP (e.g. LoadPermCtrl -16).
+      // Read the constants; do not quote a number here — the frame size is a
+      // function of the register pools and has already gone stale once.
       // 128KB is a fail-safe margin; the small allocation is freed once we
       // pivot, so the long-term footprint is unchanged. See
       // feedback_macro_strategy_2026-05-16 for the bug-class context.
