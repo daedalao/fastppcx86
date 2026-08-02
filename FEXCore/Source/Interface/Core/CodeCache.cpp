@@ -220,7 +220,26 @@ void CodeMapWriter::AppendData(std::span<const std::byte> Data) {
 namespace FEXCore::Context {
 
 CodeCache::CodeCache(ContextImpl& CTX_)
-  : CTX(CTX_) {}
+  : CTX(CTX_) {
+  // B5: two properties of EnableCodeCacheValidation that no amount of code can
+  // fix, and that both cost time to rediscover from a confusing result.
+  //
+  // Once per process, not once per section: LoadData runs per executable
+  // section, and a validation context constructs a second CodeCache of its own.
+  if (EnableCodeCacheValidation) {
+    static std::once_flag WarnOnce;
+    std::call_once(WarnOnce, []() {
+      LogMan::Msg::EFmt("EnableCodeCacheValidation is set. Two things it does NOT mean:");
+      LogMan::Msg::EFmt("  1. A pass does not say the cached code matches what a production run emits. The reference compile decodes with "
+                        "the same section bounds and guest relocations the cache was generated with, so it compares cache-mode bytes "
+                        "against cache-mode bytes. It catches JIT-config drift and missing FEX relocations, not differences between "
+                        "cached and uncached codegen.");
+      LogMan::Msg::EFmt("  2. It is not observation-only. This flag also puts the main thread's own decoding on the section-bounded, "
+                        "relocation-aware path (Frontend.cpp), so it changes the code under test. A bug that reproduces only with it on, "
+                        "or only with it off, is the flag doing its job, not a paradox.");
+    });
+  }
+}
 CodeCache::~CodeCache() = default;
 
 uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
