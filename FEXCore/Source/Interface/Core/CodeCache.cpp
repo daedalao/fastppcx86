@@ -245,6 +245,13 @@ struct CodeCacheHeader {
   uint32_t CodeBufferSize;
   uint32_t NumRelocations;
   uint32_t padding;
+  // Guest base address the code buffer was relocated to before being written.
+  // SaveData applies relocations against this value, so LoadData's own
+  // relocation pass is only correct if it matches what LoadData assumes, which
+  // is 0. The only producer (FEXOfflineCompiler) passes 0, but nothing enforced
+  // it: a non-zero value would have been written, ignored on load, and produced
+  // code relocated against the wrong base. T8: LoadData now rejects anything
+  // else. See the check there for why the field is kept rather than deleted.
   uint64_t SerializedBaseAddress;
   // TODO: Consider including information from LookupCache.BlockLinks
 
@@ -370,6 +377,24 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   if (!ranges::equal(header.FEXVersion, GIT_HASH)) {
     LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
                       fmt::join(GIT_HASH, ""));
+    return false;
+  }
+
+  // T8: SerializedBaseAddress was written by SaveData and never read here.
+  // LoadData's relocation pass rebases the code buffer from 0 to the current
+  // BinarySection.FileStartVA, so it is only correct if the data on disk really
+  // was serialized against base 0. That happens to hold — the only producer
+  // passes 0 — but nothing checked it, so a producer that ever passed a real
+  // base would have silently produced code relocated against the wrong one.
+  //
+  // Kept rather than deleted: removing it is an on-disk layout change and would
+  // cost a FormatVersion bump (invalidating every existing cache) to delete a
+  // field that will be needed the moment relocations stop being re-emitted on
+  // both sides. Validating it costs one compare and makes the current
+  // "always 0" assumption explicit instead of implicit.
+  if (header.SerializedBaseAddress != 0) {
+    LogMan::Msg::EFmt("Cache for {} was serialized against base {:#x}, but only base 0 is supported; skipping",
+                      BinarySection.FileInfo.Filename, header.SerializedBaseAddress);
     return false;
   }
 
