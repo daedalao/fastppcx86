@@ -53,6 +53,16 @@ DEF_OP(InlineConstant)         { /* nop — handled by IsInlineConstant */ }
 DEF_OP(InlineEntrypointOffset) { /* nop */ }
 
 DEF_OP(CycleCounter) {
+  auto Op = IROp->C<IR::IROp_CycleCounter>();
+  if (Op->SelfSynchronizingLoads) {
+    // The guest (RDTSCP) requires all prior instructions and loads to have
+    // completed before the counter read. Power ISA Book II prescribes `isync`
+    // for this: the timebase read may otherwise complete out of order.
+    // Deliberately NOT preceded by `hwsync` — Book II only calls for that when
+    // storage accesses must be ordered too, which this IR flag does not ask
+    // for, and this handler also serves plain RDTSC where it would be pure cost.
+    isync();
+  }
   // mftb reads the 64-bit time base register (SPR 268)
   mftb(GetReg(Node));
 }
