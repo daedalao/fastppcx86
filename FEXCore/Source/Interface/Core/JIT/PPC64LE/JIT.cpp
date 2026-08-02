@@ -2062,23 +2062,38 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
 // EmitEntryPoint: prologue emitted at the start of each JIT block
 // -------------------------------------------------------------------------
 // The caller binds HeaderLabel and reserves the JITCodeHeader before calling
-// us. We emit the InlineJITBlockHeader store for the cold path (first entry
-// via ExecuteThread, before FillStaticRegs runs), then FillStaticRegs, then
-// the optional TF check. Warm dispatcher entries skip FillStaticRegs but
-// still emit their own store in the per-block loop.
+// us. We emit an InlineJITBlockHeader store, then FillStaticRegs, then the
+// optional TF check.
+//
+// WARNING: none of it is reachable. See the comment on FillStaticRegs below.
+// The per-block loop emits its own InlineJITBlockHeader store and records the
+// entry points the dispatcher actually branches to; this sequence sits at
+// BlockBegin+4, which nothing branches to. Treat it as a structural
+// placeholder kept in parity with ARM64, and keep it correct against the day
+// trap-flag support makes it live.
 void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF) {
-  // Cold-path store — first execution enters here after FillStaticRegs is
-  // needed. Emitting the store here means any signal during FillStaticRegs
-  // finds a valid InlineJITBlockHeader pointing at this block's header
-  // rather than a stale one from the previous block.
+  // Would keep InlineJITBlockHeader pointing at this block's header rather
+  // than a stale one from the previous block if a signal arrived during
+  // FillStaticRegs -- but see above, execution never gets here.
   EmitStoreBlockBeginToInlineHeader(HeaderLabel);
 
-  // Fill SRA registers from the CpuStateFrame. NOTE: this only runs on the
-  // cold path (ExitFunctionLink slow return). The dispatcher's L1-hit path
-  // branches directly to CodeData.EntryPoints[Entry], which the caller sets
-  // AFTER this function returns, so warm dispatch skips this FillStaticRegs.
-  // SRA on warm dispatch is filled once by DispatcherLoopTopFillSRA before
-  // falling into the L1 lookup loop.
+  // Fill SRA registers from the CpuStateFrame.
+  //
+  // CORRECTION: an earlier comment here claimed this "only runs on the cold
+  // path (ExitFunctionLink slow return)". That is wrong. Everything this
+  // function emits is UNCONDITIONALLY UNREACHABLE in the current design.
+  // The only recorded entry into the block is CodeData.EntryPoints[Entry],
+  // which the caller sets AFTER this function returns and then overwrites
+  // again in the per-IR-block loop; nothing ever branches to BlockBegin+4.
+  // BlockBegin itself is only ever consumed as a header/tail base and a
+  // bounds check (Core.cpp:133-187, CodeCache.cpp), never as a branch target.
+  // SRA is filled instead by DispatcherLoopTopFillSRA, by ExitFunctionLinker,
+  // and by the signal-return path.
+  //
+  // So this is dead code -- roughly 70 unreachable instructions per compiled
+  // block -- kept only for structural parity with ARM64. Whether it should
+  // exist at all is a separate question; while it does, it must stay correct,
+  // because the day someone wires up trap-flag support it becomes live.
   FillStaticRegs();
 
   if (CheckTF) {
@@ -2086,7 +2101,11 @@ void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF
     int32_t eflags_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC]));
     lbz(TMP1, static_cast<int16_t>(eflags_off), STATE);
-    cmpdi(TMP1, 0);
+    // CR7, not CR0. CR0 holds the guest's packed NZCV N/Z bits that
+    // FillStaticRegs just wrote immediately above, and bare cmpdi defaults to
+    // CR0 (CodeEmitter/PPC64LE/Emitter.h:506). Same CR7 discipline as
+    // PPC64Dispatcher.cpp:321-333 and BranchOps.cpp:141-145,249-253.
+    cmpdi(cr(7), TMP1, 0);
     // If TF is set, branch to the interpreter
     // For now just skip — full TF handling added later
   }
