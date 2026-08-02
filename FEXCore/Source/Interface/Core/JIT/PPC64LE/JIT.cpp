@@ -2547,6 +2547,30 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   Tail->SpinLockFutex      = 0;
   Tail->SingleInst         = SingleInst;
 
+  // S3.7-C3: RELOC_GUEST_RIP_LITERAL for Tail->RIP so cache save/load
+  // rewrites it across sessions with different ASLR. Runtime reads the plain
+  // uint64_t written above; the relocation only kicks in when Relocations
+  // are retained (IsGeneratingCache || EnableCodeCacheValidation) and applied
+  // via ApplyCodeRelocations.
+  //
+  // Offset arithmetic: BlockBufferOffset (block start in whole buffer) plus
+  // CodeSize (bytes emitted before the tail — Align16B has already run at
+  // :2501, and CodeSize was captured at :2503 before this point; nothing else
+  // emits between there and here) plus offsetof(JITCodeTail, RIP). Do NOT
+  // use CodeBuffers.LatestOffset — it is bumped at :2526 and would be off by
+  // CodeSize. Do NOT port PlaceNamedSymbolLiteral: nothing in emitted code
+  // reads Tail->RIP (only C++ does), so there is no literal-pool label.
+  {
+    Relocation Reloc {};
+    Reloc.GuestRIP.Header = {
+      .Offset = BlockBufferOffset + static_cast<uint64_t>(CodeSize) + offsetof(CPUBackend::JITCodeTail, RIP),
+      .Type   = FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL,
+    };
+    Reloc.GuestRIP.GuestRIP      = Entry;
+    Reloc.GuestRIP.RegisterIndex = 0;   // unused for literals
+    Relocations.emplace_back(Reloc);
+  }
+
   auto* EntryLoc = reinterpret_cast<uint8_t*>(Tail) + sizeof(CPUBackend::JITCodeTail);
   auto* EntryBase = EntryLoc;
   uintptr_t PrevPCOffset  = 0;
