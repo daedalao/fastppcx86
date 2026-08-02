@@ -539,70 +539,35 @@ elseif (NOT TUNE_CPU STREQUAL "none")
   endif()
 endif()
 
-set(GIT_DESCRIBE_STRING "FEX-Unknown")
+# FEX build identity (GIT_DESCRIBE_STRING / GIT_HASH / GIT_HASH_ARRAY).
+#
+# The detection logic lives in Scripts/GenerateGitVersion.cmake so that the
+# configure-time run below and the build-time `git_version_header` target
+# (FEXCore/CMakeLists.txt) share one implementation. If they diverged, the
+# generated header would be rewritten on every build and cascade a rebuild.
+#
+# This configure-time run also writes ${CMAKE_BINARY_DIR}/generated/git_version.h,
+# so the header always exists before anything compiles, and leaves GIT_HASH /
+# GIT_DESCRIBE_STRING set for Source/Steam/VERSIONS.txt.in.
+#
+# OVERRIDE_VERSION / OVERRIDE_HASH remain the escape hatch for reproducible and
+# release builds; with OVERRIDE_HASH set to anything but "detect" no git command
+# is run at configure or build time.
+find_package(Git)
 
-if (OVERRIDE_VERSION STREQUAL "detect")
-  find_package(Git)
+set(GIT_VERSION_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/FEXCore/include/git_version.h.in")
+set(GIT_VERSION_OUTPUT "${CMAKE_BINARY_DIR}/generated/git_version.h")
+set(GIT_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/Scripts/GenerateGitVersion.cmake")
+set(FEX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
-  if (GIT_FOUND)
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} describe --abbrev=7
-      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-      OUTPUT_VARIABLE GIT_DESCRIBE_STRING
-      ERROR_QUIET
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
-  endif()
-else()
-  set(GIT_DESCRIBE_STRING "${OVERRIDE_VERSION}")
-endif()
-
-set(GIT_HASH "Unknown")
-
-if (OVERRIDE_HASH STREQUAL "detect")
-  find_package(Git)
-
-  if (GIT_FOUND)
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-      OUTPUT_VARIABLE GIT_HASH
-      ERROR_QUIET
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-    # Cache invalidation guard for uncommitted source changes.
-    # FEX code-cache uses GIT_HASH as the version key (CodeCache.cpp:358).
-    # Without this guard, a cached JIT blob compiled by a dirty binary will be
-    # loaded by a subsequently-rebuilt dirty binary, even when the source has
-    # changed and the resulting codegen differs.
-    # When the working tree has uncommitted changes, derive a fresh hash by
-    # SHA1-mixing HEAD with the diff content. Cmake-time only — re-run
-    # `cmake .` (or wipe ~/.cache/fex-emu/cache/) after editing source if you
-    # want the cache to invalidate. A build-time custom-command refresh is a
-    # follow-up.
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} diff HEAD --binary
-      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-      OUTPUT_VARIABLE GIT_DIRTY_DIFF
-      ERROR_QUIET)
-    if (NOT GIT_DIRTY_DIFF STREQUAL "")
-      string(SHA1 GIT_HASH "${GIT_HASH}${GIT_DIRTY_DIFF}")
-      message(STATUS "FEX commit (dirty-derived): ${GIT_HASH}")
-    endif()
-  endif()
-else()
-  set(GIT_HASH "${OVERRIDE_HASH}")
-endif()
+include("${GIT_VERSION_SCRIPT}")
 
 message(STATUS "FEX version: ${GIT_DESCRIBE_STRING}")
-message(STATUS "FEX commit: ${GIT_HASH}")
-
-# Prepends 0x to every two-character sequence in the hash,
-# OR the final character of the hash, to plumb it for C++ usage. e.g.:
-# -DOVERRIDE_HASH=123456aa => 0x12, 0x34, 0x56, 0xaa,
-# -DOVERRIDE_HASH=12345678a => 0x12, 0x34, 0x56, 0x78, 0xa,
-string(REGEX
-  REPLACE "(..|.$)" "0x\\1, "
-  GIT_HASH_ARRAY "${GIT_HASH}")
+if (GIT_VERSION_DIRTY)
+  message(STATUS "FEX commit (dirty-derived): ${GIT_HASH}")
+else()
+  message(STATUS "FEX commit: ${GIT_HASH}")
+endif()
 
 if (ENABLE_IWYU)
   find_program(IWYU_EXE
@@ -776,3 +741,29 @@ endif()
 if (NOT MINGW AND BUILD_STEAM_SUPPORT)
   add_subdirectory(Source/Steam/)
 endif()
+
+# Order the build-time git_version.h refresh ahead of the translation units
+# that #include it. Ninja gets the real dependency from the compiler-emitted
+# depfile, so a changed hash rebuilds these regardless; this edge is what makes
+# a *clean* build order the generation before the first compile.
+#
+# Nine translation units include git_version.h, across five targets:
+#   FEXCore_object  FEXCore/Source/Interface/Core/CodeCache.cpp
+#                   FEXCore/Source/Interface/Core/CPUID.cpp
+#   Common          Source/Common/SHMStats.cpp
+#   LinuxEmulation  Source/Tools/LinuxEmulation/LinuxSyscalls/EmulatedFiles/EmulatedFiles.cpp
+#                   Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/Info.cpp
+#                   Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.cpp
+#                   Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Info.cpp
+#   FEXGetConfig    Source/Tools/FEXGetConfig/Main.cpp
+#   FEXServer       Source/Tools/FEXServer/ArgumentLoader.cpp
+#
+# Guarded with if(TARGET) because everything under Source/Tools/ is skipped on
+# MINGW. If a consumer is ever added, add its target here; the configure-time
+# generation in Scripts/GenerateGitVersion.cmake keeps a missing edge from
+# breaking the build, it just costs that TU a stale hash until the next cmake.
+foreach (GIT_VERSION_CONSUMER FEXCore_object Common LinuxEmulation FEXGetConfig FEXServer)
+  if (TARGET ${GIT_VERSION_CONSUMER})
+    add_dependencies(${GIT_VERSION_CONSUMER} git_version_header)
+  endif()
+endforeach()

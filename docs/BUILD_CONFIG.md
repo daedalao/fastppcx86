@@ -78,6 +78,93 @@ alone — that skips TestHarnessRunner and every ctest run after fails with
   (`ar x deb && tar --zstd -xf data.tar.zst -C $ROOTFS`) — see
   `~/Downloads/thunk-dev-debs/` for the 25 packages the thunks tree needs.
 
+## Build identity / code-cache invalidation — 2026-08-01
+
+**This change forces a cmake reconfigure on the next build.** `CMakeLists.txt`
+and `FEXCore/CMakeLists.txt` both changed, so ninja re-runs cmake before the
+first compile. That is expected; nothing needs to be wiped.
+
+### What changed
+
+`git_version.h` is now regenerated at **build** time, not only at cmake
+configure time.
+
+- `Scripts/GenerateGitVersion.cmake` is the single implementation of the
+  build-identity computation. It is `include()`d by the top-level
+  `CMakeLists.txt` at configure time (which also guarantees the header exists
+  before anything compiles, and leaves `GIT_HASH` / `GIT_DESCRIBE_STRING` set
+  for `Source/Steam/VERSIONS.txt.in`), and re-run via `cmake -P` by the
+  `git_version_header` custom target on every `ninja` invocation.
+- The two call sites must stay in lockstep. If they ever computed different
+  content, the header would be rewritten on every build and cascade a rebuild
+  of its consumers — which is why the logic lives in one file rather than
+  being duplicated.
+
+### Why
+
+`FEXCore/Source/Interface/Core/CodeCache.cpp` gates code-cache loads on
+`GIT_HASH` and on nothing else that tracks the build. The header check is
+`Magic` / `FormatVersion` / `FEXVersion` / non-zero block count — no mtime, no
+path, no size. With configure-time-only detection, an incremental `ninja`
+after a JIT source edit produces a binary that happily loads caches emitted by
+the *previous* build, so an A/B measurement across a codegen change compares
+old code against old code and reads as "no regression".
+
+`EnableCodeCachingWIP` defaults false, so this is a **benchmarking gate, not a
+live correctness bug**. It matters when measuring, not when running.
+
+### What the hash covers
+
+| Covered | Not covered |
+|---|---|
+| `git rev-parse HEAD` | Untracked files (`git diff HEAD` does not see them) |
+| `git diff HEAD --binary -- ':!External'` — every tracked, modified, non-submodule file in the tree, including `Source/` (volatile-metadata handling, Mono detection) and `Config.json.in` (defaults compile into `ConfigValues.inl`) | Uncommitted working-tree edits *inside* a submodule under `External/` |
+| Submodule pointer bumps — a changed gitlink is a change to the top-level tree, so it still shows in the diff | Compiler version / CMake options / `CMAKE_BUILD_TYPE` (they were never covered) |
+
+The `':!External'` exclusion is the only narrowing versus the previous
+whole-tree `git diff`, and it is deliberate. `External/` is ~554 MB across 16
+submodules and is essentially the entire cost. Measured on the aarch64 host:
+whole-tree `git diff HEAD --binary` 76.6 s cold / ~2.1 s warm; with
+`':!External'` ~0.7 s. Exclusion verified in this repo: `git ls-files` 3329
+paths, `git ls-files -- ':!External'` 3188, `git ls-files -- External` 141.
+
+A previously proposed variant that hashed only `FEXCore/Source`,
+`FEXCore/include` and `CodeEmitter` was **rejected** — it drops `Source/` and
+`Config.json.in`, both of which affect codegen. Do not reintroduce it.
+
+### Requirements and costs
+
+- **git >= 1.9** on the build host, for magic pathspec (`:!`) support.
+- Every `ninja` invocation, including a no-op one, now runs one `git rev-parse`
+  plus one `git diff` (~0.7 s measured on aarch64; faster on the POWER9 box)
+  and prints `Refreshing FEX build identity (git_version.h)`.
+- A no-op build does **not** recompile anything. The generator ends in
+  `configure_file()`, which does not rewrite unchanged content, and the target
+  declares the header as `BYPRODUCTS` so Ninja's `restat` stops the edge there.
+  Verified on a standalone ninja reproducer: repeated no-op builds run only the
+  refresh step; a dirty-tree edit changes the hash and rebuilds exactly the
+  consuming TU plus the link, leaving unrelated objects alone.
+- When the hash does change, nine translation units rebuild plus their links:
+  `FEXCore/Source/Interface/Core/{CodeCache,CPUID}.cpp`,
+  `Source/Common/SHMStats.cpp`,
+  `Source/Tools/LinuxEmulation/LinuxSyscalls/{EmulatedFiles/EmulatedFiles,Syscalls/Info,ThreadManager,x32/Info}.cpp`,
+  `Source/Tools/FEXGetConfig/Main.cpp`, `Source/Tools/FEXServer/ArgumentLoader.cpp`.
+  Their five targets (`FEXCore_object`, `Common`, `LinuxEmulation`,
+  `FEXGetConfig`, `FEXServer`) carry an `add_dependencies` edge on
+  `git_version_header` at the end of the top-level `CMakeLists.txt`. **If you
+  add a new `#include <git_version.h>`, add its target there.**
+
+### Escape hatch — unchanged
+
+`-DOVERRIDE_HASH=<hex>` and `-DOVERRIDE_VERSION=<string>` still bypass
+detection entirely, for reproducible and release builds. With `OVERRIDE_HASH`
+set to anything but `detect`, no git command runs at configure or build time.
+
+| Option             | Value      | Why |
+|--------------------|------------|-----|
+| `OVERRIDE_HASH`    | `detect`   | Default. Leave it for development so code-cache invalidation tracks the working tree. Pin it for release/reproducible builds. |
+| `OVERRIDE_VERSION` | `detect`   | Default. Note `git describe --abbrev=7` fails in this repo (no tags), so `GIT_DESCRIBE_STRING` renders empty — pre-existing behaviour, unchanged by this commit. |
+
 ## Corollaries — reproducing a known-good commit
 
 A `git worktree add <commit>` inherits the **source** at that commit only. It
