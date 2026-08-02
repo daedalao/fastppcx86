@@ -44,6 +44,67 @@ constexpr auto VTMP1 = VR{30};
 constexpr auto VTMP2 = VR{31};
 
 // -------------------------------------------------------------------------
+// ELFv2 volatility boundaries, plus the compile-time checks that keep each
+// mode's "which pool registers survive a host call" answer honest.
+//
+// PPC64LE ELFv2 §2.2: r0-r13 and v0-v19 are volatile (caller-saved); r14-r31
+// and v20-v31 are non-volatile (callee-saved). CALLER_GPR_MASK /
+// CALLER_FPR_MASK below encode the same fact for the mask-driven paths.
+//
+// These predicates exist because a register pool edit that pulls a volatile
+// register into RA or RAFPR turns every host call that does not save it into
+// a silent miscompiler. Nothing in the backend would notice at runtime; the
+// symptom is rare, non-deterministic wrong results. Fail the build instead.
+// -------------------------------------------------------------------------
+namespace RegVolatility {
+  constexpr uint32_t kFirstNonVolatileGPR = 14;  // r14-r31 callee-saved
+  constexpr uint32_t kFirstNonVolatileVR  = 20;  // v20-v31 callee-saved
+
+  // Every element of a GPR pool is callee-saved.
+  template<size_t N>
+  constexpr bool AllGPRsNonVolatile(const std::array<GPR, N>& Pool) {
+    for (const auto& R : Pool) {
+      if (R.idx < kFirstNonVolatileGPR) { return false; }
+    }
+    return true;
+  }
+
+  template<size_t N>
+  constexpr bool ContainsVR(const std::array<VR, N>& Set, uint32_t Idx) {
+    for (const auto& R : Set) {
+      if (R.idx == Idx) { return true; }
+    }
+    return false;
+  }
+
+  // Every pool element NOT named in the declared volatile list is callee-saved
+  // — i.e. the list does not under-report.
+  template<size_t N, size_t M>
+  constexpr bool UnlistedVRsAreNonVolatile(const std::array<VR, N>& Pool,
+                                           const std::array<VR, M>& Volatile) {
+    for (const auto& R : Pool) {
+      if (!ContainsVR(Volatile, R.idx) && R.idx < kFirstNonVolatileVR) { return false; }
+    }
+    return true;
+  }
+
+  // The declared volatile list is EXACTLY the pool's volatile elements, in
+  // pool order — i.e. it neither under- nor over-reports. This is what stops
+  // the two lists drifting apart under a future pool edit.
+  template<size_t N, size_t M>
+  constexpr bool VolatileListIsExact(const std::array<VR, N>& Pool,
+                                     const std::array<VR, M>& Volatile) {
+    size_t i = 0;
+    for (const auto& R : Pool) {
+      if (R.idx >= kFirstNonVolatileVR) { continue; }
+      if (i >= M || Volatile[i].idx != R.idx) { return false; }
+      ++i;
+    }
+    return i == M;
+  }
+}
+
+// -------------------------------------------------------------------------
 // Register allocation tables (x86-64 mode)
 // -------------------------------------------------------------------------
 namespace x64 {
@@ -78,6 +139,31 @@ namespace x64 {
     VR{24}, VR{25}, VR{26}, VR{27},
     VR{28}, VR{29},
   };
+
+  // The subset of RAFPR that ELFv2 does NOT preserve across a call. Any host
+  // call that does not save these destroys the JIT-internal vector SSA values
+  // living in them — and the register allocator hands out the lowest free
+  // index first (RegisterAllocationPass.cpp:479), so RAFPR[0] = v16 is the
+  // FIRST vector value allocated in any block. Drive every such save/restore
+  // loop off THIS array so there is exactly one list.
+  constexpr std::array<VR, 4> RAFPRVolatile = {
+    VR{16}, VR{17}, VR{18}, VR{19},
+  };
+
+  // There is deliberately NO RAVolatile. RA is r24, r25, r26, r30, r31 — all
+  // >= r14, hence all callee-saved — so the volatile GPR subset is empty in
+  // this mode (and in x32). Asserted below rather than declared as an empty
+  // array that every callsite would have to iterate zero times.
+  static_assert(RegVolatility::AllGPRsNonVolatile(RA),
+                "x64 RA contains an ELFv2-volatile GPR. It would be destroyed across any "
+                "host call that saves only static registers (DEF_OP(Syscall)). Move it "
+                "back above r14, or add an RAVolatile array plus save/restore loops.");
+  static_assert(RegVolatility::UnlistedVRsAreNonVolatile(RAFPR, RAFPRVolatile),
+                "x64 RAFPR contains an ELFv2-volatile vector register that RAFPRVolatile "
+                "does not list. DEF_OP(Syscall) would not save it.");
+  static_assert(RegVolatility::VolatileListIsExact(RAFPR, RAFPRVolatile),
+                "x64 RAFPRVolatile has drifted from RAFPR. It must be exactly the RAFPR "
+                "entries with index < 20, in pool order.");
 
   // PushDynamicRegs/PopDynamicRegs spill-frame layout (ELFv2, x64 guest).
   //
@@ -122,6 +208,26 @@ namespace x32 {
     VR{16}, VR{17}, VR{18}, VR{19}, VR{20}, VR{21}, VR{22}, VR{23},
     VR{24}, VR{25}, VR{26}, VR{27}, VR{28}, VR{29},
   };
+
+  // As x64::RAFPRVolatile — the ELFv2-volatile subset of the pool. x32's pool
+  // starts at v8, so twelve of its twenty-two entries are volatile, and
+  // RAFPR[0] = v8 is the first vector value the allocator hands out.
+  constexpr std::array<VR, 12> RAFPRVolatile = {
+    VR{8},  VR{9},  VR{10}, VR{11}, VR{12}, VR{13}, VR{14}, VR{15},
+    VR{16}, VR{17}, VR{18}, VR{19},
+  };
+
+  // No RAVolatile here either — x32 RA is r16-r26, r30, r31, all callee-saved.
+  static_assert(RegVolatility::AllGPRsNonVolatile(RA),
+                "x32 RA contains an ELFv2-volatile GPR. It would be destroyed across any "
+                "host call that saves only static registers (DEF_OP(Syscall)). Move it "
+                "back above r14, or add an RAVolatile array plus save/restore loops.");
+  static_assert(RegVolatility::UnlistedVRsAreNonVolatile(RAFPR, RAFPRVolatile),
+                "x32 RAFPR contains an ELFv2-volatile vector register that RAFPRVolatile "
+                "does not list. DEF_OP(Syscall) would not save it.");
+  static_assert(RegVolatility::VolatileListIsExact(RAFPR, RAFPRVolatile),
+                "x32 RAFPRVolatile has drifted from RAFPR. It must be exactly the RAFPR "
+                "entries with index < 20, in pool order.");
 
   // ELFv2 96-byte reservation as x64 above. Same reasoning; the x32 numbers
   // work out to 208 for kDynFPRStart and 560 for kDynRegSaveSize.

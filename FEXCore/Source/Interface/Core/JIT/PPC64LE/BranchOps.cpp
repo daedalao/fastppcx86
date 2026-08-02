@@ -352,12 +352,15 @@ DEF_OP(Syscall) {
     std(TMP1, static_cast<int16_t>(isi_off), STATE);
   }
 
-  // Create a mini-frame for the C call.  Layout (160 bytes, 16-byte aligned):
-  //   [r1+ 0]:                 back chain (old r1)
-  //   [r1+ 8..31]:             ELFv2 linkage area (CR/LR/TOC save for HandleSyscall)
-  //   [r1+32..95]:             ELFv2 parameter save area (8 doublewords, callee-scratch)
-  //   [r1+96..151]:            SyscallArguments (7 × 8 = 56 bytes)
+  // Create a mini-frame for the C call.  Layout (16-byte aligned):
+  //   [r1+  0]:                back chain (old r1)
+  //   [r1+  8..31]:            ELFv2 linkage area (CR/LR/TOC save for HandleSyscall)
+  //   [r1+ 32..95]:            ELFv2 parameter save area (8 doublewords, callee-scratch)
+  //   [r1+ 96..151]:           SyscallArguments (7 × 8 = 56 bytes)
   //   [r1+152..159]:           padding
+  //   [r1+160..]:              volatile dynamic-FPR save area (see below):
+  //                            4 × 16 = 64 bytes in x64 mode  -> frame 224
+  //                            12 × 16 = 192 bytes in x32 mode -> frame 352
   //
   // SyscallArguments MUST live above the 96-byte ELFv2 linkage+param block:
   // the parameter save area is defined by ELFv2 §2.2.2 as callee-scratch --
@@ -365,8 +368,54 @@ DEF_OP(Syscall) {
   // freely, so putting SyscallArguments there and handing HandleSyscall an
   // r5 pointer into it was a data hazard. Move the SSA-source pack to +96
   // and grow the frame to 160B to keep 16B alignment.
+  //
+  // ---- Volatile dynamic-FPR save area ----------------------------------
+  // This op spills STATIC registers only, and on Linux `syscall` is NOT
+  // block-end (X86Tables.h:409-414 adds FLAGS_BLOCK_END on _WIN32 only), so
+  // JIT-internal vector SSA values are routinely live across the bctrl. The
+  // named-vector-constant cache is per-BLOCK and survives FlushRegisterCache
+  // (OpcodeDispatcher.h:2288, sole clear at :167 on block reset), and such
+  // values are never rematerialised (RegisterAllocationPass.cpp:126-128 --
+  // only OP_CONSTANT is). The allocator hands out the lowest free index
+  // (:479), i.e. RAFPR[0] = v16 in x64 and v8 in x32, and both are
+  // ELFv2-volatile. So the first FPR value allocated in a block was being
+  // silently destroyed by any syscall in that block.
+  //
+  // Guest XMM state was never at risk -- SRAFPR is spilled by
+  // SpillStaticRegs. The exposure is JIT-internal temporaries, which is why
+  // it presented as rare non-deterministic wrong results rather than as a
+  // reproducible failure.
+  //
+  // Saved into this op's OWN mini-frame rather than via PushDynamicRegs:
+  // that helper would pay a second stdu and a second 96-byte linkage
+  // reservation on top of the one already reserved here, and would save the
+  // non-volatile half of the pool for nothing. The loop is driven off
+  // RAFPRVolatile so there is still exactly one list; the static_asserts in
+  // ArchHelpers/PPC64Emitter.h are what keep that list in step with RAFPR.
+  //
+  // The dynamic GPR pool needs no equivalent: RA is r24-r26/r30-r31 (x64) and
+  // r16-r26/r30-r31 (x32), all ELFv2 callee-saved. Asserted in the header.
+  //
+  // Signal safety is unchanged: these are IR SSA temporaries, not guest
+  // state, so SpillSRA never reads them. On an abandon/restart path the
+  // restore below simply does not run, exactly as before.
   static_assert(FEXCore::HLE::SyscallArguments::MAX_ARGS == 7);
-  stdu(r1, -160, r1);
+
+  constexpr int kFPRSaveOff = 160;
+  const auto RAFPRVolatile = CTX->Config.Is64BitMode()
+                               ? std::span<const VR>(x64::RAFPRVolatile)
+                               : std::span<const VR>(x32::RAFPRVolatile);
+  const int16_t FrameSize =
+    static_cast<int16_t>(kFPRSaveOff + RAFPRVolatile.size() * 16);
+
+  stdu(r1, static_cast<int16_t>(-FrameSize), r1);
+
+  // Save the volatile dynamic FPRs. r1 is 16-byte aligned per ELFv2 and every
+  // offset is a multiple of 16, so stvx's address masking is a no-op.
+  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
+    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
+    stvx(RAFPRVolatile[i], r1, TMP1);
+  }
 
   // Fill SyscallArguments from the IR op's source nodes.
   // After SpillStaticRegs the physical SRA registers still hold the live values.
@@ -421,8 +470,15 @@ DEF_OP(Syscall) {
   // everything that follows.
   mr(GetReg(Node), r3);
 
+  // Restore the volatile dynamic FPRs. Deliberately after both consumers of
+  // r3 above, because the loop uses TMP1 (= r3) to form the index.
+  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
+    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
+    lvx(RAFPRVolatile[i], r1, TMP1);
+  }
+
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
-  addi(r1, r1, 160);
+  addi(r1, r1, FrameSize);
   FillStaticRegs();
   // HandleSyscall is a host C function; r0 was clobbered. Restore the JIT's
   // r0=0 zero-index invariant before falling back into JIT code that uses
