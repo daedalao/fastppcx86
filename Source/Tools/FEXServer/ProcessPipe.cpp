@@ -599,6 +599,19 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
       FEXCore::ExecutableFileInfo MainFileId = {nullptr, filename_hash, fextl::string(Tmp, TmpLen)};
       fmt::print("Requested {}cache generation for {}\n", HasMultiblock ? "" : "nomb-", MainFileId.Filename);
 
+      // NOTE: the `false` below is deliberate and must stay until T1/T3 land. Code map filenames are
+      // variant-suffixed (every other GetBaseFilename call in this file passes !HasMultiblock), but cache
+      // filenames are not: the writer (FEXOfflineCompiler/Main.cpp, GenerateSingleCache) and both readers
+      // (LinuxEmulation SyscallsSMCTracking.cpp LoadCodeCache, Windows Common/ImageTracker.cpp) all pass
+      // false, so a `-nomb` cache file is never created and never opened. Passing !HasMultiblock here would
+      // only point the staleness test below at a path nothing in the tree ever writes, so every nomb
+      // request would see a "missing" cache and trigger an unconditional offline recompile.
+      //
+      // The real defect is that the multiblock and no-multiblock code maps for one binary compile down to a
+      // single shared cache file which they overwrite in turn, so a nomb process can load multiblock code
+      // and vice versa, and the mtime test cannot distinguish the two. The fix is to encode the generating
+      // config in the cache filename across writer and readers together; that is queued as T1/T3 in
+      // docs/TASK_QUEUE.md. Do not paper over it by desynchronising this call site from its consumers.
       auto GetCacheFilename = [](const FEXCore::ExecutableFileInfo& FileId) {
         return fmt::format("{}cache/{}-{:016x}", FEX::Config::GetCacheDirectory(), FEXCore::CodeMap::GetBaseFilename(FileId, false),
                            0 /* TODO: Use unique cache id */);
@@ -614,7 +627,9 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
           continue;
         }
 
-        // Trigger cache generation for this file if no cache exists or if the cache is older than the most recent update to its code map
+        // Trigger cache generation for this file if no cache exists or if the cache is older than the most recent update to its code map.
+        // The cache side of this comparison is variant-agnostic while the code map side is not; see the note on GetCacheFilename above
+        // for why that cannot be fixed here (T1/T3).
         std::error_code ec;
         const auto BinaryName = FEXCore::CodeMap::GetBaseFilename(FileInfo, !HasMultiblock);
         const auto MergedCodeMapFilename = fmt::format("{}/{}", ReadyCodeMapDirectory, BinaryName);
