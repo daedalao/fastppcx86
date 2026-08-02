@@ -440,12 +440,28 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   CTX.LatestOffset += Delta;
 
   while (CTX.LatestOffset + header.CodeBufferSize > CodeBuffer->UsableSize()) {
-    if (Thread) {
-      CTX.ClearCodeCache(Thread);
-      CodeBuffer = CTX.GetLatest();
-      LogMan::Msg::IFmt("Increased code buffer size to {} MiB for cache load", CodeBuffer->AllocatedSize / 1024 / 1024);
-    } else {
+    if (!Thread) {
       ERROR_AND_DIE_FMT("Cannot extend codebuffer without thread!");
+    }
+
+    const size_t PrevUsableSize = CodeBuffer->UsableSize();
+    CTX.ClearCodeCache(Thread);
+    CodeBuffer = CTX.GetLatest();
+    LogMan::Msg::IFmt("Increased code buffer size to {} MiB for cache load", CodeBuffer->AllocatedSize / 1024 / 1024);
+
+    // F1: StartLargerCodeBuffer grows geometrically but saturates at
+    // MAX_CODE_SIZE, so once the buffer stops growing this condition can never
+    // become false: the loop would spin forever, mapping and unmapping a
+    // 128 MiB region on every iteration. header.CodeBufferSize is read straight
+    // out of the file and is not otherwise validated, so a corrupt or hostile
+    // header reaches this. A cache this build generated cannot (the generator
+    // is itself bounded by the same UsableSize), so this is hardening, not a
+    // live hang. Same shape as the PPC64 JIT's rotation guard in
+    // JIT/PPC64LE/JIT.cpp.
+    if (CodeBuffer->UsableSize() <= PrevUsableSize) {
+      ERROR_AND_DIE_FMT("Code cache for {} declares a {} byte code buffer, but the maximum code buffer only has {} usable bytes. "
+                        "Refusing to spin re-allocating it.",
+                        BinarySection.FileInfo.Filename, header.CodeBufferSize, CodeBuffer->UsableSize());
     }
   }
 
@@ -567,9 +583,19 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
   auto NewCodeBuffer = ValidationCTX->GetLatest();
   while (CachedCode.size_bytes() > NewCodeBuffer->UsableSize()) {
+    const size_t PrevUsableSize = NewCodeBuffer->UsableSize();
     ValidationCTX->ClearCodeCache(ValidationThread.get());
     NewCodeBuffer = ValidationCTX->GetLatest();
     LogMan::Msg::IFmt("Increased cache validation code buffer size to {} MiB", NewCodeBuffer->AllocatedSize / 1024 / 1024);
+
+    // F1: see the matching guard on the load path. Validation is optional, so
+    // skip it rather than killing the process.
+    if (NewCodeBuffer->UsableSize() <= PrevUsableSize) {
+      LogMan::Msg::EFmt("Cache validation skipped for {}: {} bytes of cached code do not fit the maximum validation code buffer ({} usable "
+                        "bytes)",
+                        Section.FileInfo.Filename, CachedCode.size_bytes(), NewCodeBuffer->UsableSize());
+      return;
+    }
   }
 
   std::span<std::byte> CodeBufferRangeRef =
