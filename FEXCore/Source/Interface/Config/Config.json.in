@@ -326,6 +326,17 @@
           "Can be very slow."
         ]
       },
+      "JITOpSizeProfile": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "PPC64LE only: measure how many host bytes each IR op expands to.",
+          "Accumulates count/total/max host bytes per IROps enum value and",
+          "periodically rewrites /tmp/fex-jit-opsize-<pid>.txt.",
+          "Used to validate the JIT's kMaxHostBytesPerIROp code-buffer reserve.",
+          "Grep the dump for IROP_OVER_BUDGET and BLOCK_BUDGET."
+        ]
+      },
       "InjectLibSegFault": {
         "Type": "bool",
         "Default": "false",

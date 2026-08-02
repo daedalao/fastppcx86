@@ -34,6 +34,7 @@ option(ENABLE_WERROR "Enable -Werror" FALSE)
 option(ENABLE_FEX_ALLOCATOR "Enable allocator for FEX" TRUE)
 option(ENABLE_JEMALLOC_GLIBC_ALLOC "Enable jemalloc glibc allocator" TRUE)
 option(ENABLE_OFFLINE_TELEMETRY "Enable FEX offline telemetry" TRUE)
+option(ENABLE_JIT_OPSIZE_PROFILE "Enable the PPC64LE JIT per-IR-op host-expansion profiler (runtime opt-in via FEX_JITOPSIZEPROFILE)" FALSE)
 option(ENABLE_COMPILE_TIME_TRACE "Enable time trace compile option" FALSE)
 option(ENABLE_LIBCXX "Use LLVM's libc++ instead of the GNU libstdc++" FALSE)
 option(ENABLE_CCACHE "Enable ccache for build caching" TRUE)
@@ -303,6 +304,12 @@ endif()
 if (NOT ENABLE_OFFLINE_TELEMETRY)
   # Disable FEX offline telemetry entirely if asked
   add_compile_definitions(FEX_DISABLE_TELEMETRY=1)
+endif()
+
+if (NOT ENABLE_JIT_OPSIZE_PROFILE)
+  # Compile the PPC64LE JIT op-size profiler out entirely. When enabled at
+  # build time it is still runtime-off unless FEX_JITOPSIZEPROFILE=1.
+  add_compile_definitions(FEX_DISABLE_JIT_OPSIZE_PROFILE=1)
 endif()
 
 if (ENABLE_UBSAN)

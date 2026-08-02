@@ -30,14 +30,22 @@ $end_info$
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/string.h>
+#include <FEXCore/fextl/vector.h>
 
 #include <execinfo.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cfenv>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string_view>
 #include <unistd.h>
 
 namespace FEXCore::CPU {
@@ -2106,6 +2114,331 @@ void PPC64JITCore::EmitSuspendInterruptCheck() {
   stb(r(0), FaultOff, STATE);
 }
 
+// ---------------------------------------------------------------------------
+// Code-buffer reserve constants
+// ---------------------------------------------------------------------------
+// These were function-local constexprs inside CompileCode. They are at
+// namespace scope now purely so the op-size profiler below can print the
+// budget it is measuring against; the VALUES ARE UNCHANGED. See the long
+// comment at the capacity guard in CompileCode for what they mean and why the
+// reserve has to scale with the IR size.
+//
+// kMaxHostBytesPerIROp is a *claim*, not a measurement. That is what the
+// profiler below exists to check.
+constexpr size_t kMaxHostBytesPerIROp = 128;
+constexpr size_t kMaxRIPEntryBytesPerIROp = 16;
+
+// ---------------------------------------------------------------------------
+// IR op host-expansion profiler (diagnostic; off by default)
+// ---------------------------------------------------------------------------
+// Records, per IROps enum value, how many host bytes the JIT actually emitted
+// for that op: count, total, and — the number that matters — the maximum,
+// together with the guest RIP of the block the maximum was seen in.
+//
+// Enabled at build time by default; compiled to nothing with
+// -DENABLE_JIT_OPSIZE_PROFILE=OFF (defines FEX_DISABLE_JIT_OPSIZE_PROFILE).
+// Enabled at runtime with FEX_JITOPSIZEPROFILE=1. When runtime-off the only
+// cost in the emission loop is one already-loaded boolean test per IR op.
+//
+// Dump mechanism: the whole table is re-serialised and atomically renamed over
+// /tmp/fex-jit-opsize-<pid>.txt. This deliberately does NOT go through
+// FEXCore::Telemetry, which only writes on a clean exit(0) — the workloads we
+// need this for hang or get killed. The rewrite is triggered:
+//   * immediately whenever any per-op maximum increases (rare, and it is the
+//     only value that can change the conclusion), and
+//   * every kDumpIntervalBlocks compiled blocks, to refresh counts/totals.
+// So the maxima on disk are always current as of the last time one moved, even
+// under SIGKILL. See the caveat list next to Dump() for what this misses.
+#ifndef FEX_DISABLE_JIT_OPSIZE_PROFILE
+namespace OpSizeProfile {
+
+// Synthetic buckets sit immediately after the real IROps range. IROps::OP_LAST
+// is not a dispatchable op (its name is "Last"), so index OP_LAST is reused for
+// "op index out of range", which is the Op_Unhandled fallback path in the
+// emission loop.
+enum Bucket : size_t {
+  BUCKET_UNKNOWN_OP = static_cast<size_t>(IR::IROps::OP_LAST),
+  BUCKET_COMPILECODE_PREAMBLE,   // JITCodeHeader + EmitEntryPoint, once per CompileCode
+  BUCKET_ENTRYPOINT_PROLOGUE,    // per IR block tagged EntryPoint
+  BUCKET_TAIL_AND_RIP_ENTRIES,   // JITCodeTail + vl64pair entries + the TAIL's 16-byte pad.
+                                 // NOT the Align16B() pad at the end of the code region --
+                                 // that is up to 12 bytes of nops charged to no bucket, so
+                                 // bucket-sum and block-total legitimately differ by 0-12.
+  BUCKET_COUNT,
+};
+
+static std::string_view NameOf(size_t Index) {
+  switch (Index) {
+  case BUCKET_UNKNOWN_OP: return "<UnknownOp>";
+  case BUCKET_COMPILECODE_PREAMBLE: return "<CompileCodePreamble>";
+  case BUCKET_ENTRYPOINT_PROLOGUE: return "<EntryPointPrologue>";
+  case BUCKET_TAIL_AND_RIP_ENTRIES: return "<TailAndRIPEntries>";
+  default: break;
+  }
+  return IR::GetName(static_cast<IR::IROps>(Index));
+}
+
+struct Slot {
+  std::atomic<uint64_t> Count {0};
+  std::atomic<uint64_t> TotalBytes {0};
+  std::atomic<uint64_t> MaxBytes {0};
+  std::atomic<uint64_t> MaxRIP {0};
+};
+
+// Process-wide, not per-thread: the question is about the op, not the thread.
+// Every writer below runs inside CompileCode, which holds
+// CodeBuffers.CodeBufferWriteMutex for its whole emission window, so these are
+// already serialised between JIT threads; the atomics are for the benefit of a
+// reader (Dump) that could in principle run from another thread.
+static std::array<Slot, static_cast<size_t>(BUCKET_COUNT)> Slots {};
+
+static std::atomic<uint64_t> BlocksCompiled {0};
+static std::atomic<uint64_t> MaxBlockBytes {0};
+static std::atomic<uint64_t> MaxBlockBytesRIP {0};
+static std::atomic<uint64_t> MaxBlockBytesSSA {0};
+// Whole-block host bytes divided by SSA count, scaled by 256 so the comparison
+// keeps sub-byte resolution without floating point. This is the number the
+// reserve arithmetic in CompileCode actually depends on.
+static std::atomic<uint64_t> MaxScaledBytesPerSSA {0};
+static std::atomic<uint64_t> MaxBytesPerSSARIP {0};
+static std::atomic<uint64_t> MaxBytesPerSSABytes {0};
+static std::atomic<uint64_t> MaxBytesPerSSACount {0};
+
+static std::atomic<bool> MaximaMoved {false};
+
+static constexpr uint64_t kBytesPerSSAScale = 256;
+static constexpr uint64_t kDumpIntervalBlocks = 512;
+
+static void Record(size_t Index, uint64_t Bytes, uint64_t RIP) {
+  auto& S = Slots[Index];
+  S.Count.fetch_add(1, std::memory_order_relaxed);
+  S.TotalBytes.fetch_add(Bytes, std::memory_order_relaxed);
+
+  uint64_t Prev = S.MaxBytes.load(std::memory_order_relaxed);
+  while (Bytes > Prev) {
+    if (S.MaxBytes.compare_exchange_weak(Prev, Bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      S.MaxRIP.store(RIP, std::memory_order_relaxed);
+      MaximaMoved.store(true, std::memory_order_relaxed);
+      break;
+    }
+  }
+}
+
+// Serialise the whole table and replace the dump file atomically (write to a
+// sibling .tmp, then rename). Atomic replace matters because the trigger for
+// this is "the guest may be about to be killed": a partially written file
+// would be indistinguishable from a short one.
+//
+// What this does NOT cover:
+//   * counts/totals can lag by up to kDumpIntervalBlocks compiles on an abrupt
+//     kill. Maxima cannot -- they are flushed the moment they move.
+//   * a crash *inside* an op handler: the bytes that handler had emitted so far
+//     are never attributed, because the delta is only taken after it returns.
+//   * ops emitted outside the per-op dispatch loop that are not one of the
+//     three synthetic buckets. There are none today; if the emission loop gains
+//     another out-of-band emit site it must get its own bucket, or the bucket
+//     totals will silently under-count the block. Note the BLOCK_BUDGET section
+//     prints reserve / observed-per-SSA / observed-max-block / verdict -- it
+//     does NOT print a bucket-sum residual, so such a gap would not announce
+//     itself. Compare bucket totals against block totals by hand if you suspect
+//     one, and expect a legitimate 0-12 byte discrepancy from the Align16B()
+//     pad (see BUCKET_TAIL_AND_RIP_ENTRIES).
+//   * a hang with no further compiles: the file is as of the last compile,
+//     which is what we want, but it will not be updated while the guest spins.
+static void Dump() {
+  static std::mutex DumpMutex;
+  std::lock_guard Guard {DumpMutex};
+
+  struct Row {
+    size_t Index;
+    uint64_t Count;
+    uint64_t Total;
+    uint64_t Max;
+    uint64_t RIP;
+  };
+
+  fextl::vector<Row> Rows;
+  Rows.reserve(BUCKET_COUNT);
+  for (size_t i = 0; i < BUCKET_COUNT; ++i) {
+    const uint64_t Count = Slots[i].Count.load(std::memory_order_relaxed);
+    if (!Count) {
+      continue;
+    }
+    Rows.push_back(Row {
+      .Index = i,
+      .Count = Count,
+      .Total = Slots[i].TotalBytes.load(std::memory_order_relaxed),
+      .Max = Slots[i].MaxBytes.load(std::memory_order_relaxed),
+      .RIP = Slots[i].MaxRIP.load(std::memory_order_relaxed),
+    });
+  }
+
+  std::sort(Rows.begin(), Rows.end(), [](const Row& a, const Row& b) {
+    if (a.Max != b.Max) {
+      return a.Max > b.Max;
+    }
+    return a.Total > b.Total;
+  });
+
+  const uint64_t Blocks = BlocksCompiled.load(std::memory_order_relaxed);
+
+  fextl::string Out;
+  Out += fextl::fmt::format("# FEX PPC64LE JIT per-IR-op host expansion profile\n");
+  Out += fextl::fmt::format("# pid={} compiles={} \n", ::getpid(), Blocks);
+  Out += fextl::fmt::format("# reserve model in CompileCode: SSACount * ({} + {}) bytes\n", kMaxHostBytesPerIROp, kMaxRIPEntryBytesPerIROp);
+  Out += fextl::fmt::format("# max_at_rip is the CompileCode Entry RIP of the block the maximum was seen in,\n"
+                            "# not the guest RIP of the individual instruction.\n\n");
+
+  // ---- The deliverable, first and impossible to miss. ----
+  // Grep `IROP_OVER_BUDGET ` (trailing space) for real IR ops that blow the
+  // budget; `IROP_OVER_BUDGET_INFO` for the synthetic per-block buckets, which
+  // are not bound by a per-op constant and are listed for completeness only.
+  size_t OverBudget = 0;
+  size_t OverBudgetInfo = 0;
+  fextl::string OverLines;
+  for (const auto& R : Rows) {
+    if (R.Max <= kMaxHostBytesPerIROp) {
+      continue;
+    }
+    const bool Synthetic = R.Index > static_cast<size_t>(IR::IROps::OP_LAST);
+    if (Synthetic) {
+      ++OverBudgetInfo;
+    } else {
+      ++OverBudget;
+    }
+    // over_x100 is max*100/budget, i.e. "812" means 8.12x the claimed bound.
+    OverLines += fextl::fmt::format("IROP_OVER_BUDGET{} name={} max={} budget={} over_by={} over_x100={} count={} max_at_rip={:#x}\n",
+                                    Synthetic ? "_INFO" : "", NameOf(R.Index), R.Max, kMaxHostBytesPerIROp, R.Max - kMaxHostBytesPerIROp,
+                                    (R.Max * 100) / kMaxHostBytesPerIROp, R.Count, R.RIP);
+  }
+
+  Out += fextl::fmt::format("################################################################################\n"
+                            "### OPS EXCEEDING kMaxHostBytesPerIROp ({} bytes): {} real, {} synthetic\n"
+                            "################################################################################\n",
+                            kMaxHostBytesPerIROp, OverBudget, OverBudgetInfo);
+  if (OverBudget || OverBudgetInfo) {
+    Out += OverLines;
+  } else {
+    Out += fextl::fmt::format("IROP_OVER_BUDGET_NONE (no op observed above {} bytes yet)\n", kMaxHostBytesPerIROp);
+  }
+  Out += "\n";
+
+  // ---- Whole-block budget: what the reserve arithmetic actually needs. ----
+  const uint64_t ScaledPerSSA = MaxScaledBytesPerSSA.load(std::memory_order_relaxed);
+  const uint64_t ReservePerSSA = kMaxHostBytesPerIROp + kMaxRIPEntryBytesPerIROp;
+  Out += fextl::fmt::format("################################################################################\n"
+                            "### BLOCK BUDGET (whole-CompileCode, the value the reserve really depends on)\n"
+                            "################################################################################\n");
+  Out += fextl::fmt::format("BLOCK_BUDGET reserve_bytes_per_ssa={} (kMaxHostBytesPerIROp={} + kMaxRIPEntryBytesPerIROp={})\n", ReservePerSSA,
+                            kMaxHostBytesPerIROp, kMaxRIPEntryBytesPerIROp);
+  Out += fextl::fmt::format("BLOCK_BUDGET observed_max_bytes_per_ssa={}.{:03} at_rip={:#x} block_bytes={} ssa_count={}\n",
+                            ScaledPerSSA / kBytesPerSSAScale, ((ScaledPerSSA % kBytesPerSSAScale) * 1000) / kBytesPerSSAScale,
+                            MaxBytesPerSSARIP.load(std::memory_order_relaxed), MaxBytesPerSSABytes.load(std::memory_order_relaxed),
+                            MaxBytesPerSSACount.load(std::memory_order_relaxed));
+  Out += fextl::fmt::format("BLOCK_BUDGET observed_max_block_bytes={} at_rip={:#x} ssa_count={}\n",
+                            MaxBlockBytes.load(std::memory_order_relaxed), MaxBlockBytesRIP.load(std::memory_order_relaxed),
+                            MaxBlockBytesSSA.load(std::memory_order_relaxed));
+  Out += fextl::fmt::format("BLOCK_BUDGET verdict={}\n\n", ScaledPerSSA > ReservePerSSA * kBytesPerSSAScale ? "SHORT" : "OK");
+
+  // ---- Full table, max descending. ----
+  Out += fextl::fmt::format("################################################################################\n"
+                            "### PER-OP TABLE (sorted by max host bytes, descending)\n"
+                            "################################################################################\n");
+  for (const auto& R : Rows) {
+    Out += fextl::fmt::format("IROP_SIZE max={:6} avg={:6} count={:10} total={:12} max_at_rip={:#018x} name={}\n", R.Max, R.Total / R.Count,
+                              R.Count, R.Total, R.RIP, NameOf(R.Index));
+  }
+
+  const auto Path = fextl::fmt::format("/tmp/fex-jit-opsize-{}.txt", ::getpid());
+  const auto TmpPath = Path + ".tmp";
+
+  const int FD = ::open(TmpPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+  if (FD == -1) {
+    return;
+  }
+
+  size_t Written = 0;
+  while (Written < Out.size()) {
+    const ssize_t Result = ::write(FD, Out.data() + Written, Out.size() - Written);
+    if (Result <= 0) {
+      break;
+    }
+    Written += static_cast<size_t>(Result);
+  }
+  ::close(FD);
+
+  if (Written == Out.size()) {
+    ::rename(TmpPath.c_str(), Path.c_str());
+  } else {
+    ::unlink(TmpPath.c_str());
+  }
+}
+
+// Called once per CompileCode, after the tail is sized. TotalBytes is the whole
+// span the block consumes in the code buffer (code + align + tail + RIP
+// entries), i.e. exactly what BlockHeadroom has to have covered.
+static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t TotalBytes) {
+  const uint64_t Blocks = BlocksCompiled.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  uint64_t PrevMax = MaxBlockBytes.load(std::memory_order_relaxed);
+  while (TotalBytes > PrevMax) {
+    if (MaxBlockBytes.compare_exchange_weak(PrevMax, TotalBytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      MaxBlockBytesRIP.store(Entry, std::memory_order_relaxed);
+      MaxBlockBytesSSA.store(SSACount, std::memory_order_relaxed);
+      MaximaMoved.store(true, std::memory_order_relaxed);
+      break;
+    }
+  }
+
+  if (SSACount) {
+    const uint64_t Scaled = (TotalBytes * kBytesPerSSAScale) / SSACount;
+    uint64_t PrevScaled = MaxScaledBytesPerSSA.load(std::memory_order_relaxed);
+    while (Scaled > PrevScaled) {
+      if (MaxScaledBytesPerSSA.compare_exchange_weak(PrevScaled, Scaled, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        MaxBytesPerSSARIP.store(Entry, std::memory_order_relaxed);
+        MaxBytesPerSSABytes.store(TotalBytes, std::memory_order_relaxed);
+        MaxBytesPerSSACount.store(SSACount, std::memory_order_relaxed);
+        MaximaMoved.store(true, std::memory_order_relaxed);
+        break;
+      }
+    }
+  }
+
+  if (MaximaMoved.exchange(false, std::memory_order_relaxed) || (Blocks % kDumpIntervalBlocks) == 0) {
+    Dump();
+  }
+}
+
+} // namespace OpSizeProfile
+
+// The `Enabled` argument is the single boolean test the requirement allows in
+// the hot path. It is read once per CompileCode into a local, so this is a
+// register test, not a config lookup.
+#define PPC64_OPSIZE_RECORD(Enabled, Index, Bytes, RIP) \
+  do {                                                  \
+    if (Enabled) {                                      \
+      OpSizeProfile::Record((Index), (Bytes), (RIP));   \
+    }                                                   \
+  } while (0)
+
+#define PPC64_OPSIZE_RECORD_BLOCK(Enabled, Entry, SSACount, Bytes)             \
+  do {                                                                        \
+    if (Enabled) {                                                            \
+      OpSizeProfile::RecordBlockAndMaybeDump((Entry), (SSACount), (Bytes));    \
+    }                                                                         \
+  } while (0)
+
+#else // FEX_DISABLE_JIT_OPSIZE_PROFILE
+
+#define PPC64_OPSIZE_RECORD(Enabled, Index, Bytes, RIP) \
+  do {                                                  \
+  } while (0)
+#define PPC64_OPSIZE_RECORD_BLOCK(Enabled, Entry, SSACount, Bytes) \
+  do {                                                             \
+  } while (0)
+
+#endif
+
 // -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
@@ -2115,6 +2448,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     FEXCore::Core::DebugData* DebugData_, bool CheckTF) {
 
   FEXCORE_PROFILE_SCOPED("PPC64JITCore::CompileCode");
+
+  // Op-size profiler gate. Read once per CompileCode from the already-cached
+  // config Getter, so the emission loop below only sees a local boolean.
+#ifndef FEX_DISABLE_JIT_OPSIZE_PROFILE
+  [[maybe_unused]] const bool OpSizeProfileEnabled = CTX->Config.JITOpSizeProfile();
+#else
+  [[maybe_unused]] constexpr bool OpSizeProfileEnabled = false;
+#endif
 
   // PPC64 emits directly into the shared CurrentCodeBuffer (unlike arm64,
   // which stages in a per-thread TempCodeBuffer and copies under the lock).
@@ -2236,8 +2577,9 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // re-acquiring CodeBufferLock, LatestOffset is 0 in the new buffer.
   // Loop, because one rotation only grows the buffer geometrically and a very
   // large block may need several before it fits.
-  constexpr size_t kMaxHostBytesPerIROp = 128;
-  constexpr size_t kMaxRIPEntryBytesPerIROp = 16;
+  // kMaxHostBytesPerIROp / kMaxRIPEntryBytesPerIROp now live at namespace scope
+  // (just above the op-size profiler) so the profiler can print the budget it
+  // is checking. Values are unchanged.
   const size_t BlockHeadroom = std::max<size_t>(
     1u << 20,
     IRView->GetSSACount() * (kMaxHostBytesPerIROp + kMaxRIPEntryBytesPerIROp) + sizeof(CPUBackend::JITCodeTail));
@@ -2326,6 +2668,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // INSIDE the for-loop, immediately after the EntryPoint recording, not
   // here.
   CodeData.EntryPoints[Entry] = GetCursorAddress<uint8_t*>();
+
+  // Everything emitted since SetBuffer (JITCodeHeader + EmitEntryPoint) is
+  // per-CompileCode overhead that no IR op pays for. Bucket it separately so
+  // the per-op numbers are not polluted and the block-level residual adds up.
+  // GetOffset() is block-relative here because SetBuffer reset it to 0.
+  PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_COMPILECODE_PREAMBLE, GetOffset(), Entry);
 
   // -------------------------------------------------------------------------
   // Dispatch table
@@ -2440,6 +2788,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
 
+    // Start of this IR block's out-of-band prologue (EntryPoint marker store,
+    // suspend check, spill-frame stdu). Attributed to a synthetic bucket, not
+    // to whichever IR op happens to be first in the block.
+    [[maybe_unused]] const size_t BlockPrologueStart = GetOffset();
+
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
@@ -2478,17 +2831,37 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     }
 
     // Intra-CompileCode jump label, bound AFTER the per-EntryPoint stdu.
+    // Bind() only patches already-emitted forward branches; it does not move
+    // the cursor, so the prologue delta is complete here.
     Bind(JumpTarget(BlockNode));
+
+    PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
       uint16_t Op = static_cast<uint16_t>(IROp->Op);
+
+      // Op-size profiler: the emitter cursor is the only ground truth for how
+      // much host code a handler produced. Sampling it immediately either side
+      // of the handler call is exact for this backend because PPC64 emits
+      // straight into the block's buffer window with no staging, no reordering
+      // and no post-hoc insertion — every byte a handler writes moves Offset,
+      // and nothing else moves Offset between these two reads. (Backpatching
+      // via Bind()/PatchPending rewrites bytes in place without advancing the
+      // cursor, so a forward branch resolved by a later op is still charged to
+      // the op that emitted it, which is what we want.)
+      [[maybe_unused]] const size_t OpStart = GetOffset();
 
       if (Op <= static_cast<uint16_t>(IR::IROps::OP_LAST)) {
         (this->*OpHandlers[Op])(IROp, CodeNode);
       } else {
         Op_Unhandled(IROp, CodeNode);
       }
+
+      PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
+                          Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? static_cast<size_t>(Op) :
+                                                                            static_cast<size_t>(OpSizeProfile::BUCKET_UNKNOWN_OP),
+                          GetOffset() - OpStart, Entry);
     }
   }
 
@@ -2615,6 +2988,15 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // capacity-checked against BlockHeadroom above so no compile can exceed
   // 4 GiB.
   CodeHeader->OffsetToBlockTail = static_cast<uint32_t>(CodeSize);
+
+  // Op-size profiler: charge the out-of-band tail region (JITCodeTail plus the
+  // vl64pair RIP entries plus the 16-byte alignment pad) to its own bucket —
+  // it is written by pointer arithmetic, never through the emitter cursor, so
+  // no per-op delta can see it. Then record the whole-CompileCode span, which
+  // is exactly what BlockHeadroom had to cover, and let the profiler decide
+  // whether to rewrite the dump.
+  PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_TAIL_AND_RIP_ENTRIES, TailAndEntriesAligned, Entry);
+  PPC64_OPSIZE_RECORD_BLOCK(OpSizeProfileEnabled, Entry, IRView->GetSSACount(), CodeSize + TailAndEntriesAligned);
 
   return CodeData;
 }
