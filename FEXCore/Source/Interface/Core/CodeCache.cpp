@@ -581,6 +581,16 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     }
   }
 
+  // Return the validation context to the state the next Validate call expects:
+  // no reference blocks in the lookup cache and a write offset of 0. The
+  // reference span below is always taken from offset 0, so leaving a non-zero
+  // LatestOffset behind would make the next run compare bytes it never wrote.
+  // Used by every path that abandons a validation run, and by the success path.
+  auto ResetValidationState = [this]() {
+    ValidationThread->LookupCache->ClearCache(ValidationThread->LookupCache->AcquireWriteLock());
+    ValidationCTX->LatestOffset = 0;
+  };
+
   auto NewCodeBuffer = ValidationCTX->GetLatest();
   while (CachedCode.size_bytes() > NewCodeBuffer->UsableSize()) {
     const size_t PrevUsableSize = NewCodeBuffer->UsableSize();
@@ -616,7 +626,20 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
                                                Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
                                       }),
                        NewRelocations.end());
-  (void)ApplyCodeRelocations(Section.FileStartVA, CodeBufferRangeRef, NewRelocations, false);
+  // F3: do not discard this result. ApplyCodeRelocations bails out mid-loop
+  // when a thunk symbol lookup returns ~0ULL, which leaves the reference buffer
+  // patched up to that relocation and unpatched after it. Comparing that against
+  // the cache reports a byte mismatch at whatever offset the first unpatched
+  // relocation happens to sit at, which reads exactly like a codegen bug and
+  // sends the reader hunting one that does not exist. Mirror the load path's
+  // handling of the same call: log and return, validation inconclusive. Not
+  // ERROR_AND_DIE — a missing thunk says nothing about whether the cached code
+  // is correct.
+  if (!ApplyCodeRelocations(Section.FileStartVA, CodeBufferRangeRef, NewRelocations, false)) {
+    LogMan::Msg::EFmt("Cache validation INCONCLUSIVE for {}: failed to apply relocations to the reference compile", Section.FileInfo.Filename);
+    ResetValidationState();
+    return;
+  }
 
   if (ValidationCTX->LatestOffset <= CodeBufferRangeRef.size()) {
     // Reference compilation produced fewer bytes than our cache, so validation is going to fail.
@@ -673,8 +696,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
   }
 
   // Reset Context state for next validation
-  ValidationThread->LookupCache->ClearCache(ValidationThread->LookupCache->AcquireWriteLock());
-  ValidationCTX->LatestOffset = 0;
+  ResetValidationState();
 
   LogMan::Msg::IFmt("\tSuccessfully validated cache");
 }
