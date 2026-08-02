@@ -347,14 +347,46 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   return true;
 }
 
-bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCacheFile, const ExecutableFileSectionInfo& BinarySection) {
+bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCacheFile, size_t MappedCacheFileSize,
+                         const ExecutableFileSectionInfo& BinarySection) {
   if (!EnableCodeCaching) {
     return true;
   }
 
   namespace ranges = std::ranges;
 
-  // Read file header
+  // F2: every offset and count consumed below comes straight out of a file FEX
+  // does not control, and several of them turn into executable jump targets or
+  // allocation sizes. MappedCacheFileSize is the length of the mapping the
+  // caller handed us, and it is the only thing that bounds the reads; without
+  // it a header that overstates its own contents walks off the end of the
+  // mapping.
+  const std::byte* const FileBegin = MappedCacheFile;
+  const uint64_t FileSize = MappedCacheFileSize;
+
+  // Bytes between the read cursor and the end of the mapping. Every read below
+  // is checked against this before it happens, so the cursor always stays
+  // within [FileBegin, FileBegin + FileSize] and this subtraction never wraps.
+  auto Remaining = [&]() -> uint64_t {
+    return FileSize - static_cast<uint64_t>(MappedCacheFile - FileBegin);
+  };
+
+  // Counts are file-controlled uint64_t/uint32_t values, so every bound below is
+  // written as `Count > Remaining() / ElementSize` or `Bytes > Remaining()`,
+  // never `Offset + Size > Limit`: a bounds check that itself wraps is worse
+  // than none.
+  auto RejectTruncated = [&](std::string_view What, uint64_t Needed) {
+    LogMan::Msg::EFmt("Rejecting code cache for {}: {} needs {:#x} bytes but only {:#x} of the {:#x} byte file are left",
+                      BinarySection.FileInfo.Filename, What, Needed, Remaining(), FileSize);
+    return false;
+  };
+
+  // Read file header. Bound it before a single field is touched.
+  if (FileSize < sizeof(CodeCacheHeader)) {
+    LogMan::Msg::EFmt("Rejecting code cache for {}: file is {:#x} bytes, too small to hold the {:#x} byte header",
+                      BinarySection.FileInfo.Filename, FileSize, sizeof(CodeCacheHeader));
+    return false;
+  }
   CodeCacheHeader header {};
   ::memcpy(&header, MappedCacheFile, sizeof(header));
   MappedCacheFile += sizeof(header);
@@ -404,11 +436,35 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     return false;
   }
 
+  // Each block entry occupies at least four 8-byte fields in the file and each
+  // code page entry at least two, so the counts can be bounded against the file
+  // before either is used as an allocation size. The block table, the code page
+  // table and the relocation array are disjoint regions that all follow the
+  // header, so bounding each against the whole remainder is conservative but
+  // sound. Without this, a 32-bit count out of a corrupt header turns into a
+  // multi-gigabyte resize before a single element has been read.
+  constexpr uint64_t MinBlockEntrySize = 4 * sizeof(uint64_t);
+  constexpr uint64_t MinCodePageEntrySize = 2 * sizeof(uint64_t);
+  if (header.NumBlocks > Remaining() / MinBlockEntrySize) {
+    return RejectTruncated("the block table", header.NumBlocks * MinBlockEntrySize);
+  }
+  if (header.NumCodePages > Remaining() / MinCodePageEntrySize) {
+    return RejectTruncated("the code page table", header.NumCodePages * MinCodePageEntrySize);
+  }
+  if (header.NumRelocations > Remaining() / sizeof(FEXCore::CPU::Relocation)) {
+    return RejectTruncated("the relocation array", header.NumRelocations * sizeof(FEXCore::CPU::Relocation));
+  }
+
   // Read guest<->host block mappings
   using BlockListEntry = decltype(GuestToHostMap::BlockList)::value_type;
   fextl::vector<BlockListEntry> BlockList(header.NumBlocks);
   {
     for (auto& BlockPtr : BlockList) {
+      // Fixed part of one entry: guest address, HostCode, BlockBegin, NumGuestPages.
+      if (Remaining() < MinBlockEntrySize) {
+        return RejectTruncated("a block table entry", MinBlockEntrySize);
+      }
+
       ::memcpy(&BlockPtr.first, MappedCacheFile, sizeof(BlockPtr.first));
       MappedCacheFile += sizeof(BlockPtr.first);
       ::memcpy(&BlockPtr.second.HostCode, MappedCacheFile, sizeof(BlockPtr.second.HostCode));
@@ -431,18 +487,14 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       // rather than `X + sizeof(...) > Limit`: these are file-controlled
       // uint64_t values, so a bounds check that itself wraps is worse than none.
       //
-      // NOTE: this cannot bound the reads against the actual length of the
-      // mapped file, because LoadData is not given one — the length is known at
-      // both call sites (LinuxSyscalls/SyscallsSMCTracking.cpp fstat's it,
-      // Windows/Common/ImageTracker.cpp holds the mapping) but is not passed
-      // through the AbstractCodeCache interface. Closing that gap means changing
-      // a public FEXCore header and both callers. Until then NumGuestPages is
-      // bounded by header.NumCodePages, which is the count of distinct guest
-      // code pages in the whole cache and is therefore an upper bound on any one
-      // block's page list (a block's pages are always registered into that same
-      // global set at compile time). That bounds the resize to something
-      // proportional to the rest of the header rather than to 2^64, but it is an
-      // internal-consistency check, not a true file-length bound.
+      // NumGuestPages is bounded twice, and the two bounds are independent.
+      // header.NumCodePages is the count of distinct guest code pages in the
+      // whole cache and is therefore an upper bound on any one block's page list
+      // (a block's pages are always registered into that same global set at
+      // compile time) — an internal-consistency check that catches a header
+      // which is self-contradictory but not truncated. Remaining() is the real
+      // file-length bound and is what stops the memcpy below reading past the
+      // end of the mapping.
       if (BlockPtr.second.HostCode >= header.CodeBufferSize || BlockPtr.second.BlockBegin >= header.CodeBufferSize) {
         LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} has HostCode {:#x} / BlockBegin {:#x} outside the {:#x} byte code buffer",
                           BinarySection.FileInfo.Filename, BlockPtr.first, BlockPtr.second.HostCode, BlockPtr.second.BlockBegin,
@@ -454,6 +506,11 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
         LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} claims {} guest code pages, more than the {} the whole cache holds",
                           BinarySection.FileInfo.Filename, BlockPtr.first, NumGuestPages, header.NumCodePages);
         return false;
+      }
+
+      using CodePageEntry = decltype(BlockPtr.second.CodePages)::value_type;
+      if (NumGuestPages > Remaining() / sizeof(CodePageEntry)) {
+        return RejectTruncated("a block's guest code page list", NumGuestPages * sizeof(CodePageEntry));
       }
 
       BlockPtr.second.CodePages.resize(NumGuestPages);
@@ -475,13 +532,34 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     BlockList.erase(BlockList.begin(), begin);
   }
 
-  // Read relocations
+  // Read relocations. The up-front bound above was taken against the whole
+  // post-header remainder; re-check against what the block table actually left.
+  if (header.NumRelocations > Remaining() / sizeof(FEXCore::CPU::Relocation)) {
+    return RejectTruncated("the relocation array", header.NumRelocations * sizeof(FEXCore::CPU::Relocation));
+  }
   fextl::vector<FEXCore::CPU::Relocation> Relocations(header.NumRelocations, FEXCore::CPU::Relocation::Default());
   ::memcpy(Relocations.data(), MappedCacheFile, Relocations.size() * sizeof(Relocations[0]));
   MappedCacheFile += Relocations.size() * sizeof(Relocations[0]);
 
-  // Pad to next page in file, which contains CodeBuffer data
-  MappedCacheFile = reinterpret_cast<std::byte*>(AlignUp(reinterpret_cast<uintptr_t>(MappedCacheFile), Utils::FEX_PAGE_SIZE));
+  // Pad to next page in file, which contains CodeBuffer data.
+  // SaveData pads the file offset, and both callers map from offset 0 at a
+  // page-aligned address, so aligning the cursor is the same thing as aligning
+  // the file offset. The padding itself has to be inside the file: a cache
+  // truncated in the middle of that pad would otherwise put the cursor past the
+  // end of the mapping before the code buffer read even gets a chance to check.
+  const uint64_t PageAlignPadding =
+    AlignUp(reinterpret_cast<uintptr_t>(MappedCacheFile), Utils::FEX_PAGE_SIZE) - reinterpret_cast<uintptr_t>(MappedCacheFile);
+  if (PageAlignPadding > Remaining()) {
+    return RejectTruncated("the page alignment padding before the code buffer", PageAlignPadding);
+  }
+  MappedCacheFile += PageAlignPadding;
+
+  // The code buffer is memcpy'd out of the file wholesale further below, after
+  // the destination has been sized. Bound it here, before anything is allocated
+  // or any context state is touched, so a rejection at this point is free.
+  if (header.CodeBufferSize > Remaining()) {
+    return RejectTruncated("the code buffer", header.CodeBufferSize);
+  }
 
   // Prepare CodeBuffer: Page aligned and big enough to hold all cached data
   auto Lock = std::unique_lock {CTX.CodeBufferWriteMutex};
@@ -531,6 +609,37 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   ::memcpy(CodeBufferRange.data(), MappedCacheFile, header.CodeBufferSize);
   MappedCacheFile += header.CodeBufferSize;
   CTX.LatestOffset += header.CodeBufferSize;
+
+  // Walk the trailing code page table without consuming it, purely to bound it
+  // against the file. The loop that actually reads it runs with the LookupCache
+  // write lock held and after blocks have already been registered, so bailing
+  // out of it halfway would leave the lookup cache holding part of a cache file
+  // we just rejected. Checking it here means that loop can only ever be entered
+  // when every read it is about to make is known to be in bounds.
+  {
+    const std::byte* Cursor = MappedCacheFile;
+    for (uint32_t i = 0; i < header.NumCodePages; ++i) {
+      const uint64_t Left = FileSize - static_cast<uint64_t>(Cursor - FileBegin);
+      if (Left < MinCodePageEntrySize) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: code page entry {} of {} runs past the end of the {:#x} byte file",
+                          BinarySection.FileInfo.Filename, i, header.NumCodePages, FileSize);
+        CTX.LatestOffset -= header.CodeBufferSize;
+        return false;
+      }
+
+      uint64_t NumEntrypoints;
+      ::memcpy(&NumEntrypoints, Cursor + sizeof(uint64_t), sizeof(NumEntrypoints));
+      Cursor += MinCodePageEntrySize;
+
+      if (NumEntrypoints > (FileSize - static_cast<uint64_t>(Cursor - FileBegin)) / sizeof(uint64_t)) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: code page entry {} of {} claims {} entrypoints, more than the {:#x} byte file holds",
+                          BinarySection.FileInfo.Filename, i, header.NumCodePages, NumEntrypoints, FileSize);
+        CTX.LatestOffset -= header.CodeBufferSize;
+        return false;
+      }
+      Cursor += NumEntrypoints * sizeof(uint64_t);
+    }
+  }
 
   // Apply FEX relocations. B2 (S3-REVISED): must check the return value with a
   // real branch, not LOGMAN_THROW_A_FMT — the latter expands to `(void)(pred)`

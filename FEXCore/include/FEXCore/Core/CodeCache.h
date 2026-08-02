@@ -194,8 +194,15 @@ public:
    * Loads a code cache from mapped memory and appends it to the current Core state.
    * TODO: Optionally recompiles all contained code blocks at runtime for validation.
    * Returns false if the provided cache file is invalid, and true otherwise.
+   *
+   * MappedCacheFileSize is the number of bytes readable at MappedCacheFile. Cache
+   * files are untrusted input: every offset and count parsed out of one is bounded
+   * against this before it is used, so the caller must pass a length it knows will
+   * not fault, not a length the file claims for itself. Passing too small a value
+   * only costs a rejected cache; passing too large a one is a memory safety bug.
    */
-  virtual bool LoadData(Core::InternalThreadState*, std::byte* MappedCacheFile, const ExecutableFileSectionInfo&) = 0;
+  virtual bool LoadData(Core::InternalThreadState*, std::byte* MappedCacheFile, size_t MappedCacheFileSize,
+                        const ExecutableFileSectionInfo&) = 0;
 
   /**
    * Bundles the current Core state (CodeBuffer, GuestToHostMapping, ...) to a code cache and writes it to the given file descriptor.

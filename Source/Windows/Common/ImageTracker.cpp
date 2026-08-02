@@ -172,7 +172,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
 
     auto AOTImage = AOTImages.find(ID);
     if (AOTImage != AOTImages.end()) {
-      CTX.GetCodeCache().LoadData(nullptr, AOTImage->second.Data, ImageInfo->SectionInfo);
+      CTX.GetCodeCache().LoadData(nullptr, AOTImage->second.Data, AOTImage->second.Size, ImageInfo->SectionInfo);
     }
   }
 
@@ -276,7 +276,11 @@ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
               UniqueId.resize(AnsiLength);
               RtlUnicodeToMultiByteN(UniqueId.data(), AnsiLength, NULL, Info->FileName, Info->FileNameLength);
 
-              AOTImages[UniqueId] = {.Data = static_cast<std::byte*>(LoadAddress)};
+              // NtMapViewOfSection writes the actual view size back into MappedSize. That is the
+              // amount of memory that is guaranteed readable at LoadAddress (the section is
+              // SEC_COMMIT over the whole cache file, and the tail of the last page is zero-filled),
+              // which is exactly what CodeCache::LoadData needs to bound the file against.
+              AOTImages[UniqueId] = {.Data = static_cast<std::byte*>(LoadAddress), .Size = MappedSize};
               LogMan::Msg::IFmt("Loaded cache: {}", UniqueId);
             }
           }

@@ -441,7 +441,10 @@ static void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::E
   auto CacheFileSize = buf.st_size;
   auto MappedCache = (std::byte*)FEXCore::Allocator::mmap(nullptr, CacheFileSize, PROT_READ, MAP_PRIVATE, CacheFD, 0);
   LOGMAN_THROW_A_FMT(MappedCache, "Failed to map code cache into memory");
-  if (!Thread.CTX->GetCodeCache().LoadData(&Thread, MappedCache, Section)) {
+  // Pass the file length, not the page-rounded mapping length: LoadData bounds every
+  // offset and count it parses out of the (untrusted) cache file against this, and the
+  // bytes between the end of the file and the end of its last page are not file data.
+  if (!Thread.CTX->GetCodeCache().LoadData(&Thread, MappedCache, static_cast<size_t>(CacheFileSize), Section)) {
     // The cache file was rejected. Delete it so the next run regenerates it: without this, a cache that
     // fails validation is silently ignored and then re-mapped and re-rejected on every single process
     // start, forever, permanently pinning the guest onto the JIT-compile path with no visible symptom.

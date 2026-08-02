@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <map>
@@ -57,6 +58,11 @@ private:
 
   struct AOTImageInfo {
     std::byte* Data;
+    // Size of the mapped view in bytes, as reported by NtMapViewOfSection.
+    // CodeCache::LoadData bounds every offset it parses out of the (untrusted)
+    // cache file against this, so it must describe readable memory rather than
+    // any length the file claims for itself.
+    size_t Size;
   };
 
   void LoadAOTImages(MappedImageInfo& Info);
