@@ -2903,7 +2903,9 @@ DEF_OP(CPUID) {
   const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
 
   // Mini-frame layout (96 bytes, accessed at +0..+88 BEFORE SpillForABICall,
-  // and at +304..+360 AFTER SpillForABICall):
+  // and at +kABISpill+0..+kABISpill+88 AFTER SpillForABICall — kABISpill is
+  // kDynRegSaveSize from ArchHelpers/PPC64Emitter.h and differs per guest
+  // bitness, so it is never written as a literal here):
   //   [r1+ 0]  back chain
   //   [r1+ 8]  CPUIDObj  (this)
   //   [r1+16]  LR save
@@ -2941,7 +2943,7 @@ DEF_OP(CPUID) {
 
   SpillForABICall(TMP1);
 
-  // Marshal args into ABI registers (post-spill mini-frame is at +304).
+  // Marshal args into ABI registers (post-spill mini-frame is at +kABISpill).
   ld(r3,     8 + kABISpill, r1);  // r3  = this (CPUIDObj)
   ld(r4,    32 + kABISpill, r1);  // r4  = Function
   ld(r5,    40 + kABISpill, r1);  // r5  = Leaf
@@ -2953,7 +2955,7 @@ DEF_OP(CPUID) {
   ld(r2, 48 + kABISpill, r1);     // restore TOC
   // Function returns 16-byte aggregate in r3:r4.
 
-  // Save result to mini-frame slots (post-spill: +304+56, +304+64).
+  // Save result to mini-frame slots (post-spill: +kABISpill+56, +kABISpill+64).
   std(r3, 56 + kABISpill, r1);
   std(r4, 64 + kABISpill, r1);
 

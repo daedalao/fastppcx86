@@ -28,10 +28,35 @@
 //   * `AbridgedFTW` is a one-byte register-indexed valid-tag bitmap: bit `i`
 //     corresponds to mm[i] (NOT st(i)). Bit set = valid, bit clear = invalid.
 //
-// Sizes: this backend always operates in non-reduced-precision mode (full
-// 80-bit values stored as 128-bit FPRs). PushStack / ReadStackValue / etc.
-// move full 16-byte vectors. ReducedPrecisionMode is an upstream config we
-// don't expect to encounter on PPC64LE.
+// Sizes: every handler in this file assumes full precision — 80-bit values
+// stored in the 16-byte mm slots. PushStack / ReadStackValue / etc. move full
+// 16-byte vectors.
+//
+// This file does NOT assume ReducedPrecisionMode is absent, and an earlier
+// version of this comment claiming it is "an upstream config we don't expect
+// to encounter on PPC64LE" was wrong: `Source/Steam/ConfigTemplate.json` sets
+// `X87ReducedPrecision: 1` for every Steam title, and the InstructionCountCI
+// suite runs seven JSON files with `FEX_X87REDUCEDPRECISION=1`.
+//
+// What is actually true is narrower and is what protects us: nothing in this
+// file executes outside `FEX_O0`. x87StackOptimizationPass rewrites every
+// X87:true op unconditionally and the pass is gated only on `!DisablePasses()`
+// (see JIT.cpp:2359-2364), which is why ARM64 implements none of these ops at
+// all. Reduced precision therefore never reaches these handlers on any normal
+// configuration.
+//
+// If it ever did — `O0` together with reduced precision — the result would be
+// silent numeric garbage, not a trap, because the stack slots would hold
+// doubles while these handlers keep reading them as 80-bit values:
+//   * F80StackChangeSign / F80StackAbs XOR/AND against the 80-bit sign bit at
+//     byte 9 bit 7 (~:724); a double's sign bit is at byte 7 bit 7.
+//   * StoreStackMem's inline path (~:371) splits the slot into an 8-byte
+//     mantissa plus a 2-byte sign+exponent halfword read from bytes 8..9.
+//   * Every arithmetic and transcendental handler routes through the
+//     `OPINDEX_F80*` FABI helpers, which interpret their operands as 80-bit.
+//   * F80PTANStack (~:694) pushes a literal 80-bit encoding of 1.0.
+// Making this file reduced-precision-correct means a second set of handlers,
+// not a size parameter. Nobody has needed one; the O0 gate is the reason.
 //
 // Note on r0 / addressing
 // -----------------------

@@ -900,21 +900,25 @@ void PPC64Dispatcher::EmitDispatcher() {
 //   [r1+32]: stvx buf1 (16-byte aligned, for float/double <-> VMX conversion)
 //   [r1+48]: stvx buf2 (16-byte aligned, for second double)
 //
-// SpillForABICall lowers r1 by PushDynamicRegs(SaveSize) = 304 bytes for x64
-// (32-byte ELFv2 link area + 5 GPRs * 8 = 40 (padded to 48) + 14 VRs * 16 =
-// 224, total = 304, 16-aligned).  The 32-byte ELFv2 link area at the bottom
-// of the spill frame is mandatory: a typical C++ callee's prologue stores its
-// LR via `std r0, 16(r1)` to *its caller's* r1+16, so we must not place a
-// register spill there. After the spill, mini-frame slots shift by +304:
-//   [r1+312]: Func; [r1+320]: LR; [r1+328]: int save;
-//   [r1+336]: buf1; [r1+352]: buf2
+// SpillForABICall lowers r1 by PushDynamicRegs(SaveSize) = kDynRegSaveSize
+// bytes, which is derived in ArchHelpers/PPC64Emitter.h from kDynLinkArea
+// plus the RA/RAFPR pool sizes and differs per guest bitness. Do not
+// hardcode it here — read the constant. The kDynLinkArea reservation at the
+// bottom of the spill frame is mandatory: a typical C++ callee's prologue
+// stores its LR via `std r0, 16(r1)` to *its caller's* r1+16, and one that
+// spills incoming arguments writes the parameter save area too, so we must
+// not place a register spill there. After the spill, every mini-frame slot
+// below shifts up by kSpill (= the same constant), i.e. Func is at
+// [r1+kSpill+8], LR at [r1+kSpill+16], int save at [r1+kSpill+24],
+// buf1 at [r1+kSpill+32], buf2 at [r1+kSpill+48].
 //
 // ============================================================
 uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   const auto Address = GetCursorAddress<uint64_t>();
 
-  // x64 used literal 304 for kDynRegSaveSize; in x32 mode the spill frame is
-  // 496 bytes, so every post-spill mini-frame access must be bitness-aware.
+  // The spill frame size differs between guest bitnesses (x32 has larger RA
+  // and RAFPR pools), so every post-spill mini-frame access must be
+  // bitness-aware. Always go through kDynRegSaveSize; never a literal.
   const bool Is64Bit = CTX->Config.Is64BitMode();
   const int16_t kSpill = static_cast<int16_t>(Is64Bit ? x64::kDynRegSaveSize : x32::kDynRegSaveSize);
 
@@ -946,8 +950,8 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   };
 
   // Reload Func pointer (TMP4) from mini-frame spare slot. After
-  // SpillForABICall, r1 has been decremented by 304 (PushDynamicRegs SaveSize
-  // for x64) so the original [r1+8] is now at [r1+312].
+  // SpillForABICall, r1 has been decremented by kSpill (= kDynRegSaveSize,
+  // PushDynamicRegs' SaveSize) so the original [r1+8] is now at [r1+kSpill+8].
   // Also copy Func to r12 — PPC64LE ELFv2 mandates the caller passes the
   // callee's global entry point address in r12 so the callee can compute its
   // TOC pointer via the standard `addis r2,r12,...; addi r2,r2,...` prologue.
