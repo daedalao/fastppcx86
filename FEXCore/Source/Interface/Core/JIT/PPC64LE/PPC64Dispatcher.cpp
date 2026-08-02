@@ -625,12 +625,72 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   ThreadPauseHandlerAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   // Call SleepThread(CTX, Frame): r3=CTX, r4=STATE
+  //
+  // ARGUMENT REGISTER: the function pointer goes in r12, NOT TMP1.
+  // TMP1 *is* r3 (PPC64Emitter.h:37), so the previous
+  // `LoadConstant(TMP1, SleepThread)` overwrote the CTX argument that the
+  // line above had just materialised, and SleepThread ran with
+  // CTX == &SleepThread. `CTX->SyscallHandler->SleepThread(...)` then read
+  // a pointer out of its own machine code and dereferenced the result —
+  // a fault *inside* SleepThread on every pause. r12 is the register ELFv2
+  // wants here anyway (global entry point → callee's `addis r2,r12,...`
+  // TOC prologue), so this is one load instead of load+mr. r12 is SRA
+  // (guest RBP) but both entries to this handler arrive with SRA already
+  // spilled, so clobbering it is safe — same reasoning as the `ld r12` in
+  // ExitFunctionLinker above.
+  //
+  // STACK FRAME: allocate one before the bctrl. ELFv2 makes the CALLER own
+  // the 32-byte linkage area + 64-byte parameter save area at the bottom of
+  // its frame (see the layout comment at ArchHelpers/PPC64Emitter.h:82-98):
+  // the callee stores its return address to [caller_r1+16], may store CR to
+  // [caller_r1+8], and may spill incoming argument registers anywhere in
+  // [caller_r1+32, caller_r1+96). Nothing here had reserved that.
+  //
+  // What r1 actually points at on entry is the reason this was survivable
+  // until now, and the reason it must still be fixed: both entry points are
+  // only ever reached by SignalDelegator::HandleSignalPause rewriting the
+  // interrupted context's PC, and StoreThreadState has already moved SP to
+  // point *at* the PPC64ContextBackup it stamped
+  // (LinuxSyscalls/SignalDelegator.cpp: StoreThreadState → SetSp(NewSP)).
+  // So r1 == &Backup, and PPC64ContextBackup's head is a deliberate
+  // 128-byte LinkageArea pad (ArchHelpers/MContext_ppc64le.h:21-48) that
+  // absorbs exactly these writes. That pad was added for the guest-signal
+  // path, not this one; depending on it here means the correctness of the
+  // pause path is coupled to the layout of an unrelated struct, and any
+  // future entry with a different r1 corrupts the frame below it. Own the
+  // reservation instead.
+  //
+  // Size: kDynLinkArea (96) — the ABI minimum, already 16-byte aligned, and
+  // a multiple of 4 so `stdu`'s DS-form displacement is encodable. Nothing
+  // is stored in the frame beyond what the ABI hands to the callee, so
+  // there is no reason to make it larger.
+  //
+  // Placement: after ThreadPauseHandlerAddress, so the SpillSRA entry gets
+  // it too by fall-through and the "already spilled" entry does not skip
+  // it. SpillStaticRegs does not touch r1 (PPC64Emitter.cpp), so ordering
+  // the stdu after it changes nothing about the spill.
+  //
+  // r1 MUST be restored before the trap word below. The wake path is
+  // HandleSIGILL → RestoreThreadState(TYPE_PAUSE), which recovers the
+  // backup with `Context = (ContextBackup*)GetSp(ucontext)` — it finds the
+  // saved state by taking the trapping SP *as* the backup pointer. Leaving
+  // r1 96 bytes low would make it reconstruct the whole host context from
+  // the wrong address. (No TOC save/restore around the call, unlike
+  // ExitFunctionLinker: nothing between the bctrl and the trap reads r2,
+  // and RestoreContext reinstates all 48 gp_regs, r2 included.)
+  static_assert(x64::kDynLinkArea == x32::kDynLinkArea,
+                "Pause frame assumes both guest bitnesses use the same ELFv2 linkage reservation");
+  constexpr int16_t PAUSE_FRAME_SIZE = static_cast<int16_t>(x64::kDynLinkArea);  // 96
+  static_assert(PAUSE_FRAME_SIZE >= 96 && (PAUSE_FRAME_SIZE % 16) == 0,
+                "ELFv2 caller frame must cover linkage+param save area and stay 16-byte aligned");
+
+  stdu(r1, static_cast<int16_t>(-PAUSE_FRAME_SIZE), r1);
   LoadConstant(r3, reinterpret_cast<uint64_t>(CTX));
   mr(r4, STATE);
-  LoadConstant(TMP1, reinterpret_cast<uint64_t>(SleepThread));
-  mr(r(12), TMP1);
-  mtctr(TMP1);
+  LoadConstant(r(12), reinterpret_cast<uint64_t>(SleepThread));
+  mtctr(r(12));
   bctrl();
+  addi(r1, r1, PAUSE_FRAME_SIZE);
 
   // PauseReturnInstruction: illegal opcode 0x00000000 → SIGILL.
   // FEX sends SIGILL to this address to wake the paused thread.
