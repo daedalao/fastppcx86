@@ -591,8 +591,17 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     ValidationCTX->LatestOffset = 0;
   };
 
+  // B3: both backends can rotate the code buffer in the middle of the compile
+  // loop below — ppc64le pre-reserves at least 1 MiB of headroom per block
+  // (JIT/PPC64LE/JIT.cpp), ARM64 does an exact-fit check before copying its
+  // staged block into the shared buffer (JIT/JIT.cpp). This is not a ppc64le
+  // peculiarity. Reserve the JIT's own headroom floor on top of the cached code
+  // so the last block does not trip the rotation path; that only makes rotation
+  // unlikely, and the post-loop check is what makes it safe.
+  constexpr size_t JITBlockHeadroom = 1u << 20;
+
   auto NewCodeBuffer = ValidationCTX->GetLatest();
-  while (CachedCode.size_bytes() > NewCodeBuffer->UsableSize()) {
+  while (CachedCode.size_bytes() + JITBlockHeadroom > NewCodeBuffer->UsableSize()) {
     const size_t PrevUsableSize = NewCodeBuffer->UsableSize();
     ValidationCTX->ClearCodeCache(ValidationThread.get());
     NewCodeBuffer = ValidationCTX->GetLatest();
@@ -608,15 +617,33 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     }
   }
 
-  std::span<std::byte> CodeBufferRangeRef =
-    std::as_writable_bytes(std::span {NewCodeBuffer->Ptr, NewCodeBuffer->Ptr + NewCodeBuffer->UsableSize()}).subspan(0, CachedCode.size_bytes());
-
   while (!GuestBlocks.empty()) {
     auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
     for (auto& Entry : CompiledBlocks.EntryPoints) {
       GuestBlocks.erase(Entry.first);
     }
   }
+
+  // B3: if the buffer rotated during the compile, the reference bytes for every
+  // block compiled before the rotation are in a buffer that has been abandoned,
+  // and nothing in the new buffer can stand in for them. Report inconclusive
+  // rather than comparing the cache against whatever the surviving fragment
+  // happens to be. The pre-loop span capture this replaces silently compared
+  // post-rotation bytes against pre-rotation cached code.
+  if (ValidationCTX->GetLatest().get() != NewCodeBuffer.get()) {
+    LogMan::Msg::EFmt("Cache validation INCONCLUSIVE for {}: the validation code buffer rotated during the reference compile, so the "
+                      "reference bytes for the blocks compiled before the rotation are unrecoverable",
+                      Section.FileInfo.Filename);
+    ResetValidationState();
+    return;
+  }
+
+  // Size the reference span to what the reference compile actually emitted, not
+  // to the size of the cache. B3: this capture has to happen after the compile
+  // loop, because NewCodeBuffer is only known to still be the live buffer once
+  // the rotation check above has passed.
+  std::span<std::byte> CodeBufferRangeRef =
+    std::as_writable_bytes(std::span {NewCodeBuffer->Ptr, NewCodeBuffer->Ptr + NewCodeBuffer->UsableSize()}).subspan(0, ValidationCTX->LatestOffset);
 
   // Patch FEX-internal function addresses with values from the main Context to ensure the code blocks are comparable
   auto NewRelocations = ValidationThread->CPUBackend->TakeRelocations(Section.FileStartVA);
@@ -641,16 +668,31 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     return;
   }
 
-  if (ValidationCTX->LatestOffset <= CodeBufferRangeRef.size()) {
-    // Reference compilation produced fewer bytes than our cache, so validation is going to fail.
-    // Make sure we don't output any garbage bytes though.
-    CodeBufferRangeRef = CodeBufferRangeRef.subspan(0, ValidationCTX->LatestOffset);
-  }
+  const size_t RefSize = CodeBufferRangeRef.size_bytes();
+  const size_t CachedSize = CachedCode.size_bytes();
+  const size_t CommonSize = std::min(RefSize, CachedSize);
 
-  auto [Mismatch, _] = std::mismatch(CodeBufferRangeRef.begin(), CodeBufferRangeRef.end(), CachedCode.begin());
-  if (Mismatch != CodeBufferRangeRef.end()) {
-    // Align down to instruction size
-    auto Idx = AlignDown(std::distance(CodeBufferRangeRef.begin(), Mismatch), 4);
+  // B2: report what was actually compared on every run, not only on failure.
+  // Without this the check can only ever speak by failing, and a passing run is
+  // indistinguishable from one that compared almost nothing.
+  LogMan::Msg::IFmt("\tCache validation for {}: reference compile emitted {:#x} bytes, cache holds {:#x} bytes, comparing {:#x}",
+                    Section.FileInfo.Filename, RefSize, CachedSize, CommonSize);
+
+  // B2: compare the common prefix first, so a genuine content divergence is
+  // still reported at its first differing byte rather than being hidden behind
+  // the length report below. The previous code truncated the reference span to
+  // the cached length and then declared success, so a cache holding more bytes
+  // than the reference compiles had the excess never examined at all.
+  auto RefCommon = CodeBufferRangeRef.first(CommonSize);
+  auto [Mismatch, _] = std::mismatch(RefCommon.begin(), RefCommon.end(), CachedCode.begin());
+  if (Mismatch != RefCommon.end()) {
+    // Align down to instruction size, then clamp so the 4-byte context windows
+    // reported below stay inside both spans. CommonSize derives from a
+    // file-supplied size and is not guaranteed to be 4-aligned, so
+    // `subspan(Idx, 4)` on an aligned-down Idx can run off the end.
+    const size_t ContextSize = std::min<size_t>(4, CommonSize);
+    auto Idx = AlignDown(std::distance(RefCommon.begin(), Mismatch), 4);
+    Idx = std::min<uint64_t>(Idx, CommonSize - ContextSize);
 
     // S3.6: find the owning block by its BlockBegin (the greatest BlockBegin
     // <= Idx-in-buffer). The prior form combined `HostBlocks.lower_bound` with
@@ -691,14 +733,32 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
       GuestBlockInfo += " (MISMATCH)";
     }
     ERROR_AND_DIE_FMT("Cache validation failed at offset {:#x}: {:02x} <-> {:02x} (at {} <-> {}, guest block {})", Idx,
-                      fmt::join(CachedCode.subspan(Idx, 4), ""), fmt::join(CodeBufferRangeRef.subspan(Idx, 4), ""),
+                      fmt::join(CachedCode.subspan(Idx, ContextSize), ""), fmt::join(CodeBufferRangeRef.subspan(Idx, ContextSize), ""),
                       fmt::ptr(CachedCode.data()), fmt::ptr(CodeBufferRangeRef.data()), GuestBlockInfo);
+  }
+
+  if (RefSize != CachedSize) {
+    // B2: the common prefix matches but the two are not the same length, so
+    // some bytes on one side were never examined. Deliberately NOT fatal: a
+    // file with more than one block-bearing executable VMA legitimately makes
+    // the reference compile a strict prefix of the cached buffer. LoadData
+    // filters BlockList down to the section being loaded but memcpy's the whole
+    // code buffer (see the "TODO: Only load the data needed for the selected
+    // section" there), so the cache carries every section's code while the
+    // reference only compiles this section's blocks. That case passes today and
+    // killing the process on it would be a regression.
+    LogMan::Msg::EFmt("Cache validation INCONCLUSIVE for {}: the common {:#x} byte prefix matches, but the reference compile emitted {:#x} "
+                      "bytes against {:#x} cached bytes, leaving {:#x} bytes unexamined{}",
+                      Section.FileInfo.Filename, CommonSize, RefSize, CachedSize, std::max(RefSize, CachedSize) - CommonSize,
+                      RefSize < CachedSize ? " (expected when the cache covers more than one executable section of this file)" : "");
+    ResetValidationState();
+    return;
   }
 
   // Reset Context state for next validation
   ResetValidationState();
 
-  LogMan::Msg::IFmt("\tSuccessfully validated cache");
+  LogMan::Msg::IFmt("\tSuccessfully validated cache ({:#x} bytes)", CachedSize);
 }
 
 bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
