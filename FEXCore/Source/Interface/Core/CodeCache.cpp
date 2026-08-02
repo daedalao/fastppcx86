@@ -714,8 +714,17 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
       if (Pointer == ~0ULL) {
         return false;
       }
+      // S3.7-C1: hard bounds check + fixed-width patch. The emitter's own
+      // width assert is in LOGMAN_THROW which is (void)pred in Release, so
+      // an under-sized Remaining would silently overrun. This is executable
+      // code being patched — Reloc.Header.Offset comes from a file at load
+      // time and from JIT emission at validation time.
+      if (Reloc.Header.Offset + PPC64Emitter::Emitter::LoadConstantFixedBytes > Code.size()) {
+        LogMan::Msg::EFmt("NamedThunkMove reloc @{:#x} would overrun buffer size {:#x}", Reloc.Header.Offset, Code.size());
+        return false;
+      }
       FEXCore::CPU::PPC64EmitterBase PatchEmitter(&CTX, Ptr, Remaining);
-      PatchEmitter.LoadConstant(PPC64Emitter::r(Reloc.NamedThunkMove.RegisterIndex), Pointer);
+      PatchEmitter.LoadConstantFixed(PPC64Emitter::r(Reloc.NamedThunkMove.RegisterIndex), Pointer);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
@@ -725,8 +734,13 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
       uint64_t Pointer = Reloc.GuestRIP.GuestRIP + GuestEntry;
+      // S3.7-C1: same bounds guard as above.
+      if (Reloc.Header.Offset + PPC64Emitter::Emitter::LoadConstantFixedBytes > Code.size()) {
+        LogMan::Msg::EFmt("GuestRIP MOVE reloc @{:#x} would overrun buffer size {:#x}", Reloc.Header.Offset, Code.size());
+        return false;
+      }
       FEXCore::CPU::PPC64EmitterBase PatchEmitter(&CTX, Ptr, Remaining);
-      PatchEmitter.LoadConstant(PPC64Emitter::r(Reloc.GuestRIP.RegisterIndex), Pointer);
+      PatchEmitter.LoadConstantFixed(PPC64Emitter::r(Reloc.GuestRIP.RegisterIndex), Pointer);
       break;
     }
     default: ERROR_AND_DIE_FMT("Unknown relocation type {}", ToUnderlying(Reloc.Header.Type));

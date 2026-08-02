@@ -1531,6 +1531,30 @@ public:
     if (lo & 0xFFFF) ori(rt, rt, static_cast<uint16_t>(lo & 0xFFFF));
   }
 
+  // Always exactly 5 instructions regardless of `imm`. ONLY for relocation
+  // sites: CodeCache::ApplyCodeRelocations re-emits the sequence in place with
+  // a different value, so the window must be fixed-width or the patch overruns.
+  // Deliberately NOT gated on a config flag: CodeCacheConfigId is hardcoded 0
+  // (FEXOfflineCompiler/Main.cpp:119), so config is not in the cache key and a
+  // caching-off build could load a caching-on cache.
+  //
+  // Verified round-trip via simulation across all 16-bit boundaries plus
+  // realistic PIE addresses: `sldi rt,rt,32` == `rldicr rt,rt,32,31` discards
+  // `lis`'s sign extension, and `ori`/`oris` are zero-extending.
+  static constexpr size_t LoadConstantFixedBytes = 5 * 4;
+
+  void LoadImm64Fixed(GPR rt, uint64_t imm) {
+    [[maybe_unused]] const size_t Start = GetOffset();
+    const uint32_t hi = static_cast<uint32_t>(imm >> 32);
+    const uint32_t lo = static_cast<uint32_t>(imm);
+    lis (rt, static_cast<int16_t>(hi >> 16));      // static_cast REQUIRED — narrowing
+    ori (rt, rt, static_cast<uint16_t>(hi & 0xFFFF));
+    sldi(rt, rt, 32);
+    oris(rt, rt, static_cast<uint16_t>(lo >> 16));
+    ori (rt, rt, static_cast<uint16_t>(lo & 0xFFFF));
+    LOGMAN_THROW_A_FMT(GetOffset() - Start == LoadConstantFixedBytes, "LoadImm64Fixed width");
+  }
+
   // =========================================================================
   // Miscellaneous
   // =========================================================================

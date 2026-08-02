@@ -24,6 +24,10 @@ void PPC64EmitterBase::LoadConstant(GPR rt, uint64_t Constant) {
   LoadImm64(rt, Constant);
 }
 
+void PPC64EmitterBase::LoadConstantFixed(GPR rt, uint64_t Constant) {
+  LoadImm64Fixed(rt, Constant);
+}
+
 // Mask the upper 32 bits of `reg` to zero when running a 32-bit guest.
 // `rldicl reg, reg, 0, 32` is the canonical PPC 32-bit zero-extend (rotate
 // by 0, mask bits 32..63 of source — leaving the low 32 bits intact in

@@ -152,6 +152,13 @@ public:
   // Materialise an arbitrary 64-bit constant into rt.
   void LoadConstant(GPR rt, uint64_t Constant);
 
+  // Fixed-width 5-instruction / 20-byte materialisation of a 64-bit constant.
+  // ONLY for relocation sites — see PPC64LE/Emitter.h::LoadImm64Fixed for the
+  // full rationale. Must be on PPC64EmitterBase (not PPC64JITCore) because
+  // CodeCache::ApplyCodeRelocations constructs a bare PPC64EmitterBase to
+  // re-emit patched constants in place.
+  void LoadConstantFixed(GPR rt, uint64_t Constant);
+
   // Fill/spill x86 SRA registers from/to the CpuStateFrame.
   // These are called on entry/exit from the JIT dispatcher.
   void SpillStaticRegs(GPR tmp);

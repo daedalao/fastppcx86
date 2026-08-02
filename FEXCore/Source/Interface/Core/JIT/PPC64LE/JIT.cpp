@@ -1253,7 +1253,11 @@ void PPC64JITCore::InsertNamedThunkRelocation(GPR Reg, const IR::SHA256Sum& Sum)
   if (CTX->ThunkHandler) {
     Pointer = reinterpret_cast<uint64_t>(CTX->ThunkHandler->LookupThunk(Sum));
   }
-  LoadConstant(Reg, Pointer);
+  // S3.7-C1: use the fixed-width form so ApplyCodeRelocations' PatchEmitter
+  // re-emits into the identical 20-byte window. LoadConstant here would take
+  // the 1-instruction short-circuit when Pointer is 0 (thunk missing / not
+  // registered), and the on-load patch would overrun the emitted window.
+  LoadConstantFixed(Reg, Pointer);
   Relocations.emplace_back(Reloc);
 }
 
