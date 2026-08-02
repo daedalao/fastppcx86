@@ -3,20 +3,24 @@
 // Uses POWER8 lwarx/stwcx./ldarx/stdcx. load-link/store-conditional primitives.
 // Also lbarx/stbcx_ and lharx/sthcx_ for sub-word atomics (POWER8).
 //
-// x86 LOCK-prefixed RMW operations are sequentially consistent. To emulate that
-// on PPC64LE's relaxed memory model, every atomic primitive in this file is
-// wrapped with `hwsync` before the load-reserved and `isync` after the
-// successful store-conditional — the standard mapping for memory_order_seq_cst
-// on POWER. lwsync is insufficient because it doesn't order earlier stores
-// against the LL/SC's load.
+// x86 LOCK-prefixed RMW operations are sequentially consistent. To emulate
+// that on PPC64LE's relaxed memory model, every atomic primitive in this file
+// is wrapped with `hwsync` before the alignment dispatch and `isync` after
+// the paths converge — the standard mapping for memory_order_seq_cst on
+// POWER. Both the aligned LL/SC path and the misaligned mutex-helper path
+// execute inside that bracket (Tier D atomics C1). lwsync is insufficient
+// because it doesn't order earlier stores against the LL/SC's load.
 //
 // Misalignment: lwarx/lharx/ldarx all require natural alignment, so an x86
 // `lock add dword [r15+3]` would raise SIGBUS if dispatched straight to the
 // LL/SC path. Each RMW op below emits a runtime alignment check; aligned EAs
-// take the LL/SC fast path (atomic across cores), misaligned EAs fall back to
-// a plain load-op-store sequence (single-core/single-thread correct, matches
-// the implementation-defined behavior x86 already has for cross-cache-line
-// LOCK ops). The 8-bit (lbarx) path is always aligned by definition.
+// take the LL/SC fast path, misaligned EAs are routed to
+// `PPC64_SplitLockEmulate` (Tier D atomics C2 for `CASPair`; earlier phase
+// for the Fetch* / Swap ops). The helper is process-wide striped-mutex
+// serialised, so misaligned ops compose with other helper calls — but
+// **NOT with the aligned LL/SC path on the same address in another thread**
+// (Tier D atomics defect 1; the container-in-helper C3/C4 series closes that
+// gap). The 8-bit (lbarx) path is always aligned by definition.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Context/Context.h"
 
@@ -71,9 +75,10 @@ namespace FEXCore::CPU {
 // ops on the same striped cacheline, **but not with the aligned LL/SC path on
 // the same address in another FEX thread** — the mutex and LL/SC do not
 // compose (Tier D atomics defect 1). The container-in-helper series
-// (Tier D atomics C3/C4) closes that gap. Tier D atomics C1 also brackets
-// the misaligned-helper call site with `hwsync`/`isync` in the same commit
-// as the code changes; the block comment there notes the hoist.
+// (Tier D atomics C3/C4) closes that gap. The `hwsync`/`isync` bracket
+// around the helper call is provided by each caller op (Tier D atomics C1
+// hoists `hwsync` above the alignment test and moves `Bind(&done)` above
+// `isync`, so both the aligned and misaligned paths run inside it).
 //
 // Frame layout (80 bytes, allocated via stdu r1, -80, r1):
 //
@@ -226,15 +231,13 @@ DEF_OP(AtomicSwap) {
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
 
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK XCHG: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::Swap,
                             A, Val, Dst, Sz);
@@ -242,13 +245,12 @@ DEF_OP(AtomicSwap) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   STORE_COND(Val, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 — XCHG preserves flags.
   ld(TMP4, -8, r1);
   mtocrf(0x80, TMP4);
@@ -287,15 +289,13 @@ DEF_OP(AtomicFetchAdd) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK ADD: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAdd,
                             A, Val, Dst, Sz);
@@ -303,14 +303,13 @@ DEF_OP(AtomicFetchAdd) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   add(TMP2, Dst, Val);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -339,15 +338,13 @@ DEF_OP(AtomicFetchSub) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK SUB: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchSub,
                             A, Val, Dst, Sz);
@@ -355,14 +352,13 @@ DEF_OP(AtomicFetchSub) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   subf(TMP2, Val, Dst);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -391,15 +387,13 @@ DEF_OP(AtomicFetchAnd) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK AND: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAnd,
                             A, Val, Dst, Sz);
@@ -407,14 +401,13 @@ DEF_OP(AtomicFetchAnd) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   and_(TMP2, Dst, Val);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -443,15 +436,13 @@ DEF_OP(AtomicFetchCLR) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK BTR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchCLR,
                             A, Val, Dst, Sz);
@@ -459,14 +450,13 @@ DEF_OP(AtomicFetchCLR) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   andc(TMP2, Dst, Val);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -495,15 +485,13 @@ DEF_OP(AtomicFetchOr) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK OR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchOr,
                             A, Val, Dst, Sz);
@@ -511,14 +499,13 @@ DEF_OP(AtomicFetchOr) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   or_(TMP2, Dst, Val);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -547,15 +534,13 @@ DEF_OP(AtomicFetchXor) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK XOR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchXor,
                             A, Val, Dst, Sz);
@@ -563,14 +548,13 @@ DEF_OP(AtomicFetchXor) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   xor_(TMP2, Dst, Val);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -597,15 +581,13 @@ DEF_OP(AtomicFetchNeg) {
   // restore at op end.
   mfocrf(TMP4, 0x80);
   std(TMP4, -8, r1);
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
-    // x86 LOCK semantics require full SC; the aligned LL/SC path
-    // already supplies hwsync;...;isync, but the misaligned fallback
-    // was barrier-less, dropping the release/acquire fences.  Bracket
-    // with hwsync to match the aligned path's ordering.
     // Misaligned LOCK NEG: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchNeg,
                             A, r(0), Dst, Sz);
@@ -613,14 +595,13 @@ DEF_OP(AtomicFetchNeg) {
   }
   Bind(&aligned);
   auto loop = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   neg(TMP2, Dst);
   STORE_COND(TMP2, A, Sz);
   bc(CC_NE, &loop);
-  isync();
   Bind(&done);
+  isync();
   // Restore CR0 saved at op entry — x86 LOCK <op> conceptually preserves
   // any prior NZCV state up until the following flag-setter writes its own.
   ld(TMP4, -8, r1);
@@ -675,6 +656,8 @@ DEF_OP(CAS) {
     }
   };
 
+  // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+  hwsync();
   const unsigned AlignMask = static_cast<unsigned>(IR::OpSizeToSize(Sz)) - 1;
   PPC64Emitter::Label aligned, done;
   if (AlignMask) {
@@ -710,7 +693,6 @@ DEF_OP(CAS) {
 
   auto loop = PPC64Emitter::Label{};
   auto fail = PPC64Emitter::Label{};
-  hwsync();
   Bind(&loop);
   LOAD_RESERVED(Dst, A, Sz);
   EmitCmp();
@@ -718,8 +700,8 @@ DEF_OP(CAS) {
   STORE_COND(D, A, Sz);
   bc(CC_NE, &loop);   // SC failed (reservation lost): retry
   Bind(&fail);
-  isync();
   Bind(&done);
+  isync();
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +778,8 @@ DEF_OP(CASPair) {
     // only atomic path in the backend with nothing serialising it, and a lost
     // update here lands a wrong value in guest EDX:EAX. Route it through the
     // same process-wide striped-mutex helper every other misaligned RMW uses.
+    // C1: hwsync/isync bracket both paths (aligned LL/SC and mutex helper).
+    hwsync();
     andi_(TMP4, Addr, 7);
     bc(CC_EQ, &aligned);
     {
@@ -827,7 +811,6 @@ DEF_OP(CASPair) {
     }
 
     Bind(&aligned);
-    hwsync();
     Bind(&loop);
     ldarx(TMP2, r0, Addr);          // TMP2 = current 8 bytes
     cmpd (TMP2, TMP1);
