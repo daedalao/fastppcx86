@@ -308,14 +308,21 @@ DEF_OP(StoreStackToStack) {
 // `softfloat`-style helper calls that we don't have wired up on PPC64LE.
 //
 // To avoid silently producing incorrect numeric results we trap loudly on
-// the conversion paths and only inline the same-size i128 (raw 80-bit blob)
+// the conversion paths and only inline the same-size (raw 80-bit blob)
 // store path. That covers `fstp tword [mem]` from a stack value that's
 // already 80-bit, while loudly rejecting `fstp dword`/`fstp qword` that
-// would need rounding. Better a clear SIGILL than silent FP corruption.
+// would need rounding. Better a clear SIGTRAP than silent FP corruption.
+//
+// SourceSize is f80Bit, not i128Bit. IR.json's prose says "SourceSize is
+// 128bit for F80 values", but the sole emitter — OpcodeDispatcher/X87.cpp
+// FST() at :129-133 — passes `ReducedPrecisionMode ? OpSize::i64Bit :
+// OpSize::f80Bit`. f80Bit is 10 and i128Bit is 16 (IR/IR.h:498-508), so
+// testing against i128Bit made the guard unsatisfiable and trapped every
+// fst/fstp to memory.
 DEF_OP(StoreStackMem) {
   auto Op = IROp->C<IR::IROp_StoreStackMem>();
 
-  if (Op->StoreSize != IR::OpSize::f80Bit || Op->SourceSize != IR::OpSize::i128Bit) {
+  if (Op->StoreSize != IR::OpSize::f80Bit || Op->SourceSize != IR::OpSize::f80Bit) {
     // Unsupported conversion path — emit a trap. 0x7FE00008 is `trap` (tw 31,r0,r0),
     // an unconditional program-check on PPC64. This is the project-wide
     // convention for "I don't know what this means; fail loudly".
