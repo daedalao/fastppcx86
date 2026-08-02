@@ -648,7 +648,6 @@ constexpr int CryptoMiniFrameSize = 96;
 constexpr int CryptoSlotA = 32;
 constexpr int CryptoSlotB = 48;
 constexpr int CryptoSlotC = 64;
-constexpr int CryptoSlotR26 = 80;
 }
 
 DEF_OP(VUMinV) {
@@ -4617,14 +4616,12 @@ DEF_OP(VFCVTL2) {
     mflr(r(0)); std(r(0), 16, r1);
     LoadConstant(TMP1, CryptoSlotA); stvx(Src, r1, TMP1);
     SpillForABICall(TMP1);
-    ld(TMP1, 16, r1); std(TMP1, PostSpill(CryptoSlotR26), r1);
     addi(r3, r1, PostSpill(CryptoSlotA));
     addi(r4, r1, PostSpill(CryptoSlotA));
     EmitLoadPPC64Helper(r(12), PPC64_HELPER_F16HiToF32x4);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
-    ld(r(0), PostSpill(CryptoSlotR26), r1); std(r(0), 16, r1);
     FillForABICall();
     LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
     ld(r(0), 16, r1); mtlr(r(0));
@@ -4670,14 +4667,12 @@ DEF_OP(VFCVTN2) {
     LoadConstant(TMP1, CryptoSlotA); stvx(VL, r1, TMP1);  // dst seed
     LoadConstant(TMP1, CryptoSlotB); stvx(VU, r1, TMP1);  // f32 source
     SpillForABICall(TMP1);
-    ld(TMP1, 16, r1); std(TMP1, PostSpill(CryptoSlotR26), r1);
     addi(r3, r1, PostSpill(CryptoSlotA));   // dst (= VL spill, helper writes upper half)
     addi(r4, r1, PostSpill(CryptoSlotB));   // f32 source (VU)
     EmitLoadPPC64Helper(r(12), PPC64_HELPER_F32x4ToF16Hi);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
-    ld(r(0), PostSpill(CryptoSlotR26), r1); std(r(0), 16, r1);
     FillForABICall();
     LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
     ld(r(0), 16, r1); mtlr(r(0));
@@ -5208,10 +5203,7 @@ uint64_t* GetPPC64HelperTable() {
 //   [r1+32]  Slot A — primary vector input + dst output
 //   [r1+48]  Slot B — secondary vector input
 //   [r1+64]  Slot C — reserved (e.g. 3rd vector input for SHA1C)
-//   [r1+80]  unused (was r26 spill-rescue; obsolete since PushDynamicRegs now
-//            reserves a 32-byte ELFv2 link area, so the helper LR-save at
-//            caller_r1+16 lands harmlessly in the link area)
-//   [r1+88..95]  pad)
+//   [r1+80..95]  pad)
 
 DEF_OP(VAESImc) {
   const auto Op  = IROp->C<IR::IROp_VAESImc>();
@@ -5390,8 +5382,6 @@ DEF_OP(VSha1H) {
     LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
     LoadConstant(TMP1, CryptoSlotC); stvx((Src3Reg), r1, TMP1);              \
     SpillForABICall(TMP1);                                                   \
-    ld(TMP1, 16, r1);                                                         \
-    std(TMP1, PostSpill(CryptoSlotR26), r1);                                  \
     addi(r3, r1, PostSpill(CryptoSlotA));                                    \
     addi(r4, r1, PostSpill(CryptoSlotA));                                    \
     addi(r5, r1, PostSpill(CryptoSlotB));                                    \
@@ -5400,8 +5390,6 @@ DEF_OP(VSha1H) {
     std(r2, PostSpill(24), r1);                                              \
     mtctr(r(12)); bctrl();                                                   \
     ld(r2, PostSpill(24), r1);                                               \
-    ld(r(0), PostSpill(CryptoSlotR26), r1);                                   \
-    std(r(0), 16, r1);                                                        \
     FillForABICall();                                                        \
     LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
     ld(r(0), 16, r1); mtlr(r(0));                                             \
@@ -5420,8 +5408,6 @@ DEF_OP(VSha1H) {
     LoadConstant(TMP1, CryptoSlotA); stvx((Src1Reg), r1, TMP1);              \
     LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
     SpillForABICall(TMP1);                                                   \
-    ld(TMP1, 16, r1);                                                         \
-    std(TMP1, PostSpill(CryptoSlotR26), r1);                                  \
     addi(r3, r1, PostSpill(CryptoSlotA));                                    \
     addi(r4, r1, PostSpill(CryptoSlotA));                                    \
     addi(r5, r1, PostSpill(CryptoSlotB));                                    \
@@ -5429,8 +5415,6 @@ DEF_OP(VSha1H) {
     std(r2, PostSpill(24), r1);                                              \
     mtctr(r(12)); bctrl();                                                   \
     ld(r2, PostSpill(24), r1);                                               \
-    ld(r(0), PostSpill(CryptoSlotR26), r1);                                   \
-    std(r(0), 16, r1);                                                        \
     FillForABICall();                                                        \
     LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
     ld(r(0), 16, r1); mtlr(r(0));                                             \

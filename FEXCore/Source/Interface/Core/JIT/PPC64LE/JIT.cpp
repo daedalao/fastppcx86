@@ -906,24 +906,14 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     //   [r1+ 64]  RAX save (8 bytes; ESTRX only)
     //   [r1+ 72]  RDX save (8 bytes; ESTRX only)
     //   [r1+ 80]  Result save slot
-    //   [r1+ 88]  RA[2] (r26) spill rescue — see comment below
-    //   [r1+ 96..111]  pad (keep frame size a multiple of 16)
+    //   [r1+ 88..111]  pad (keep frame size a multiple of 16)
     //
-    // The helper called by bctrl is a non-leaf C function. Its prologue
+    // The helper called by bctrl is a non-leaf C function whose prologue
     // saves the incoming LR to "caller_r1 + 16" per the PPC64LE ELFv2 ABI.
-    // After SpillForABICall, our caller_r1 sits inside the dispatcher's
-    // PushDynamicRegs spill area, where slot [r1+16..23] holds the saved
-    // value of RA[2] = r26. The helper's prologue therefore *clobbers*
-    // r26's spill slot. PopDynamicRegs (inside FillForABICall) then reloads
-    // r26 from the corrupted slot, giving r26 a stale LR address. If the
-    // IR's register allocator put any live value in r26, that value is
-    // destroyed across this op — the bug surfaces non-deterministically as
-    // missing SF/ZF in LAHF after VPCMPxSTRx because PCMPxSTRXOpImpl's
-    // result-NZCV chain happens to land in r26 for some test inputs.
-    //
-    // Workaround: snapshot the r26 spill slot ([post-spill r1+16]) into a
-    // private slot in our mini-frame before bctrl, then restore it after
-    // bctrl (before FillForABICall reloads PopDynamicRegs).
+    // After SpillForABICall that lands inside the PushDynamicRegs frame's
+    // linkage area, which exists precisely to absorb it: dynamic GPR spill
+    // slots start at kDynGPRStart == kDynLinkArea == 96, and nothing reads
+    // [r1+16] on this path. No rescue of that slot is needed.
     constexpr int FrameSize = 112;
     const int SpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
     constexpr int SlotA   = 32;     // LHS vector
@@ -931,7 +921,6 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     constexpr int SlotRAX = 64;     // ESTRX RAX
     constexpr int SlotRDX = 72;     // ESTRX RDX
     constexpr int SlotR   = 80;     // 64-bit return value
-    constexpr int SlotR26 = 88;     // saved r26 spill slot (post-spill [r1+16])
     auto Post = [&](int Off) { return Off + SpillSaveSize; };
 
     // Capture sources & destination from the strongly-typed IROp variant.
@@ -972,12 +961,6 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
 
     SpillForABICall(TMP1);
 
-    // Snapshot the r26 spill slot ([post-spill r1+16]) so we can restore it
-    // after the helper's prologue clobbers it. (Done BEFORE we set up r3..r7
-    // for the call, since TMP1 = r3 is needed for the helper's first arg.)
-    ld(TMP1, 16, r1);
-    std(TMP1, Post(SlotR26), r1);
-
     // Set up arguments for the helper using ELFv2 ABI:
     //   PPC64_VPCMPESTRX(const uint8_t* lhs, const uint8_t* rhs,
     //                    uint64_t RAX, uint64_t RDX, uint64_t Control)
@@ -1000,11 +983,6 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
                                           //   but bctrl semantics are unchanged)
     mtctr(r(12)); bctrl();
     ld(r2, Post(24), r1);                 // restore TOC
-    // Restore the r26 spill slot before PopDynamicRegs reloads from it.
-    // r3 holds the helper's return value — must not be clobbered yet, so
-    // bounce through r0 (volatile, zero-restored later).
-    ld(r(0), Post(SlotR26), r1);
-    std(r(0), 16, r1);
 
     // Save 64-bit return value to a scratch slot, then refill SRA. The
     // SRA refill reloads STATE/x86 GPRs but does not touch SlotR.
