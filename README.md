@@ -28,6 +28,23 @@ address in a JIT buffer; a fix for guest arithmetic flags being corrupted after 
 out-of-bounds FPSCR write reachable from `_MM_SET_FLUSH_ZERO_MODE`; and ELFv2 r2/TOC preservation across
 cross-DSO thunk calls.
 
+## Milestone — code cache validates on PPC64LE
+
+`CodeCache::Validate` reports **`Successfully validated cache`** — the first time the code-cache detector
+has passed on this backend. Cache-mode compilation is now provably byte-identical between sessions modulo
+ASLR.
+
+Getting there took nine commits. The detector itself was crashing (a malformed erase-remove idiom left a
+relocation vector corrupted), and underneath that the backend emitted only one of the four relocation
+types, recorded relocation offsets block-relative while consuming them buffer-relative, never rebased
+guest addresses, and materialised constants with a value-dependent instruction count so patch sites could
+not be rewritten in place.
+
+The cache is **not** enabled yet — validation proves cache-mode compilation is reproducible, not that
+cached code is safe to run. Remaining before it can be trusted: `Validate`'s own blind spots (it does not
+check the block-mapping table, and has no length-equality check) and cache invalidation, which currently
+keys on the guest binary's *path string* rather than its identity.
+
 Detail is in the commit messages and `docs/POWER9_PORT_PLAN.md`.
 
 ## Headline wins on this branch
