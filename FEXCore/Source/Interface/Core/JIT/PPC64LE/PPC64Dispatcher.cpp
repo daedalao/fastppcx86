@@ -952,9 +952,13 @@ void PPC64Dispatcher::EmitDispatcher() {
 //   TMP3  (r5)  = integer source 2 / Control immediate
 //   TMP4  (r6)  = Func pointer (the actual C handler to call)
 //
+// TMP4 stays live across SpillForABICall and needs no stash: the ppc64le
+// SpillStaticRegs writes only its `tmp` argument plus TMP2/TMP3, and every
+// ppc64le callsite passes TMP1 (see EmitMiniFrameEnter below).
+//
 // Mini-frame layout (64 bytes, allocated with stdu before SpillForABICall):
 //   [r1+ 0]: back chain (old r1)
-//   [r1+ 8]: Func pointer save (TMP4, clobbered by SpillStaticRegs NZCV pack)
+//   [r1+ 8]: unused
 //   [r1+16]: LR save
 //   [r1+24]: integer arg / result save slot
 //   [r1+32]: stvx buf1 (16-byte aligned, for float/double <-> VMX conversion)
@@ -968,9 +972,9 @@ void PPC64Dispatcher::EmitDispatcher() {
 // stores its LR via `std r0, 16(r1)` to *its caller's* r1+16, and one that
 // spills incoming arguments writes the parameter save area too, so we must
 // not place a register spill there. After the spill, every mini-frame slot
-// below shifts up by kSpill (= the same constant), i.e. Func is at
-// [r1+kSpill+8], LR at [r1+kSpill+16], int save at [r1+kSpill+24],
-// buf1 at [r1+kSpill+32], buf2 at [r1+kSpill+48].
+// below shifts up by kSpill (= the same constant), i.e. LR is at
+// [r1+kSpill+16], int save at [r1+kSpill+24], buf1 at [r1+kSpill+32],
+// buf2 at [r1+kSpill+48].
 //
 // ============================================================
 uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
@@ -990,15 +994,24 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   // Helpers emitted inline
   // ----------------------------------------------------------------
 
-  // Allocate mini-frame and save LR. Also stashes TMP4 (=Func pointer) into
-  // mini-frame slot [r1+8] because SpillStaticRegs (called inside
-  // SpillForABICall) clobbers TMP4 when packing NZCV. Stub bodies must call
-  // EmitReloadFunc() after SpillForABICall and before `mtctr(TMP4); bctrl()`.
+  // Allocate mini-frame and save LR.
+  //
+  // This used to also stash TMP4 (=Func pointer) to mini-frame [r1+8], on the
+  // grounds that SpillStaticRegs clobbers TMP4 when packing NZCV. That is only
+  // true of the register passed as SpillStaticRegs' `tmp` argument
+  // (ArchHelpers/PPC64Emitter.cpp:161) — and every ppc64le callsite in the
+  // backend passes TMP1; only the ARM64 backend passes TMP4, and its files are
+  // not compiled here (FEXCore/Source/CMakeLists.txt:37-65). Besides `tmp`,
+  // SpillForABICall touches TMP2 (saved through f0), TMP3, r0, the SRA and RA
+  // pools and r1 — never r6. TMP4 is therefore live from stub entry straight
+  // through to `mtctr(TMP4); bctrl()`, and no stub body writes r6 in between.
+  //
+  // If a ppc64le callsite ever starts passing TMP4 to SpillStaticRegs /
+  // SpillForABICall, the stash has to come back.
   auto EmitMiniFrameEnter = [&]() {
     stdu(r1, -64, r1);
     mflr(r(0));
     std(r(0), 16, r1);
-    std(TMP4, 8, r1);          // stash Func pointer at mini-frame +8
   };
 
   // Restore LR, pop mini-frame, return
@@ -1009,14 +1022,14 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     blr();
   };
 
-  // Reload Func pointer (TMP4) from mini-frame spare slot. After
-  // SpillForABICall, r1 has been decremented by kSpill (= kDynRegSaveSize,
-  // PushDynamicRegs' SaveSize) so the original [r1+8] is now at [r1+kSpill+8].
-  // Also copy Func to r12 — PPC64LE ELFv2 mandates the caller passes the
+  // Publish the Func pointer (still live in TMP4 — see EmitMiniFrameEnter) in
+  // r12. PPC64LE ELFv2 mandates that the caller of an indirect call passes the
   // callee's global entry point address in r12 so the callee can compute its
   // TOC pointer via the standard `addis r2,r12,...; addi r2,r2,...` prologue.
-  auto EmitReloadFunc = [&]() {
-    ld(TMP4, static_cast<int16_t>(kSpill + 8), r1);
+  // Must run AFTER SpillForABICall: r12 is SRA[5] in both guest modes
+  // (ArchHelpers/PPC64Emitter.h), so before the spill it still holds live
+  // guest state that SpillStaticRegs is about to write to gregs[5].
+  auto EmitFuncToR12 = [&]() {
     mr(r12, TMP4);
   };
 
@@ -1138,7 +1151,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitExtractF32FromVTMP1();   // f1 = float, before spill
     SpillForABICall(TMP1);
     EmitFCW_And_Frame_r5();      // r3=FCW, r5=Frame*; f1 already set
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec1Result();
     EmitMiniFrameLeave();
@@ -1152,7 +1165,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitExtractF64FromVTMP1();   // f1 = double, before spill
     SpillForABICall(TMP1);
     EmitFCW_And_Frame_r5();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec1Result();
     EmitMiniFrameLeave();
@@ -1166,7 +1179,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);       // TMP2=r4 unchanged; TMP1=r3 clobbered
     EmitFCW_And_Frame_r5();      // r3=FCW, r5=Frame*; r4=src already set by JIT
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec1Result();
     EmitMiniFrameLeave();
@@ -1179,7 +1192,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX1_Frame_r7();     // r3=FCW, v2=VTMP1, r4=Frame*
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillF32Result();
     EmitMiniFrameLeave();
@@ -1192,7 +1205,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX1_Frame_r7();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillF64Result();
     EmitMiniFrameLeave();
@@ -1207,7 +1220,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitExtractF64FromVTMP1();   // f1 = double, before spill
     SpillForABICall(TMP1);
     mr(r4, STATE);               // r4=Frame*; f1 already set
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillF64Result();
     EmitMiniFrameLeave();
@@ -1222,7 +1235,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitExtractF64FromVTMP2();   // f2 = double 2
     SpillForABICall(TMP1);
     mr(r5, STATE);
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillF64Result();
     EmitMiniFrameLeave();
@@ -1237,7 +1250,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX1_Frame_r7();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillIntResult();
     EmitMiniFrameLeave();
@@ -1250,7 +1263,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX2_Frame_r9();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillIntResult();
     EmitMiniFrameLeave();
@@ -1263,7 +1276,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX1_Frame_r7();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec1Result();
     EmitMiniFrameLeave();
@@ -1276,7 +1289,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX2_Frame_r9();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec1Result();
     EmitMiniFrameLeave();
@@ -1289,7 +1302,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     SpillForABICall(TMP1);
     EmitFCW_VMX1_Frame_r7();
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillVec2Result();
     EmitMiniFrameLeave();
@@ -1304,7 +1317,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitExtractF64FromVTMP1();
     SpillForABICall(TMP1);
     mr(r4, STATE);              // r4 = Frame* (r3 skipped by double arg)
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillF64x2Result();
     EmitMiniFrameLeave();
@@ -1320,14 +1333,14 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     //   slot 4-5=RHS(v3,r7-r8), slot 6=Control→r9, slot 7=Frame→r10.
     // JIT stages: TMP1(r3)=RAX, TMP2(r4)=RDX, TMP3(r5)=Control(low 16),
     // VTMP1=LHS, VTMP2=RHS, TMP4(r6)=Func.
-    EmitMiniFrameEnter();        // stashes TMP4(Func) to mini-frame +8
+    EmitMiniFrameEnter();        // TMP4(Func) stays live in r6
     std(r3, 24, r1);             // save RAX to [mini_r1+24]
     std(TMP2, 32+8, r1);         // save RDX to mini-frame +40 (overlaps buf1
                                  // upper half; we don't use it before reload)
     std(TMP3, 48+8, r1);         // save Control to mini-frame +56 (overlaps
                                  // buf2 upper half; safe — no buf2 use here)
     SpillForABICall(TMP1);
-    EmitReloadFunc();
+    EmitFuncToR12();
     ld(r3, static_cast<int16_t>(kSpill + 24), r1);       // RAX
     ld(r4, static_cast<int16_t>(kSpill + 40), r1);       // RDX (mini-frame +40)
     vmr(VR{2}, VTMP1);           // v2 = LHS  (and r5-r6 reserved)
@@ -1344,13 +1357,13 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: int32_t handle(uint16_t Control, VectorRegType LHS, VectorRegType RHS)
     // PPC64LE ELFv2 slots: slot 0=Control→r3, slot 1 skipped (vec align),
     //   slot 2-3=LHS(v2,r5-r6), slot 4-5=RHS(v3,r7-r8). No Frame* arg.
-    EmitMiniFrameEnter();        // stashes TMP4(Func) to mini-frame +8
+    EmitMiniFrameEnter();        // TMP4(Func) stays live in r6
     std(r3, 24, r1);             // save Control to [mini_r1+24]
     SpillForABICall(TMP1);
     vmr(VR{2}, VTMP1);           // v2 = LHS
     vmr(VR{3}, VTMP2);           // v3 = RHS
     ld(r3, static_cast<int16_t>(kSpill + 24), r1);       // Control
-    EmitReloadFunc();
+    EmitFuncToR12();
     mtctr(TMP4); bctrl();
     FillIntResult();
     EmitMiniFrameLeave();

@@ -117,8 +117,10 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
   // ARM64 doesn't need this because PSTATE.NZCV is a hardware register that
   // survives across the dispatcher's C++ calls; PPC's CR0 + XER do not.
   //
-  // Callers pass tmp ∈ {TMP1, TMP4}; both also alias scratch we used in the
-  // SRA loop above. We need two non-aliased scratches (TMP2/TMP3) for the
+  // Every ppc64le caller passes tmp = TMP1 (the {TMP1, TMP4} choice this
+  // comment used to describe is the ARM64 emitter's; those files are not
+  // compiled here). tmp aliases scratch we used in the SRA loop above, so we
+  // need two non-aliased scratches (TMP2/TMP3) for the
   // CR/XER pack — but TMP2 (=r4) is also load-bearing for the FABI int-arg
   // contract: the dispatcher's per-FABI stubs (FABI_F80_I16_I16/I32_PTR)
   // expect TMP2 to still hold the int argument set by the JIT's Op_Unhandled
