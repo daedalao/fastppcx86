@@ -2,6 +2,7 @@
 // PPC64LE memory operations for FEX JIT backend.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Context/Context.h"
+#include "Interface/Core/CPUID.h"
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -1138,7 +1139,35 @@ DEF_OP(CacheLineClean)  {
 DEF_OP(CacheLineZero)   {
   GPR Addr = GetReg(IROp->C<IR::IROp_CacheLineZero>()->Addr);
   if (!CTX->Config.Is64BitMode()) { rldicl(TMP3, Addr, 0, 32); Addr = TMP3; }
-  dcbz(r0, Addr);
+
+  if (CTX->HostFeatures.DCacheLineSize == CPUIDEmu::CACHELINE_SIZE) {
+    // Fast path: dcbz zeroes exactly one host d-cache line, at an effective
+    // address truncated to that line. That is the semantics x86 CLZERO wants
+    // only when the host line is 64 bytes.
+    //
+    // NEVER TAKEN ON POWER8/9 -- their line is 128 bytes, and HostFeatures.cpp
+    // :722-729 reports the kernel's AT_DCACHEBSIZE (measured 128) with a 128
+    // fallback. Written as a guarded branch anyway so the intent is legible
+    // and so the instruction does not merely look forgotten.
+    dcbz(r0, Addr);
+  } else {
+    // We must walk the cacheline ourselves.
+    //
+    // x86 CLZERO zeroes 64 bytes at a 64-byte-truncated effective address. A
+    // bare dcbz on POWER zeroes 128 bytes at a 128-byte-truncated address, so
+    // it destroys up to 64 bytes of unrelated guest memory before and/or after
+    // the intended region -- silent guest heap corruption, not a fault.
+    //
+    // Mirrors ARM64's non-CLZERO path (JIT/MemoryOps.cpp:2451-2460), including
+    // the forced alignment: the guest address is not required to be aligned and
+    // CLZERO truncates rather than faulting.
+    clrrdi(TMP1, Addr, 6);  // EA & ~63
+    for (int16_t Offset = 0; Offset < static_cast<int16_t>(CPUIDEmu::CACHELINE_SIZE); Offset += 8) {
+      // r0 in the RS slot reads the register, which the backend's r0 == 0 block
+      // invariant holds at zero (see MemoryOps.cpp:705, ALUOps.cpp:3275).
+      std(r0, Offset, TMP1);
+    }
+  }
 }
 
 DEF_OP(Fence) {
