@@ -459,9 +459,15 @@ private:
       // Add the new pointer to the page block
       auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
-      // This silently replaces existing mappings
-      BlockPointers[PageOffset].GuestCode = FullAddress;
-      BlockPointers[PageOffset].HostCode = Entry.HostCode;
+      // This silently replaces existing mappings.
+      // Same release-publish discipline as L1 above: HostCode first, release
+      // fence, then GuestCode as the visibility key.  See
+      // LookupCacheEntry::Publish.  Every reader of L2 currently holds the
+      // shared read lock, so this is not load-bearing today, but the previous
+      // unordered store pair is the exact inverse of the required order and
+      // would hand a lock-free reader a valid GuestCode paired with a stale or
+      // uninitialised HostCode on a weakly-ordered host.
+      BlockPointers[PageOffset].Publish(Entry.HostCode, FullAddress);
     }
   }
 
