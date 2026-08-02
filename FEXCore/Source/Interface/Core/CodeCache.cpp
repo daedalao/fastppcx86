@@ -397,6 +397,40 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       ::memcpy(&NumGuestPages, MappedCacheFile, sizeof(NumGuestPages));
       MappedCacheFile += sizeof(NumGuestPages);
 
+      // F2: none of the three values above has been validated, and all three are
+      // about to be trusted — HostCode and BlockBegin become absolute host
+      // pointers that the LookupCache hands to the dispatcher as jump targets,
+      // and NumGuestPages drives the resize plus memcpy immediately below.
+      //
+      // Comparisons are written as `X >= Limit` / `X > Limit - sizeof(...)`
+      // rather than `X + sizeof(...) > Limit`: these are file-controlled
+      // uint64_t values, so a bounds check that itself wraps is worse than none.
+      //
+      // NOTE: this cannot bound the reads against the actual length of the
+      // mapped file, because LoadData is not given one — the length is known at
+      // both call sites (LinuxSyscalls/SyscallsSMCTracking.cpp fstat's it,
+      // Windows/Common/ImageTracker.cpp holds the mapping) but is not passed
+      // through the AbstractCodeCache interface. Closing that gap means changing
+      // a public FEXCore header and both callers. Until then NumGuestPages is
+      // bounded by header.NumCodePages, which is the count of distinct guest
+      // code pages in the whole cache and is therefore an upper bound on any one
+      // block's page list (a block's pages are always registered into that same
+      // global set at compile time). That bounds the resize to something
+      // proportional to the rest of the header rather than to 2^64, but it is an
+      // internal-consistency check, not a true file-length bound.
+      if (BlockPtr.second.HostCode >= header.CodeBufferSize || BlockPtr.second.BlockBegin >= header.CodeBufferSize) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} has HostCode {:#x} / BlockBegin {:#x} outside the {:#x} byte code buffer",
+                          BinarySection.FileInfo.Filename, BlockPtr.first, BlockPtr.second.HostCode, BlockPtr.second.BlockBegin,
+                          header.CodeBufferSize);
+        return false;
+      }
+
+      if (NumGuestPages > header.NumCodePages) {
+        LogMan::Msg::EFmt("Rejecting code cache for {}: block {:#x} claims {} guest code pages, more than the {} the whole cache holds",
+                          BinarySection.FileInfo.Filename, BlockPtr.first, NumGuestPages, header.NumCodePages);
+        return false;
+      }
+
       BlockPtr.second.CodePages.resize(NumGuestPages);
       ::memcpy(BlockPtr.second.CodePages.data(), MappedCacheFile, std::span {BlockPtr.second.CodePages}.size_bytes());
       MappedCacheFile += std::span {BlockPtr.second.CodePages}.size_bytes();
