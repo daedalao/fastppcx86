@@ -345,6 +345,48 @@ executed** — inline SMC is entirely unhandled on ppc64le. P1.1 makes it live. 
 
 ---
 
+## CODE CACHE — NOT PARKED. Non-negotiable. Correction recorded 2026-08-01.
+
+Research recommended measuring JIT-compile time as a fraction of wall time before committing to the
+cache, and I relayed that as a gate. **That was the wrong framing and the decision is reversed.**
+
+**Why it was wrong:** the ceiling was computed as a fraction of *aggregate* wall time. Stutter is not an
+aggregate — it is a tail. A 40 ms compile arriving at the wrong moment is an audible glitch and a dropped
+frame, and it is invisible in a mean and nearly invisible at p95. The research's own Factorio section
+predicted the effect would appear in **max and p99.9** and not at p95, which should have been the tell
+that the aggregate number answers a different question than the one that matters.
+
+**The measurement's own data already argued against my reading.** Every Factorio launch spawns FEXServer
+and thunk-helper subprocesses, and those measured at **~75% JIT** (`blocks=427`). That is the `perl -e0`
+case (82.6%) happening dozens of times per session. Games are not one long-lived process; they are a
+long-lived process surrounded by a constant churn of short-lived ones, and the short-lived ones are
+almost entirely compilation. That churn is where hitches and audio glitches come from.
+
+**Standing position:** the cache work proceeds. The P5.1 numbers remain useful as a **baseline** — they
+tell us what the absolute JIT cost is per workload (perl 0.135 s, Factorio 5.37 s per launch) so we can
+tell a working cache from a broken one later. They are not a go/no-go gate.
+
+**What still stands from the research**, because it is about correctness rather than value:
+- Landing order: fixed-width constant emission (without a config flag) → offset-base + `TakeRelocations`
+  rebasing together → relocation emission + `Tail->RIP` together → I-cache flush → then the invalidation
+  work. There is no useful intermediate state; a partially-correct relocation set patches real code at
+  wrong offsets.
+- `CodeCache::Validate` must land first — it is the only detector for the rest, and it is being fixed now
+  as S3.
+- Validation is blind to the block-mapping table. Add the structural header/tail check.
+- `ComputeCodeMapId` hashes only the path string and ignores the FD it is handed — `apt upgrade` inside
+  the rootfs silently poisons every cache for every upgraded library. Must be fixed before the cache is
+  left enabled.
+- `CodeCacheConfigId` is hardcoded `0`, so codegen-affecting options do not invalidate. Fix before
+  benchmarking, or you will measure a cache built from different codegen.
+
+**Measurement, when the time comes:** report max, p99.9 and p99 on the first ~300 ticks separately from
+the remainder, with `--benchmark-runs 1` and never pooled — the benchmark warms itself, so pooling 8000
+frames buries the compile cost. Also time-to-first-frame and time-to-initialised, which are plain
+wall-clock numbers where a startup cache should show its clearest win.
+
+---
+
 ## PRIORITY RESET — 2026-08-01
 
 **Foundational implements first: proper tracing, then the code cache.** Stop diagnosing the engine
@@ -352,6 +394,56 @@ through the exhaust pipe. Symptom-chasing (RimWorld, `probe_thread_spawn`, Facto
 until the tools exist to look at it directly.
 
 The order is now: **P3.1 → P2.1 → P3.2 → P3.3.** Everything else is parked.
+
+### Pre-registered decision — inline L1 dispatch probe (`c6c8d8dde`, `7f5e92bbb`)
+
+**Recorded 2026-08-01, before the measurement exists, so we are not arguing with a result we have grown
+attached to.**
+
+The criterion: *keep a change if it simplifies the execution pipeline and reduces error surface — that is
+worth more than performance. If it is riskier AND does not improve performance, it is worthless.*
+
+**This change does not get the simplification defence.** It **adds** structural complexity: two linker
+entry points where there was one, an address-dependency idiom that needs explaining, and signal-critical
+reachability that must now be reasoned about per path. So it has to pay on performance.
+
+- **Measures meaningfully faster** → keep. 84 → 14 instructions on the L1 hit path, and it removes a
+  double-spill (the old miss path spilled in both `ExitFunction` and `ExitFunctionLinker`).
+- **Measures flat** → **revert**, same as the vector spill, for the same reason. Salvage separately: the
+  load-ordering fix (`c6c8d8dde`) is a standalone bug fix to existing dispatcher code and should survive
+  independently, and the double-spill finding is worth its own small commit.
+- **Measures worse** → revert immediately, no discussion.
+
+> ### ⚠ DO NOT `git revert 7f5e92bbb` — the revert must be SURGICAL
+>
+> S2's SMC single-step work was **co-committed into `7f5e92bbb`**. A subagent committed while the build
+> agent had uncommitted changes to the same file (`PPC64Dispatcher.cpp`); "stage only your own files"
+> does not help when two actors edit one file. Six hunks of S2 work are inside that commit and its
+> message describes none of them.
+>
+> **Reverting the commit would silently take out:** the `EmitDeferredSignal{Enter,Exit}` guard around
+> `CompileSingleStepLabel`, the `r3 == 0` compile-failure check, and `ThreadStopNoSpillLabel`. Those are
+> correctness fixes to a path that had never executed, and they must survive.
+>
+> **A revert must remove only:** the `BranchOps.cpp` inlining of the L1 probe, and the
+> `ExitFunctionLinker` split into spilling/non-spilling entries in `PPC64Dispatcher.cpp`. Leave the
+> `CompileSingleStepLabel` rewrite untouched.
+>
+> History was deliberately not rewritten to fix this — the build agent had already committed
+> `357973731` on top, and rewriting shared history while another actor is working in the same tree is
+> how work gets lost.
+>
+> **Process fix applied:** code-writing subagents are now instructed to refuse to commit when the tree
+> is dirty with files they did not author, and to report rather than sweep the changes up. A `git
+> worktree` per subagent would be stronger but adds setup; revisit if this recurs.
+
+Contrast with P2.1, which earned its place on simplification alone: it removed 22 baked host addresses,
+made block code position-independent, and shrank the fixed-width work from ~37 sites to ~5, at zero
+measured performance. That is a change worth keeping regardless of the stopwatch. This one is not.
+
+Measurement: Factorio graphics benchmark, cpu-frame median, SMT2 node 0, against the §E cell (24.427 ms).
+Note the bench cannot resolve ~3.7%, so if the result is ambiguous use `perf stat` instruction-count
+deltas — deterministic and noise-free, which is how the vector spill was settled in two runs.
 
 ### New: P4.1 — block linking. Probably the largest remaining performance item, and it was dropped.
 
@@ -376,6 +468,37 @@ host with non-coherent split I/D caches; and a linked branch that skips the entr
 skip the `InlineJITBlockHeader` store that `667b59685` just added, leaving the header stale.
 
 Design in progress. Adversarial review before any implementation.
+
+### New: P4.2 — does FEX's GdbServer work on ppc64le?
+
+**Queued, not urgent. Potentially makes a chunk of planned tooling unnecessary.**
+
+We can now reconstruct a per-instruction guest RIP, but turning one into a symbol is still manual:
+find the mapping in `/proc/<pid>/maps`, subtract the base, correct for the ELF load bias, then
+`addr2line` against the guest binary from inside the rootfs. And for RimWorld the harder half is that
+Mono JITs into **anonymous mappings** — a RIP landing in a JIT arena has no ELF and no symbol table.
+
+FEX ships a GdbServer (`Source/Tools/LinuxEmulation/LinuxSyscalls/GdbServer.cpp`, plus
+`Source/Tools/FEXGDBReader`). If it works here, attaching gdb gives module resolution, symbols, memory
+inspection and backtraces natively — and the maps-dump-plus-resolver-script plan below becomes
+unnecessary.
+
+**Investigate, in order:**
+1. Does it work at all on ppc64le? Find the config option that enables it and try it against something
+   trivial before a game.
+2. If it works: does it resolve guest symbols, and does it see into Mono JIT arenas or stop at the
+   mapping boundary?
+3. If it does not work: what is broken? It reads guest state through paths this port has repeatedly
+   found bugs in — note that `5685fc55a` (P1.6) just fixed the flag reconstruction it uses, so its flag
+   display may have been wrong until today and may now be correct.
+
+**Fallback if the GdbServer is not viable** (a couple of hours, permanently useful):
+- Dump `/proc/self/maps` at fault time from FEX's crash handler — the address is unresolvable after the
+  process dies, and the handler already knows it is crashing.
+- A ~20-line resolver script: RIP + maps file → module and load-bias-corrected offset. Removes the
+  arithmetic error from every future investigation.
+- For Mono specifically, enable Mono's `/tmp/perf-<pid>.map` so JIT-arena addresses resolve to managed
+  method names. That is the difference between debugging RimWorld and staring at it.
 
 ### Testing gap being closed: x87 workload
 Quake 2 (id Tech 2, 1997, pre-SSE, float-heavy, `timedemo 1` with `demo1.dm2`) is being brought into the
