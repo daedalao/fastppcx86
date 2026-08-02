@@ -442,7 +442,21 @@ static void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::E
   auto MappedCache = (std::byte*)FEXCore::Allocator::mmap(nullptr, CacheFileSize, PROT_READ, MAP_PRIVATE, CacheFD, 0);
   LOGMAN_THROW_A_FMT(MappedCache, "Failed to map code cache into memory");
   if (!Thread.CTX->GetCodeCache().LoadData(&Thread, MappedCache, Section)) {
-    // TODO: Delete this cache file
+    // The cache file was rejected. Delete it so the next run regenerates it: without this, a cache that
+    // fails validation is silently ignored and then re-mapped and re-rejected on every single process
+    // start, forever, permanently pinning the guest onto the JIT-compile path with no visible symptom.
+    //
+    // Deleting a file that another process is currently mmap'ing is safe on Linux. The mapping holds a
+    // reference to the inode, so an existing MAP_PRIVATE mapping stays valid and readable after the
+    // directory entry is gone; concurrent FEX starts keep working on the data they already mapped. If
+    // two processes race to unlink the same path, one of them loses with ENOENT, which is not an error
+    // condition here.
+    LogMan::Msg::EFmt("Rejected invalid code cache, deleting it: {}", CacheFilename);
+    if (unlink(CacheFilename.c_str()) != 0 && errno != ENOENT) {
+      // Non-fatal: a read-only or permission-restricted cache directory just means we will re-reject
+      // this same file on the next start. Falling back to JIT compilation is still correct.
+      LogMan::Msg::EFmt("Failed to delete invalid code cache {}: {}", CacheFilename, strerror(errno));
+    }
   }
   FEXCore::Allocator::munmap(MappedCache, CacheFileSize);
   close(CacheFD);
