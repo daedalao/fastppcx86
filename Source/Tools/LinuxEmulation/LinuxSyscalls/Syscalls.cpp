@@ -851,6 +851,24 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
     }
   }
 
+  // FEX_SMCLAZYINVAL (DELIBERATELY UNSOUND -- see
+  // LinuxSyscalls/SMCLazyInvalidate.h). It is a relaxation of v3's drain
+  // discipline, so v3's machinery has to be there for it to relax: without
+  // SMCSoftInvalidate a deferred page would have to be hard-invalidated at the
+  // drain (throwing away exactly the amortization this is chasing), and without
+  // mtrack there are no SMC write faults to defer in the first place.
+  // Publishing the dirty-count pointer is what arms drain point (a) inside
+  // FEXCore; leaving it null is what makes the option cost nothing when off.
+  if (SMCLazyInval() && SMCSoftInvalidate() && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+    SMCLazyInvalEnabled.store(true, std::memory_order_relaxed);
+    LazySMCDirtyCount = &SMCLazyDirtyCount;
+    LogMan::Msg::EFmt("FEX_SMCLAZYINVAL is ON: SMC invalidation is deferred to drain points and guest code "
+                      "can execute STALE translations. This is deliberately unsound -- expect self-modifying "
+                      "guests (runtime codegen, JITs) to miscompute or crash.");
+  } else if (SMCLazyInval()) {
+    LogMan::Msg::EFmt("FEX_SMCLAZYINVAL needs FEX_SMCSOFTINVALIDATE=1 and FEX_SMCCHECKS=mtrack; staying off.");
+  }
+
 #ifdef ARCHITECTURE_ppc64le
   // FEX_SMCSTOREBACKPATCH rides on the store decoder that SMCStoreEmulation
   // owns: without that path there is no fault site to rewrite. Arm the page
@@ -926,6 +944,26 @@ uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXC
   // fault correctly. This Phase 3 closes the loop by actually arming the guard
   // at the right scope.
   FEXCore::DeferredSignalRefCountGuard SignalGuard(Frame->Thread);
+
+  // FEX_SMCLAZYINVAL drain point (b): guest syscall entry.
+  //
+  // x86 requires a serializing event before cross-modified code may run, and a
+  // syscall is the one every real guest actually uses; it is also the natural
+  // bound on how long a same-thread patch may stay invisible in practice. The
+  // drain must happen at entry (before the syscall body can, say, hand the page
+  // to another thread or change its protection), not on the way out.
+  //
+  // Lock protocol: nothing is held here. The JIT has exited its block, no
+  // shared CodeInvalidationMutex is outstanding, and the drain's own
+  // ReleaseAllPendingSharedLocks is therefore a no-op. Taking the exclusive
+  // CodeInvalidationMutex from inside a syscall body is what every mm-related
+  // syscall already does (GuestMunmap et al. via InvalidateCodeRangeIfNecessary),
+  // including under this same DeferredSignalRefCountGuard.
+  //
+  // Cost with the option off: one relaxed load of SMCLazyInvalEnabled.
+  if (SMCLazyInvalActive()) {
+    DrainSMCLazyDirtyPages(Frame->Thread, FEX::HLE::SMCLazy::DrainPoint::Syscall);
+  }
 
   // Grab the return address which will be inside the JIT.
   const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));

@@ -472,6 +472,21 @@
           "goes undetected. Opt in per application."
         ]
       },
+      "SMCLazyInval": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "DELIBERATELY UNSOUND, for speed. On an SMC write fault, unprotect",
+          "the page and record it as dirty but invalidate NOTHING, so the",
+          "writer runs at native speed. The recorded pages are soft-invalidated",
+          "later, at the next drain point (a thread entering the block",
+          "compiler, a guest syscall, or guest signal delivery). A thread can",
+          "execute a STALE translation between the write and that drain; a",
+          "same-thread patch-then-call that hits the L1 lookup cache is the",
+          "known exposure and can make a guest miscompute or crash. Requires",
+          "SMCSoftInvalidate and SMCChecks=mtrack. Off: no effect."
+        ]
+      },
       "SMCStoreEmulation": {
         "Type": "bool",
         "Default": "false",

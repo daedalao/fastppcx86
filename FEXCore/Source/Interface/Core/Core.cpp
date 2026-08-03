@@ -935,6 +935,21 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
+  // FEX_SMCLAZYINVAL drain point (a). This thread is about to run code it does
+  // not already have in its L1, so settle any deferred SMC invalidations first:
+  // pages dirtied since the last drain get soft-invalidated now, so the lookup
+  // below either misses (and recompiles) or relinks against a validated hash,
+  // instead of publishing a translation of bytes that have been overwritten.
+  //
+  // MUST stay above the shared CodeInvalidationMutex guard: the drain takes the
+  // exclusive side of that same mutex and calls ReleaseAllPendingSharedLocks to
+  // get there, which would yank a lock this function relies on for its whole
+  // body (the v2 hazard, see SMCSoftInvalidate.h note (d)). Null pointer =>
+  // option off => one predictable load and a not-taken branch.
+  if (auto* LazyCount = SyscallHandler->LazySMCDirtyCount; LazyCount && LazyCount->load(std::memory_order_acquire) != 0) {
+    SyscallHandler->DrainLazySMCInvalidations(Thread);
+  }
+
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <optional>
 
@@ -66,6 +67,22 @@ public:
   virtual std::optional<ExecutableFileSectionInfo> LookupExecutableFileSection(Core::InternalThreadState* Thread, uint64_t GuestAddr) = 0;
 
   virtual void PreCompile() {}
+
+  // FEX_SMCLAZYINVAL: with lazy SMC invalidation the SMC fault handler only
+  // records dirtied guest code pages; the soft-invalidation itself happens at
+  // the next "drain point", and a thread that is about to run code it doesn't
+  // already have cached is one of them (ContextImpl::CompileBlock).
+  //
+  // The frontend owns the dirty set, so it publishes a pointer to its atomic
+  // count here when -- and only when -- the option is active.  A null pointer
+  // is the whole cost of the feature when it is off: one predictable load and
+  // a not-taken branch per CompileBlock, no virtual call.  Never dereference
+  // this without checking it; never call the drain with any code-invalidation
+  // lock held (the drain takes the exclusive side of CodeInvalidationMutex and
+  // force-releases pending shared locks to do it).
+  // See Source/Tools/LinuxEmulation/LinuxSyscalls/SMCLazyInvalidate.h.
+  std::atomic<uint64_t>* LazySMCDirtyCount {nullptr};
+  virtual void DrainLazySMCInvalidations(FEXCore::Core::InternalThreadState* Thread) {}
 
   virtual SourcecodeResolver* GetSourcecodeResolver() {
     return nullptr;

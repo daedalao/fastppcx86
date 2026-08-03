@@ -11,6 +11,7 @@ $end_info$
 #include "Common/VolatileMetadata.h"
 #include "LinuxSyscalls/FileManagement.h"
 #include "LinuxSyscalls/LinuxAllocator.h"
+#include "LinuxSyscalls/SMCLazyInvalidate.h"
 #include "LinuxSyscalls/ThreadManager.h"
 #include "LinuxSyscalls/Seccomp/SeccompEmulator.h"
 #include "LinuxSyscalls/SyscallsVMATracking.h"
@@ -233,6 +234,7 @@ public:
   FEX_CONFIG_OPT(SMCMprotectDefer, SMCMPROTECTDEFER);
   FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
   FEX_CONFIG_OPT(SMCFileImmutable, SMCFILEIMMUTABLE);
+  FEX_CONFIG_OPT(SMCLazyInval, SMCLAZYINVAL);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
 
@@ -472,6 +474,80 @@ public:
   // for the immutability assumption.
   // - VMATracking.Mutex must be unique_locked before calling
   void RevokeSMCFileImmutabilityLocked(uint64_t Base, uint64_t Top);
+  ///// Lazy SMC invalidation (FEX_SMCLAZYINVAL) /////
+  //
+  // DELIBERATELY UNSOUND FOR SPEED. The full design note, the drain-point
+  // list, and the exact statement of what correctness is being traded away
+  // live in LinuxSyscalls/SMCLazyInvalidate.h -- read it before touching any
+  // of this.
+  //
+  // Structure mirrors the SMCDeferredDirtyPages block above: a leaf mutex
+  // guarding an ordered page set, plus an atomic count so every drain point
+  // is a single relaxed-ish load when the set is empty (which is every check
+  // in a run with the option off, and the overwhelming majority of checks
+  // even with it on). The mutex is a leaf: nothing is called while holding
+  // it, and in particular no drain runs under it -- the batch is swapped out
+  // first, then soft-invalidated outside, because
+  // ThreadManager::SoftInvalidateGuestCodeRange takes ThreadCreationMutex and
+  // the exclusive CodeInvalidationMutex and force-releases pending shared
+  // locks (ReleaseAllPendingSharedLocks) on its way there.
+  //
+  // Taking it from the SIGSEGV handler is safe for the same reason
+  // SMCDeferredDirtyMutex already is: no guest memory is touched while it is
+  // held (only the set's own nodes), so a thread holding it cannot take an SMC
+  // fault and re-enter.
+  std::mutex SMCLazyDirtyMutex;
+  std::atomic<uint64_t> SMCLazyDirtyCount {0};
+  fextl::set<uint64_t> SMCLazyDirtyPages;
+
+  // Set once at construction, after the SMCSoftInvalidate + mtrack gate.
+  std::atomic<bool> SMCLazyInvalEnabled {false};
+
+  bool SMCLazyInvalActive() const {
+    return SMCLazyInvalEnabled.load(std::memory_order_relaxed);
+  }
+
+  // Records a page as dirty-but-not-invalidated. Returns true if this is the
+  // first time the page entered the set since the last drain (the audit trace
+  // logs the lazy unprotect once per page per dirty epoch, not once per
+  // store). Called from the SIGSEGV handler.
+  bool MarkSMCLazyDirtyPage(uint64_t Page) {
+    std::lock_guard lk {SMCLazyDirtyMutex};
+    const bool Inserted = SMCLazyDirtyPages.insert(Page).second;
+    SMCLazyDirtyCount.store(SMCLazyDirtyPages.size(), std::memory_order_release);
+    return Inserted;
+  }
+
+  // Forgets every dirty record intersecting [Base, Top) WITHOUT invalidating.
+  // Only legal where the caller performs (or has performed) a hard
+  // invalidation of the same range, which is strictly stronger. Returns true
+  // if any record existed.
+  bool ClearSMCLazyDirtyRange(uint64_t Base, uint64_t Top) {
+    if (SMCLazyDirtyCount.load(std::memory_order_acquire) == 0) {
+      return false;
+    }
+    std::lock_guard lk {SMCLazyDirtyMutex};
+    auto First = SMCLazyDirtyPages.lower_bound(Base);
+    auto Last = SMCLazyDirtyPages.lower_bound(Top);
+    const bool Any = First != Last;
+    SMCLazyDirtyPages.erase(First, Last);
+    SMCLazyDirtyCount.store(SMCLazyDirtyPages.size(), std::memory_order_release);
+    return Any;
+  }
+
+  // Drain: soft-invalidate every dirty page and drop the records. Must not be
+  // called with any code-invalidation lock held. No-op when the set is empty.
+  void DrainSMCLazyDirtyPages(FEXCore::Core::InternalThreadState* Thread, FEX::HLE::SMCLazy::DrainPoint Point);
+
+  // Drain restricted to [Base, Top). Used by guest mprotect(PROT_EXEC), which
+  // must settle the range's debt before it returns.
+  void DrainSMCLazyDirtyRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Base, uint64_t Top,
+                              FEX::HLE::SMCLazy::DrainPoint Point);
+
+  // FEXCore-side hook for drain point (a), ContextImpl::CompileBlock.
+  void DrainLazySMCInvalidations(FEXCore::Core::InternalThreadState* Thread) override {
+    DrainSMCLazyDirtyPages(Thread, FEX::HLE::SMCLazy::DrainPoint::CompileBlock);
+  }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   std::optional<FEXCore::ExecutableFileSectionInfo>

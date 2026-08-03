@@ -1303,6 +1303,29 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   } else if (Handler.GuestAction.sigaction_handler.handler == SIG_IGN) {
     return;
   } else {
+    // FEX_SMCLAZYINVAL drain point (c): guest signal delivery.
+    //
+    // The guest handler is about to run, on a control-flow edge the guest did
+    // not write and cannot have prepared for. It is also a serializing event in
+    // x86 terms, so it is a place a guest is entitled to assume its own earlier
+    // code writes have become visible. Settle the deferred invalidations before
+    // the frame is built and the handler dispatched.
+    //
+    // Lock protocol: this runs in a host signal handler, so the drain's
+    // ReleaseAllPendingSharedLocks is load-bearing rather than decorative --
+    // it is the same recovery HandleSegfault performs before it soft-invalidates
+    // from signal context. Reaching here means the signal was NOT deferred:
+    // async signals with DeferredSignalRefCount != 0 (which covers every host
+    // syscall body, hence every place FEX holds VMATracking/ThreadCreation
+    // locks) and async signals raised inside the JIT or dispatcher have already
+    // returned above, queued. What is left is a synchronous guest fault from
+    // JIT code, or an async signal at a drained-to boundary; in neither case is
+    // this thread inside a FEX lock scope that the drain's exclusive
+    // CodeInvalidationMutex could deadlock against.
+    if (_SyscallHandler->SMCLazyInvalActive()) {
+      _SyscallHandler->DrainSMCLazyDirtyPages(Thread, FEX::HLE::SMCLazy::DrainPoint::GuestSignal);
+    }
+
     if (Handler.GuestHandler &&
         Handler.GuestHandler(Thread, Signal, &SigInfo, UContext, &Handler.GuestAction, &ThreadObject->SignalInfo.GuestAltStack)) {
       uint64_t NewMask = GetNewSigMask(Signal);

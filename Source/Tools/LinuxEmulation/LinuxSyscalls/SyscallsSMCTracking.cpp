@@ -353,6 +353,11 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     }
 #endif // ARCHITECTURE_ppc64le
 
+    // FEX_SMCLAZYINVAL: set when this fault was answered by recording the page
+    // instead of invalidating it. Nothing was invalidated, so nothing may
+    // pretend a pending invalidation debt has been settled below.
+    bool LazyDeferred = false;
+
     if (Entry->second.Flags.Shared) {
       LOGMAN_THROW_A_FMT(Entry->second.Resource, "VMA tracking error");
 
@@ -373,6 +378,26 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
           }
         }
       } while ((VMA = VMA->ResourceNextVMA));
+    } else if (_SyscallHandler->SMCLazyInvalActive()) {
+      // FEX_SMCLAZYINVAL: unprotect and record, invalidate NOTHING. The writer
+      // returns to native speed immediately; the page's blocks stay live (and
+      // therefore possibly stale) in every lookup structure until a drain
+      // point soft-invalidates them. This is the deliberately unsound path --
+      // see LinuxSyscalls/SMCLazyInvalidate.h for exactly what is being traded.
+      //
+      // Record BEFORE unprotecting, never after: with the reverse order a
+      // concurrent drain could run in between, leaving the page unprotected
+      // *and* unrecorded, i.e. permanently writable with live translations on
+      // it and nothing left to ever invalidate them. In this order the worst
+      // interleaving is a drain that soft-invalidates the page just before we
+      // unprotect it, which merely re-arms protection at the next
+      // compile/relink through MarkGuestExecutableRange -- sound.
+      const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase);
+      UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_PAGE_SIZE);
+      LazyDeferred = true;
+      if (FirstThisEpoch) {
+        SMC_AUDIT("[%d] fault addr=%lx LAZY-UNPROTECT page=%lx\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase);
+      }
     } else if (_SyscallHandler->SMCSoftInvalidate()) {
       // SMC v3: delink the page's blocks but keep their code and content
       // hashes, then unprotect exactly as legacy does. The delink completes
@@ -387,8 +412,13 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
 
-    SMC_AUDIT("[%d] fault addr=%lx %s page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress,
-              (!Entry->second.Flags.Shared && _SyscallHandler->SMCSoftInvalidate()) ? "SOFT-INVALIDATED" : "INVALIDATED", FaultBase,
+    const char* FaultOutcome = "INVALIDATED";
+    if (LazyDeferred) {
+      FaultOutcome = "LAZY-DEFERRED";
+    } else if (!Entry->second.Flags.Shared && _SyscallHandler->SMCSoftInvalidate()) {
+      FaultOutcome = "SOFT-INVALIDATED";
+    }
+    SMC_AUDIT("[%d] fault addr=%lx %s page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress, FaultOutcome, FaultBase,
               Entry->second.Flags.Shared ? 1 : 0);
 
     // FEX_SMCMPROTECTDEFER: a deferred-dirty page can still fault here if a
@@ -397,7 +427,10 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // deferred debt, so drop the record instead of paying for it again at the
     // next PROT_EXEC.  (Cheap: the atomic count short-circuits when no page is
     // deferred, which is every fault in a run with the option off.)
-    if (_SyscallHandler->SMCMprotectDeferActive()) {
+    //
+    // Not when FEX_SMCLAZYINVAL took the fault: nothing was invalidated, so the
+    // W^X deferral is still owed and must survive to its PROT_EXEC.
+    if (!LazyDeferred && _SyscallHandler->SMCMprotectDeferActive()) {
       _SyscallHandler->ClearSMCDeferredDirtyRange(FaultBase, FaultBase + FEXCore::Utils::FEX_PAGE_SIZE);
     }
 
@@ -627,6 +660,100 @@ void SyscallHandler::RevokeSMCFileImmutabilityLocked(uint64_t Base, uint64_t Top
       Mapping->second.Resource->SMCFileImmutableRevoked = true;
     }
   }
+}
+// ---------------------------------------------------------------------------
+// FEX_SMCLAZYINVAL drains.  See LinuxSyscalls/SMCLazyInvalidate.h.
+//
+// Lock protocol, and it is the whole reason these live here rather than inline:
+//   * SMCLazyDirtyMutex is a LEAF.  The batch is swapped/extracted under it and
+//     the mutex is dropped before anything else is called.
+//   * ThreadManager::SoftInvalidateGuestCodeRange runs outside it and brings
+//     its own protocol -- ReleaseAllPendingSharedLocks, ThreadCreationMutex,
+//     then the steal-capable exclusive CodeInvalidationMutex.  Because it
+//     force-releases pending shared locks, NO caller may hold a shared
+//     CodeInvalidationMutex across a drain; every drain point is placed before
+//     such a lock is taken (CompileBlock) or where none is held at all
+//     (syscall entry, guest signal delivery, guest mprotect).
+//   * Nothing here re-protects.  SoftInvalidateRange erases the page from
+//     GuestToHostMap::CodePages, so the next relink or compile on that page
+//     sees AddBlockExecutableRange return NewPage==true and goes through
+//     MarkGuestExecutableRange, which is where mtrack protection is installed.
+//     The page is protected again exactly when live code reappears on it.
+// ---------------------------------------------------------------------------
+namespace {
+// Soft-invalidate an ascending, deduplicated page list, coalescing runs of
+// contiguous pages so a burst that dirtied one arena costs one lock round trip
+// instead of one per page.
+void SoftInvalidateLazyPages(FEX::HLE::SyscallHandler* Handler, FEXCore::Core::InternalThreadState* Thread,
+                             const fextl::vector<uint64_t>& Pages) {
+  // SoftInvalidateGuestCodeRange's after_callback is where legacy re-protects
+  // or unprotects; the lazy drain does neither (see the note above), so this is
+  // deliberately empty rather than absent.
+  const auto NoCallback = [](uint64_t, uint64_t) {};
+
+  size_t Index = 0;
+  while (Index < Pages.size()) {
+    size_t Run = 1;
+    while (Index + Run < Pages.size() && Pages[Index + Run] == Pages[Index + Run - 1] + FEXCore::Utils::FEX_PAGE_SIZE) {
+      ++Run;
+    }
+    Handler->TM.SoftInvalidateGuestCodeRange(Thread, Pages[Index], Run * FEXCore::Utils::FEX_PAGE_SIZE, NoCallback);
+    Index += Run;
+  }
+}
+} // anonymous namespace
+
+void SyscallHandler::DrainSMCLazyDirtyPages(FEXCore::Core::InternalThreadState* Thread, FEX::HLE::SMCLazy::DrainPoint Point) {
+  // O(1) when there is nothing to do, which is every call in a run with the
+  // option off and the overwhelming majority of calls with it on.
+  if (SMCLazyDirtyCount.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+
+  fextl::vector<uint64_t> Batch;
+  {
+    std::lock_guard lk {SMCLazyDirtyMutex};
+    Batch.reserve(SMCLazyDirtyPages.size());
+    Batch.insert(Batch.end(), SMCLazyDirtyPages.begin(), SMCLazyDirtyPages.end());
+    SMCLazyDirtyPages.clear();
+    SMCLazyDirtyCount.store(0, std::memory_order_release);
+  }
+
+  if (Batch.empty()) {
+    // Raced another drain to the swap; it did the work.
+    return;
+  }
+
+  SMC_AUDIT("[%d] lazy-drain at=%s pages=%zu first=%lx\n", FHU::Syscalls::gettid(), FEX::HLE::SMCLazy::DrainPointName(Point), Batch.size(),
+            Batch.front());
+
+  SoftInvalidateLazyPages(this, Thread, Batch);
+}
+
+void SyscallHandler::DrainSMCLazyDirtyRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Base, uint64_t Top,
+                                            FEX::HLE::SMCLazy::DrainPoint Point) {
+  if (SMCLazyDirtyCount.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+
+  fextl::vector<uint64_t> Batch;
+  {
+    std::lock_guard lk {SMCLazyDirtyMutex};
+    auto First = SMCLazyDirtyPages.lower_bound(Base);
+    auto Last = SMCLazyDirtyPages.lower_bound(Top);
+    Batch.insert(Batch.end(), First, Last);
+    SMCLazyDirtyPages.erase(First, Last);
+    SMCLazyDirtyCount.store(SMCLazyDirtyPages.size(), std::memory_order_release);
+  }
+
+  if (Batch.empty()) {
+    return;
+  }
+
+  SMC_AUDIT("[%d] lazy-drain at=%s pages=%zu first=%lx range=%lx-%lx\n", FHU::Syscalls::gettid(),
+            FEX::HLE::SMCLazy::DrainPointName(Point), Batch.size(), Batch.front(), Base, Top);
+
+  SoftInvalidateLazyPages(this, Thread, Batch);
 }
 
 void SyscallHandler::MaybeRecordMonoMapping(std::string_view Path, uint64_t Base, uint64_t End) {
@@ -889,6 +1016,12 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   // FEX_SMCFILEIMMUTABLE: whatever was mapped here is gone and the invalidation
   // below is unconditional, so the skip records for the range retire with it.
   ClearSMCImmutableSkippedRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  // FEX_SMCLAZYINVAL: same reasoning. The mmap retired whatever was there and
+  // InvalidateCodeRangeIfNecessary below hard-invalidates the range, which is
+  // strictly stronger than the soft-invalidate the record was owed, so drop it.
+  if (SMCLazyInvalActive()) {
+    ClearSMCLazyDirtyRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  }
 
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
 
@@ -946,6 +1079,13 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
   // skip records.
   ClearSMCImmutableSkippedRange(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK,
                                 FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  // FEX_SMCLAZYINVAL: the memory is gone and the hard invalidation below is
+  // unconditional; drop the lazy records so a dirty page can never outlive its
+  // mapping (and so a later drain can't soft-invalidate an unmapped range).
+  if (SMCLazyInvalActive()) {
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
+    ClearSMCLazyDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  }
 
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size);
 
@@ -1003,6 +1143,10 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
   // not covered by InvalidateCodeRangeIfNecessaryOnRemap, so if it carried
   // records from an earlier mapping, settle them with an invalidation now rather
   // than leave blocks behind an address whose backing just changed.
+  // FEX_SMCLAZYINVAL: identical shape. The old range moved/shrank and was
+  // invalidated above, so both features' records just go. Anything either
+  // feature was tracking at the destination is settled with an invalidation
+  // now rather than carried across the mapping change.
   {
     const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_PAGE_MASK;
     const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_PAGE_SIZE);
@@ -1010,7 +1154,12 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
     const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_PAGE_SIZE);
 
     ClearSMCImmutableSkippedRange(OldBase, OldTop);
-    if (ClearSMCImmutableSkippedRange(NewBase, NewTop)) {
+    bool SettleNew = ClearSMCImmutableSkippedRange(NewBase, NewTop);
+    if (SMCLazyInvalActive()) {
+      ClearSMCLazyDirtyRange(OldBase, OldTop);
+      SettleNew |= ClearSMCLazyDirtyRange(NewBase, NewTop);
+    }
+    if (SettleNew) {
       InvalidateCodeRangeIfNecessary(Thread, NewBase, NewTop - NewBase);
     }
   }
@@ -1127,6 +1276,31 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
       // page-by-page.  Let the normal invalidation run and forget any deferral
       // rather than carrying it to some later PROT_EXEC.
       ClearSMCDeferredDirtyRange(Base, Top);
+    }
+  }
+
+  // FEX_SMCLAZYINVAL: the guest's own mprotect already replaced whatever mtrack
+  // protection was installed here, so any lazy record for this range has lost
+  // the page state it was describing and must be settled or dropped now.
+  if (SMCLazyInvalActive()) {
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+
+    if (prot & PROT_EXEC) {
+      // The guest is arming the range for execution: it may branch into it the
+      // instant this syscall returns, so the debt is settled synchronously
+      // here, before the return. (The unconditional invalidation just below
+      // would also cover it whenever DeferInvalidation is false -- which
+      // PROT_EXEC always is -- but this drain keeps the rule "PROT_EXEC drains
+      // the range" true independently of the other options' interactions.)
+      DrainSMCLazyDirtyRange(Thread, Base, Top, FEX::HLE::SMCLazy::DrainPoint::MprotectExec);
+    } else {
+      // Not executable. Either the unconditional invalidation below covers the
+      // range, or SMCMprotectDefer took ownership of it (W-not-X) and will
+      // invalidate at the matching PROT_EXEC. Either way the lazy record is
+      // superseded; carrying it would only risk soft-invalidating a range whose
+      // protection state we no longer control.
+      ClearSMCLazyDirtyRange(Base, Top);
     }
   }
 
