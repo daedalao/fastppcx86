@@ -221,24 +221,50 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // v1 restriction: private mappings only — a shared mapping's write is
     // visible through every mirror, so the overlap check would have to cover
     // all mirrored VAs; keep mirrors on the proven path for now.
-    if (_SyscallHandler->SMCStoreEmulation() && !Entry->second.Flags.Shared) {
-      DecodedStore Store;
-      if (DecodePPCStore(ucontext, ArchHelpers::Context::GetPc(ucontext), &Store)) {
+    //
+    // Every way out of this block emits exactly one FEX_SMC_AUDIT line tagged
+    // with the reason it declined, plus the faulting address, the decoded
+    // effective address/width where known, and the raw host instruction word.
+    // The CP2077 histogram showed this fast path firing 0 times with no
+    // recorded reason; without per-reason attribution there is no way to tell
+    // "the overlap test is too coarse" (fixable, Idea 3) from "the store form
+    // isn't decoded" (fixable, widen the decoder) from "these are all shared
+    // mappings" (out of scope for v1).
+    if (_SyscallHandler->SMCStoreEmulation()) {
+      const uint64_t StorePC = ArchHelpers::Context::GetPc(ucontext);
+      const uint32_t RawInsn = *reinterpret_cast<const uint32_t*>(StorePC);
+      DecodedStore Store {};
+
+      // Tag, then decoded EA/width (0/0 when we never got that far).
+      const auto Fallback = [&](const char* Reason, uint64_t EA, uint32_t Width) {
+        SMC_AUDIT("[%d] fault addr=%lx SMC-FALLBACK reason=%s ea=%lx w=%u insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress, Reason, EA,
+                  Width, RawInsn);
+      };
+
+      if (Entry->second.Flags.Shared) {
+        Fallback("shared-mapping", 0, 0);
+      } else if (!DecodePPCStore(ucontext, StorePC, &Store)) {
+        // Not a plain GPR store: VSX/VMX, byte-reversed, store-conditional,
+        // dcbz, stq, or an update form with RA==0.
+        Fallback("decode-fail", 0, 0);
+      } else if (!(FaultAddress >= Store.EA && FaultAddress < Store.EA + Store.Width)) {
         // The decoded target must include the faulting address, or we decoded
         // an instruction whose fault this isn't (paranoia; mismatch => legacy).
-        const bool CoversFault = FaultAddress >= Store.EA && FaultAddress < Store.EA + Store.Width;
-        if (CoversFault && !Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
-          const int fd = SelfMemFD();
-          if (fd >= 0 && ::pwrite(fd, &Store.Value, Store.Width, static_cast<off_t>(Store.EA)) == static_cast<ssize_t>(Store.Width)) {
-            if (Store.UpdateRA != ~0u) {
-              ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
-            }
-            ArchHelpers::Context::SetPc(ucontext, ArchHelpers::Context::GetPc(ucontext) + 4);
-            SMC_AUDIT("[%d] fault addr=%lx EMULATED-STORE ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, Store.EA, Store.Width);
-            FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
-            return true;
-          }
+        Fallback("fault-outside-store", Store.EA, Store.Width);
+      } else if (Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
+        Fallback("overlaps-code", Store.EA, Store.Width);
+      } else if (SelfMemFD() < 0) {
+        Fallback("selfmem-open-fail", Store.EA, Store.Width);
+      } else if (::pwrite(SelfMemFD(), &Store.Value, Store.Width, static_cast<off_t>(Store.EA)) != static_cast<ssize_t>(Store.Width)) {
+        Fallback("pwrite-fail", Store.EA, Store.Width);
+      } else {
+        if (Store.UpdateRA != ~0u) {
+          ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
         }
+        ArchHelpers::Context::SetPc(ucontext, StorePC + 4);
+        SMC_AUDIT("[%d] fault addr=%lx EMULATED-STORE ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, Store.EA, Store.Width);
+        FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+        return true;
       }
     }
 #endif // ARCHITECTURE_ppc64le
