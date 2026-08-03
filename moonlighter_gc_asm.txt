@@ -1,0 +1,65 @@
+ Percent |	Source code & Disassembly of libmonobdwgc-2.0.so for cpu/cycles/Pu (1 samples, percent: local period)
+---------------------------------------------------------------------------------------------------------------------
+         :
+         :
+         :
+         : 3      Disassembly of section .text:
+         :
+         : 5      0000000000240bd1 <GC_malloc_kind_global@@Base>:
+    0.00 :   240bd1: push   %rbx
+    0.00 :   240bd2: sub    $0x10,%rsp
+    0.00 :   240bd6: cmp    $0x7ff,%rdi
+    0.00 :   240bdd: jbe    240bfa <GC_malloc_kind_global@@Base+0x29>
+    0.00 :   240bdf: mov    0x3166d2(%rip),%rax        # 5572b8 <GC_all_interior_pointers@@Base-0x692c>
+    0.00 :   240be6: movslq (%rax),%rdx
+    0.00 :   240be9: mov    $0x800,%eax
+    0.00 :   240bee: sub    %rdx,%rax
+    0.00 :   240bf1: cmp    %rax,%rdi
+    0.00 :   240bf4: ja     240c8f <GC_malloc_kind_global@@Base+0xbe>
+    0.00 :   240bfa: mov    0x31679f(%rip),%rbx        # 5573a0 <GC_need_to_lock@@Base-0xe8f0>
+    0.00 :   240c01: cmpl   $0x0,(%rbx)
+    0.00 :   240c04: je     240c2a <GC_malloc_kind_global@@Base+0x59>
+    0.00 :   240c06: mov    0x3168d3(%rip),%rdx        # 5574e0 <GC_allocate_lock@@Base-0xe7b8>
+    0.00 :   240c0d: mov    $0xff,%al
+    0.00 :   240c0f: xchg   %al,(%rdx)
+    0.00 :   240c11: inc    %al
+    0.00 :   240c13: jne    240c2a <GC_malloc_kind_global@@Base+0x59>
+    0.00 :   240c15: mov    %esi,0xc(%rsp)
+    0.00 :   240c19: mov    %rdi,(%rsp)
+    0.00 :   240c1d: call   3e180 <GC_lock@plt>
+    0.00 :   240c22: mov    0xc(%rsp),%esi
+    0.00 :   240c26: mov    (%rsp),%rdi
+    0.00 :   240c2a: movslq %esi,%rax
+    0.00 :   240c2d: mov    0x31728c(%rip),%rdx        # 557ec0 <GC_arrays@@Base-0xe8d0>
+    0.00 :   240c34: imul   $0x30,%rax,%rax
+    0.00 :   240c38: add    0x316791(%rip),%rax        # 5573d0 <GC_obj_kinds@@Base-0x6900>
+    0.00 :   240c3f: mov    0x14d8(%rdx,%rdi,8),%r8
+    0.00 :   240c47: mov    (%rax),%rax
+    0.00 :   240c4a: lea    (%rax,%r8,8),%rcx
+    0.00 :   240c4e: mov    (%rcx),%rax
+    0.00 :   240c51: test   %rax,%rax
+    0.00 :   240c54: je     240c80 <GC_malloc_kind_global@@Base+0xaf>
+    0.00 :   240c56: test   %esi,%esi
+    0.00 :   240c58: mov    (%rax),%rsi
+  100.00 :   240c5b: mov    %rsi,(%rcx)
+    0.00 :   240c5e: je     240c67 <GC_malloc_kind_global@@Base+0x96>
+    0.00 :   240c60: movq   $0x0,(%rax)
+    0.00 :   240c67: shl    $0x4,%r8
+    0.00 :   240c6b: add    %r8,0x40(%rdx)
+    0.00 :   240c6f: cmpl   $0x0,(%rbx)
+    0.00 :   240c72: je     240ca1 <GC_malloc_kind_global@@Base+0xd0>
+    0.00 :   240c74: mov    0x316865(%rip),%rdx        # 5574e0 <GC_allocate_lock@@Base-0xe7b8>
+    0.00 :   240c7b: movb   $0x0,(%rdx)
+    0.00 :   240c7e: jmp    240ca1 <GC_malloc_kind_global@@Base+0xd0>
+    0.00 :   240c80: cmpl   $0x0,(%rbx)
+    0.00 :   240c83: je     240c8f <GC_malloc_kind_global@@Base+0xbe>
+    0.00 :   240c85: mov    0x316854(%rip),%rax        # 5574e0 <GC_allocate_lock@@Base-0xe7b8>
+    0.00 :   240c8c: movb   $0x0,(%rax)
+    0.00 :   240c8f: call   41030 <GC_generic_malloc@plt>
+    0.00 :   240c94: add    $0x10,%rsp
+    0.00 :   240c98: mov    %rax,%rdi
+    0.00 :   240c9b: pop    %rbx
+    0.00 :   240c9c: jmp    40570 <GC_clear_stack@plt>
+    0.00 :   240ca1: add    $0x10,%rsp
+    0.00 :   240ca5: pop    %rbx
+    0.00 :   240ca6: ret

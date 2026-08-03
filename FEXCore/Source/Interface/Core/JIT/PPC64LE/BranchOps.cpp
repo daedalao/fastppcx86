@@ -70,9 +70,39 @@ DEF_OP(CallbackReturn) {
 //   does NOT order load->load on Power, so the GuestCode value is fed into the
 //   HostCode load's base register.
 //
-// NOT block linking. There is no backpatching, no jump thunk, no
-// ExitFunctionLinkData and no shadow stack here — every exit still goes
-// through the L1 table. Those are a later stage.
+// BLOCK LINKING (constant-target JUMP exits only, BlockLinking knob).
+//
+// When BlockLinkingEnabled and this exit is a plain jump to a constant RIP
+// (Hint == None — calls, returns and CheckTF exits are excluded; patching a
+// call exit to `bl` would push the probe's second instruction onto POWER9's
+// link stack while the architectural return goes elsewhere, mispredicting
+// every linked call/ret pair, and that redesign is not done), the exit is
+// reordered so the WHOLE L1 probe becomes the patch target:
+//
+//     InsertGuestRIPMove TMP1, NewRIP     (5 insns, fixed width)
+//     std   TMP1, State.rip(STATE)        hoisted from BOTH probe legs
+//     li    r0, 0                         hoisted from the hit leg (P5.0.2)
+//   PatchSite:                            4-byte aligned by construction
+//     <L1 probe, hit leg ends mtctr;bctr, miss leg spills and branches to
+//      this exit's jump thunk LinkPath — see CompileCode's thunk emission>
+//
+// Unlinked, PatchSite holds the probe's first instruction and behaviour is
+// identical to the non-linking lowering below (the rip store and r0 re-zero
+// run earlier, on both legs instead of split across them — architecturally
+// invisible). On link, ExitFunctionLinkWithRecord atomically rewrites
+// PatchSite to `b HostCode` (I-form, ±32MiB) or, out of range — the common
+// case against a 128MiB code buffer — `b Thunk`, with the thunk's own first
+// word patched to the `bcl 20,31,$+4` PC-discovery idiom that loads HostCode
+// from the adjacent record.
+//
+// The hoist ordering is load-bearing:
+//   - std State.rip BEFORE PatchSite keeps the P5.0.1 invariant (below) on
+//     the linked fast path, which never executes probe instructions at all.
+//   - li r0,0 BEFORE PatchSite: a linked branch skips the probe's hit leg,
+//     so leaving the re-zero inside it would let a nonzero r0 reach the
+//     target block's X-form rB=r0 addressing — silent guest memory
+//     corruption. The invariant must be re-established before the patchable
+//     word, not after it.
 DEF_OP(ExitFunction) {
   auto Op = IROp->C<IR::IROp_ExitFunction>();
   ResetStack();
@@ -91,8 +121,10 @@ DEF_OP(ExitFunction) {
   // ---------------------------------------------------------------------
   GPR RIPReg = TMP1;
   uint64_t NewRIP;
+  bool ConstRIP = false;
   if (IsInlineConstant(Op->NewRIP, &NewRIP) ||
       IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
+    ConstRIP = true;
     // 32-bit guest: ensure the RIP constant is canonical 32-bit. For inline
     // constants the value was already produced from a 32-bit source so the
     // upper 32 should already be zero, but mask defensively for jumps from
@@ -104,11 +136,19 @@ DEF_OP(ExitFunction) {
     // a code cache saved in one ASLR session and loaded in another would jump
     // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
     // the 32-bit mask so the recorded value matches the emitted immediate.
+<<<<<<< HEAD
     // SMC Idea 4: this is the ONLY guest-RIP constant the semantic-patch fault
     // handler is allowed to rewrite, so it is the only one recorded. Identical
     // to InsertGuestRIPMove with the flag off.
     // See Interface/Core/SMCSemanticPatch.h.
     InsertExitRIPMove(TMP1, NewRIP);
+=======
+    // (Under BlockLinkingEnabled there is no code cache — the knob is hard-
+    // gated off when caching is on — but the relocation is recorded anyway
+    // so the emitted bytes do not depend on the knob's interaction with
+    // cache-validation builds.)
+    InsertGuestRIPMove(TMP1, NewRIP);
+>>>>>>> origin/power9
     RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);
@@ -120,6 +160,27 @@ DEF_OP(ExitFunction) {
     } else {
       RIPReg = NewRIPReg;
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Block-linking hoist + patch-site registration (see header comment).
+  // Only for constant-target plain jumps with the knob on; every other exit
+  // shape keeps the exact non-linking lowering below.
+  // ---------------------------------------------------------------------
+  const bool Linkable =
+    ConstRIP && Op->Hint == IR::BranchHint::None && BlockLinkingEnabled;
+  PPC64Emitter::Label* LinkPathLabel = nullptr;
+  if (Linkable) {
+    // Hoisted region: rip store + r0 re-zero, then the patch site. Both
+    // probe legs below skip their own copies when Linkable.
+    std(RIPReg, rip_off, STATE);
+    li(r(0), 0);
+    // PatchSite == the probe's first instruction (the ld of L1Pointer just
+    // below). All emitted instructions are 4 bytes and SetBuffer lands on a
+    // 16-byte boundary, so this address is always 4-byte aligned for the
+    // linker's atomic 4-byte rewrite.
+    PendingJumpThunks.push_back({GetCursorAddress<uint64_t>(), NewRIP, {}});
+    LinkPathLabel = &PendingJumpThunks.back().LinkPath;
   }
 
   // ---------------------------------------------------------------------
@@ -158,25 +219,31 @@ DEF_OP(ExitFunction) {
   add(TMP2, TMP2, TMP3);
   ld(TMP3, 0, TMP2);             // TMP3 = HostCode (loaded under address-dep)
   mtctr(TMP3);
-  // P5.0.1: store the destination RIP into State.rip on the hit leg too.
-  // Rationale: RestoreRIPFromHostPC's fallback (Frame->State.rip) is invoked
-  // whenever a JIT block has no per-instruction RIP entries or the host PC
-  // sits outside a header'd block; without this store the fallback returns
-  // whatever the last L1 *miss* stored, which can be arbitrarily stale.
-  // Symptom (silent): guest signal frames carry wrong-but-plausible RIPs and
-  // sigreturn resumes at the wrong address. 1 instruction on a 14-instruction
-  // leg. Reviewed against Power ISA v3.0B — safe placement here (RIPReg is
-  // still live; no dependency on TMP1-TMP4 that could be misordered).
-  std(RIPReg, rip_off, STATE);
-  // P5.0.2: reset r0 to 0 before the bctr. JIT blocks emit X-form indexed
-  // memory ops with r0 in the rB slot (ldx/stdx and friends), which read r0
-  // as its actual value (not literal zero — the "r0 reads as zero" rule
-  // applies only to rA). A nonzero r0 silently offsets every load/store in
-  // the target block. Every mflr(r0) in the backend today is paired with a
-  // restore, so no bug is visible — but the invariant is currently globally
-  // assumed, and the failure mode is silent guest memory corruption. Make
-  // the local guarantee explicit for 1 extra instruction on this hot leg.
-  li(r(0), 0);
+  if (!Linkable) {
+    // P5.0.1: store the destination RIP into State.rip on the hit leg too.
+    // Rationale: RestoreRIPFromHostPC's fallback (Frame->State.rip) is invoked
+    // whenever a JIT block has no per-instruction RIP entries or the host PC
+    // sits outside a header'd block; without this store the fallback returns
+    // whatever the last L1 *miss* stored, which can be arbitrarily stale.
+    // Symptom (silent): guest signal frames carry wrong-but-plausible RIPs and
+    // sigreturn resumes at the wrong address. 1 instruction on a 14-instruction
+    // leg. Reviewed against Power ISA v3.0B — safe placement here (RIPReg is
+    // still live; no dependency on TMP1-TMP4 that could be misordered).
+    std(RIPReg, rip_off, STATE);
+    // P5.0.2: reset r0 to 0 before the bctr. JIT blocks emit X-form indexed
+    // memory ops with r0 in the rB slot (ldx/stdx and friends), which read r0
+    // as its actual value (not literal zero — the "r0 reads as zero" rule
+    // applies only to rA). A nonzero r0 silently offsets every load/store in
+    // the target block. Every mflr(r0) in the backend today is paired with a
+    // restore, so no bug is visible — but the invariant is currently globally
+    // assumed, and the failure mode is silent guest memory corruption. Make
+    // the local guarantee explicit for 1 extra instruction on this hot leg.
+    li(r(0), 0);
+  }
+  // Linkable exits hoisted both of the above ABOVE the patch site: a linked
+  // branch replaces the probe's first instruction, so anything after it on
+  // this leg would be skipped by linked callers (P5.0.2's failure mode is
+  // silent guest memory corruption — see the hoist comment up top).
   bctr();
 
   // ---------------------------------------------------------------------
@@ -201,14 +268,27 @@ DEF_OP(ExitFunction) {
   // dispatcher's own L1 miss branches to a second, SRA-spilling entry.
   // ---------------------------------------------------------------------
   Bind(&MissLabel);
-  std(RIPReg, rip_off, STATE);   // BEFORE the spill clobbers TMP1-TMP4
+  if (!Linkable) {
+    std(RIPReg, rip_off, STATE); // BEFORE the spill clobbers TMP1-TMP4
+  }
   SpillStaticRegs(TMP1);
 
-  const int32_t exit_off = static_cast<int32_t>(
-    offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
-  ld(TMP1, exit_off, STATE);
-  mtctr(TMP1);
-  bctr();
+  if (Linkable) {
+    // Linkable miss leg: State.rip was already stored by the hoisted region.
+    // Branch to this exit's jump thunk LinkPath (emitted at the tail of
+    // CompileCode), which PC-discovers the adjacent PPC64BlockLinkRecord and
+    // enters the dispatcher's ExitFunctionLinkerWithRecord stub with
+    // r4 = &record. That path compiles/looks up the target AND backpatches
+    // the probe above; it dispatches exactly like ExitFunctionLinker
+    // otherwise (deferred-signal guard, FillStaticRegs, bctr).
+    b(LinkPathLabel);
+  } else {
+    const int32_t exit_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
+    ld(TMP1, exit_off, STATE);
+    mtctr(TMP1);
+    bctr();
+  }
 }
 
 DEF_OP(Jump) {

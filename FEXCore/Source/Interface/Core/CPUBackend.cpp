@@ -12,14 +12,27 @@
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/PrctlUtils.h>
+#include <FEXCore/Utils/Telemetry.h>
 
+#include <algorithm>
+#include <cinttypes>
 #include <cstdint>
+<<<<<<< HEAD
 #include <mutex>
+=======
+#include <cstdio>
+#include <cstdlib>
+>>>>>>> origin/power9
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <linux/prctl.h>
 #include <sys/prctl.h>
+<<<<<<< HEAD
 #include <sys/syscall.h>
+=======
+#include <time.h>
+>>>>>>> origin/power9
 #include <unistd.h>
 #endif
 
@@ -318,6 +331,10 @@ namespace CPU {
     // Telemetry.h). Writing past that clobbers DispatcherLoopTop et al.
     // — an OOB carry between the C5 array-resize and the C-helper-only
     // slots added above the marker.
+    static_assert(sizeof(Ptrs.TelemetryValueAddresses) / sizeof(Ptrs.TelemetryValueAddresses[0]) ==
+                    FEXCore::Telemetry::TYPE_JIT_ADDRESSABLE_LAST,
+                  "Loop bound below must match the TelemetryValueAddresses extent; a mismatch is the cb57944a3 "
+                  "dispatcher-pointer clobber. If the array grows, re-audit CoreState.h's 2*PAGE_SIZE invariant.");
     for (size_t i = 0; i < FEXCore::Telemetry::TYPE_JIT_ADDRESSABLE_LAST; ++i) {
       auto& Telem = FEXCore::Telemetry::GetTelemetryValue(static_cast<FEXCore::Telemetry::TelemetryType>(i));
       Ptrs.TelemetryValueAddresses[i] = reinterpret_cast<uint64_t>(&Telem);
@@ -385,6 +402,85 @@ namespace CPU {
     FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
   }
 
+  // ------------------------------------------------------------------
+  // Code-buffer growth/rotation instrumentation
+  // ------------------------------------------------------------------
+  // Answers whether a workload's code footprint ever drives the geometric
+  // buffer growth into the MAX_CODE_SIZE cap and, past it, into steady-state
+  // rotation — every rotation discards all translated code, so at-cap
+  // workloads pay a periodic whole-process retranslation storm. Everything
+  // hangs off AllocateNew, the one funnel all CodeBuffer changes pass
+  // through, so the cost in normal operation is a few counter updates per
+  // buffer allocation (a session has a handful). Nothing runs per-block or
+  // per-compile.
+
+  // Relaxed atomic max; shared by the manager stats and the telemetry slots
+  // (Telemetry::Value is the same std::atomic<uint64_t>).
+  static void AtomicStoreMax(std::atomic<uint64_t>& Slot, uint64_t Value) {
+    uint64_t Prev = Slot.load(std::memory_order_relaxed);
+    while (Prev < Value && !Slot.compare_exchange_weak(Prev, Value, std::memory_order_relaxed)) {
+    }
+  }
+
+#ifndef FEX_DISABLE_TELEMETRY
+  // Instance reached by Telemetry::PreDumpHook (a plain function pointer, so
+  // no captures). Last-constructed manager wins; in practice there is exactly
+  // one per process (ContextImpl). Cleared by ~CodeBufferManager so the hook
+  // can never reach a dead manager.
+  static std::atomic<CodeBufferManager*> StatsInstance {nullptr};
+
+  static void FlushStatsHook() {
+    if (auto* Manager = StatsInstance.load(std::memory_order_relaxed)) {
+      Manager->FlushCodeBufferTelemetry();
+    }
+  }
+#endif
+
+#ifndef _WIN32
+  // FEX_BUFSTATS: append-only raw-fd timeline of CodeBuffer allocation
+  // events, one line per event, same shape as FEX_SMC_AUDIT
+  // (SyscallsSMCTracking.cpp). The telemetry slots give session totals but
+  // only reach disk through Telemetry::Shutdown — a clean exit or a caught
+  // fatal signal. A Proton session that gets SIGKILLed loses them, and
+  // totals cannot show *when* rotations happened; this log answers both.
+  // Env resolved once — an unset variable costs one getenv for the process
+  // lifetime.
+  static int BufStatsFD() {
+    static int fd = [] {
+      const char* p = getenv("FEX_BUFSTATS");
+      if (!p) {
+        return -1;
+      }
+      return ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }();
+    return fd;
+  }
+#endif
+
+  void CodeBufferManager::FlushCodeBufferTelemetry() {
+#ifndef FEX_DISABLE_TELEMETRY
+    // Unlocked LatestOffset read by design; see the declaration comment.
+    const uint64_t LiveBytes = LatestOffset;
+    FEXCORE_TELEMETRY_SET(TYPE_CODEBUFFER_TOTAL_EMITTED, StatsRetiredBytes.load(std::memory_order_relaxed) + LiveBytes);
+    FEXCORE_TELEMETRY_SET(TYPE_CODEBUFFER_DISCARDED_BLOCKS, StatsRetiredBlocks.load(std::memory_order_relaxed));
+    AtomicStoreMax(FEXCore::Telemetry::GetTelemetryValue(FEXCore::Telemetry::TYPE_CODEBUFFER_PEAK_LIVE),
+                   std::max<uint64_t>(StatsPeakLiveBytes.load(std::memory_order_relaxed), LiveBytes));
+#endif
+  }
+
+  CodeBufferManager::~CodeBufferManager() {
+#ifndef FEX_DISABLE_TELEMETRY
+    // Fold the final buffer in for teardown orders that destroy the Context
+    // before dumping telemetry (FEXInterpreter dumps after Context teardown
+    // begins on some paths; when the dump ran first this is a harmless
+    // idempotent re-run), then detach so the hook can never reach a dead
+    // manager. The hook itself stays installed — it null-checks StatsInstance.
+    FlushCodeBufferTelemetry();
+    CodeBufferManager* Expected = this;
+    StatsInstance.compare_exchange_strong(Expected, nullptr, std::memory_order_relaxed);
+#endif
+  }
+
   auto CodeBufferManager::AllocateNew(size_t Size) -> fextl::shared_ptr<CodeBuffer> {
 #ifndef _WIN32
 // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
@@ -411,6 +507,54 @@ namespace CPU {
     }
 #endif
 
+    // Growth/rotation statistics. Sample the departing buffer before Latest
+    // and LatestOffset are replaced below. Reading BlockList without its lock
+    // is sound on every path that has a departing buffer: once Latest is
+    // non-null the only route here is GetEmptyCodeBuffer via the backends'
+    // ClearCache (Arm64JITCore::ClearCache / PPC64JITCore::ClearCache), both
+    // of which take the departing buffer's LookupCache write lock first.
+    const uint64_t RetiredBytes = Latest ? LatestOffset : 0;
+    const uint64_t RetiredBlocks = Latest ? Latest->LookupCache->BlockList.size() : 0;
+    const size_t PrevSize = Latest ? Latest->AllocatedSize : 0;
+    // A replacement that could not grow is a rotation; StartLargerCodeBuffer
+    // only stops doubling once AllocatedSize saturates at MAX_CODE_SIZE.
+    const bool Rotation = Latest && Size <= PrevSize;
+    if (Latest) {
+      StatsRetiredBytes.fetch_add(RetiredBytes, std::memory_order_relaxed);
+      StatsRetiredBlocks.fetch_add(RetiredBlocks, std::memory_order_relaxed);
+      AtomicStoreMax(StatsPeakLiveBytes, RetiredBytes);
+    }
+#ifndef FEX_DISABLE_TELEMETRY
+    FEXCORE_TELEMETRY_INC(TYPE_CODEBUFFER_ALLOCATIONS);
+    if (Rotation) {
+      FEXCORE_TELEMETRY_INC(TYPE_CODEBUFFER_ROTATIONS);
+    }
+    AtomicStoreMax(FEXCore::Telemetry::GetTelemetryValue(FEXCore::Telemetry::TYPE_CODEBUFFER_PEAK_SIZE), Size);
+    // Install the pre-dump flush so the live buffer's fill level reaches the
+    // dump even in sessions that never outgrow their first buffer.
+    StatsInstance.store(this, std::memory_order_relaxed);
+    FEXCore::Telemetry::PreDumpHook.store(FlushStatsHook, std::memory_order_relaxed);
+#endif
+#ifndef _WIN32
+    if (const int LogFD = BufStatsFD(); LogFD >= 0) {
+      timespec Now {};
+      clock_gettime(CLOCK_MONOTONIC, &Now);
+      const uint64_t NowMS = static_cast<uint64_t>(Now.tv_sec) * 1000 + static_cast<uint64_t>(Now.tv_nsec) / 1000000;
+      // T0 is this process's first allocation event. Each line carries the
+      // pid because a Proton session is a tree of FEX processes appending to
+      // the same file.
+      static const uint64_t BaseMS = NowMS;
+      const uint64_t Delta = NowMS - BaseMS;
+      if (!Latest) {
+        dprintf(LogFD, "[pid %d +%" PRIu64 ".%03" PRIu64 "s] codebuffer initial: %zu MiB\n", getpid(), Delta / 1000, Delta % 1000, Size >> 20);
+      } else {
+        dprintf(LogFD,
+                "[pid %d +%" PRIu64 ".%03" PRIu64 "s] codebuffer %s: %zu MiB -> %zu MiB, discarding %" PRIu64 " bytes / %" PRIu64 " blocks\n",
+                getpid(), Delta / 1000, Delta % 1000, Rotation ? "ROTATION" : "grow", PrevSize >> 20, Size >> 20, RetiredBytes, RetiredBlocks);
+      }
+    }
+#endif
+
     auto Buffer = fextl::make_shared<CodeBuffer>(Size);
 
     Latest = Buffer;
@@ -418,6 +562,14 @@ namespace CPU {
     // Everything anyone cached about the previous buffer's addresses is now
     // stale; see CodeBufferGeneration.
     CodeBufferGeneration.fetch_add(1, std::memory_order_release);
+
+#ifndef FEX_DISABLE_TELEMETRY
+    // Refresh the derived totals only after the retired bytes have moved from
+    // LatestOffset into StatsRetiredBytes (flushing before the reset would
+    // count the departing buffer twice); keeps the slots correct if the
+    // process dies before the shutdown dump runs its own flush.
+    FlushCodeBufferTelemetry();
+#endif
 
     OnCodeBufferAllocated(Buffer);
 

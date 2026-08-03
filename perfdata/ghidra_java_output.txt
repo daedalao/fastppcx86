@@ -1,0 +1,826 @@
+INFO  Using log config file: jar:file:/opt/ghidra/Ghidra/Framework/Generic/lib/Generic.jar!/generic.log4j.xml (LoggingInitialization)  
+INFO  Using log file: /home/books/.config/ghidra/ghidra_12.1.2_DEV/application.log (LoggingInitialization)  
+INFO  Loading user preferences: /home/books/.config/ghidra/ghidra_12.1.2_DEV/preferences (Preferences)  
+INFO  Searching for classes... (ClassSearcher)  
+INFO  Class search complete (733 ms) (ClassSearcher)  
+INFO  Initializing SSL Context (DefaultSSLContextInitializer)  
+INFO  Initializing Random Number Generator... (SecureRandomFactory)  
+INFO  Random Number Generator initialization complete: NativePRNGNonBlocking (SecureRandomFactory)  
+INFO  Trust manager disabled, cacerts have not been set (DefaultTrustManagerFactory)  
+INFO  Headless startup complete (1515 ms) (AnalyzeHeadless)  
+INFO  Class searcher loaded 59 extension points (20 false positives) (ClassSearcher)  
+INFO  HEADLESS Script Paths:
+    /opt/ghidra/Ghidra/Features/GnuDemangler/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/JVM/ghidra_scripts
+    /opt/ghidra/Ghidra/Debug/Debugger-rmi-trace/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/MicrosoftCodeAnalyzer/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/VersionTracking/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/PyGhidra/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/SwiftDemangler/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/Atmel/ghidra_scripts
+    /opt/ghidra/Ghidra/Debug/Debugger/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/Decompiler/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/FunctionID/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/PIC/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/BSim/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/BytePatterns/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/SystemEmulation/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/WildcardAssembler/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/DATA/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/DecompilerDependent/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/Base/ghidra_scripts
+    /home/books/.config/ghidra/ghidra_12.1.2_DEV/Extensions/Jython/ghidra_scripts
+    /home/books/Projects/power8/fex-ppc64le/perfdata
+    /home/books/.config/ghidra/ghidra_12.1.2_DEV/Extensions/Lisa/ghidra_scripts
+    /home/books/.config/ghidra/ghidra_12.1.2_DEV/Extensions/MachineLearning/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/PDB/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/8051/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/FileFormats/ghidra_scripts (HeadlessAnalyzer)  
+INFO  HEADLESS: execution starts (HeadlessAnalyzer)  
+INFO  Opening existing project: /tmp/GhidraProj (HeadlessAnalyzer)  
+INFO  Opening project: /tmp/GhidraProj (HeadlessProject)  
+INFO  REPORT: Processing project file: /libmono.so (HeadlessAnalyzer)  
+INFO  ANALYZING all memory and code: /libmono.so (HeadlessAnalyzer)  
+INFO  DWARF external debug information found: ExternalDebugInfo [filename=null, crc=0, hash=cd9a94f9590859571e6e1c54870729ec5e6c9742, objectType=DEBUGINFO, extra=null] (ExternalDebugFileSectionProvider)  
+INFO  DWARF External Debug File: found: /home/books/.cache/debuginfod_client/cd9a94f9590859571e6e1c54870729ec5e6c9742/debuginfo (ExternalDebugFileSectionProvider)  
+ERROR Error while generating Elf import options (ElfLoader) ghidra.app.util.bin.format.elf.ElfException: java.io.IOException: Unable to read past EOF: 0, 4
+	at ghidra.app.util.bin.format.elf.ElfHeader.<init>(ElfHeader.java:183)
+	at ghidra.app.util.opinion.ElfLoaderOptionsFactory.addOptions(ElfLoaderOptionsFactory.java:77)
+	at ghidra.app.util.opinion.ElfLoader.getDefaultOptions(ElfLoader.java:77)
+	at ghidra.app.util.bin.format.dwarf.sectionprovider.ExternalDebugFileSectionProvider.createExternalSectionProviderFor(ExternalDebugFileSectionProvider.java:88)
+	at ghidra.app.util.bin.format.dwarf.sectionprovider.DWARFSectionProviderFactory.createSectionProviderFor(DWARFSectionProviderFactory.java:67)
+	at ghidra.app.plugin.core.analysis.DWARFAnalyzer.added(DWARFAnalyzer.java:88)
+	at ghidra.app.plugin.core.analysis.AnalysisScheduler.runAnalyzer(AnalysisScheduler.java:186)
+	at ghidra.app.plugin.core.analysis.AnalysisTask.applyTo(AnalysisTask.java:37)
+	at ghidra.app.plugin.core.analysis.AnalysisTask.applyTo(AnalysisTask.java:24)
+	at ghidra.app.plugin.core.analysis.AutoAnalysisManager$AnalysisTaskWrapper.run(AutoAnalysisManager.java:660)
+	at ghidra.app.plugin.core.analysis.AutoAnalysisManager.startAnalysis(AutoAnalysisManager.java:760)
+	at ghidra.app.plugin.core.analysis.AutoAnalysisManager.startAnalysis(AutoAnalysisManager.java:639)
+	at ghidra.app.plugin.core.analysis.AutoAnalysisManager.startAnalysis(AutoAnalysisManager.java:604)
+	at ghidra.app.util.headless.HeadlessAnalyzer.analyzeProgram(HeadlessAnalyzer.java:1056)
+	at ghidra.app.util.headless.HeadlessAnalyzer.processFileNoImport(HeadlessAnalyzer.java:1195)
+	at ghidra.app.util.headless.HeadlessAnalyzer.processFolderNoImport(HeadlessAnalyzer.java:1367)
+	at ghidra.app.util.headless.HeadlessAnalyzer.processNoImport(HeadlessAnalyzer.java:1396)
+	at ghidra.app.util.headless.HeadlessAnalyzer.processLocal(HeadlessAnalyzer.java:461)
+	at ghidra.app.util.headless.AnalyzeHeadless.launch(AnalyzeHeadless.java:199)
+	at ghidra.GhidraLauncher.launch(GhidraLauncher.java:81)
+	at ghidra.Ghidra.main(Ghidra.java:54)
+Caused by: java.io.IOException: Unable to read past EOF: 0, 4
+	at ghidra.app.util.bin.FileByteProvider.ensureBounds(FileByteProvider.java:275)
+	at ghidra.app.util.bin.FileByteProvider.readBytes(FileByteProvider.java:129)
+	at ghidra.app.util.bin.format.elf.ElfHeader.<init>(ElfHeader.java:114)
+	... 20 more
+ 
+INFO  Unable to find DWARF information, skipping DWARF analysis (DWARFAnalyzer)  
+WARN  Decompiling 0014466c, pcode error at 00166e59: Unable to resolve constructor at 00166e59 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 0015ec30: Unable to resolve constructor at 0015ec30 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 0015bbe1: Unable to resolve constructor at 0015bbe1 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 001505e9: Unable to resolve constructor at 001505e9 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 0014f7be: Unable to resolve constructor at 0014f7be (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00148ffb: Unable to resolve constructor at 00148ffb (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00148da2: Unable to resolve constructor at 00148da2 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 0014859a: Unable to resolve constructor at 0014859a (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 001481ed: Unable to resolve constructor at 001481ed (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00148076: Unable to resolve constructor at 00148076 (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00147ebd: Unable to resolve constructor at 00147ebd (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00147a4d: Unable to resolve constructor at 00147a4d (DecompileCallback)  
+WARN  Decompiling 0014466c, pcode error at 00147975: Unable to resolve constructor at 00147975 (DecompileCallback)  
+INFO  Packed database cache: /var/tmp/books-ghidra/packed-db-cache (PackedDatabaseCache)  
+INFO  Multiple function definitions for __sigsetjmp at EXTERNAL:00000103 found.  No function signature applied. (ApplyFunctionDataTypesCmd)  
+INFO  Applied data type archive: generic_clib_64 (ApplyDataArchiveAnalyzer)  
+INFO  Resolving External Symbols of [/libmono.so] - 284 unresolved symbols, no external libraries configured - skipping (ExternalSymbolResolverAnalyzer)  
+INFO  -----------------------------------------------------
+    ASCII Strings                              0.349 secs
+    Apply Data Archives                        0.107 secs
+    Call Convention ID                         0.033 secs
+    Call-Fixup Installer                       0.023 secs
+    Create Address Tables                      0.471 secs
+    Create Function                            0.000 secs
+    DWARF                                      0.091 secs
+    Data Reference                             0.550 secs
+    Decompiler Switch Analysis                61.882 secs
+    Demangler GNU                              0.193 secs
+    Disassemble Entry Points                   0.113 secs
+    ELF Scalar Operand References              2.333 secs
+    Embedded Media                             0.048 secs
+    External Entry References                  0.005 secs
+    External Symbol Resolver                   0.003 secs
+    Function ID                                2.366 secs
+    Function Start Pre Search                  0.042 secs
+    Function Start Search                      0.240 secs
+    Function Start Search After Code           0.198 secs
+    Function Start Search After Data           0.167 secs
+    GCC Exception Handlers                     1.532 secs
+    Non-Returning Functions - Discovered       2.162 secs
+    Non-Returning Functions - Known            0.055 secs
+    Reference                                  0.600 secs
+    Shared Return Calls                        0.555 secs
+    Stack                                      2.069 secs
+    Subroutine References                      0.467 secs
+    x86 Constant Reference Analyzer            8.067 secs
+-----------------------------------------------------
+     Total Time   84 secs
+-----------------------------------------------------
+ (AutoAnalysisManager)  
+INFO  REPORT: Analysis succeeded for file: /libmono.so (HeadlessAnalyzer)  
+INFO  REPORT: Execute script: AnalyzeGC.java  (HeadlessAnalyzer)  
+INFO  SCRIPT: /home/books/Projects/power8/fex-ppc64le/perfdata/AnalyzeGC.java (HeadlessAnalyzer)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x18fd13 (GhidraScript)  
+INFO  AnalyzeGC.java> Found function at: 0018fbff (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Assembly (first 10 insts) --- (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fbff PUSH R15 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc01 MOV R15,R8 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc04 PUSH R14 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc06 MOV R14,RSI (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc09 PUSH R13 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc0b MOV R13,RDI (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc0e PUSH R12 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc10 PUSH RBP (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc11 MOV RBP,R9 (GhidraScript)  
+INFO  AnalyzeGC.java> 0018fc14 PUSH RBX (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Decompiled Code --- (GhidraScript)  
+INFO  AnalyzeGC.java> 
+undefined8
+FUN_0018fbff(long param_1,undefined8 param_2,long param_3,long param_4,long param_5,
+            undefined8 *param_6,undefined8 param_7,long param_8)
+
+{
+  long *plVar1;
+  ulong uVar2;
+  int iVar3;
+  undefined8 uVar4;
+  undefined8 uVar5;
+  undefined8 uVar6;
+  ulong uVar7;
+  long local_40 [2];
+  
+  uVar7 = *(ulong *)(param_4 + 0x40);
+  if (param_6 != (undefined8 *)0x0) {
+    *param_6 = 0;
+  }
+  if (((param_3 == 0) || (uVar7 <= *(ulong *)(param_3 + 0x10))) ||
+     (*(ulong *)(param_3 + 0x10) + (long)*(int *)(param_3 + 0x1c) <= uVar7)) {
+    param_3 = FUN_0018fb47(param_1,uVar7,local_40);
+  }
+  if (local_40[0] == 0) {
+    local_40[0] = param_1;
+  }
+  uVar4 = 0;
+  iVar3 = FUN_001cc31a(local_40[0],param_2,param_3,param_4,param_5,param_7,param_8);
+  if (iVar3 != 0) {
+    *(undefined4 *)(param_8 + 0x24) = 0xffffffff;
+    *(long *)(param_8 + 0x18) = local_40[0];
+    plVar1 = *(long **)(param_8 + 8);
+    if ((plVar1 != (long *)0x0) &&
+       ((*(int *)(param_8 + 0x20) != 0 || ((*(byte *)(*plVar1 + 0x20) & 0x7c) != 0)))) {
+      uVar2 = plVar1[2];
+      if (*(int *)(param_8 + 0x20) == 0) {
+        uVar7 = *(ulong *)(param_5 + 0x40);
+      }
+      if ((uVar2 <= uVar7) && (uVar7 <= (long)*(int *)((long)plVar1 + 0x1c) + uVar2)) {
+        *(int *)(param_8 + 0x24) = (int)uVar7 - (int)uVar2;
+      }
+      if (param_6 == (undefined8 *)0x0) {
+        return 1;
+      }
+      uVar4 = mono_debug_print_stack_frame(*plVar1,*(undefined4 *)(param_8 + 0x24),param_1);
+      *param_6 = uVar4;
+      return 1;
+    }
+    uVar4 = 1;
+    if ((param_6 != (undefined8 *)0x0) && (*(long *)(param_8 + 0x10) != 0)) {
+      uVar5 = mono_method_full_name(*(long *)(param_8 + 0x10),1);
+      uVar6 = FUN_00290b54("in (unmanaged) %s",uVar5);
+      *param_6 = uVar6;
+      g_free(uVar5);
+    }
+  }
+  return uVar4;
+}
+
+ (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x132b66 (GhidraScript)  
+INFO  AnalyzeGC.java> Found function at: 00132a0e (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Assembly (first 10 insts) --- (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a0e PUSH RBP (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a0f MOV R8D,EDI (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a12 LEA RCX,[0x2a57bd] (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a19 MOV EBP,EDI (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a1b MOV EDX,0x100 (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a20 MOV ESI,0x1 (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a25 PUSH RBX (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a26 SUB RSP,0x118 (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a2d MOV RAX,qword ptr FS:[0x28] (GhidraScript)  
+INFO  AnalyzeGC.java> 00132a36 MOV qword ptr [RSP + 0x108],RAX (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Decompiled Code --- (GhidraScript)  
+INFO  AnalyzeGC.java> 
+long FUN_00132a0e(int param_1)
+
+{
+  int iVar1;
+  long lVar2;
+  byte *pbVar3;
+  undefined8 uVar4;
+  long in_FS_OFFSET;
+  undefined1 local_120 [256];
+  long local_20;
+  
+  local_20 = *(long *)(in_FS_OFFSET + 0x28);
+  __sprintf_chk(local_120,1,0x100,"ves_array_new_va_%d",param_1);
+  iVar1 = pthread_mutex_lock((pthread_mutex_t *)&DAT_005aadc8);
+  if (iVar1 != 0) {
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_lock result %d",iVar1);
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x4b9,"ret == 0");
+  }
+  lVar2 = FUN_002044f5(local_120);
+  if (lVar2 != 0) goto LAB_00132c6a;
+  iVar1 = pthread_mutex_lock((pthread_mutex_t *)&DAT_005aadc8);
+  if (iVar1 != 0) {
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_lock result %d",iVar1);
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x48d,"ret == 0");
+  }
+  if (DAT_005aadf0 == 0) {
+    DAT_005aadf0 = FUN_0028faf3(0,0);
+LAB_00132b69:
+    pbVar3 = (byte *)mono_metadata_signature_alloc(DAT_005af1c0,param_1 + 1);
+    pbVar3[1] = pbVar3[1] | 1;
+    *pbVar3 = *pbVar3 & 3 | 0x14;
+    *(long *)(pbVar3 + 0x18) = DAT_005af210 + 0xc0;
+    iVar1 = 0;
+    while (lVar2 = DAT_005aadf0, iVar1 < param_1) {
+      iVar1 = iVar1 + 1;
+      *(long *)(pbVar3 + (long)iVar1 * 8 + 0x18) = DAT_005af210 + 0xc0;
+    }
+    *(long *)(pbVar3 + 0x10) = DAT_005af1c8 + 0xc0;
+    FUN_0028fb76(lVar2,(long)param_1,pbVar3,0);
+    iVar1 = pthread_mutex_unlock((pthread_mutex_t *)&DAT_005aadc8);
+    if (iVar1 != 0) {
+      FUN_00290740(0,0x10,"Bad call to mono_mutex_unlock result %d",iVar1);
+      uVar4 = 0x4a9;
+LAB_00132c13:
+      FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",uVar4,"ret == 0");
+    }
+  }
+  else {
+    pbVar3 = (byte *)FUN_0028fd44(DAT_005aadf0,(long)param_1);
+    if (pbVar3 == (byte *)0x0) goto LAB_00132b69;
+    iVar1 = pthread_mutex_unlock((pthread_mutex_t *)&DAT_005aadc8);
+    if (iVar1 != 0) {
+      FUN_00290740(0,0x10,"Bad call to mono_mutex_unlock result %d",iVar1);
+      uVar4 = 0x492;
+      goto LAB_00132c13;
+    }
+  }
+  uVar4 = FUN_002904ad(local_120);
+  lVar2 = FUN_002045f7(FUN_0016d5f2,uVar4,pbVar3,0);
+  FUN_0028fb76(*(undefined8 *)PTR_DAT_005a0e40,uVar4,uVar4,0);
+LAB_00132c6a:
+  iVar1 = pthread_mutex_unlock((pthread_mutex_t *)&DAT_005aadc8);
+  if (iVar1 != 0) {
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_unlock result %d",iVar1);
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x4c2,"ret == 0");
+  }
+  if (local_20 != *(long *)(in_FS_OFFSET + 0x28)) {
+                    /* WARNING: Subroutine does not return */
+    __stack_chk_fail();
+  }
+  return lVar2;
+}
+
+ (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0xf6a8d (GhidraScript)  
+INFO  AnalyzeGC.java> No function found containing this address. (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x13889f (GhidraScript)  
+INFO  AnalyzeGC.java> Found function at: 00138375 (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Assembly (first 10 insts) --- (GhidraScript)  
+INFO  AnalyzeGC.java> 00138375 PUSH RBP (GhidraScript)  
+INFO  AnalyzeGC.java> 00138376 MOV RBP,RSP (GhidraScript)  
+INFO  AnalyzeGC.java> 00138379 PUSH R15 (GhidraScript)  
+INFO  AnalyzeGC.java> 0013837b PUSH R14 (GhidraScript)  
+INFO  AnalyzeGC.java> 0013837d PUSH R13 (GhidraScript)  
+INFO  AnalyzeGC.java> 0013837f MOV R13,RCX (GhidraScript)  
+INFO  AnalyzeGC.java> 00138382 PUSH R12 (GhidraScript)  
+INFO  AnalyzeGC.java> 00138384 MOV R12,RDI (GhidraScript)  
+INFO  AnalyzeGC.java> 00138387 PUSH RBX (GhidraScript)  
+INFO  AnalyzeGC.java> 00138388 SUB RSP,0x158 (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Decompiled Code --- (GhidraScript)  
+INFO  AnalyzeGC.java> 
+undefined8 FUN_00138375(byte *param_1,long param_2,long *param_3,long *param_4)
+
+{
+  char cVar1;
+  code *pcVar2;
+  byte bVar3;
+  int iVar4;
+  int iVar5;
+  long lVar6;
+  long *plVar7;
+  undefined8 uVar8;
+  long lVar9;
+  long *plVar10;
+  long lVar11;
+  byte *pbVar12;
+  long *plVar13;
+  byte **ppbVar14;
+  ulong uVar15;
+  undefined8 *puVar16;
+  long *plVar17;
+  long in_FS_OFFSET;
+  undefined8 uStack_190;
+  byte *local_188;
+  long *local_180;
+  undefined8 *local_178;
+  long *local_170;
+  undefined8 local_168;
+  long *local_160;
+  pthread_mutex_t *local_158;
+  long local_150;
+  long local_148;
+  undefined1 local_140 [128];
+  undefined8 local_c0 [16];
+  long local_40;
+  
+  ppbVar14 = &local_188;
+  local_40 = *(long *)(in_FS_OFFSET + 0x28);
+  uStack_190 = 0x1383b1;
+  local_160 = param_3;
+  local_150 = param_2;
+  lVar6 = mono_domain_get();
+  if (((local_150 == 0) && ((*param_1 & 0x10) == 0)) && ((param_1[0x20] & 0xfc) == 0)) {
+    uStack_190 = 0x1383e2;
+    FUN_00290740(0,0x10,"Ignoring invocation of an instance method on a NULL instance.\n");
+LAB_001384e8:
+    uVar8 = 0;
+    ppbVar14 = &local_188;
+    goto LAB_00138a1e;
+  }
+  local_158 = (pthread_mutex_t *)(lVar6 + 8);
+  lVar11 = *(long *)(lVar6 + 0x220);
+  uStack_190 = 0x138401;
+  iVar4 = pthread_mutex_lock(local_158);
+  if (iVar4 != 0) {
+    uStack_190 = 0x13841c;
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_lock result %d",iVar4);
+    uStack_190 = 0x138445;
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x1283,"ret == 0");
+  }
+  uStack_190 = 0x138451;
+  plVar7 = (long *)FUN_0028fd44(*(undefined8 *)(lVar11 + 0x50),param_1);
+  uStack_190 = 0x138460;
+  iVar4 = pthread_mutex_unlock(local_158);
+  if (iVar4 != 0) {
+    uStack_190 = 0x13847b;
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_unlock result %d",iVar4);
+    uStack_190 = 0x1384a4;
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x1285,"ret == 0");
+  }
+  if (plVar7 != (long *)0x0) goto LAB_00138849;
+  uStack_190 = 0x1384b2;
+  iVar4 = FUN_002565b3();
+  if (iVar4 == 1) {
+    uStack_190 = 0x1384c0;
+    FUN_001ddfcf(*(undefined8 *)(param_1 + 8));
+    if (*(char *)(*(long *)(param_1 + 8) + 0x25) != '\0') {
+      if (param_4 == (long *)0x0) {
+        uStack_190 = 0x1384e0;
+        uVar8 = FUN_001df84a();
+        uStack_190 = 0x1384e8;
+        mono_raise_exception(uVar8);
+      }
+      else {
+        uStack_190 = 0x1384d5;
+        lVar6 = FUN_001df84a();
+        *param_4 = lVar6;
+      }
+      goto LAB_001384e8;
+    }
+  }
+  uStack_190 = 0x1384f9;
+  plVar7 = (long *)FUN_00290467(0x30);
+  uStack_190 = 0x138506;
+  local_168 = FUN_00210dd4(param_1,0);
+  uStack_190 = 0x13851f;
+  lVar9 = FUN_002357a1(lVar6,*(undefined8 *)(param_1 + 8),1);
+  plVar7[3] = lVar9;
+  if (lVar9 == 0) {
+    uStack_190 = 0x13854f;
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x129b,
+                 "info->vtable");
+  }
+  if ((*(char *)(*(long *)(param_1 + 8) + 0x1a) == '\0') ||
+     ((*(ushort *)(param_1 + 2) & 0x1001) != 0x1001)) {
+    local_148 = 0;
+    uStack_190 = 0x138599;
+    lVar9 = FUN_00137876(param_1,DAT_005aae48,&local_148);
+    plVar7[1] = lVar9;
+    if (lVar9 == 0) {
+      uStack_190 = 0x1385aa;
+      g_free(plVar7);
+      if (local_148 == 0) {
+        uStack_190 = 0x1385dd;
+        FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x12aa,"jit_ex")
+        ;
+      }
+      if (param_4 != (long *)0x0) {
+        *param_4 = local_148;
+        goto LAB_001384e8;
+      }
+      uStack_190 = 0x1385f7;
+      mono_raise_exception();
+    }
+    uStack_190 = 0x138601;
+    iVar4 = FUN_001f8869(param_1,0);
+    if (iVar4 != 0) {
+      uStack_190 = 0x138611;
+      lVar9 = FUN_00191e0a(param_1,plVar7[1]);
+      plVar7[1] = lVar9;
+    }
+  }
+  else {
+    plVar7[1] = 0;
+  }
+  if ((*(int *)PTR_mono_aot_only_005a08f0 == 0) && (DAT_005aae30 == 0))
+  goto switchD_001386ff_caseD_1;
+  uStack_190 = 0x138636;
+  plVar10 = (long *)mono_method_signature(param_1);
+  if ((char)param_1[0x20] < '\0') {
+    uStack_190 = 0x138649;
+    plVar10 = (long *)FUN_00210db3(param_1);
+  }
+  uVar15 = 1;
+  for (iVar4 = 0; iVar4 < (int)(uint)*(ushort *)((long)plVar10 + 4); iVar4 = iVar4 + 1) {
+    if (*(char *)(plVar10[(long)iVar4 + 3] + 10) == '\x15') {
+      local_188 = (byte *)CONCAT44(local_188._4_4_,iVar4);
+      local_178 = (undefined8 *)CONCAT44(local_178._4_4_,(int)uVar15);
+      uStack_190 = 0x13867b;
+      local_180 = plVar10;
+      uVar8 = mono_class_from_mono_type();
+      uStack_190 = 0x138683;
+      iVar5 = FUN_001db7c0(uVar8);
+      iVar4 = (int)local_188;
+      uVar15 = (ulong)local_178 & 0xffffffff;
+      plVar10 = local_180;
+      if (iVar5 != 0) {
+        uVar15 = 0;
+      }
+    }
+  }
+  if (((-1 < *(char *)(*(long *)(param_1 + 8) + 0x22)) && (plVar7[1] != 0)) && ((int)uVar15 != 0)) {
+    uStack_190 = 0x1386cf;
+    local_180 = plVar10;
+    lVar9 = FUN_001b32df(plVar10);
+    plVar7[4] = lVar9;
+    plVar10 = local_180;
+  }
+  if (plVar7[4] == 0) goto switchD_001386ff_caseD_1;
+  puVar16 = (undefined8 *)plVar10[2];
+  switch(*(undefined1 *)((long)puVar16 + 10)) {
+  case 1:
+  case 0xe:
+  case 0x12:
+  case 0x14:
+  case 0x1c:
+  case 0x1d:
+    break;
+  case 2:
+  case 3:
+  case 4:
+  case 5:
+  case 6:
+  case 7:
+  case 8:
+  case 9:
+  case 10:
+  case 0xb:
+  case 0xc:
+  case 0xd:
+  case 0x11:
+  case 0x18:
+  case 0x19:
+switchD_001386ff_caseD_2:
+    uStack_190 = 0x138731;
+    lVar9 = mono_class_from_mono_type(puVar16);
+    goto LAB_00138708;
+  case 0xf:
+    lVar9 = DAT_005af210;
+LAB_00138708:
+    plVar7[5] = lVar9;
+    break;
+  default:
+    uStack_190 = 0x138755;
+    FUN_00290740(0,4,"* Assertion: should not be reached at %s:%d\n","mini.c",0x12f7);
+    break;
+  case 0x15:
+    uStack_190 = 0x13871d;
+    local_180 = plVar10;
+    iVar4 = mono_metadata_generic_class_is_valuetype(*puVar16);
+    if (iVar4 != 0) {
+      puVar16 = (undefined8 *)local_180[2];
+      goto switchD_001386ff_caseD_2;
+    }
+  }
+switchD_001386ff_caseD_1:
+  if (plVar7[4] == 0) {
+    uStack_190 = 0x138768;
+    lVar9 = FUN_0013830b(local_168);
+    plVar7[2] = lVar9;
+  }
+  uStack_190 = 0x138778;
+  iVar4 = pthread_mutex_lock(local_158);
+  if (iVar4 != 0) {
+    uStack_190 = 0x138793;
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_lock result %d",iVar4);
+    uStack_190 = 0x1387bc;
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x1301,"ret == 0");
+  }
+  uStack_190 = 0x1387c8;
+  plVar10 = (long *)FUN_0028fd44(*(undefined8 *)(lVar11 + 0x50),param_1);
+  if (plVar10 == (long *)0x0) {
+    uStack_190 = 0x1387f9;
+    FUN_0028fb76(*(undefined8 *)(lVar11 + 0x50),param_1,plVar7,0);
+  }
+  else {
+    uStack_190 = 0x1387dc;
+    local_170 = plVar10;
+    g_free(plVar7);
+    plVar7 = local_170;
+  }
+  uStack_190 = 0x138805;
+  iVar4 = pthread_mutex_unlock(local_158);
+  if (iVar4 != 0) {
+    uStack_190 = 0x138820;
+    FUN_00290740(0,0x10,"Bad call to mono_mutex_unlock result %d",iVar4);
+    uStack_190 = 0x138849;
+    FUN_00290740(0,4,"* Assertion at %s:%d, condition `%s\' not met\n","mini.c",0x1309,"ret == 0");
+  }
+LAB_00138849:
+  pcVar2 = (code *)plVar7[2];
+  if (param_4 == (long *)0x0) {
+    uStack_190 = 0x138875;
+    mono_runtime_class_init(plVar7[3]);
+  }
+  else {
+    uStack_190 = 0x13885d;
+    lVar11 = FUN_00238885(plVar7[3],0);
+    *param_4 = lVar11;
+    uVar8 = 0;
+    if (lVar11 != 0) goto LAB_00138a1e;
+  }
+  if (plVar7[4] == 0) {
+    uStack_190 = 0x138a1e;
+    uVar8 = (*pcVar2)(local_150,local_160,param_4,plVar7[1]);
+    ppbVar14 = &local_188;
+  }
+  else {
+    uStack_190 = 0x138888;
+    pbVar12 = (byte *)mono_method_signature(param_1);
+    if (DAT_005aae68 == (code *)0x0) {
+      uStack_190 = 0x1388a1;
+      local_188 = pbVar12;
+      uVar8 = FUN_00211b5a();
+      uStack_190 = 0x1388a9;
+      DAT_005aae68 = (code *)FUN_0013830b(uVar8);
+      pbVar12 = local_188;
+    }
+    bVar3 = *pbVar12 & 1;
+    lVar11 = -(ulong)(((uint)bVar3 + (uint)*(ushort *)(pbVar12 + 4)) * 8 + 0x1e & 0x1ffff0);
+    ppbVar14 = (byte **)((long)&local_188 + lVar11);
+    plVar10 = (long *)((long)&local_180 + lVar11);
+    if (bVar3 != 0) {
+      *plVar10 = (long)&local_150;
+    }
+    plVar17 = plVar10 + (int)(uint)(bVar3 != 0);
+    plVar13 = local_160;
+    for (lVar9 = 0; (int)lVar9 < (int)(uint)*(ushort *)(pbVar12 + 4); lVar9 = lVar9 + 1) {
+      puVar16 = *(undefined8 **)(pbVar12 + (long)(int)lVar9 * 8 + 0x18);
+      if (((((*(byte *)((long)puVar16 + 0xb) & 0x40) == 0) &&
+           (cVar1 = *(char *)((long)puVar16 + 10), cVar1 != '\x1d')) &&
+          ((cVar1 != '\x0e' && ((cVar1 != '\x12' && (cVar1 != '\x1c')))))) && (cVar1 != '\x14')) {
+        if (cVar1 == '\x15') {
+          uVar8 = *puVar16;
+          local_188 = pbVar12;
+          local_180 = plVar13;
+          local_178 = puVar16;
+          local_170 = plVar17;
+          *(undefined8 *)((long)&uStack_190 + lVar11) = 0x138955;
+          iVar4 = mono_metadata_generic_class_is_valuetype(uVar8);
+          pbVar12 = local_188;
+          plVar13 = local_180;
+          puVar16 = local_178;
+          plVar17 = local_170;
+          if (iVar4 == 0) goto LAB_0013897b;
+        }
+        if (*(char *)((long)puVar16 + 10) == '\x0f') goto LAB_0013897b;
+        plVar17[lVar9] = *plVar13;
+      }
+      else {
+LAB_0013897b:
+        plVar17[lVar9] = (long)plVar13;
+      }
+      plVar13 = plVar13 + 1;
+    }
+    lVar9 = plVar7[4];
+    *(undefined8 *)((long)&uStack_190 + lVar11) = 0x1389bf;
+    FUN_001b3391(lVar9,plVar10,local_c0,local_140,0x80);
+    lVar9 = plVar7[1];
+    *(undefined8 *)((long)&uStack_190 + lVar11) = 0x1389d3;
+    (*DAT_005aae68)(local_140,param_4,lVar9);
+    lVar9 = plVar7[4];
+    *(undefined8 *)((long)&uStack_190 + lVar11) = 0x1389e3;
+    FUN_001b368b(lVar9,local_140);
+    lVar9 = plVar7[5];
+    uVar8 = local_c0[0];
+    if (lVar9 != 0) {
+      *(undefined8 *)((long)&uStack_190 + lVar11) = 0x1389fb;
+      uVar8 = mono_value_box(lVar6,lVar9,local_c0);
+      ppbVar14 = (byte **)((long)&local_188 + lVar11);
+    }
+  }
+LAB_00138a1e:
+  if (local_40 != *(long *)(in_FS_OFFSET + 0x28)) {
+                    /* WARNING: Subroutine does not return */
+    *(undefined8 *)((long)ppbVar14 + -8) = 0x138a32;
+    __stack_chk_fail();
+  }
+  return uVar8;
+}
+
+ (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x1208c7 (GhidraScript)  
+INFO  AnalyzeGC.java> No function found containing this address. (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x1a361b (GhidraScript)  
+INFO  AnalyzeGC.java> Found function at: 001a344a (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Assembly (first 10 insts) --- (GhidraScript)  
+INFO  AnalyzeGC.java> 001a344a PUSH R12 (GhidraScript)  
+INFO  AnalyzeGC.java> 001a344c PUSH RBP (GhidraScript)  
+INFO  AnalyzeGC.java> 001a344d MOV RBP,RSI (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3450 PUSH RBX (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3451 MOV RBX,RDI (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3454 SUB RSP,0x10 (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3458 MOV RDI,qword ptr [RDI] (GhidraScript)  
+INFO  AnalyzeGC.java> 001a345b CALL 0x001a236e (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3460 TEST EAX,EAX (GhidraScript)  
+INFO  AnalyzeGC.java> 001a3462 MOV RDI,qword ptr [RBX] (GhidraScript)  
+INFO  AnalyzeGC.java> 
+--- Decompiled Code --- (GhidraScript)  
+INFO  AnalyzeGC.java> 
+void FUN_001a344a(undefined8 *param_1,undefined8 param_2)
+
+{
+  undefined8 *puVar1;
+  int iVar2;
+  undefined4 uVar3;
+  undefined8 uVar4;
+  undefined8 uVar5;
+  long lVar6;
+  undefined4 local_1c;
+  
+  iVar2 = FUN_001a236e(*param_1);
+  param_1[0xb] = param_2;
+  *(uint *)(param_1 + 0xe) = (uint)(iVar2 != 0);
+  FUN_001a1877(*param_1,".debug_abbrev",0);
+  FUN_001a253f(param_1,1,0x11,1,&DAT_005a2e80,0xe);
+  FUN_001a253f(param_1,2,0x2e,1,&DAT_005a2ec0,8);
+  FUN_001a253f(param_1,3,5,0,&DAT_005a2ee0,6);
+  FUN_001a253f(param_1,0xf,5,0,&DAT_005a2f00,6);
+  FUN_001a253f(param_1,4,0x24,0,&DAT_005a2f20,6);
+  FUN_001a253f(param_1,5,2,1,&DAT_005a2f40,4);
+  FUN_001a253f(param_1,0x11,2,0,&DAT_005a2f40,4);
+  FUN_001a253f(param_1,6,0xd,0,&DAT_005a2f50,6);
+  FUN_001a253f(param_1,7,0x16,0,&DAT_005a2f70,4);
+  FUN_001a253f(param_1,8,4,1,&DAT_005a2f80,6);
+  FUN_001a253f(param_1,9,0x28,0,&DAT_005a2fa0,4);
+  FUN_001a253f(param_1,10,0x39,1,&DAT_005a2fb0,2);
+  FUN_001a253f(param_1,0xb,0x34,0,&DAT_005a2fc0,6);
+  FUN_001a253f(param_1,0xc,0x34,0,&DAT_005a2fe0,6);
+  FUN_001a253f(param_1,0xd,0xf,0,&DAT_005a2ff8,2);
+  FUN_001a253f(param_1,0xe,0x10,0,&DAT_005a3000,2);
+  FUN_001a253f(param_1,0x10,0x1c,0,&DAT_005a3010,4);
+  FUN_001a222d(*param_1,0);
+  FUN_001a1877(*param_1,".debug_info",0);
+  FUN_001a1c52(*param_1,".Ldebug_info_start");
+  FUN_001a20bb(*param_1,".Ldebug_info_end",".Ldebug_info_begin",0);
+  FUN_001a1c52(*param_1,".Ldebug_info_begin");
+  FUN_001a1f1f(*param_1,2);
+  FUN_001a1fe7(*param_1,0);
+  FUN_001a222d(*param_1,8);
+  iVar2 = FUN_001a236e(*param_1);
+  if ((iVar2 != 0) && (*(int *)((long)param_1 + 0x74) != 0)) {
+    FUN_001a1877(*param_1,".debug_info",1);
+    FUN_001a222d(*param_1,0);
+    FUN_001a1c52(*param_1,".Ldebug_info_end");
+    FUN_001a1877(*param_1,".debug_info",0);
+  }
+  FUN_001a23f7(param_1,1);
+  uVar4 = FUN_00131561();
+  uVar5 = FUN_00290b54("Mono AOT Compiler %s",uVar4);
+  FUN_001a1dd1(*param_1,uVar5);
+  lVar6 = 0;
+  g_free(uVar4);
+  g_free(uVar5);
+  FUN_001a1dd1(*param_1,"JITted code");
+  FUN_001a1dd1(*param_1,&DAT_002b2326);
+  FUN_001a222d(*param_1,2);
+  FUN_001a23d7(param_1,0);
+  FUN_001a23d7(param_1,0);
+  FUN_001a20bb(*param_1,".Ldebug_line_start",".Ldebug_line_section_start",0);
+  do {
+    FUN_001a1c52(*param_1,*(undefined8 *)((long)&PTR_s__LDIE_I1_0059d5c0 + lVar6));
+    FUN_001a23f7(param_1,4);
+    FUN_001a222d(*param_1,(&DAT_0059d5d4)[lVar6]);
+    FUN_001a222d(*param_1,(&DAT_0059d5d8)[lVar6]);
+    puVar1 = (undefined8 *)((long)&PTR_s_sbyte_0059d5c8 + lVar6);
+    lVar6 = lVar6 + 0x20;
+    FUN_001a1dd1(*param_1,*puVar1);
+  } while (lVar6 != 0x220);
+  FUN_001a1877(*param_1,".debug_loc",0);
+  FUN_001a1c52(*param_1,".Ldebug_loc_start");
+  FUN_001a1877(*param_1,".debug_line",0);
+  FUN_001a1c52(*param_1,".Ldebug_line_section_start");
+  FUN_001a1877(*param_1,".debug_line",1);
+  FUN_001a1c52(*param_1,".Ldebug_line_start");
+  FUN_001a20bb(*param_1,".Ldebug_line_end",".",0xfffffffc);
+  FUN_001a1f1f(*param_1,2);
+  FUN_001a20bb(*param_1,".Ldebug_line_header_end",".",0xfffffffc);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,0xfb);
+  FUN_001a222d(*param_1,0xe);
+  FUN_001a222d(*param_1,0xd);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,1);
+  FUN_001a1877(*param_1,".debug_line",2);
+  FUN_001a1877(*param_1,".debug_line",3);
+  FUN_001a222d(*param_1,0);
+  FUN_001a3232(param_1,"xdb.il");
+  FUN_001a1877(*param_1,".debug_line",4);
+  FUN_001a222d(*param_1,0);
+  FUN_001a1c52(*param_1,".Ldebug_line_header_end");
+  FUN_001a1877(*param_1,".debug_line",5);
+  FUN_001a222d(*param_1,0);
+  FUN_001a222d(*param_1,1);
+  FUN_001a222d(*param_1,1);
+  FUN_001a1c52(*param_1,".Ldebug_line_end");
+  FUN_001a1877(*param_1,".debug_frame",0);
+  FUN_001a1e5a(*param_1,8);
+  FUN_001a20bb(*param_1,".Lcie0_end",".Lcie0_start",0);
+  FUN_001a1c52(*param_1,".Lcie0_start");
+  FUN_001a1fe7(*param_1,0xffffffff);
+  FUN_001a222d(*param_1,3);
+  FUN_001a1dd1(*param_1,&DAT_002b2326);
+  FUN_001a2425(param_1,1);
+  iVar2 = FUN_0019fb91();
+  FUN_001a2425(param_1,(long)iVar2);
+  uVar3 = FUN_0019fb97();
+  FUN_001a23f7(param_1,uVar3);
+  if (param_1[0xb] != 0) {
+    uVar4 = FUN_0019f435(param_1[0xb],&local_1c);
+    FUN_001a1cd1(*param_1,uVar4,local_1c);
+    g_free(uVar4);
+  }
+  FUN_001a1e5a(*param_1,8);
+  FUN_001a1c52(*param_1,".Lcie0_end");
+  return;
+}
+
+ (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x11fab1 (GhidraScript)  
+INFO  AnalyzeGC.java> No function found containing this address. (GhidraScript)  
+INFO  AnalyzeGC.java> 
+=========================================== (GhidraScript)  
+INFO  AnalyzeGC.java> Analyzing address: 0x38850 (GhidraScript)  
+INFO  AnalyzeGC.java> No function found containing this address. (GhidraScript)  
+INFO  ANALYZING changes made by post scripts: /libmono.so (HeadlessAnalyzer)  
+INFO  REPORT: Post-analysis succeeded for file: /libmono.so (HeadlessAnalyzer)  
+INFO  REPORT: Save succeeded for processed file: /libmono.so (HeadlessAnalyzer)  

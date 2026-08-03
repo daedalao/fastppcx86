@@ -710,6 +710,16 @@
           "While enabled these ops bypass the helper entirely, so the doubleword-contained split-lock telemetry counter no longer observes them."
         ]
       },
+      "BlockLinking": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "PPC64LE: backpatch constant-target JUMP block exits into direct branches to the destination block (block linking), skipping the inlined L1 probe on subsequent executions.",
+          "Call, return and register-indirect exits keep the inlined L1 probe regardless. Ignored (forced off) while EnableCodeCachingWIP is set:",
+          "link thunk records embed absolute host addresses as data inside the code stream, which would be serialized by the code cache and reloaded stale at a different base.",
+          "Default on: cleared by the 2026-08-03 real-workload regression set (probe_thread_spawn 0/30 + 0/30, ctest 7024/7024, Factorio oil-refinery ×5, FTL, stress-ng, OpenSSL 128-thread 162/162, Dex, Steam-in-Proton), all run with FEX_BLOCKLINKING=1 for the entire cycle."
+        ]
+      },
       "KernelUnalignedAtomicBackpatching": {
         "Type": "bool",
         "Default": "true",

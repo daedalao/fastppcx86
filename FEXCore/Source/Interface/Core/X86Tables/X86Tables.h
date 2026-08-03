@@ -209,12 +209,19 @@ struct DecodedOperand {
 };
 
 struct DecodedInst {
+  // Architectural maximum length of an x86 instruction. Hardware raises #UD
+  // past this; DecodeInstructionImpl still commits over-long InstBytes at its
+  // tail, and DecodeInstruction (the caller) then flags ErrorDuringDecoding
+  // and substitutes an invalid-instruction stub — the over-long record is
+  // committed but never consumed.
+  static constexpr size_t MAX_INST_SIZE = 15;
+
   uint64_t PC;
 
   DecodedOperand Dest;
   DecodedOperand Src[3];
 
-  // Constains the dispatcher handler pointer
+  // Contains the dispatcher handler pointer
   const X86InstInfo* TableInfo;
 
   uint32_t Flags;
@@ -225,6 +232,14 @@ struct DecodedInst {
   uint8_t SIB;
   uint8_t InstSize;
   int8_t REXIndex;
+
+  // Raw guest bytes this instruction was decoded from, in stream order.
+  // InstSize bytes are valid; the tail is zero. SMC validation must compare
+  // against these rather than re-reading guest memory: a guest write landing
+  // between decode and IR emission would otherwise pair IR built from the old
+  // bytes with a snapshot of the new ones, and validation would then pass
+  // forever while stale semantics execute.
+  std::array<uint8_t, MAX_INST_SIZE> InstBytes;
 };
 
 union ModRMDecoded {

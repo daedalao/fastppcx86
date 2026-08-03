@@ -1876,6 +1876,185 @@ static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
   std::abort();
 }
 
+// -------------------------------------------------------------------------
+// Block linking (constant-target JUMP exits): linker + delinkers
+// -------------------------------------------------------------------------
+// See DEF_OP(ExitFunction) in BranchOps.cpp for the exit-site layout and
+// CompileCode's tail for the thunk/record layout. Contract summary:
+//
+//   in-block patch site (CallerAddress = &record + CallerOffset):
+//     unlinked           first instruction of the inlined L1 probe
+//     linked, in range   b HostCode                       (I-form, ±32MiB)
+//     linked, far        b ThunkStart
+//   thunk patch site (ThunkStart = &record - PPC64LinkRecordFromThunkStart):
+//     unlinked           b LinkPath        (falls into the relink/compile path)
+//     linked, far        bcl 20,31,$+4     (PC-discovery; next insns load
+//                                           record.HostCode; mtctr; bctr)
+//
+// Every transition is ONE atomic 4-byte instruction store + icache flush per
+// site. Delinking restores the exact pre-link word stashed in the record at
+// emit time, so a delinked exit is byte-identical to a never-linked one.
+//
+// Benign-transient property the patch ORDER relies on: the thunk word is
+// patched before the caller word, and the caller's far patch targets the
+// thunk's first word. A remote hart that observes the caller patch but a
+// stale thunk word executes `b LinkPath` and simply re-enters the linker,
+// which is idempotent (AddBlockLink on a duplicate key keeps the existing
+// entry; re-patching writes identical words). The reverse order would have
+// no unlinked fallback.
+namespace {
+
+// bcl 20,31,$+4 — the LK=1 form the link-stack predictor does not push
+// (see CodeEmitter Emitter.h::bcl). Verified encoding: opcode 16, BO=20,
+// BI=31, BD=+4, AA=0, LK=1.
+constexpr uint32_t PPC64_BCL_20_31_PLUS4 = 0x429F0005u;
+
+// I-form `b`: signed 26-bit byte displacement (LI field is 24 bits, <<2).
+bool PPC64BranchDisplacementInRange(int64_t Delta) {
+  return (Delta & 3) == 0 && Delta >= -0x2000000ll && Delta <= 0x1FFFFFCll;
+}
+
+uint32_t PPC64EncodeBranch(int64_t Delta) {
+  return 0x48000000u | (static_cast<uint32_t>(Delta) & 0x03FFFFFCu);
+}
+
+// Single atomic 4-byte instruction rewrite + icache maintenance. The store
+// is naturally atomic (4-byte aligned); atomic_ref documents the intent and
+// forbids tearing at the C++ level. __builtin___clear_cache lowers to
+// dcbst; sync; icbi; isync on ppc64le — icbi is broadcast on POWER9, so
+// remote harts stop fetching the stale word once this returns; instructions
+// already in a remote pipeline may still retire as the OLD word, which every
+// transition above tolerates (old word is always a correct-behaviour path).
+void PPC64PatchInstruction(uintptr_t Address, uint32_t Word) {
+  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Address)).store(Word, std::memory_order_relaxed);
+  __builtin___clear_cache(reinterpret_cast<char*>(Address), reinterpret_cast<char*>(Address) + 4);
+}
+
+// Both delinkers run under the LookupCache WRITE lock (GuestToHostMap::Erase
+// walks BlockLinks under it) and must restore the exact pre-link instruction
+// with one atomic 4-byte store. No LOGMAN dependence anywhere on this path.
+void PPC64DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Link) {
+  auto* Record = reinterpret_cast<PPC64BlockLinkRecord*>(Link);
+  const uintptr_t CallerAddress = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
+  PPC64PatchInstruction(CallerAddress, Record->OrigCallerWord);
+}
+
+void PPC64IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Link) {
+  auto* Record = reinterpret_cast<PPC64BlockLinkRecord*>(Link);
+  const uintptr_t CallerAddress = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
+  const uintptr_t ThunkStart = reinterpret_cast<uintptr_t>(Record) - PPC64LinkRecordFromThunkStart;
+  // Caller first: stop new arrivals into the thunk's linked leg, then unlink
+  // the thunk word itself. A hart already past the caller word can still
+  // execute the stale bcl leg and load Record->HostCode — the same in-flight
+  // window every delinker on every backend has; the invalidation contract
+  // (exclusive CodeInvalidationMutex + guest coherency rules) covers it.
+  PPC64PatchInstruction(CallerAddress, Record->OrigCallerWord);
+  PPC64PatchInstruction(ThunkStart, Record->OrigThunkWord);
+}
+
+} // anonymous namespace
+
+uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* Frame,
+                                                  FEXCore::Context::ExitFunctionLinkData* Link) {
+  auto* Record = reinterpret_cast<PPC64BlockLinkRecord*>(Link);
+  auto Thread = Frame->Thread;
+  auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
+  const uint64_t GuestRIP = Record->GuestRIP;
+
+  // Snapshot the code buffer we would be linking into BEFORE any compile can
+  // rotate it — same guard as ExitFunctionLink (commit 9c07619e2). A rotation
+  // moves Thread->LookupCache->Shared to the new buffer's map; both the
+  // lookup result and this record's patch sites belong to the old buffer and
+  // must not be linked or registered against the new map.
+  auto CodeBuffer = static_cast<PPC64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
+
+  uintptr_t HostCode;
+  {
+    // Same lock discipline as ExitFunctionLink: the shared invalidation guard
+    // MUST be dropped before CompileBlock (non-recursive WritePriorityMutex;
+    // see the deadlock comment there).
+    auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
+    HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
+  }
+  if (!HostCode) {
+    HostCode = CTX->CompileBlock(Frame, GuestRIP, 0);
+    if (!HostCode || Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+      // Not compilable (dispatch stub stops the thread on 0), or the buffer
+      // rotated: dispatch to the result but register/patch nothing.
+      return HostCode;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Link. Registration and both patches happen under the SAME exclusive
+  // section: CodeInvalidationMutex (shared, so invalidation's exclusive
+  // acquisition excludes us) + the LookupCache write lock (so Erase's
+  // delink walk and this linker serialize).
+  // ---------------------------------------------------------------------
+  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
+  auto lk = Thread->LookupCache->AcquireWriteLock();
+
+  // RE-VALIDATE under the final write lock. Everything above ran under (at
+  // most) a shared lock and there is a window between it and this point:
+  // invalidation takes the exclusive lock and can erase or supersede the
+  // GuestRIP -> HostCode mapping in that gap. Patching against the stale
+  // HostCode would permanently branch this exit to a translation of guest
+  // code that has since been REWRITTEN — callers arriving via the link would
+  // diverge from callers arriving via lookup, forever, and the registration
+  // would only be consumed by a future Erase that may never come. (The ARM64
+  // implementation in this tree patches without re-checking; that is an
+  // upstream bug, deliberately not ported.) Refuse to patch on miss or
+  // mismatch; the returned HostCode is still correct for this one dispatch
+  // when it came from a successful CompileBlock above, and on a stale lookup
+  // the dispatch lands on the not-yet-erased old translation exactly as an
+  // unlinked exit would have.
+  if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+    return HostCode;
+  }
+  auto* Entry = Thread->LookupCache->Shared->FindBlock(GuestRIP, lk);
+  if (!Entry || Entry->HostCode != HostCode) {
+    return HostCode;
+  }
+
+  const uintptr_t CallerAddress = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
+  const uintptr_t ThunkStart = reinterpret_cast<uintptr_t>(Record) - PPC64LinkRecordFromThunkStart;
+  const int64_t DirectDelta = static_cast<int64_t>(HostCode) - static_cast<int64_t>(CallerAddress);
+  const int64_t ThunkDelta = static_cast<int64_t>(ThunkStart) - static_cast<int64_t>(CallerAddress);
+
+  if (PPC64BranchDisplacementInRange(DirectDelta)) {
+    // Registration BEFORE patch, under the same locks: once the patched word
+    // is observable, the delinker that undoes it is already findable by
+    // Erase. The reverse order would leave a patched branch with no
+    // registered undo if this thread stalled between the two.
+    Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64DirectBlockDelinker, lk);
+    PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(DirectDelta));
+  } else if (PPC64BranchDisplacementInRange(ThunkDelta)) {
+    Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
+
+    // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
+    // between. __builtin___clear_cache orders nothing for REMOTE observers
+    // and runs after both stores anyway — without the hwsync a remote hart
+    // can fetch the new bcl leg and still read a stale HostCode, branching
+    // to garbage. Sequence: store HostCode; hwsync; store patch word;
+    // icache maintenance. hwsync's cumulativity guarantees any hart that
+    // observes the patched word also observes the HostCode store.
+    std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order_seq_cst);
+#ifdef __powerpc64__
+    asm volatile("sync" ::: "memory"); // hwsync
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+    PPC64PatchInstruction(ThunkStart, PPC64_BCL_20_31_PLUS4);
+    PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(ThunkDelta));
+  }
+  // else: even the thunk is out of `b` range of the exit (would need a
+  // single compile unit larger than ±32MiB — beyond every intra-block branch
+  // this backend already emits). Leave the exit unlinked; it stays on the
+  // inlined-probe path forever, which is correct, just slower.
+
+  return HostCode;
+}
+
 uint64_t PPC64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
   // Mode-dependent widths for the whole routine below. i386 guests have a
   // 4-byte return-address sentinel at 4-byte granularity, and a 32-bit
@@ -2043,6 +2222,43 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // Wire up the block-find/compile function pointer used by the dispatcher's ExitFunctionLinker.
   ThreadState->CurrentFrame->Pointers.ExitFunctionLink =
     reinterpret_cast<uintptr_t>(&PPC64JITCore::ExitFunctionLink);
+  // PPC64JITCore::ExitFunctionLinkWithRecord no longer needs a frame slot —
+  // the dispatcher stub materialises its address as an inline constant
+  // (PPC64Dispatcher.cpp), so nothing has to be written per-thread.  Retiring
+  // that slot keeps CpuStateFrame within its 2-page budget after C4.5/C6/C7
+  // consumed the remaining headroom.
+
+  // Resolve the block-linking gate ONCE, at backend construction:
+  //   knob on  AND  code caching off.
+  // The code-caching hard gate is a correctness requirement, not tuning:
+  // CodeCache::SaveData dumps the live code buffer wholesale, and link thunk
+  // records hold ABSOLUTE host addresses (Record.HostCode) plus a raw
+  // GuestRIP as data inside the code stream, with no relocation records.
+  // Serialized in one session and reloaded at a different base, a patched
+  // thunk would branch to a dead absolute address. Gating emission off means
+  // a caching-enabled process contains zero thunks and zero patched words,
+  // so the serialized buffer is bit-identical to the non-linking backend's —
+  // strictly safer than trying to delink-walk before SaveData, which would
+  // still serialize the (unread-when-unlinked, but stale) HostCode fields
+  // and needs a walk ordered against every thread's compile activity.
+  BlockLinkingEnabled = CTX->Config.BlockLinking() && !FEXCore::Config::Get_ENABLECODECACHINGWIP();
+
+  // SMC interlocks: two fork features are only sound when every constant-target
+  // exit re-probes the lookup path, which is exactly what a established direct
+  // link bypasses.
+  //  * FEX_SMCSEMANTICPATCH patches the exit's destination-RIP window; a linked
+  //    exit never reloads that window, so the patch would be silently
+  //    ineffective (worse than a fault — stale target, no error).
+  //  * FEX_SMCLAZYINVAL's soundness (FEX_SMCLAZYSCRUB) forces the faulting
+  //    thread's next dispatch through ExitFunctionLink to drain; a linked exit
+  //    skips ExitFunctionLink entirely, reopening the same-thread stale hole.
+  // Soft-invalidate alone stays compatible with linking: it severs inbound
+  // links via SeverBlockLinks(), same as legacy Erase.
+  if (BlockLinkingEnabled && (CTX->Config.SMCSemanticPatch() || FEXCore::Config::Get_SMCLAZYINVAL())) {
+    LogMan::Msg::IFmt("BlockLinking disabled: incompatible with FEX_SMCSEMANTICPATCH/FEX_SMCLAZYINVAL "
+                      "(both need every constant-target exit to re-probe the lookup path).");
+    BlockLinkingEnabled = false;
+  }
 
   // Point the JIT's helper-address table at the static array in VectorOps.cpp.
   // JIT-emitted call sites will (in P2.1 C2..C5) reach C helpers via
@@ -2222,7 +2438,17 @@ void PPC64JITCore::EmitSuspendInterruptCheck() {
 //
 // kMaxHostBytesPerIROp is a *claim*, not a measurement. That is what the
 // profiler below exists to check.
-constexpr size_t kMaxHostBytesPerIROp = 128;
+//
+// Raised 128 -> 160 for block linking: each linkable constant-jump
+// ExitFunction now also emits an 80-byte jump thunk + record at the tail of
+// CompileCode, on top of an inline expansion that already exceeded the
+// per-op claim (SpillStaticRegs alone is ~62 instructions). The reserve is
+// an AGGREGATE bound — SSACount * per-op — so the heavyweight exits amortize
+// against the many small ops in any real block, and the 1MiB floor dominates
+// for small blocks anyway; the bump keeps the aggregate honest for
+// exit-dense blocks (a block that is a single guest Jcc is ~10 SSA ops for
+// two exits: 10*160 = 1600 >= 2*(inline ~420 + thunk 80)).
+constexpr size_t kMaxHostBytesPerIROp = 160;
 constexpr size_t kMaxRIPEntryBytesPerIROp = 16;
 
 // ---------------------------------------------------------------------------
@@ -2758,6 +2984,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // no longer exists; drop them.
   ClearPendingBranches();
 
+  // Same for pending block-link jump thunks: their LinkPath labels are the
+  // targets of miss-leg branches recorded in PendingBranches, so the two
+  // lists must be reset together.
+  PendingJumpThunks.clear();
+
   // -------------------------------------------------------------------------
   // Emit entry point
   // -------------------------------------------------------------------------
@@ -2969,6 +3200,92 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
                                                                             static_cast<size_t>(OpSizeProfile::BUCKET_UNKNOWN_OP),
                           GetOffset() - OpStart, Entry);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Block-link jump thunks (one per linkable constant-jump exit)
+  // -------------------------------------------------------------------------
+  // Layout, offsets from ThunkStart (8-byte aligned):
+  //   +0x00  b +0x14                ThunkPatchSite. Unlinked -> LinkPath.
+  //                                 Linked out-of-range -> bcl 20,31,$+4.
+  //   +0x04  mflr TMP1              (runs only when patched) TMP1 = ThunkStart+4
+  //   +0x08  ld   TMP2, 0x2C(TMP1)  TMP2 = record.HostCode (at ThunkStart+0x30)
+  //   +0x0c  mtctr TMP2
+  //   +0x10  bctr
+  //   +0x14  LinkPath: bcl 20,31,$+4     LR = ThunkStart+0x18 (no link-stack push)
+  //   +0x18  mflr TMP2              TMP2 = ThunkStart+0x18
+  //   +0x1c  addi TMP2, TMP2, 0x18  TMP2 = r4 = &record (linker stub argument)
+  //   +0x20  ld   TMP1, 32(TMP2)    TMP1 = record.StubAddr — dispatcher stub
+  //                                 addr cached in the record so no per-thread
+  //                                 CpuStateFrame slot is needed
+  //   +0x24  mtctr TMP1
+  //   +0x28  bctr
+  //   +0x2c  nop                    pad so the record is 8-byte aligned
+  //   +0x30  PPC64BlockLinkRecord   (5 x dc64; HostCode field atomically
+  //                                 rewritten by the linker; StubAddr is the
+  //                                 dispatcher stub's fixed address, written
+  //                                 once at emit time)
+  //
+  // Register discipline: only TMP1/TMP2 (r3/r4, non-SRA scratch) and LR are
+  // touched. LR clobbering on the linked leg matches the established hot-path
+  // precedent (EmitStoreBlockBeginToInlineHeader runs bcl/mflr at every
+  // dispatcher-reachable block entry). r0 is NOT touched — the exit site
+  // re-zeroed it above its patch site, and the target block relies on it.
+  // The LinkPath leg runs after the exit's SpillStaticRegs, mirroring the
+  // classic miss leg's state at the ExitFunctionLinker stub boundary.
+  //
+  // Emitted BEFORE Align16B/CodeSize capture so the thunk bytes are included
+  // in CodeData.Size and in the icache flush below.
+  const uint64_t StubAddr = CTX->Dispatcher->GetExitFunctionLinkerWithRecordAddress();
+  for (auto& Thunk : PendingJumpThunks) {
+    static_assert(offsetof(PPC64BlockLinkRecord, StubAddr) <= 32764 &&
+                    (offsetof(PPC64BlockLinkRecord, StubAddr) & 3) == 0,
+                  "thunk's d-form ld must reach the record's StubAddr field");
+    // 8-align the thunk start; SetBuffer lands on a 16-byte boundary so
+    // buffer offsets equal address alignment. The record at +0x30 inherits
+    // 8-byte alignment for the linker's atomic u64 HostCode store.
+    while (GetOffset() % 8) {
+      nop();
+    }
+    const uint64_t ThunkStart = GetCursorAddress<uint64_t>();
+    b(0x14);                                                        // +0x00
+    mflr(TMP1);                                                     // +0x04
+    ld(TMP2, static_cast<int16_t>(PPC64LinkRecordFromThunkStart - 0x4), TMP1); // +0x08
+    mtctr(TMP2);                                                    // +0x0c
+    bctr();                                                         // +0x10
+    Bind(&Thunk.LinkPath);                                          // +0x14
+    bcl(20, 31, 4);
+    mflr(TMP2);                                                     // +0x18
+    addi(TMP2, TMP2, static_cast<int16_t>(PPC64LinkRecordFromThunkStart - 0x18)); // +0x1c
+    // TMP2 now holds &record. Load the dispatcher stub address from
+    // record.StubAddr (populated below with the constant fetched above).
+    ld(TMP1,                                                        // +0x20
+       static_cast<int16_t>(offsetof(PPC64BlockLinkRecord, StubAddr)),
+       TMP2);
+    mtctr(TMP1);                                                    // +0x24
+    bctr();                                                         // +0x28
+    nop();                                                          // +0x2c
+    // Release-visible layout check (LOGMAN_* compiles to nothing in Release
+    // and the failure mode of a drifted record offset is silent wrong-code:
+    // the linked leg's ld would read instruction bytes as a host address).
+    if (GetCursorAddress<uint64_t>() != ThunkStart + PPC64LinkRecordFromThunkStart) {
+      ERROR_AND_DIE_FMT("PPC64 block-link thunk layout drifted: record lands at {:#x}, expected {:#x}",
+                        GetCursorAddress<uint64_t>(), ThunkStart + PPC64LinkRecordFromThunkStart);
+    }
+    const uint64_t RecordAddress = GetCursorAddress<uint64_t>();
+    // Stash the exact pre-link words for the delinkers. Read back from the
+    // buffer rather than re-encoded: the caller word is the probe's first
+    // instruction (already final — it is a direct emission, not a pending
+    // branch), the thunk word is the b +0x14 emitted just above.
+    const uint32_t OrigCallerWord = *reinterpret_cast<const uint32_t*>(Thunk.CallerAddress);
+    const uint32_t OrigThunkWord = *reinterpret_cast<const uint32_t*>(ThunkStart);
+    dc64(0);                                                          // HostCode
+    dc64(Thunk.GuestRIP);                                             // GuestRIP
+    dc64(static_cast<uint64_t>(Thunk.CallerAddress - RecordAddress)); // CallerOffset
+    dc64(static_cast<uint64_t>(OrigCallerWord) |
+         (static_cast<uint64_t>(OrigThunkWord) << 32));               // Orig{Caller,Thunk}Word
+    dc64(StubAddr);                                                   // StubAddr — dispatcher
+                                                                      // stub cached per record
   }
 
   // -------------------------------------------------------------------------

@@ -166,7 +166,14 @@ struct GuestToHostMap {
       .first->second;
   }
 
-  const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
+  // Token widened to the base type: reading BlockList needs at least the
+  // shared lock, and the write token grants a strict superset of that.
+  // PPC64LE's block linker re-validates GuestRIP -> HostCode under the final
+  // WRITE lock immediately before backpatching (patching against a stale
+  // mapping would permanently link a branch to a translation of guest code
+  // that has since been rewritten), which requires calling this with a
+  // LookupCacheWriteLockToken.
+  const BlockEntry* FindBlock(uint64_t Address, const LookupCacheBaseLockToken&) {
     auto HostCode = BlockList.find(Address);
     if (HostCode == BlockList.end()) {
       return nullptr;

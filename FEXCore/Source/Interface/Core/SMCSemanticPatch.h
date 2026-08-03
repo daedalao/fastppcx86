@@ -70,6 +70,18 @@
 //     therefore permanently EMPTY on this port, and SeverBlockLinks() -- the
 //     delinker path the design suggested reusing -- is a guaranteed no-op.
 //
+//   STALENESS WARNING (2026-08-03): the above was true until FEX_BLOCKLINKING
+//   (f28ba8721, default-on since 01a21b4e6) added real constant-target jump
+//   linking to this port.  A LINKED exit branches directly and never reloads
+//   the patched window, which would make rel32 patches silently ineffective.
+//   The interlock in PPC64JITCore (JIT.cpp, BlockLinkingEnabled) therefore
+//   force-disables block linking whenever FEX_SMCSEMANTICPATCH (or
+//   FEX_SMCLAZYINVAL, whose scrub needs every exit to re-probe) is enabled,
+//   restoring the invariant this file's soundness argument rests on.  If a
+//   linking-compatible semantic patch is ever wanted, the patch path must
+//   also sever inbound links to the OLD destination (SeverBlockLinks is no
+//   longer a no-op) and suppress re-linking of claimed exits.
+//
 // Consequences:
 //   * "Sever the outbound direct link" is not merely insufficient here, it is
 //     a nop.  Delinking alone would leave the block jumping to the OLD target
