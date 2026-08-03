@@ -451,9 +451,16 @@ void ThreadManager::HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bo
   // create/destroy cycles -- Steam sessions are bounded so this is
   // acceptable until the proper fix lands.
   //
-  // Mark the leaked object as zombie via TID=0 so SignalHandlerThunk
-  // can bail out cleanly via its TID check.
-  Thread->ThreadInfo.TID.store(0);
+  // Mark the leaked object as zombie via a dedicated flag. DO NOT zero
+  // ThreadInfo.TID here: the parent's CLONE_THREAD return path reads
+  // TID as the guest-visible syscall result, and short-lived children
+  // that exit before the parent finishes CreateNewThread would race the
+  // store and hand `0` back to glibc as a "successful" clone. glibc
+  // treats non-negative as success, stores `pd->tid = 0`, and the
+  // downstream pd/_State recycling produces a use-after-free that
+  // presents as libstdc++'s execute_native_thread_routine faulting on
+  // `[rax+0x10]` (vtable slot 2 of a recycled _State chunk).
+  Thread->ThreadInfo.IsZombie.store(true, std::memory_order_release);
 
   // Original deallocation (DO NOT re-enable until the signal-delivery
   // race is fixed via refcount or epoch-based reclaim):

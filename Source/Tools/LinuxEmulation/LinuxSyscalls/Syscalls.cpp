@@ -791,11 +791,23 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
       FEX::HLE::_SyscallHandler->TM.DestroyThread(NewThread);
     }
 
+    // Belt-and-braces: zero is never a valid child TID and glibc's
+    // create_thread only tests `< 0` for failure, so a stray 0 would be
+    // accepted as success and stored as `pd->tid`, corrupting downstream
+    // pthread_join / pthread_kill / pd-recycling. The primary fix moves
+    // the DestroyThread zombie marker off TID (ThreadInfo.IsZombie), so
+    // this branch should never be taken. If it is, we've introduced a
+    // second instance of the same overload — surface it as EAGAIN, which
+    // is the errno glibc treats as "transient, try again."
+    if (Result == 0) {
+      LogMan::Msg::EFmt("CLONE_THREAD returned TID=0 to guest (should be impossible); returning EAGAIN");
+      Result = static_cast<uint64_t>(-EAGAIN);
+    }
+
     {
       // FEX_TRACE_CLONE=1: log the value we return to the guest for the
-      // thread-creating clone.  Result carries the child TID.  errno
-      // capture would only matter if Result == -1, which the TID path
-      // cannot produce, but log both to catch the impossible case.
+      // thread-creating clone. Result carries the child TID unless the
+      // never-return-zero guard rewrote it to -EAGAIN.
       char buf[192];
       int len = 0;
       const char* p = "CLONE-RETURN-THREAD caller_tid=";
