@@ -65,8 +65,17 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
   auto CallRetStackInfo = ThreadObject->GetCallRetStackInfo();
   if (FaultAddress >= CallRetStackInfo.AllocationBase && FaultAddress < CallRetStackInfo.AllocationEnd) {
-    // Reset REG_CALLRET_SP to the default location to allow for underflows/overflows
+    // Reset REG_CALLRET_SP to the default location to allow for underflows/overflows.
+    // ARM64 REG_CALLRET_SP is X25; the register-index literal 25 is ARM-specific and
+    // was compiling on every architecture, silently writing an unrelated host GPR on
+    // ppc64le (id=25 → gp_regs[28] → pinned r28). Arch-guard the assignment.
+#if defined(ARCHITECTURE_arm64)
     ArchHelpers::Context::SetArmReg(ucontext, 25, CallRetStackInfo.DefaultLocation);
+#elif defined(ARCHITECTURE_ppc64le)
+    // No REG_CALLRET_SP on ppc64le yet; the JIT does not push/pop callret_sp,
+    // so the guard-page range is dead today. When the shadow return stack lands
+    // and a ppc64le REG_CALLRET_SP is assigned, write it here via gp_regs.
+#endif
     return true;
   }
 
