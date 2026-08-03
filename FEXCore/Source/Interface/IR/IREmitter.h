@@ -320,6 +320,14 @@ public:
     FEXCore::IR::IROp_Header* IROp = RealNode->Op(DualListData.DataBegin());
     if (IROp->Op == OP_CONSTANT) {
       auto Op = IROp->C<IR::IROp_Constant>();
+      if (Op->PatchSite != 0) {
+        // FEX_SMCSEMANTICPATCH: a PatchSite-tagged constant's value can be
+        // rewritten at runtime by the SMC semantic patcher. Every caller uses
+        // this to fold the compile-time value into a fresh node or an inline
+        // form, which orphans the tagged materialisation window — so report
+        // it as non-constant and force consumers to use the node itself.
+        return false;
+      }
       if (Constant) {
         *Constant = Op->Constant;
       }

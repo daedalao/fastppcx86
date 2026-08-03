@@ -561,7 +561,7 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* 
         return PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
       }
     }
-  } else if (IROp->Op == OP_XGETBV && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT) {
+  } else if (IROp->Op == OP_XGETBV && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT && LastOp->C<IROp_Constant>()->PatchSite == 0) {
     // Try to constant fold
     uint64_t ConstantFunction = LastOp->C<IROp_Constant>()->Constant;
     auto Op = IROp->CW<IR::IROp_XGetBV>();
@@ -573,7 +573,7 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* 
       IREmit->RemovePostRA(CodeNode);
       return false;
     }
-  } else if (IROp->Op == OP_CPUID && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT) {
+  } else if (IROp->Op == OP_CPUID && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT && LastOp->C<IROp_Constant>()->PatchSite == 0) {
     // Try to constant fold. As a limitation of merging only 2 instructions, we
     // can only handle constant functions, not constant leafs. This could be
     // lifted if we generalized at a (significant) complexity cost.
