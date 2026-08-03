@@ -26,10 +26,11 @@
 // compose with aligned LL/SC (Tier D atomics defect 1, narrowed by C3+C4
 // but not closed — closure requires a dual-container crossing path, deferred
 // as a future C4.5). The 8-bit (lbarx) path is always aligned by definition.
-// Since C6, when SplitLockInlineContained is set, the doubleword-contained
-// subset of the misaligned Fetch*/Swap ops (2-/4-byte fields with
+// Since C6/C7, when SplitLockInlineContained is set, the doubleword-contained
+// subset of the misaligned Fetch*/Swap and CAS ops (2-/4-byte fields with
 // (EA & 7) + size <= 8) is JIT-inlined as an aligned ldarx/stdcx. container
-// loop (EmitInlineContainedRMW below) and no longer reaches the helper at all.
+// loop (EmitInlineContainedRMW / EmitInlineContainedCAS below) and no longer
+// reaches the helper at all. Misaligned CASPair/cmpxchg8b stays on the helper.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Context/Context.h"
 
@@ -354,6 +355,108 @@ void PPC64JITCore::EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLock
   bc(CC_NE, &loop);
 
   srd(Dst, r0, TMP2);            // recover the old field
+  clrldi(Dst, Dst, ClrBits);     // zero-extend, matching lharx/lwarx semantics
+  li(r0, 0);                     // restore the r0 == 0 invariant (P5.0.2)
+  b(Done);
+
+  Bind(&helper);                 // not doubleword-contained: caller's helper call runs
+}
+
+// ---------------------------------------------------------------------------
+// C7: JIT-inline container loop for doubleword-contained misaligned CAS.
+//
+// Same placement and gating as EmitInlineContainedRMW above (misaligned
+// branch, inside the C1 hwsync/isync bracket, 2-/4-byte fields with
+// (EA & 7) + size <= 8, SplitLockInlineContained knob), and the same C4.5
+// dependency, SIGBUS-decoder non-interaction (the ldarx targets EA & ~7 and
+// the decoder additionally rejects CAS-shaped bodies by design), red-zone
+// prohibition and r0 contract. Only the CAS-specific parts differ:
+//
+// Register accounting — DEF_OP(CAS) stashes differently from the Fetch
+// family (Addr->TMP1, Expected->TMP4, Desired->TMP2 when each aliases Dst;
+// TMP3 is the CAS-safe scratch, see the andi_ comment in DEF_OP(CAS)). In
+// the maximal stash case every TMP is an input, so the arm makes its six
+// registers by *consuming* inputs as they die:
+//   TMP3 — free on entry (alignment-test value dead): off, then sh.
+//   TMP2 — Delta64 = ((E ^ D) & szmask) << sh, computed first, precisely so
+//          Desired dies before the loop; TMP2 either held the Desired stash
+//          (overwritten in-place) or was free.
+//   TMP1 — Abase = EA & ~7 in-place; the EA is dead once sh exists.
+//   TMP4 — (16-bit only) zero-extended Expected field for the loop compare;
+//          either held the Expected stash (masked in-place) or was free.
+//          The 32-bit compare needs no mask (cmpw reads low 32 bits only),
+//          so E stays live in its own register instead.
+//   Dst / r0 — loop scratch and Old64 carrier, as in the RMW arm.
+//
+// The xor-insert identity does double duty here: Delta64 is loop-invariant,
+// and on a compare match New64 = Old64 ^ Delta64 rewrites exactly the field
+// bytes (Old64's field == Expected's field when we store, so
+// Old64 ^ ((E ^ D) & szmask) << sh has D's bits in the field and Old64's
+// everywhere else).
+//
+// CR0/ZF contract at every exit — must be indistinguishable from the
+// aligned LL/SC path because downstream ZF consumers read CR0 directly:
+//   success:  CR0 comes from the final stdcx. (EQ set), exactly as the
+//             aligned path's STORE_COND exit. The fixup instructions after
+//             the loop (srd/clrldi/li) touch no CR field.
+//   mismatch: CR0 comes from a cmpw of the same two quantities the aligned
+//             EmitCmp compares — 16-bit: both sides zero-extended to 32
+//             bits (aligned: lharx-zero-extended Dst vs clrldi'd E; here:
+//             clrldi'd t_old vs clrldi'd E), 32-bit: low-32 compare where
+//             high garbage is ignored by cmpw on both paths — so EQ/NE and
+//             even LT/GT match bit-for-bit.
+// Dst on exit is the observed old field, zero-extended, matching
+// lharx/lwarx semantics on the aligned path.
+void PPC64JITCore::EmitInlineContainedCAS(PPC64Emitter::GPR A, PPC64Emitter::GPR E,
+                                          PPC64Emitter::GPR D, PPC64Emitter::GPR Dst,
+                                          IR::OpSize Sz, PPC64Emitter::Label* Done) {
+  if (!CTX->Config.SplitLockInlineContained()) {
+    return;
+  }
+  if (Sz != IR::OpSize::i16Bit && Sz != IR::OpSize::i32Bit) {
+    // Misaligned 8-byte CAS stays on the helper (quadword/crossing paths);
+    // 8-bit CAS is aligned by definition. CASPair never calls this.
+    return;
+  }
+  const auto SzBytes = static_cast<uint32_t>(IR::OpSizeToSize(Sz));
+  const auto ClrBits = 64 - SzBytes * 8;
+
+  PPC64Emitter::Label helper, loop, fail;
+  andi_(TMP3, A, 7);                                    // off = EA & 7
+  cmpldi(TMP3, static_cast<uint16_t>(8 - SzBytes));     // contained iff off <= 8 - size
+  bc(CC_GT, &helper);
+
+  sldi(TMP3, TMP3, 3);           // sh = off * 8 (off dead)
+  xor_(TMP2, E, D);              // Delta64 build (in-place safe when D == TMP2) ...
+  clrldi(TMP2, TMP2, ClrBits);
+  sld(TMP2, TMP2, TMP3);         // ... = ((E ^ D) & szmask) << sh; Desired dead
+  clrrdi(TMP1, A, 3);            // Abase = EA & ~7 (in-place safe when A == TMP1); EA dead
+  if (Sz == IR::OpSize::i16Bit) {
+    // Zero-extended Expected field for the loop compare — mirrors the
+    // aligned EmitCmp's clrldi(TMP3, E, 48) (in-place safe when E == TMP4).
+    clrldi(TMP4, E, 48);
+  }
+
+  Bind(&loop);
+  ldarx(r0, r0, TMP1);           // Old64 (RA slot = literal 0; 8-aligned, no BUS_ADRALN)
+  srd(Dst, r0, TMP3);            // t_old, neighbour garbage above the field
+  if (Sz == IR::OpSize::i16Bit) {
+    clrldi(Dst, Dst, 48);
+    cmpw(Dst, TMP4);
+  } else {
+    // cmpw compares the low 32 bits only, so t_old's high garbage and any
+    // stale upper bits of E are both irrelevant — bit-identical CR0 to the
+    // aligned path's cmpw(Dst, E).
+    cmpw(Dst, E);
+  }
+  bc(CC_NE, &fail);              // mismatch: no store, CR0 = NE for downstream ZF
+  xor_(Dst, r0, TMP2);           // New64 = Old64 ^ Delta64
+  stdcx_(Dst, r0, TMP1);
+  bc(CC_NE, &loop);              // reservation lost: retry
+  // Success falls through with CR0.EQ from the stdcx. — the same exit CR0
+  // the aligned path produces. Nothing below writes any CR field.
+  Bind(&fail);
+  srd(Dst, r0, TMP3);            // recover the observed old field
   clrldi(Dst, Dst, ClrBits);     // zero-extend, matching lharx/lwarx semantics
   li(r0, 0);                     // restore the r0 == 0 invariant (P5.0.2)
   b(Done);
@@ -861,6 +964,10 @@ DEF_OP(CAS) {
     // point (no caller path stashes through TMP3) so we use it for the test.
     andi_(TMP3, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C7: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done with Dst = observed old field and CR0 already carrying
+    // the ZF contract; anything else falls through to the helper call.
+    EmitInlineContainedCAS(A, E, D, Dst, Sz, &done);
     // Misaligned: route through the mutex-serialized helper. The helper does
     // the compare-and-conditional-swap internally and returns the observed
     // Old in Dst. It also reloads our Expected into TMP4 from a side slot,

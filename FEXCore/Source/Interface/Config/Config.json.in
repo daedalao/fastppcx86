@@ -527,7 +527,7 @@
         "Type": "bool",
         "Default": "true",
         "Desc": [
-          "PPC64LE: JIT-inline doubleword-contained misaligned LOCK RMW ops ((EA & 7) + size <= 8, 2-/4-byte operands) as aligned ldarx/stdcx. container loops",
+          "PPC64LE: JIT-inline doubleword-contained misaligned LOCK RMW and CAS ops ((EA & 7) + size <= 8, 2-/4-byte operands) as aligned ldarx/stdcx. container loops",
           "instead of routing them through the mutex-serialized split-lock helper. Crossing and quadword-contained cases still use the helper.",
           "While enabled these ops bypass the helper entirely, so the doubleword-contained split-lock telemetry counter no longer observes them."
         ]

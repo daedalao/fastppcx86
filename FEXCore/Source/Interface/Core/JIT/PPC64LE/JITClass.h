@@ -380,6 +380,14 @@ private:
                               PPC64Emitter::GPR Dst, IR::OpSize Sz,
                               PPC64Emitter::Label* Done);
 
+  // C7: CAS variant of EmitInlineContainedRMW, same gating and fall-through
+  // behaviour. On the taken path it leaves Dst = observed old field
+  // (zero-extended) and CR0 = the CAS ZF contract (EQ on success, NE on
+  // compare-mismatch), matching the aligned LL/SC exit exactly.
+  void EmitInlineContainedCAS(PPC64Emitter::GPR Addr, PPC64Emitter::GPR Expected,
+                              PPC64Emitter::GPR Desired, PPC64Emitter::GPR Dst,
+                              IR::OpSize Sz, PPC64Emitter::Label* Done);
+
   // -----------------------------------------------------------------------
   // Stack management
   // -----------------------------------------------------------------------
