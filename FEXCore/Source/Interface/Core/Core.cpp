@@ -579,6 +579,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
 
+    // Cheap compile tier (FEX_SMCCHEAPTIER): the decoder decides per block
+    // whether the entry page is churning badly enough to compile disposably,
+    // and refuses to follow branches when it is. Mirror that decision onto the
+    // dispatcher, which otherwise stitches blocks together on its own. This is
+    // a per-compilation override of Config.Multiblock; the global config is
+    // untouched, and the next block re-derives the flag from scratch.
+    Thread->OpDispatcher->SetMultiblock(Config.Multiblock && !Thread->FrontendDecoder->IsCheapTierBlock());
+
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
 
@@ -1023,6 +1031,12 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+
+  // Every invalidation funnels through here, so this is the one place that
+  // sees the per-page churn the cheap compile tier keys off. No-op unless
+  // FEX_SMCCHEAPTIER is set.
+  RecordCodeRangeInvalidation(Start, Length);
+
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
   while (it != CodeBufferList.end()) {

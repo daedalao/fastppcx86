@@ -21,6 +21,7 @@
 #include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -223,6 +224,35 @@ public:
   bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
   bool GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
 
+  ///// Cheap compile tier for churn arenas (FEX_SMCCHEAPTIER) /////
+  //
+  // A runtime code arena (CP2077's scripting VM, mono, CoreCLR) overwrites the
+  // same guest pages over and over -- the CP2077 SMC audit histogram showed
+  // ~90 invalidations per page across thousands of pages.  Almost all of the
+  // compile work spent on such a page is thrown away before it executes enough
+  // to pay for itself, and a big multiblock compile is the most expensive kind
+  // of work to throw away.  So: count invalidations per guest page, and once a
+  // page is clearly churning, compile its blocks disposably -- a small
+  // instruction cap and no multiblock formation.  Correctness is unaffected;
+  // this only changes how much code a compilation is allowed to cover.
+  //
+  // The counters are a fixed-size direct-mapped table rather than a growable
+  // map: it must be safe to bump from the invalidation path (which runs under
+  // the code-invalidation write lock, but also from mmap/munmap/mprotect and
+  // the SIGSEGV handler) with no allocation and no lock, and the arenas that
+  // motivate this span thousands of pages, so an unbounded map would be pure
+  // growth.  Two pages colliding on a slot simply steal it from each other and
+  // lose their counts, which costs a heuristic miss and nothing else.
+  static constexpr size_t SMCPageCounterSlots = 4096; // power of two
+  struct SMCPageCounter {
+    std::atomic<uint64_t> Page {0};
+    std::atomic<uint32_t> Count {0};
+  };
+  std::array<SMCPageCounter, SMCPageCounterSlots> SMCPageCounters {};
+
+  void RecordCodeRangeInvalidation(uint64_t Start, uint64_t Length);
+  bool ShouldUseCheapTier(uint64_t GuestRIP);
+
   // returns false if a handler was already registered
   std::optional<CustomIRResult>
   AddCustomIREntrypoint(uintptr_t Entrypoint, CustomIREntrypointHandler Handler, void* Creator = nullptr, void* Data = nullptr);
@@ -256,6 +286,9 @@ public:
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
     FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+    FEX_CONFIG_OPT(SMCCheapTier, SMCCHEAPTIER);
+    FEX_CONFIG_OPT(SMCCheapTierThreshold, SMCCHEAPTIERTHRESHOLD);
+    FEX_CONFIG_OPT(SMCCheapTierMaxInst, SMCCHEAPTIERMAXINST);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
     FEX_CONFIG_OPT(GlobalJITNaming, GLOBALJITNAMING);

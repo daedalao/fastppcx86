@@ -76,6 +76,16 @@ public:
     ExecutableRangeBase = ExecutableRangeEnd = 0;
   }
 
+  // True if the block just decoded was compiled in the cheap/disposable tier
+  // (FEX_SMCCHEAPTIER): its entry RIP sits on a guest page that has been
+  // invalidated often enough that a full-size multiblock compile is not worth
+  // paying for.  Recomputed at the top of every DecodeInstructionsAtEntry, so
+  // it never carries over between compilations.  GenerateIR reads it to keep
+  // the dispatcher from stitching blocks together as well.
+  bool IsCheapTierBlock() const {
+    return CheapTierBlock;
+  }
+
 private:
   // To pass any information from instruction prefixes
   // down into the actual instruction handling machinery.
@@ -125,6 +135,7 @@ private:
   bool ExecutableRangeWritable {};
   bool HitNonExecutableRange {};
   bool HitBadRelocation {};
+  bool CheapTierBlock {};
 
   const uint8_t* InstStream {};
   IR::OpSize GetGPROpSize() const {

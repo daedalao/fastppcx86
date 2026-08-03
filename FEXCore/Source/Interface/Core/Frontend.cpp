@@ -1132,7 +1132,10 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
 }
 
 void Decoder::BranchTargetInMultiblockRange() {
-  if (!CTX->Config.Multiblock) {
+  // CheapTierBlock: this block's page is being invalidated so often that
+  // growing the compilation past the entry block is work we expect to throw
+  // away. See ContextImpl::SMCPageCounters.
+  if (!CTX->Config.Multiblock || CheapTierBlock) {
     return;
   }
 
@@ -1494,6 +1497,17 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
 
   if (MaxInst == 0) {
     MaxInst = CTX->Config.MaxInstPerBlock;
+  }
+
+  // Cheap/disposable compile tier (FEX_SMCCHEAPTIER). Recomputed every call so
+  // it can never leak from one compilation into the next. Single-instruction
+  // blocks (MaxInst == 1, the SMC single-step path) are left alone -- they are
+  // already as small as a block gets, and clamping them would be a no-op at
+  // best. The clamp only ever lowers MaxInst, so an explicit caller-supplied
+  // cap still wins if it is tighter.
+  CheapTierBlock = MaxInst != 1 && CTX->ShouldUseCheapTier(PC);
+  if (CheapTierBlock) {
+    MaxInst = std::min<uint64_t>(MaxInst, std::max<uint64_t>(CTX->Config.SMCCheapTierMaxInst(), 1));
   }
 
   bool EntryBlock {true};

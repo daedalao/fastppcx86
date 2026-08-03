@@ -454,6 +454,32 @@
           "overlap compiled code fall back to the normal invalidation path."
         ]
       },
+      "SMCCheapTier": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Compile blocks on repeatedly-invalidated guest pages with a cheap,",
+          "disposable tier: a small instruction cap and no multiblock. Runtime",
+          "code arenas overwrite the same pages dozens of times, so most of the",
+          "compile work spent on them is thrown away before it ever pays off."
+        ]
+      },
+      "SMCCheapTierThreshold": {
+        "Type": "uint32",
+        "Default": "8",
+        "Desc": [
+          "Invalidations of a guest page before its blocks drop to the cheap",
+          "compile tier. Only meaningful with SMCCheapTier enabled."
+        ]
+      },
+      "SMCCheapTierMaxInst": {
+        "Type": "uint32",
+        "Default": "500",
+        "Desc": [
+          "Maximum guest instructions per block in the cheap compile tier.",
+          "Only meaningful with SMCCheapTier enabled."
+        ]
+      },
       "SMCMprotectDefer": {
         "Type": "bool",
         "Default": "false",
