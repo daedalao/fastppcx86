@@ -1304,6 +1304,34 @@ void PPC64JITCore::InsertExitRIPMove(GPR Reg, uint64_t Constant) {
   CodeData.ExitRIPSites.push_back({reinterpret_cast<uint64_t>(Window)});
 }
 
+// SMC Idea 4, mov-immediate half: see JITClass.h.
+bool PPC64JITCore::TryInsertPatchableImmMove(GPR Reg, uint64_t Constant, uint32_t PatchSite) {
+  if (PatchSite == 0 || !CTX->Config.SMCSemanticPatch()) {
+    return false;
+  }
+  if (MovImmWindowsOverflowed) {
+    return false;
+  }
+  if (CodeData.MovImmWindows.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
+    // Over the cap: drop the whole table so the block is ineligible rather than
+    // partially described, exactly as InsertExitRIPMove does.
+    CodeData.MovImmWindows.clear();
+    MovImmWindowsOverflowed = true;
+    return false;
+  }
+
+  auto* Window = GetCursorAddress<uint8_t*>();
+  LoadConstantFixed(Reg, Constant);
+
+  [[maybe_unused]] uint32_t Expected[FEXCore::SMC::kRIPWindowWords];
+  FEXCore::SMC::SynthesizeRIPWindow(Reg.idx, Constant, Expected);
+  LOGMAN_THROW_A_FMT(::memcmp(Window, Expected, FEXCore::SMC::kRIPWindowBytes) == 0,
+                     "SMCSemanticPatch::SynthesizeRIPWindow disagrees with LoadImm64Fixed for {:#x}", Constant);
+
+  CodeData.MovImmWindows.push_back({reinterpret_cast<uint64_t>(Window), PatchSite - 1});
+  return true;
+}
+
 // -------------------------------------------------------------------------
 // Condition code mapping
 // -------------------------------------------------------------------------
@@ -2678,6 +2706,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   CodeData = {};
   ExitRIPSitesOverflowed = false;
+  MovImmWindowsOverflowed = false;
   CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
 
   // -------------------------------------------------------------------------

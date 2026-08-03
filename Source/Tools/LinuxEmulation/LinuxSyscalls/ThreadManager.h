@@ -322,8 +322,11 @@ public:
   // the SIGSEGV handler safe: it excludes ClearCodeCache and every concurrent
   // compile. Nothing is delinked, no per-thread L1/L2 flush is needed (the
   // blocks stay valid), and the page is left write-protected by the caller.
+  // (Same for a guest mov-immediate, whose patch site is the fixed-width
+  // materialisation window the backend emitted for that immediate.)
   // Returns false with *Reason set if the write is not a recognised patch, in
-  // which case nothing was modified. See
+  // which case nothing was modified; on success *Reason receives the shape that
+  // was patched ("rel32", "movimm" or "mixed"). See
   // FEXCore/Source/Interface/Core/SMCSemanticPatch.h.
   bool SemanticPatchGuestCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
     FEXCore::ReleaseAllPendingSharedLocks();

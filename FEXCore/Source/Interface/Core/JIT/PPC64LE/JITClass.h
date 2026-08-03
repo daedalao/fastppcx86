@@ -150,6 +150,9 @@ private:
   // Reset with CodeData at the top of CompileCode.
   bool                               ExitRIPSitesOverflowed {};
 
+  // Same, for the mov-immediate window table.
+  bool                               MovImmWindowsOverflowed {};
+
   // Per-block jump targets
   fextl::vector<PPC64Emitter::Label> JumpTargets;
 
@@ -413,6 +416,17 @@ private:
   // recording any other guest-RIP constant would make that lookup ambiguous.
   // See Interface/Core/SMCSemanticPatch.h.
   void InsertExitRIPMove(GPR Reg, uint64_t Constant);
+
+  // SMC Idea 4, mov-immediate half: materialise a constant the frontend tagged
+  // as a patchable guest immediate (IROp_Constant::PatchSite != 0) into the same
+  // fixed-width 20-byte window, and record it against its site index. Returns
+  // false without emitting anything when the constant is untagged, the flag is
+  // off, or the table overflowed -- the caller then emits the ordinary
+  // variable-width LoadConstant. Unlike InsertGuestRIPMove this records NO
+  // relocation: the value is a plain guest immediate, not an address, so it is
+  // correct as-is in a code-cache session with a different ASLR base.
+  // See Interface/Core/SMCSemanticPatch.h.
+  bool TryInsertPatchableImmMove(GPR Reg, uint64_t Constant, uint32_t PatchSite);
 
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);

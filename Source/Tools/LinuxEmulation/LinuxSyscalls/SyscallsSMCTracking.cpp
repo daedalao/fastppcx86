@@ -260,6 +260,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // store emulation below is then the completion of that patch rather than
       // the false-sharing fast path.
       bool SemanticPatched = false;
+      // Which shape it recognised, for per-shape attribution in the trace:
+      // "rel32", "movimm" or "mixed".
+      const char* SemanticPatchKind = "unknown";
 
       // Decide the overlap/patch question once, so it can be expressed inside
       // the existing else-if chain without evaluating it twice.
@@ -299,6 +302,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         }
 
         SemanticPatched = true;
+        SemanticPatchKind = PatchReason;
         return false;
       };
 
@@ -345,8 +349,12 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
           ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
         }
         ArchHelpers::Context::SetPc(ucontext, StorePC + 4);
-        SMC_AUDIT("[%d] fault addr=%lx %s ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress,
-                  SemanticPatched ? "SEMANTIC-PATCH" : "EMULATED-STORE", Store.EA, Store.Width);
+        if (SemanticPatched) {
+          SMC_AUDIT("[%d] fault addr=%lx SEMANTIC-PATCH kind=%s ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, SemanticPatchKind,
+                    Store.EA, Store.Width);
+        } else {
+          SMC_AUDIT("[%d] fault addr=%lx EMULATED-STORE ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, Store.EA, Store.Width);
+        }
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
         return true;
       }

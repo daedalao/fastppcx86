@@ -37,7 +37,14 @@ static inline IR::CondClass IntegerNZCVCond(IR::CondClass C) {
 DEF_OP(Constant) {
   auto Op  = IROp->C<IR::IROp_Constant>();
   auto Dst = GetReg(Node);
-  LoadConstant(Dst, Op->Constant);
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH): a constant the frontend tagged as the
+  // immediate of a guest mov gets a fixed-width, repatchable window instead of
+  // the ordinary value-dependent 1..5 instruction sequence. Untagged constants
+  // (everything, with the flag off) take the unchanged path.
+  // See Interface/Core/SMCSemanticPatch.h.
+  if (!TryInsertPatchableImmMove(Dst, Op->Constant, Op->PatchSite)) {
+    LoadConstant(Dst, Op->Constant);
+  }
 }
 
 DEF_OP(EntrypointOffset) {

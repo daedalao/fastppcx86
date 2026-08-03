@@ -246,18 +246,21 @@ public:
    * @brief SMC Idea 4: try to service a guest code write by patching translated
    *        code instead of invalidating it.
    *
-   * Succeeds only when [Start, Start+Length) lies wholly inside the rel32 field
-   * of a direct branch in every compiled block that covers it, and the
-   * resulting destination change is publishable as a single atomic host-word
-   * store in each. On success the caller must still perform the guest store
-   * itself (the page stays write-protected); on failure nothing has been
-   * modified and the caller falls back to (soft-)invalidation.
+   * Succeeds only when [Start, Start+Length) is exactly one recognised
+   * patchable immediate -- the rel32 field of a direct branch, or the immediate
+   * of a mov-immediate -- in every compiled block that covers it, and the
+   * resulting value change is publishable as a single atomic host-word store in
+   * each. On success the caller must still perform the guest store itself (the
+   * page stays write-protected); on failure nothing has been modified and the
+   * caller falls back to (soft-)invalidation.
    *
    * MUST be called with the exclusive CodeInvalidationMutex held -- it writes
    * into live code buffers. See Interface/Core/SMCSemanticPatch.h.
    *
    * @param NewBytes The Length bytes the guest store is about to write.
-   * @param Reason   Receives a static audit tag when false is returned.
+   * @param Reason   Receives a static audit tag: the decline reason when false
+   *                 is returned, the patched shape ("rel32", "movimm" or
+   *                 "mixed") when true is.
    */
   FEX_DEFAULT_VISIBILITY virtual bool TrySemanticPatchCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) = 0;
 

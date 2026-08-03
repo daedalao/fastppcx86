@@ -553,13 +553,16 @@
         "Type": "bool",
         "Default": "false",
         "Desc": [
-          "SMC Idea 4 (ppc64le): recognise a guest store that overwrites only",
-          "the rel32 target field of a direct call/jmp/jcc inside an already-",
-          "compiled block. Instead of invalidating, emulate the store and patch",
-          "the destination RIP baked into the block's translated exit, leaving",
-          "the page protected and the block live. Anything else (mov-immediate",
-          "patches, partial/oversized writes, ambiguous or non-atomically",
-          "patchable constants) falls back to the normal path. Off: no effect."
+          "SMC Idea 4 (ppc64le): recognise a guest store that overwrites only a",
+          "patchable immediate inside an already-compiled block -- the rel32",
+          "target of a direct call/jmp/jcc, or the immediate of a mov r32,imm32",
+          "/ mov r64,imm64 / C7 /0 reg,imm32. Instead of invalidating, emulate",
+          "the store and patch the value baked into the block's translated code",
+          "(the destination RIP of the exit, or the tagged constant's fixed-width",
+          "materialisation window), leaving the page protected and the block",
+          "live. Anything else (partial/oversized writes, writes that also change",
+          "instruction bytes, ambiguous or non-atomically patchable constants)",
+          "falls back to the normal path. Off: no effect."
         ]
       },
       "SMCStoreBackpatch": {

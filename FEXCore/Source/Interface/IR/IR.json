@@ -954,9 +954,15 @@
         ]
       },
 
-      "GPR = Constant i64:$Constant, ConstPad:$Pad{IR::ConstPad::NoPad}, i32:$MaxBytes{0}": {
+      "GPR = Constant i64:$Constant, ConstPad:$Pad{IR::ConstPad::NoPad}, i32:$MaxBytes{0}, u32:$PatchSite{0}": {
         "Desc": ["Generates a 64bit constant inside of a GPR",
-                 "Unsupported to create a constant in FPR"
+                 "Unsupported to create a constant in FPR",
+                 "PatchSite is FEX_SMCSEMANTICPATCH provenance (fork): 0 for every ordinary constant,",
+                 "otherwise 1 + the index of the guest mov-immediate field this constant was decoded",
+                 "from. A tagged constant is never pooled, so it has exactly one user, and the ppc64le",
+                 "backend materialises it in a fixed-width window the SMC fault handler can repatch.",
+                 "Backends that do not implement semantic patching ignore the field.",
+                 "See Interface/Core/SMCSemanticPatch.h."
                 ],
         "DestSize": "OpSize::i64Bit",
         "EmitValidation": [
