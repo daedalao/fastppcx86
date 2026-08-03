@@ -43,6 +43,59 @@ $end_info$
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/fsuid.h>
+#include <fcntl.h>
+#include <atomic>
+#include <stdlib.h>
+
+// FEX_TRACE_CLONE=1: log child-side thread bring-up so we can pair a
+// CLONE-RETURN-THREAD (parent) with a CLONE-CHILD-START (child) that
+// share the same TID.  If the parent line reports a child_tid the child
+// side never emits, the child never ran.  If both appear with matching
+// TIDs, the thread was actually created.
+namespace CloneChildTrace {
+static std::atomic<int> Fd {-2};
+inline int Get() {
+  int f = Fd.load(std::memory_order_acquire);
+  if (f == -2) {
+    if (getenv("FEX_TRACE_CLONE")) {
+      f = ::open("/tmp/fex_clone_trace.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    } else {
+      f = -1;
+    }
+    int expected = -2;
+    if (!Fd.compare_exchange_strong(expected, f)) {
+      if (f >= 0) ::close(f);
+      f = Fd.load(std::memory_order_acquire);
+    }
+  }
+  return f;
+}
+inline int Hex(char* dst, uint64_t v) {
+  char tmp[18];
+  int n = 0;
+  if (v == 0) { tmp[n++] = '0'; }
+  while (v) { int d = v & 0xf; tmp[n++] = (d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+  int len = 0;
+  dst[len++] = '0'; dst[len++] = 'x';
+  while (n > 0) dst[len++] = tmp[--n];
+  return len;
+}
+inline void EmitLine(const char* tag, uint64_t tid) {
+  int f = Get();
+  if (f < 0) return;
+  char buf[128];
+  int len = 0;
+  while (*tag) buf[len++] = *tag++;
+  len += Hex(buf + len, tid);
+  buf[len++] = '\n';
+  ssize_t off = 0;
+  while (off < len) {
+    ssize_t w = ::write(f, buf + off, len - off);
+    if (w <= 0) break;
+    off += w;
+  }
+}
+}  // namespace CloneChildTrace
 
 ARG_TO_STR(idtype_t, "%u")
 
@@ -65,6 +118,7 @@ static void* ThreadHandler(void* Data) {
 
   Thread->ThreadInfo.PID = ::getpid();
   Thread->ThreadInfo.TID = FHU::Syscalls::gettid();
+  CloneChildTrace::EmitLine("CLONE-CHILD-START tid=", (uint64_t)Thread->ThreadInfo.TID.load());
   if (Thread->Thread->ThreadStats) {
     Thread->Thread->ThreadStats->TID.store(Thread->ThreadInfo.TID, std::memory_order_relaxed);
   }
@@ -82,6 +136,7 @@ static void* ThreadHandler(void* Data) {
   // Handler is a stack object on the parent thread, and will be invalid after notification.
   Handler->StartRunningResponse.NotifyOne();
 
+  CloneChildTrace::EmitLine("CLONE-CHILD-EXEC tid=", (uint64_t)Thread->ThreadInfo.TID.load());
   CTX->ExecuteThread(Thread->Thread);
 
   // Release any WritePriorityMutex shared locks the dying thread is still
