@@ -1086,6 +1086,14 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     // Genuinely modified: drop the metadata (the host code stays in the
     // CodeBuffer for any thread still executing it, exactly as legacy
     // invalidation leaves it) and let the caller compile a fresh block.
+    //
+    // The soft-invalidation path bypasses InvalidateCodeBuffersCodeRange, so
+    // the cheap-tier churn counter (FEX_SMCCHEAPTIER) would never see these
+    // pages. Count the churn here instead — a hash mismatch is a stronger
+    // "this page's code really changed" signal than a raw invalidation, and it
+    // deliberately excludes relinks (false sharing / identical rewrites), which
+    // are not churn worth demoting a page's compile tier over.
+    RecordCodeRangeInvalidation(Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (SMCAuditCompileFD() >= 0) {
       dprintf(SMCAuditCompileFD(), "relink-miss rip=%lx\n", GuestRIP);
     }
