@@ -47,6 +47,47 @@ keys on the guest binary's *path string* rather than its identity.
 
 Detail is in the commit messages and `docs/POWER9_PORT_PLAN.md`.
 
+## Milestone — the thread-spawn corruption is fixed
+
+**`clone3` could return 0 to the parent, and glibc read that as success** — producing a `pthread` carrying
+`tid = 0`: a handle that looks valid, gets used, and corrupts on teardown.
+
+The cause was one line of our own. `DestroyThread` zeroed `ThreadInfo.TID` as a zombie marker while the
+parent's syscall-return path still read that field as data. Marker and data shared a slot.
+
+**`76b36f6c0`** splits them: a new `std::atomic<bool> IsZombie` carries the marker with release ordering,
+`TID` is never zeroed, and both `TID == 0` consumers migrate to the flag with acquire ordering. A
+belt-and-braces guard rewrites any surviving `Result == 0` to `-EAGAIN`.
+
+`probe_thread_spawn` goes **10–17 % failure → 0/30 foreground and 0/30 background.** The guard never fired
+across 7,200 `clone3` calls, so the marker split closes the race on its own.
+
+This retires a cluster we had treated as separate bugs: **Factorio's `execute_native_thread_routine`
+SIGSEGV on save-load**, Factorio's intermittent crash at ~3 % load, and Steam's crash dialogs and general
+sluggishness. All one race.
+
+## Milestone — misaligned atomics run without the mutex fallback
+
+x86 permits `LOCK` on unaligned addresses; POWER's `larx`/`stcx.` require natural alignment, so every
+misaligned guest atomic previously fell back to striped-mutex emulation. Six commits move the common cases
+onto real hardware atomics:
+
+| Commit | Case |
+|---|---|
+| `00d64c59c` | **C3** — access fits inside one aligned doubleword: `ldarx`/`stdcx.` on the container |
+| `e5eff0e3d` | **C4** — quadword container via `lqarx`/`stqcx.` (ISA 2.07) |
+| `c48a741f6` | **C4.5** — CAS crossing a dual-doubleword boundary |
+| `2613c73a6` | **C5** — split-lock telemetry three ways + retry high-water |
+| `6a4bcddd0` `7904276aa` | **C6/C7** — JIT-inline container loops; contained cases take no helper call at all |
+
+Frequency is sharply title-dependent and it is **a 32-bit/Mono phenomenon**: Dex records 14,794 misaligned
+atomics, Factorio/FTL/OpenSSL record zero.
+
+Two unrelated defects fell out of the same batch. **`cb57944a3`** — the C5 telemetry init loop was bounded
+by `TYPE_LAST` (23) against an array sized `TYPE_JIT_ADDRESSABLE_LAST` (17), overwriting dispatcher pointers;
+it passed the full regression gate while corrupting memory. **`8970907ef`** — CPUID topology used
+`bit_ceil` where a log2 was meant, an upstream regression that made `cpu_count.64` fail; now PASS.
+
 ## Headline wins on this branch
 
 Each entry corresponds to a real commit. Pick the keystones if reading top-to-bottom:
@@ -77,8 +118,10 @@ Each entry corresponds to a real commit. Pick the keystones if reading top-to-bo
 | Game | Status |
 |---|---|
 | **FTL: Advanced Edition** | **Playable** — menu + gameplay + audio. SIGABRT on exit (deferred). |
-| **Factorio 2.x** | **Playable, and the primary performance workload.** Renders, benchmarks to completion, map checksums byte-identical across every change landed. `cpu-frame` median 19.6 ms on POWER9 (was 37.7 ms). An intermittent `execute_native_thread_routine` SIGSEGV on save-load is under investigation — same signature as the open `probe_thread_spawn` corruption. |
-| RimWorld (Unity/Mono) | Boots, loads, **deterministic** fatal signal 11 in `mono_runtime_invoke` at ~90 s. Now debuggable — guest-RIP reconstruction resolves the fault to a specific guest instruction. Note Mono uses SIGSEGV for null checks on an altstack, so startup SIGSEGVs are expected behaviour, not defects. |
+| **Factorio 2.x** | **Playable, and the primary performance workload.** Renders, benchmarks to completion, map checksums byte-identical across every change landed. `cpu-frame` median 19.6 ms on POWER9 (was 37.7 ms). **The `execute_native_thread_routine` SIGSEGV on save-load is fixed** — it was the `clone3` thread-spawn race, not a Factorio-specific defect (`76b36f6c0`). Five consecutive clean `oil_refinery` benchmark runs. |
+| **Dex** (32-bit Unity/Mono) | **Playable** — runs to gameplay and exits cleanly through the in-game menu. The primary misaligned-atomics and SMC workload: 14,794 misaligned atomics and ~23,000 code-page invalidations in one session. Startup/cutscene video renders markedly slower than gameplay — open, and the reason an SSE-heavy vector workload is now on the queue. |
+| RimWorld (Unity/Mono) | Boots, loads, **deterministic** fatal signal 11 in `mono_runtime_invoke` at ~90 s — still open. Now debuggable: guest-RIP reconstruction resolves the fault to a specific guest instruction. Also a standing SMC-audit workload. Note Mono uses SIGSEGV for null checks on an altstack, so startup SIGSEGVs are expected behaviour, not defects. |
+| Hard West (Unity/Mono) | Loads. Used as an x86_64 Mono workload for the SMC audit; not yet taken to gameplay here, so no playability claim. |
 | SuperTuxKart (Vulkan) | Vulkan window opens; cross-arch GL callback dispatch is the next blocker. |
 | Stardew Valley | Main thread spins on FUTEX_WAIT→EAGAIN after cold JIT; pre-existing project_stardew_main_thread_spin note. |
 | Ziggurat (Unity/Mono) | Mono-specific EAGAIN spin in `libmono.so` (not a general FEX bug — strace diff vs other games proves it). |

@@ -9,6 +9,147 @@ Each item: what, why it is where it is, size, gate, and what blocks it.
 
 ---
 
+# ⭐ STANDING RULE — this is the `power9` branch
+
+**Optimise for POWER9. Gate divergences as a courtesy. Never let POWER8 shape the design.**
+
+`origin/smc-store-emulation`'s "all codegen must stay POWER8-legal" is **op4k's** rule for **op4k's**
+branch. It has leaked into our reasoning more than once — read their docs for findings, not constraints.
+
+- `HostFeatures.SupportsISA30` is a **real runtime check** (`HostFeatures.cpp:722`, `AT_HWCAP2 &
+  PPC_FEATURE2_ARCH_3_00_`), consumed at emit time (`PPC64Emitter.cpp:440,450,534`).
+- `ENABLE_DISABLE_OPTION(SupportsISA30, …)` at `HostFeatures.cpp:490` **forces ISA 3.0 off at runtime**, so
+  the POWER8 fallback leg is testable here. Gate for any ISA-gated optimisation: run the set once with it
+  disabled.
+- **POWER9 has no CRC32C instruction** (`JIT/PPC64LE/ALUOps.cpp:3818`; guest SSE4.2 `CRC32` goes through a
+  C helper). Any hash/checksum design ported from an ARM64 rationale is invalid here on that point alone.
+
+---
+
+# ⭐ NIMBUS — our SMC redesign. Design pass complete 2026-08-03. **Implementation gated on `U_page`.**
+
+## The name
+
+**Nimbus**, not "v3" — that is op4k's numbering and staying in it invites the assumption we are producing
+their next version. Nimbus is POWER9's own silicon codename (scale-out; Cumulus is scale-up) and a nimbus
+is a storm cloud. Named for the chip it targets and the fault storm it disperses. Use it in identifiers:
+`NimbusHash`, `FEX_NIMBUS=1`.
+
+## Mechanism, after a five-agent design pass and an alternatives bake-off
+
+Hash the guest bytes each compile unit was built from; on re-entry, re-protect, re-hash, and relink
+unchanged units instead of recompiling. **Chosen over store emulation, shadow-copy diffing, coarse-then-fine
+and backpatch special-casing.** op4k independently converged on the same mechanism after measuring their own
+store-emulation v1 as a regression (a contention benchmark to *timeout*, another 27× slower).
+
+**Store emulation is refuted at the ISA level, not on effort.** FEX compiles the guest's aligned
+`LOCK CMPXCHG` — 50–60 % of stores — into an inline `lwarx`/`stwcx.` loop, so the faulting instruction is a
+*store-conditional*. Emulate it as success and you silently discard the reservation, losing another thread's
+write; emulate it as failure and the guest's CAS loop retries, faults, and livelocks unless you unprotect —
+which is legacy. There is no third option.
+
+## The five corrections that reshaped the design
+
+1. **The check cannot run at fault time.** All four design agents derived this independently. The write
+   fault fires *before* the store retires, so guest bytes at fault time are unchanged by construction and a
+   hash there is vacuous. Worse, re-protecting and resuming puts the same store back on a read-only page —
+   a **livelock**, not a slowdown. Nimbus quarantines at fault and verifies at **re-entry**, before compile,
+   where blocking is legal.
+2. **Nimbus does not reduce the fault count** — it reduces cost per fault (~22 µs recompile → link walk plus
+   a small hash). Any acceptance criterion written as "SMC fault count drops" will read as a failure.
+3. **Retention starves the re-protect trigger.** Found independently by three agents. Re-protection fires
+   only when a page has no registered blocks (`LookupCache.h:167` → `Core.cpp:1005`), and `CodePages` is
+   emptied only by `InvalidateRange` (`:154`). Keep blocks and the page is **never re-protected — SMC
+   tracking for it dies silently and permanently.** Nimbus must own its re-arm explicitly.
+4. **Quarantine by moving rows out of `BlockList`, not by flagging them.** Two agents converged. Every
+   present *and future* lookup then misses by construction; no call site needs auditing.
+5. **Units are not page-sized and they overlap.** `MaxInst` is 5000 and `Multiblock` is on; a unit spans
+   pages, and two units can cover the same bytes. Verifying one may require hashing pages that never
+   faulted. Erase granularity is the whole `CompiledCode` — a clean sibling must never resurrect a stale one.
+
+## Constraints for implementation
+
+- Baseline hash from `DecodedInst::InstBytes` (landed, `e742fd761`); **verify-time comparand from live guest
+  memory.** These are never the same code path — the "never re-read guest memory" rule applies to the
+  baseline only.
+- **Protect → hash → publish**, in that order, and the dirty-mark must precede the unprotect.
+- `XXH3` from the vendored `External/xxhash`. Do not hand-roll: hashing 4 KB is ~1.6 % of one recompile, so
+  no size exists at which a faster hash changes a decision. Per-process random seed closes the adversarial
+  case — consequence: **Nimbus hashes can never be persisted into the code cache.**
+- Ineligible: units whose decode hit invalid/partial/noexec instructions (their bytes are unrecorded, and
+  guests patch invalid instructions in place — we would relink a permanent #UD).
+- A **compile-epoch counter**: "same bytes ⇒ same code" is false today. Forced-TSO ranges, the Mono hook
+  flag, the SMC mode and 32/64-bit mode all feed compilation without being guest bytes.
+- Only `MAP_PRIVATE` (and in-process `MAP_SHARED|MAP_ANONYMOUS`) mappings are eligible. Shared file-backed
+  mappings keep legacy behaviour — closes cross-process writes, kernel writeback, hole-punching and
+  truncation structurally rather than by enumeration.
+- **Must cover the misaligned-CAS helper path**, not just JIT-inline stores. Measured: every out-of-JIT
+  writer HostPC on Dex (27 %) and Hard West (52 %) lands inside `PPC64_SplitLockEmulate`.
+- Escalation is keyed on **fault frequency with hysteresis**, never on changed-byte extent — hashing is
+  three orders of magnitude cheaper than the recompile it avoids. This is what killed op4k's v1.
+- **Tier-3 escape hatch (inline `ValidateCode` / `ForceFullSMCDetection`) is NOT available.** It is the only
+  mechanism structurally immune to block linking, but its emission has a known unfixed state-corruption bug
+  (`3987be2db`, `SMCCHECKS=full` path truncation, no fix commit). Do not present it as a ready fallback.
+- Ship gate: an **audit mode** that does the whole computation then invalidates anyway. Compare prediction
+  against ground truth; **"hash says unchanged but bytes differ" is a false negative and any single
+  occurrence blocks the feature.**
+
+## ⛔ THE GATE — measure `U_page` before writing Nimbus code
+
+RimWorld's ~42,000 faults over ~100 s at the measured 22 µs cycle is **0.92 s — under 1 % of wall time.**
+That is not the major drag we have been treating this as. The cost is only real if each fault destroys many
+units that are then rebuilt, and **units-per-page has never been measured.** It sets both the size of the
+problem and the size of Nimbus's payoff: ~95 % of needless block destruction eliminated at `U_page`=32,
+~75 % at 4, and **at ~2 the premise collapses** — for us *and* for op4k — and the answer becomes "make
+recompiles cheaper" instead. The instrument already exists (`FEX_SMC_AUDIT_COMPILE`, `Core.cpp:1006-1008`).
+
+**"The premise collapsed" is a success of the process, not a failure.**
+
+---
+
+# ⭐ QUEUED BATCH — SMC coverage gaps. Independent of Nimbus; all ship even if `U_page` cancels it.
+
+**Gate for all of these: every gap test must FAIL on the current tree first.** A gap test that passes
+beforehand proves nothing. No adversarial review needed — each is a few lines against a concrete defect.
+
+1. **`mremap` never invalidates the destination — live bug, verified.** `Syscalls.h:297-312` invalidates
+   only `(OldAddress, OldSize)`. With `MREMAP_FIXED` onto a mapping that held compiled code, those blocks
+   survive while the bytes under them are replaced.
+2. **`ptrace(POKETEXT/POKEDATA)` writes guest code with no invalidation — live bug, verified.**
+   `Syscalls/Info.cpp:104-121` passes it straight through; the kernel writes through `PROT_READ`, so mtrack
+   cannot see it even in principle. The passthrough comment says it exists so Wine can run the Ubisoft
+   launcher — a debugger patching guest code is the *intended* workload.
+3. **`mprotect` returns checked with a macro that vanishes in Release.** `SyscallsSMCTracking.cpp:117`,
+   `:232`, `:251` call `LogMan::Throw::AFmt` directly (the function, not the macro — grepping for
+   `LOGMAN_THROW_A_FMT` finds nothing). Realistic trigger: `ENOMEM` from `vm.max_map_count` under the VMA
+   fragmentation ~23,000 invalidations per Dex session produces.
+4. **`SeverLinks` — pure refactor.** Factor the delink walk out of `GuestToHostMap::Erase`
+   (`LookupCache.h:131-141`) so a "delink but keep the block" primitive exists. Needed by any retention
+   scheme including op4k's; harmless without one. Return the severed count — inbound fan-in per unit is
+   unmeasured and the lazy-relink argument rests on it.
+5. **8/16-bit XCHG hits `ERROR_AND_DIE_FMT`.** `OpcodeDispatcher.cpp:1166-1168` emits
+   `_MonoBackpatcherWrite` for *any* `DestIsMem` XCHG including `86 /r`, while `IR.json:300-302` accepts
+   only 32/64-bit and `Core.cpp:1174` is a live-in-Release abort. Gate the branch on size and fall through
+   to `_AtomicSwap`. Dormant only because the detector never fires; lands on inspection, not on a test.
+
+---
+
+# ✅ CLOSED 2026-08-03 — the Mono backpatcher hook. Do not fix it; Nimbus subsumes it.
+
+Settled by observation: armed 1/1/1, fired **0/0/0** across ~72,000 faults on Dex, RimWorld and Hard West
+(`SyscallsSMCTracking.cpp:291` vs `:328`). The check requires byte `0x87` (XCHG) — a **Windows** Mono
+signature ported verbatim, comment and all, from `Source/Windows/Common/InvalidationTracker.cpp:192`. Linux
+Mono patches with `LOCK CMPXCHG` (`F0 [REX] 0F B1`), measured at 50–60 % of stores.
+
+**Do not "just fix the signature" — it is a correctness regression.** `IsMonoBackpatcherBlock` has exactly
+one consumer, `OpcodeDispatcher.cpp:1167` inside `XCHGOp`. `CMPXCHGOp` has no equivalent branch and emits a
+bare `_CAS` that invalidates nothing. A firing detector calls `DisableSMCDetectionLocked`, unprotecting every
+W+X VMA process-wide, while the backpatcher's writes stop invalidating — indefinite silent stale execution,
+including Steam's overlay CEF/V8 and Wine RWX. It would also still be blind to 27–52 % of faults, which
+never satisfy the `IsAddressInCodeBuffer` gate at `:303`.
+
+---
+
 ## P0 — RESOLVED 2026-08-01. All four done; patches on branch, unpushed, awaiting review.
 
 **P0.1 — ANSWERED: NEVER.** The probe fired zero times across a full RimWorld run to its ~90 s crash.
