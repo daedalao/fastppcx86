@@ -76,11 +76,12 @@ for fallback-reason is a wanted 3-line patch).
 
 ## Open questions
 
-1. Boot-crash (AV reading 0x300000073, pre-menu, once): nondeterministic; 3×
-   flag-ON boot sampling was in flight when this session ended — rerun via
+1. Boot-crash (AV reading 0x300000073, pre-menu, once): RESOLVED-ish by sampling —
+   3× flag-ON boots gave TIMEOUT(no dump, semi-cold, ambiguous) / MENU-OK 110s /
+   MENU-OK 110s (baseline-identical). Did not reproduce; classified intermittent,
+   likely the pre-existing wild-pointer corruption family (vertex/audio garbage
+   class), not an atomics or v1 regression. Watch-list. Harness:
    `for n in 1 2 3; do /tmp/cp-boottest.sh ~/projects/fex-emu-ppc64le/build-smc/Bin FEX_SMCSTOREEMULATION=1; done`
-   Suspects: atomics series first game exposure vs. coincidence. v1 code is
-   read-only+fallback on that path and unlikely.
 2. Audio corruption class (buzz→silence in CP2077, channel-drop/distortion in
    Portal 2, Stardew): NOT SMC. Untested lever: FEX_VECTORTSOENABLED=1
    FEX_MEMCPYSETTSOENABLED=1.
