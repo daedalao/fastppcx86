@@ -17,7 +17,14 @@
 namespace FEXCore::Telemetry {
 #ifndef FEX_DISABLE_TELEMETRY
 std::array<Value, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryValues = {{}};
-const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryNames {
+std::atomic<PreDumpHookType> PreDumpHook {nullptr};
+// Deduced size rather than an explicit TYPE_LAST bound: with the size spelled
+// out, an entry list that fell behind the enum would still compile and
+// value-initialize the tail to empty names. The static_assert below turns
+// that into a compile error instead — the hardening deferred from the
+// cb57944a3 fix, where a TYPE_LAST/TYPE_JIT_ADDRESSABLE_LAST bound mismatch
+// went unnoticed because nothing tied the two together at compile time.
+const std::array TelemetryNames = std::to_array<std::string_view>({
   "Split lock helper entries (PPC64: bypassed by JIT-inline C6/C7 when the SplitLockInlineContained knob is on, so doubleword-contained events do not count here — ARM64 semantics unchanged)",
   "16byte Split atomics",
   "EVEX instructions (AVX512)",
@@ -41,7 +48,14 @@ const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST>
   "PPC64 Split Lock - container LL/SC retry high-water",
   "PPC64 Split Lock - crossing CAS tear (reported to guest as CAS failure)",
   "PPC64 Split Lock - crossing RMW tear (half-applied; pre-op value returned)",
-};
+  "CodeBuffer allocations (growth curve lives in the FEX_BUFSTATS timeline)",
+  "CodeBuffer rotations (at MAX_CODE_SIZE; each one discards all translated code)",
+  "CodeBuffer peak size in bytes (134217728 means MAX_CODE_SIZE was hit)",
+  "CodeBuffer total bytes of host code emitted across the session",
+  "CodeBuffer peak live bytes (largest fill level of any single buffer)",
+  "CodeBuffer translated blocks discarded across all retirements",
+});
+static_assert(TelemetryNames.size() == TelemetryType::TYPE_LAST, "TelemetryNames must have exactly one entry per TelemetryType slot");
 
 static bool Enabled {true};
 void Initialize() {
@@ -62,6 +76,11 @@ void Initialize() {
 void Shutdown(const fextl::string& ApplicationName) {
   if (!Enabled) {
     return;
+  }
+
+  // Let lazily-maintained counters finalize before the values are read out.
+  if (auto Hook = PreDumpHook.load()) {
+    Hook();
   }
 
   auto DataDirectory = Config::GetTelemetryDirectory() + ApplicationName + ".telem";

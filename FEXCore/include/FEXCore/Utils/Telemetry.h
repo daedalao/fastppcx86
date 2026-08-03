@@ -63,6 +63,34 @@ enum TelemetryType {
   // real guest-visible atomicity violation, not noise.
   TYPE_SPLIT_LOCK_CROSSING_CAS_TEAR,
   TYPE_SPLIT_LOCK_CROSSING_RMW_TEAR,
+  // Code-buffer growth/rotation instrumentation. C-helper only — updated from
+  // CodeBufferManager::AllocateNew and the pre-dump flush, never from JIT
+  // code. CodeBuffers grow geometrically and saturate at MAX_CODE_SIZE
+  // (CPUBackend.cpp), and every replacement abandons the departing buffer's
+  // LookupCache without migrating it (ChangeGuestToHostMapping swaps to the
+  // new buffer's empty map), so all translated code is discarded and
+  // retranslated on demand. A "rotation" is the at-cap case where the
+  // replacement is no larger than the buffer it retires — unbounded in
+  // steady state, and the whole-process retranslation storm these counters
+  // exist to detect.
+  TYPE_CODEBUFFER_ALLOCATIONS,
+  // Subset of allocations that were rotations (no growth possible; only
+  // reachable once AllocatedSize has hit MAX_CODE_SIZE).
+  TYPE_CODEBUFFER_ROTATIONS,
+  // Largest AllocatedSize any buffer reached; equal to MAX_CODE_SIZE
+  // (134217728) exactly when the cap was hit.
+  TYPE_CODEBUFFER_PEAK_SIZE,
+  // Total bytes of host code ever emitted, summed across every buffer the
+  // session used (retired buffers, plus the live one folded in by the
+  // pre-dump flush). Divide by PEAK_LIVE for the session's retranslation
+  // factor: ~1.0 means code was translated once; higher means the same code
+  // kept being retranslated after discards.
+  TYPE_CODEBUFFER_TOTAL_EMITTED,
+  // Largest fill level (bytes of emitted code) any single buffer held.
+  TYPE_CODEBUFFER_PEAK_LIVE,
+  // Translated blocks discarded across all buffer retirements (departing
+  // buffers' BlockList sizes, summed).
+  TYPE_CODEBUFFER_DISCARDED_BLOCKS,
   TYPE_LAST,
 };
 
@@ -79,6 +107,18 @@ inline Value& GetTelemetryValue(TelemetryType Type) {
 
 FEX_DEFAULT_VISIBILITY void Initialize();
 FEX_DEFAULT_VISIBILITY void Shutdown(const fextl::string& ApplicationName);
+
+// Invoked (if set) at the start of Shutdown, before the slot values are
+// written out. Lets a subsystem whose counters are cheapest to maintain
+// lazily finalize them at dump time — CodeBufferManager uses it to fold the
+// live buffer's write offset into TYPE_CODEBUFFER_TOTAL_EMITTED/PEAK_LIVE,
+// which are otherwise only updated when a buffer retires. Shutdown runs both
+// on clean exit and from the fatal-signal path
+// (SignalDelegator::SaveTelemetry), so the hook must be signal-tolerable:
+// no locks, no allocation, and it must tolerate concurrent mutation of
+// whatever it reads.
+using PreDumpHookType = void (*)();
+FEX_DEFAULT_VISIBILITY extern std::atomic<PreDumpHookType> PreDumpHook;
 
 // Telemetry object declaration
 // Telemetry ALU operations

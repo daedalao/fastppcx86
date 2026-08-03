@@ -99,10 +99,30 @@ namespace CPU {
 
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
+    // Folds the live buffer's fill level into the code-buffer telemetry slots.
+    // TOTAL_EMITTED/PEAK_LIVE are otherwise only updated when a buffer
+    // retires, so a session that never outgrew its first buffer would dump
+    // zeros. Idempotent (SET/max semantics, no accumulation), installed as
+    // Telemetry::PreDumpHook by AllocateNew and re-run from the destructor.
+    // Reads LatestOffset without CodeBufferWriteMutex: the fatal-signal dump
+    // path can run this mid-compile, and a torn value only skews a statistic
+    // — no safety property rests on it.
+    void FlushCodeBufferTelemetry();
+
+    ~CodeBufferManager();
+
   private:
     fextl::shared_ptr<CodeBuffer> Latest;
 
     fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
+
+    // Code-buffer growth/rotation statistics (instrumentation only; see the
+    // block in AllocateNew). Written at buffer-allocation events, which are
+    // rare — a handful per session. Atomics because FlushCodeBufferTelemetry
+    // can read them from the fatal-signal telemetry path on another thread.
+    std::atomic<uint64_t> StatsRetiredBytes {};
+    std::atomic<uint64_t> StatsRetiredBlocks {};
+    std::atomic<uint64_t> StatsPeakLiveBytes {};
   };
 
   class CPUBackend {
