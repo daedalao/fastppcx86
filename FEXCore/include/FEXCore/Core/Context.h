@@ -163,6 +163,22 @@ public:
   FEX_DEFAULT_VISIBILITY virtual void SoftInvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
+
+  /**
+   * @brief FEX_SMCLAZYSCRUB: make this thread's next dispatch take the lookup
+   *        slow path, and record that it owes a lazy-SMC drain.
+   *
+   * Called from the SMC write-fault signal handler, on the faulting thread and
+   * only for that thread, when FEX_SMCLAZYINVAL defers the invalidation.  It
+   * zeroes the thread's L1 block-lookup table and sets a per-thread flag that
+   * the lookup slow path consumes (draining the deferred invalidations before
+   * it consults the shared L2/L3 caches).  That pair is what makes lazy
+   * invalidation sound for same-thread self-modifying code.
+   *
+   * Takes no lock and issues no allocation; safe from a signal handler.  See
+   * Source/Tools/LinuxEmulation/LinuxSyscalls/SMCLazyInvalidate.h.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThreadState* Thread) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void

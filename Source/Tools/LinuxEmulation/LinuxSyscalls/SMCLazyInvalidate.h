@@ -4,8 +4,12 @@
 // ===========================================================================
 // SMC lazy invalidation   (FEX_SMCLAZYINVAL=1)
 //
-//   *** THIS OPTION DELIBERATELY RELAXES CORRECTNESS FOR SPEED. ***
-//   Read "ACCEPTED UNSOUNDNESS" below before enabling it anywhere.
+//   As originally written this option traded correctness for speed.  It no
+//   longer does by default: FEX_SMCLAZYSCRUB (default 1) closes the
+//   same-thread hole -- see "SAME-THREAD SOUNDNESS: THE SCRUB" at the bottom,
+//   which supersedes the "ACCEPTED UNSOUNDNESS" section above it.
+//   FEX_SMCLAZYSCRUB=0 restores the original unsound-but-faster behaviour and
+//   is kept only for A/B measurement.
 //
 // ===========================================================================
 //
@@ -59,7 +63,8 @@
 // else the option logs once and stays off.  Off => not one line of this runs
 // and behaviour is byte-identical to whatever the other SMC options select.
 //
-// ACCEPTED UNSOUNDNESS  (this is the whole point of the option)
+// ACCEPTED UNSOUNDNESS  (FEX_SMCLAZYSCRUB=0 only -- see the scrub section
+// below, which is the default and removes the same-thread part of this)
 // ------------------------------------------------------------
 // v3 is sound because the delink completes inside the SIGSEGV handler, before
 // the faulting store is even retired: from the instant the store lands, no
@@ -94,16 +99,98 @@
 //
 //     That is precisely smcstorm's `patchloop` shape (patch an immediate in a
 //     tiny stub, then call the stub, in a tight loop with no intervening
-//     syscall).  **smcstorm/patchloop's checksum may legitimately FAIL under
-//     FEX_SMCLAZYINVAL=1.  That is an accepted, expected outcome of this
-//     option and NOT a bug in it.**  Any guest doing runtime codegen in that
+//     syscall).  **With FEX_SMCLAZYSCRUB=0, smcstorm/patchloop's checksum may
+//     legitimately FAIL.  That is the accepted, expected outcome of turning
+//     the scrub off and NOT a bug.**  Any guest doing runtime codegen in that
 //     shape (Mono/.NET tiering-up, JS JIT patch points, game scripting VMs)
-//     can miscompute or crash with this option on.
+//     can miscompute or crash in that configuration.
+//
+//     With the default FEX_SMCLAZYSCRUB=1 this exposure is closed; see
+//     "SAME-THREAD SOUNDNESS: THE SCRUB" below.
 //
 // Nothing here can corrupt FEX itself: soft-invalidation never frees host
 // code, so a stale block is stale-but-valid machine code operating on the
 // guest's own state, exactly as a legacy in-flight block is.  The damage is
 // confined to guest semantics.
+//
+//
+// SAME-THREAD SOUNDNESS: THE SCRUB   (FEX_SMCLAZYSCRUB=1, the default)
+// --------------------------------------------------------------------
+// x86 only ever promised SMC coherence to the *modifying* processor.  Code
+// modified by one logical processor and executed by another is
+// "cross-modifying code" and the architecture requires the executing processor
+// to perform a serializing operation before running it; a plain branch is not
+// enough, on real hardware either.  So lazy invalidation does not have to
+// invalidate globally at fault time.  It only has to guarantee:
+//
+//   *** after a store fault on thread T dirties page P, thread T's NEXT   ***
+//   *** dispatch into any block drains the deferred set first.            ***
+//
+// Other threads may lawfully keep running stale translations until one of
+// their own drain points, and every mechanism a guest has for the serializing
+// event x86 demands -- a syscall, a signal, or dispatching code it has not run
+// before -- IS one of those drain points.
+//
+// The guarantee is implemented in two halves:
+//
+//   1. FAULT SIDE.  SyscallsSMCTracking.cpp, in the lazy branch of
+//      HandleSegfault, calls Context::ScrubThreadLookupCacheForLazySMC on the
+//      faulting thread.  That zeroes THIS thread's entire L1 lookup table
+//      (LookupCache::ScrubForLazySMC -- one madvise(MADV_DONTNEED) on the L1
+//      mapping, no lock, no allocation, signal-safe) and sets a per-thread
+//      "owes a drain" flag inside the same per-thread LookupCache object.
+//      A full flush rather than a per-page one: the fault already costs
+//      microseconds, and the page->block direction is not indexable from L1
+//      without the write lock this handler must not take.
+//
+//   2. LOOKUP SIDE.  With L1 empty, the thread cannot resolve ANY guest RIP
+//      inline: the dispatcher's probe (PPC64Dispatcher.cpp) and every block's
+//      inlined exit probe (BranchOps.cpp DEF_OP(ExitFunction)) both miss and
+//      branch to PPC64JITCore::ExitFunctionLink.  That function now, BEFORE it
+//      takes CodeInvalidationMutex and consults the shared L2/L3, consumes the
+//      flag and runs the drain.  Only then does it look anything up -- so the
+//      lookup it performs is against a set from which the dirtied page's
+//      blocks have already been soft-invalidated, and a patched block
+//      re-hashes and recompiles instead of being republished into L1.
+//
+// Why the L1 flush alone is not enough, and the ordering in (2) is the whole
+// point: L2/L3 are shared and were never scrubbed, so an L1 miss that went
+// straight to L2 would simply re-publish the stale translation.  The flush
+// buys nothing except the guaranteed trip through (2); (2) is where the
+// correctness is.
+//
+// Why this is complete on PPC64LE and not on Arm64: this backend has no block
+// linking.  There is no jump thunk, no ExitFunctionLinkData, no return-address
+// predictor stack (BranchOps.cpp's DEF_OP(ExitFunction) header says so; the
+// backend's non-use of the CallRet stack is noted in JIT/PPC64LE/JIT.cpp).
+// Every single block-to-block transfer re-probes L1.  Therefore "L1 is empty"
+// really does mean "the next transfer of control leaves translated code".
+// Arm64 patches callsites to branch directly between blocks, so the same
+// scrub would leave a thread inside a linked chain running stale code; the
+// hook exists there for parity but the soundness claim is PPC64LE-only.
+//
+// What the scrub still does NOT cover, by design:
+//   - The block the faulting thread is CURRENTLY executing runs to its next
+//     exit before the scrub can matter.  Identical to legacy invalidation,
+//     which also cannot recall an in-flight block, and handled by the
+//     pre-existing single-instruction-block re-execution path at the tail of
+//     HandleSegfault for the case where the store hits the current block.
+//   - Cross-thread modification with no serializing event on the reader.  Not
+//     a regression: x86 does not guarantee that either.
+//   - A store that FEX never sees as a fault at all (a page unprotected by an
+//     earlier lazy fault and not yet drained can be written repeatedly with no
+//     further faults).  That is the amortization the whole option is built on;
+//     it is safe because the FIRST such store on that page already scrubbed
+//     this thread and left the drain owed, and the debt is only cleared by a
+//     drain that soft-invalidates every recorded page.
+//
+// Cost model: the scrub is paid once per fault, on the writer, and it is a
+// single syscall.  The drain is paid at the writer's next dispatch, and only
+// then.  A writer that stores into a page and never re-dispatches (smcstorm's
+// falseshare and crossthread shapes) pays the syscall and nothing else, which
+// is why lazy's speedup is expected to survive there while patchloop -- which
+// re-dispatches into the page it just wrote, every iteration, and is exactly
+// the case that requires the drain -- becomes correct.
 //
 // POWER8: no codegen is involved.  Pure C++ runtime code.
 // ===========================================================================

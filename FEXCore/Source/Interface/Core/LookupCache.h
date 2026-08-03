@@ -787,6 +787,59 @@ public:
   void ClearL2Cache(const LookupCacheBaseLockToken&);
   void ClearThreadLocalCaches(const LookupCacheWriteLockToken&);
 
+  // ---------------------------------------------------------------------
+  // FEX_SMCLAZYSCRUB (see Source/Tools/LinuxEmulation/LinuxSyscalls/
+  // SMCLazyInvalidate.h, section "SAME-THREAD SOUNDNESS").
+  //
+  // Called from the SMC SIGSEGV handler, on the faulting thread, for its OWN
+  // LookupCache, when the lazy route defers invalidation.  It does two things:
+  //
+  //   * zeroes this thread's entire L1 table, so the thread's next dispatch --
+  //     from the dispatcher's inlined probe or from a block's inlined
+  //     ExitFunction probe -- cannot hit any translation at all and must call
+  //     into the C++ lookup slow path (PPC64JITCore::ExitFunctionLink); and
+  //   * records that this thread owes a lazy drain, which that slow path
+  //     settles before it consults the shared L2/L3 caches.
+  //
+  // Together those close the same-thread patch-then-call hole: the thread that
+  // wrote the code cannot reach ANY cached translation again without first
+  // draining the dirty set.  Other threads are untouched and may lawfully keep
+  // running stale code until one of their own drain points, which is exactly
+  // what x86 permits for cross-modifying code.
+  //
+  // SIGNAL SAFETY.  Takes no lock.  The only writer of this thread's L1 is
+  // this thread (which is stopped inside this handler); the only foreign
+  // writes are LookupCache::InvalidateCache from a cross-thread Erase, which
+  // stores a zero into GuestCode -- so a race can at worst lose a store that
+  // zeroing is performing anyway.  Nothing anywhere reads another thread's L1.
+  // The zeroing itself is a single madvise(MADV_DONTNEED) on the L1 mapping
+  // (a private anonymous mapping, so it reads back as zero), which is one
+  // syscall rather than a multi-megabyte memset and is safe to issue from a
+  // signal handler.
+  //
+  // Zeroing HostCode as well as GuestCode is deliberate and matches
+  // ClearThreadLocalCaches; the "leave HostCode alone" rule in InvalidateCache
+  // exists so a concurrent *lock-free reader of a single entry* cannot observe
+  // {matching GuestCode, null HostCode}, and here GuestCode goes to zero at
+  // the same time or earlier, so no entry can ever be observed half-cleared in
+  // that direction.  A guest RIP of 0 is the sole address that "matches" a
+  // zeroed entry; that is already true of a freshly allocated L1 and is
+  // filtered as a suspect RIP by the lookup slow path.
+  void ScrubForLazySMC() {
+    LazySMCDrainPending.store(true, std::memory_order_relaxed);
+    FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, false);
+  }
+
+  // Consume this thread's lazy-drain debt.  Cleared BEFORE the drain runs so
+  // that a fault re-arming it while the drain is in flight is not lost.
+  bool TakeLazySMCDrainPending() {
+    if (!LazySMCDrainPending.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    LazySMCDrainPending.store(false, std::memory_order_relaxed);
+    return true;
+  }
+
   uintptr_t GetL1Pointer() const {
     return L1Pointer;
   }
@@ -895,6 +948,12 @@ private:
   constexpr static size_t MAX_L1_SIZE = MAX_L1_ENTRIES * sizeof(LookupCacheEntry);
 
   size_t AllocateOffset {};
+
+  // FEX_SMCLAZYSCRUB.  Per-thread (this object is per-thread), set by the SMC
+  // fault handler on the faulting thread and consumed by that same thread in
+  // the lookup slow path.  Atomic only so the compiler cannot sink or fold the
+  // signal-handler store; no cross-thread ordering is required or implied.
+  std::atomic<bool> LazySMCDrainPending {false};
 
   FEXCore::Context::ContextImpl* ctx;
   uint64_t VirtualMemSize {};

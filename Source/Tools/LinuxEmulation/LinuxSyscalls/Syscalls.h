@@ -235,6 +235,7 @@ public:
   FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
   FEX_CONFIG_OPT(SMCFileImmutable, SMCFILEIMMUTABLE);
   FEX_CONFIG_OPT(SMCLazyInval, SMCLAZYINVAL);
+  FEX_CONFIG_OPT(SMCLazyScrub, SMCLAZYSCRUB);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
 
@@ -503,8 +504,17 @@ public:
   // Set once at construction, after the SMCSoftInvalidate + mtrack gate.
   std::atomic<bool> SMCLazyInvalEnabled {false};
 
+  // FEX_SMCLAZYSCRUB. Set at the same point, and only if lazy invalidation
+  // itself came up. This is what makes lazy sound for same-thread SMC; see
+  // LinuxSyscalls/SMCLazyInvalidate.h, section "SAME-THREAD SOUNDNESS".
+  std::atomic<bool> SMCLazyScrubEnabled {false};
+
   bool SMCLazyInvalActive() const {
     return SMCLazyInvalEnabled.load(std::memory_order_relaxed);
+  }
+
+  bool SMCLazyScrubActive() const {
+    return SMCLazyScrubEnabled.load(std::memory_order_relaxed);
   }
 
   // Records a page as dirty-but-not-invalidated. Returns true if this is the

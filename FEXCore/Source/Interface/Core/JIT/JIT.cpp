@@ -534,6 +534,24 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   uintptr_t HostCode {};
   auto GuestRip = Record->GuestRIP;
 
+  // FEX_SMCLAZYSCRUB drain point, mirroring the PPC64LE backend's copy in
+  // JIT/PPC64LE/JIT.cpp. Must sit above every CodeInvalidationMutex guard below
+  // (the drain takes the exclusive side of it).
+  //
+  // NOTE: on Arm64 this is NOT by itself sufficient to make FEX_SMCLAZYINVAL
+  // sound for same-thread SMC. This backend links blocks directly (the
+  // callsite patching further down), so a scrubbed L1 does not force a thread
+  // already inside a linked chain back through here. The option is only
+  // claimed sound on PPC64LE, which has no block linking. This hook is here so
+  // the two backends do not silently diverge, and so an Arm64 experiment gets
+  // the drain at the one place it can.
+  if (Thread->LookupCache->TakeLazySMCDrainPending()) {
+    auto* Handler = static_cast<Context::ContextImpl*>(Thread->CTX)->SyscallHandler;
+    if (auto* LazyCount = Handler->LazySMCDirtyCount; LazyCount && LazyCount->load(std::memory_order_acquire) != 0) {
+      Handler->DrainLazySMCInvalidations(Thread);
+    }
+  }
+
   if (TFSet) {
     // If TF is set, the cache must be skipped as different code needs to be generated.
     Frame->State.rip = GuestRip;
