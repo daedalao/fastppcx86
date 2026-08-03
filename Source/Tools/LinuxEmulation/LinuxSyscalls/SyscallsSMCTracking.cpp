@@ -319,7 +319,14 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // never traps.  A refusal is not an error: the site simply stays
         // faulting and keeps taking this path, exactly as it does today.
         // Either way the current store is emulated below.
-        if (_SyscallHandler->SMCStoreBackpatch()) {
+        //
+        // Not when this fault was serviced as a semantic patch: that site's
+        // writes hit live code on a page that deliberately stays protected, so
+        // a stub would just fault again from inside itself on every later
+        // patch — strictly worse than faulting here directly. A site that
+        // mixes false-sharing and imm-field writes still gets backpatched the
+        // first time it faults as false sharing.
+        if (!SemanticPatched && _SyscallHandler->SMCStoreBackpatch()) {
           const char* Reason = FEX::HLE::SMCBackpatch::TryBackpatchStore(Thread, StorePC);
           if (Reason) {
             SMC_AUDIT("[%d] fault addr=%lx BACKPATCH-REFUSED reason=%s pc=%lx insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress,
