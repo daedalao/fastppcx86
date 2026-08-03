@@ -1159,7 +1159,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
-  auto [CompiledCode, DebugData, StartAddr, Length, _, __] = CompileCode(Thread, GuestRIP, 1);
+  auto [CompiledCode, DebugData, StartAddr, Length, _, __, ___] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     if (SMCAuditCompileFD() >= 0) {
