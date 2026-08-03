@@ -26,6 +26,10 @@
 // compose with aligned LL/SC (Tier D atomics defect 1, narrowed by C3+C4
 // but not closed — closure requires a dual-container crossing path, deferred
 // as a future C4.5). The 8-bit (lbarx) path is always aligned by definition.
+// Since C6, when SplitLockInlineContained is set, the doubleword-contained
+// subset of the misaligned Fetch*/Swap ops (2-/4-byte fields with
+// (EA & 7) + size <= 8) is JIT-inlined as an aligned ldarx/stdcx. container
+// loop (EmitInlineContainedRMW below) and no longer reaches the helper at all.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Context/Context.h"
 
@@ -213,6 +217,151 @@ void PPC64JITCore::EmitSplitLockCASCall(PPC64Emitter::GPR Addr, PPC64Emitter::GP
 }
 
 // ---------------------------------------------------------------------------
+// C6: JIT-inline container loop for doubleword-contained misaligned RMW.
+//
+// Emitted inside each Fetch*/Swap op's misaligned branch, between the
+// alignment check and the EmitSplitLockHelperCall fallback, and therefore
+// inside the op's C1 hwsync/isync bracket. For a 2- or 4-byte operand with
+// (EA & 7) + size <= 8 the whole field lives in one naturally-aligned
+// doubleword, so an aligned ldarx/stdcx. loop against EA & ~7 performs the
+// RMW with no ABI spill and no mutex, and it composes with every aligned or
+// contained LL/SC touching the same doubleword. This is only safe now that
+// C4.5 routes crossing ops through container reservations as well — see the
+// commit message. Crossing and quadword-contained cases branch back out and
+// fall through to the caller's helper call. 8-byte and 8-bit sites never
+// reach this function (the size gate below rejects them at emit time), so
+// they see zero code-size growth.
+//
+// Register accounting — six scratch registers needed in the worst aliasing
+// case, six available:
+//   TMP4 — free: op entry stashed CR0 to memory ([r1-8]), and the alignment
+//          test value TMP4 holds is dead once the misaligned branch is taken.
+//   TMP3 — consumable: holds at most a copy of the EA (Addr == Dst stash);
+//          Abase = EA & ~7 replaces it in-place, after which the EA is dead.
+//   TMP2 — free: only the aligned-path loop body uses it.
+//   TMP1 — consumable: holds at most a copy of Val (Val == Dst stash); the
+//          width-masked operand replaces it in-place.
+//   Dst  — scratch until the final result: GetReg only hands out pool/SRA
+//          registers (r7+), never TMPs; Dst's architectural value is dead on
+//          entry; and the callers' Val==Dst / Addr==Dst stashes guarantee no
+//          input aliases it. Every input is derived before the first write.
+//   r0   — scratch inside the loop: ldarx/stdcx. encode r0 in the RA slot,
+//          which the ISA reads as literal 0 regardless of r0's contents (the
+//          r0-reads-its-value hazard is only the rB slot — see P5.0.2 in
+//          BranchOps.cpp). r0 carries the loaded doubleword; every exit from
+//          the arm restores r0 = 0.
+//
+// The mask register is eliminated algebraically: with diff = t_old ^ t_new,
+//   New64 = Old64 ^ ((diff & szmask) << sh)
+// splices the new field into the doubleword, and szmask is a compile-time
+// clrldi immediate, so no register holds a mask at runtime. High garbage in
+// t_old (neighbour bytes above the field after the srd) is harmless: every
+// op in this family computes its low size*8 result bits from its inputs'
+// low size*8 bits only (add/sub carries propagate strictly upward, logical
+// ops are bitwise, neg is ~x+1), and diff is masked before splicing.
+//
+// SIGBUS decoder (Utils/ArchHelpers/PPC64.cpp): no interaction. The ldarx
+// here targets EA & ~7, which is 8-aligned and cannot raise BUS_ADRALN, so
+// HandleUnalignedAtomicSIGBUS never fires on this sequence; and were some
+// unrelated SIGBUS to land on it, the instruction at PC+4 is srd (XO 539),
+// which the decoder's body/store-conditional tables reject.
+//
+// CR0 is clobbered (andi_/cmpldi/stdcx.), exactly like the aligned path;
+// every caller restores CR0 from its [r1-8] stash after &done, and this
+// function never touches that slot (no stack use at all — the red zone is
+// off limits, see the clone()-stack SEGV note in PPC64Emitter.cpp).
+//
+// Telemetry: with the knob on, doubleword-contained ops no longer reach
+// PPC64_SplitLockEmulate, so the C5 TYPE_SPLIT_LOCK_DWORD_CONTAINED counter
+// stops observing them (crossing/quadword counters are unaffected).
+void PPC64JITCore::EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp Op,
+                                          PPC64Emitter::GPR A, PPC64Emitter::GPR Val,
+                                          PPC64Emitter::GPR Dst, IR::OpSize Sz,
+                                          PPC64Emitter::Label* Done) {
+  using SplitLockOp = FEXCore::ArchHelpers::PPC64::SplitLockOp;
+
+  if (!CTX->Config.SplitLockInlineContained()) {
+    return;
+  }
+  if (Sz != IR::OpSize::i16Bit && Sz != IR::OpSize::i32Bit) {
+    // Only 2-/4-byte fields can be doubleword-contained while misaligned;
+    // misaligned 8-byte ops always need the quadword or crossing helper
+    // path, and 8-bit ops are aligned by definition.
+    return;
+  }
+  const auto SzBytes = static_cast<uint32_t>(IR::OpSizeToSize(Sz));
+  const auto ClrBits = 64 - SzBytes * 8;
+
+  PPC64Emitter::Label helper, loop;
+  andi_(TMP4, A, 7);                                    // off = EA & 7
+  cmpldi(TMP4, static_cast<uint16_t>(8 - SzBytes));     // contained iff off <= 8 - size
+  bc(CC_GT, &helper);
+
+  sldi(TMP2, TMP4, 3);           // sh = off * 8
+  clrrdi(TMP3, A, 3);            // Abase = EA & ~7 (in-place safe when A == TMP3)
+  if (Op != SplitLockOp::FetchNeg) {
+    clrldi(TMP1, Val, ClrBits);  // operand masked to width (in-place safe when Val == TMP1)
+  }
+
+  Bind(&loop);
+  ldarx(r0, r0, TMP3);           // Old64 (RA slot = literal 0; 8-aligned, no BUS_ADRALN)
+  srd(TMP4, r0, TMP2);           // t_old, neighbour garbage above the field
+  switch (Op) {
+  case SplitLockOp::Swap:
+    // t_new is the masked operand itself, so diff = t_new ^ t_old directly.
+    xor_(Dst, TMP1, TMP4);
+    break;
+  case SplitLockOp::FetchAdd:
+    add(Dst, TMP4, TMP1);
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchSub:
+    subf(Dst, TMP1, TMP4);       // t_new = t_old - operand
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchAnd:
+    and_(Dst, TMP4, TMP1);
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchOr:
+    or_(Dst, TMP4, TMP1);
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchXor:
+    xor_(Dst, TMP4, TMP1);
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchCLR:
+    andc(Dst, TMP4, TMP1);       // t_new = t_old & ~operand
+    xor_(Dst, Dst, TMP4);
+    break;
+  case SplitLockOp::FetchNeg:
+    neg(Dst, TMP4);
+    xor_(Dst, Dst, TMP4);
+    break;
+  default:
+    // Unreachable by construction: only the eight Fetch*/Swap DEF_OPs call
+    // this (CAS has its own C7 emitter). Emit a benign diff = 0 so even a
+    // future miswired caller stores the doubleword back unchanged and
+    // returns the old field, rather than writing garbage.
+    xor_(Dst, TMP4, TMP4);
+    break;
+  }
+  clrldi(Dst, Dst, ClrBits);     // confine diff to the field
+  sld(Dst, Dst, TMP2);
+  xor_(Dst, r0, Dst);            // New64 = Old64 ^ (diff << sh)
+  stdcx_(Dst, r0, TMP3);
+  bc(CC_NE, &loop);
+
+  srd(Dst, r0, TMP2);            // recover the old field
+  clrldi(Dst, Dst, ClrBits);     // zero-extend, matching lharx/lwarx semantics
+  li(r0, 0);                     // restore the r0 == 0 invariant (P5.0.2)
+  b(Done);
+
+  Bind(&helper);                 // not doubleword-contained: caller's helper call runs
+}
+
+// ---------------------------------------------------------------------------
 // AtomicSwap — exchange, returns old value
 // ---------------------------------------------------------------------------
 DEF_OP(AtomicSwap) {
@@ -245,6 +394,10 @@ DEF_OP(AtomicSwap) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::Swap,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK XCHG: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::Swap,
                             A, Val, Dst, Sz);
@@ -303,6 +456,10 @@ DEF_OP(AtomicFetchAdd) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAdd,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK ADD: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAdd,
                             A, Val, Dst, Sz);
@@ -352,6 +509,10 @@ DEF_OP(AtomicFetchSub) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchSub,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK SUB: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchSub,
                             A, Val, Dst, Sz);
@@ -401,6 +562,10 @@ DEF_OP(AtomicFetchAnd) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAnd,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK AND: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchAnd,
                             A, Val, Dst, Sz);
@@ -450,6 +615,10 @@ DEF_OP(AtomicFetchCLR) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchCLR,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK BTR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchCLR,
                             A, Val, Dst, Sz);
@@ -499,6 +668,10 @@ DEF_OP(AtomicFetchOr) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchOr,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK OR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchOr,
                             A, Val, Dst, Sz);
@@ -548,6 +721,10 @@ DEF_OP(AtomicFetchXor) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchXor,
+                           A, Val, Dst, Sz, &done);
     // Misaligned LOCK XOR: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchXor,
                             A, Val, Dst, Sz);
@@ -595,6 +772,11 @@ DEF_OP(AtomicFetchNeg) {
   if (AlignMask) {
     andi_(TMP4, A, AlignMask);
     bc(CC_EQ, &aligned);
+    // C6: doubleword-contained cases run a JIT-inline container loop and
+    // jump to &done; anything else falls through to the helper call.
+    // FetchNeg has no Val operand — r(0) is passed but never read.
+    EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchNeg,
+                           A, r(0), Dst, Sz, &done);
     // Misaligned LOCK NEG: route through the mutex-serialized helper.
     EmitSplitLockHelperCall(FEXCore::ArchHelpers::PPC64::SplitLockOp::FetchNeg,
                             A, r(0), Dst, Sz);

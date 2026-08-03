@@ -366,6 +366,20 @@ private:
                             PPC64Emitter::GPR Desired, PPC64Emitter::GPR Dst,
                             IR::OpSize Sz);
 
+  // C6: JIT-inline ldarx/stdcx. container loop for the doubleword-contained
+  // subset of misaligned Fetch*/Swap ops (2-/4-byte fields with
+  // (EA & 7) + size <= 8). Emitted in the misaligned branch before the
+  // helper call; branches to *Done when it handled the op, falls through
+  // (emitting nothing on the reject path beyond the containment test) when
+  // the case is crossing/quadword-contained — or emits nothing at all when
+  // the SplitLockInlineContained knob is off or the size is not 2/4 — so
+  // the caller's EmitSplitLockHelperCall still covers those. See the
+  // definition for the register accounting and the CR0/r0 contracts.
+  void EmitInlineContainedRMW(FEXCore::ArchHelpers::PPC64::SplitLockOp Op,
+                              PPC64Emitter::GPR Addr, PPC64Emitter::GPR Val,
+                              PPC64Emitter::GPR Dst, IR::OpSize Sz,
+                              PPC64Emitter::Label* Done);
+
   // -----------------------------------------------------------------------
   // Stack management
   // -----------------------------------------------------------------------

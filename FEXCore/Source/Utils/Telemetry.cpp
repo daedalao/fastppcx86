@@ -18,7 +18,7 @@ namespace FEXCore::Telemetry {
 #ifndef FEX_DISABLE_TELEMETRY
 std::array<Value, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryValues = {{}};
 const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryNames {
-  "64byte Split Locks",
+  "Split lock helper entries (PPC64: bypassed by JIT-inline C6/C7 when the SplitLockInlineContained knob is on, so doubleword-contained events do not count here — ARM64 semantics unchanged)",
   "16byte Split atomics",
   "EVEX instructions (AVX512)",
   "16bit CAS Tear",
