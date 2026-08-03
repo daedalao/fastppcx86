@@ -1840,7 +1840,6 @@ Consolidated so nothing lives only in the build-agent log. Ordered by my judgeme
 | 4 | **Mono HANG class** | Untouched | `LOCKONLYTSO=1` floors it at 10%; every other config 37–63%. Last thing between the port and Mono |
 | 5 | **NoExec entry-block forensic abort** | Unfixed | One root cause, four FEXLinuxTests symptoms: `sigill_flags.64`, `smc-exec-stack.64`, `smc-missing-gnustack.64`, `smc-unexec-stack.64` |
 | 6 | `execveat_memfd.64` dies with signal 5 | Unfixed | FEXLinuxTests |
-| 7 | `cpu_count.64` — 16 max addressable IDs vs 128 `hw_concurrency` | Unfixed | POWER9 topology; may be an x86 semantic difference rather than a bug |
 | 8 | **Perf cost of the landed TSO fix** | Unmeasured | vkmark 1364 at SMT4 is not recipe-comparable. Blocked on the SMT2 flip (user action) |
 | 9 | `r0` zero-on-entry residual | Unchecked | ELFv2 makes `r0` volatile; `PushCalleeSavedRegisters` touches it. One code read |
 | 10 | README:11 SIGABRT-on-exit in FTL | Never reproduced | Both play sessions were SIGKILLed, so the natural exit path never ran |

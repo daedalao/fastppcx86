@@ -489,7 +489,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
 
   Res.ebx = 0 |                 // Brand index
             (8 << 8) |          // Cache line size in bytes
-            (Cores << 16) |     // Number of addressable IDs for the logical cores in the physical CPU
+            (std::min(Cores, 255u) << 16) |     // Number of addressable IDs for the logical cores in the physical CPU (8-bit; overflow corrupts APIC ID byte at [31:24])
             (GetCPUID() << 24); // Local APIC ID
 
   Res.ecx = (1 << 0) |                                      // SSE3
@@ -586,7 +586,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_04h(uint32_t Leaf) const {
 
   if (Leaf == 0) {
     // Report L1D
-    uint32_t CoreCount = Cores - 1;
+    // EAX[31:26] max addressable core IDs in package — 6-bit, saturates at 63 (64 cores)
+    uint32_t CoreCount = std::min(Cores, 64u) - 1;
 
     Res.eax = CacheType_Data |   // Cache type
               (0b001 << 5) |     // Cache level
@@ -607,7 +608,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_04h(uint32_t Leaf) const {
               (0 << 2);  // Complex cache indexing - 0: Direct, 1: Complex
   } else if (Leaf == 1) {
     // Report L1I
-    uint32_t CoreCount = Cores - 1;
+    // EAX[31:26] max addressable core IDs in package — 6-bit, saturates at 63 (64 cores)
+    uint32_t CoreCount = std::min(Cores, 64u) - 1;
 
     Res.eax = CacheType_Instruction | // Cache type
               (0b001 << 5) |          // Cache level
@@ -628,7 +630,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_04h(uint32_t Leaf) const {
               (0 << 2);  // Complex cache indexing - 0: Direct, 1: Complex
   } else if (Leaf == 2) {
     // Report L2
-    uint32_t CoreCount = Cores - 1;
+    // EAX[31:26] max addressable core IDs in package — 6-bit, saturates at 63 (64 cores)
+    uint32_t CoreCount = std::min(Cores, 64u) - 1;
 
     Res.eax = CacheType_Unified | // Cache type
               (0b010 << 5) |      // Cache level
@@ -649,13 +652,18 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_04h(uint32_t Leaf) const {
               (0 << 2);  // Complex cache indexing - 0: Direct, 1: Complex
   } else if (Leaf == 3) {
     // Report L3
-    uint32_t CoreCount = Cores - 1;
+    // Two distinct fields must use two distinct saturations:
+    //   EAX[31:26] max addressable core IDs in package — 6-bit,  saturates at 63   (64 cores)
+    //   EAX[25:14] max addressable core IDs sharing this cache — 12-bit, saturates at 4095 (4096 cores)
+    // Using one shared variable and capping at 64 silently corrupts the 12-bit field's low bits.
+    uint32_t CoreCount = std::min(Cores, 64u) - 1;
+    uint32_t CacheShare = std::min(Cores, 4096u) - 1;
 
     Res.eax = CacheType_Unified | // Cache type
               (0b011 << 5) |      // Cache level
               (1 << 8) |          // Self initializing cache level
               (0 << 9) |          // Fully associative
-              (CoreCount << 14) | // Maximum number of addressable IDs for logical processors sharing this cache
+              (CacheShare << 14) | // Maximum number of addressable IDs for logical processors sharing this cache
               (CoreCount << 26);  // Maximum number of addressable IDs for processor cores in the physical package
 
     Res.ebx = (63 << 0) | // Line Size - 1 : Claiming 64 byte
@@ -1274,10 +1282,13 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0008h(uint32_t Leaf) con
             (0 << 1) |                               // IRPerf: Instructions retired count support
             (CTX->HostFeatures.SupportsCLZERO << 0); // CLZERO support
 
-  uint32_t CoreCount = Cores - 1;
-  Res.ecx = (0 << 16) |                    // PerfTscSize: Performance timestamp count size
-            (std::bit_ceil(Cores) << 12) | // ApicIdSize: Number of bits in ApicID
-            (CoreCount << 0);              // Count count subtract one
+  // ECX[7:0]  NC          — CoreCount, 8-bit, saturates at 255 (256 cores)
+  // ECX[15:12] ApicIdSize — ceil(log2(Cores)), 4-bit, saturates at 15
+  uint32_t CoreCount = std::min<uint32_t>(Cores, 256u) - 1;
+  uint32_t ApicIdSize = std::min<uint32_t>(std::bit_width(Cores - 1u), 15u);
+  Res.ecx = (0 << 16) |            // PerfTscSize: Performance timestamp count size
+            (ApicIdSize << 12) |   // ApicIdSize: Number of bits in ApicID
+            (CoreCount << 0);      // NC: core count minus one
 
   return Res;
 }
@@ -1360,13 +1371,14 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_001Dh(uint32_t Leaf) con
               (0 << 1);  // Cache inclusiveness - Includes lower caches
   } else if (Leaf == 3) {
     // Report L3
-    uint32_t CoreCount = Cores - 1;
+    // EAX[25:14] max addressable core IDs sharing this cache — 12-bit, saturates at 4095 (4096 cores)
+    uint32_t CacheShare = std::min(Cores, 4096u) - 1;
 
     Res.eax = CacheType_Unified | // Cache type
               (0b011 << 5) |      // Cache level
               (1 << 8) |          // Self initializing cache level
               (0 << 9) |          // Fully associative
-              (CoreCount << 14);  // Maximum number of addressable IDs for logical processors sharing this cache
+              (CacheShare << 14);  // Maximum number of addressable IDs for logical processors sharing this cache
 
     Res.ebx = (63 << 0) | // Line Size - 1 : Claiming 64 byte
               (0 << 12) | // Physical Line partitions
