@@ -1646,11 +1646,14 @@ extern "C" {
 // from g_recent_rips, and disasm of the JIT block tail so we can identify
 // which guest x86 op's emit produced the bad target. Aborts after the dump.
 //
-// Suppress with FEX_EXITLINK_NOABORT=1 to revert to silent forwarding.
+// PRODUCTION DEFAULT: silent forwarding. The dump+abort is a debugging
+// tripwire — opt in with FEX_EXITLINK_ABORT=1 when hunting this class (it
+// fires during normal Unity/Mono loads, e.g. Ziggurat at ~22s, and would
+// otherwise kill known-working titles).
 static void DiagnoseSuspectGuestRIP(uint64_t GuestRIP, uint64_t HostLR,
                                      FEXCore::Core::CpuStateFrame* Frame) {
-  static const bool absorb = (getenv("FEX_EXITLINK_NOABORT") != nullptr);
-  if (absorb) {
+  static const bool abort_wanted = (getenv("FEX_EXITLINK_ABORT") != nullptr);
+  if (!abort_wanted) {
     return;
   }
   // Direct write to stderr — LogMan may not flush before abort().

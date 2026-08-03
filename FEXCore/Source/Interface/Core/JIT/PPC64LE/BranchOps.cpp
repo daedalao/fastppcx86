@@ -136,19 +136,16 @@ DEF_OP(ExitFunction) {
     // a code cache saved in one ASLR session and loaded in another would jump
     // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
     // the 32-bit mask so the recorded value matches the emitted immediate.
-<<<<<<< HEAD
     // SMC Idea 4: this is the ONLY guest-RIP constant the semantic-patch fault
-    // handler is allowed to rewrite, so it is the only one recorded. Identical
-    // to InsertGuestRIPMove with the flag off.
-    // See Interface/Core/SMCSemanticPatch.h.
-    InsertExitRIPMove(TMP1, NewRIP);
-=======
+    // handler is allowed to rewrite, so it is the only one recorded (via
+    // InsertExitRIPMove, which wraps InsertGuestRIPMove and is identical to it
+    // with the flag off). See Interface/Core/SMCSemanticPatch.h.
     // (Under BlockLinkingEnabled there is no code cache — the knob is hard-
     // gated off when caching is on — but the relocation is recorded anyway
     // so the emitted bytes do not depend on the knob's interaction with
-    // cache-validation builds.)
-    InsertGuestRIPMove(TMP1, NewRIP);
->>>>>>> origin/power9
+    // cache-validation builds. Note BlockLinking is also interlocked off when
+    // FEX_SMCSEMANTICPATCH is enabled; see JIT.cpp BlockLinkingEnabled.)
+    InsertExitRIPMove(TMP1, NewRIP);
     RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);

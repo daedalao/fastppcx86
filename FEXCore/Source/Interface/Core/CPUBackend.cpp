@@ -17,22 +17,16 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdint>
-<<<<<<< HEAD
-#include <mutex>
-=======
 #include <cstdio>
 #include <cstdlib>
->>>>>>> origin/power9
+#include <mutex>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <linux/prctl.h>
 #include <sys/prctl.h>
-<<<<<<< HEAD
 #include <sys/syscall.h>
-=======
 #include <time.h>
->>>>>>> origin/power9
 #include <unistd.h>
 #endif
 

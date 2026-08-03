@@ -1721,12 +1721,15 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
             // absorbs ALL BreakOp(SIGSEGV) (including legitimate guest
             // INT/INTO/HLT) which masks the real bug; this path bypasses it
             // for NOEXEC_INST only, leaving INT/INTO/HLT behavior untouched.
-            // Suppress with FEX_NOEXEC_ABSORB=1 if needed.
+            // PRODUCTION DEFAULT: absorb. The abort is a debugging tripwire —
+            // opt in with FEX_NOEXEC_ABORT=1 when hunting this class (it fires
+            // during normal Unity/Mono loads, e.g. Ziggurat at ~22s, and would
+            // otherwise kill known-working titles).
             if (BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST) {
-              static const bool absorb = (getenv("FEX_NOEXEC_ABSORB") != nullptr);
-              if (!absorb) {
+              static const bool abort_wanted = (getenv("FEX_NOEXEC_ABORT") != nullptr);
+              if (abort_wanted) {
                 LogMan::Msg::EFmt("Aborting on entry-block NoExec for forensic coredump "
-                                  "(set FEX_NOEXEC_ABSORB=1 to revert to silent absorb).");
+                                  "(unset FEX_NOEXEC_ABORT to absorb).");
                 std::abort();
               }
             }
