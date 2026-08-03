@@ -579,6 +579,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   const bool RecordBranchImmSites = Config.SMCSemanticPatch();
   FEXCore::SMC::BranchImmSites BranchImmSites;
   bool BranchImmSitesOverflowed {};
+  // ... and the immediate fields of its mov-immediates. Recorded in the same
+  // loop; each recognised site additionally tags the IR constant the dispatcher
+  // materialises for it, which is what gives the backend provenance for the
+  // host window it bakes.
+  FEXCore::SMC::MovImmSites MovImmSites;
+  bool MovImmSitesOverflowed {};
 
   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
     std::shared_lock lk(CustomIRMutex);
@@ -678,21 +684,46 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 #endif
 
-        if (RecordBranchImmSites && !BranchImmSitesOverflowed) {
-          FEXCore::SMC::BranchImmSite Site {};
-          if (FEXCore::SMC::DecodeRel32BranchSite(reinterpret_cast<const uint8_t*>(InstAddress), DecodedInfo->InstSize, InstAddress,
-                                                  BlockInfo->Is64BitMode, &Site)) {
-            if (BranchImmSites.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
-              // Over the cap: drop the whole table rather than describe the
-              // block partially. A partial table would let a write to an
-              // unrecorded branch look like "not a patch site" and silently take
-              // the fallback -- which is correct but unattributable -- while a
-              // write to a recorded one would be serviced against a block whose
-              // other branches we never checked.
-              BranchImmSites.clear();
-              BranchImmSitesOverflowed = true;
-            } else {
-              BranchImmSites.push_back(Site);
+        if (RecordBranchImmSites) {
+          if (!BranchImmSitesOverflowed) {
+            FEXCore::SMC::BranchImmSite Site {};
+            if (FEXCore::SMC::DecodeRel32BranchSite(reinterpret_cast<const uint8_t*>(InstAddress), DecodedInfo->InstSize, InstAddress,
+                                                    BlockInfo->Is64BitMode, &Site)) {
+              if (BranchImmSites.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
+                // Over the cap: drop the whole table rather than describe the
+                // block partially. A partial table would let a write to an
+                // unrecorded branch look like "not a patch site" and silently take
+                // the fallback -- which is correct but unattributable -- while a
+                // write to a recorded one would be serviced against a block whose
+                // other branches we never checked.
+                BranchImmSites.clear();
+                BranchImmSitesOverflowed = true;
+              } else {
+                BranchImmSites.push_back(Site);
+              }
+            }
+          }
+
+          // The mov-immediate half. The tag handed to the dispatcher is only
+          // valid for THIS instruction, so it is cleared first and re-set only
+          // when the instruction is a recognised site; the dispatcher also
+          // re-checks the instruction's PC before acting on it.
+          Thread->OpDispatcher->ClearPatchableImmSite();
+          if (!MovImmSitesOverflowed) {
+            FEXCore::SMC::MovImmSite MovSite {};
+            uint64_t MovValue {};
+            if (FEXCore::SMC::DecodeMovImmSite(reinterpret_cast<const uint8_t*>(InstAddress), DecodedInfo->InstSize, InstAddress,
+                                               BlockInfo->Is64BitMode, &MovSite, &MovValue)) {
+              if (MovImmSites.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
+                // Same all-or-nothing rule as above. Windows already tagged with
+                // now-dangling indices are harmless: CompileBlock drops the whole
+                // window table when the site table is empty.
+                MovImmSites.clear();
+                MovImmSitesOverflowed = true;
+              } else {
+                MovImmSites.push_back(MovSite);
+                Thread->OpDispatcher->SetPatchableImmSite(static_cast<uint32_t>(MovImmSites.size()), InstAddress, MovValue, MovSite.ImmSize);
+              }
             }
           }
         }
@@ -870,6 +901,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     .Length = Thread->FrontendDecoder->DecodedMaxAddress - Thread->FrontendDecoder->DecodedMinAddress,
     .NeedsAddGuestCodeRanges = !HasCustomIR,
     .BranchImmSites = std::move(BranchImmSites),
+    .MovImmSites = std::move(MovImmSites),
   };
 }
 
@@ -883,11 +915,11 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   }
 
   // Generate IR + Meta Info
-  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites] =
+  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites, MovImmSites] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
     // OpDispatcher IR already released in this case.
-    return {{}, nullptr, 0, 0, false, {}};
+    return {{}, nullptr, 0, 0, false, {}, {}};
   }
 
   // Attempt to get the CPU backend to compile this code
@@ -904,7 +936,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
               .StartAddr = 0,
               .Length = 0,
               .NeedsAddGuestCodeRanges = false,
-              .BranchImmSites = {}};
+              .BranchImmSites = {},
+              .MovImmSites = {}};
     }
   }
 
@@ -925,6 +958,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     .Length = Length,
     .NeedsAddGuestCodeRanges = NeedsAddGuestCodeRanges,
     .BranchImmSites = std::move(BranchImmSites),
+    .MovImmSites = std::move(MovImmSites),
   };
 }
 
@@ -973,7 +1007,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
-  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites] = CompileCode(Thread, GuestRIP, MaxInst);
+  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites, MovImmSites] =
+    CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
@@ -1080,10 +1115,18 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     BranchImmSites.clear();
     CompiledCode.ExitRIPSites.clear();
   }
+  // The mov-immediate half is independent: a block can be eligible for one
+  // shape and not the other. Same all-or-nothing rule per half -- a site table
+  // without windows (or windows whose site indices were invalidated by an
+  // overflowing site table) must not be consulted at fault time.
+  if (MovImmSites.empty() || CompiledCode.MovImmWindows.empty()) {
+    MovImmSites.clear();
+    CompiledCode.MovImmWindows.clear();
+  }
 
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr, StartAddr, HashedRangeLength, GuestHash,
-                                         BranchImmSites, CompiledCode.ExitRIPSites);
+                                         BranchImmSites, CompiledCode.ExitRIPSites, MovImmSites, CompiledCode.MovImmWindows);
   }
 
   if (CodeMapWriter) {
@@ -1190,9 +1233,16 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     }
   }
 
+  // SMC Idea 4: carry the semantic-patch metadata across the relink. A relink
+  // only happens when the guest bytes hashed identical, and the host code is
+  // the same code that was compiled from them -- so every recorded guest field
+  // and every recorded host window is still exactly as valid as it was before
+  // the soft-invalidation. Dropping it here would silently make every
+  // soft-invalidated block ineligible for patching from then on.
   Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, Retained->BlockBegin, Retained->CodePages,
                                        reinterpret_cast<void*>(Retained->HostCode), Retained->GuestRangeStart, Retained->GuestRangeLength,
-                                       Retained->GuestHash);
+                                       Retained->GuestHash, Retained->BranchImmSites, Retained->ExitRIPSites, Retained->MovImmSites,
+                                       Retained->MovImmWindows);
 
   if (SMCAuditCompileFD() >= 0) {
     dprintf(SMCAuditCompileFD(), "relink rip=%lx host=%lx pages=%zu\n", GuestRIP, Retained->HostCode, Retained->CodePages.size());

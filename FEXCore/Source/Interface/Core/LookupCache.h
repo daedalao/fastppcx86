@@ -116,6 +116,13 @@ struct GuestToHostMap {
     // See Interface/Core/SMCSemanticPatch.h.
     FEXCore::SMC::BranchImmSites BranchImmSites;
     FEXCore::SMC::ExitRIPSites ExitRIPSites;
+
+    // SMC Idea 4, mov-immediate half: the block's guest mov-immediate fields
+    // and the host windows their tagged constants were materialised into.
+    // MovImmWindow::SiteIndex indexes MovImmSites, so the claim is resolved by
+    // identity rather than by value. Both empty => ineligible, same rules.
+    FEXCore::SMC::MovImmSites MovImmSites;
+    FEXCore::SMC::MovImmWindows MovImmWindows;
   };
 
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
@@ -144,7 +151,8 @@ struct GuestToHostMap {
   const BlockEntry& AddBlockMapping(uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages, void* HostCode,
                                     const LookupCacheWriteLockToken&, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0,
                                     uint64_t GuestHash = 0, const FEXCore::SMC::BranchImmSites& BranchImmSites = {},
-                                    const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {}) {
+                                    const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {}, const FEXCore::SMC::MovImmSites& MovImmSites = {},
+                                    const FEXCore::SMC::MovImmWindows& MovImmWindows = {}) {
     // This may replace an existing mapping
     // NOTE: Generally no previous entry should exist, however there is one exception:
     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
@@ -152,7 +160,7 @@ struct GuestToHostMap {
     //       one of the two blocks in this case.
     return BlockList
       .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages, GuestRangeStart, GuestRangeLength, GuestHash,
-                                             BranchImmSites, ExitRIPSites})
+                                             BranchImmSites, ExitRIPSites, MovImmSites, MovImmWindows})
       .first->second;
   }
 
@@ -356,32 +364,45 @@ struct GuestToHostMap {
   };
 
   /**
-   * @brief Plan (but do not apply) the host-code edits for a rel32 patch.
+   * @brief Plan (but do not apply) the host-code edits for a semantic patch.
    *
    * For every compiled block registered on the written page, check whether the
-   * guest range [Start, Start+Length) lies wholly inside one of its recorded
-   * rel32 immediate fields. If it does, that block MUST be patchable or the
-   * whole attempt is abandoned: leaving one copy of the branch stale would let
-   * a thread using that code buffer keep calling the old target.
+   * guest range [Start, Start+Length) is exactly one of its recorded patchable
+   * immediate fields -- the rel32 of a direct branch, or the immediate of a
+   * mov-immediate. If it is, that block MUST be patchable or the whole attempt
+   * is abandoned: leaving one copy stale would let a thread using that code
+   * buffer keep using the old value.
    *
    * NewBytes holds the Length bytes the guest store is about to write; the old
-   * and new branch targets are derived from the claiming site's current guest
-   * bytes overlaid with them. Guest memory is NOT touched here -- the caller
-   * performs the store only after every buffer has planned successfully.
+   * and new values are derived from the claiming site's current guest bytes
+   * overlaid with them. Guest memory is NOT touched here -- the caller performs
+   * the store only after every buffer has planned successfully.
    *
-   * *Reason receives a static audit tag whenever Decline is returned.
+   * *Reason receives a static audit tag whenever Decline is returned, and
+   * *Kind the shape ("rel32"/"movimm"/"mixed") whenever anything was Planned.
    *
    * Requires the read lock; the caller additionally holds the exclusive
    * CodeInvalidationMutex, which is what keeps the host code buffers alive.
    */
   SemanticPatchPlan PlanSemanticPatch(uint64_t Start, uint64_t Length, const uint8_t* NewBytes,
-                                      fextl::vector<FEXCore::SMC::WordPatch>& Out, const char** Reason,
+                                      fextl::vector<FEXCore::SMC::WordPatch>& Out, const char** Reason, const char** Kind,
                                       const LookupCacheBaseLockToken&) const {
     const uint64_t End = Start + Length;
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((End - 1) >> 12);
 
     auto Result = SemanticPatchPlan::NoCandidate;
+
+    // Claims of both shapes can land in one planning pass (two code buffers,
+    // or two blocks covering the same bytes); the audit line reports "mixed"
+    // rather than silently attributing the fault to one of them.
+    const auto NoteKind = [Kind](const char* K) {
+      if (*Kind == nullptr || ::strcmp(*Kind, K) == 0) {
+        *Kind = K;
+      } else {
+        *Kind = "mixed";
+      }
+    };
 
     for (auto it = lower; it != upper; it++) {
       for (const auto& EntryAddr : it->second) {
@@ -401,6 +422,29 @@ struct GuestToHostMap {
           }
         }
         if (!Claimed) {
+          // ... or as one of its mov-immediate fields?
+          switch (PlanMovImmPatch(Entry, Start, End, NewBytes, Out, Reason)) {
+          case SemanticPatchPlan::NoCandidate: continue;
+          case SemanticPatchPlan::Decline:     return SemanticPatchPlan::Decline;
+          case SemanticPatchPlan::Planned:
+            NoteKind("movimm");
+            Result = SemanticPatchPlan::Planned;
+            continue;
+          }
+
+          // Nothing in this block claims the write, but the block may still have
+          // TRANSLATED these guest bytes -- it can carry no metadata at all (a
+          // code-cache-loaded block, a block whose site table overflowed) or
+          // have decoded them at different instruction boundaries. Patching the
+          // other blocks while leaving this one live would make two translations
+          // of the same guest bytes disagree, with this one stuck on the old
+          // value forever, since the page deliberately stays protected. That is
+          // exactly what soundness note (b) forbids, so decline the whole
+          // attempt and let the normal invalidation path deal with it.
+          if (BlockTranslatedRange(Entry, Start, End)) {
+            *Reason = "unclaimed-cover";
+            return SemanticPatchPlan::Decline;
+          }
           continue;
         }
 
@@ -456,12 +500,161 @@ struct GuestToHostMap {
         if (NeedsWrite) {
           Out.push_back(Patch);
         }
+        NoteKind("rel32");
         Result = SemanticPatchPlan::Planned;
       }
     }
 
     return Result;
   }
+
+private:
+  /**
+   * @brief Does this block's translated guest extent overlap [Start, End)?
+   *
+   * Same JITCodeTail read RangeOverlapsCompiledCode uses, and equally
+   * conservative: an unknown extent answers yes.
+   */
+  bool BlockTranslatedRange(const BlockEntry& Entry, uint64_t Start, uint64_t End) const {
+    const auto* Header = reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeHeader*>(Entry.BlockBegin);
+    const auto* Tail = reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeTail*>(Entry.BlockBegin + Header->OffsetToBlockTail);
+    if (Tail->GuestSize == 0) {
+      return true;
+    }
+    return Tail->RIP < End && (Tail->RIP + Tail->GuestSize) > Start;
+  }
+
+  /**
+   * @brief The mov-immediate half of PlanSemanticPatch, for one block.
+   *
+   * Returns NoCandidate when this block does not claim the write, Planned when
+   * it does and yielded an unambiguous edit (appended to Out unless the value
+   * is unchanged), Decline when it claims it but cannot be patched.
+   *
+   * The claim is by containment, in either direction:
+   *   * the store lies wholly inside the immediate field -- a partial patch,
+   *     combined with the bytes already there (the rel32 rule); or
+   *   * the store covers the whole field, and every byte it writes OUTSIDE the
+   *     field is byte-identical to what is already there. This is the shape a
+   *     real patcher uses when it publishes `b8 <imm32> c3` with one 8-byte
+   *     store. A store that changes a byte outside the field is changing
+   *     instructions, not immediates: it is not claimed, and the caller falls
+   *     back to invalidation, which is what such a write deserves.
+   *
+   * Unlike the rel32 half, the host window is found by IDENTITY (the site index
+   * the frontend tagged the IR constant with), not by value; the value check is
+   * then a verification of the invariant rather than the lookup key. See the
+   * mov-immediate section of Interface/Core/SMCSemanticPatch.h for why value
+   * lookup would be unsound here.
+   */
+  SemanticPatchPlan PlanMovImmPatch(const BlockEntry& Entry, uint64_t Start, uint64_t End, const uint8_t* NewBytes,
+                                    fextl::vector<FEXCore::SMC::WordPatch>& Out, const char** Reason) const {
+    // Every site is examined, not just the first hit: a block whose decode
+    // visited the same guest instruction twice (a jump into the middle of an
+    // already-decoded run) holds two sites over the same bytes and two windows,
+    // and patching one of them would leave the other stale.
+    size_t ClaimedIndex = Entry.MovImmSites.size();
+    size_t Claims = 0;
+    for (size_t i = 0; i < Entry.MovImmSites.size(); ++i) {
+      const auto& Site = Entry.MovImmSites[i];
+      const uint64_t ImmEnd = Site.ImmStart + Site.ImmSize;
+
+      if (Start >= Site.ImmStart && End <= ImmEnd) {
+        ClaimedIndex = i;
+        ++Claims;
+        continue;
+      }
+
+      if (Start <= Site.ImmStart && End >= ImmEnd) {
+        bool OutsideUnchanged = true;
+        for (uint64_t Addr = Start; Addr < End; ++Addr) {
+          if (Addr >= Site.ImmStart && Addr < ImmEnd) {
+            continue;
+          }
+          if (*reinterpret_cast<const uint8_t*>(Addr) != NewBytes[Addr - Start]) {
+            OutsideUnchanged = false;
+            break;
+          }
+        }
+        if (!OutsideUnchanged) {
+          // The write reaches past this immediate and genuinely changes those
+          // bytes. Stop looking: no site may claim a write that rewrites
+          // instruction bytes.
+          return SemanticPatchPlan::NoCandidate;
+        }
+        ClaimedIndex = i;
+        ++Claims;
+        continue;
+      }
+    }
+
+    if (Claims == 0) {
+      return SemanticPatchPlan::NoCandidate;
+    }
+    if (Claims > 1) {
+      *Reason = "movimm-duplicate-site";
+      return SemanticPatchPlan::Decline;
+    }
+
+    const auto& Site = Entry.MovImmSites[ClaimedIndex];
+    const uint64_t ImmEnd = Site.ImmStart + Site.ImmSize;
+
+    // Old value from the bytes still in guest memory; new value from those same
+    // bytes with the part of the pending store that lands inside the field
+    // overlaid. Both zero-extended, matching DecodeMovImmSite.
+    const uint64_t OldValue = FEXCore::SMC::MovImmSiteValue(Site);
+    uint64_t NewValue = OldValue;
+    {
+      const uint64_t OverlapStart = Start > Site.ImmStart ? Start : Site.ImmStart;
+      const uint64_t OverlapEnd = End < ImmEnd ? End : ImmEnd;
+      ::memcpy(reinterpret_cast<uint8_t*>(&NewValue) + (OverlapStart - Site.ImmStart), NewBytes + (OverlapStart - Start),
+               OverlapEnd - OverlapStart);
+    }
+
+    // Exactly one window may belong to this site. Zero means the constant was
+    // never materialised as tagged (folded, rematerialised away, deleted as
+    // dead, or the dispatcher transformed the immediate); more than one means
+    // it was rematerialised into several windows, and patching one of them
+    // would leave the others stale.
+    const FEXCore::SMC::MovImmWindow* Window {};
+    size_t Windows = 0;
+    for (const auto& W : Entry.MovImmWindows) {
+      if (W.SiteIndex == ClaimedIndex) {
+        Window = &W;
+        ++Windows;
+      }
+    }
+    if (Windows != 1) {
+      *Reason = Windows == 0 ? "movimm-no-window" : "movimm-multi-window";
+      return SemanticPatchPlan::Decline;
+    }
+
+    FEXCore::SMC::WordPatch Patch {};
+    bool NeedsWrite = false;
+    switch (FEXCore::SMC::ClassifyRIPSite(Window->HostAddr, OldValue, NewValue, &Patch, &NeedsWrite)) {
+    case FEXCore::SMC::SiteMatch::NoMatch:
+      // The window does not currently hold the value the guest bytes say it
+      // should. The invariant is broken (a code buffer rotated under us, the
+      // constant was transformed on the way to the backend, ...), so nothing
+      // here is trustworthy.
+      *Reason = "movimm-stale-window";
+      return SemanticPatchPlan::Decline;
+    case FEXCore::SMC::SiteMatch::MultiWord:
+      // The new immediate would need two or more of the five window words
+      // rewritten, which cannot be published atomically to a thread executing
+      // the block. Typically a change in both 16-bit halves at once.
+      *Reason = "movimm-multiword";
+      return SemanticPatchPlan::Decline;
+    case FEXCore::SMC::SiteMatch::Patchable: break;
+    }
+
+    if (NeedsWrite) {
+      Out.push_back(Patch);
+    }
+    return SemanticPatchPlan::Planned;
+  }
+
+public:
 #endif // ARCHITECTURE_ppc64le
 
   void InvalidateRange(uint64_t Start, uint64_t Length) {
@@ -716,14 +909,15 @@ public:
   // Adds to Guest -> Host code mapping
   void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages,
                        void* HostCode, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0, uint64_t GuestHash = 0,
-                       const FEXCore::SMC::BranchImmSites& BranchImmSites = {}, const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {}) {
+                       const FEXCore::SMC::BranchImmSites& BranchImmSites = {}, const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {},
+                       const FEXCore::SMC::MovImmSites& MovImmSites = {}, const FEXCore::SMC::MovImmWindows& MovImmWindows = {}) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
     const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk, GuestRangeStart, GuestRangeLength, GuestHash,
-                                                BranchImmSites, ExitRIPSites);
+                                                BranchImmSites, ExitRIPSites, MovImmSites, MovImmWindows);
 
     // There is no need to update L1 or L2, they will get updated on first lookup
     // However, adding to L1 here increases performance

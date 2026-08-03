@@ -1193,6 +1193,24 @@ public:
     Multiblock = _Multiblock;
   }
 
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH). Called by ContextImpl::GenerateIR
+  // immediately before dispatching a guest instruction whose immediate field
+  // DecodeMovImmSite recognised, and cleared before every other instruction.
+  // While set, the one literal source that matches (PC, value, width) is
+  // materialised as an UNPOOLED constant tagged with SiteIndexPlusOne, giving
+  // the backend unambiguous provenance for the host window it emits.
+  // See Interface/Core/SMCSemanticPatch.h.
+  void SetPatchableImmSite(uint32_t SiteIndexPlusOne, uint64_t PC, uint64_t Value, uint32_t Size) {
+    PatchableImmSite = SiteIndexPlusOne;
+    PatchableImmPC = PC;
+    PatchableImmValue = Value;
+    PatchableImmSize = Size;
+  }
+
+  void ClearPatchableImmSite() {
+    PatchableImmSite = 0;
+  }
+
   static inline constexpr unsigned IndexNZCV(unsigned BitOffset) {
     switch (BitOffset) {
     case FEXCore::X86State::RFLAG_OF_RAW_LOC: return 28;
@@ -2483,6 +2501,14 @@ private:
   bool Multiblock {};
   bool Is64BitMode {};
   uint64_t Entry {};
+
+  // SMC Idea 4: the guest mov-immediate currently being translated, if any.
+  // PatchableImmSite == 0 (the state with the flag off, and between recognised
+  // instructions) disables the tagging path with a single predictable compare.
+  uint32_t PatchableImmSite {};
+  uint32_t PatchableImmSize {};
+  uint64_t PatchableImmPC {};
+  uint64_t PatchableImmValue {};
 
   // Set if mono hacks are enabled and the current block is the mono callsite backpatcher, in which case the
   // XCHG ops that would patch code are replaced with a hook that performs the write and manually invalidates

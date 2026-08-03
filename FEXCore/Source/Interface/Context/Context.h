@@ -362,8 +362,10 @@ public:
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
     // SMC Idea 4 (FEX_SMCSEMANTICPATCH): rel32 fields of the direct branches
-    // the frontend decoded into this block. Empty unless the flag is on.
+    // the frontend decoded into this block, and the immediate fields of its
+    // mov-immediates. Both empty unless the flag is on.
     FEXCore::SMC::BranchImmSites BranchImmSites;
+    FEXCore::SMC::MovImmSites MovImmSites;
   };
   [[nodiscard]]
   GenerateIRResult GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst);
@@ -375,6 +377,7 @@ public:
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
     FEXCore::SMC::BranchImmSites BranchImmSites;
+    FEXCore::SMC::MovImmSites MovImmSites;
   };
   [[nodiscard]]
   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);

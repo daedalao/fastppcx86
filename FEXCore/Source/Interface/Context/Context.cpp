@@ -91,10 +91,23 @@ bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, ui
     *Reason = "flag-off";
     return false;
   }
-  if (Length == 0 || Length > 4) {
-    // A store wider than the field itself cannot be contained by it; a
-    // zero-length write is nonsense. Either way, not our case.
+  if (Length == 0 || Length > 8) {
+    // A zero-length write is nonsense, and nothing wider than a doubleword can
+    // be a single guest immediate patch. (4 < Length <= 8 is meaningful only for
+    // the mov-immediate half: an 8-byte imm64, or an 8-byte store publishing a
+    // 4-byte immediate plus surrounding bytes it leaves unchanged. The rel32
+    // half's containment test rejects anything wider than its field on its own.)
     *Reason = "width";
+    return false;
+  }
+  if ((Start & FEXCore::Utils::FEX_PAGE_MASK) != ((Start + Length - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
+    // Planning reads the guest bytes around the written range to decide whether
+    // a covering store leaves them unchanged. Those reads are safe only because
+    // the range lies on one live, mapped code page; a store straddling a page
+    // boundary would have us dereference the neighbouring page, which may not be
+    // mapped at all -- inside a SIGSEGV handler. Such a store faults per page
+    // anyway, so this costs nothing real.
+    *Reason = "page-cross";
     return false;
   }
 
@@ -103,6 +116,9 @@ bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, ui
   // the branch pointing at the old target.
   fextl::vector<FEXCore::SMC::WordPatch> Patches;
   bool AnyCandidate = false;
+  // Which shape claimed the write, for the audit trace: "rel32", "movimm", or
+  // "mixed". Reported through *Reason on success.
+  const char* Kind = nullptr;
 
   {
     std::scoped_lock lk {CodeBufferListLock};
@@ -116,7 +132,7 @@ bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, ui
       it++;
 
       auto rlk = Strong->LookupCache->AcquireReadLock();
-      switch (Strong->LookupCache->PlanSemanticPatch(Start, Length, static_cast<const uint8_t*>(NewBytes), Patches, Reason, rlk)) {
+      switch (Strong->LookupCache->PlanSemanticPatch(Start, Length, static_cast<const uint8_t*>(NewBytes), Patches, Reason, &Kind, rlk)) {
       case GuestToHostMap::SemanticPatchPlan::NoCandidate: break;
       case GuestToHostMap::SemanticPatchPlan::Planned: AnyCandidate = true; break;
       case GuestToHostMap::SemanticPatchPlan::Decline: return false;
@@ -137,6 +153,7 @@ bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, ui
   for (const auto& Patch : Patches) {
     FEXCore::SMC::ApplyWordPatch(Patch);
   }
+  *Reason = Kind ? Kind : "rel32";
   return true;
 #else
   (void)Start;

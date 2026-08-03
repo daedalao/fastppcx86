@@ -4348,6 +4348,26 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
   auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage] = Options;
   AddressMode A = DecodeAddress(Op, Operand, AccessType, true /* IsLoad */);
 
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH): this literal is the immediate field of a
+  // guest mov-immediate the frontend wants to keep patchable. Emit it as an
+  // UNPOOLED constant tagged with the site index instead of letting
+  // LoadEffectiveAddress hand back a pooled one -- a pooled node can be shared
+  // with an unrelated use of the same value, and rewriting it at fault time
+  // would corrupt that user. All the guards are cheap and must all hold:
+  //   * a literal source, materialised (not loaded from) and not an address --
+  //     DecodeAddress leaves Base/Index/Segment empty for that case;
+  //   * the very instruction the frontend recognised (PC), and an immediate of
+  //     the width it recorded;
+  //   * the value LoadEffectiveAddress would have produced anyway.
+  // Anything else falls through to the unchanged path, which is always correct;
+  // the block then simply has no window for that site and declines at fault
+  // time. See Interface/Core/SMCSemanticPatch.h.
+  if (PatchableImmSite != 0 && Class == RegClass::GPR && Operand.IsLiteral() && !ForceLoad && Op->PC == PatchableImmPC &&
+      Operand.Data.Literal.Size == PatchableImmSize && !A.Base && !A.Index && !A.Segment &&
+      static_cast<uint64_t>(A.Offset) == PatchableImmValue) {
+    return _Constant(static_cast<int64_t>(PatchableImmValue), IR::ConstPad::NoPad, 0, PatchableImmSite);
+  }
+
   if (Operand.IsGPR()) {
     const auto gpr = Operand.Data.GPR.GPR;
     const auto highIndex = Operand.Data.GPR.HighBits ? 1 : 0;
@@ -4563,6 +4583,8 @@ void OpDispatchBuilder::ResetWorkingList() {
   CurrentCodeBlock = nullptr;
   RegCache.Written = 0;
   RegCache.Cached = 0;
+  // SMC Idea 4: never carry a patch-site tag across compilations.
+  PatchableImmSite = 0;
 }
 
 void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {

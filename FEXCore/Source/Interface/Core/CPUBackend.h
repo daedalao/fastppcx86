@@ -143,6 +143,11 @@ namespace CPU {
       // makes the block ineligible for semantic patching.
       // See Interface/Core/SMCSemanticPatch.h.
       FEXCore::SMC::ExitRIPSites ExitRIPSites;
+
+      // SMC Idea 4, mov-immediate half: the fixed-width windows this block
+      // materialised its tagged guest immediates into, each carrying the index
+      // of the MovImmSite it came from. Same population rules as above.
+      FEXCore::SMC::MovImmWindows MovImmWindows;
     };
 
     // Header that can live at the start of a JIT block.
