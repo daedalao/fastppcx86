@@ -599,6 +599,15 @@
           "Disables inline syscalls in order to support seccomp handling"
         ]
       },
+      "Reported_CPUs": {
+        "Type": "uint32",
+        "Default": "0",
+        "Desc": [
+          "Overrides the guest-visible CPU count returned by CPUID and sysconf.",
+          "Zero (default) reports the real host thread count. Clamped to 1..4096 in Source/Common/CPUInfo.cpp.",
+          "Useful for guests whose worker pools scale with the reported count and misbehave at high thread counts."
+        ]
+      },
       "ExtendedVolatileMetadata": {
         "Type": "str",
         "Default": "",

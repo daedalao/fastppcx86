@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+#include <FEXCore/Config/Config.h>
+#include <FEXCore/Utils/LogManager.h>
 #include <FEXHeaderUtils/Filesystem.h>
 
 #include <fmt/compile.h>
@@ -33,15 +35,13 @@ namespace FEX::CPUInfo {
 // address-space footprint, under control. Note taskset/affinity does NOT help
 // here, because this count feeds the emulated /proc/cpuinfo the guest reads.
 static uint32_t GetCPUCountOverride() {
-  const char* Env = getenv("FEX_REPORTED_CPUS");
-  if (!Env) {
-    return 0;
-  }
-  const uint32_t Value = std::strtoul(Env, nullptr, 10);
+  FEX_CONFIG_OPT(ReportedCPUs, REPORTED_CPUS);
+  const uint32_t Value = ReportedCPUs();
   // Clamp to something sane; 0 or garbage means "no override".
   if (Value == 0 || Value > 4096) {
     return 0;
   }
+  LogMan::Msg::IFmt("FEX_REPORTED_CPUS override active: reporting {} CPUs to guest", Value);
   return Value;
 }
 
