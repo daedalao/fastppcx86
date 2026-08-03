@@ -125,6 +125,16 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
 
   // Track atomic TSO emulation configuration.
   UpdateAtomicTSOEmulationConfig();
+
+  // SMC Idea 3: the code-granule bitmap exists purely to accelerate the SMC
+  // store fast paths, so it is gated on exactly the flags that consult it -- no
+  // new flag of its own. With all three off nothing is allocated and no reader
+  // ever looks at it. This must be decided here, before the first CodeBuffer
+  // (and therefore the first GuestToHostMap) is created; see the constructor in
+  // Interface/Core/LookupCache.cpp for why it can never be switched on later.
+  if (Config.SMCStoreEmulation() || Config.SMCStoreBackpatch() || Config.SMCSemanticPatch()) {
+    FEXCore::SMC::CodeGranuleTrackingEnabled.store(true, std::memory_order_release);
+  }
 }
 
 struct GetFrameBlockInfoResult {
@@ -1010,7 +1020,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     CodePages.reserve(BlockInfo->CodePages.size());
     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
     for (auto CodePage : BlockInfo->CodePages) {
-      const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      // SMC Idea 3: [StartAddr, StartAddr+Length) is the frontend's decoded
+      // guest span; passing it gives the granule bitmap 64-byte precision for
+      // this block instead of a whole-page mark. It MUST be recorded here,
+      // before MarkGuestExecutableRange below arms the page's write protection
+      // -- see the ordering argument in Interface/Core/SMCCodeGranules.h.
+      const bool NewPage =
+        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, StartAddr, Length);
       if (NewPage) {
         SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
       }
@@ -1148,7 +1164,12 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
   // becomes protected exactly when live code reappears on it.
   fextl::set<uint64_t> Entrypoints {GuestRIP};
   for (auto CodePage : Retained->CodePages) {
-    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+    // SMC Idea 3: re-set the granule bits the soft-invalidation cleared. The
+    // retained entry always carries a non-zero extent (SoftEraseBlock refuses
+    // to retain a block without one), so this is granule-precise, and it lands
+    // before MarkGuestExecutableRange re-arms the protection.
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(
+      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (NewPage) {
       SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
     }

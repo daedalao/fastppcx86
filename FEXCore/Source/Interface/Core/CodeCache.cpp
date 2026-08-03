@@ -811,6 +811,11 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
         Entrypoint += BinarySection.FileStartVA;
       }
 
+      // SMC Idea 3: no decoded guest extent survives serialization, so the
+      // default (0, 0) extent is passed and the granule bitmap marks the whole
+      // page as code. Conservative in the safe direction -- cache-loaded pages
+      // simply never take the store-emulation fast path, exactly as they do
+      // today.
       if (LookupCache.AddBlockExecutableRange(Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, WriteLock)) {
         CTX.SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
       }

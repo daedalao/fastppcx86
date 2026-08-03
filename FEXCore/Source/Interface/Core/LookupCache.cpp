@@ -14,11 +14,26 @@ $end_info$
 #include "Interface/Core/LookupCache.h"
 
 namespace FEXCore {
+namespace SMC {
+  // SMC Idea 3. Written once by ContextImpl's constructor before any CodeBuffer
+  // exists; read only by the GuestToHostMap constructor below.
+  std::atomic<bool> CodeGranuleTrackingEnabled {false};
+} // namespace SMC
+
 GuestToHostMap::GuestToHostMap()
   : BlockLinks_mbr {"FEXMem_BlockLinks"} {
   BlockLinks_pma = fextl::make_unique<std::pmr::polymorphic_allocator<std::byte>>(&BlockLinks_mbr);
   // Setup our PMR map.
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+
+  // SMC Idea 3: allocate the granule bitmap only if one of the SMC store fast
+  // paths that consults it is enabled. Enabling it here and nowhere else is
+  // load-bearing: a map that acquired blocks while untracked and then had
+  // tracking switched on would present an empty (all-clear) bitmap over live
+  // code, which is precisely the false negative the design forbids.
+  if (SMC::CodeGranuleTrackingEnabled.load(std::memory_order_acquire)) {
+    CodeGranules.Enable();
+  }
 }
 
 LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
@@ -108,6 +123,12 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // CodeBuffer that is being retired here, so they must not survive it.
   RetainedBlocks.clear();
   RetainedCodePages.clear();
+
+  // SMC Idea 3 CLEAR POINT (whole-cache). BlockList and RetainedBlocks are now
+  // empty, so no granule anywhere is backed by a live block. Leaves are zeroed
+  // rather than freed so a concurrent lock-free reader can never chase a
+  // dangling node; the memory is reclaimed when the CodeBuffer dies.
+  CodeGranules.ClearAll();
 }
 
 } // namespace FEXCore

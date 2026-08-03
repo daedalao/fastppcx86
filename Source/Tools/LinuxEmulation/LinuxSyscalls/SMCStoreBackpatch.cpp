@@ -444,6 +444,13 @@ namespace {
 extern "C" void FEXSMCBackpatchStoreHelper(FEXCore::Core::CpuStateFrame* Frame, uint64_t EA, uint64_t Value, uint64_t Width) {
   auto* Thread = Frame->Thread;
 
+  // SMC Idea 3: this query is now front-ended by the lock-free code-granule
+  // bitmap inside LookupCache::RangeOverlapsCompiledCode. A "provably clear"
+  // bitmap answer returns here in a few loads with no lock taken; anything else
+  // still runs the authoritative CodePages/BlockList walk under the read lock,
+  // whose verdict is final. Before that, this single call was 55% of all CPU on
+  // op4k's smcstorm/falseshare (~400us/call) while the pwrite it gates was 3%.
+  // See FEXCore/Source/Interface/Core/SMCCodeGranules.h.
   if (!Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, EA, Width)) {
     // MISS: pure data on a code page (false sharing).  pwrite through
     // /proc/self/mem writes past the read-only protection with FOLL_FORCE and

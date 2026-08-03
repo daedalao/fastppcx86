@@ -302,6 +302,12 @@ public:
     FEX_CONFIG_OPT(SMCCheapTierMaxInst, SMCCHEAPTIERMAXINST);
     FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
     FEX_CONFIG_OPT(SMCSemanticPatch, SMCSEMANTICPATCH);
+    // SMC Idea 3 uses these two only to decide whether to build the code-granule
+    // bitmap. Their policy still lives entirely in the Linux frontend
+    // (LinuxSyscalls/Syscalls.h); this is a read of the same options, not a new
+    // flag. See Interface/Core/SMCCodeGranules.h.
+    FEX_CONFIG_OPT(SMCStoreEmulation, SMCSTOREEMULATION);
+    FEX_CONFIG_OPT(SMCStoreBackpatch, SMCSTOREBACKPATCH);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
     FEX_CONFIG_OPT(GlobalJITNaming, GLOBALJITNAMING);

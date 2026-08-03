@@ -264,6 +264,12 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // Decide the overlap/patch question once, so it can be expressed inside
       // the existing else-if chain without evaluating it twice.
       const auto OverlapDeclines = [&]() -> bool {
+        // SMC Idea 3: same substitution as the backpatch helper -- the overlap
+        // query is front-ended by the lock-free code-granule bitmap inside
+        // LookupCache::RangeOverlapsCompiledCode, which can only answer
+        // "provably no code here"; every other answer falls through to the
+        // original locked CodePages/BlockList walk unchanged. See
+        // FEXCore/Source/Interface/Core/SMCCodeGranules.h.
         if (!Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
           // Pure false sharing: v1's case. Only SMCStoreEmulation may take it.
           if (_SyscallHandler->SMCStoreEmulation()) {

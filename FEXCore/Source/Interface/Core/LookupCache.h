@@ -2,6 +2,7 @@
 #pragma once
 #include "Interface/Context/Context.h"
 #include "Interface/Core/CPUBackend.h"
+#include "Interface/Core/SMCCodeGranules.h"
 #include <atomic>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
@@ -129,6 +130,13 @@ struct GuestToHostMap {
   // invalidation (munmap/mprotect/...) can purge them by address range.
   fextl::map<uint64_t, BlockEntry> RetainedBlocks;
   fextl::map<uint64_t, fextl::robin_set<uint64_t>> RetainedCodePages;
+
+  // SMC Idea 3: lock-free "does this guest range hold code?" accelerator for the
+  // SMC store fast paths. Mirrors (conservatively) the CodePages/BlockList
+  // content maintained above; consulted only as a fast negative gate, with
+  // RangeOverlapsCompiledCode below as the authoritative fallback.
+  // See Interface/Core/SMCCodeGranules.h.
+  FEXCore::SMC::CodeGranuleBitmap CodeGranules;
 
   GuestToHostMap();
 
@@ -286,6 +294,13 @@ struct GuestToHostMap {
     for (auto it = lower; it != upper; it++) {
       for (const auto& Entry : it->second) {
         SoftEraseBlock(Entry, lk);
+      }
+      // SMC Idea 3 CLEAR POINT (soft): the page's blocks just left BlockList,
+      // so no granule on it is backed by a live block anymore. A relink
+      // (Core.cpp TryRelinkSoftInvalidatedBlock) re-registers the page through
+      // AddBlockExecutableRange and re-sets the bits.
+      if (CodeGranules.Enabled()) {
+        CodeGranules.ClearPage(it->first << 12);
       }
     }
     CodePages.erase(lower, upper);
@@ -459,6 +474,11 @@ struct GuestToHostMap {
       for (const auto& Entry : it->second) {
         Erase(Entry, lk);
       }
+      // SMC Idea 3 CLEAR POINT (hard). Page-granular, matching the CodePages
+      // erase below. Never per-block: several blocks share a 64-byte granule.
+      if (CodeGranules.Enabled()) {
+        CodeGranules.ClearPage(it->first << 12);
+      }
     }
     CodePages.erase(lower, upper);
 
@@ -473,13 +493,25 @@ struct GuestToHostMap {
     BlockLinks->insert({{GuestDestination, HostLink}, delinker});
   }
 
-  bool AddBlockExecutableRange(const std::ranges::input_range auto& Addresses, uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken&) {
+  // SMC Idea 3 SET POINT. This is the single choke point through which a guest
+  // page becomes a tracked code page, so it is also where the granule bits go
+  // in. GuestRangeStart/GuestRangeLength describe the block's decoded guest
+  // extent; a zero length means "extent unknown" (cache-loaded blocks, custom
+  // IR, callers with no hash) and sets every granule of the page. Callers must
+  // invoke this BEFORE SyscallHandler::MarkGuestExecutableRange arms the page's
+  // write protection -- see the ordering argument in SMCCodeGranules.h.
+  bool AddBlockExecutableRange(const std::ranges::input_range auto& Addresses, uint64_t Start, uint64_t Length,
+                               const LookupCacheWriteLockToken&, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0) {
     bool rv = false;
 
     for (auto CurrentPage = Start >> 12, EndPage = (Start + Length - 1) >> 12; CurrentPage <= EndPage; CurrentPage++) {
       auto& CodePage = CodePages[CurrentPage];
       rv |= CodePage.empty();
       CodePage.insert(CodePage.end(), Addresses.begin(), Addresses.end());
+
+      if (CodeGranules.Enabled()) {
+        CodeGranules.SetPageRange(CurrentPage << 12, GuestRangeStart, GuestRangeLength);
+      }
     }
 
     return rv;
@@ -637,19 +669,39 @@ public:
 
   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
   // Returns true if new pages are marked as containing code
-  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, const fextl::set<uint64_t>& Addresses, uint64_t Start, uint64_t Length) {
+  // GuestRangeStart/GuestRangeLength: SMC Idea 3, the block's decoded guest
+  // extent. Zero length => the granule bitmap conservatively marks the whole
+  // page. See GuestToHostMap::AddBlockExecutableRange.
+  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, const fextl::set<uint64_t>& Addresses, uint64_t Start,
+                               uint64_t Length, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk);
+    return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk, GuestRangeStart, GuestRangeLength);
   }
 
   // SMC store-emulation support: does [Start, Start+Length) intersect any
-  // compiled block's guest bytes? Takes the shared read lock. See
-  // GuestToHostMap::RangeOverlapsCompiledCode for semantics.
+  // compiled block's guest bytes? See GuestToHostMap::RangeOverlapsCompiledCode
+  // for the authoritative semantics.
+  //
+  // SMC Idea 3 READER. Both consumers of this query --
+  // FEXSMCBackpatchStoreHelper (SMCStoreBackpatch.cpp) and HandleSegfault's v1
+  // fast path (SyscallsSMCTracking.cpp) -- reach it through
+  // ContextImpl::GuestRangeOverlapsCompiledCode, so the substitution is made
+  // once, here, rather than duplicated at both call sites where the two copies
+  // could drift apart. The bitmap is consulted WITHOUT taking the read lock; it
+  // may report false positives but never false negatives, so a "provably clear"
+  // answer is final and anything else falls through to the original locked map
+  // walk unchanged. Reading `Shared` unlocked is exactly what this function
+  // already did before touching the lock. See Interface/Core/SMCCodeGranules.h
+  // for the memory-ordering argument.
   bool RangeOverlapsCompiledCode(uint64_t Start, uint64_t Length) {
+    if (Shared->CodeGranules.ProvablyClear(Start, Length)) {
+      return false;
+    }
+
     auto lk = Shared->AcquireReadLock();
     return Shared->RangeOverlapsCompiledCode(Start, Length, lk);
   }
