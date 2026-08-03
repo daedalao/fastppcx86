@@ -214,7 +214,14 @@ public:
   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+  void SoftInvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+
+  // SMC v3: attempts to revalidate and re-publish a soft-invalidated block for
+  // this guest RIP. Returns its host code pointer on success, 0 if there is no
+  // retained block or its guest bytes changed. Must be called with
+  // CodeInvalidationMutex held (shared is enough; CompileBlock's lock).
+  uintptr_t TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP);
   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
     return CodeInvalidationMutex;
   }
@@ -289,6 +296,7 @@ public:
     FEX_CONFIG_OPT(SMCCheapTier, SMCCHEAPTIER);
     FEX_CONFIG_OPT(SMCCheapTierThreshold, SMCCHEAPTIERTHRESHOLD);
     FEX_CONFIG_OPT(SMCCheapTierMaxInst, SMCCHEAPTIERMAXINST);
+    FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
     FEX_CONFIG_OPT(GlobalJITNaming, GLOBALJITNAMING);

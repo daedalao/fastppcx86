@@ -285,6 +285,34 @@ public:
     after_callback(Start, Length);
   }
 
+  // SMC v3 (FEX_SMCSOFTINVALIDATE): identical lock protocol and call shape to
+  // the callback overload above -- ReleaseAllPendingSharedLocks, then
+  // ThreadCreationMutex, then the steal-capable exclusive CodeInvalidationMutex
+  // -- but retains the affected blocks' compiled code and content hashes so
+  // that a later dispatch can revalidate and relink them. The per-thread
+  // L1/L2 + CallRet-stack flush is the unmodified legacy one: soft-invalidated
+  // blocks must be unreachable from every fast path, only their code survives.
+  // See FEXCore/Source/Interface/Core/SMCSoftInvalidate.h.
+  void SoftInvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
+                                    FEXCore::Context::CodeRangeInvalidationFn after_callback) {
+    FEXCore::ReleaseAllPendingSharedLocks();
+    std::lock_guard lk(ThreadCreationMutex);
+
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
+    CTX->SoftInvalidateCodeBuffersCodeRange(Start, Length);
+    for (auto& Thread : Threads) {
+      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    }
+
+    after_callback(Start, Length);
+  }
+
   const fextl::vector<FEX::HLE::ThreadStateObject*>* GetThreads() const {
     return &Threads;
   }

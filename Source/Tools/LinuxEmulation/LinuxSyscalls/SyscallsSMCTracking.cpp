@@ -289,11 +289,22 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
           }
         }
       } while ((VMA = VMA->ResourceNextVMA));
+    } else if (_SyscallHandler->SMCSoftInvalidate()) {
+      // SMC v3: delink the page's blocks but keep their code and content
+      // hashes, then unprotect exactly as legacy does. The delink completes
+      // here, inside the handler, before the faulting store is retried -- that
+      // is what makes same-thread patch-then-call safe. See
+      // FEXCore/Source/Interface/Core/SMCSoftInvalidate.h.
+      // Restricted to private mappings for the same reason as the v1 fast path
+      // above: a shared mapping's blocks live under several mirrored VAs and
+      // the mirror walk stays on the proven legacy path.
+      _SyscallHandler->TM.SoftInvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     } else {
       _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
 
-    SMC_AUDIT("[%d] fault addr=%lx INVALIDATED page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase,
+    SMC_AUDIT("[%d] fault addr=%lx %s page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress,
+              (!Entry->second.Flags.Shared && _SyscallHandler->SMCSoftInvalidate()) ? "SOFT-INVALIDATED" : "INVALIDATED", FaultBase,
               Entry->second.Flags.Shared ? 1 : 0);
 
     // FEX_SMCMPROTECTDEFER: a deferred-dirty page can still fault here if a

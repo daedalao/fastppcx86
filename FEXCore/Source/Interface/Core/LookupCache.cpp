@@ -103,6 +103,11 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
   // All code is gone, clear the block list
   BlockList.clear();
+
+  // SMC v3: retained (soft-invalidated) entries point at host code in the
+  // CodeBuffer that is being retired here, so they must not survive it.
+  RetainedBlocks.clear();
+  RetainedCodePages.clear();
 }
 
 } // namespace FEXCore

@@ -442,6 +442,18 @@
           "\tfull: Validate code before every run (slow)"
         ]
       },
+      "SMCSoftInvalidate": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "SMC v3: on an SMC write fault, soft-invalidate the page's blocks",
+          "(delink from the lookup caches and sever inbound block links) while",
+          "retaining their compiled code and a hash of their guest source",
+          "bytes, instead of discarding them. The next dispatch of an affected",
+          "block re-hashes the guest bytes and relinks it if unchanged, and",
+          "only recompiles genuinely modified blocks. Off: legacy behaviour."
+        ]
+      },
       "SMCStoreEmulation": {
         "Type": "bool",
         "Default": "false",

@@ -16,6 +16,7 @@ $end_info$
 #include "Interface/Core/ArchHelpers/Arm64Emitter.h"
 #endif
 #include "Interface/Core/LookupCache.h"
+#include "Interface/Core/SMCSoftInvalidate.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/CPUID.h"
 #include "Interface/Core/Frontend.h"
@@ -901,6 +902,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return HostCode;
   }
 
+  // SMC v3: the lookup miss may be a soft-invalidated block whose guest bytes
+  // never actually changed. Revalidating by hash costs microseconds where a
+  // recompile costs tens. See Interface/Core/SMCSoftInvalidate.h.
+  // Runs under this function's shared CodeInvalidationMutex, which is what
+  // makes it mutually exclusive with any concurrent (soft-)invalidation.
+  if (Config.SMCSoftInvalidate()) {
+    if (auto HostCode = TryRelinkSoftInvalidatedBlock(Thread, GuestRIP)) {
+      return HostCode;
+    }
+  }
+
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
@@ -980,13 +992,24 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+  // SMC v3: record a content hash of the block's guest source bytes so a later
+  // soft-invalidation of this block can be undone by revalidation instead of a
+  // recompile. [StartAddr, StartAddr+Length) is the frontend's decoded span;
+  // HashGuestBlock only hashes the parts of it that lie in CodePages.
+  uint64_t GuestHash = 0;
+  uint64_t HashedRangeLength = 0;
+  if (Config.SMCSoftInvalidate() && FEXCore::SMC::IsHashableBlock(Length, CodePages.size())) {
+    HashedRangeLength = Length;
+    GuestHash = FEXCore::SMC::HashGuestBlock(CodePages, StartAddr, Length);
+  }
+
   // Insert to lookup cache
 
   // BlockBegin is shared across all EntryPoints of a single CompiledCode
   // (each block has one begin, potentially multiple entry points).
   const uint64_t BlockBegin = reinterpret_cast<uintptr_t>(CompiledCode.BlockBegin);
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr);
+    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr, StartAddr, HashedRangeLength, GuestHash);
   }
 
   if (CodeMapWriter) {
@@ -1042,6 +1065,64 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   while (it != CodeBufferList.end()) {
     if (auto Strong = it->lock()) {
       Strong->LookupCache->InvalidateRange(Start, Length);
+      it++;
+    } else {
+      it = CodeBufferList.erase(it);
+    }
+  }
+}
+
+uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+  // Called from CompileBlock, which holds CodeInvalidationMutex shared. That is
+  // load-bearing: it excludes every (soft-)invalidation for the duration, so a
+  // retained entry taken here cannot be concurrently purged by a munmap.
+  auto Retained = Thread->LookupCache->TakeRetainedBlock(GuestRIP);
+  if (!Retained) {
+    return 0;
+  }
+
+  const uint64_t CurrentHash = FEXCore::SMC::HashGuestBlock(Retained->CodePages, Retained->GuestRangeStart, Retained->GuestRangeLength);
+  if (CurrentHash != Retained->GuestHash) {
+    // Genuinely modified: drop the metadata (the host code stays in the
+    // CodeBuffer for any thread still executing it, exactly as legacy
+    // invalidation leaves it) and let the caller compile a fresh block.
+    if (SMCAuditCompileFD() >= 0) {
+      dprintf(SMCAuditCompileFD(), "relink-miss rip=%lx\n", GuestRIP);
+    }
+    return 0;
+  }
+
+  // Unchanged: re-publish. Registering the code pages again re-arms mtrack's
+  // write protection through the same path a fresh compile uses, so the page
+  // becomes protected exactly when live code reappears on it.
+  fextl::set<uint64_t> Entrypoints {GuestRIP};
+  for (auto CodePage : Retained->CodePages) {
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+    if (NewPage) {
+      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+    }
+  }
+
+  Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, Retained->BlockBegin, Retained->CodePages,
+                                       reinterpret_cast<void*>(Retained->HostCode), Retained->GuestRangeStart, Retained->GuestRangeLength,
+                                       Retained->GuestHash);
+
+  if (SMCAuditCompileFD() >= 0) {
+    dprintf(SMCAuditCompileFD(), "relink rip=%lx host=%lx pages=%zu\n", GuestRIP, Retained->HostCode, Retained->CodePages.size());
+  }
+
+  return Retained->HostCode;
+}
+
+void ContextImpl::SoftInvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+  FEXCORE_PROFILE_SCOPED("SoftInvalidateCodeBuffersCodeRange");
+
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  std::scoped_lock lk {CodeBufferListLock};
+  auto it = CodeBufferList.begin();
+  while (it != CodeBufferList.end()) {
+    if (auto Strong = it->lock()) {
+      Strong->LookupCache->SoftInvalidateRange(Start, Length);
       it++;
     } else {
       it = CodeBufferList.erase(it);

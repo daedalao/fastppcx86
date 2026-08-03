@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <stddef.h>
+#include <optional>
 #include <utility>
 #include <mutex>
 
@@ -95,23 +96,45 @@ struct GuestToHostMap {
     // it explicitly rather than assuming.
     uint64_t BlockBegin;
     fextl::vector<uint64_t> CodePages;
+
+    // SMC v3 (FEX_SMCSOFTINVALIDATE): content hash of the block's guest source
+    // bytes plus the guest extent it was taken over. GuestRangeLength == 0
+    // means "no hash recorded" (code-cache-loaded blocks, custom IR, blocks
+    // with no tracked code pages, flag off) and makes the block ineligible for
+    // soft-invalidation -- it takes the legacy hard-invalidate path instead.
+    // See Interface/Core/SMCSoftInvalidate.h for the full design note.
+    uint64_t GuestRangeStart = 0;
+    uint64_t GuestRangeLength = 0;
+    uint64_t GuestHash = 0;
   };
 
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
 
+  // SMC v3: blocks that have been soft-invalidated. Their host code is still
+  // live in the CodeBuffer and their metadata is intact, but they are absent
+  // from BlockList/L1/L2 so every dispatch of them misses into CompileBlock,
+  // which re-hashes and either relinks or recompiles them.
+  // RetainedCodePages mirrors CodePages for these entries so that a later hard
+  // invalidation (munmap/mprotect/...) can purge them by address range.
+  fextl::map<uint64_t, BlockEntry> RetainedBlocks;
+  fextl::map<uint64_t, fextl::robin_set<uint64_t>> RetainedCodePages;
+
   GuestToHostMap();
 
   // Adds to Guest -> Host code mapping
   const BlockEntry& AddBlockMapping(uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages, void* HostCode,
-                                    const LookupCacheWriteLockToken&) {
+                                    const LookupCacheWriteLockToken&, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0,
+                                    uint64_t GuestHash = 0) {
     // This may replace an existing mapping
     // NOTE: Generally no previous entry should exist, however there is one exception:
     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
     //       may already contain the block address. Since is comparatively rare, we'll just leak
     //       one of the two blocks in this case.
-    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages}).first->second;
+    return BlockList
+      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages, GuestRangeStart, GuestRangeLength, GuestHash})
+      .first->second;
   }
 
   const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
@@ -122,16 +145,139 @@ struct GuestToHostMap {
     return &HostCode->second;
   }
 
-  bool Erase(uint64_t Address, const LookupCacheWriteLockToken&) {
-    // Sever any links to this block
+  // Runs the delinker for every direct (dispatch-bypassing) block link that
+  // targets this guest address, so no other block can branch straight into its
+  // host code anymore. Factored out of Erase so soft-invalidation can reuse the
+  // exact same severing behaviour.
+  void SeverBlockLinks(uint64_t Address) {
     auto lower = BlockLinks->lower_bound({Address, nullptr});
     auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
     for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
       it->second(it->first.HostLink);
     }
+  }
+
+  bool Erase(uint64_t Address, const LookupCacheWriteLockToken&) {
+    // Sever any links to this block
+    SeverBlockLinks(Address);
 
     // Remove from BlockList
     return BlockList.erase(Address) != 0;
+  }
+
+  // --- SMC v3 soft-invalidate -----------------------------------------------
+  // All of these require the write lock to be held (token parameter enforces on
+  // the public entry points; the *Locked helpers are called from them).
+
+  void DropRetainedBlockLocked(uint64_t Address) {
+    auto it = RetainedBlocks.find(Address);
+    if (it == RetainedBlocks.end()) {
+      return;
+    }
+
+    for (uint64_t Page : it->second.CodePages) {
+      auto PageIt = RetainedCodePages.find(Page >> 12);
+      if (PageIt != RetainedCodePages.end()) {
+        PageIt->second.erase(Address);
+        if (PageIt->second.empty()) {
+          RetainedCodePages.erase(PageIt);
+        }
+      }
+    }
+
+    RetainedBlocks.erase(it);
+  }
+
+  // Removes a block from the lookup structures without discarding its compiled
+  // code: severs inbound links, moves the entry into the retained table, and
+  // erases it from BlockList so every dispatch misses into CompileBlock.
+  // Blocks that carry no content hash cannot be revalidated and are simply
+  // erased, exactly like legacy invalidation.
+  void SoftEraseBlock(uint64_t Address, const LookupCacheWriteLockToken&) {
+    auto BlockIt = BlockList.find(Address);
+    if (BlockIt == BlockList.end()) {
+      return;
+    }
+
+    SeverBlockLinks(Address);
+
+    if (BlockIt->second.GuestRangeLength == 0 || BlockIt->second.CodePages.empty()) {
+      BlockList.erase(Address);
+      return;
+    }
+
+    // Drop any older retained copy first so the page index stays consistent.
+    DropRetainedBlockLocked(Address);
+
+    for (uint64_t Page : BlockIt->second.CodePages) {
+      RetainedCodePages[Page >> 12].insert(Address);
+    }
+    RetainedBlocks.insert_or_assign(Address, std::move(BlockIt->second));
+    BlockList.erase(Address);
+  }
+
+  // Removes retained entries whose guest code pages intersect the range. Called
+  // from every hard invalidation so that unmapped/remapped/reprotected guest
+  // memory can never be revalidated against a stale hash.
+  void DropRetainedRange(uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken&) {
+    if (RetainedCodePages.empty()) {
+      return;
+    }
+
+    auto lower = RetainedCodePages.lower_bound(Start >> 12);
+    auto upper = RetainedCodePages.upper_bound((Start + Length - 1) >> 12);
+
+    fextl::vector<uint64_t> Doomed;
+    for (auto it = lower; it != upper; ++it) {
+      Doomed.insert(Doomed.end(), it->second.begin(), it->second.end());
+    }
+
+    // DropRetainedBlockLocked mutates RetainedCodePages, hence the two passes.
+    for (uint64_t Address : Doomed) {
+      DropRetainedBlockLocked(Address);
+    }
+  }
+
+  // Hands the retained entry for this address (if any) to the caller and
+  // removes it from the retained table. The caller (ContextImpl::CompileBlock)
+  // either re-publishes it after a successful hash check, or drops it on the
+  // floor and compiles a fresh block.
+  std::optional<BlockEntry> TakeRetainedBlock(uint64_t Address, const LookupCacheWriteLockToken&) {
+    auto it = RetainedBlocks.find(Address);
+    if (it == RetainedBlocks.end()) {
+      return std::nullopt;
+    }
+
+    BlockEntry Out = std::move(it->second);
+    RetainedBlocks.erase(it);
+
+    for (uint64_t Page : Out.CodePages) {
+      auto PageIt = RetainedCodePages.find(Page >> 12);
+      if (PageIt != RetainedCodePages.end()) {
+        PageIt->second.erase(Address);
+        if (PageIt->second.empty()) {
+          RetainedCodePages.erase(PageIt);
+        }
+      }
+    }
+
+    return Out;
+  }
+
+  // Soft-invalidate every block registered on the pages covering the range.
+  // Mirrors InvalidateRange, but retains instead of erasing.
+  void SoftInvalidateRange(uint64_t Start, uint64_t Length) {
+    auto lk = AcquireWriteLock();
+
+    auto lower = CodePages.lower_bound(Start >> 12);
+    auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
+
+    for (auto it = lower; it != upper; it++) {
+      for (const auto& Entry : it->second) {
+        SoftEraseBlock(Entry, lk);
+      }
+    }
+    CodePages.erase(lower, upper);
   }
 
   // Returns true if any *compiled block's guest bytes* intersect
@@ -185,6 +331,11 @@ struct GuestToHostMap {
       }
     }
     CodePages.erase(lower, upper);
+
+    // A hard invalidation supersedes any pending soft-invalidation of the same
+    // guest memory: the bytes may be about to be unmapped or reused, so their
+    // retained metadata (and the hash that would revalidate it) must go too.
+    DropRetainedRange(Start, Length, lk);
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
@@ -373,15 +524,22 @@ public:
     return Shared->RangeOverlapsCompiledCode(Start, Length, lk);
   }
 
+  // SMC v3: take the retained (soft-invalidated) entry for this guest address,
+  // if one exists. See Interface/Core/SMCSoftInvalidate.h.
+  std::optional<GuestToHostMap::BlockEntry> TakeRetainedBlock(uint64_t Address) {
+    auto lk = Shared->AcquireWriteLock();
+    return Shared->TakeRetainedBlock(Address, lk);
+  }
+
   // Adds to Guest -> Host code mapping
   void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages,
-                       void* HostCode) {
+                       void* HostCode, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0, uint64_t GuestHash = 0) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk);
+    const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk, GuestRangeStart, GuestRangeLength, GuestHash);
 
     // There is no need to update L1 or L2, they will get updated on first lookup
     // However, adding to L1 here increases performance

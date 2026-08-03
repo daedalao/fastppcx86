@@ -142,6 +142,11 @@ public:
 
   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+  // SMC v3 (FEX_SMCSOFTINVALIDATE): like InvalidateCodeBuffersCodeRange, but
+  // retains the compiled code and its guest-content hash so that a later
+  // dispatch can revalidate and relink it instead of recompiling. See
+  // FEXCore/Source/Interface/Core/SMCSoftInvalidate.h.
+  FEX_DEFAULT_VISIBILITY virtual void SoftInvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
