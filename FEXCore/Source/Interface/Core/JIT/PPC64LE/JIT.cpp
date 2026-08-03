@@ -1914,7 +1914,19 @@ bypass_diagnose:
     HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
   }
   if (!HostCode) {
+    // Snapshot the code buffer we would be publishing into. CompileBlock can
+    // rotate to a fresh buffer if the current one fills up; the LookupCache
+    // it publishes to lives on the buffer, so a rotation invalidates the
+    // pointer we hold. If that happened, return the freshly-compiled
+    // HostCode without registering any link/publish on top of it — the new
+    // LookupCache is a clean slate and the old buffer's HostCode is still
+    // valid for the caller's immediate dispatch, but must not be recorded.
+    // Mirrors Arm64Emitter's ExitFunctionLink at JIT/JIT.cpp:548-555.
+    auto CodeBuffer = static_cast<PPC64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
     HostCode = CTX->CompileBlock(Frame, GuestRIP, 0);
+    if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+      return HostCode;
+    }
   }
   return HostCode;
 }
