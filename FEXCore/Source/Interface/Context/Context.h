@@ -230,6 +230,7 @@ public:
 
   bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
   bool GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+  bool TrySemanticPatchCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) override;
 
   ///// Cheap compile tier for churn arenas (FEX_SMCCHEAPTIER) /////
   //
@@ -297,6 +298,7 @@ public:
     FEX_CONFIG_OPT(SMCCheapTierThreshold, SMCCHEAPTIERTHRESHOLD);
     FEX_CONFIG_OPT(SMCCheapTierMaxInst, SMCCHEAPTIERMAXINST);
     FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
+    FEX_CONFIG_OPT(SMCSemanticPatch, SMCSEMANTICPATCH);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
     FEX_CONFIG_OPT(GlobalJITNaming, GLOBALJITNAMING);
@@ -350,6 +352,9 @@ public:
     uint64_t StartAddr;
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
+    // SMC Idea 4 (FEX_SMCSEMANTICPATCH): rel32 fields of the direct branches
+    // the frontend decoded into this block. Empty unless the flag is on.
+    FEXCore::SMC::BranchImmSites BranchImmSites;
   };
   [[nodiscard]]
   GenerateIRResult GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst);
@@ -360,6 +365,7 @@ public:
     uint64_t StartAddr;
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
+    FEXCore::SMC::BranchImmSites BranchImmSites;
   };
   [[nodiscard]]
   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);

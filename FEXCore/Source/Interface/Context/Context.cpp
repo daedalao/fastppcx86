@@ -67,6 +67,72 @@ bool FEXCore::Context::ContextImpl::GuestRangeOverlapsCompiledCode(FEXCore::Core
   return Thread->LookupCache->RangeOverlapsCompiledCode(Start, Length);
 }
 
+// SMC Idea 4 (FEX_SMCSEMANTICPATCH). See Interface/Core/SMCSemanticPatch.h for
+// the design, the PPC64LE exit-structure analysis, and the soundness argument.
+bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
+#ifdef ARCHITECTURE_ppc64le
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+
+  if (!Config.SMCSemanticPatch()) {
+    *Reason = "flag-off";
+    return false;
+  }
+  if (Length == 0 || Length > 4) {
+    // A store wider than the field itself cannot be contained by it; a
+    // zero-length write is nonsense. Either way, not our case.
+    *Reason = "width";
+    return false;
+  }
+
+  // Two phases over every code buffer: plan everything first, apply only if no
+  // buffer declined. A partially applied patch would leave one thread's copy of
+  // the branch pointing at the old target.
+  fextl::vector<FEXCore::SMC::WordPatch> Patches;
+  bool AnyCandidate = false;
+
+  {
+    std::scoped_lock lk {CodeBufferListLock};
+    auto it = CodeBufferList.begin();
+    while (it != CodeBufferList.end()) {
+      auto Strong = it->lock();
+      if (!Strong) {
+        it = CodeBufferList.erase(it);
+        continue;
+      }
+      it++;
+
+      auto rlk = Strong->LookupCache->AcquireReadLock();
+      switch (Strong->LookupCache->PlanSemanticPatch(Start, Length, static_cast<const uint8_t*>(NewBytes), Patches, Reason, rlk)) {
+      case GuestToHostMap::SemanticPatchPlan::NoCandidate: break;
+      case GuestToHostMap::SemanticPatchPlan::Planned: AnyCandidate = true; break;
+      case GuestToHostMap::SemanticPatchPlan::Decline: return false;
+      }
+    }
+  }
+
+  if (!AnyCandidate) {
+    // Nothing compiled claims this write as a branch immediate. It may not even
+    // overlap code -- the SMCStoreEmulation fast path above us handles that
+    // case; here it just means "not a recognised patch".
+    *Reason = "no-claiming-block";
+    return false;
+  }
+
+  // Publish. Each entry is one naturally-aligned instruction word plus the
+  // tree's existing code-publication sequence.
+  for (const auto& Patch : Patches) {
+    FEXCore::SMC::ApplyWordPatch(Patch);
+  }
+  return true;
+#else
+  (void)Start;
+  (void)Length;
+  (void)NewBytes;
+  *Reason = "not-ppc64le";
+  return false;
+#endif
+}
+
 // Cheap compile tier (FEX_SMCCHEAPTIER); see the comment on SMCPageCounters.
 namespace {
 // An invalidation this large is a mapping being torn down or replaced, not

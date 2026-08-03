@@ -1269,6 +1269,41 @@ void PPC64JITCore::InsertGuestRIPMove(GPR Reg, uint64_t Constant) {
   Relocations.emplace_back(Reloc);
 }
 
+// SMC Idea 4: see JITClass.h. Records the emitted window so the fault handler
+// can repatch it, and (flag on only) verifies that SMCSemanticPatch.h's
+// dependency-free re-encoder still agrees with the emitter byte for byte --
+// the whole scheme rests on synthesizing an identical 20-byte window, so any
+// future change to LoadImm64Fixed must fail here rather than silently turn
+// every fault-time match into a miss.
+void PPC64JITCore::InsertExitRIPMove(GPR Reg, uint64_t Constant) {
+  if (!CTX->Config.SMCSemanticPatch()) {
+    InsertGuestRIPMove(Reg, Constant);
+    return;
+  }
+
+  auto* Window = GetCursorAddress<uint8_t*>();
+  InsertGuestRIPMove(Reg, Constant);
+
+  [[maybe_unused]] uint32_t Expected[FEXCore::SMC::kRIPWindowWords];
+  FEXCore::SMC::SynthesizeRIPWindow(Reg.idx, Constant, Expected);
+  LOGMAN_THROW_A_FMT(::memcmp(Window, Expected, FEXCore::SMC::kRIPWindowBytes) == 0,
+                     "SMCSemanticPatch::SynthesizeRIPWindow disagrees with LoadImm64Fixed for {:#x}", Constant);
+
+  if (CodeData.ExitRIPSites.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
+    // Over the cap: drop the whole table so the block is ineligible rather than
+    // partially described (a partial table would let the handler conclude "this
+    // branch has no constant exit" and decline for the wrong reason -- or worse,
+    // match a different site).
+    CodeData.ExitRIPSites.clear();
+    ExitRIPSitesOverflowed = true;
+    return;
+  }
+  if (ExitRIPSitesOverflowed) {
+    return;
+  }
+  CodeData.ExitRIPSites.push_back({reinterpret_cast<uint64_t>(Window)});
+}
+
 // -------------------------------------------------------------------------
 // Condition code mapping
 // -------------------------------------------------------------------------
@@ -2620,6 +2655,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             CB->UsableSize() - CodeBuffers.LatestOffset);
 
   CodeData = {};
+  ExitRIPSitesOverflowed = false;
   CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
 
   // -------------------------------------------------------------------------

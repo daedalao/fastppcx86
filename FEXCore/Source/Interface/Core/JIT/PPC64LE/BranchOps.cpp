@@ -104,7 +104,11 @@ DEF_OP(ExitFunction) {
     // a code cache saved in one ASLR session and loaded in another would jump
     // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
     // the 32-bit mask so the recorded value matches the emitted immediate.
-    InsertGuestRIPMove(TMP1, NewRIP);
+    // SMC Idea 4: this is the ONLY guest-RIP constant the semantic-patch fault
+    // handler is allowed to rewrite, so it is the only one recorded. Identical
+    // to InsertGuestRIPMove with the flag off.
+    // See Interface/Core/SMCSemanticPatch.h.
+    InsertExitRIPMove(TMP1, NewRIP);
     RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);

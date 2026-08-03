@@ -8,6 +8,8 @@ $end_info$
 
 #pragma once
 
+#include "Interface/Core/SMCSemanticPatch.h"
+
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <atomic>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -118,6 +120,14 @@ namespace CPU {
       fextl::map<uint64_t, uint8_t*> EntryPoints;
       // The total size of the codeblock from [BlockBegin, BlockBegin+Size).
       size_t Size;
+
+      // SMC Idea 4 (FEX_SMCSEMANTICPATCH): host addresses of the fixed-width
+      // guest-RIP materialisation windows this block's ExitFunctions emitted
+      // for compile-time-constant destinations. Populated by the PPC64LE
+      // backend only, and only when the flag is on; empty otherwise, which
+      // makes the block ineligible for semantic patching.
+      // See Interface/Core/SMCSemanticPatch.h.
+      FEXCore::SMC::ExitRIPSites ExitRIPSites;
     };
 
     // Header that can live at the start of a JIT block.

@@ -313,6 +313,32 @@ public:
     after_callback(Start, Length);
   }
 
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH): same lock protocol as
+  // SoftInvalidateGuestCodeRange above -- ReleaseAllPendingSharedLocks, then
+  // ThreadCreationMutex, then the steal-capable exclusive CodeInvalidationMutex
+  // -- but instead of invalidating anything it rewrites the destination RIP
+  // baked into the affected blocks' translated exits. Holding the exclusive
+  // CodeInvalidationMutex is what makes writing into a live code buffer from
+  // the SIGSEGV handler safe: it excludes ClearCodeCache and every concurrent
+  // compile. Nothing is delinked, no per-thread L1/L2 flush is needed (the
+  // blocks stay valid), and the page is left write-protected by the caller.
+  // Returns false with *Reason set if the write is not a recognised patch, in
+  // which case nothing was modified. See
+  // FEXCore/Source/Interface/Core/SMCSemanticPatch.h.
+  bool SemanticPatchGuestCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
+    FEXCore::ReleaseAllPendingSharedLocks();
+    std::lock_guard lk(ThreadCreationMutex);
+
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
+    return CTX->TrySemanticPatchCodeRange(Start, Length, NewBytes, Reason);
+  }
+
   const fextl::vector<FEX::HLE::ThreadStateObject*>* GetThreads() const {
     return &Threads;
   }

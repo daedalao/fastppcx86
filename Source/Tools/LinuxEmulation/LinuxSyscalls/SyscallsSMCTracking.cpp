@@ -230,7 +230,15 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // "the overlap test is too coarse" (fixable, Idea 3) from "the store form
     // isn't decoded" (fixable, widen the decoder) from "these are all shared
     // mappings" (out of scope for v1).
-    if (_SyscallHandler->SMCStoreEmulation()) {
+    // SMC Idea 4 (FEX_SMCSEMANTICPATCH) shares this decode and this store
+    // emulation, but applies where v1 gives up: when the written bytes DO
+    // overlap compiled code and are exactly the rel32 field of a direct branch.
+    // It repatches the destination RIP baked into every affected block's
+    // translated exit and then lets the store through with the page still
+    // protected -- no invalidation, no recompile. Independent flag: either
+    // option alone enables its own half of the "emulate the store" outcome.
+    // See FEXCore/Source/Interface/Core/SMCSemanticPatch.h.
+    if (_SyscallHandler->SMCStoreEmulation() || _SyscallHandler->SMCSemanticPatch()) {
       const uint64_t StorePC = ArchHelpers::Context::GetPc(ucontext);
       const uint32_t RawInsn = *reinterpret_cast<const uint32_t*>(StorePC);
       DecodedStore Store {};
@@ -239,6 +247,47 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       const auto Fallback = [&](const char* Reason, uint64_t EA, uint32_t Width) {
         SMC_AUDIT("[%d] fault addr=%lx SMC-FALLBACK reason=%s ea=%lx w=%u insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress, Reason, EA,
                   Width, RawInsn);
+      };
+
+      // Set when the overlap test says "this is a write into live code" and the
+      // semantic patcher then successfully rewrote the translated exits; the
+      // store emulation below is then the completion of that patch rather than
+      // the false-sharing fast path.
+      bool SemanticPatched = false;
+
+      // Decide the overlap/patch question once, so it can be expressed inside
+      // the existing else-if chain without evaluating it twice.
+      const auto OverlapDeclines = [&]() -> bool {
+        if (!Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
+          // Pure false sharing: v1's case. Only SMCStoreEmulation may take it.
+          if (_SyscallHandler->SMCStoreEmulation()) {
+            return false;
+          }
+          Fallback("storeemulation-off", Store.EA, Store.Width);
+          return true;
+        }
+
+        if (!_SyscallHandler->SMCSemanticPatch()) {
+          Fallback("overlaps-code", Store.EA, Store.Width);
+          return true;
+        }
+
+        // The bytes this store is about to write, in guest order. Store.Value
+        // is the source register; only the low Width bytes are written, and
+        // ppc64le is little-endian so they are already in place.
+        uint8_t NewBytes[8];
+        ::memcpy(NewBytes, &Store.Value, sizeof(NewBytes));
+
+        const char* PatchReason = "unknown";
+        if (!_SyscallHandler->TM.SemanticPatchGuestCodeRange(Store.EA, Store.Width, NewBytes, &PatchReason)) {
+          SMC_AUDIT("[%d] fault addr=%lx SEMPATCH-DECLINE reason=%s ea=%lx w=%u insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress,
+                    PatchReason, Store.EA, Store.Width, RawInsn);
+          Fallback("overlaps-code", Store.EA, Store.Width);
+          return true;
+        }
+
+        SemanticPatched = true;
+        return false;
       };
 
       if (Entry->second.Flags.Shared) {
@@ -251,8 +300,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // The decoded target must include the faulting address, or we decoded
         // an instruction whose fault this isn't (paranoia; mismatch => legacy).
         Fallback("fault-outside-store", Store.EA, Store.Width);
-      } else if (Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
-        Fallback("overlaps-code", Store.EA, Store.Width);
+      } else if (OverlapDeclines()) {
+        // Audit line already emitted by the lambda.
       } else if (SelfMemFD() < 0) {
         Fallback("selfmem-open-fail", Store.EA, Store.Width);
       } else if (::pwrite(SelfMemFD(), &Store.Value, Store.Width, static_cast<off_t>(Store.EA)) != static_cast<ssize_t>(Store.Width)) {
@@ -262,7 +311,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
           ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
         }
         ArchHelpers::Context::SetPc(ucontext, StorePC + 4);
-        SMC_AUDIT("[%d] fault addr=%lx EMULATED-STORE ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, Store.EA, Store.Width);
+        SMC_AUDIT("[%d] fault addr=%lx %s ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress,
+                  SemanticPatched ? "SEMANTIC-PATCH" : "EMULATED-STORE", Store.EA, Store.Width);
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
         return true;
       }

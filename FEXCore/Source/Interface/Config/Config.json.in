@@ -466,6 +466,19 @@
           "overlap compiled code fall back to the normal invalidation path."
         ]
       },
+      "SMCSemanticPatch": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "SMC Idea 4 (ppc64le): recognise a guest store that overwrites only",
+          "the rel32 target field of a direct call/jmp/jcc inside an already-",
+          "compiled block. Instead of invalidating, emulate the store and patch",
+          "the destination RIP baked into the block's translated exit, leaving",
+          "the page protected and the block live. Anything else (mov-immediate",
+          "patches, partial/oversized writes, ambiguous or non-atomically",
+          "patchable constants) falls back to the normal path. Off: no effect."
+        ]
+      },
       "SMCCheapTier": {
         "Type": "bool",
         "Default": "false",

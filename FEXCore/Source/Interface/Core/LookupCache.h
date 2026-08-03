@@ -106,6 +106,15 @@ struct GuestToHostMap {
     uint64_t GuestRangeStart = 0;
     uint64_t GuestRangeLength = 0;
     uint64_t GuestHash = 0;
+
+    // SMC Idea 4 (FEX_SMCSEMANTICPATCH): the block's direct rel32 branch
+    // immediates (guest side) and the host windows its ExitFunctions baked
+    // constant destination RIPs into. Both empty => block ineligible for
+    // semantic patching, which is the default for cache-loaded blocks, custom
+    // IR, and every block compiled with the flag off.
+    // See Interface/Core/SMCSemanticPatch.h.
+    FEXCore::SMC::BranchImmSites BranchImmSites;
+    FEXCore::SMC::ExitRIPSites ExitRIPSites;
   };
 
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
@@ -126,14 +135,16 @@ struct GuestToHostMap {
   // Adds to Guest -> Host code mapping
   const BlockEntry& AddBlockMapping(uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages, void* HostCode,
                                     const LookupCacheWriteLockToken&, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0,
-                                    uint64_t GuestHash = 0) {
+                                    uint64_t GuestHash = 0, const FEXCore::SMC::BranchImmSites& BranchImmSites = {},
+                                    const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {}) {
     // This may replace an existing mapping
     // NOTE: Generally no previous entry should exist, however there is one exception:
     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
     //       may already contain the block address. Since is comparatively rare, we'll just leak
     //       one of the two blocks in this case.
     return BlockList
-      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages, GuestRangeStart, GuestRangeLength, GuestHash})
+      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, BlockBegin, CodePages, GuestRangeStart, GuestRangeLength, GuestHash,
+                                             BranchImmSites, ExitRIPSites})
       .first->second;
   }
 
@@ -318,6 +329,125 @@ struct GuestToHostMap {
     }
     return false;
   }
+
+#ifdef ARCHITECTURE_ppc64le
+  // --- SMC Idea 4 semantic patching ----------------------------------------
+  // Outcome of planning a semantic patch over one lookup cache. Ordering
+  // matters: the caller keeps the worst outcome seen across all code buffers.
+  enum class SemanticPatchPlan {
+    NoCandidate, // no compiled block on these pages claims the write
+    Planned,     // every claiming block yielded an unambiguous single-word edit
+    Decline,     // a claiming block could not be patched -- abandon entirely
+  };
+
+  /**
+   * @brief Plan (but do not apply) the host-code edits for a rel32 patch.
+   *
+   * For every compiled block registered on the written page, check whether the
+   * guest range [Start, Start+Length) lies wholly inside one of its recorded
+   * rel32 immediate fields. If it does, that block MUST be patchable or the
+   * whole attempt is abandoned: leaving one copy of the branch stale would let
+   * a thread using that code buffer keep calling the old target.
+   *
+   * NewBytes holds the Length bytes the guest store is about to write; the old
+   * and new branch targets are derived from the claiming site's current guest
+   * bytes overlaid with them. Guest memory is NOT touched here -- the caller
+   * performs the store only after every buffer has planned successfully.
+   *
+   * *Reason receives a static audit tag whenever Decline is returned.
+   *
+   * Requires the read lock; the caller additionally holds the exclusive
+   * CodeInvalidationMutex, which is what keeps the host code buffers alive.
+   */
+  SemanticPatchPlan PlanSemanticPatch(uint64_t Start, uint64_t Length, const uint8_t* NewBytes,
+                                      fextl::vector<FEXCore::SMC::WordPatch>& Out, const char** Reason,
+                                      const LookupCacheBaseLockToken&) const {
+    const uint64_t End = Start + Length;
+    auto lower = CodePages.lower_bound(Start >> 12);
+    auto upper = CodePages.upper_bound((End - 1) >> 12);
+
+    auto Result = SemanticPatchPlan::NoCandidate;
+
+    for (auto it = lower; it != upper; it++) {
+      for (const auto& EntryAddr : it->second) {
+        auto Block = BlockList.find(EntryAddr);
+        if (Block == BlockList.end()) {
+          // Stale page-vector entry (block already erased via another page).
+          continue;
+        }
+        const auto& Entry = Block->second;
+
+        // Does this block claim the write as one of its rel32 fields?
+        const FEXCore::SMC::BranchImmSite* Claimed {};
+        for (const auto& Site : Entry.BranchImmSites) {
+          if (Start >= Site.ImmStart && End <= Site.ImmStart + 4) {
+            Claimed = &Site;
+            break;
+          }
+        }
+        if (!Claimed) {
+          continue;
+        }
+
+        // Old target from the bytes still in guest memory; new target from the
+        // same four bytes with the pending store overlaid.
+        uint32_t OldRel {};
+        ::memcpy(&OldRel, reinterpret_cast<const void*>(Claimed->ImmStart), sizeof(OldRel));
+        uint32_t NewRel = OldRel;
+        ::memcpy(reinterpret_cast<uint8_t*>(&NewRel) + (Start - Claimed->ImmStart), NewBytes, Length);
+
+        const uint64_t OldTarget = FEXCore::SMC::Rel32Target(Claimed->InstEnd, OldRel);
+        const uint64_t NewTarget = FEXCore::SMC::Rel32Target(Claimed->InstEnd, NewRel);
+
+        if (Entry.ExitRIPSites.empty()) {
+          // Compiled without the metadata (flag off at compile time, cap
+          // exceeded, cache-loaded), so its baked constant cannot be located.
+          *Reason = "no-exit-sites";
+          return SemanticPatchPlan::Decline;
+        }
+
+        // Exactly one exit window may currently materialise OldTarget.
+        FEXCore::SMC::WordPatch Patch {};
+        bool NeedsWrite = false;
+        size_t Matches = 0;
+        for (const auto& Site : Entry.ExitRIPSites) {
+          FEXCore::SMC::WordPatch Candidate {};
+          bool CandidateNeedsWrite = false;
+          switch (FEXCore::SMC::ClassifyRIPSite(Site.HostAddr, OldTarget, NewTarget, &Candidate, &CandidateNeedsWrite)) {
+          case FEXCore::SMC::SiteMatch::NoMatch: continue;
+          case FEXCore::SMC::SiteMatch::MultiWord:
+            // The new RIP would need two or more of the five window words
+            // rewritten, which cannot be published atomically to a thread
+            // executing the block.
+            *Reason = "multiword";
+            return SemanticPatchPlan::Decline;
+          case FEXCore::SMC::SiteMatch::Patchable:
+            ++Matches;
+            Patch = Candidate;
+            NeedsWrite = CandidateNeedsWrite;
+            break;
+          }
+        }
+
+        if (Matches != 1) {
+          // 0: the branch did not become a constant-destination exit (the
+          //    target was folded into this compilation unit by multiblock, or
+          //    the destination is register-computed).
+          // >1: two exits bake the same RIP; patching either would be a guess.
+          *Reason = Matches == 0 ? "no-matching-exit" : "ambiguous-exit";
+          return SemanticPatchPlan::Decline;
+        }
+
+        if (NeedsWrite) {
+          Out.push_back(Patch);
+        }
+        Result = SemanticPatchPlan::Planned;
+      }
+    }
+
+    return Result;
+  }
+#endif // ARCHITECTURE_ppc64le
 
   void InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
@@ -533,13 +663,15 @@ public:
 
   // Adds to Guest -> Host code mapping
   void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t BlockBegin, const fextl::vector<uint64_t>& CodePages,
-                       void* HostCode, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0, uint64_t GuestHash = 0) {
+                       void* HostCode, uint64_t GuestRangeStart = 0, uint64_t GuestRangeLength = 0, uint64_t GuestHash = 0,
+                       const FEXCore::SMC::BranchImmSites& BranchImmSites = {}, const FEXCore::SMC::ExitRIPSites& ExitRIPSites = {}) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk, GuestRangeStart, GuestRangeLength, GuestHash);
+    const auto& Entry = Shared->AddBlockMapping(Address, BlockBegin, CodePages, HostCode, lk, GuestRangeStart, GuestRangeLength, GuestHash,
+                                                BranchImmSites, ExitRIPSites);
 
     // There is no need to update L1 or L2, they will get updated on first lookup
     // However, adding to L1 here increases performance

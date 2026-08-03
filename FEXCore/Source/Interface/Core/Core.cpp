@@ -17,6 +17,7 @@ $end_info$
 #endif
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/SMCSoftInvalidate.h"
+#include "Interface/Core/SMCSemanticPatch.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/CPUID.h"
 #include "Interface/Core/Frontend.h"
@@ -560,6 +561,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   bool HasCustomIR {};
 
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH): rel32 fields of the direct branches this
+  // decode covers. Filled in the instruction loop below, where the decoded
+  // instruction's address and length are both in hand; left empty (and the
+  // block therefore ineligible) with the flag off or on a custom-IR block.
+  // See Interface/Core/SMCSemanticPatch.h.
+  const bool RecordBranchImmSites = Config.SMCSemanticPatch();
+  FEXCore::SMC::BranchImmSites BranchImmSites;
+  bool BranchImmSitesOverflowed {};
+
   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
     std::shared_lock lk(CustomIRMutex);
     auto Handler = CustomIRHandlers.find(GuestRIP);
@@ -657,6 +667,25 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
         }
 #endif
+
+        if (RecordBranchImmSites && !BranchImmSitesOverflowed) {
+          FEXCore::SMC::BranchImmSite Site {};
+          if (FEXCore::SMC::DecodeRel32BranchSite(reinterpret_cast<const uint8_t*>(InstAddress), DecodedInfo->InstSize, InstAddress,
+                                                  BlockInfo->Is64BitMode, &Site)) {
+            if (BranchImmSites.size() >= FEXCore::SMC::kMaxSitesPerBlock) {
+              // Over the cap: drop the whole table rather than describe the
+              // block partially. A partial table would let a write to an
+              // unrecorded branch look like "not a patch site" and silently take
+              // the fallback -- which is correct but unattributable -- while a
+              // write to a recorded one would be serviced against a block whose
+              // other branches we never checked.
+              BranchImmSites.clear();
+              BranchImmSitesOverflowed = true;
+            } else {
+              BranchImmSites.push_back(Site);
+            }
+          }
+        }
 
         bool IsLocked = DecodedInfo->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
 
@@ -830,6 +859,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     .StartAddr = Thread->FrontendDecoder->DecodedMinAddress,
     .Length = Thread->FrontendDecoder->DecodedMaxAddress - Thread->FrontendDecoder->DecodedMinAddress,
     .NeedsAddGuestCodeRanges = !HasCustomIR,
+    .BranchImmSites = std::move(BranchImmSites),
   };
 }
 
@@ -843,11 +873,11 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   }
 
   // Generate IR + Meta Info
-  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
+  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
     // OpDispatcher IR already released in this case.
-    return {{}, nullptr, 0, 0, false};
+    return {{}, nullptr, 0, 0, false, {}};
   }
 
   // Attempt to get the CPU backend to compile this code
@@ -863,7 +893,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
               .DebugData = nullptr,
               .StartAddr = 0,
               .Length = 0,
-              .NeedsAddGuestCodeRanges = false};
+              .NeedsAddGuestCodeRanges = false,
+              .BranchImmSites = {}};
     }
   }
 
@@ -883,6 +914,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     .StartAddr = StartAddr,
     .Length = Length,
     .NeedsAddGuestCodeRanges = NeedsAddGuestCodeRanges,
+    .BranchImmSites = std::move(BranchImmSites),
   };
 }
 
@@ -916,7 +948,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
-  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
@@ -1008,8 +1040,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // BlockBegin is shared across all EntryPoints of a single CompiledCode
   // (each block has one begin, potentially multiple entry points).
   const uint64_t BlockBegin = reinterpret_cast<uintptr_t>(CompiledCode.BlockBegin);
+  // SMC Idea 4: the block is eligible for semantic patching only if BOTH halves
+  // of the metadata survived (a decoded rel32 field to match the guest write
+  // against, and a constant exit window to repatch). Either table empty leaves
+  // both empty, so the fault handler's "block claims the write but has no exit
+  // sites" decline can only mean a genuine multiblock-folded branch.
+  if (BranchImmSites.empty() || CompiledCode.ExitRIPSites.empty()) {
+    BranchImmSites.clear();
+    CompiledCode.ExitRIPSites.clear();
+  }
+
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr, StartAddr, HashedRangeLength, GuestHash);
+    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, BlockBegin, CodePages, HostAddr, StartAddr, HashedRangeLength, GuestHash,
+                                         BranchImmSites, CompiledCode.ExitRIPSites);
   }
 
   if (CodeMapWriter) {
@@ -1035,7 +1078,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
-  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
+  auto [CompiledCode, DebugData, StartAddr, Length, _, __] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     if (SMCAuditCompileFD() >= 0) {

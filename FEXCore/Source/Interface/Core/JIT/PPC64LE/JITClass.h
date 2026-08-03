@@ -145,6 +145,11 @@ private:
   uint64_t                           Entry {};
   CPUBackend::CompiledCode           CodeData {};
 
+  // SMC Idea 4: sticky "this block had more constant exits than
+  // kMaxSitesPerBlock", so a later exit can't repopulate the cleared table.
+  // Reset with CodeData at the top of CompileCode.
+  bool                               ExitRIPSitesOverflowed {};
+
   // Per-block jump targets
   fextl::vector<PPC64Emitter::Label> JumpTargets;
 
@@ -399,6 +404,15 @@ private:
   // TakeRelocations() rebases these against the caller-supplied guest base
   // before serialization; the patcher adds the new base back on load.
   void InsertGuestRIPMove(GPR Reg, uint64_t Constant);
+
+  // SMC Idea 4 (FEX_SMCSEMANTICPATCH): as InsertGuestRIPMove, but additionally
+  // records the host address of the 20-byte window in CodeData.ExitRIPSites so
+  // the SMC fault handler can repatch this destination when the guest rewrites
+  // the rel32 that produced it. Only ExitFunction destinations may use this --
+  // the fault handler identifies a window by the RIP value it materialises, and
+  // recording any other guest-RIP constant would make that lookup ambiguous.
+  // See Interface/Core/SMCSemanticPatch.h.
+  void InsertExitRIPMove(GPR Reg, uint64_t Constant);
 
   // Emit the JIT block entry sequence (SRA fill, TF check)
   void EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF);
