@@ -442,6 +442,18 @@
           "\tfull: Validate code before every run (slow)"
         ]
       },
+      "SMCStoreEmulation": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "ppc64le: emulate faulting guest stores to SMC-tracked pages in the",
+          "signal handler (via /proc/self/mem) when the written bytes do not",
+          "overlap any compiled block, instead of invalidating and",
+          "re-protecting the page. Eliminates false-sharing invalidation",
+          "storms (data and code on the same guest page). Writes that DO",
+          "overlap compiled code fall back to the normal invalidation path."
+        ]
+      },
       "TSOEnabled": {
         "Type": "bool",
         "Default": "true",

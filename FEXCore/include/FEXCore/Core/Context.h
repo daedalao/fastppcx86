@@ -158,6 +158,10 @@ public:
    * @return true if PC is inside the thread's code buffers.
    */
   FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const = 0;
+  // SMC store-emulation support: true if [Start, Start+Length) of guest
+  // address space intersects any compiled block's guest bytes for this
+  // thread's (shared) lookup cache.
+  FEX_DEFAULT_VISIBILITY virtual bool GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
 
   /**
    * @brief Informs the context if hardware TSO is supported.

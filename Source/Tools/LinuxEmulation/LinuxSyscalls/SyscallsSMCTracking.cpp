@@ -59,6 +59,114 @@ int SMCAuditFD() {
   } while (0)
 
 // SMC interactions
+// ---------------------------------------------------------------------------
+// SMC store emulation (FEX_SMCSTOREEMULATION=1)
+//
+// When a guest store faults on an SMC-tracked page but the written bytes do
+// not overlap any compiled block, the write is pure data that happens to share
+// a page with code (false sharing). Invalidate-unprotect-retry costs a full
+// invalidate + recompile round trip per write burst (~22us measured on
+// POWER8, smcstorm falseshare: 376x slowdown vs native). Instead: decode the
+// faulting host store, perform it via pwrite on /proc/self/mem (kernel
+// FOLL_FORCE writes through the read-only protection and breaks CoW
+// correctly), advance NIP past the store, and leave the page protected. No
+// invalidation, no protection flapping, no recompile.
+//
+// Scope (v1): plain GPR stores only — D/DS-form stb/sth/stw/std (+update
+// forms) and X-form stbx/sthx/stwx/stdx (+update forms). Everything else
+// (VSX/VMX stores, byte-reversed forms, store-conditional, dcbz) falls back
+// to the legacy invalidate path. Store-conditional MUST fall back: a
+// reservation cannot be honored via pwrite.
+//
+// Known caveat (documented for review): pwrite's kernel-side copy is not
+// guaranteed single-copy-atomic for 8-byte aligned stores the way a host
+// `std` is. A lock-free guest data structure sharing a page with compiled
+// code could observe a torn 8-byte write. Accepted for v1 as a narrow race
+// on an already-pathological layout; revisit if telemetry implicates it.
+
+#ifdef ARCHITECTURE_ppc64le
+namespace {
+struct DecodedStore {
+  uint64_t EA;
+  uint64_t Value;
+  uint32_t Width;    // bytes: 1/2/4/8
+  uint32_t UpdateRA; // register to write EA back to for update forms, ~0u if none
+};
+
+int SelfMemFD() {
+  static int fd = ::open("/proc/self/mem", O_WRONLY | O_CLOEXEC);
+  return fd;
+}
+
+// Decode a ppc64le GPR store at PC using register state from the ucontext.
+// Returns false for anything that is not a recognized plain store.
+bool DecodePPCStore(void* ucontext, uint64_t PC, DecodedStore* Out) {
+  const uint32_t Insn = *reinterpret_cast<const uint32_t*>(PC);
+  const uint32_t Primary = Insn >> 26;
+  const uint32_t RS = (Insn >> 21) & 31;
+  const uint32_t RA = (Insn >> 16) & 31;
+  const uint32_t RB = (Insn >> 11) & 31;
+  const int64_t D = static_cast<int16_t>(Insn & 0xFFFF);
+  const int64_t DS = static_cast<int16_t>(Insn & 0xFFFC);
+
+  const auto GPR = [ucontext](uint32_t r) {
+    return FEX::ArchHelpers::Context::GetPPCGpReg(ucontext, r);
+  };
+  const uint64_t Base = (RA == 0) ? 0 : GPR(RA);
+
+  uint32_t Width = 0;
+  uint64_t EA = 0;
+  bool Update = false;
+
+  switch (Primary) {
+  case 36: Width = 4; EA = Base + D; break;              // stw
+  case 37: Width = 4; EA = GPR(RA) + D; Update = true; break; // stwu
+  case 38: Width = 1; EA = Base + D; break;              // stb
+  case 39: Width = 1; EA = GPR(RA) + D; Update = true; break; // stbu
+  case 44: Width = 2; EA = Base + D; break;              // sth
+  case 45: Width = 2; EA = GPR(RA) + D; Update = true; break; // sthu
+  case 62: {                                             // std/stdu (DS-form)
+    const uint32_t XO = Insn & 3;
+    if (XO == 0) {
+      Width = 8; EA = Base + DS;
+    } else if (XO == 1) {
+      Width = 8; EA = GPR(RA) + DS; Update = true;
+    } else {
+      return false; // stq etc.
+    }
+    break;
+  }
+  case 31: {                                             // X-forms
+    const uint32_t XO = (Insn >> 1) & 0x3FF;
+    switch (XO) {
+    case 215: Width = 1; EA = Base + GPR(RB); break;     // stbx
+    case 247: Width = 1; EA = GPR(RA) + GPR(RB); Update = true; break; // stbux
+    case 407: Width = 2; EA = Base + GPR(RB); break;     // sthx
+    case 439: Width = 2; EA = GPR(RA) + GPR(RB); Update = true; break; // sthux
+    case 151: Width = 4; EA = Base + GPR(RB); break;     // stwx
+    case 183: Width = 4; EA = GPR(RA) + GPR(RB); Update = true; break; // stwux
+    case 149: Width = 8; EA = Base + GPR(RB); break;     // stdx
+    case 181: Width = 8; EA = GPR(RA) + GPR(RB); Update = true; break; // stdux
+    default: return false; // stdcx./byte-reversed/vector/dcbz -> legacy path
+    }
+    break;
+  }
+  default: return false;
+  }
+
+  if (Update && RA == 0) {
+    return false; // invalid form
+  }
+
+  Out->EA = EA;
+  Out->Value = GPR(RS); // truncation happens at pwrite via Width
+  Out->Width = Width;
+  Out->UpdateRA = Update ? RA : ~0u;
+  return true;
+}
+} // anonymous namespace
+#endif // ARCHITECTURE_ppc64le
+
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
 
@@ -107,6 +215,33 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
       LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
     };
+
+#ifdef ARCHITECTURE_ppc64le
+    // SMC store-emulation fast path: see block comment above HandleSegfault.
+    // v1 restriction: private mappings only — a shared mapping's write is
+    // visible through every mirror, so the overlap check would have to cover
+    // all mirrored VAs; keep mirrors on the proven path for now.
+    if (_SyscallHandler->SMCStoreEmulation() && !Entry->second.Flags.Shared) {
+      DecodedStore Store;
+      if (DecodePPCStore(ucontext, ArchHelpers::Context::GetPc(ucontext), &Store)) {
+        // The decoded target must include the faulting address, or we decoded
+        // an instruction whose fault this isn't (paranoia; mismatch => legacy).
+        const bool CoversFault = FaultAddress >= Store.EA && FaultAddress < Store.EA + Store.Width;
+        if (CoversFault && !Thread->CTX->GuestRangeOverlapsCompiledCode(Thread, Store.EA, Store.Width)) {
+          const int fd = SelfMemFD();
+          if (fd >= 0 && ::pwrite(fd, &Store.Value, Store.Width, static_cast<off_t>(Store.EA)) == static_cast<ssize_t>(Store.Width)) {
+            if (Store.UpdateRA != ~0u) {
+              ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
+            }
+            ArchHelpers::Context::SetPc(ucontext, ArchHelpers::Context::GetPc(ucontext) + 4);
+            SMC_AUDIT("[%d] fault addr=%lx EMULATED-STORE ea=%lx w=%u\n", FHU::Syscalls::gettid(), FaultAddress, Store.EA, Store.Width);
+            FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+            return true;
+          }
+        }
+      }
+    }
+#endif // ARCHITECTURE_ppc64le
 
     if (Entry->second.Flags.Shared) {
       LOGMAN_THROW_A_FMT(Entry->second.Resource, "VMA tracking error");

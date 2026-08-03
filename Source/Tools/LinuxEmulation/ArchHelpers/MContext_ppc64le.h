@@ -142,6 +142,20 @@ static inline void SetFillSRASingleInst(void* ucontext, bool SingleInst) {
   GetMContext(ucontext)->gp_regs[PPC_PT_R4] = SingleInst ? 1 : 0;
 }
 
+// Raw ppc64le GPR access by *hardware* register number (r0..r31), for callers
+// that decode host instructions (the SMC store-emulation fast path) and
+// therefore already speak PPC numbering. Deliberately separate from
+// GetArmReg/SetArmReg below, which translate ARM64 register IDs — mixing the
+// two numbering schemes is exactly the bug class recorded in the SetArmReg
+// history note.
+static inline uint64_t GetPPCGpReg(void* ucontext, uint32_t HwReg) {
+  return GetMContext(ucontext)->gp_regs[HwReg];
+}
+
+static inline void SetPPCGpReg(void* ucontext, uint32_t HwReg, uint64_t val) {
+  GetMContext(ucontext)->gp_regs[HwReg] = val;
+}
+
 // GetArmReg / SetArmReg map ARM64 caller-saved register IDs onto the closest
 // ppc64le equivalent.  Cross-arch callers (e.g. the SMC SIGSEGV handler in
 // SyscallsSMCTracking.cpp using ARM64 X1 == ENTRY_FILL_SRA_SINGLE_INST_REG ==

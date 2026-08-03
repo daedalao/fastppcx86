@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "Interface/Context/Context.h"
+#include "Interface/Core/CPUBackend.h"
 #include <atomic>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
@@ -131,6 +132,45 @@ struct GuestToHostMap {
 
     // Remove from BlockList
     return BlockList.erase(Address) != 0;
+  }
+
+  // Returns true if any *compiled block's guest bytes* intersect
+  // [Start, Start+Length). Used by the SMC store-emulation fast path to
+  // distinguish a write into code (must invalidate, take the slow path) from a
+  // write that merely lands on the same page as code (false sharing — safe to
+  // emulate and keep every block).
+  //
+  // Guest extent is recovered per block via
+  // BlockBegin -> JITCodeHeader::OffsetToBlockTail -> JITCodeTail{RIP, GuestSize},
+  // the same walk CodeCache::Validate does. A block whose tail cannot be
+  // trusted is treated as overlapping (conservative: false positives cost a
+  // page invalidation, false negatives would execute stale code).
+  //
+  // Must be called with at least the read lock held (token parameter enforces).
+  bool RangeOverlapsCompiledCode(uint64_t Start, uint64_t Length, const LookupCacheBaseLockToken&) const {
+    const uint64_t End = Start + Length;
+    auto lower = CodePages.lower_bound(Start >> 12);
+    auto upper = CodePages.upper_bound((End - 1) >> 12);
+
+    for (auto it = lower; it != upper; it++) {
+      for (const auto& EntryAddr : it->second) {
+        auto Block = BlockList.find(EntryAddr);
+        if (Block == BlockList.end()) {
+          // Stale page-vector entry (block already erased via another page).
+          continue;
+        }
+        const auto* Header = reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeHeader*>(Block->second.BlockBegin);
+        const auto* Tail =
+          reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeTail*>(Block->second.BlockBegin + Header->OffsetToBlockTail);
+        if (Tail->GuestSize == 0) {
+          return true; // Unknown extent — be conservative.
+        }
+        if (Tail->RIP < End && (Tail->RIP + Tail->GuestSize) > Start) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   void InvalidateRange(uint64_t Start, uint64_t Length) {
@@ -323,6 +363,14 @@ public:
     LockTime.reset();
 
     return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk);
+  }
+
+  // SMC store-emulation support: does [Start, Start+Length) intersect any
+  // compiled block's guest bytes? Takes the shared read lock. See
+  // GuestToHostMap::RangeOverlapsCompiledCode for semantics.
+  bool RangeOverlapsCompiledCode(uint64_t Start, uint64_t Length) {
+    auto lk = Shared->AcquireReadLock();
+    return Shared->RangeOverlapsCompiledCode(Start, Length, lk);
   }
 
   // Adds to Guest -> Host code mapping

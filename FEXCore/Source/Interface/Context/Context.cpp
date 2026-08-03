@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Interface/Context/Context.h"
 #include "Interface/Core/OpcodeDispatcher.h"
+#include "Interface/Core/LookupCache.h"
 #ifndef ARCHITECTURE_ppc64le
 #include "Interface/Core/Dispatcher/Dispatcher.h"
 #endif
@@ -56,5 +57,9 @@ FEXCore::CPUID::FunctionResults FEXCore::Context::ContextImpl::RunCPUIDFunctionN
 
 bool FEXCore::Context::ContextImpl::IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const {
   return Thread->CPUBackend->IsAddressInCodeBuffer(Address);
+}
+
+bool FEXCore::Context::ContextImpl::GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  return Thread->LookupCache->RangeOverlapsCompiledCode(Start, Length);
 }
 } // namespace FEXCore::Context
