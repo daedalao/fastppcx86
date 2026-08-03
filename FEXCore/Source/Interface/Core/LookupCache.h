@@ -426,7 +426,7 @@ struct GuestToHostMap {
         if (!Claimed) {
           // ... or as one of its mov-immediate fields?
           switch (PlanMovImmPatch(Entry, Start, End, NewBytes, Out, Reason)) {
-          case SemanticPatchPlan::NoCandidate: continue;
+          case SemanticPatchPlan::NoCandidate: break; // fall through to the unclaimed-cover check
           case SemanticPatchPlan::Decline:     return SemanticPatchPlan::Decline;
           case SemanticPatchPlan::Planned:
             NoteKind("movimm");
