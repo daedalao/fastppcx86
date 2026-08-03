@@ -479,6 +479,21 @@
           "patchable constants) falls back to the normal path. Off: no effect."
         ]
       },
+      "SMCStoreBackpatch": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "ppc64le: when an SMC write fault lands on a decodable host store,",
+          "rewrite that store site to branch to a generated stub instead of",
+          "faulting again. The stub recomputes the effective address, checks a",
+          "lock-free filter of mtrack-write-protected pages, and either performs",
+          "the store natively or calls a helper that writes through",
+          "/proc/self/mem when the bytes do not overlap compiled code. Removes",
+          "the ~17us signal round trip that dominates the SMC storm cycle.",
+          "Writes that DO overlap compiled code keep faulting, and are",
+          "invalidated exactly as they are today. Requires SMCStoreEmulation."
+        ]
+      },
       "SMCCheapTier": {
         "Type": "bool",
         "Default": "false",

@@ -15,6 +15,7 @@ $end_info$
 
 #include "LinuxSyscalls/LinuxAllocator.h"
 #include "LinuxSyscalls/SignalDelegator.h"
+#include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/Syscalls/Thread.h"
 #include "LinuxSyscalls/Utils/Threads.h"
@@ -835,6 +836,19 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
                         FEXCore::Utils::FEX_PAGE_SIZE);
     }
   }
+
+#ifdef ARCHITECTURE_ppc64le
+  // FEX_SMCSTOREBACKPATCH rides on the store decoder that SMCStoreEmulation
+  // owns: without that path there is no fault site to rewrite. Arm the page
+  // filter once, here, so every hot-path entry point is a relaxed atomic load
+  // that is false for the entire process when the feature is off.
+  if (SMCStoreBackpatch() && SMCStoreEmulation() && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+    FEX::HLE::SMCBackpatch::SetEnabled(true);
+    LogMan::Msg::IFmt("SMC store backpatching enabled (FEX_SMCSTOREBACKPATCH).");
+  } else if (SMCStoreBackpatch()) {
+    LogMan::Msg::EFmt("FEX_SMCSTOREBACKPATCH needs FEX_SMCSTOREEMULATION=1 and FEX_SMCCHECKS=mtrack; staying off.");
+  }
+#endif
 }
 
 SyscallHandler::~SyscallHandler() {

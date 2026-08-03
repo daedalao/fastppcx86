@@ -18,6 +18,7 @@ $end_info$
 #include <sys/personality.h>
 #include <sys/shm.h>
 
+#include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 
@@ -214,6 +215,11 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
       auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
       LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
+#ifdef ARCHITECTURE_ppc64le
+      // FEX_SMCSTOREBACKPATCH: the page is writable again, so an already-
+      // backpatched store site targeting it can go back to storing natively.
+      FEX::HLE::SMCBackpatch::NotePagesUnprotected(Start, Length);
+#endif
     };
 
 #ifdef ARCHITECTURE_ppc64le
@@ -307,6 +313,20 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       } else if (::pwrite(SelfMemFD(), &Store.Value, Store.Width, static_cast<off_t>(Store.EA)) != static_cast<ssize_t>(Store.Width)) {
         Fallback("pwrite-fail", Store.EA, Store.Width);
       } else {
+        // FEX_SMCSTOREBACKPATCH: this one-shot emulation is correct but costs
+        // a full signal round trip (~17us of the ~22us storm cycle, measured
+        // on op4k at f01128c0d).  Rewrite the store site so the NEXT execution
+        // never traps.  A refusal is not an error: the site simply stays
+        // faulting and keeps taking this path, exactly as it does today.
+        // Either way the current store is emulated below.
+        if (_SyscallHandler->SMCStoreBackpatch()) {
+          const char* Reason = FEX::HLE::SMCBackpatch::TryBackpatchStore(Thread, StorePC);
+          if (Reason) {
+            SMC_AUDIT("[%d] fault addr=%lx BACKPATCH-REFUSED reason=%s pc=%lx insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress,
+                      Reason, StorePC, RawInsn);
+          }
+        }
+
         if (Store.UpdateRA != ~0u) {
           ArchHelpers::Context::SetPPCGpReg(ucontext, Store.UpdateRA, Store.EA);
         }
@@ -450,6 +470,9 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
               const auto MirroredSize = std::min(OffsetTop, VMAOffsetTop) - MirroredBase;
 
               auto rv = mprotect((void*)(MirroredBase - VMAOffsetBase + VMABase), MirroredSize, PROT_READ);
+#ifdef ARCHITECTURE_ppc64le
+              FEX::HLE::SMCBackpatch::NotePagesProtected(MirroredBase - VMAOffsetBase + VMABase, MirroredSize);
+#endif
               SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(),
                         MirroredBase - VMAOffsetBase + VMABase, MirroredSize);
               LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", MirroredBase, MirroredSize);
@@ -469,6 +492,11 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           }
 
           int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
+#ifdef ARCHITECTURE_ppc64le
+          // FEX_SMCSTOREBACKPATCH: this is where a guest page acquires live
+          // compiled code and the mtrack write protection that goes with it.
+          FEX::HLE::SMCBackpatch::NotePagesProtected(ProtectBase, ProtectSize);
+#endif
 
           SMC_AUDIT("[%d] mark PROTECT base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
           LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
@@ -776,6 +804,9 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
         return -errno;
       }
     }
+#ifdef ARCHITECTURE_ppc64le
+    FEX::HLE::SMCBackpatch::NotePagesUnprotected(reinterpret_cast<uint64_t>(addr), length);
+#endif
     TrackMunmap(Thread, addr, length);
   }
 
@@ -886,6 +917,12 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     }
 
     SMC_AUDIT("[%d] guest-mprotect addr=%lx len=%lx prot=%x\n", FHU::Syscalls::gettid(), reinterpret_cast<uint64_t>(addr), len, prot);
+#ifdef ARCHITECTURE_ppc64le
+    // The guest's own mprotect replaced whatever mtrack protection we had
+    // installed on this range. (MarkGuestExecutableRange re-counts it if code
+    // is compiled there again.)
+    FEX::HLE::SMCBackpatch::NotePagesUnprotected(reinterpret_cast<uint64_t>(addr), len);
+#endif
     TrackMprotect(Thread, addr, len, prot);
   }
 

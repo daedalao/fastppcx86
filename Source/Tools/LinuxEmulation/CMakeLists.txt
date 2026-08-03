@@ -15,6 +15,7 @@ add_library(LinuxEmulation STATIC
   LinuxSyscalls/Seccomp/BPFEmitter.cpp
   LinuxSyscalls/Seccomp/Dumper.cpp
   LinuxSyscalls/SignalDelegator.cpp
+  LinuxSyscalls/SMCStoreBackpatch.cpp
   LinuxSyscalls/Syscalls.cpp
   LinuxSyscalls/SyscallsSMCTracking.cpp
   LinuxSyscalls/SyscallsVMATracking.cpp
@@ -87,7 +88,8 @@ target_include_directories(LinuxEmulation INTERFACE
 
 target_link_libraries(LinuxEmulation PRIVATE
   Common
-  CommonTools)
+  CommonTools
+  CodeEmitter)
 
 target_link_libraries(LinuxEmulation INTERFACE FEXCore)
 
