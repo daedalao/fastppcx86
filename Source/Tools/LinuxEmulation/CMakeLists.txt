@@ -20,6 +20,7 @@ add_library(LinuxEmulation STATIC
   LinuxSyscalls/SyscallsSMCTracking.cpp
   LinuxSyscalls/SyscallsVMATracking.cpp
   LinuxSyscalls/SyscallObserver.cpp
+  LinuxSyscalls/ThreadCensus.cpp
   LinuxSyscalls/ThreadManager.cpp
   LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
   LinuxSyscalls/Utils/Threads.cpp

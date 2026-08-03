@@ -10,6 +10,7 @@ $end_info$
 #include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/Syscalls/Thread.h"
+#include "LinuxSyscalls/ThreadCensus.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x64/Thread.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -147,6 +148,17 @@ FEX::HLE::ThreadStateObject* CreateNewThread(FEXCore::Context::Context* CTX, FEX
 
   // Return the new threads TID
   uint64_t Result = NewThread->ThreadInfo.TID;
+
+  // Census: a CLONE_THREAD guest thread just came up. ThreadInfo.TID was
+  // filled in by the new host thread's own gettid(), so guest TID == host TID
+  // here. Frame->State.rip is still the guest RIP of the clone caller's
+  // syscall instruction (the child's copy is what gets advanced past it by
+  // AdjustRipForNewThread above), and is logged raw -- resolving it to a
+  // module would mean walking the VMA structures under their locks.
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    FEX::HLE::ThreadCensus::OnThreadCreate(FEX::HLE::ThreadCensus::CloneKind::Thread, Result, Result, FHU::Syscalls::gettid(),
+                                           Frame->State.rip, flags);
+  }
 
   // Sets the child TID to pointer in ParentTID
   if (flags & CLONE_PARENT_SETTID) {
@@ -459,6 +471,14 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
 
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, nullptr, sizeof(Mask));
 
+    // Census: record from the parent, and before the vfork wait below so the
+    // line lands even if the child then wedges. Only the parent logs -- the
+    // child shares the same census fd and would double-count.
+    if (Result > 0 && FEX::HLE::ThreadCensus::Enabled()) {
+      FEX::HLE::ThreadCensus::OnThreadCreate(FEX::HLE::ThreadCensus::CloneKind::Fork, Result, Result, FHU::Syscalls::gettid(),
+                                             Frame->State.rip, flags);
+    }
+
     // VFork needs the parent to wait for the child to exit.
     if (IsVFork) {
       // Wait for the read end of the pipe to close.
@@ -623,6 +643,19 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           }
                           default: Result = ::prctl(option, arg2, arg3, arg4, arg5); break;
                           }
+
+                          // Census: PR_SET_NAME always names the calling
+                          // thread. Recorded only after the host prctl
+                          // succeeded, which proves the guest's name buffer
+                          // was readable -- a bogus pointer keeps returning
+                          // EFAULT from the kernel instead of faulting here.
+                          // This handler runs in normal thread context (the
+                          // JIT calls it on the guest thread's host stack),
+                          // not from a signal handler.
+                          if (option == PR_SET_NAME && Result == 0 && FEX::HLE::ThreadCensus::Enabled()) {
+                            FEX::HLE::ThreadCensus::OnSetName(reinterpret_cast<const char*>(arg2));
+                          }
+
                           SYSCALL_ERRNO();
                         });
 

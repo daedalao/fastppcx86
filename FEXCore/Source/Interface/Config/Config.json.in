@@ -427,6 +427,39 @@
         "Desc": [
           "Enables profiling when FEX was built with the gpuvis profiler backend."
         ]
+      },
+      "ThreadCensus": {
+        "Type": "str",
+        "Default": "",
+        "Desc": [
+          "Diagnostic. Path of a plain-text file to append a thread census to.",
+          "One line per event, written with a single append per line:",
+          "\t<monotonic-ms> tid=<n> event=<type> <key=val>...",
+          "Events: thread_create (guest/host TID, parent TID, raw guest RIP of",
+          "the clone caller, clone flags), set_name (prctl PR_SET_NAME),",
+          "sched_setscheduler / sched_setattr / sched_setparam (policy,",
+          "priority and what FEX did with the request),  sched_setaffinity",
+          "(mask popcount plus lowest/highest set CPU), and sched_boost (the",
+          "SchedPassthrough ladder). Observation only -- never changes what a",
+          "guest syscall returns. Unset: the file is never opened and every",
+          "hook short-circuits on a single load."
+        ]
+      },
+      "SchedPassthrough": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Opt-in. FEX forwards guest sched_setscheduler/sched_setattr to the",
+          "host verbatim, so an unprivileged host with no RLIMIT_RTPRIO",
+          "budget refuses every guest SCHED_FIFO/SCHED_RR request with EPERM",
+          "and the guest's audio/render threads run at plain SCHED_OTHER.",
+          "With this set, an EPERM'd RT request is retried on the host with",
+          "progressively weaker boosts: SCHED_RR at the lowest permitted",
+          "priority, then a niceness boost to -10 (clamped by RLIMIT_NICE),",
+          "then give up. Only real host scheduling changes -- the guest still",
+          "receives exactly the return value it would have without this",
+          "option. Log the ladder with ThreadCensus. Off: no effect."
+        ]
       }
     },
     "Hacks": {

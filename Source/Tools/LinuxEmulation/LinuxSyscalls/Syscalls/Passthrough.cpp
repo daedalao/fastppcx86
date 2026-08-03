@@ -10,6 +10,7 @@ $end_info$
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
+#include "LinuxSyscalls/ThreadCensus.h"
 
 #ifdef ARCHITECTURE_ppc64le
 #include "LinuxSyscalls/PPC64LE/TermiosTranslation.h"
@@ -446,6 +447,102 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// ThreadCensus / SchedPassthrough wrappers for the sched_set* family.
+//
+// FEX's pre-existing behaviour for every one of these is a *bare passthrough*:
+// the guest's request goes straight to the host kernel with the same arguments
+// (guest TIDs are host TIDs in FEX's 1:1 threading model), and the guest sees
+// whatever the kernel said. Nothing is faked and nothing is filtered. These
+// wrappers preserve that exactly -- they call the same SyscallPassthrough<N>
+// template and return its result unmodified. All they add are side effects:
+// census lines, and (only after the host has already refused with EPERM) the
+// SchedPassthrough ladder's extra host-side scheduling calls.
+//
+// Reading the guest's argument structs: these pointers were just handed to the
+// kernel, so they are only dereferenced when the kernel's own return value
+// proves it read them successfully. Every one of these syscalls copies its
+// user struct in before any other validation, so anything other than -EFAULT
+// means the buffer was readable. That keeps a bogus guest pointer returning
+// EFAULT instead of faulting inside FEX.
+static bool GuestStructReadable(uint64_t Pointer, uint64_t Result) {
+  return Pointer != 0 && static_cast<int64_t>(Result) != -EFAULT;
+}
+
+// struct sched_param is a single int on every ABI FEX emulates (x86-32,
+// x86-64) as well as on the PPC64LE host, so no layout translation is needed.
+static int ReadSchedPriority(uint64_t Param, uint64_t Result) {
+  if (!GuestStructReadable(Param, Result)) {
+    return -1;
+  }
+  return *reinterpret_cast<const int32_t*>(Param);
+}
+
+// Prefix of the kernel's struct sched_attr. Identical layout for 32-bit and
+// 64-bit guests (fixed-width fields, naturally aligned, no pointers).
+struct CensusSchedAttr {
+  uint32_t size;
+  uint32_t sched_policy;
+  uint64_t sched_flags;
+  int32_t sched_nice;
+  uint32_t sched_priority;
+};
+
+static uint64_t WrappedSchedSetparam(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t param) {
+  const uint64_t Result = SyscallPassthrough2<SYSCALL_DEF(sched_setparam)>(Frame, pid, param);
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    FEX::HLE::ThreadCensus::OnSchedSet("sched_setparam", static_cast<int64_t>(pid), -1, ReadSchedPriority(param, Result),
+                                       static_cast<int64_t>(Result));
+  }
+  return Result;
+}
+
+static uint64_t WrappedSchedSetscheduler(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t policy, uint64_t param) {
+  const uint64_t Result = SyscallPassthrough3<SYSCALL_DEF(sched_setscheduler)>(Frame, pid, policy, param);
+
+  const int Priority = ReadSchedPriority(param, Result);
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    FEX::HLE::ThreadCensus::OnSchedSet("sched_setscheduler", static_cast<int64_t>(pid), static_cast<int>(policy), Priority,
+                                       static_cast<int64_t>(Result));
+  }
+  if (static_cast<int64_t>(Result) < 0) {
+    FEX::HLE::SchedPassthrough::OnSchedRequestRefused(static_cast<int64_t>(pid), static_cast<int>(policy), Priority,
+                                                      static_cast<int64_t>(Result));
+  }
+  return Result;
+}
+
+static uint64_t WrappedSchedSetattr(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t attr, uint64_t flags) {
+  const uint64_t Result = SyscallPassthrough3<SYSCALL_DEF(sched_setattr)>(Frame, pid, attr, flags);
+
+  int Policy = -1;
+  int Priority = -1;
+  if (GuestStructReadable(attr, Result)) {
+    const auto* GuestAttr = reinterpret_cast<const CensusSchedAttr*>(attr);
+    if (GuestAttr->size >= sizeof(CensusSchedAttr)) {
+      Policy = static_cast<int>(GuestAttr->sched_policy);
+      Priority = static_cast<int>(GuestAttr->sched_priority);
+    }
+  }
+
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    FEX::HLE::ThreadCensus::OnSchedSet("sched_setattr", static_cast<int64_t>(pid), Policy, Priority, static_cast<int64_t>(Result));
+  }
+  if (static_cast<int64_t>(Result) < 0 && Policy >= 0) {
+    FEX::HLE::SchedPassthrough::OnSchedRequestRefused(static_cast<int64_t>(pid), Policy, Priority, static_cast<int64_t>(Result));
+  }
+  return Result;
+}
+
+static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t cpusetsize, uint64_t mask) {
+  const uint64_t Result = SyscallPassthrough3<SYSCALL_DEF(sched_setaffinity)>(Frame, pid, cpusetsize, mask);
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    const bool Readable = GuestStructReadable(mask, Result);
+    FEX::HLE::ThreadCensus::OnSetAffinity(static_cast<int64_t>(pid), Readable ? reinterpret_cast<const uint8_t*>(mask) : nullptr,
+                                          Readable ? cpusetsize : 0, static_cast<int64_t>(Result));
+  }
+  return Result;
+}
 
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
@@ -513,9 +610,9 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(capset, SyscallPassthrough2<SYSCALL_DEF(capset)>);
   REGISTER_SYSCALL_IMPL(getpriority, SyscallPassthrough2<SYSCALL_DEF(getpriority)>);
   REGISTER_SYSCALL_IMPL(setpriority, SyscallPassthrough3<SYSCALL_DEF(setpriority)>);
-  REGISTER_SYSCALL_IMPL(sched_setparam, SyscallPassthrough2<SYSCALL_DEF(sched_setparam)>);
+  REGISTER_SYSCALL_IMPL(sched_setparam, WrappedSchedSetparam);
   REGISTER_SYSCALL_IMPL(sched_getparam, SyscallPassthrough2<SYSCALL_DEF(sched_getparam)>);
-  REGISTER_SYSCALL_IMPL(sched_setscheduler, SyscallPassthrough3<SYSCALL_DEF(sched_setscheduler)>);
+  REGISTER_SYSCALL_IMPL(sched_setscheduler, WrappedSchedSetscheduler);
   REGISTER_SYSCALL_IMPL(sched_getscheduler, SyscallPassthrough1<SYSCALL_DEF(sched_getscheduler)>);
   REGISTER_SYSCALL_IMPL(sched_get_priority_max, SyscallPassthrough1<SYSCALL_DEF(sched_get_priority_max)>);
   REGISTER_SYSCALL_IMPL(sched_get_priority_min, SyscallPassthrough1<SYSCALL_DEF(sched_get_priority_min)>);
@@ -535,7 +632,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(flistxattr, SyscallPassthrough3<SYSCALL_DEF(flistxattr)>);
   REGISTER_SYSCALL_IMPL(fremovexattr, SyscallPassthrough2<SYSCALL_DEF(fremovexattr)>);
   REGISTER_SYSCALL_IMPL(tkill, SyscallPassthrough2<SYSCALL_DEF(tkill)>);
-  REGISTER_SYSCALL_IMPL(sched_setaffinity, SyscallPassthrough3<SYSCALL_DEF(sched_setaffinity)>);
+  REGISTER_SYSCALL_IMPL(sched_setaffinity, WrappedSchedSetaffinity);
   REGISTER_SYSCALL_IMPL(sched_getaffinity, SyscallPassthrough3<SYSCALL_DEF(sched_getaffinity)>);
   REGISTER_SYSCALL_IMPL(io_setup, SyscallPassthrough2<SYSCALL_DEF(io_setup)>);
   REGISTER_SYSCALL_IMPL(io_destroy, SyscallPassthrough1<SYSCALL_DEF(io_destroy)>);
@@ -576,7 +673,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(setns, SyscallPassthrough2<SYSCALL_DEF(setns)>);
   REGISTER_SYSCALL_IMPL(getcpu, SyscallPassthrough3<SYSCALL_DEF(getcpu)>);
   REGISTER_SYSCALL_IMPL(kcmp, SyscallPassthrough5<SYSCALL_DEF(kcmp)>);
-  REGISTER_SYSCALL_IMPL(sched_setattr, SyscallPassthrough3<SYSCALL_DEF(sched_setattr)>);
+  REGISTER_SYSCALL_IMPL(sched_setattr, WrappedSchedSetattr);
   REGISTER_SYSCALL_IMPL(sched_getattr, SyscallPassthrough4<SYSCALL_DEF(sched_getattr)>);
   REGISTER_SYSCALL_IMPL(getrandom, SyscallPassthrough3<SYSCALL_DEF(getrandom)>);
   REGISTER_SYSCALL_IMPL(memfd_create, SyscallPassthrough2<SYSCALL_DEF(memfd_create)>);

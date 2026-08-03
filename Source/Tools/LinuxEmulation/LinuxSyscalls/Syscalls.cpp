@@ -18,6 +18,7 @@ $end_info$
 #include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/Syscalls/Thread.h"
+#include "LinuxSyscalls/ThreadCensus.h"
 #include "LinuxSyscalls/Utils/Threads.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -689,6 +690,15 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
         FEX::HLE::_SyscallHandler->UnlockAfterFork(Frame->Thread, false);
 
         ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &args->SignalMask, nullptr, sizeof(args->SignalMask));
+
+        // Census: the "unhandled flags" path, where FEX hands the clone
+        // straight to the host kernel instead of building a FEX thread
+        // object. Result is the raw kernel return, so only a positive value
+        // is a child TID.
+        if (static_cast<int64_t>(Result) > 0 && FEX::HLE::ThreadCensus::Enabled()) {
+          FEX::HLE::ThreadCensus::OnThreadCreate(FEX::HLE::ThreadCensus::CloneKind::RawClone, Result, Result, FHU::Syscalls::gettid(),
+                                                 Frame->State.rip, args->args.flags);
+        }
       }
       return Result;
     } else {
