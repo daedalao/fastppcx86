@@ -86,6 +86,85 @@ inline uint64_t SizeMask(uint32_t size) {
   }
   return (uint64_t {1} << (size * 8)) - 1;
 }
+
+// Compute the RMW result value from op / current-Old / operand. CAS is
+// excluded from this dispatch — it needs Expected and a "did we store"
+// signal, so callers handle it inline.
+static inline uint64_t ApplyRmwOp(SplitLockOp op, uint64_t Old, uint64_t Operand, uint64_t Mask) {
+  switch (op) {
+  case SplitLockOp::Swap:     return Operand;
+  case SplitLockOp::FetchAdd: return (Old + Operand) & Mask;
+  case SplitLockOp::FetchSub: return (Old - Operand) & Mask;
+  case SplitLockOp::FetchAnd: return (Old & Operand) & Mask;
+  case SplitLockOp::FetchOr:  return (Old | Operand) & Mask;
+  case SplitLockOp::FetchXor: return (Old ^ Operand) & Mask;
+  case SplitLockOp::FetchCLR: return (Old & ~Operand) & Mask;
+  case SplitLockOp::FetchNeg: return static_cast<uint64_t>(-static_cast<int64_t>(Old)) & Mask;
+  default:                    return Old; // CAS is handled by the caller
+  }
+}
+
+// C3 — doubleword container fast path. Contract:
+//   - Caller has already taken the stripe mutex(es) covering this EA.
+//   - HostAddr is byte-misaligned but (EA & 7) + size <= 8, so the entire
+//     size-byte operand lives inside one host doubleword and we can drive
+//     the RMW through an aligned uint64_t ldarx/stdcx. loop instead of
+//     memcpy+memcpy.
+//
+// Why this exists on top of the mutex: the mutex only composes with other
+// misaligned callers going through this helper. It does NOT compose with
+// aligned lwarx/stwcx./ldarx/stdcx. issued by the JIT in another FEX thread
+// against overlapping bytes of the same doubleword — the aligned path holds
+// no mutex and can lose its reservation to our helper's plain-store window.
+// Real ldarx/stdcx. here uses the same reservation channel as the JIT's
+// aligned path, so aligned↔contained composes correctly.  Contained↔crossing
+// composition is preserved by the stripe mutex the caller still holds:
+// crossing ops execute their StoreMis inside that mutex.
+//
+// CAS mismatch does NOT issue a store — the existing memcpy path's
+// unconditional write-back on mismatch is the bug PA called out as widening
+// the clobber window to failed CASes, and this path deliberately doesn't
+// replicate it.
+//
+// Sizes: valid sizes are {1,2,4,8}.  size==8 with (EA&7)==0 is naturally
+// aligned and never lands here (the JIT emits ldarx/stdcx. directly), so
+// the interesting cases are size {1,2,4} at any non-crossing offset.
+static inline void ContainerDoubleword(SplitLockOp op, void* HostAddr, uint64_t Operand,
+                                       uint64_t* result, uint32_t size, uint64_t Mask) {
+  const uintptr_t EA = reinterpret_cast<uintptr_t>(HostAddr);
+  const uintptr_t Aligned = EA & ~uintptr_t{7};
+  const uint32_t ByteOffset = static_cast<uint32_t>(EA & 7u);
+  const uint32_t BitShift = ByteOffset * 8u;
+  const uint64_t FieldMask = Mask << BitShift;
+  uint64_t* AlignedPtr = reinterpret_cast<uint64_t*>(Aligned);
+
+  uint64_t Expected_dword = __atomic_load_n(AlignedPtr, __ATOMIC_ACQUIRE);
+  while (true) {
+    const uint64_t Old = (Expected_dword >> BitShift) & Mask;
+    if (op == SplitLockOp::CAS) {
+      const uint64_t GuestExpected = (*result) & Mask;
+      if (Old != GuestExpected) {
+        // Guest CAS mismatch: report observed Old to caller and DO NOT
+        // store.  A memory barrier equivalent to the successful path is
+        // still owed to the guest because x86 LOCK is seq_cst regardless
+        // of the mismatch outcome; the JIT's hwsync bracket provides it.
+        *result = Old;
+        return;
+      }
+    }
+    const uint64_t New = (op == SplitLockOp::CAS) ? (Operand & Mask)
+                                                  : ApplyRmwOp(op, Old, Operand, Mask);
+    const uint64_t New_dword = (Expected_dword & ~FieldMask) | ((New & Mask) << BitShift);
+    if (__atomic_compare_exchange_n(AlignedPtr, &Expected_dword, New_dword,
+                                    /*weak=*/false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) {
+      *result = Old;
+      return;
+    }
+    // CAS failed: Expected_dword was overwritten with the current value.
+    // Loop; nothing else to reset.
+  }
+}
 } // namespace
 
 extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* value, uint64_t* result, uint32_t size) {
@@ -112,6 +191,14 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   // span two cachelines; in that case acquire both stripes in canonical
   // order (low-index first) so concurrent threads can't deadlock and any
   // other thread touching the same cacheline pair serialises with us.
+  //
+  // The stripe mutex is UNCONDITIONAL, including when we then hand off to
+  // the doubleword container: dropping it in the container case would
+  // introduce a NEW race — a 2-byte contained op at offset 12 would race
+  // an 8-byte crossing op at offset 12 against the same 16 bytes, with the
+  // crossing op holding only the mutex and the contained op holding only a
+  // stdcx. reservation.  Adversarial-review-mandated per POWER9_PORT_PLAN +
+  // TASK_QUEUE Tier D correction #2.
   const uintptr_t HostAddrVal = reinterpret_cast<uintptr_t>(HostAddr);
   const size_t StripeLo = (HostAddrVal >> 6) & (SPLIT_LOCK_STRIPES - 1);
   const size_t StripeHi = ((HostAddrVal + size - 1) >> 6) & (SPLIT_LOCK_STRIPES - 1);
@@ -128,6 +215,15 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
     LockLo = std::unique_lock<std::mutex>(g_SplitLockMutexes[SLo], std::defer_lock);
     LockHi = std::unique_lock<std::mutex>(g_SplitLockMutexes[SHi], std::defer_lock);
     std::lock(LockLo, LockHi);
+  }
+
+  // C3 — doubleword container: if the entire operand lives in one host
+  // doubleword, run a real ldarx/stdcx. loop against that doubleword. This
+  // composes with aligned LL/SC on overlapping bytes in other threads,
+  // which the plain-memcpy path below cannot.
+  if ((HostAddrVal & 7u) + size <= 8u) {
+    ContainerDoubleword(static_cast<SplitLockOp>(op), HostAddr, Operand, result, size, Mask);
+    return;
   }
 
   // Load the current value at the (possibly misaligned) EA.
