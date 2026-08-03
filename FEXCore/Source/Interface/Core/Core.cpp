@@ -688,7 +688,24 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+          // Evidence gate for the accumulator-vs-decoder-PC audit: use
+          // DecodedInfo->PC (the address the decoder actually decoded from)
+          // as the validated address, not InstAddress (a running total
+          // computed before DecodedInfo is even assigned above). If they
+          // ever diverge, S4's snapshot would compare the right bytes at
+          // the wrong address and validation would pass forever. This trap
+          // is Release-visible (ERROR_AND_DIE_FMT — LOGMAN asserts compile
+          // out); if it never fires across the regression set, the follow-up
+          // commit moves the InstAddress computation on :651 to DecodedInfo
+          // ->PC after :655 so the loop has one notion of the current
+          // instruction address instead of two.
+          if (InstAddress != DecodedInfo->PC) {
+            ERROR_AND_DIE_FMT(
+              "SMC snapshot: InstAddress accumulator ({:#x}) diverged from decoder PC ({:#x}); "
+              "S4 validation would compare decoder bytes at accumulator address (guaranteed miscompile)",
+              InstAddress, DecodedInfo->PC);
+          }
+          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, DecodedInfo->PC - GuestRIP);
           // Snapshot the bytes the decoder actually consumed (DecodedInfo->
           // InstBytes), not a re-read of live guest memory. A guest write
           // landing between decode and this point would otherwise pair IR
