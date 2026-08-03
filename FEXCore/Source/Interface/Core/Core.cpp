@@ -688,16 +688,17 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-          // Bound the memcpy: DecodedInfo->InstSize can exceed sizeof(CodeOriginal)
-          // when a malformed decode leaks an over-long instruction past this point
-          // (length rejection lives in DecodeInstruction's caller, above the SMC
-          // snapshot). Zero-init so any unread tail is defined for the
-          // ValidateCode backend, which reads InstSize bytes and would otherwise
-          // hash uninitialised stack past the sixteenth byte.
+          // Snapshot the bytes the decoder actually consumed (DecodedInfo->
+          // InstBytes), not a re-read of live guest memory. A guest write
+          // landing between decode and this point would otherwise pair IR
+          // built from the OLD bytes with a snapshot of the NEW ones, and
+          // ValidateCode would then return equal-forever while stale semantics
+          // execute. Zero-initialised so any tail past InstSize is defined;
+          // static_assert bounds the copy against CodeOriginal.
           std::array<uint8_t, 0x10> CodeOriginal {};
-          memcpy(CodeOriginal.data(), ExistingCodePtr, std::min<size_t>(DecodedInfo->InstSize, sizeof(CodeOriginal)));
+          static_assert(sizeof(DecodedInfo->InstBytes) <= sizeof(CodeOriginal));
+          memcpy(CodeOriginal.data(), DecodedInfo->InstBytes.data(), sizeof(DecodedInfo->InstBytes));
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);

@@ -131,7 +131,9 @@ private:
     return BlockInfo.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
   }
 
-  static constexpr size_t MAX_INST_SIZE = 15;
+  // Single source of truth lives on DecodedInst so the persisted per-inst
+  // byte record (DecodedInst::InstBytes) can never disagree on size.
+  static constexpr size_t MAX_INST_SIZE = X86Tables::DecodedInst::MAX_INST_SIZE;
   uint8_t InstructionSize {};
   std::array<uint8_t, MAX_INST_SIZE> Instruction;
   uint8_t LastEscapePrefix {};

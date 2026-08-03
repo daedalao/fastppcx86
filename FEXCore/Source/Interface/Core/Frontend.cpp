@@ -137,7 +137,16 @@ uint8_t Decoder::ReadByte() {
     return 0;
   }
 
-  Instruction[InstructionSize] = *Byte;
+  // Explicit bounds check: the LOGMAN assert above compiles out in release
+  // builds, and a malformed over-long sequence can reach here past
+  // MAX_INST_SIZE (the decode loop only bounds prefix/opcode reads). The byte
+  // is still consumed so decode advances; the over-long record is committed
+  // at DecodeInstructionImpl's tail (memcpy into DecodedInst::InstBytes),
+  // then DecodeInstruction flags ErrorDuringDecoding on return and substitutes
+  // an invalid-instruction stub, so the record is never *consumed*.
+  if (InstructionSize < MAX_INST_SIZE) [[likely]] {
+    Instruction[InstructionSize] = *Byte;
+  }
   InstructionSize++;
   return *Byte;
 }
@@ -165,13 +174,23 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   }
 
 
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  for (size_t i = 0; i < Size; ++i) {
-    ReadByte();
+  // Mirror the consumed bytes into the Instruction[] scratch array — the
+  // committed record (DecodedInst::InstBytes) is built from it and feeds the
+  // SMC validation snapshot. Copy from Res rather than re-reading InstStream:
+  // a racing guest write must not let the record diverge from the value this
+  // decode actually consumed. This must stay above the relocation handling
+  // below, which transforms the returned value — the record holds what memory
+  // contained. Round-tripping through Res's object representation reproduces
+  // the stream bytes exactly; both memcpys move the same Size low-order bytes.
+  // Bounds-checked explicitly: a malformed over-long sequence loses its record
+  // bytes past MAX_INST_SIZE, but DecodeInstructionImpl still commits the
+  // (over-long) InstBytes at its tail; DecodeInstruction then flags
+  // ErrorDuringDecoding and substitutes an invalid-instruction stub so the
+  // record is never *consumed*.
+  if (InstructionSize + Size <= MAX_INST_SIZE) [[likely]] {
+    std::memcpy(&Instruction[InstructionSize], &Res, Size);
   }
-#else
   SkipBytes(Size);
-#endif
 
   if (Relocations) {
     uint32_t SectionOffset = static_cast<uint32_t>(Address - SectionMinAddress);
@@ -682,6 +701,12 @@ bool Decoder::NormalOp(const FEXCore::X86Tables::X86InstInfo* Info, uint16_t Op,
   LOGMAN_THROW_A_FMT(Bytes == 0, "Inst at 0x{:x}: 0x{:04x} '{}' Had an instruction of size {} with {} remaining", DecodeInst->PC,
                      DecodeInst->OP, DecodeInst->TableInfo->Name ?: "UND", InstructionSize, Bytes);
   DecodeInst->InstSize = InstructionSize;
+  // Persist the decoder-consumed bytes into the committed record. Instruction[]
+  // is zero-filled at the start of every decode, so the tail past InstSize is
+  // zero; copying the whole array keeps the copy length constant and
+  // independent of any (possibly over-long, later rejected) InstSize.
+  static_assert(sizeof(DecodeInst->InstBytes) == sizeof(Instruction));
+  std::memcpy(DecodeInst->InstBytes.data(), Instruction.data(), sizeof(DecodeInst->InstBytes));
   return true;
 }
 
@@ -1096,6 +1121,14 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
   HitNonExecutableRange = false;
   HitBadRelocation = false;
   bool ErrorDuringDecoding = !DecodeInstructionImpl(PC);
+
+  // The decode loop only bounds prefix/opcode reads; ModRM/SIB/displacement/
+  // immediate reads inside NormalOp can carry a malformed sequence past
+  // MAX_INST_SIZE. Hardware raises #UD past 15 bytes — reject such sequences
+  // here so an over-long InstSize never commits. Downstream consumers size
+  // buffers to MAX_INST_SIZE (DecodedInst::InstBytes, and the 16-byte SMC
+  // validation snapshot in Core.cpp).
+  ErrorDuringDecoding |= InstructionSize > MAX_INST_SIZE;
 
   if (ErrorDuringDecoding || HitNonExecutableRange || HitBadRelocation) [[unlikely]] {
     // Put an invalid instruction in the stream so the core can raise SIGILL if hit
