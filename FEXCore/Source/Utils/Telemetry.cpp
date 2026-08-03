@@ -37,8 +37,10 @@ const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST>
   "Non-Canonical 64-bit address access",
   "PPC64 Split Lock - doubleword-contained (C3 path)",
   "PPC64 Split Lock - quadword-contained (C4 path)",
-  "PPC64 Split Lock - crossing (mutex + memcpy fallback)",
+  "PPC64 Split Lock - crossing (dual-doubleword CAS under stripe mutex, C4.5 path)",
   "PPC64 Split Lock - container LL/SC retry high-water",
+  "PPC64 Split Lock - crossing CAS tear (reported to guest as CAS failure)",
+  "PPC64 Split Lock - crossing RMW tear (half-applied; pre-op value returned)",
 };
 
 static bool Enabled {true};

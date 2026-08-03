@@ -39,10 +39,12 @@ enum TelemetryType {
   TYPE_JIT_ADDRESSABLE_LAST,
   // PPC64 split-lock helper path breakdown (C5). PPC64_SplitLockEmulate
   // dispatches by containment inside the striped mutex; these three counters
-  // let us tell "how much of the split-lock traffic actually still lands on
-  // the mutex-only crossing path" from the shutdown dump, rather than
-  // inferring it from a single TYPE_HAS_SPLIT_LOCKS total. TYPE_HAS_SPLIT_LOCKS
-  // remains the always-incremented top-level counter.
+  // let us tell how much of the split-lock traffic lands on each path from
+  // the shutdown dump, rather than inferring it from a single
+  // TYPE_HAS_SPLIT_LOCKS total. (Since C4.5 the crossing path is a
+  // dual-doubleword CAS under the stripe mutex, no longer a plain memcpy;
+  // the counter keeps its name because the mutex is still held there.)
+  // TYPE_HAS_SPLIT_LOCKS remains the always-incremented top-level counter.
   TYPE_SPLIT_LOCK_DWORD_CONTAINED = TYPE_JIT_ADDRESSABLE_LAST,
   TYPE_SPLIT_LOCK_QWORD_CONTAINED,
   TYPE_SPLIT_LOCK_CROSSING_MUTEX,
@@ -51,6 +53,16 @@ enum TelemetryType {
   // instrument exists to make diagnosable — a normal run shows single-digit
   // retries; a livelock shows an unbounded climb.
   TYPE_SPLIT_LOCK_MAX_RETRIES,
+  // C4.5 crossing-path tear counters, CAS and RMW separately. A tear is the
+  // crossing path's second doubleword commit finding the operand's own bytes
+  // changed after the first doubleword already committed — the one window a
+  // dual-doubleword CAS cannot make atomic against the JIT's mutex-free
+  // aligned LL/SC path. A CAS tear is reported to the guest as CAS failure
+  // (never success — see ContainerCrossing in PPC64.cpp); an RMW tear leaves
+  // the operation half-applied. Any nonzero value in a shutdown dump is a
+  // real guest-visible atomicity violation, not noise.
+  TYPE_SPLIT_LOCK_CROSSING_CAS_TEAR,
+  TYPE_SPLIT_LOCK_CROSSING_RMW_TEAR,
   TYPE_LAST,
 };
 
