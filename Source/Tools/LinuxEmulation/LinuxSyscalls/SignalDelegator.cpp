@@ -213,12 +213,13 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
     auto* ThreadObject = GetThreadFromAltStack(_context->uc_stack);
     if (ThreadObject && !InReconstruct) {
       // Same zombie-ThreadStateObject guard SignalHandlerThunk applies below:
-      // after ThreadManager::DestroyThread zeroes ThreadInfo.TID the object is
-      // a leaked slab and ->Thread must not be dereferenced.
+      // after ThreadManager::DestroyThread sets ThreadInfo.IsZombie, the
+      // slab is leaked and ->Thread must not be dereferenced.
       const uint32_t TraceHostTid = FHU::Syscalls::gettid();
+      const bool ObjIsZombie = ThreadObject->ThreadInfo.IsZombie.load(std::memory_order_acquire);
       const uint32_t ObjTid = ThreadObject->ThreadInfo.TID.load(std::memory_order_relaxed);
       auto* Thread = ThreadObject->Thread;
-      if (Thread && ObjTid != 0 && ObjTid == TraceHostTid) {
+      if (Thread && !ObjIsZombie && ObjTid == TraceHostTid) {
         InReconstruct = 1;
         const uint64_t HostPC = ArchHelpers::Context::GetPc(_context);
         StateRIP = Thread->CurrentFrame->State.rip;
@@ -385,13 +386,15 @@ static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   }
   // UAF guard (Steam SteamRT3 teardown race, 2026-05-15): the kernel can
   // deliver an in-flight signal AFTER ThreadManager::DestroyThread has run
-  // (which now zeroes ThreadInfo.TID before leaking the slab). If the TID
-  // is zero or doesn't match the current kernel TID, the ThreadObject is
-  // a zombie and dereferencing ->Thread / ->SignalInfo crashes.  Fall
-  // through to default disposition; coredump preserves original siginfo.
+  // (which sets ThreadInfo.IsZombie before leaking the slab). If the
+  // object is marked zombie or the TID does not match the current kernel
+  // TID, the ThreadObject is dead-mail and dereferencing ->Thread /
+  // ->SignalInfo crashes. Fall through to default disposition; coredump
+  // preserves original siginfo.
   const uint32_t HostTid = FHU::Syscalls::gettid();
+  const bool ObjIsZombie = ThreadObject->ThreadInfo.IsZombie.load(std::memory_order_acquire);
   const uint32_t ObjTid = ThreadObject->ThreadInfo.TID.load(std::memory_order_relaxed);
-  if (ObjTid == 0 || ObjTid != HostTid) {
+  if (ObjIsZombie || ObjTid != HostTid) {
     struct sigaction sa {};
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);

@@ -47,6 +47,7 @@ $end_info$
 
 #include <algorithm>
 #include <alloca.h>
+#include <atomic>
 #include <charconv>
 #include <functional>
 #include <linux/audit.h>
@@ -65,10 +66,56 @@ $end_info$
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 namespace FEX::HLE {
 class SignalDelegator;
 SyscallHandler* _SyscallHandler {};
+
+// 2026-08-03 diagnostic: FEX_TRACE_CLONE=1 logs the guest-visible clone
+// return value alongside child-thread bring-up, so we can correlate a
+// crashing probe run's fault with the sequence of clone returns that
+// preceded it.  Same async-signal-safe raw write() shape as
+// FEX_TRACE_SIGNALS.  Cheap fast-path; no output when unset.
+namespace CloneTrace {
+static std::atomic<int> Fd {-2};
+inline int Get() {
+  int f = Fd.load(std::memory_order_acquire);
+  if (f == -2) {
+    if (getenv("FEX_TRACE_CLONE")) {
+      f = ::open("/tmp/fex_clone_trace.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    } else {
+      f = -1;
+    }
+    int expected = -2;
+    if (!Fd.compare_exchange_strong(expected, f)) {
+      if (f >= 0) ::close(f);
+      f = Fd.load(std::memory_order_acquire);
+    }
+  }
+  return f;
+}
+inline void Emit(const char* line, size_t n) {
+  int f = Get();
+  if (f < 0) return;
+  ssize_t off = 0;
+  while (off < static_cast<ssize_t>(n)) {
+    ssize_t w = ::write(f, line + off, n - off);
+    if (w <= 0) break;
+    off += w;
+  }
+}
+inline int Hex(char* dst, uint64_t v) {
+  char tmp[18];
+  int n = 0;
+  if (v == 0) { tmp[n++] = '0'; }
+  while (v) { int d = v & 0xf; tmp[n++] = (d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+  int len = 0;
+  dst[len++] = '0'; dst[len++] = 'x';
+  while (n > 0) dst[len++] = tmp[--n];
+  return len;
+}
+}  // namespace CloneTrace
 
 template<bool IncrementOffset, typename T>
 uint64_t GetDentsEmulation(int fd, T* dirp, uint32_t count) {
@@ -601,6 +648,25 @@ static uint64_t Clone3Handler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clo
 
 uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
   uint64_t flags = args->args.flags;
+  {
+    // FEX_TRACE_CLONE=1 diagnostic entry: log the flags + calling TID
+    // before we branch into any of the fork/thread paths.
+    char buf[192];
+    int len = 0;
+    const char* p = "CLONE-ENTRY caller_tid=";
+    while (*p) buf[len++] = *p++;
+    len += CloneTrace::Hex(buf + len, (uint64_t)::syscall(SYS_gettid));
+    p = " flags="; while (*p) buf[len++] = *p++;
+    len += CloneTrace::Hex(buf + len, flags);
+    p = " type="; while (*p) buf[len++] = *p++;
+    len += CloneTrace::Hex(buf + len, (uint64_t)args->Type);
+    p = " stack="; while (*p) buf[len++] = *p++;
+    len += CloneTrace::Hex(buf + len, args->args.stack);
+    p = " tls="; while (*p) buf[len++] = *p++;
+    len += CloneTrace::Hex(buf + len, args->args.tls);
+    buf[len++] = '\n';
+    CloneTrace::Emit(buf, len);
+  }
 
   // CLONE_CLEAR_SIGHAND (kernel 5.5+) is the posix_spawn-style optimisation:
   // the child resets all non-default sigactions to SIG_DFL atomically with the
@@ -736,6 +802,37 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
       FEX::HLE::_SyscallHandler->TM.DestroyThread(NewThread);
     }
 
+    // Belt-and-braces: zero is never a valid child TID and glibc's
+    // create_thread only tests `< 0` for failure, so a stray 0 would be
+    // accepted as success and stored as `pd->tid`, corrupting downstream
+    // pthread_join / pthread_kill / pd-recycling. The primary fix moves
+    // the DestroyThread zombie marker off TID (ThreadInfo.IsZombie), so
+    // this branch should never be taken. If it is, we've introduced a
+    // second instance of the same overload — surface it as EAGAIN, which
+    // is the errno glibc treats as "transient, try again."
+    if (Result == 0) {
+      LogMan::Msg::EFmt("CLONE_THREAD returned TID=0 to guest (should be impossible); returning EAGAIN");
+      Result = static_cast<uint64_t>(-EAGAIN);
+    }
+
+    {
+      // FEX_TRACE_CLONE=1: log the value we return to the guest for the
+      // thread-creating clone. Result carries the child TID unless the
+      // never-return-zero guard rewrote it to -EAGAIN.
+      char buf[192];
+      int len = 0;
+      const char* p = "CLONE-RETURN-THREAD caller_tid=";
+      while (*p) buf[len++] = *p++;
+      len += CloneTrace::Hex(buf + len, (uint64_t)::syscall(SYS_gettid));
+      p = " child_tid=";
+      while (*p) buf[len++] = *p++;
+      len += CloneTrace::Hex(buf + len, Result);
+      p = " errno=";
+      while (*p) buf[len++] = *p++;
+      len += CloneTrace::Hex(buf + len, (uint64_t)errno);
+      buf[len++] = '\n';
+      CloneTrace::Emit(buf, len);
+    }
     SYSCALL_ERRNO();
   }
 };

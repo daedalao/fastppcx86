@@ -18,7 +18,7 @@ namespace FEXCore::Telemetry {
 #ifndef FEX_DISABLE_TELEMETRY
 std::array<Value, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryValues = {{}};
 const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST> TelemetryNames {
-  "64byte Split Locks",
+  "Split lock helper entries (PPC64: bypassed by JIT-inline C6/C7 when the SplitLockInlineContained knob is on, so doubleword-contained events do not count here — ARM64 semantics unchanged)",
   "16byte Split atomics",
   "EVEX instructions (AVX512)",
   "16bit CAS Tear",
@@ -35,6 +35,12 @@ const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST>
   "Uses 32-bit Segment CS",
   "Uses 32-bit Segment DS",
   "Non-Canonical 64-bit address access",
+  "PPC64 Split Lock - doubleword-contained (C3 path)",
+  "PPC64 Split Lock - quadword-contained (C4 path)",
+  "PPC64 Split Lock - crossing (dual-doubleword CAS under stripe mutex, C4.5 path)",
+  "PPC64 Split Lock - container LL/SC retry high-water",
+  "PPC64 Split Lock - crossing CAS tear (reported to guest as CAS failure)",
+  "PPC64 Split Lock - crossing RMW tear (half-applied; pre-op value returned)",
 };
 
 static bool Enabled {true};

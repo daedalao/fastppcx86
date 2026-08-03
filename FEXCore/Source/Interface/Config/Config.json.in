@@ -701,6 +701,15 @@
           "This is required to ensure a split-lock doesn't tear inside the process"
         ]
       },
+      "SplitLockInlineContained": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "PPC64LE: JIT-inline doubleword-contained misaligned LOCK RMW and CAS ops ((EA & 7) + size <= 8, 2-/4-byte operands) as aligned ldarx/stdcx. container loops",
+          "instead of routing them through the mutex-serialized split-lock helper. Crossing and quadword-contained cases still use the helper.",
+          "While enabled these ops bypass the helper entirely, so the doubleword-contained split-lock telemetry counter no longer observes them."
+        ]
+      },
       "KernelUnalignedAtomicBackpatching": {
         "Type": "bool",
         "Default": "true",
@@ -775,6 +784,15 @@
         "Default": "false",
         "Desc": [
           "Disables inline syscalls in order to support seccomp handling"
+        ]
+      },
+      "Reported_CPUs": {
+        "Type": "uint32",
+        "Default": "0",
+        "Desc": [
+          "Overrides the guest-visible CPU count returned by CPUID and sysconf.",
+          "Zero (default) reports the real host thread count. Clamped to 1..4096 in Source/Common/CPUInfo.cpp.",
+          "Useful for guests whose worker pools scale with the reported count and misbehave at high thread counts."
         ]
       },
       "ExtendedVolatileMetadata": {

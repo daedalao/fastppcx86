@@ -541,7 +541,25 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
     Thread->CPUBackend->ClearCache();
   } else {
-    // Clear L1+L2 cache of this thread, and clear L3 cache across any threads using it
+    // Clear L1+L2 cache of this thread, and clear L3 cache across any threads using it.
+    //
+    // HAZARD: GuestToHostMap::ClearCache (LookupCache.cpp:101-106) drops the
+    // BlockLinks map without running any delinker callback. The code buffer,
+    // however, stays live in this branch (NewCodeBuffer=false) — its patched
+    // callsites still branch to what USED to be linked HostCode entries. Once
+    // BlockLinks is gone, those callsites resolve into now-freed slots and any
+    // subsequent dispatch through them is undefined.
+    //
+    // Trip a Release-visible trap here rather than a LOGMAN_* assertion because
+    // those compile out in Release (LogManager.h:69-74,130-136) and would let
+    // the hazard reach users silently. Today the only caller is
+    // ThreadManager::Step (ThreadManager.cpp:535), which is itself stubbed
+    // ("not implemented"), so this guard is unreachable in normal execution;
+    // if Step gets a real implementation or a new caller appears, they must
+    // land a delink walk (or a full code-buffer rotation via NewCodeBuffer=true)
+    // before this path becomes correct to take.
+    ERROR_AND_DIE_FMT("ClearCodeCache(NewCodeBuffer=false) reached without a delink walk; "
+                      "live code buffer still contains patched callsites into cleared BlockLinks");
     auto lk = Thread->LookupCache->AcquireWriteLock();
     Thread->LookupCache->ClearCache(lk);
   }

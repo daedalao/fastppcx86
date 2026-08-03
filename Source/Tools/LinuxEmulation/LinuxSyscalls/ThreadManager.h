@@ -62,6 +62,14 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     uint32_t parent_tid;
     uint32_t PID;
     std::atomic<uint32_t> TID;
+    // Set by DestroyThread once the ThreadStateObject slab is being leaked
+    // for signal-delivery UAF mitigation. Kept SEPARATE from TID because
+    // TID is a data field the parent's CLONE_THREAD return path reads for
+    // its guest-visible syscall result; overloading TID as the marker
+    // races the parent's read when a short-lived child exits before the
+    // parent's post-notify readback. See Syscalls/Thread.cpp CreateNewThread
+    // and Syscalls.cpp CloneHandler for the reader that this write races.
+    std::atomic<bool> IsZombie {false};
     int32_t* set_child_tid {0};
     int32_t* clear_child_tid {0};
     uint64_t robust_list_head {0};

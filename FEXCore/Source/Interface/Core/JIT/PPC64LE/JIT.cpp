@@ -1999,7 +1999,19 @@ bypass_diagnose:
     HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP);
   }
   if (!HostCode) {
+    // Snapshot the code buffer we would be publishing into. CompileBlock can
+    // rotate to a fresh buffer if the current one fills up; the LookupCache
+    // it publishes to lives on the buffer, so a rotation invalidates the
+    // pointer we hold. If that happened, return the freshly-compiled
+    // HostCode without registering any link/publish on top of it — the new
+    // LookupCache is a clean slate and the old buffer's HostCode is still
+    // valid for the caller's immediate dispatch, but must not be recorded.
+    // Mirrors Arm64Emitter's ExitFunctionLink at JIT/JIT.cpp:548-555.
+    auto CodeBuffer = static_cast<PPC64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
     HostCode = CTX->CompileBlock(Frame, GuestRIP, 0);
+    if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+      return HostCode;
+    }
   }
   return HostCode;
 }
@@ -2600,10 +2612,17 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   //
   // Arm64JITCore does the same handshake before copying its staging buffer out
   // (JIT/JIT.cpp:1085); it matters more here because PPC64 emits directly into
-  // the shared buffer rather than staging per-thread. No CallRetStack reset is
-  // needed alongside it: the PPC64LE backend does not use the call-return
-  // predictor stack.
+  // the shared buffer rather than staging per-thread.
+  //
+  // Wipe CallRetStack alongside the code-buffer rotation. The current PPC64LE
+  // backend does not push/pop the call-return predictor stack, so this is a
+  // no-op today; landing it here now preserves the ordering invariant for
+  // when a future shadow return stack starts using it — stale entries in
+  // the per-thread callret stack must never survive a code-buffer rotation
+  // because their embedded HostPC values reference memory that is about to
+  // be reused. Mirrors JIT/JIT.cpp:1086.
   if (auto Prev = CheckCodeBufferUpdate()) {
+    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
     auto CacheLock = ThreadState->LookupCache->AcquireWriteLock();
     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, CacheLock);
   }
