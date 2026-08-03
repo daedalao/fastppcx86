@@ -17,10 +17,15 @@
 // take the LL/SC fast path, misaligned EAs are routed to
 // `PPC64_SplitLockEmulate` (Tier D atomics C2 for `CASPair`; earlier phase
 // for the Fetch* / Swap ops). The helper is process-wide striped-mutex
-// serialised, so misaligned ops compose with other helper calls — but
-// **NOT with the aligned LL/SC path on the same address in another thread**
-// (Tier D atomics defect 1; the container-in-helper C3/C4 series closes that
-// gap). The 8-bit (lbarx) path is always aligned by definition.
+// serialised, and since C3/C4 it also runs real ldarx/stdcx. (C3, doubleword
+// container) or lqarx/stqcx. (C4, quadword container) inside that mutex when
+// the operand fits — so misaligned-contained ops now compose with the
+// aligned LL/SC path on overlapping bytes in another thread. A crossing
+// residual remains: 8-byte ops at (EA & 15) > 8, and i386 `cmpxchg8b` at
+// offset 12 mod 16, still stay on the memcpy-crossing path which does not
+// compose with aligned LL/SC (Tier D atomics defect 1, narrowed by C3+C4
+// but not closed — closure requires a dual-container crossing path, deferred
+// as a future C4.5). The 8-bit (lbarx) path is always aligned by definition.
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Context/Context.h"
 
@@ -71,14 +76,16 @@ namespace FEXCore::CPU {
 // SplitLock mini-frame helper. The misaligned LOCK-RMW path used to inline a
 // non-atomic LD->op->ST (single-thread correct only). Phase 3 replaces it
 // with a call into PPC64_SplitLockEmulate (process-wide striped-mutex
-// serialised). This composes correctly with other helper-serialised misaligned
-// ops on the same striped cacheline, **but not with the aligned LL/SC path on
-// the same address in another FEX thread** — the mutex and LL/SC do not
-// compose (Tier D atomics defect 1). The container-in-helper series
-// (Tier D atomics C3/C4) closes that gap. The `hwsync`/`isync` bracket
-// around the helper call is provided by each caller op (Tier D atomics C1
-// hoists `hwsync` above the alignment test and moves `Bind(&done)` above
-// `isync`, so both the aligned and misaligned paths run inside it).
+// serialised, plus real ldarx/stdcx. or lqarx/stqcx. inside the mutex when
+// the operand is doubleword- or quadword-contained — Tier D atomics C3/C4).
+// This composes correctly with the aligned LL/SC path in another FEX thread
+// for every contained case. Crossing 8-byte ops at (EA & 15) > 8 still take
+// the plain memcpy fallback under the mutex only, which does not compose
+// with aligned LL/SC — a residual of Tier D atomics defect 1, narrowed by
+// C3+C4 but not closed. The `hwsync`/`isync` bracket around the helper call
+// is provided by each caller op (Tier D atomics C1 hoists `hwsync` above the
+// alignment test and moves `Bind(&done)` above `isync`, so both the aligned
+// and misaligned paths run inside it).
 //
 // Frame layout (80 bytes, allocated via stdu r1, -80, r1):
 //
