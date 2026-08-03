@@ -307,8 +307,13 @@ namespace CPU {
       reinterpret_cast<uint64_t>(PBLENDW_LUT.data());
 
 #ifndef FEX_DISABLE_TELEMETRY
-    // Fill in telemetry values
-    for (size_t i = 0; i < FEXCore::Telemetry::TYPE_LAST; ++i) {
+    // Fill in telemetry values. Bound is TYPE_JIT_ADDRESSABLE_LAST, not
+    // TYPE_LAST: the Ptrs.TelemetryValueAddresses array is sized to the
+    // JIT-addressable subrange (see CoreState.h:362 and the marker in
+    // Telemetry.h). Writing past that clobbers DispatcherLoopTop et al.
+    // — an OOB carry between the C5 array-resize and the C-helper-only
+    // slots added above the marker.
+    for (size_t i = 0; i < FEXCore::Telemetry::TYPE_JIT_ADDRESSABLE_LAST; ++i) {
       auto& Telem = FEXCore::Telemetry::GetTelemetryValue(static_cast<FEXCore::Telemetry::TelemetryType>(i));
       Ptrs.TelemetryValueAddresses[i] = reinterpret_cast<uint64_t>(&Telem);
     }
