@@ -946,8 +946,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // get there, which would yank a lock this function relies on for its whole
   // body (the v2 hazard, see SMCSoftInvalidate.h note (d)). Null pointer =>
   // option off => one predictable load and a not-taken branch.
-  if (auto* LazyCount = SyscallHandler->LazySMCDirtyCount; LazyCount && LazyCount->load(std::memory_order_acquire) != 0) {
-    SyscallHandler->DrainLazySMCInvalidations(Thread);
+  if (auto* LazyCount = SyscallHandler->LazySMCDirtyCount; LazyCount) {
+    // FEX_SMCLAZYSCRUB: this thread's scrub debt (if any) is settled by the
+    // unconditional drain below, so consume it here too. CompileBlock is
+    // normally reached *through* the lookup slow path, which already took it;
+    // this covers the direct callers (CompileRIP, HandleCallback, AOT).
+    Thread->LookupCache->TakeLazySMCDrainPending();
+    if (LazyCount->load(std::memory_order_acquire) != 0) {
+      SyscallHandler->DrainLazySMCInvalidations(Thread);
+    }
   }
 
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
@@ -1230,6 +1237,16 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
     Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
   }
+}
+
+void ContextImpl::ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThreadState* Thread) {
+  // FEX_SMCLAZYSCRUB. Signal-handler context, faulting thread, own cache.
+  // Deliberately does NOT touch L2/L3, CachedCodePages, the frontend's
+  // executable-range cache, or the CallRet stack: all of those need a lock this
+  // handler must not take, and none of them is reachable without first going
+  // through the lookup slow path, which drains. The PPC64LE backend does not
+  // use the CallRet predictor stack at all (see JIT/PPC64LE/JIT.cpp).
+  Thread->LookupCache->ScrubForLazySMC();
 }
 
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {

@@ -395,6 +395,24 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase);
       UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_PAGE_SIZE);
       LazyDeferred = true;
+
+      // FEX_SMCLAZYSCRUB (default on): make the deferral sound for THIS thread.
+      // x86 only guarantees SMC coherence to the modifying processor, so it is
+      // enough to guarantee that the thread which just dirtied this page cannot
+      // reach any cached translation again without draining first. Zeroing its
+      // L1 forces its very next dispatch -- inlined block-exit probe or
+      // dispatcher probe alike -- into PPC64JITCore::ExitFunctionLink, which
+      // drains before it looks at the shared L2/L3. Other threads keep their
+      // caches and their speedup, and stay exactly as (un)sound as x86 already
+      // allows for cross-modifying code.
+      //
+      // Deliberately AFTER the record + unprotect: the scrub only has to be in
+      // place before this handler returns, and doing it last keeps the ordering
+      // argument above (record-before-unprotect) intact and unentangled.
+      if (_SyscallHandler->SMCLazyScrubActive()) {
+        Thread->CTX->ScrubThreadLookupCacheForLazySMC(Thread);
+      }
+
       if (FirstThisEpoch) {
         SMC_AUDIT("[%d] fault addr=%lx LAZY-UNPROTECT page=%lx\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase);
       }

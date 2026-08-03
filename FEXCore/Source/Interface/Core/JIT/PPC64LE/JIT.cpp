@@ -1937,6 +1937,28 @@ bypass_diagnose:
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
 
+  // FEX_SMCLAZYSCRUB drain point. This is the L1-miss slow path -- the ONLY
+  // way a PPC64LE guest thread can reach a translation it does not already
+  // have in L1 (there is no block linking on this backend: every block exit
+  // re-probes L1 inline and branches here on a miss, see BranchOps.cpp
+  // DEF_OP(ExitFunction); the dispatcher loop top does the same, see
+  // PPC64Dispatcher.cpp). The SMC fault handler zeroed this thread's L1 when
+  // it deferred an invalidation, so the thread that just patched guest code is
+  // guaranteed to arrive here before it can execute anything. Settle the debt
+  // now, BEFORE the L2/L3 lookup below, or that lookup would republish exactly
+  // the stale translation the scrub was meant to hide.
+  //
+  // Must stay above the shared CodeInvalidationMutex guard for the same reason
+  // ContextImpl::CompileBlock's copy does: the drain takes the exclusive side
+  // of that mutex via ReleaseAllPendingSharedLocks. Cost with the option off:
+  // one relaxed load of a per-thread bool.
+  if (Thread->LookupCache->TakeLazySMCDrainPending()) {
+    auto* Handler = CTX->SyscallHandler;
+    if (auto* LazyCount = Handler->LazySMCDirtyCount; LazyCount && LazyCount->load(std::memory_order_acquire) != 0) {
+      Handler->DrainLazySMCInvalidations(Thread);
+    }
+  }
+
   uintptr_t HostCode;
   {
     // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking.

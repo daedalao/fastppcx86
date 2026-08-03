@@ -872,9 +872,21 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   if (SMCLazyInval() && SMCSoftInvalidate() && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
     SMCLazyInvalEnabled.store(true, std::memory_order_relaxed);
     LazySMCDirtyCount = &SMCLazyDirtyCount;
-    LogMan::Msg::EFmt("FEX_SMCLAZYINVAL is ON: SMC invalidation is deferred to drain points and guest code "
-                      "can execute STALE translations. This is deliberately unsound -- expect self-modifying "
-                      "guests (runtime codegen, JITs) to miscompute or crash.");
+    // FEX_SMCLAZYSCRUB (default on) scrubs the faulting thread's L1 and makes
+    // it drain in the lookup slow path, which closes the same-thread
+    // patch-then-call hole. Only meaningful once lazy is actually armed.
+    SMCLazyScrubEnabled.store(SMCLazyScrub(), std::memory_order_relaxed);
+    if (SMCLazyScrub()) {
+      LogMan::Msg::IFmt("FEX_SMCLAZYINVAL is ON: SMC invalidation is deferred to drain points. Same-thread "
+                        "self-modifying code stays correct via FEX_SMCLAZYSCRUB; cross-thread modification "
+                        "without a serializing event on the reader can still observe STALE translations, as "
+                        "x86 already permits.");
+    } else {
+      LogMan::Msg::EFmt("FEX_SMCLAZYINVAL is ON with FEX_SMCLAZYSCRUB=0: SMC invalidation is deferred to drain "
+                        "points and guest code can execute STALE translations, including code the SAME thread "
+                        "just wrote. This is deliberately unsound -- expect self-modifying guests (runtime "
+                        "codegen, JITs) to miscompute or crash.");
+    }
   } else if (SMCLazyInval()) {
     LogMan::Msg::EFmt("FEX_SMCLAZYINVAL needs FEX_SMCSOFTINVALIDATE=1 and FEX_SMCCHECKS=mtrack; staying off.");
   }

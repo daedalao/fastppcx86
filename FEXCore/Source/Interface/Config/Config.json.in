@@ -509,15 +509,32 @@
         "Type": "bool",
         "Default": "false",
         "Desc": [
-          "DELIBERATELY UNSOUND, for speed. On an SMC write fault, unprotect",
-          "the page and record it as dirty but invalidate NOTHING, so the",
-          "writer runs at native speed. The recorded pages are soft-invalidated",
-          "later, at the next drain point (a thread entering the block",
-          "compiler, a guest syscall, or guest signal delivery). A thread can",
-          "execute a STALE translation between the write and that drain; a",
-          "same-thread patch-then-call that hits the L1 lookup cache is the",
-          "known exposure and can make a guest miscompute or crash. Requires",
-          "SMCSoftInvalidate and SMCChecks=mtrack. Off: no effect."
+          "On an SMC write fault, unprotect the page and record it as dirty but",
+          "invalidate NOTHING, so the writer runs at native speed. The recorded",
+          "pages are soft-invalidated later, at the next drain point (a thread",
+          "entering the block compiler, a guest syscall, guest signal delivery,",
+          "or a guest mprotect granting PROT_EXEC). Sound for same-thread",
+          "self-modifying code because SMCLazyScrub (on by default) forces the",
+          "writing thread through a drain before its next dispatch; cross-thread",
+          "modification stays as unsound as x86 already allows it to be (the",
+          "reader must serialize, and every way it can is a drain point).",
+          "Setting SMCLazyScrub=0 restores the older, faster, unsound behaviour.",
+          "Requires SMCSoftInvalidate and SMCChecks=mtrack. Off: no effect."
+        ]
+      },
+      "SMCLazyScrub": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "Only meaningful with SMCLazyInval=1. When an SMC write fault takes",
+          "the lazy route, scrub the faulting thread's L1 block-lookup cache and",
+          "mark that thread as owing a drain, so its very next dispatch misses",
+          "every fast path, lands in the lookup slow path, and drains the",
+          "deferred invalidations before it can consult the shared L2/L3 caches.",
+          "This is what makes lazy invalidation sound for same-thread",
+          "patch-then-call (smcstorm/patchloop). Set to 0 to measure -- or",
+          "restore -- the original unsound-but-faster lazy behaviour, in which a",
+          "thread can execute a STALE translation of code it just wrote."
         ]
       },
       "SMCStoreEmulation": {
