@@ -296,6 +296,16 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     SMC_AUDIT("[%d] fault addr=%lx INVALIDATED page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase,
               Entry->second.Flags.Shared ? 1 : 0);
 
+    // FEX_SMCMPROTECTDEFER: a deferred-dirty page can still fault here if a
+    // block was compiled on it afterwards and MarkGuestExecutableRange
+    // re-installed read-only tracking.  The invalidation just above settles the
+    // deferred debt, so drop the record instead of paying for it again at the
+    // next PROT_EXEC.  (Cheap: the atomic count short-circuits when no page is
+    // deferred, which is every fault in a run with the option off.)
+    if (_SyscallHandler->SMCMprotectDeferActive()) {
+      _SyscallHandler->ClearSMCDeferredDirtyRange(FaultBase, FaultBase + FEXCore::Utils::FEX_PAGE_SIZE);
+    }
+
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
 
     // Mirror of InvalidationTracker::HandleRWXAccessViolation's tail on Windows:
@@ -660,6 +670,13 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
   }
 
+  // An mmap over a deferred-dirty range retires whatever was there; the
+  // invalidation above is unconditional, so all that is left is to forget the
+  // deferral (otherwise the new mapping's first PROT_EXEC would pay for it).
+  if (SMCMprotectDeferActive()) {
+    ClearSMCDeferredDirtyRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  }
+
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
 
   if (LateMetadata) {
@@ -700,6 +717,15 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
     }
     TrackMunmap(Thread, addr, length);
   }
+
+  // Same as GuestMmap: the range is gone, the invalidation below is
+  // unconditional, so just drop the deferred records for it.  This is what
+  // keeps a deferred page from leaking stale blocks past its mapping.
+  if (SMCMprotectDeferActive()) {
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
+    ClearSMCDeferredDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  }
+
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size);
 
   if (length) {
@@ -731,6 +757,26 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
   }
 
   InvalidateCodeRangeIfNecessaryOnRemap(Thread, reinterpret_cast<uint64_t>(old_address), Result, old_size, new_size);
+
+  if (SMCMprotectDeferActive()) {
+    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto NewBase = Result & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_PAGE_SIZE);
+
+    // The old range is invalidated above (when it moved) and is gone either
+    // way, so its records just go.
+    ClearSMCDeferredDirtyRange(OldBase, OldTop);
+
+    // The destination is not covered by InvalidateCodeRangeIfNecessaryOnRemap.
+    // If anything there was deferred-dirty, the deferral's PROT_EXEC hook can
+    // no longer be trusted to cover it (the mapping underneath just changed),
+    // so settle the debt now rather than carrying it.
+    if (ClearSMCDeferredDirtyRange(NewBase, NewTop)) {
+      InvalidateCodeRangeIfNecessary(Thread, NewBase, NewTop - NewBase);
+    }
+  }
+
   return Result;
 }
 
@@ -782,7 +828,48 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     TrackMprotect(Thread, addr, len, prot);
   }
 
-  InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len);
+  // FEX_SMCMPROTECTDEFER: use the guest's own mprotect calls as the SMC
+  // validation point for W^X code flips.  See the block comment on
+  // SMCDeferredDirtyPages in Syscalls.h for the soundness argument.
+  bool DeferInvalidation = false;
+  if (SMCMprotectDeferActive()) {
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+
+    if (prot & PROT_EXEC) {
+      // The guest is (re-)arming the range for execution.  This is the point
+      // the deferral was aiming at: drop the records and fall through to the
+      // unconditional invalidation below, which happens before this syscall
+      // returns and therefore before the guest can branch into the range.
+      //
+      // A single W+X request lands here too, which is exactly the legacy
+      // behaviour we owe it: with PROT_EXEC granted alongside PROT_WRITE there
+      // is no window in which the guest is forbidden from executing, so
+      // nothing may be deferred.
+      if (ClearSMCDeferredDirtyRange(Base, Top)) {
+        SMC_AUDIT("[%d] mprotect-defer REVALIDATE base=%lx top=%lx prot=%x\n", FHU::Syscalls::gettid(), Base, Top, prot);
+      }
+    } else if ((prot & PROT_WRITE) && (Top - Base) <= SMCMaxDeferredMprotectSize) {
+      // Writable but not executable.  The ::mprotect above already replaced
+      // whatever read-only tracking protection we had installed, so the
+      // guest's writes now run at full speed; record the range so the matching
+      // PROT_EXEC transition knows it must invalidate, and skip invalidating
+      // (and re-protecting) here.
+      MarkSMCDeferredDirtyRange(Base, Top);
+      DeferInvalidation = true;
+      SMC_AUDIT("[%d] mprotect-defer DEFER base=%lx top=%lx prot=%x\n", FHU::Syscalls::gettid(), Base, Top, prot);
+    } else {
+      // Either not writable (PROT_READ / PROT_NONE), in which case nothing
+      // more can dirty the range, or a range too large to be worth tracking
+      // page-by-page.  Let the normal invalidation run and forget any deferral
+      // rather than carrying it to some later PROT_EXEC.
+      ClearSMCDeferredDirtyRange(Base, Top);
+    }
+  }
+
+  if (!DeferInvalidation) {
+    InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len);
+  }
 
   // Prepare for delayed code cache load after ld/Wine is done applying relocations.
   // Hooking into mprotect is a reliable heuristic that matches behavior of ld (for ELF) and Wine (for PE).

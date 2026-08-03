@@ -23,13 +23,16 @@ $end_info$
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+#include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/functional.h>
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/memory.h>
+#include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -225,6 +228,7 @@ public:
   FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   FEX_CONFIG_OPT(SMCStoreEmulation, SMCSTOREEMULATION);
+  FEX_CONFIG_OPT(SMCMprotectDefer, SMCMPROTECTDEFER);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
 
@@ -348,6 +352,63 @@ public:
 
   bool IsSMCDetectionDisabled() const {
     return SMCDetectionDisabled.load(std::memory_order_relaxed);
+  }
+
+  ///// Deferred SMC invalidation across a guest W^X flip (FEX_SMCMPROTECTDEFER) /////
+  //
+  // A guest that flips a code page W -> write -> X pays a full
+  // invalidate/re-protect round trip on the W transition today, even though
+  // nothing on the page can be executed until the X transition arrives.  With
+  // the option enabled, the W transition instead records the pages here and
+  // leaves them unprotected (the guest's own mprotect already dropped our
+  // read-only tracking), and the X transition performs the invalidation before
+  // the syscall returns.
+  //
+  // The deferral is sound only because the intermediate protection lacks
+  // PROT_EXEC: the guest may not legally execute from those pages, so no stale
+  // block can be legitimately reached while the page sits deferred.  A guest
+  // asking for PROT_WRITE|PROT_EXEC in one call gets legacy behaviour.
+  //
+  // Anything that can retire or re-point the underlying memory (munmap, an
+  // mmap over the range, mremap) still invalidates unconditionally and simply
+  // drops the deferred record, so a stale block can never outlive its mapping.
+  //
+  // The atomic count lets the hot paths (and the SIGSEGV handler) skip the
+  // mutex entirely in the overwhelmingly common case of an empty set.
+  // An mprotect of a very large region is not a W^X code flip; recording it
+  // page-by-page would cost more than the invalidation it saves, so ranges
+  // above this size keep legacy behaviour.
+  static constexpr uint64_t SMCMaxDeferredMprotectSize = 4 * 1024 * 1024;
+
+  std::mutex SMCDeferredDirtyMutex;
+  std::atomic<uint64_t> SMCDeferredDirtyCount {0};
+  fextl::set<uint64_t> SMCDeferredDirtyPages;
+
+  bool SMCMprotectDeferActive() const {
+    return SMCMprotectDefer && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
+  }
+
+  void MarkSMCDeferredDirtyRange(uint64_t Base, uint64_t Top) {
+    std::lock_guard lk {SMCDeferredDirtyMutex};
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+      SMCDeferredDirtyPages.insert(Page);
+    }
+    SMCDeferredDirtyCount.store(SMCDeferredDirtyPages.size(), std::memory_order_release);
+  }
+
+  // Drops every deferred record intersecting [Base, Top).  Returns true if any
+  // record existed, i.e. if the caller must make sure an invalidation happens.
+  bool ClearSMCDeferredDirtyRange(uint64_t Base, uint64_t Top) {
+    if (SMCDeferredDirtyCount.load(std::memory_order_acquire) == 0) {
+      return false;
+    }
+    std::lock_guard lk {SMCDeferredDirtyMutex};
+    auto First = SMCDeferredDirtyPages.lower_bound(Base);
+    auto Last = SMCDeferredDirtyPages.lower_bound(Top);
+    const bool Any = First != Last;
+    SMCDeferredDirtyPages.erase(First, Last);
+    SMCDeferredDirtyCount.store(SMCDeferredDirtyPages.size(), std::memory_order_release);
+    return Any;
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;

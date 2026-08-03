@@ -454,6 +454,20 @@
           "overlap compiled code fall back to the normal invalidation path."
         ]
       },
+      "SMCMprotectDefer": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Treat guest mprotect as the SMC validation point for W^X code",
+          "flips. An mprotect that makes a tracked page writable but NOT",
+          "executable no longer invalidates: the page is recorded as",
+          "deferred-dirty and left unprotected, so the guest's writes run at",
+          "full speed. The deferred invalidation is performed when the guest",
+          "mprotects the page back to PROT_EXEC, before that syscall returns.",
+          "Only legal because the guest cannot execute the intermediate,",
+          "non-PROT_EXEC protection; a W+X request keeps legacy behaviour."
+        ]
+      },
       "TSOEnabled": {
         "Type": "bool",
         "Default": "true",
