@@ -16,10 +16,12 @@
 #include <FEXCore/fextl/memory_resource.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stddef.h>
 #include <optional>
 #include <utility>
 #include <mutex>
+#include <sys/mman.h>
 
 namespace FEXCore {
 struct LookupCacheBaseLockToken {
@@ -827,7 +829,13 @@ public:
   // filtered as a suspect RIP by the lookup slow path.
   void ScrubForLazySMC() {
     LazySMCDrainPending.store(true, std::memory_order_relaxed);
-    FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, false);
+    // A failed madvise (EAGAIN under memory pressure) would silently leave the
+    // stale L1 entries in place and reopen the same-thread hole this exists to
+    // close, so the result must be checked; fall back to zeroing by hand.
+    // Both paths are async-signal-safe.
+    if (::madvise(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, MADV_DONTNEED) != 0) {
+      std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
+    }
   }
 
   // Consume this thread's lazy-drain debt.  Cleared BEFORE the drain runs so
