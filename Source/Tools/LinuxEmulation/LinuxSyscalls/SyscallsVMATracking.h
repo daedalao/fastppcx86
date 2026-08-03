@@ -50,6 +50,16 @@ struct MappedResource {
   ContainerType::iterator Iterator;
 
   bool RequiresDelayedCacheLoad = false;
+
+  // FEX_SMCFILEIMMUTABLE: set once the guest mprotects any part of this
+  // resource writable *after* FEX skipped installing SMC write-protection on
+  // it, i.e. once the "file-backed code is immutable" assumption has been
+  // observably contradicted. Sticky and resource-wide (fail closed): from then
+  // on every VMA of this mapping goes back to plain mtrack behaviour.
+  // Written only under a unique lock on VMATracking::Mutex (GuestMprotect),
+  // read under the shared lock in MarkGuestExecutableRange.
+  bool SMCFileImmutableRevoked = false;
+
   fextl::vector<Elf64_Phdr> ProgramHeaders;
 };
 

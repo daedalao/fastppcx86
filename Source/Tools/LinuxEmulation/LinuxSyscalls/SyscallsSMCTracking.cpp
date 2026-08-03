@@ -426,6 +426,69 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
   }
 }
 
+// FEX_SMCFILEIMMUTABLE — treat file-backed code as immutable
+// ---------------------------------------------------------------------------
+// Relaxed correctness for speed.  Opt-in, off by default, and only meaningful
+// with SMCChecks=mtrack (Syscalls.cpp logs and ignores it otherwise).
+//
+// Every page a block was compiled from gets write-protected below so that a
+// later guest write faults and invalidates the block.  For a PRIVATE
+// FILE-BACKED mapping -- Wine DLLs, libc, the game executable's .text -- that
+// protection is nearly pure waste: the mapping is written at load time
+// (relocations, CoW) and essentially never again, while data that merely
+// shares a page with code keeps faulting forever (the smcstorm "falseshare"
+// class).  With this option on, such pages are skipped: no mprotect, no fault,
+// no invalidation, no re-protect.
+//
+// (3) Startup relocations are unaffected in both directions: protection is
+// only ever installed HERE, at compile time, and ld.so/Wine write their CoW
+// pages before any code is compiled from them.  There is nothing installed for
+// their writes to trip over with the option off, and nothing skipped with it
+// on.
+//
+// What still invalidates -- the guest cannot silently retire or repoint a
+// skipped page, because these are unconditional (SMCChecks != none):
+//   - guest mmap over the range:  GuestMmap     -> InvalidateCodeRangeIfNecessary
+//   - guest munmap:               GuestMunmap   -> InvalidateCodeRangeIfNecessary
+//   - guest mprotect:             GuestMprotect -> InvalidateCodeRangeIfNecessary
+//   - guest mremap:               GuestMremap   -> InvalidateCodeRangeIfNecessaryOnRemap
+// (all in this file; InvalidateCodeRangeIfNecessary itself is a no-op only for
+// SMCChecks=none, where nothing was tracked to begin with)
+// So the only detection actually given up is a genuine in-place SMC write to a
+// file-backed page:
+//
+//   (2a) the mapping is not writable.  This case costs nothing: the guest's own
+//        store faults, HandleSegfault above sees !Prot.Writable, returns false,
+//        and the signal is forwarded to the guest as SIGSEGV exactly as today.
+//        Note that mtrack never installed anything for a non-writable mapping
+//        in the first place (the `else` SKIP branch below), so for this class
+//        the option changes nothing at all -- its only reachable effect is on
+//        WRITABLE private file-backed mappings, which is where Wine's PE images
+//        and any RWX file mapping live.
+//   (2b) the guest later mprotects the mapping writable and patches it.  This is
+//        the case that keeps the option "mostly correct" rather than unsound,
+//        and it is handled in GuestMprotect: an mprotect that adds PROT_WRITE to
+//        a range we skipped revokes the assumption for the whole MappedResource
+//        (sticky) and forces the invalidation, even if FEX_SMCMPROTECTDEFER
+//        would otherwise have deferred it.  Chosen over "install the protection
+//        at mprotect time" because after revocation the mapping is back on the
+//        ordinary mtrack path, so the very next compile on it installs the
+//        protection through the normal call below -- same end state, without
+//        mprotecting pages whose blocks this same syscall is about to discard,
+//        and without having to reason about a protection installed against the
+//        protection the guest just asked for.
+//
+// WATCH LIST -- known breakage class: in-place code patching of file-backed
+// .text through a mapping that is ALREADY writable when the patch happens (some
+// DRM/packers, some Mono AOT fixups, anything that keeps its own .text RWX and
+// rewrites it).  No mprotect is involved, so nothing re-arms and the stale
+// translation survives.  That is the price of the option, which is why it is
+// opt-in per application.
+//
+// AUDIT (FEX_SMC_AUDIT): one `mark SKIP-fileimmutable` line per skipped
+// protection with the page range, the backing path when it is already known,
+// and a running skipped-page total; plus `fileimmutable REARM` from GuestMprotect
+// when case 2b fires.
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   const auto Base = Start & FEXCore::Utils::FEX_PAGE_MASK;
   const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_PAGE_SIZE);
@@ -505,6 +568,26 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
             continue;
           }
 
+          // FEX_SMCFILEIMMUTABLE: see the block comment above this function.
+          // File-backed-ness comes straight out of VMA tracking: TrackMmap
+          // attaches a MappedResource to every non-MAP_ANONYMOUS mapping and to
+          // anonymous MAP_SHARED / SysV shm, and only to those, so within this
+          // branch -- which is already the !Flags.Shared side of the split --
+          // `Resource != nullptr` is exactly "private file-backed".  Anonymous
+          // private memory (JIT arenas, the heap, the class of pages the CP2077
+          // histogram is made of) has Resource == nullptr and keeps full mtrack
+          // behaviour.  Anything undeterminable therefore fails closed onto the
+          // mprotect below.
+          if (SMCFileImmutableActive() && Mapping->second.Resource != nullptr && !Mapping->second.Resource->SMCFileImmutableRevoked) {
+            const uint64_t Total = MarkSMCImmutableSkippedRange(ProtectBase, ProtectBase + ProtectSize);
+            if (SMCAuditFD() >= 0) {
+              const auto* MappedFile = Mapping->second.Resource->MappedFile.get();
+              SMC_AUDIT("[%d] mark SKIP-fileimmutable base=%lx size=%lx total-pages=%lu path=%s\n", FHU::Syscalls::gettid(), ProtectBase,
+                        ProtectSize, Total, MappedFile ? MappedFile->Filename.c_str() : "<unknown>");
+            }
+            continue;
+          }
+
           int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
 #ifdef ARCHITECTURE_ppc64le
           // FEX_SMCSTOREBACKPATCH: this is where a guest page acquires live
@@ -519,6 +602,29 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
                     Mapping->second.Flags.Shared ? 1 : 0, Mapping->second.Prot.Writable ? 1 : 0);
         }
       }
+    }
+  }
+}
+
+// FEX_SMCFILEIMMUTABLE case 2b: the guest has contradicted the immutability
+// assumption for this range, so every MappedResource it touches drops back to
+// ordinary mtrack behaviour permanently.  Resource granularity (rather than
+// page or VMA granularity) is deliberate: it is the conservative direction --
+// more protection, never less -- and it survives the VMA splitting that a
+// partial-range mprotect performs.
+void SyscallHandler::RevokeSMCFileImmutabilityLocked(uint64_t Base, uint64_t Top) {
+  auto Mapping = VMATracking.VMAs.lower_bound(Top);
+  while (Mapping != VMATracking.VMAs.begin()) {
+    Mapping--;
+
+    const auto MapBase = Mapping->first;
+    const auto MapTop = MapBase + Mapping->second.Length;
+    if (MapTop <= Base) {
+      break;
+    }
+
+    if (Mapping->second.Resource) {
+      Mapping->second.Resource->SMCFileImmutableRevoked = true;
     }
   }
 }
@@ -780,6 +886,10 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     ClearSMCDeferredDirtyRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
   }
 
+  // FEX_SMCFILEIMMUTABLE: whatever was mapped here is gone and the invalidation
+  // below is unconditional, so the skip records for the range retire with it.
+  ClearSMCImmutableSkippedRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
 
   if (LateMetadata) {
@@ -832,6 +942,11 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
     ClearSMCDeferredDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
   }
 
+  // FEX_SMCFILEIMMUTABLE: same as GuestMmap -- the mapping is gone, so are its
+  // skip records.
+  ClearSMCImmutableSkippedRange(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK,
+                                FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size);
 
   if (length) {
@@ -883,6 +998,23 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
     }
   }
 
+  // FEX_SMCFILEIMMUTABLE: the old range is invalidated above (when it moved) and
+  // no longer holds what it held, so drop its skip records.  The destination is
+  // not covered by InvalidateCodeRangeIfNecessaryOnRemap, so if it carried
+  // records from an earlier mapping, settle them with an invalidation now rather
+  // than leave blocks behind an address whose backing just changed.
+  {
+    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto NewBase = Result & FEXCore::Utils::FEX_PAGE_MASK;
+    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_PAGE_SIZE);
+
+    ClearSMCImmutableSkippedRange(OldBase, OldTop);
+    if (ClearSMCImmutableSkippedRange(NewBase, NewTop)) {
+      InvalidateCodeRangeIfNecessary(Thread, NewBase, NewTop - NewBase);
+    }
+  }
+
   return Result;
 }
 
@@ -922,6 +1054,7 @@ int SyscallHandler::OpenCodeMapFile() {
 
 uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
   uint64_t Result {};
+  bool FileImmutableRearm = false;
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
@@ -938,6 +1071,24 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     FEX::HLE::SMCBackpatch::NotePagesUnprotected(reinterpret_cast<uint64_t>(addr), len);
 #endif
     TrackMprotect(Thread, addr, len, prot);
+
+    // FEX_SMCFILEIMMUTABLE case 2b: the guest is making a range writable that
+    // holds compiled code we deliberately left unprotected.  From here on the
+    // mapping cannot be assumed immutable, so revoke it (sticky, resource-wide)
+    // and make sure the invalidation below actually runs -- both blocks
+    // compiled before this call are dropped, and anything compiled after it is
+    // write-protected through the normal MarkGuestExecutableRange path.  Only
+    // reached when the option is on: with it off no page is ever recorded and
+    // ClearSMCImmutableSkippedRange short-circuits on an atomic load.
+    if (prot & PROT_WRITE) {
+      const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
+      const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+      if (ClearSMCImmutableSkippedRange(Base, Top)) {
+        RevokeSMCFileImmutabilityLocked(Base, Top);
+        FileImmutableRearm = true;
+        SMC_AUDIT("[%d] fileimmutable REARM base=%lx top=%lx prot=%x\n", FHU::Syscalls::gettid(), Base, Top, prot);
+      }
+    }
   }
 
   // FEX_SMCMPROTECTDEFER: use the guest's own mprotect calls as the SMC
@@ -979,7 +1130,11 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     }
   }
 
-  if (!DeferInvalidation) {
+  // A re-arm outranks the W^X deferral: the deferral's soundness argument is
+  // that the intermediate protection lacks PROT_EXEC, but a file-immutable page
+  // that was skipped may still be mapped executable right now, so the stale
+  // blocks have to go before this syscall returns.
+  if (!DeferInvalidation || FileImmutableRearm) {
     InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len);
   }
 

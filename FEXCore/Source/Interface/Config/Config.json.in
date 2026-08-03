@@ -454,6 +454,24 @@
           "only recompiles genuinely modified blocks. Off: legacy behaviour."
         ]
       },
+      "SMCFileImmutable": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Relaxed correctness for speed: treat code that came from a private",
+          "file-backed mapping (Wine DLLs, libc, an executable's .text) as",
+          "immutable, and skip installing mtrack write-protection on it. Such",
+          "mappings are written at load time (relocations, CoW) before any code",
+          "is compiled from them and essentially never after, so the protection",
+          "mostly buys false-sharing faults on neighbouring data. Guest",
+          "mmap/munmap/mprotect still invalidate unconditionally, and an",
+          "mprotect that adds PROT_WRITE to a skipped range revokes the",
+          "assumption for that mapping. Only meaningful with SMCChecks=mtrack.",
+          "KNOWN BREAKAGE: in-place patching of file-backed .text through an",
+          "already-writable mapping (some DRM/packers, some Mono AOT fixups)",
+          "goes undetected. Opt in per application."
+        ]
+      },
       "SMCStoreEmulation": {
         "Type": "bool",
         "Default": "false",

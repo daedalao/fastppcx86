@@ -232,6 +232,7 @@ public:
   FEX_CONFIG_OPT(SMCStoreBackpatch, SMCSTOREBACKPATCH);
   FEX_CONFIG_OPT(SMCMprotectDefer, SMCMPROTECTDEFER);
   FEX_CONFIG_OPT(SMCSoftInvalidate, SMCSOFTINVALIDATE);
+  FEX_CONFIG_OPT(SMCFileImmutable, SMCFILEIMMUTABLE);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
 
@@ -413,6 +414,64 @@ public:
     SMCDeferredDirtyCount.store(SMCDeferredDirtyPages.size(), std::memory_order_release);
     return Any;
   }
+
+  ///// File-backed code treated as immutable (FEX_SMCFILEIMMUTABLE) /////
+  //
+  // Relaxed-correctness speed option; see the design block comment above
+  // SyscallHandler::MarkGuestExecutableRange in SyscallsSMCTracking.cpp for the
+  // full argument.  Two pieces of state:
+  //
+  //  - SMCImmutableSkippedPages: the pages where MarkGuestExecutableRange
+  //    declined to install write protection because the code came from a
+  //    private file-backed mapping.  This is what makes the guest-mprotect
+  //    re-arm (case 2b) precise: only an mprotect that adds PROT_WRITE to a
+  //    range we actually skipped has anything to answer for.
+  //  - MappedResource::SMCFileImmutableRevoked: set by that re-arm, sticky, so
+  //    the mapping goes back to legacy mtrack for the rest of the process.
+  //
+  // Same atomic-count fast path as the deferred-dirty set above: with the
+  // option off the set is permanently empty and every query is one relaxed
+  // load.
+  std::mutex SMCImmutableSkippedMutex;
+  std::atomic<uint64_t> SMCImmutableSkippedCount {0};
+  std::atomic<uint64_t> SMCImmutableSkipTotal {0}; // audit counter, never decremented
+  fextl::set<uint64_t> SMCImmutableSkippedPages;
+
+  bool SMCFileImmutableActive() const {
+    return SMCFileImmutable && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
+  }
+
+  // Returns the running total of skipped pages, for the audit line.
+  uint64_t MarkSMCImmutableSkippedRange(uint64_t Base, uint64_t Top) {
+    std::lock_guard lk {SMCImmutableSkippedMutex};
+    uint64_t Added {};
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+      Added += SMCImmutableSkippedPages.insert(Page).second ? 1 : 0;
+    }
+    SMCImmutableSkippedCount.store(SMCImmutableSkippedPages.size(), std::memory_order_release);
+    return SMCImmutableSkipTotal.fetch_add(Added, std::memory_order_relaxed) + Added;
+  }
+
+  // Drops every skip record intersecting [Base, Top).  Returns true if any
+  // existed, i.e. if the caller is looking at a range that currently holds
+  // compiled code FEX chose not to protect.
+  bool ClearSMCImmutableSkippedRange(uint64_t Base, uint64_t Top) {
+    if (SMCImmutableSkippedCount.load(std::memory_order_acquire) == 0) {
+      return false;
+    }
+    std::lock_guard lk {SMCImmutableSkippedMutex};
+    auto First = SMCImmutableSkippedPages.lower_bound(Base);
+    auto Last = SMCImmutableSkippedPages.lower_bound(Top);
+    const bool Any = First != Last;
+    SMCImmutableSkippedPages.erase(First, Last);
+    SMCImmutableSkippedCount.store(SMCImmutableSkippedPages.size(), std::memory_order_release);
+    return Any;
+  }
+
+  // Marks every MappedResource intersecting [Base, Top) as no longer eligible
+  // for the immutability assumption.
+  // - VMATracking.Mutex must be unique_locked before calling
+  void RevokeSMCFileImmutabilityLocked(uint64_t Base, uint64_t Top);
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   std::optional<FEXCore::ExecutableFileSectionInfo>

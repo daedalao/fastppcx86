@@ -837,6 +837,20 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
     }
   }
 
+  // FEX_SMCFILEIMMUTABLE only has anything to skip where mtrack installs
+  // protection in the first place; with SMCChecks=none nothing is tracked and
+  // with =full every block is validated before it runs.  Log and ignore rather
+  // than silently doing nothing.
+  if (SMCFileImmutable()) {
+    if (SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+      LogMan::Msg::IFmt("FEX_SMCFILEIMMUTABLE: private file-backed code is assumed immutable and will NOT be "
+                        "write-protected. Relaxed correctness: in-place patching of file-backed .text through an "
+                        "already-writable mapping will go undetected.");
+    } else {
+      LogMan::Msg::EFmt("FEX_SMCFILEIMMUTABLE needs FEX_SMCCHECKS=mtrack; ignoring it.");
+    }
+  }
+
 #ifdef ARCHITECTURE_ppc64le
   // FEX_SMCSTOREBACKPATCH rides on the store decoder that SMCStoreEmulation
   // owns: without that path there is no fault site to rewrite. Arm the page
