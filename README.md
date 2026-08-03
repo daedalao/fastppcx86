@@ -30,15 +30,6 @@ reconcile this fork's design back into upstream.
 - Everything in this document describes *this* fork's state, build, and configuration surface —
   not upstream FEX-Emu's.
 
-## Runtime flags
-
-Flags marked **Fork** do not exist upstream — they are specific to this PPC64LE fork. All of them are off/unset by default and cost at most one load when unset.
-
-| Flag | Kind | What it does |
-|---|---|---|
-| `FEX_THREADCENSUS=<path>` | **Fork** | Diagnostic. Appends a plain-text thread census to `<path>`, one line per event: `<monotonic-ms> tid=<n> event=<type> <key=val>...`. Events: `thread_create` (guest/host TID, parent TID, raw guest RIP of the clone caller, clone flags), `set_name` (`prctl(PR_SET_NAME)`), `sched_setscheduler` / `sched_setattr` / `sched_setparam` (policy, priority, and what FEX did with the request — always `passthrough-ok`/`passthrough-fail`, FEX fakes none of them), `sched_setaffinity` (mask popcount plus lowest/highest set CPU), and `sched_boost` (the `FEX_SCHEDPASSTHROUGH` ladder). Observation only — never changes a guest-visible return value. |
-| `FEX_SCHEDPASSTHROUGH=1` | **Fork** | Opt-in. FEX forwards guest `sched_setscheduler`/`sched_setattr` to the host verbatim, so an unprivileged host with no `RLIMIT_RTPRIO` budget refuses every guest `SCHED_FIFO`/`SCHED_RR` request with `EPERM` and the guest's audio/render threads end up at plain `SCHED_OTHER`. With this set, an `EPERM`'d RT request is retried on the host with progressively weaker boosts: `SCHED_RR` at the lowest permitted priority, then a niceness boost to `-10` (clamped by `RLIMIT_NICE`), then give up. Changes real host scheduling only — the guest still receives exactly the value it would have without the flag. Log the ladder with `FEX_THREADCENSUS`. |
-
 ## Build
 
 Standard CMake/Ninja build, same as upstream FEX:
@@ -200,6 +191,8 @@ are off by default and must be opted into (globally or per-app).
 | `TelemetryDirectory` | str ("") | Overrides where telemetry data is written (default under the data directory's `Telemetry/`). |
 | `ProfileStats` | bool (false) | Enables low-overhead sampling profile statistics; requires a Mangohud build that understands them to view. |
 | `EnableGpuvisProfiling` | bool (false) | Enables gpuvis-backend profiling, if FEX was built with it. |
+| `ThreadCensus` | str ("") | **Fork.** Diagnostic. Appends a plain-text thread census to the given path, one line per event: `<monotonic-ms> tid=<n> event=<type> <key=val>...`. Events: `thread_create` (guest/host TID, parent TID, raw guest RIP of the clone caller, clone flags), `set_name` (`prctl(PR_SET_NAME)`), `sched_setscheduler`/`sched_setattr`/`sched_setparam` (policy, priority, and what FEX did with the request — always `passthrough-ok`/`passthrough-fail`; FEX fakes none of them), `sched_setaffinity` (mask popcount plus lowest/highest set CPU), and `sched_boost` (the `SchedPassthrough` ladder). Observation only — never changes a guest-visible return value. |
+| `SchedPassthrough` | bool (false) | **Fork.** FEX forwards guest scheduler calls to the host verbatim, so an unprivileged host refuses guest `SCHED_FIFO`/`SCHED_RR` requests with `EPERM` and audio/render threads end up at plain `SCHED_OTHER`. With this set, an `EPERM`'d RT request is retried on the host with progressively weaker boosts: `SCHED_RR` at the lowest permitted priority, then a niceness boost to −10 (clamped by `RLIMIT_NICE`), then give up. Changes real host scheduling only — the guest still receives exactly the value it would have without the flag. Log the ladder with `ThreadCensus`. |
 
 ### Misc
 
