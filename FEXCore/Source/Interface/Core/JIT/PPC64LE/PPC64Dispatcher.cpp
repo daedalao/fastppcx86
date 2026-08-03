@@ -20,6 +20,7 @@
 //   [CallbackPtr]                   JIT callback re-entry
 
 #include "Interface/Core/JIT/PPC64LE/PPC64Dispatcher.h"
+#include "Interface/Core/JIT/PPC64LE/JITClass.h" // for PPC64JITCore::ExitFunctionLinkWithRecord
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
 #include "Utils/MemberFunctionToPointer.h"
@@ -119,6 +120,11 @@ void PPC64Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thr
   Ptrs.DispatcherLoopTop         = DispatcherLoopTopAddress;
   Ptrs.DispatcherLoopTopFillSRA  = DispatcherLoopTopFillSRAAddress;
   Ptrs.ExitFunctionLinker        = ExitFunctionLinkerAddress;
+  // ExitFunctionLinkerWithRecordAddress is NOT copied to a Pointers slot —
+  // its address is read via the dispatcher getter at CompileCode time and
+  // written into each PPC64BlockLinkRecord::StubAddr, so the thunk's
+  // LinkPath ld reads it off the record.  Retiring the frame slot keeps
+  // InternalThreadState within its 2-page budget.
   Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
   Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
   Ptrs.GuestSignal_SIGILL        = GuestSignal_SIGILL_Address;
@@ -508,6 +514,70 @@ void PPC64Dispatcher::EmitDispatcher() {
     // the next JIT block expects it to be scratch, so reusing it for the
     // refcount decrement / fault store is safe. r0 still holds the host
     // code ptr (only used here to be reset to zero before bctr).
+    EmitDeferredSignalExit();
+    li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
+    bctr();
+  }
+
+  // ==============================================================
+  // ExitFunctionLinkerWithRecord — block-linking variant.
+  //
+  // Entered ONLY from a link thunk's LinkPath leg (see CompileCode's thunk
+  // emission in PPC64LE/JIT.cpp): the JIT block's miss leg has ALREADY run
+  // SpillStaticRegs and the hoisted State.rip store, and the thunk left
+  //   r4 (TMP2) = &PPC64BlockLinkRecord.
+  // Mirror of "Entry 2" above with two differences: the second argument is
+  // the record pointer instead of State.rip, and the C++ callee is
+  // Pointers.ExitFunctionLinkWithRecord, which backpatches the exit before
+  // returning the host code address. The dispatch tail (0 => thread stop,
+  // else FillStaticRegs and bctr) is identical in behaviour to the classic
+  // linker path; it is duplicated rather than shared so the existing body's
+  // label structure stays untouched.
+  //
+  // r4 must survive from thunk to bctrl: EmitDeferredSignalEnter uses only
+  // TMP1 (r3), and nothing below writes r4 before the call.
+  // ==============================================================
+  ExitFunctionLinkerWithRecordAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  {
+    EmitDeferredSignalEnter();
+
+    // Call PPC64JITCore::ExitFunctionLinkWithRecord(Frame, Record):
+    //   r3 = Frame (CpuStateFrame*)
+    //   r4 = ExitFunctionLinkData* (set by the thunk, preserved here)
+    // Returns r3 = host code address (0 if the block can't be compiled).
+    //
+    // Materialise the C++ function address as an inline constant rather than
+    // loading it from a per-thread CpuStateFrame::Pointers slot — the target
+    // is `static PPC64JITCore::ExitFunctionLinkWithRecord`, a plain function
+    // pointer known at dispatcher-generation time, and eliminating the frame
+    // slot keeps InternalThreadState within its 2-page budget after
+    // C4.5/C6/C7 consumed the remaining headroom.  Cost is 5 instructions
+    // (LoadConstant64) vs 1 ld, once per dispatcher generation; the stub is
+    // reached once per unlinked-thunk hit, so aggregate is trivial.
+    mr(r3, STATE);
+    LoadConstant(r(12), reinterpret_cast<uint64_t>(&PPC64JITCore::ExitFunctionLinkWithRecord));
+    mtctr(r(12));
+    std(r2, 24, r1);
+    bctrl();
+    ld(r2, 24, r1);
+
+    cmpdi(r3, 0);
+    auto found_wr_label = PPC64Emitter::Label{};
+    bc(CC_NE, &found_wr_label);
+
+    // Not compilable: balance the deferred-signal counter, then stop via the
+    // non-spilling entry — SRA was spilled before the bctrl and host
+    // volatiles hold garbage now (same rationale as the classic path above).
+    EmitDeferredSignalExit();
+    b(&ThreadStopNoSpillLabel);
+
+    Bind(&found_wr_label);
+    // Same tail as the classic linker: park the host pointer in r0 across
+    // FillStaticRegs (which clobbers TMP1=r3), drain the guard, restore the
+    // r0=0 zero-index invariant, dispatch.
+    mr(r(0), r3);
+    FillStaticRegs();
+    mtctr(r(0));
     EmitDeferredSignalExit();
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();

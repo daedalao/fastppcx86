@@ -50,6 +50,16 @@ public:
     return ExitFunctionLinkerAddress;
   }
 
+  // Address of the block-linking dispatcher stub. Read at CompileCode time
+  // when the thunk record is emitted and written into PPC64BlockLinkRecord::
+  // StubAddr, so the thunk's LinkPath ld reads it off the record instead of
+  // through a per-thread CpuStateFrame::Pointers slot (that slot was retired
+  // to keep InternalThreadState within its 2-page budget after C4.5/C6/C7
+  // consumed the remaining headroom in CpuStateFrame).
+  uint64_t GetExitFunctionLinkerWithRecordAddress() const {
+    return ExitFunctionLinkerWithRecordAddress;
+  }
+
 private:
   FEXCore::Context::ContextImpl* CTX;
 
@@ -71,6 +81,9 @@ private:
 
   // Exit / link path
   uint64_t ExitFunctionLinkerAddress {};
+  // Block-linking variant: entered from a link thunk's LinkPath leg with
+  // r4 = &PPC64BlockLinkRecord and SRA already spilled by the JIT block.
+  uint64_t ExitFunctionLinkerWithRecordAddress {};
 
   // Thread stop: pop callee-saved regs, blr.
   //   *SpillSRA entry runs SpillStaticRegs first (thread was in JIT);

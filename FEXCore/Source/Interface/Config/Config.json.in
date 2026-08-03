@@ -532,6 +532,16 @@
           "While enabled these ops bypass the helper entirely, so the doubleword-contained split-lock telemetry counter no longer observes them."
         ]
       },
+      "BlockLinking": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "PPC64LE: backpatch constant-target JUMP block exits into direct branches to the destination block (block linking), skipping the inlined L1 probe on subsequent executions.",
+          "Call, return and register-indirect exits keep the inlined L1 probe regardless. Ignored (forced off) while EnableCodeCachingWIP is set:",
+          "link thunk records embed absolute host addresses as data inside the code stream, which would be serialized by the code cache and reloaded stale at a different base.",
+          "Default off: failure modes of bad backpatching are silent wrong execution, so this stays opt-in until the real-workload regression set clears it."
+        ]
+      },
       "KernelUnalignedAtomicBackpatching": {
         "Type": "bool",
         "Default": "true",

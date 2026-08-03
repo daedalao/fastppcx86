@@ -15,6 +15,7 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/fextl/list.h>
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/string.h>
@@ -101,6 +102,43 @@ uint64_t* GetPPC64HelperTable();
 // Byte size of one PPC64HelperTable slot (a raw uint64_t function address).
 static constexpr int16_t PPC64HelperSlotSize = 8;
 
+// -------------------------------------------------------------------------
+// Block linking (constant-target JUMP exits only)
+// -------------------------------------------------------------------------
+// Data record emitted directly after each per-exit jump thunk in the code
+// buffer. Layout contract shared by four sites, all in this backend:
+//   - CompileCode's thunk emission (JIT.cpp) writes it via dc64,
+//   - the thunk's linked-out-of-range leg loads HostCode from it,
+//   - ExitFunctionLinkWithRecord (JIT.cpp) reads GuestRIP / writes HostCode
+//     and computes the in-block patch site from CallerOffset,
+//   - the delinkers (JIT.cpp) restore the stashed original words.
+// The first three fields deliberately mirror Context::ExitFunctionLinkData
+// (HostCode / GuestRIP / CallerOffset); the pointer registered with
+// GuestToHostMap::AddBlockLink is a cast of this record. The two Orig*Word
+// fields stash the exact pre-link instruction words so delinking is a
+// byte-identical restore rather than a re-computation.
+struct PPC64BlockLinkRecord {
+  uint64_t HostCode;       // written by the linker BEFORE the thunk-word patch
+  uint64_t GuestRIP;       // constant destination RIP of this exit
+  int64_t CallerOffset;    // in-block patch site address minus &record (negative)
+  uint32_t OrigCallerWord; // pre-link first word of the in-block L1 probe
+  uint32_t OrigThunkWord;  // pre-link first word of the thunk (b LinkPath)
+  // Cached dispatcher-stub address. The thunk's LinkPath leg loads this via a
+  // single d-form ld off &record instead of ld off Pointers.<...>(STATE),
+  // which keeps CpuStateFrame at its 2-page budget. Written once at thunk
+  // emission from CTX->Dispatcher->GetExitFunctionLinkerWithRecordAddress()
+  // (constant over the process lifetime after dispatcher generation).
+  uint64_t StubAddr;
+};
+static_assert(sizeof(PPC64BlockLinkRecord) == 40, "emitted-record layout contract");
+static_assert(offsetof(PPC64BlockLinkRecord, StubAddr) == 32, "thunk stub-addr load contract");
+static_assert(offsetof(PPC64BlockLinkRecord, HostCode) == 0, "thunk ld displacement contract");
+
+// Byte distance from a jump thunk's first instruction (the thunk-side patch
+// site) to its PPC64BlockLinkRecord. Must match CompileCode's thunk emission
+// exactly; the emission site has a Release-visible check.
+static constexpr uint64_t PPC64LinkRecordFromThunkStart = 0x30;
+
 class PPC64JITCore final : public CPUBackend, public PPC64EmitterBase {
 public:
   explicit PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
@@ -118,6 +156,15 @@ public:
   void ClearRelocations() override { Relocations.clear(); }
 
   static uint64_t ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
+
+  // Block-linking variant, reached only from a link thunk's LinkPath leg via
+  // the dispatcher's ExitFunctionLinkerWithRecord stub. Looks up or compiles
+  // Record->GuestRIP, then — re-validated under the LookupCache WRITE lock —
+  // registers the link and backpatches either the in-block patch site
+  // (in ±32MiB `b` range) or the thunk (out of range). Returns the host code
+  // address to dispatch to (0 if the block cannot be compiled).
+  static uint64_t ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* Frame,
+                                             FEXCore::Context::ExitFunctionLinkData* Record);
 
   fextl::vector<FEXCore::CPU::Relocation> TakeRelocations(uint64_t GuestBaseAddress) override {
     // S3.7-C4: rebase RELOC_GUEST_RIP_* against the caller-supplied guest
@@ -157,6 +204,22 @@ private:
     auto Block = IR->GetOp<IR::IROp_CodeBlock>(Node);
     return &JumpTargets[Block->ID];
   }
+
+  // Block linking: one pending jump thunk per linkable constant-jump exit,
+  // emitted after the block bodies at the tail of CompileCode. fextl::list,
+  // NOT vector: the emitter's pending-branch fixups hold Label* into these
+  // elements (DEF_OP(ExitFunction)'s miss leg branches to LinkPath before
+  // the thunk exists), so element addresses must survive later insertions.
+  struct PendingJumpThunk {
+    uint64_t CallerAddress; // absolute address of the in-block patch site
+    uint64_t GuestRIP;      // constant destination RIP (post 32-bit masking)
+    PPC64Emitter::Label LinkPath {};
+  };
+  fextl::list<PendingJumpThunk> PendingJumpThunks;
+
+  // Resolved once at construction: BlockLinking knob AND code caching off.
+  // See the resolution site in JIT.cpp for the hard-gate rationale.
+  bool BlockLinkingEnabled {};
 
   // Spill slots management.
   //

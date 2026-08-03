@@ -390,6 +390,12 @@ struct JITPointers {
   uint64_t F64ScaleHandler {};
   uint64_t F64AtanHandler {};
   uint64_t F64FYL2XHandler {};
+  // PPC64LE block linking (constant-target jump exits only) intentionally
+  // does NOT add per-thread frame slots.  The dispatcher stub materialises
+  // its C++ callee address as an inline constant (PPC64Dispatcher.cpp), and
+  // the thunk record itself caches the stub's address in its StubAddr field
+  // (JITClass.h).  Keeping the two addresses out of CpuStateFrame is what
+  // preserves the InternalThreadState ≤ 2·PAGE_SIZE budget after C4.5/C6/C7.
   /**  @} */
 
   // Copy of process-wide named vector constants data.
