@@ -690,8 +690,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-          std::array<uint8_t, 0x10> CodeOriginal;
-          memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
+          // Bound the memcpy: DecodedInfo->InstSize can exceed sizeof(CodeOriginal)
+          // when a malformed decode leaks an over-long instruction past this point
+          // (length rejection lives in DecodeInstruction's caller, above the SMC
+          // snapshot). Zero-init so any unread tail is defined for the
+          // ValidateCode backend, which reads InstSize bytes and would otherwise
+          // hash uninitialised stack past the sixteenth byte.
+          std::array<uint8_t, 0x10> CodeOriginal {};
+          memcpy(CodeOriginal.data(), ExistingCodePtr, std::min<size_t>(DecodedInfo->InstSize, sizeof(CodeOriginal)));
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
