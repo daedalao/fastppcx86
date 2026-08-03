@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <cstddef>
 #include <functional>
 #include <stdint.h>
 
@@ -45,6 +46,19 @@ using CodeRangeInvalidationFn = std::function<void(uint64_t start, uint64_t Leng
 using CustomIREntrypointHandler = std::function<void(uintptr_t Entrypoint, IR::IREmitter*)>;
 
 using ExitHandler = std::function<void(Core::InternalThreadState* Thread)>;
+
+/**
+ * Result of Context::AllocateJITAuxMemory: a chunk carved out of the JIT's own
+ * code buffer. See that method for the contract.
+ */
+struct JITAuxAllocation {
+  ///< Start of the chunk, or nullptr when the request could not be served.
+  uint8_t* Ptr {};
+  ///< Base address of the CodeBuffer the chunk was carved from.
+  uint64_t BufferBase {};
+  ///< Generation of that CodeBuffer; see Context::GetJITCodeBufferGeneration.
+  uint64_t Generation {};
+};
 
 class Context {
 public:
@@ -163,6 +177,50 @@ public:
    * @return true if PC is inside the thread's code buffers.
    */
   FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const = 0;
+
+  /**
+   * @brief SMC store backpatching (FEX_SMCSTOREBACKPATCH, ppc64le): carve a
+   *        chunk of scratch space out of the JIT's own code buffer.
+   *
+   * The ppc64le backpatcher needs executable memory within the reach of a
+   * PowerISA `b` (+-32MiB) from a host PC that lives inside a CodeBuffer.
+   * Independent mmap()s cannot satisfy that: the JIT code buffer is a single
+   * large RWX mapping and any address hint inside it is ignored by the kernel,
+   * which then returns memory far outside branch reach. The only memory
+   * reliably near JIT code is the code buffer itself, so hand out its free
+   * tail -- the same bytes and the same cursor that block emission advances.
+   *
+   * Carving a gap is invisible to the emitters: every compile re-bases its
+   * cursor from the shared write offset, so a hole simply becomes bytes no
+   * block occupies.
+   *
+   * LOCKING: this is callable from a SIGSEGV handler. It NEVER blocks -- it
+   * try-locks the code buffer write mutex and refuses on contention, and it
+   * refuses outright if the calling thread already owns that (non-recursive)
+   * mutex. It also never rotates or allocates a code buffer.
+   *
+   * @param Thread The faulting thread.
+   * @param Bytes Size of the requested chunk.
+   * @param Alignment Power-of-two alignment for the returned pointer.
+   * @param NearHostPC Host PC the chunk must be reachable from.
+   * @param MaxDelta Maximum |chunk - NearHostPC| in bytes, applied to both ends
+   *        of the chunk. Zero disables the check.
+   *
+   * @return The carved chunk, or a JITAuxAllocation with a null Ptr if the
+   *         request could not be served. Nothing is modified on failure.
+   */
+  FEX_DEFAULT_VISIBILITY virtual JITAuxAllocation AllocateJITAuxMemory(FEXCore::Core::InternalThreadState* Thread, size_t Bytes,
+                                                                       size_t Alignment, uint64_t NearHostPC, uint64_t MaxDelta) = 0;
+
+  /**
+   * @brief Monotonic id of the code buffer new code is currently emitted into.
+   *
+   * Bumped every time a new CodeBuffer is allocated, i.e. every time previously
+   * handed-out JITAuxAllocations may be freed underneath their holder. Callers
+   * that cache anything derived from a code buffer address must drop that cache
+   * when this changes.
+   */
+  FEX_DEFAULT_VISIBILITY virtual uint64_t GetJITCodeBufferGeneration() const = 0;
   // SMC store-emulation support: true if [Start, Start+Length) of guest
   // address space intersects any compiled block's guest bytes for this
   // thread's (shared) lookup cache.

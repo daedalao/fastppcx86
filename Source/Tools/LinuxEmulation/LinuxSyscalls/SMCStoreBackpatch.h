@@ -105,7 +105,12 @@ void NotePagesUnprotected(uint64_t Base, uint64_t Size);
 
 /// Attempt to backpatch the store at host address StorePC.
 /// Returns nullptr on success, or a short reason tag for SMC_AUDIT on refusal.
-const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64_t StorePC);
+///
+/// `SuppressAudit` (optional) is set when the caller should NOT emit its audit
+/// line: the refusal is a repeat of one already recorded for this site and a
+/// storm hits the same PC hundreds of thousands of times. The first
+/// kMaxRefusalAudits refusals per site are still reported.
+const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64_t StorePC, bool* SuppressAudit = nullptr);
 
 #endif // ARCHITECTURE_ppc64le
 

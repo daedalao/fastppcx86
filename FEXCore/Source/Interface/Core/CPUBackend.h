@@ -24,6 +24,10 @@ namespace FEXCore::CPU {
 union Relocation;
 }
 
+namespace FEXCore::Context {
+struct JITAuxAllocation;
+}
+
 namespace FEXCore {
 
 namespace IR {
@@ -98,6 +102,17 @@ namespace CPU {
     // window leaves the mutex held forever.  Track the owner so the re-entry can
     // be detected and reported instead of silently hanging every thread.
     std::atomic<uint64_t> CodeBufferWriteOwner {0};
+
+    // Monotonic id of `Latest`, bumped by AllocateNew. Anything cached by
+    // address inside a code buffer (SMC backpatch stub pools, for instance) is
+    // invalidated by a change here: the previous buffer can be freed once the
+    // last shared_ptr to it drops, and its address range reused.
+    std::atomic<uint64_t> CodeBufferGeneration {1};
+
+    // Carve `Bytes` of the latest code buffer's free tail out for non-block
+    // use. See FEXCore::Context::Context::AllocateJITAuxMemory for the full
+    // contract; this is the implementation and does the actual locking.
+    FEXCore::Context::JITAuxAllocation TryAllocateAuxMemory(size_t Bytes, size_t Alignment, uint64_t NearHostPC, uint64_t MaxDelta);
 
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 

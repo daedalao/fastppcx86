@@ -38,6 +38,13 @@ public:
     const auto Result = pthread_mutex_lock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
   }
+  // Non-blocking acquire, for callers that may not wait (signal handlers).
+  // Returns false both when the mutex is held by another thread and when this
+  // thread already owns it (this mutex is not recursive).
+  [[nodiscard]]
+  bool try_lock() {
+    return pthread_mutex_trylock(&Mutex) == 0;
+  }
   void unlock() {
     const auto Result = pthread_mutex_unlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to unlock with {}", __func__, Result);

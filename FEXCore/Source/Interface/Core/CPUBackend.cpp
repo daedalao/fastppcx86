@@ -7,15 +7,20 @@
 #include "Interface/Core/Dispatcher/Dispatcher.h"
 #endif
 
+#include <FEXCore/Core/Context.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/PrctlUtils.h>
 
 #include <cstdint>
+#include <mutex>
 
 #ifndef _WIN32
 #include <linux/prctl.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace FEXCore {
@@ -405,6 +410,9 @@ namespace CPU {
 
     Latest = Buffer;
     LatestOffset = 0;
+    // Everything anyone cached about the previous buffer's addresses is now
+    // stale; see CodeBufferGeneration.
+    CodeBufferGeneration.fetch_add(1, std::memory_order_release);
 
     OnCodeBufferAllocated(Buffer);
 
@@ -435,6 +443,104 @@ namespace CPU {
     return AllocateNew(NewCodeBufferSize);
   }
 
+
+  // ---------------------------------------------------------------------------
+  // JIT auxiliary allocation (SMC store backpatching, ppc64le)
+  //
+  // The ppc64le SMC store backpatcher replaces a faulting host store inside a
+  // code buffer with a `b` to a stub. `b` reaches +-32MiB, and the JIT's code
+  // lives in a single large RWX mapping, so a fresh mmap() is useless here: an
+  // address hint that lands inside that mapping is ignored by the kernel and
+  // the returned address is far out of branch range. The only memory that is
+  // reliably near JIT code is the code buffer itself, so hand out its free
+  // tail.
+  //
+  // Carving a hole is invisible to block emission: PPC64JITCore rebases its
+  // emitter on `Ptr + LatestOffset` at the start of every CompileCode (see
+  // JIT/PPC64LE/JIT.cpp SetBuffer), so advancing LatestOffset here just means
+  // the next block starts past our chunk.
+  //
+  // LOCKING. The caller is a SIGSEGV handler on a thread that faulted while
+  // *executing* JIT code, so in practice it does not hold CodeBufferWriteMutex.
+  // "In practice" is not good enough for a lock that, taken recursively,
+  // deadlocks the whole process (see the CodeBufferWriteOwner comment in the
+  // header), so this never blocks:
+  //   - if this thread already owns the mutex, refuse. This covers the one
+  //     path that could get here while compiling -- an emission overrun into
+  //     the guard page -- and any future one.
+  //   - otherwise try_lock, and refuse on contention rather than waiting on a
+  //     compiling thread from inside a signal handler.
+  // Refusal is always safe: the caller falls back to the pre-existing,
+  // unpatched fault handling.
+  // ---------------------------------------------------------------------------
+  FEXCore::Context::JITAuxAllocation CodeBufferManager::TryAllocateAuxMemory(size_t Bytes, size_t Alignment, uint64_t NearHostPC, uint64_t MaxDelta) {
+    FEXCore::Context::JITAuxAllocation Result {};
+#ifdef ARCHITECTURE_ppc64le
+    if (!Bytes || !Alignment || (Alignment & (Alignment - 1))) {
+      return Result;
+    }
+
+    // Code caching serializes [0, LatestOffset) of the buffer and replays it
+    // into a fresh mapping on the next run. Stub chunks are full of absolute
+    // helper addresses and PC-relative branches to store sites, none of which
+    // survive that, so refuse to mix the two features.
+    if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+      return Result;
+    }
+
+    const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
+    if (CodeBufferWriteOwner.load(std::memory_order_relaxed) == SelfTID) {
+      return Result;
+    }
+    if (!CodeBufferWriteMutex.try_lock()) {
+      return Result;
+    }
+    std::unique_lock Lock {CodeBufferWriteMutex, std::adopt_lock};
+    CodeBufferWriteOwner.store(SelfTID, std::memory_order_relaxed);
+    struct OwnerClear {
+      std::atomic<uint64_t>& Owner;
+      ~OwnerClear() {
+        Owner.store(0, std::memory_order_relaxed);
+      }
+    } ClearOnExit {CodeBufferWriteOwner};
+
+    // Deliberately not GetLatest(): that allocates a code buffer when none
+    // exists yet, which is not something to do from a signal handler. No
+    // buffer means no JIT code, so there is nothing to be near anyway.
+    if (!Latest) {
+      return Result;
+    }
+
+    const uint64_t Base = reinterpret_cast<uint64_t>(Latest->Ptr);
+    const size_t Start = AlignUp(LatestOffset, Alignment);
+    if (Start < LatestOffset || Start + Bytes < Start || Start + Bytes > Latest->UsableSize()) {
+      // No headroom. Rotating the buffer from here is not an option (it frees
+      // the code the faulting thread is standing in), so refuse.
+      return Result;
+    }
+
+    const uint64_t Addr = Base + Start;
+    if (MaxDelta) {
+      const int64_t Low = static_cast<int64_t>(Addr) - static_cast<int64_t>(NearHostPC);
+      const int64_t High = static_cast<int64_t>(Addr + Bytes) - static_cast<int64_t>(NearHostPC);
+      if (Low < -static_cast<int64_t>(MaxDelta) || High > static_cast<int64_t>(MaxDelta)) {
+        return Result;
+      }
+    }
+
+    LatestOffset = Start + Bytes;
+
+    Result.Ptr = reinterpret_cast<uint8_t*>(Addr);
+    Result.BufferBase = Base;
+    Result.Generation = CodeBufferGeneration.load(std::memory_order_acquire);
+#else
+    (void)Bytes;
+    (void)Alignment;
+    (void)NearHostPC;
+    (void)MaxDelta;
+#endif
+    return Result;
+  }
 
   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
     auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {

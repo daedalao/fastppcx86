@@ -288,8 +288,27 @@ namespace {
 
   // ===========================================================================
   // Stub pool
+  // ---------------------------------------------------------------------------
+  // Pools are carved out of the JIT's OWN code buffer via
+  // Context::AllocateJITAuxMemory.
+  //
+  // The obvious implementation -- mmap a pool near the site -- cannot work and
+  // measurably did not: all JIT code lives inside one large RWX mapping
+  // ([anon:FEXMemJIT], 0x1001980c000-0x1002180b000 on op4k), so every address
+  // hint at StorePC+-{8,20,28}MiB lands *inside* that existing mapping. mmap
+  // without MAP_FIXED silently ignores such a hint and returns unrelated memory
+  // far outside `b` range, the reach check rejects it, and the pool is
+  // munmapped again. Every hint failed every time: an audit of a smcstorm
+  // falseshare run showed 511,744 BACKPATCH-REFUSED reason=no-stub-in-reach,
+  // and because each refused fault re-ran all six mmap/munmap pairs the
+  // benchmark fell from 42.3K/s (legacy handling) to 103/s.
+  //
+  // The code buffer is the only memory that is guaranteed near JIT code, and it
+  // is already RWX. Pools are therefore small (64KiB, ~160 stubs each after the
+  // shared tail) so a pool that ends up out of reach of later sites wastes very
+  // little of the buffer.
   // ===========================================================================
-  constexpr size_t kPoolSize = 1024 * 1024;
+  constexpr size_t kPoolSize = 64 * 1024;
   // `b` reaches +-32MiB. Keep a margin so the pool tail is still reachable from
   // a site at the far end of the window.
   constexpr int64_t kBranchReach = (int64_t {1} << 25) - (int64_t {2} << 20);
@@ -310,6 +329,28 @@ namespace {
   std::vector<StubPool> gPools;
   std::map<uint64_t, PatchRecord> gPatched;
 
+  // ---------------------------------------------------------------------------
+  // Negative cache
+  //
+  // A site we could not serve is very likely to fault again immediately -- that
+  // is what an SMC storm *is*. Without this, every one of those faults re-runs
+  // the whole allocation attempt (and, before pools came from the code buffer,
+  // six mmap/munmap pairs). Remember the refusal instead and answer it from the
+  // map. Entries are code-buffer-relative host PCs, so they die with the
+  // generation exactly like gPools and gPatched.
+  //
+  // The value counts how many times this site has been audited: audit output is
+  // capped per site because a storm hits the same PC hundreds of thousands of
+  // times and the audit file is the thing that would explode.
+  // ---------------------------------------------------------------------------
+  std::map<uint64_t, uint32_t> gRefused;
+  constexpr uint32_t kMaxRefusalAudits = 3;
+  constexpr size_t kMaxRefusedSites = 64 * 1024;
+
+  // Generation of the code buffer everything above describes. See
+  // Context::GetJITCodeBufferGeneration.
+  uint64_t gGeneration {0};
+
   constexpr size_t kMaxPatchedSites = 4096;
 
   bool InReach(uint64_t From, uint64_t To) {
@@ -317,11 +358,25 @@ namespace {
     return Delta >= -kBranchReach && Delta <= kBranchReach;
   }
 
+  // Caller must hold gMutex. A new code buffer means every host address we
+  // recorded -- pool bases, patched store PCs, refused store PCs -- belongs to
+  // a buffer that may already have been freed and whose range may have been
+  // handed back out. None of it may be reused or even dereferenced.
+  void DropStaleStateIfNeeded(uint64_t Generation) {
+    if (Generation == gGeneration) {
+      return;
+    }
+    gGeneration = Generation;
+    gPools.clear();
+    gPatched.clear();
+    gRefused.clear();
+  }
+
   void EmitSharedTail(Emitter& Em, uint64_t HelperAddr);
 
   // Find (or create) a pool with `Bytes` free whose allocation AND shared tail
   // are both within branch reach of `NearPC`.
-  uint8_t* AllocStub(uint64_t NearPC, size_t Bytes, uint64_t HelperAddr, uint64_t* TailAddrOut) {
+  uint8_t* AllocStub(FEXCore::Core::InternalThreadState* Thread, uint64_t NearPC, size_t Bytes, uint64_t HelperAddr, uint64_t* TailAddrOut) {
     for (auto& Pool : gPools) {
       if (Pool.Used + Bytes > kPoolSize) {
         continue;
@@ -336,45 +391,46 @@ namespace {
       return reinterpret_cast<uint8_t*>(Start);
     }
 
-    // Try to land a fresh pool near the site. mmap without MAP_FIXED never
-    // clobbers an existing mapping; it may simply ignore the hint, in which case
-    // the reach check below rejects it and we try the next hint.
-    static const int64_t Hints[] = {8 << 20, -(8 << 20), 20 << 20, -(20 << 20), 28 << 20, -(28 << 20)};
-    for (int64_t Off : Hints) {
-      const int64_t Want = static_cast<int64_t>(NearPC) + Off;
-      if (Want < 0x1'0000'0000ll) {
-        // Never hand the 32-bit guest allocator's arena to a stub pool.
-        continue;
-      }
-      void* Hint = reinterpret_cast<void*>(FEXCore::AlignDown(static_cast<uint64_t>(Want), FEXCore::Utils::FEX_PAGE_SIZE));
-      void* Mem = ::mmap(Hint, kPoolSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (Mem == MAP_FAILED) {
-        continue;
-      }
-      const uint64_t Base = reinterpret_cast<uint64_t>(Mem);
-      if (!InReach(NearPC, Base) || !InReach(NearPC, Base + kPoolSize)) {
-        ::munmap(Mem, kPoolSize);
-        continue;
-      }
-
-      StubPool Pool {reinterpret_cast<uint8_t*>(Mem), 0, 0};
-      Emitter Em(Pool.Base, kPoolSize);
-      EmitSharedTail(Em, HelperAddr);
-      Pool.Used = FEXCore::AlignUp(Em.GetOffset(), 16);
-      Pool.TailOffset = 0;
-      __builtin___clear_cache(reinterpret_cast<char*>(Pool.Base), reinterpret_cast<char*>(Pool.Base + Pool.Used));
-
-      if (Pool.Used + Bytes > kPoolSize) {
-        ::munmap(Mem, kPoolSize);
-        continue;
-      }
-      const uint64_t Start = Base + Pool.Used;
-      Pool.Used += Bytes;
-      gPools.push_back(Pool);
-      *TailAddrOut = Base;
-      return reinterpret_cast<uint8_t*>(Start);
+    // Carve a fresh pool out of the code buffer's free tail. This refuses --
+    // rather than blocks -- if another thread is compiling, which is required:
+    // we are inside a SIGSEGV handler. See the locking comment on
+    // CodeBufferManager::TryAllocateAuxMemory.
+    //
+    // Lock order note: we hold gMutex here and reach for CodeBufferWriteMutex.
+    // There is no inversion hazard even though a compiling thread holds
+    // CodeBufferWriteMutex and could in principle fault into this code, because
+    // the inner acquisition is a try_lock that also refuses outright when the
+    // calling thread is the current owner. Nothing here ever waits.
+    const auto Aux = Thread->CTX->AllocateJITAuxMemory(Thread, kPoolSize, 16, NearPC, static_cast<uint64_t>(kBranchReach));
+    if (!Aux.Ptr) {
+      return nullptr;
     }
-    return nullptr;
+    if (Aux.Generation != gGeneration) {
+      // The buffer rotated between our generation check and this call. The
+      // chunk is real but belongs to a buffer whose bookkeeping we have not
+      // adopted; drop it (it is 64KiB of a buffer that will be freed anyway)
+      // rather than mixing generations in gPools.
+      return nullptr;
+    }
+
+    StubPool Pool {Aux.Ptr, 0, 0};
+    const uint64_t Base = reinterpret_cast<uint64_t>(Aux.Ptr);
+    Emitter Em(Pool.Base, kPoolSize);
+    EmitSharedTail(Em, HelperAddr);
+    Pool.Used = FEXCore::AlignUp(Em.GetOffset(), 16);
+    Pool.TailOffset = 0;
+    __builtin___clear_cache(reinterpret_cast<char*>(Pool.Base), reinterpret_cast<char*>(Pool.Base + Pool.Used));
+
+    if (Pool.Used + Bytes > kPoolSize) {
+      // Cannot happen: the shared tail is a couple hundred bytes. Leak the
+      // chunk rather than hand out an overlapping stub.
+      return nullptr;
+    }
+    const uint64_t Start = Base + Pool.Used;
+    Pool.Used += Bytes;
+    gPools.push_back(Pool);
+    *TailAddrOut = Base;
+    return reinterpret_cast<uint8_t*>(Start);
   }
 
 } // anonymous namespace
@@ -635,7 +691,10 @@ void NotePagesUnprotected(uint64_t Base, uint64_t Size) {
   BumpRange(Base, Size, -1);
 }
 
-const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64_t StorePC) {
+const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64_t StorePC, bool* SuppressAudit) {
+  if (SuppressAudit) {
+    *SuppressAudit = false;
+  }
   if (!IsEnabled()) {
     return "backpatch-disabled";
   }
@@ -661,7 +720,23 @@ const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64
     return "r1-operand";
   }
 
+  const uint64_t Generation = Thread->CTX->GetJITCodeBufferGeneration();
+
   std::scoped_lock lk {gMutex};
+
+  DropStaleStateIfNeeded(Generation);
+
+  // Negative cache: a site we already failed to place a stub for. Answer from
+  // the map instead of re-running the allocator on every fault of a storm.
+  auto Refused = gRefused.find(StorePC);
+  if (Refused != gRefused.end()) {
+    if (Refused->second >= kMaxRefusalAudits && SuppressAudit) {
+      *SuppressAudit = true;
+    } else {
+      ++Refused->second;
+    }
+    return "no-stub-in-reach-cached";
+  }
 
   auto Existing = gPatched.find(StorePC);
   if (Existing != gPatched.end()) {
@@ -681,8 +756,14 @@ const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64
   }
 
   uint64_t TailAddr {};
-  uint8_t* Stub = AllocStub(StorePC, kMaxStubBytes, reinterpret_cast<uint64_t>(&FEXSMCBackpatchStoreHelper), &TailAddr);
+  uint8_t* Stub = AllocStub(Thread, StorePC, kMaxStubBytes, reinterpret_cast<uint64_t>(&FEXSMCBackpatchStoreHelper), &TailAddr);
   if (!Stub) {
+    // Remember the refusal so the next fault at this PC is a map lookup. The
+    // entry is dropped when the code buffer generation changes, which is the
+    // only event that can make this site placeable after all.
+    if (gRefused.size() < kMaxRefusedSites) {
+      gRefused.emplace(StorePC, 1);
+    }
     return "no-stub-in-reach";
   }
 
@@ -696,6 +777,12 @@ const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64
 
   const int64_t Delta = static_cast<int64_t>(StubAddr) - static_cast<int64_t>(StorePC);
   if (Delta < -(int64_t {1} << 25) || Delta >= (int64_t {1} << 25)) {
+    // Unreachable given AllocStub's own reach check, but if it ever happens the
+    // stub bytes are already spent -- cache the refusal so a storm cannot leak
+    // one stub per fault.
+    if (gRefused.size() < kMaxRefusedSites) {
+      gRefused.emplace(StorePC, 1);
+    }
     return "branch-out-of-range";
   }
   const uint32_t Branch = (18u << 26) | ((static_cast<uint32_t>(static_cast<int32_t>(Delta) >> 2) & 0x00FFFFFFu) << 2);

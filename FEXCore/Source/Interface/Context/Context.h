@@ -229,6 +229,9 @@ public:
   void ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) override;
 
   bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
+  FEXCore::Context::JITAuxAllocation AllocateJITAuxMemory(FEXCore::Core::InternalThreadState* Thread, size_t Bytes, size_t Alignment,
+                                                          uint64_t NearHostPC, uint64_t MaxDelta) override;
+  uint64_t GetJITCodeBufferGeneration() const override;
   bool GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   bool TrySemanticPatchCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) override;
 

@@ -327,8 +327,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // mixes false-sharing and imm-field writes still gets backpatched the
         // first time it faults as false sharing.
         if (!SemanticPatched && _SyscallHandler->SMCStoreBackpatch()) {
-          const char* Reason = FEX::HLE::SMCBackpatch::TryBackpatchStore(Thread, StorePC);
-          if (Reason) {
+          bool QuietRefusal = false;
+          const char* Reason = FEX::HLE::SMCBackpatch::TryBackpatchStore(Thread, StorePC, &QuietRefusal);
+          if (Reason && !QuietRefusal) {
             SMC_AUDIT("[%d] fault addr=%lx BACKPATCH-REFUSED reason=%s pc=%lx insn=%08x\n", FHU::Syscalls::gettid(), FaultAddress,
                       Reason, StorePC, RawInsn);
           }

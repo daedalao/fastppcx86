@@ -63,6 +63,20 @@ bool FEXCore::Context::ContextImpl::IsAddressInCodeBuffer(FEXCore::Core::Interna
   return Thread->CPUBackend->IsAddressInCodeBuffer(Address);
 }
 
+// SMC store backpatching (FEX_SMCSTOREBACKPATCH, ppc64le). All of the policy
+// and the locking argument live in CodeBufferManager::TryAllocateAuxMemory
+// (Interface/Core/CPUBackend.cpp); ContextImpl *is* the CodeBufferManager, so
+// this is a plain forward.
+FEXCore::Context::JITAuxAllocation FEXCore::Context::ContextImpl::AllocateJITAuxMemory(
+  FEXCore::Core::InternalThreadState* Thread, size_t Bytes, size_t Alignment, uint64_t NearHostPC, uint64_t MaxDelta) {
+  (void)Thread;
+  return TryAllocateAuxMemory(Bytes, Alignment, NearHostPC, MaxDelta);
+}
+
+uint64_t FEXCore::Context::ContextImpl::GetJITCodeBufferGeneration() const {
+  return CodeBufferGeneration.load(std::memory_order_acquire);
+}
+
 bool FEXCore::Context::ContextImpl::GuestRangeOverlapsCompiledCode(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   return Thread->LookupCache->RangeOverlapsCompiledCode(Start, Length);
 }
