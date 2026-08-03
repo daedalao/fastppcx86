@@ -359,7 +359,11 @@ struct JITPointers {
   FallbackABIInfo FallbackHandlerPointers[FallbackHandlerIndex::OPINDEX_MAX];
   uint64_t NamedVectorConstantPointers[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX];
   uint64_t IndexedNamedVectorConstantPointers[FEXCore::IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_MAX];
-  uint64_t TelemetryValueAddresses[FEXCore::Telemetry::TYPE_LAST];
+  // JIT-emitted code loads counter addresses out of this table; sized to the
+  // subset of TelemetryType entries the JIT actually needs (see the marker
+  // in Telemetry.h). C-helper-only counters live above the marker and are
+  // reached through the global TelemetryValues array directly.
+  uint64_t TelemetryValueAddresses[FEXCore::Telemetry::TYPE_JIT_ADDRESSABLE_LAST];
 
   /**
    * @name Dispatcher pointers

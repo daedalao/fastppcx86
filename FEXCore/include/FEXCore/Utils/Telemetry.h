@@ -29,6 +29,28 @@ enum TelemetryType {
   TYPE_USES_32BIT_SEGMENT_CS,
   TYPE_USES_32BIT_SEGMENT_DS,
   TYPE_UNHANDLED_NONCANONICAL_ADDRESS,
+  // Sentinel: entries at or above this index are C-helper-only and are NOT
+  // exposed via the per-thread CpuStateFrame::TelemetryValueAddresses table.
+  // The JIT indexes that table via TelemetryValueIndex, so growing it costs
+  // 8 bytes per new slot per thread and tightens the InternalThreadState
+  // ≤ 2·PAGE_SIZE invariant (see CoreState.h:362 and
+  // InternalThreadState.h:133). Only add above this marker if you actually
+  // need JIT-emitted access.
+  TYPE_JIT_ADDRESSABLE_LAST,
+  // PPC64 split-lock helper path breakdown (C5). PPC64_SplitLockEmulate
+  // dispatches by containment inside the striped mutex; these three counters
+  // let us tell "how much of the split-lock traffic actually still lands on
+  // the mutex-only crossing path" from the shutdown dump, rather than
+  // inferring it from a single TYPE_HAS_SPLIT_LOCKS total. TYPE_HAS_SPLIT_LOCKS
+  // remains the always-incremented top-level counter.
+  TYPE_SPLIT_LOCK_DWORD_CONTAINED = TYPE_JIT_ADDRESSABLE_LAST,
+  TYPE_SPLIT_LOCK_QWORD_CONTAINED,
+  TYPE_SPLIT_LOCK_CROSSING_MUTEX,
+  // High-water mark of the container LL/SC retry count observed by any
+  // helper invocation. Container livelocks are the class of failure this
+  // instrument exists to make diagnosable — a normal run shows single-digit
+  // retries; a livelock shows an unbounded climb.
+  TYPE_SPLIT_LOCK_MAX_RETRIES,
   TYPE_LAST,
 };
 

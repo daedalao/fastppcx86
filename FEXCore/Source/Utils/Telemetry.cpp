@@ -35,6 +35,10 @@ const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST>
   "Uses 32-bit Segment CS",
   "Uses 32-bit Segment DS",
   "Non-Canonical 64-bit address access",
+  "PPC64 Split Lock - doubleword-contained (C3 path)",
+  "PPC64 Split Lock - quadword-contained (C4 path)",
+  "PPC64 Split Lock - crossing (mutex + memcpy fallback)",
+  "PPC64 Split Lock - container LL/SC retry high-water",
 };
 
 static bool Enabled {true};

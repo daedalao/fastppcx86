@@ -87,6 +87,28 @@ inline uint64_t SizeMask(uint32_t size) {
   return (uint64_t {1} << (size * 8)) - 1;
 }
 
+// Update the retry-count high-water telemetry slot with a fetch-max.  Called
+// with the retry count observed by a single container LL/SC pass; the slot
+// itself lives on TelemetryValues[TYPE_SPLIT_LOCK_MAX_RETRIES] and monotonically
+// climbs to the largest retry-count any single split-lock event has ever seen.
+// Zero-cost when TYPE_LAST is compiled out or when Retries == 0.
+static inline void UpdateSplitLockRetryHighWater(uint32_t Retries) {
+#ifndef FEX_DISABLE_TELEMETRY
+  if (Retries == 0) {
+    return;
+  }
+  auto& Slot = Telemetry::TelemetryValues[Telemetry::TYPE_SPLIT_LOCK_MAX_RETRIES];
+  uint64_t Prev = Slot.load(std::memory_order_relaxed);
+  const uint64_t R = Retries;
+  while (R > Prev && !Slot.compare_exchange_weak(Prev, R, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    // Prev was updated by compare_exchange_weak; loop until either we win
+    // the fetch-max race or Prev >= R.
+  }
+#else
+  (void)Retries;
+#endif
+}
+
 // Compute the RMW result value from op / current-Old / operand. CAS is
 // excluded from this dispatch — it needs Expected and a "did we store"
 // signal, so callers handle it inline.
@@ -132,12 +154,13 @@ static inline uint64_t ApplyRmwOp(SplitLockOp op, uint64_t Old, uint64_t Operand
 // retry with fallback to memcpy would silently re-introduce the crossing-
 // mutex vs aligned-LL/SC race precisely when contention is highest, which
 // is the class of bug PA explicitly warned against.
-static void ContainerQuadword(SplitLockOp op, void* HostAddr, uint64_t Operand,
-                              uint64_t* result, uint32_t size, uint64_t Mask) {
+static uint32_t ContainerQuadword(SplitLockOp op, void* HostAddr, uint64_t Operand,
+                                  uint64_t* result, uint32_t size, uint64_t Mask) {
   const uintptr_t EA = reinterpret_cast<uintptr_t>(HostAddr);
   uint64_t* AlignedPtr = reinterpret_cast<uint64_t*>(EA & ~uintptr_t{15});
   const uint32_t Offset = static_cast<uint32_t>(EA & 15u);
   const uint64_t GuestExpected = (op == SplitLockOp::CAS) ? ((*result) & Mask) : 0;
+  uint32_t Retries = 0;
 
   while (true) {
     uint64_t OldHi = 0, OldLo = 0;
@@ -162,7 +185,7 @@ static void ContainerQuadword(SplitLockOp op, void* HostAddr, uint64_t Operand,
     if (op == SplitLockOp::CAS && Old != GuestExpected) {
       // Guest CAS mismatch — abandon reservation, no store.
       *result = Old;
-      return;
+      return Retries;
     }
 
     uint64_t New;
@@ -201,10 +224,11 @@ static void ContainerQuadword(SplitLockOp op, void* HostAddr, uint64_t Operand,
 
     if (Success) {
       *result = Old;
-      return;
+      return Retries;
     }
     // stqcx. failed — reservation was stolen by another aligned atomic
     // on the same 128-byte reservation granule.  Retry the whole loop.
+    ++Retries;
   }
 }
 
@@ -233,14 +257,15 @@ static void ContainerQuadword(SplitLockOp op, void* HostAddr, uint64_t Operand,
 // Sizes: valid sizes are {1,2,4,8}.  size==8 with (EA&7)==0 is naturally
 // aligned and never lands here (the JIT emits ldarx/stdcx. directly), so
 // the interesting cases are size {1,2,4} at any non-crossing offset.
-static inline void ContainerDoubleword(SplitLockOp op, void* HostAddr, uint64_t Operand,
-                                       uint64_t* result, uint32_t size, uint64_t Mask) {
+static inline uint32_t ContainerDoubleword(SplitLockOp op, void* HostAddr, uint64_t Operand,
+                                           uint64_t* result, uint32_t size, uint64_t Mask) {
   const uintptr_t EA = reinterpret_cast<uintptr_t>(HostAddr);
   const uintptr_t Aligned = EA & ~uintptr_t{7};
   const uint32_t ByteOffset = static_cast<uint32_t>(EA & 7u);
   const uint32_t BitShift = ByteOffset * 8u;
   const uint64_t FieldMask = Mask << BitShift;
   uint64_t* AlignedPtr = reinterpret_cast<uint64_t*>(Aligned);
+  uint32_t Retries = 0;
 
   uint64_t Expected_dword = __atomic_load_n(AlignedPtr, __ATOMIC_ACQUIRE);
   while (true) {
@@ -253,7 +278,7 @@ static inline void ContainerDoubleword(SplitLockOp op, void* HostAddr, uint64_t 
         // still owed to the guest because x86 LOCK is seq_cst regardless
         // of the mismatch outcome; the JIT's hwsync bracket provides it.
         *result = Old;
-        return;
+        return Retries;
       }
     }
     const uint64_t New = (op == SplitLockOp::CAS) ? (Operand & Mask)
@@ -263,10 +288,11 @@ static inline void ContainerDoubleword(SplitLockOp op, void* HostAddr, uint64_t 
                                     /*weak=*/false,
                                     __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) {
       *result = Old;
-      return;
+      return Retries;
     }
     // CAS failed: Expected_dword was overwritten with the current value.
     // Loop; nothing else to reset.
+    ++Retries;
   }
 }
 } // namespace
@@ -326,7 +352,9 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   // composes with aligned LL/SC on overlapping bytes in other threads,
   // which the plain-memcpy path below cannot.
   if ((HostAddrVal & 7u) + size <= 8u) {
-    ContainerDoubleword(static_cast<SplitLockOp>(op), HostAddr, Operand, result, size, Mask);
+    FEXCORE_TELEMETRY_INC(TYPE_SPLIT_LOCK_DWORD_CONTAINED);
+    const uint32_t Retries = ContainerDoubleword(static_cast<SplitLockOp>(op), HostAddr, Operand, result, size, Mask);
+    UpdateSplitLockRetryHighWater(Retries);
     return;
   }
 
@@ -335,7 +363,9 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   // the quadword; composes with aligned LL/SC in other threads for the same
   // reason as C3.
   if ((HostAddrVal & 15u) + size <= 16u) {
-    ContainerQuadword(static_cast<SplitLockOp>(op), HostAddr, Operand, result, size, Mask);
+    FEXCORE_TELEMETRY_INC(TYPE_SPLIT_LOCK_QWORD_CONTAINED);
+    const uint32_t Retries = ContainerQuadword(static_cast<SplitLockOp>(op), HostAddr, Operand, result, size, Mask);
+    UpdateSplitLockRetryHighWater(Retries);
     return;
   }
 
@@ -345,6 +375,7 @@ extern "C" void PPC64_SplitLockEmulate(uint8_t op, uint64_t* addr, uint64_t* val
   // and quadword-contained cases now run through real LL/SC), but a
   // crossing residual remains for 8-byte ops at (EA & 15) > 8 and for i386
   // 4-aligned `cmpxchg8b` at offset 12 mod 16.
+  FEXCORE_TELEMETRY_INC(TYPE_SPLIT_LOCK_CROSSING_MUTEX);
   // Load the current value at the (possibly misaligned) EA.
   const uint64_t Old = LoadMis(HostAddr, size) & Mask;
   uint64_t New = Old;
