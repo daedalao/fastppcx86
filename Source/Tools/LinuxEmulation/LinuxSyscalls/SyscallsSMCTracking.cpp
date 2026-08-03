@@ -927,10 +927,47 @@ uint64_t SyscallHandler::TrackShmdt(FEXCore::Core::InternalThreadState* Thread, 
 
 void SyscallHandler::TrackMadvise(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Size, int advice) {
   Size = FEXCore::AlignUp(Size, FEXCore::Utils::FEX_PAGE_SIZE);
-  {
-    auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
-    // TODO
+
+  // Destructive advice types replace page contents WITHOUT a page-write fault
+  // reaching FEX's SMC tracking, so any translations FEX has for guest code
+  // on the affected pages become stale silently. Invalidate to force a
+  // recompile on next entry.
+  //
+  //   MADV_DONTNEED — private anon reverts to zero-fill; shared reverts to
+  //                   backing-file contents. Guest arena allocators decommit
+  //                   this way; Mono is the workload where this bites us.
+  //   MADV_REMOVE   — hole-punches shmem/tmpfs.
+  //   MADV_FREE     — kernel MAY reclaim the page lazily under memory
+  //                   pressure, MINUTES after the syscall. Invalidating at
+  //                   the madvise call is strictly better than nothing but
+  //                   is NOT a full fix: the reclaim happens without any
+  //                   syscall boundary, so a block compiled between the
+  //                   madvise and the lazy reclaim is still exposed. The
+  //                   complete closure requires the range being excluded
+  //                   from any retention scheme (Nimbus's problem, not this
+  //                   commit's). Recording the partial-fix status here so
+  //                   the next reader is not misled by the presence of a
+  //                   MADV_FREE branch.
+  bool NeedsInvalidate = false;
+  switch (advice) {
+  case MADV_DONTNEED:
+  case MADV_REMOVE:
+  case MADV_FREE: NeedsInvalidate = true; break;
+  default: break;
   }
+  if (!NeedsInvalidate) {
+    return;
+  }
+
+  // Do NOT hold VMATracking.Mutex across InvalidateCodeRangeIfNecessary:
+  // it reaches TM::InvalidateGuestCodeRange, which takes ThreadCreationMutex
+  // and the EXCLUSIVE CodeInvalidationMutex, and holding VMATracking.Mutex
+  // during that would invert the lock order used everywhere else in this
+  // file (see GuestMunmap at :550-551 for the required shape: mutex work
+  // in a closed scope, then invalidate outside it). The stub used to open
+  // a VMATracking.Mutex scope for the empty TODO; there is nothing this
+  // handler actually needs to read from VMATracking, so the scope is gone.
+  InvalidateCodeRangeIfNecessary(Thread, Base, Size);
 }
 
 } // namespace FEX::HLE
