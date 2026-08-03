@@ -2527,10 +2527,17 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   //
   // Arm64JITCore does the same handshake before copying its staging buffer out
   // (JIT/JIT.cpp:1085); it matters more here because PPC64 emits directly into
-  // the shared buffer rather than staging per-thread. No CallRetStack reset is
-  // needed alongside it: the PPC64LE backend does not use the call-return
-  // predictor stack.
+  // the shared buffer rather than staging per-thread.
+  //
+  // Wipe CallRetStack alongside the code-buffer rotation. The current PPC64LE
+  // backend does not push/pop the call-return predictor stack, so this is a
+  // no-op today; landing it here now preserves the ordering invariant for
+  // when a future shadow return stack starts using it — stale entries in
+  // the per-thread callret stack must never survive a code-buffer rotation
+  // because their embedded HostPC values reference memory that is about to
+  // be reused. Mirrors JIT/JIT.cpp:1086.
   if (auto Prev = CheckCodeBufferUpdate()) {
+    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
     auto CacheLock = ThreadState->LookupCache->AcquireWriteLock();
     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, CacheLock);
   }
