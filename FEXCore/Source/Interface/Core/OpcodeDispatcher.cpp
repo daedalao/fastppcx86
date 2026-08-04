@@ -1164,10 +1164,20 @@ void OpDispatchBuilder::XCHGOp(OpcodeArgs) {
     HandledLock = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK) != 0;
 
     Ref Dest = MakeSegmentAddress(Op, Op->Dest);
-    if (IsMonoBackpatcherBlock) {
-      _MonoBackpatcherWrite(OpSizeFromSrc(Op), Src, Dest);
+    // Gate _MonoBackpatcherWrite on operand size: IR.json:300-302 validates
+    // 32/64-bit only, but EmitValidation is assert-only and compiles out in
+    // Release. Passing an 8- or 16-bit XCHG through (opcode 86 /r, or the
+    // 16-bit-prefixed form) would reach Core.cpp:1174's Release-live
+    // ERROR_AND_DIE_FMT. Fall through to _AtomicSwap for the smaller sizes —
+    // the backpatcher op is fault-avoidance for oversized RMW paths, not a
+    // semantic requirement, so _AtomicSwap is always a valid substitute.
+    // Dormant today because IsMonoBackpatcherBlock never fires (per PA's
+    // §A finding), but landing this closes the abort permanently.
+    const auto OpSize = OpSizeFromSrc(Op);
+    if (IsMonoBackpatcherBlock && (OpSize == FEXCore::IR::OpSize::i32Bit || OpSize == FEXCore::IR::OpSize::i64Bit)) {
+      _MonoBackpatcherWrite(OpSize, Src, Dest);
     } else {
-      auto Result = _AtomicSwap(OpSizeFromSrc(Op), Src, Dest);
+      auto Result = _AtomicSwap(OpSize, Src, Dest);
       StoreResultGPR(Op, Op->Src[0], Result);
     }
   } else {
