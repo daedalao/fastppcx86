@@ -1,6 +1,16 @@
 # Vector-scan fusion: `pcmpeqb ; pmovmskb ; test ; jcc` → `vcmpequb. ; bc`
 
-PPC64LE (POWER8) backend. Status: implemented, gated by `FEX_VCMPFUSION` (default on).
+PPC64LE (POWER8) backend. Status: implemented and validated, gated by
+`FEX_VCMPFUSION`, **default OFF**.
+
+> **Read §11 first.** Sections 1–9 were written against a tree where `PMOVMSKB`
+> cost ~105 host instructions, and against that baseline this fusion is worth
+> 4.6× on an SSE2 strlen loop. The concurrent `vbpermq` lowering then made
+> `PMOVMSKB` cost 6, and against *that* baseline the fusion measures 3 fewer
+> host instructions but **1.3% slower** wall clock on POWER9. §11 has the
+> integrated numbers and the analysis. Everything before it is still accurate
+> as design rationale and as the pre-`vbpermq` measurement; it is simply no
+> longer the operative comparison.
 
 ---
 
@@ -667,3 +677,135 @@ i.e. two tests, and both are flaky. Re-running just those four cases three
 times each, with the fusion on and off, gives 0, 2, 2 failures with it on and
 1, 1, 2 with it off — they are scheduler-dependent and the host had CP2077
 running throughout. Nothing else in 11 880 cases moves.
+
+---
+
+## 11. Integrated result: after `vbpermq`, this fusion no longer pays
+
+`3ede3ee9d` merges this branch with the `vmsumshm`/`vbpermq` branch described in
+§10. Everything below is measured on that merged tree, on op4k (POWER9), with
+the box otherwise idle, `FEX_VCMPFUSION` as the only variable.
+
+### 11.1 What changed underneath
+
+The merge conflict in `Vector.cpp` was resolved by moving the `vbpermq` fast
+path down one level, from `MOVMSKOpOne` into `EmitByteLaneMask`, so **both**
+callers get it — the guest `PMOVMSKB` dispatcher and this fusion's match edge.
+`PMOVMSKB` is now:
+
+```
+IROP_SIZE  max=24 avg=24  count=181  name=VExtractSignBits
+```
+
+24 bytes = **6 host instructions**, replacing the 17+2+1+90+3 = ~113 of §9.1.
+
+### 11.2 Host instruction counts, re-taken
+
+Loop body, `pcmpeqb` → `jcc`, on the merged tree:
+
+| IR op | unfused | fused |
+| --- | ---: | ---: |
+| `VCMPEQ` (architectural pcmpeqb) | 1 | 1 |
+| `VExtractSignBits` (`lvsl ; vslb ; vbpermq ; mfvsrd ; …`) | **6** | — |
+| `Constant 0` | 1 | 2 |
+| `VMov` (copy the pre-compare xmm0 for the branch) | — | 1 |
+| `StoreRegister` (xmm0 write-back) | — | 1 |
+| `SubWithFlags` + `StorePF` (the `test`) | 4 | 4 |
+| `CondJump` | 4 | 4 |
+| **total** | **≈16** | **≈13** |
+
+The fusion still removes instructions. It is worth being precise about which:
+it removes 6 (`VExtractSignBits`) and adds 3 (`VMov`, `StoreRegister`, a second
+`Constant`). The `CondJump` is 16 bytes either way — `cmpwi cr7 ; bc ; b ; b`
+becomes `vcmpequb. ; bc ; b ; b`, exactly as designed.
+
+### 11.3 Wall clock — the fusion is 1.3% *slower*
+
+`vcmpbench 400`, `asm_strlen_jnz align=0`, three runs each, alternating:
+
+| rep | `FEX_VCMPFUSION=0` | `=1` |
+| --- | ---: | ---: |
+| 1 | 0.0301 s | 0.0305 s |
+| 2 | 0.0301 s | 0.0305 s |
+| 3 | 0.0301 s | 0.0306 s |
+
+Three for three, tighter than the resolution of the measurement. This is not
+noise. For scale, the same loop on the pre-`vbpermq` tree was 0.0133 s at
+`iters=20` scaled equivalently — **`vbpermq` alone is ~8.9× on this loop, and
+the fusion on top of it is −1.3%.**
+
+### 11.4 Where the 1.3% goes
+
+Fewer instructions, more time, which means the removed instructions were not on
+the critical path and the added ones are.
+
+* `VExtractSignBits` ends in `mfvsrd`, a VSU→FXU transfer, and the branch does
+  depend on it. But the loop's *address* increment does not, so POWER9's
+  out-of-order engine overlaps iteration N's mask extraction with iteration
+  N+1's load and compare. The dependency the fusion was built to break is
+  already hidden by the machine.
+* The fusion adds a `VMov` — a vector-pipe copy — squarely into the loop. It is
+  there because the fused branch consumes the **pre-compare** `xmm0` while
+  `StoreResultFPR` overwrites the same SRA slot with the compare result, so the
+  allocator must keep a copy. That copy, plus the second `vcmpequb`, is in the
+  vector pipe alongside the work the loop actually needs.
+
+So the fusion trades ~6 well-overlapped scalar/transfer instructions for ~2
+poorly-overlapped vector ones. On POWER9 that is a small loss.
+
+### 11.5 The change that would most likely recover it
+
+Feed the fused branch the **compare result** instead of the two compare
+operands, and test "all lanes equal" against a zero vector:
+
+```
+vcmpequb   V0, A, B        ; architectural pcmpeqb, straight into the SRA slot
+vspltisb   VTMP2, 0        ; LoadZeroVector -- 1 instruction on this backend
+vcmpequb.  VTMP1, V0, VTMP2
+bc         <CR6[0]>        ; CR6[0] set == all lanes zero == NO lane matched
+```
+
+The `VMov` and the `StoreRegister` both disappear, because `%256` can write the
+SRA slot directly again — nothing needs the pre-compare value any more. Net
+≈12 instructions and, more importantly, one fewer vector op in the loop.
+
+It needs one more trailing defaulted field on `CondJump`
+(`i1:$VCmpAllLanes{false}`, selecting CR6 bit 0 instead of bit 2), which is the
+same mechanism §3.1 already uses, plus the corresponding arm in
+`DEF_OP(CondJump)`. Roughly fifteen lines.
+
+It was **not** done here, deliberately. The arithmetic says it is worth about
+one vector op per iteration — call it 1–3% — which would move the fusion from
+slightly behind `vbpermq` to slightly ahead of it. Adding IR surface and
+re-validating on the last cycle before merge, to chase a number that small, is
+a worse trade than shipping the measurement. The analysis is written down here
+so whoever picks it up starts with data rather than a hypothesis.
+
+### 11.6 Recommendation
+
+**`FEX_VCMPFUSION` defaults to off.** The `vbpermq` lowering is the change that
+matters for glibc string performance on this port; it is unconditional, it helps
+every `PMOVMSKB` including the AVX ones (§7), and it does not depend on
+recognising an instruction pattern.
+
+What this branch leaves behind that is still worth having:
+
+* **Record-form vector compares in the emitter** (`vcmpequ{b,h,w,d}_`) and the
+  finding that `EmitVX` needs no change to produce them — `Rc` is bit 10 of the
+  field it already splices.
+* **The `CondJump` vector mode**, which is the only way in this IR for a branch
+  to consume a vector comparison, and which cost nothing in the five CFG-aware
+  passes because it extends an existing op rather than adding one (§3.1).
+* **The decode lookahead window** (`SetDecodeWindow` /
+  `ConsumeFusedInstructionCount`) and its bail-out discipline — in particular
+  the `CONFIG_SMC_FULL` interaction (bail-out 19), which any future
+  multi-instruction fusion in this frontend will have to get right and which is
+  easy to miss.
+* **The out-of-order-block RA hazard** (§5.4), which is a property of the
+  allocator, not of this feature.
+* **The measured AVX gap** (§9.3): glibc runs `__strlen_avx2` on this port, so
+  256-bit `vpmovmskb` is where the remaining string-performance work is.
+
+Two open items that are now more valuable than the fusion itself: the AVX-256
+shape (§7), and re-taking §11.3 on POWER8, where `mfvsrd` is costlier and the
+conclusion could genuinely flip.

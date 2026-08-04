@@ -593,7 +593,7 @@
       },
       "VCmpFusion": {
         "Type": "bool",
-        "Default": "true",
+        "Default": "false",
         "Desc": [
           "Fuse the glibc vector-scan idiom -- pcmpeq{b,w,d} ; pmovmskb ;",
           "test r32,r32 ; jz/jnz -- into a single conditional branch driven by",
@@ -603,8 +603,19 @@
           "backend advertises HostFeatures.SupportsVCmpFlagBranch (ppc64le).",
           "The elided PMOVMSKB destination is still architecturally correct on",
           "both edges: it is provably zero on the no-match edge, and is",
-          "recomputed on the match edge. Set to 0 as an escape hatch and to A/B",
-          "the win with a single variable changed."
+          "recomputed on the match edge.",
+          "",
+          "DEFAULT OFF, and the reason is a measurement, not a doubt about",
+          "correctness. Before the vbpermq PMOVMSKB lowering landed this was",
+          "worth 4.6x on an SSE2 strlen loop (123 -> 12 host instructions).",
+          "vbpermq independently took the same loop 8.9x faster, and against",
+          "THAT baseline the fusion measures 16 -> 13 host instructions but",
+          "1.3% slower wall clock, reproducibly. See",
+          "docs/VCMPEQ_FUSION_DESIGN.md section 11 for where the 1.3% goes and",
+          "the specific change that would most likely recover it. Turn it on to",
+          "re-measure -- in particular on POWER8, where the mfvsrd this removes",
+          "from the loop-carried dependency is costlier than on the POWER9 the",
+          "numbers above were taken on."
         ]
       },
       "SMCStoreBackpatch": {
