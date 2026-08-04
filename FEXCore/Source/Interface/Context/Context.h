@@ -376,7 +376,23 @@ public:
     FEX_CONFIG_OPT(SplitLockInlineContained, SPLITLOCKINLINECONTAINED);
     FEX_CONFIG_OPT(BlockLinking, BLOCKLINKING);
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
+    FEX_CONFIG_OPT(SpinLoopClamp, SPINLOOPCLAMP);
   } Config;
+
+  // Parsed form of Config.SpinLoopClamp ("0xBEGIN-0xEND:ind:bound"). When
+  // Active, OpDispatchBuilder::CMPOp compiles any 64-bit register-register
+  // compare of InductionReg against BoundReg whose guest RIP lies in
+  // [Begin, End) with an overshoot clamp: an induction value unsigned-above
+  // the bound is forced back to the bound so the loop's equality exit fires.
+  // Workaround for loops entered with an already-corrupted induction variable
+  // (the Ziggurat finalize spin); a sane execution never trips the clamp.
+  struct SpinLoopClampInfo {
+    uint64_t Begin {};
+    uint64_t End {};
+    uint8_t InductionReg {};
+    uint8_t BoundReg {};
+    bool Active {};
+  } SpinLoopClamp {};
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 

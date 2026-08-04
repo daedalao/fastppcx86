@@ -832,6 +832,21 @@
         "Desc": [
           "Permits a hook-based SMC approach and smaller JIT blocks when mono is detected."
         ]
+      },
+      "SpinLoopClamp": {
+        "Type": "str",
+        "Default": "",
+        "Desc": [
+          "Workaround for a guest loop entered with a corrupted induction variable",
+          "(e.g. the Ziggurat finalize spin: RBX += 4 exiting only on RBX == R15).",
+          "Format: 0xBEGIN-0xEND:ind:bound with x86 register names,",
+          "e.g. 0x551330-0x5515e5:rbx:r15.",
+          "Every 64-bit register-register CMP between ind and bound whose guest RIP",
+          "falls in [BEGIN, END) is compiled with an overshoot clamp: if ind is",
+          "unsigned-above bound at the compare, it is forced equal to bound so the",
+          "equality exit fires instead of spinning forever. A sane loop never",
+          "trips the clamp; empty string disables it."
+        ]
       }
     },
     "Misc": {

@@ -68,6 +68,7 @@ $end_info$
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -100,6 +101,51 @@ static int SMCAuditCompileFD() {
 }
 
 namespace FEXCore::Context {
+// SpinLoopClamp spec: "0x<begin>-0x<end>:<induction>:<bound>", registers by
+// x86 name. Any malformed field returns false so a typo disables the hack
+// entirely rather than half-applying it. Does not set Out.Active.
+static bool ParseSpinLoopClamp(std::string_view Spec, ContextImpl::SpinLoopClampInfo& Out) {
+  static constexpr std::array<std::string_view, 16> RegNames = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                                                "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+  auto RegIndex = [&](std::string_view Name) -> int {
+    for (size_t i = 0; i < RegNames.size(); ++i) {
+      if (Name == RegNames[i]) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  };
+  auto ParseAddr = [](std::string_view Field, uint64_t& Value) {
+    const fextl::string Copy {Field};
+    char* End {};
+    Value = std::strtoull(Copy.c_str(), &End, 0);
+    return !Copy.empty() && *End == '\0';
+  };
+
+  const size_t Dash = Spec.find('-');
+  const size_t Colon1 = Spec.find(':');
+  const size_t Colon2 = Colon1 == Spec.npos ? Spec.npos : Spec.find(':', Colon1 + 1);
+  if (Dash == Spec.npos || Colon1 == Spec.npos || Colon2 == Spec.npos || Dash > Colon1) {
+    return false;
+  }
+
+  uint64_t Begin {}, End {};
+  if (!ParseAddr(Spec.substr(0, Dash), Begin) || !ParseAddr(Spec.substr(Dash + 1, Colon1 - Dash - 1), End)) {
+    return false;
+  }
+  const int Induction = RegIndex(Spec.substr(Colon1 + 1, Colon2 - Colon1 - 1));
+  const int Bound = RegIndex(Spec.substr(Colon2 + 1));
+  if (Induction < 0 || Bound < 0 || Induction == Bound || Begin >= End) {
+    return false;
+  }
+
+  Out.Begin = Begin;
+  Out.End = End;
+  Out.InductionReg = static_cast<uint8_t>(Induction);
+  Out.BoundReg = static_cast<uint8_t>(Bound);
+  return true;
+}
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
@@ -134,6 +180,17 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   // Interface/Core/LookupCache.cpp for why it can never be switched on later.
   if (Config.SMCStoreEmulation() || Config.SMCStoreBackpatch() || Config.SMCSemanticPatch()) {
     FEXCore::SMC::CodeGranuleTrackingEnabled.store(true, std::memory_order_release);
+  }
+
+  // Spin-loop overshoot clamp; see SpinLoopClampInfo in Context.h.
+  if (const fextl::string Spec = Config.SpinLoopClamp(); !Spec.empty()) {
+    if (ParseSpinLoopClamp(Spec, SpinLoopClamp)) {
+      SpinLoopClamp.Active = true;
+      LogMan::Msg::IFmt("SpinLoopClamp active: RIP [0x{:x}, 0x{:x}), induction GPR {}, bound GPR {}", SpinLoopClamp.Begin,
+                        SpinLoopClamp.End, SpinLoopClamp.InductionReg, SpinLoopClamp.BoundReg);
+    } else {
+      LogMan::Msg::EFmt("SpinLoopClamp: failed to parse '{}'; hack disabled", Spec);
+    }
   }
 }
 

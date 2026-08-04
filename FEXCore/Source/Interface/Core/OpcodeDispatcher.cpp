@@ -1391,6 +1391,30 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
   // Result isn't stored in result, only writes to flags
   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.AllowUpperGarbage = true});
   Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+
+  // Spin-loop overshoot clamp (see SpinLoopClampInfo in Context.h): if this is
+  // the configured induction-vs-bound compare, force an induction value that
+  // is unsigned-above the bound back onto the bound before the flags are
+  // computed, so the loop's equality exit fires instead of spinning forever.
+  // The architectural register is rewritten too — post-loop code must observe
+  // the same ind == bound state a legitimate final iteration leaves behind.
+  const auto& Clamp = CTX->SpinLoopClamp;
+  if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End && OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() &&
+      Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits && !Op->Src[SrcIndex].Data.GPR.HighBits) {
+    const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
+    const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
+    const bool DestIsInduction = DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg;
+    const bool SrcIsInduction = SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg;
+    if (DestIsInduction || SrcIsInduction) {
+      Ref Induction = DestIsInduction ? Dest : Src;
+      Ref Bound = DestIsInduction ? Src : Dest;
+      Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
+      StoreGPRRegister(Clamp.InductionReg, Clamped, OpSize::i64Bit);
+      (DestIsInduction ? Dest : Src) = Clamped;
+      LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
+    }
+  }
+
   CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Src);
 }
 
