@@ -13,6 +13,17 @@ Agent reports calling it POWER9 were wrong. Consequences: the vcmp fusion's
 "re-measure on P8" caveat is void); any ISA 3.0 emission is for the
 co-dev's machine only, behind runtime gating.
 
+## STATUS (2026-08-04, tree ecaf17103): findings 1, 2(staging), 5, 6 DONE;
+## finding 3 closed as FALSE LEAD both halves (splats already 1-insn incl.
+## the P8 vspltd gap via xxpermdi; loads already size-dispatched, small
+## offsets collapse to li). Full ctest + regression battery: only the
+## pre-existing ssse3-psign baseline failures. Remaining open: finding
+## 2(a) per-block constant pool for the perm controls that still need
+## LoadConstant pairs (now stall-free via mtvsrd but still 10+ insns for
+## arbitrary 128-bit ctrls); finding 4 (P9 tier, co-dev's machine);
+## VTESTPS record-form treatment (same as PTEST but sign-bit semantics);
+## AVX-256 scan shape; co-dev's shuffle dispatcher gate.
+
 ## Ranked findings
 
 1. **[HARDWARE-PROVEN, unfixed] LoadNamedVectorConstant's byte-reverse vperm
