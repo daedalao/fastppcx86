@@ -265,13 +265,20 @@ public:
                     std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec);
     while (!M.try_lock()) {
       if (std::chrono::steady_clock::now() > deadline) {
-        LogMan::Msg::EFmt("InvalidateGuestCodeRange: write-lock stalled {}s, "
-                          "suspect phantom reader leak -- calling "
-                          "StealAndDropActiveLocks() to recover",
+        // Co-dev ISA-neutral findings §1.2 (verified): StealAndDropActiveLocks
+        // outside fork() corrupts the mutex word — the stolen-from reader's
+        // later unlock_shared underflows into phantom waiters with no wake
+        // possible, and the next lock() overflows the waiter field into the
+        // owned bit. Silent corruption, Release-only. Measured ZERO firings
+        // across ~72K invalidations on real workloads, so a fatal here costs
+        // nothing in practice and converts the corruption into an actionable
+        // report. The steal remains valid ONLY on the fork() child path.
+        // (Underlying producer to fix with this: the fork-vs-fault-handler
+        // lock inversion the steal was masking — findings §3.1.)
+        ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
+                          "(phantom reader / lock inversion). Refusing the "
+                          "corrupting steal; report this with the workload.",
                           InvalidateGuestCodeRangeStealTimeoutSec);
-        M.StealAndDropActiveLocks();
-        M.lock();
-        return;
       }
       ::usleep(50);
     }

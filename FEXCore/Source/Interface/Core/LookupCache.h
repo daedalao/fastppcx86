@@ -838,10 +838,29 @@ public:
       const double AveragePerSecond = static_cast<double>(L2L3CacheHits) /
                                       static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Period).count()) * 1000.0;
 
+      // CORRECTNESS (co-dev ISA-neutral findings §1.1, verified): a resize
+      // changes the index mask, so entries published under the OLD mask sit at
+      // slots the CURRENT mask can no longer address for the same guest RIP.
+      // InvalidateCache indexes with the current mask only, so such an aliased
+      // entry survives invalidation and a later resize can make it reachable
+      // again -> a STALE TRANSLATION EXECUTES. The partial shrink wipe below
+      // covered only [CurrentL1Entries, MAX) and grow wiped nothing.
+      // Fix: flush the ENTIRE table on every resize (one madvise on a
+      // rare path; costs a cold L1 afterwards). Zeroed entries read as
+      // guest-RIP 0, which the slow path filters as a suspect RIP.
+      const auto FlushWholeL1 = [&] {
+        // Same failure-hardening as ScrubForLazySMC: a failed madvise must not
+        // silently leave stale entries.
+        if (::madvise(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, MADV_DONTNEED) != 0) {
+          std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
+        }
+      };
+
       if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
         if (CurrentL1Entries < MAX_L1_ENTRIES) {
           CurrentL1Entries <<= 1;
           L1PointerMask = CurrentL1Entries - 1;
+          FlushWholeL1();
 
           // Update the thread's L1 pointer mask to increase how much cache it uses.
           // Since we're in C-code, this is safe to update here.
@@ -851,11 +870,7 @@ public:
         if (CurrentL1Entries > MIN_L1_ENTRIES) {
           CurrentL1Entries >>= 1;
           L1PointerMask = CurrentL1Entries - 1;
-
-          // Madvise the entries that we are dropping. Gives the memory back to the OS.
-          LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
-          size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
-          FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
+          FlushWholeL1();
 
           // Update the thread's L1 pointer mask to increase how much cache it uses.
           // Since we're in C-code, this is safe to update here.
