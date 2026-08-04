@@ -382,13 +382,41 @@ revisit if such loops turn out to matter (the fix would be to also emit the
 constant-zero store *and* accept that the match edge is taken — i.e. to fall
 back to Design A's mask materialisation before the branch on backward edges).
 
-### 5.4 Cross-block SSA
+### 5.4 Cross-block SSA — a trap that was hit and had to be designed around
 
-The match block uses `CompareResult` (the `_VCMPEQ` SSA defined in the
-predecessor). FEX's IR is whole-function SSA and RA handles cross-block
-liveness; `ForeachDirection()` in `OpcodeDispatcher.h` already emits exactly
-this shape (values defined before a `CondJump` and used in blocks created after
-it). No new capability is being relied on.
+The obvious implementation has the match block use the `_VCMPEQ` SSA value
+defined in its predecessor. FEX's IR is whole-function SSA and
+`ForeachDirection()` already emits values that cross block boundaries, so this
+looks safe. **It is not, in this shape, and it silently miscompiles.**
+
+The match block is created with `CreateNewCodeBlockAtEnd()` but *filled last*,
+after the no-match edge and after everything the surrounding `GenerateIR` loop
+still had to emit. Its node IDs therefore sit BEFORE those of blocks that
+precede it in the layout — the IR is well-formed but its node numbering is
+inverted with respect to block order. FEX's register allocator does not
+tolerate a live range spanning that inversion: it happily re-used the physical
+vector register holding the compare result for the match block's own
+`movmaskb` constant.
+
+Symptom: every fused scan returned a constant. A 40-line repro
+(`scan()` over a 256-byte buffer with the NUL walked across every position)
+returned `7` for all 200 positions. It is worth stating how *quiet* this
+failure is — the IR dump looks correct, IRValidation passes, and only reading
+the register assignments in the dump (`%269(v0) = LoadNamedVectorConstant`
+against a live-in also in `v0`) shows it.
+
+`ForeachDirection` does not hit this because it fills its blocks in layout
+order.
+
+Fix, and the reason the code looks the way it does: the match block **re-loads**
+the PCMPEQ result from the guest XMM register (`LoadSourceFPR(Op, Op->Dest,
+...)`). The register cache was flushed by the `CondJump`, so this reads exactly
+what PCMPEQ stored, and the value travels through guest context instead of
+across an out-of-order block edge. It costs one host load on the cold edge and
+removes the RA hazard entirely rather than depending on allocator internals.
+
+Generalisation worth remembering: **any peephole that creates a block early and
+fills it late must pass values through guest context, not SSA.**
 
 ### 5.5 Code cache identity
 
@@ -471,12 +499,153 @@ IR — only a different pair of operands.
 3. 32-bit guests (bail-out 4) and backward conditional edges (bail-out 18) are
    unfused coverage gaps, both reversible.
 4. AVX-256, §7. This is the one that decides whether the feature matters in
-   production rather than in a microbench.
+   production rather than in a microbench. §9.3 measures it at "nothing" today.
+5. The `test`'s flag computation survives into the fused loop (4 host
+   instructions) even though nothing reads the flags, because `StorePF`
+   consumes the `SubWithFlags`. Worth a look at the dead-flag pass.
+6. The out-of-order-block RA hazard in §5.4 should be an assertion in
+   IRValidation, not a thing each peephole author rediscovers.
+
+---
+
+## 10. Relationship to the concurrent `vbpermq` work
+
+A parallel branch (`e41877db8`, "lower PMADDWD to vmsumshm and the movemasks to
+vbpermq") attacks the same 105 instructions from the other end: it gives
+`PMOVMSKB` a real POWER8 lowering — `vbpermq` gathers all sixteen sign bits in
+one instruction, with the control vector built by `lvsl` + `vslb` so it never
+touches the constant pool.
+
+**These are complementary, not competing, and they compose.**
+
+* The `vbpermq` lowering takes the *unfused* sequence from ~105 host
+  instructions to roughly 5 (`lvsl ; vslb ; vbpermq ; mfvsrd` + the compare).
+  It helps every `PMOVMSKB`, including the AVX ones this fusion cannot reach,
+  and including uses where the mask is genuinely consumed.
+* The fusion takes the *branch* off the mask entirely. What survives the
+  `vbpermq` lowering is the `mfvsrd` — a VSU→FXU transfer still sitting in the
+  loop-carried dependency of the branch — plus a GPR compare. The fusion
+  removes exactly that, and would still remove it on top of `vbpermq`.
+
+With both applied the SSE2 back edge should be `vcmpequb. ; bc ; b ; b` with the
+`vbpermq` sequence relocated to the match edge, where it also makes the cold
+path five times cheaper. Neither change makes the other redundant; the
+instruction counts in §9.1 are measured **without** `vbpermq` and should be
+re-taken once the two are merged.
+
+Two things from that branch are worth adopting here:
+
+1. **`"JITDispatch": false` as the backend-gating mechanism.** That branch adds
+   PPC64LE-only IR ops, marks them `JITDispatch:false` so the generator does not
+   demand a handler from every backend, registers them by hand in the PPC64LE op
+   table, and emits them from the OpcodeDispatcher under
+   `#ifdef ARCHITECTURE_ppc64le`. That is a cleaner and more reusable answer to
+   "backends that don't implement it must never see it" than this branch's
+   `HostFeatures::SupportsVCmpFlagBranch` + reuse-an-existing-op. If more
+   PPC64LE-only IR lands, that is the pattern to standardise on. (This branch
+   still needed the op *reuse* for a different reason — §3.1's five CFG-aware
+   passes — so the two mechanisms are orthogonal and both are worth having.)
+2. **`lvsl`-built control vectors.** `lvsl` materialises a byte ramp with no
+   load and no constant pool, and in LE mode it is not byte-reversed. Any
+   future 256-bit fused form here needs an all-ones vector; `vspltisb -1` covers
+   that, but the same "build it, don't load it" instinct applies to
+   `LoadNamedVectorConstant`, whose `movmaskb` case measures at 68 bytes / 17
+   instructions in §9.1.
 
 ---
 
 ## 9. Measurements
 
-See the report accompanying this branch. Method: `FEX_VCMPFUSION=0` vs `=1` on
-the same binary, same `FEXOfflineCompiler` disassembly for the instruction
-counts, `smcstorm`/`movchk` and the ASM differential suite for regressions.
+Host: op4k (POWER9, 4K pages), `build-vcmp` = RelWithDebInfo + ccache +
+`ENABLE_JIT_OPSIZE_PROFILE=ON`, commit `65d5dec3c`. CP2077 was running
+concurrently, so absolute times are noisy; the A/B ratio is not, because both
+sides are the same binary with one environment variable changed.
+
+### 9.1 Host instruction counts
+
+Method: IR dump of the loop block (`FEX_DUMPIR=stderr
+FEX_PASSMANAGERDUMPIR=afteropt`) × the JIT's own measured per-IR-op host
+expansion (`FEX_JITOPSIZEPROFILE=1`, which reports actual emitted bytes per op).
+Byte counts are exact; the mapping to a block is by op identity.
+
+Measured per-op expansion on this host:
+
+| IR op | host bytes (avg / max) |
+| --- | --- |
+| `VAddP` | 109 / **120** |
+| `LoadNamedVectorConstant` | 16 / **68** (68 is the `movmaskb` case) |
+| `VExtractToGPR` | 11 / 12 |
+| `VCMPLTZ` | 8 / 8 |
+| `VAnd`, `VCMPEQ`, `StoreRegister`, `Constant` | 4 / 4 |
+| `SubWithFlags` | 17 / 32 |
+| `CondJump` | 16 / 36 |
+
+The `pcmpeqb`→`jcc` span of the loop body, in host instructions (bytes ÷ 4):
+
+| | unfused | fused |
+| --- | ---: | ---: |
+| `VCMPEQ` (the architectural pcmpeqb) | 1 | 1 |
+| `LoadNamedVectorConstant movmaskb` | 17 | — |
+| `VCMPLTZ` | 2 | — |
+| `VAnd` | 1 | — |
+| `VAddP` × 3 | **90** | — |
+| `VExtractToGPR` | 3 | — |
+| `VMov` + `StoreRegister` (xmm0 write-back) | — | 2 |
+| `Constant 0` (the provable mask) | 1 | 1 |
+| `SubWithFlags` + `StorePF` (the `test`) | 4 | 4 |
+| `CondJump` | 4 | 4 |
+| **total** | **≈123** | **≈12** |
+
+The other team's independent estimate of the unfused sequence was ~105; the
+measured 123 here is the same thing plus the `test`/branch it does not count.
+
+Two things worth pointing out:
+
+* **The `CondJump` is the same size either way — 16 bytes.** Unfused it is
+  `cmpwi cr7 ; bc ; b ; b`; fused it is `vcmpequb. ; bc ; b ; b`. The branch
+  back edge really is 4 instructions, and the vector comparison rides in for
+  free in place of the GPR comparison it replaces.
+* **The `VAddP` count in the profiler is identical in both runs (543).** The
+  fusion does not delete the reduction — it *relocates* it to the match edge,
+  and the profiler proves that at compile time. Exactly the intent.
+
+The residual 12 instructions are 4 of flag computation (`SubWithFlags` for a
+`test` whose result nothing in this loop reads — the dead-flag pass keeps it
+because `StorePF` consumes it), 2 of xmm0 write-back, 1 constant, 1 compare,
+4 of branch. Removing the dead flag computation is follow-up (2) in §8.
+
+### 9.2 Wall clock (`/tmp/vcmpbench 20`, guest x86-64 under FEX)
+
+| loop | `FEX_VCMPFUSION=0` | `=1` | speedup |
+| --- | ---: | ---: | ---: |
+| `asm_strlen_jnz` align 0 (**fused**) | 0.0133 s | **0.0029 s** | **4.6×** |
+| `asm_strlen_jnz` align 5 (**fused**) | 0.0140 s | **0.0031 s** | **4.5×** |
+| `asm_strlen_jz_backward` align 0 (bail-out 18) | 0.0124 s | 0.0123 s | 1.00× |
+| `asm_strlen_jz_backward` align 5 (bail-out 18) | 0.0122 s | 0.0123 s | 1.00× |
+| libc `strlen` align 0 | 0.0095 s | 0.0095 s | 1.00× |
+| libc `memchr` align 0 | 0.0095 s | 0.0094 s | 1.00× |
+
+The backward-edge loop is the control: it is byte-for-byte the same work, the
+fusion refuses it, and it does not move. That is the bail-out being *exercised*,
+not merely asserted.
+
+### 9.3 The AVX result — the honest headline
+
+**libc `strlen`/`memchr`/`strchr` do not move at all.** This port advertises
+`SupportsAVX`, glibc's IFUNCs select `__strlen_avx2` / `__memchr_avx2`, and
+those loops use `vpcmpeqb %ymm` + `vpmovmskb`, which bail-out 5 rejects. §7
+describes the extension; until it lands, **the fusion is worth 4.5× on SSE2
+vector scans and nothing on the ones glibc actually runs.** That is the single
+most important number in this document and the obvious next piece of work.
+
+(The correctness sweep — 16 alignments × ~1000 lengths against a byte-at-a-time
+reference, plus exact raw-`pmovmskb`-value checks for 8/16/32-bit elements at
+every match position — passes identically with the fusion on and off.)
+
+### 9.4 Regressions
+
+| | result |
+| --- | --- |
+| `smcstorm crossthread 2000000` | `checksum=0000000000001890 OK`, rate 10.0 M/s |
+| `movchk 50000` | `mismatches=0 -> OK` |
+| ASM differential suite (`ctest`) | see report |
