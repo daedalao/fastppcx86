@@ -300,7 +300,9 @@ public:
   // the load zero-extends the upper bits of dst, and the store writes only the
   // low `size` bytes to *ea. Sizes accepted: 1, 2, 4, 8, 16 (load also 10).
   // Same superset clobber contract as above: TMP1..TMP3, plus VTMP2 (or VTMP1
-  // on aliasing) on the pre-3.0 scalar-load and V128 store paths.
+  // on aliasing) on the pre-3.0 scalar-load, scalar-store and V128 store
+  // paths. Sizes 4/8 take a register-only path on both load and store and
+  // clobber no TMP GPR at all, but callers must keep assuming the superset.
   void LoadFPRSized(VR dst, GPR ea, uint32_t size);
   void StoreFPRSized(VR src, GPR ea, uint32_t size);
 

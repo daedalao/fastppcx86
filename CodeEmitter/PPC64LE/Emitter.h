@@ -1024,6 +1024,20 @@ public:
   // lxsiwzx XT,RA,RB — ISA 2.07 (POWER8+) — p.488, XO=12. dword[0] =
   // zero-extended 4-byte LE int at EA.
   void lxsiwzx(VR vrt, GPR ra, GPR rb) { EmitX(31, vrt.idx, ra.idx, rb.idx,  12, 1); }
+  // Scalar stores out of dword[0] — the duals of lxsdx/lxsiwzx above.  Each
+  // store's XO is its load's XO + 128, the same relationship lxvd2x(844) /
+  // stxvd2x(972) has; that pairing is the cross-check that these numbers are
+  // right.  Both are indexed X-form with the TX/SX bit in the Rc slot, so a
+  // VMX register index r encodes VSR 32+r exactly as on the load side.
+  // stxsdx XS,RA,RB — ISA 2.06 — p.504, XO=716. Stores dword[0] as an 8-byte
+  // LE integer at EA.  dword[1] is not read.
+  void stxsdx(VR vrs, GPR ra, GPR rb)   { EmitX(31, vrs.idx, ra.idx, rb.idx, 716, 1); }
+  // stxsiwx XS,RA,RB — ISA 2.07 (POWER8+) — p.506, XO=140. Stores word
+  // element 1 of VSR[XS] (bits 32:63, i.e. the LOW word of dword[0]) as a
+  // 4-byte LE integer at EA.  This is the half lxsiwzx fills, so a value
+  // round-trips through lxsiwzx/stxsiwx unchanged.
+  void stxsiwx(VR vrs, GPR ra, GPR rb)  { EmitX(31, vrs.idx, ra.idx, rb.idx, 140, 1); }
+
   // lxsibzx XT,RA,RB — **ISA 3.0 (POWER9)** — p.486, XO=781. dword[0] =
   // zero-extended byte at EA; dword[1] = 0 (architectural, v3.0 instruction).
   void lxsibzx(VR vrt, GPR ra, GPR rb) { EmitX(31, vrt.idx, ra.idx, rb.idx, 781, 1); }

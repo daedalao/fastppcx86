@@ -475,6 +475,43 @@ void PPC64EmitterBase::StoreFPRSized(VR src, GPR ea, uint32_t size) {
     StoreUnalignedV128(src, ea);
     return;
   }
+
+  // Scalar VSX fast path for the two sizes the guest actually hits in bulk
+  // (movss/movd = 4, movsd/movq = 8). The bounce below costs 5 instructions
+  // plus a store-to-load-forwarding stall through JITScratch; this is 2.
+  //
+  // Register image convention (see the LoadFPRSized block comment): the guest
+  // value lives in the LOW bits of dword[1] — BE bytes (16-size)..15 — as an
+  // LE integer. Both stxsdx and stxsiwx read out of dword[0] instead
+  // (stxsdx the whole doubleword, stxsiwx word element 1 = the low word of
+  // dword[0]), so one xxpermdi with DM=2 moves dword[1] into dword[0]:
+  //   T.dw0 = A.dw1 = the guest value, T.dw1 = B.dw0 = don't-care.
+  // That is the exact inverse of the load path's xxpermdi(dst,dst,dst,2),
+  // and for size 4 the guest's low word lands in bits 32:63 of dw0 — the
+  // half stxsiwx stores — because it was the low word of the LE integer in
+  // dword[1]. Nothing outside the `size` bytes is written, which is the
+  // whole point of not using stvx here (hello_static __tls_init_tp SEGV).
+  //
+  // src must be preserved for the caller, so permute into a vector scratch:
+  // VTMP2, or VTMP1 when src is VTMP2. Same scratch choice, and therefore
+  // the same clobber contract, as the pre-3.0 StoreUnalignedV128 path.
+  // stxsdx is ISA 2.06 and stxsiwx ISA 2.07, so both are POWER8-legal with
+  // no feature gate — matching the ungated lxsdx/lxsiwzx on the load side.
+  // `ea` sits in RA (where RA=0 would mean literal zero), so it must not be
+  // r0; that is already the documented precondition for these helpers.
+  if (size == 4 || size == 8) {
+    const VR VScratch = (src == VTMP2) ? VTMP1 : VTMP2;
+    xxpermdi(VScratch, src, src, 2);
+    if (size == 8) {
+      stxsdx(VScratch, ea, GPRegs::r0);
+    } else {
+      stxsiwx(VScratch, ea, GPRegs::r0);
+    }
+    return;
+  }
+
+  // Sizes 1/2 (and anything else that reaches here) keep the JITScratch
+  // bounce: pre-3.0 has no single-byte/halfword scalar VSX store.
   GPR EaSafe = ea;
   if (ea == TMP1 || ea == TMP2 || ea == TMP3) {
     mr(TMP4, ea);

@@ -1831,10 +1831,25 @@ DEF_OP(TestNZ) {
   // OpcodeDispatcher.h holds for 8/16-bit TEST/AND/OR/XOR via TestNZ.
   // (The 32/64-bit SetNZ_ZeroCV path uses _SubNZCV which writes correct CA;
   // only the sub-32 path goes through _TestNZ.)
-  mfspr(TMP1, 1);
-  LoadConstant(TMP4, 0x60000000ull);   // mask: bits 29 (CA) + 30 (OV)
-  andc(TMP1, TMP1, TMP4);
-  mtspr(1, TMP1);
+  //
+  // A single OE=1 add of 0+0 replaces the mfspr/mask/mtspr XER round trip
+  // (an SPR move pair is one of the most expensive sequences on POWER8, and
+  // this is one of the hottest guest shapes: `test reg,reg` + jcc).
+  // Equivalence argument, in LSB bit numbers of the 64-bit XER value
+  // (ISA big-endian bit 32 = SO, 33 = OV, 34 = CA  =>  LSB 31/30/29):
+  //   * old mask 0x60000000 = LSB bits 30|29 = OV|CA, cleared via andc,
+  //     so the old sequence cleared exactly CA and OV and preserved SO.
+  //   * addco writes CA = carry out of the add and OV = signed overflow of
+  //     the add; 0 + 0 produces neither, so CA = OV = 0.  SO is sticky —
+  //     hardware only ORs OV into it, never clears it — so SO survives,
+  //     matching the old andc.
+  //   * Rc = 0 (Emitter.h `addco`, not `addco_`), so CR0 — which holds the
+  //     packed guest NZCV set by the and./andi. above and refined by
+  //     EmitTestNZSetCR below — is NOT touched.
+  // r0 is the JIT's zero-index invariant register (see PPC64Dispatcher.cpp),
+  // so this really is 0 + 0.  TMP1 is dead here: the old sequence's only
+  // use of it ended at the mtspr, and EmitTestNZSetCR overwrites it next.
+  addco(TMP1, r0, r0);
   // Refine CR0 to reflect ONLY the IR operand-size's worth of bits.
   EmitTestNZSetCR(TMP3, IROp->Size);
 }
@@ -1853,11 +1868,10 @@ DEF_OP(TestZ) {
   } else {
     and__(TMP3, S1, GetReg(Op->Src2));
   }
-  // Same clear-CV invariant as TestNZ above.
-  mfspr(TMP1, 1);
-  LoadConstant(TMP4, 0x60000000ull);
-  andc(TMP1, TMP1, TMP4);
-  mtspr(1, TMP1);
+  // Same clear-CV invariant as TestNZ above, same 0+0 addco argument
+  // (CA/OV cleared, sticky SO preserved, CR0 untouched because Rc=0).
+  // TMP1 is dead here for the same reason: EmitTestNZSetCR writes it next.
+  addco(TMP1, r0, r0);
   EmitTestNZSetCR(TMP3, IROp->Size);
 }
 
