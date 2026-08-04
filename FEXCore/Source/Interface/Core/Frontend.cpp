@@ -1800,6 +1800,15 @@ void Decoder::DetectSpinLoops() {
   namespace X86State = FEXCore::X86State;
   constexpr size_t MaxBodyInstructions = 48;
 
+  // Scope of the default (Mono-gated) mode: only the guest's low
+  // main-executable range. The observed wedge class lives in game-binary
+  // text (Ziggurat statically links its Unity player at the classic
+  // 0x400000 base); a live RimWorld audit showed an unscoped pass flags
+  // ~1000 loops across UnityPlayer.so/libc/ld.so/libX11 — all high-mapped
+  // shared-library text — for zero benefit. AUTO=2 stays unrestricted.
+  constexpr uint64_t MainExeAddressLimit = 1ULL << 32;
+  const bool RestrictToMainExe = CTX->Config.SpinLoopClampAuto() == 1;
+
   // Flat PC -> instruction view of the whole multiblock.
   fextl::map<uint64_t, DecodedInst*> ByPC;
   for (auto& Block : BlockInfo.Blocks) {
@@ -1881,6 +1890,9 @@ void Decoder::DetectSpinLoops() {
     }
     const uint64_t Head = BranchTarget(Branch);
     if (Head >= Branch->PC) {
+      continue;
+    }
+    if (RestrictToMainExe && Branch->PC >= MainExeAddressLimit) {
       continue;
     }
     const uint64_t BodyEnd = Branch->PC + Branch->InstSize;

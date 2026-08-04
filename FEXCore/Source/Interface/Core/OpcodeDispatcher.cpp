@@ -1401,33 +1401,40 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
   // final iteration leaves behind. Two triggers: flags placed by the
   // frontend's structural detection (Decoder::DetectSpinLoops), or the
   // manually configured FEX_SPINLOOPCLAMP guest-RIP range.
+  // Precedence: a manually-aimed range ALWAYS wins over the auto flags. The
+  // manual clamp is exact and immediate; the auto clamp is deliberately
+  // cautious (signed 2^30 margin) and letting it shadow a hand-aimed site
+  // re-wedged Ziggurat — the outer structure re-enters the loop with the
+  // induction reset BELOW the margin, turning the instant cure into hundreds
+  // of millions of spare iterations per re-entry.
   std::optional<bool> ClampDestIsInduction {};
   bool AutoClamp = false;
-  if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_DEST_IND) {
-    ClampDestIsInduction = true;
-    AutoClamp = true;
-  } else if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_SRC_IND) {
-    ClampDestIsInduction = false;
-    AutoClamp = true;
-  } else {
-    const auto& Clamp = CTX->SpinLoopClamp;
-    if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
-      if (OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() && Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits &&
-          !Op->Src[SrcIndex].Data.GPR.HighBits) {
-        const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
-        const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
-        if (DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg) {
-          ClampDestIsInduction = true;
-        } else if (SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg) {
-          ClampDestIsInduction = false;
-        }
+  const auto& Clamp = CTX->SpinLoopClamp;
+  if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
+    if (OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() && Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits &&
+        !Op->Src[SrcIndex].Data.GPR.HighBits) {
+      const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
+      const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
+      if (DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg) {
+        ClampDestIsInduction = true;
+      } else if (SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg) {
+        ClampDestIsInduction = false;
       }
-      // A mis-aimed range must not be silently indistinguishable from a
-      // working one (that already cost a session): say why an in-range CMP
-      // was skipped.
-      if (!ClampDestIsInduction.has_value()) {
-        LogMan::Msg::IFmt("SpinLoopClamp: CMP at guest RIP 0x{:x} in range but NOT clamped (size or operand mismatch)", Op->PC);
-      }
+    }
+    // A mis-aimed range must not be silently indistinguishable from a
+    // working one (that already cost a session): say why an in-range CMP
+    // was skipped.
+    if (!ClampDestIsInduction.has_value()) {
+      LogMan::Msg::IFmt("SpinLoopClamp: CMP at guest RIP 0x{:x} in range but NOT clamped (size or operand mismatch)", Op->PC);
+    }
+  }
+  if (!ClampDestIsInduction.has_value()) {
+    if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_DEST_IND) {
+      ClampDestIsInduction = true;
+      AutoClamp = true;
+    } else if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_SRC_IND) {
+      ClampDestIsInduction = false;
+      AutoClamp = true;
     }
   }
   if (ClampDestIsInduction.has_value()) {

@@ -860,8 +860,11 @@
           "SIGNED overshoot beyond a 2^30 margin, so negative inductions and",
           "small legitimate overshoots in multi-exit scan loops are never",
           "touched; unclassifiable loops are left alone entirely.",
-          "0 = off, 1 = active when a Mono runtime is detected (Unity/Mono",
-          "games; default), 2 = active for every process."
+          "0 = off.",
+          "1 (default) = Mono-detected titles only, and only loops in the",
+          "low (< 4GiB) main-executable range — the observed wedge class is",
+          "game-binary text; shared libraries are never instrumented.",
+          "2 = every process, every address (testing/diagnosis)."
         ]
       }
     },
