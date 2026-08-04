@@ -240,6 +240,34 @@ AUTO=2 with no RIPs; spinctl (induction also written by a mov) correctly
 refused; Mono gating holds (no clamp for plain binaries at default 1);
 manual range path unaffected. Commits 7df72dd17 + 5f040bd24.
 
+## 2026-08-04 RimWorld audit → signed margin clamp (ed2b5766c)
+
+Live-session audit of AUTO=1 on RimWorld: 1017 distinct flagged CMPs — 87%
+in UnityPlayer.so native text, 123 in libc/ld.so/libX11, only 6 in libmono,
+**zero** in Mono-JIT anon regions or game-executable text. Game healthy (no
+E-lines, no Mono exceptions, no spin in perf; the paired startup
+`Caught fatal signal` SIGSEGVs are baseline — present identically in the
+pre-feature Player-prev.log). The "Mono gate" is a whole-process gate, not a
+code-region gate — flags land in every library of a Mono title.
+
+Audit found two real classifier holes, both fixed by changing WHAT the auto
+clamp fires on (detection unchanged): auto sites now clamp only on **signed**
+overshoot **> 2^30** past the bound. Negative inductions (unsigned-above for
+their whole legit run) never fire; multi-exit scan loops (a second early-exit
+edge is allowed — Ziggurat's own loop has one) can legitimately overshoot a
+little but never by 1 GiB natively (fault first). All captured wedge RBX
+values (1.3-53 GB past bound=4) clear the margin. Manual ranges keep the
+exact immediate UGT clamp. Detection logging deduped per distinct CMP PC
+(was 86% of the RimWorld log).
+
+Gotcha: when a FEXServer is already running, one-off FEX runs route their
+log lines to it (they appear in the live session's log) — an empty stderr
+under FEX_SILENTLOG=0 is routing, not silence.
+
+Still open (audit item D): the clamp emits Select+store on every execution
+of each flagged compare — ~1000 sites including hot libc loops; worth a
+benchmark A/B before calling the default final.
+
 Intriguing lead for the ROOT CAUSE (from the user's "41 or 43" recollection
 of the FEX arm64 talk): 0x41/0x43 are REX.B / REX.X|REX.B prefixes, and FEX
 has release-note history of REX misapplication; the loop's invariant regs are
