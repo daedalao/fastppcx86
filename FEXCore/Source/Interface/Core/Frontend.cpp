@@ -1151,8 +1151,19 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
   if (CTX->AreMonoHacksActive()) {
     // Unity uses a standard SPSC ringbuffer with cached read/write pointers and thread waiting flags at the following
     // offsets, which are consistent between 32-bit and 64-bit Unity versions from 2015 onwards.
-    auto IsKnownAtomicDisplacement = [](uint64_t Displacement) {
-      return Displacement == 0x80 || Displacement == 0x84 || Displacement == 0xC0 || Displacement == 0xC4;
+    auto IsKnownAtomicDisplacement = [this](uint64_t Displacement) {
+      if (Displacement == 0x80 || Displacement == 0x84 || Displacement == 0xC0 || Displacement == 0xC4) {
+        return true;
+      }
+      // Per-title additions (FEX_FORCETSODISPLACEMENTS): the built-in set is
+      // upstream's ARM64-derived Unity-2015+ layout; older engines place the
+      // same ringbuffer/wait-flag fields at other offsets.
+      for (const uint64_t Extra : CTX->ExtraForceTSODisplacements) {
+        if (Displacement == Extra) {
+          return true;
+        }
+      }
+      return false;
     };
 
     if (DecodeInst->OP == 0x8b && DecodeInst->Src[0].IsGPRIndirect() &&

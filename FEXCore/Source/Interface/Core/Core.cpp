@@ -182,6 +182,31 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
     FEXCore::SMC::CodeGranuleTrackingEnabled.store(true, std::memory_order_release);
   }
 
+  // Per-title atomic-displacement additions (see ForceTSODisplacements in
+  // Config.json.in). Malformed fields are skipped individually — a partial
+  // list is still useful and a typo shouldn't disable the rest.
+  if (const fextl::string Spec = Config.ForceTSODisplacements(); !Spec.empty()) {
+    size_t Pos = 0;
+    while (Pos < Spec.size()) {
+      size_t Comma = Spec.find(',', Pos);
+      if (Comma == Spec.npos) {
+        Comma = Spec.size();
+      }
+      const fextl::string Field {Spec.substr(Pos, Comma - Pos)};
+      char* End {};
+      const uint64_t Value = std::strtoull(Field.c_str(), &End, 0);
+      if (!Field.empty() && *End == '\0') {
+        ExtraForceTSODisplacements.push_back(Value);
+      } else {
+        LogMan::Msg::EFmt("ForceTSODisplacements: skipping unparseable field '{}'", Field);
+      }
+      Pos = Comma + 1;
+    }
+    if (!ExtraForceTSODisplacements.empty()) {
+      LogMan::Msg::IFmt("ForceTSODisplacements: {} extra displacement(s) armed", ExtraForceTSODisplacements.size());
+    }
+  }
+
   // Spin-loop overshoot clamp; see SpinLoopClampInfo in Context.h.
   if (const fextl::string Spec = Config.SpinLoopClamp(); !Spec.empty()) {
     if (ParseSpinLoopClamp(Spec, SpinLoopClamp)) {

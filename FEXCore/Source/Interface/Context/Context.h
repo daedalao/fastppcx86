@@ -378,7 +378,13 @@ public:
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
     FEX_CONFIG_OPT(SpinLoopClamp, SPINLOOPCLAMP);
     FEX_CONFIG_OPT(SpinLoopClampAuto, SPINLOOPCLAMPAUTO);
+    FEX_CONFIG_OPT(ForceTSODisplacements, FORCETSODISPLACEMENTS);
   } Config;
+
+  // Parsed Config.ForceTSODisplacements (see Config.json.in): per-title
+  // additions to the Unity atomic-displacement set the frontend force-orders
+  // under MonoHacks. Small and scanned linearly at decode time only.
+  fextl::vector<uint64_t> ExtraForceTSODisplacements;
 
   // Automatic spin-loop clamp (Decoder::DetectSpinLoops): 0 = off,
   // 1 = when Mono detected (default), 2 = everywhere.

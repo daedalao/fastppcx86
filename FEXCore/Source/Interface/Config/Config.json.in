@@ -848,6 +848,19 @@
           "trips the clamp; empty string disables it."
         ]
       },
+      "ForceTSODisplacements": {
+        "Type": "str",
+        "Default": "",
+        "Desc": [
+          "Extra guest displacements (comma-separated, e.g. 0x70,0x74,0x78)",
+          "added to the built-in Unity-2015+ set (0x80,0x84,0xC0,0xC4) that",
+          "MonoHacks force-orders for plain MOV loads/stores. The built-in",
+          "numbers came from upstream's ARM64 work on Unity's SPSC ringbuffer;",
+          "older engine versions place the same fields at different offsets —",
+          "supply a title's own special numbers here (census table in",
+          "docs/MONO_UNITY_CENSUS.md). Only active when MonoHacks is active."
+        ]
+      },
       "SpinLoopClampAuto": {
         "Type": "uint32",
         "Default": "0",
