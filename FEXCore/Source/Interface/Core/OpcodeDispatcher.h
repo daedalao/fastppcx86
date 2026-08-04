@@ -522,7 +522,7 @@ public:
   // docs/VCMPEQ_FUSION_DESIGN.md. Kept as its own entry point so the fusion
   // only ever gets a lookahead window from the three opcodes that can start it.
   void PCMPEQFusableOp(OpcodeArgs, IR::OpSize ElementSize);
-  bool TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2, Ref CompareResult);
+  bool TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2);
   // The PMOVMSKB lane-mask sequence, factored out of MOVMSKOpOne so the fusion
   // can re-materialise it on the match edge.
   Ref EmitByteLaneMask(Ref Src, IR::OpSize SrcSize);

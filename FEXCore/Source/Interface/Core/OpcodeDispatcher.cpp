@@ -774,8 +774,7 @@ void OpDispatchBuilder::CondJUMPOp(OpcodeArgs) {
 //     where the guest Jcc would have gone.
 // Flags are handled the same way: set from the constant zero before the
 // branch, recomputed from the real mask on the match edge.
-bool OpDispatchBuilder::TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2,
-                                          Ref CompareResult) {
+bool OpDispatchBuilder::TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2) {
   // --- Bail-outs.  Each one is load-bearing; see the design doc. ---
 
   // (1) Escape hatch / A-B switch.
@@ -984,11 +983,25 @@ bool OpDispatchBuilder::TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, I
   SetCurrentCodeBlock(MatchBlock);
   StartNewBlock();
   {
+    // Re-LOAD the PCMPEQ result from the guest XMM rather than reusing the
+    // SSA value defined in the predecessor block.
+    //
+    // This is load-bearing, not stylistic. This block is created with
+    // CreateNewCodeBlockAtEnd() but filled last, so its node IDs sit BEFORE
+    // those of blocks that precede it in the layout. FEX's register allocator
+    // does not tolerate an SSA value whose live range spans that inversion: it
+    // re-used the physical register holding the compare result for this
+    // block's movmaskb constant, and every fused scan returned garbage. The
+    // register cache was flushed by the CondJump, so a LoadRegister here reads
+    // exactly the value PCMPEQ stored, and the value flows through guest
+    // context instead of across an out-of-order block edge.
+    Ref CmpResult = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+
     // PMOVMSKB writes a 32-bit destination, which zero-extends to 64. The mask
     // itself is only 16 bits wide for an XMM source, but go through the same
     // explicit Bfe(0,32) that StoreResult_WithOpSize would have applied rather
     // than relying on EmitByteLaneMask's extraction width.
-    Ref Mask = EmitByteLaneMask(CompareResult, RegisterSize);
+    Ref Mask = EmitByteLaneMask(CmpResult, RegisterSize);
     StoreGPRRegister(MaskGPR.GPR, _Bfe(GPRSize, 32, 0, Mask), GPRSize);
     SetNZP_ZeroCV(OpSize::i32Bit, Mask);
     InvalidateAF();

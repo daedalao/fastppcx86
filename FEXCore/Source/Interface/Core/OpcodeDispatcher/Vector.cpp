@@ -874,7 +874,7 @@ void OpDispatchBuilder::PCMPEQFusableOp(OpcodeArgs, IR::OpSize ElementSize) {
   auto Result = _VCMPEQ(Size, ElementSize, Dest, Src);
   StoreResultFPR(Op, Result);
 
-  TryFuseVectorScan(Op, Size, ElementSize, Dest, Src, Result);
+  TryFuseVectorScan(Op, Size, ElementSize, Dest, Src);
 }
 
 void OpDispatchBuilder::PUNPCKLOp(OpcodeArgs, IR::OpSize ElementSize) {
