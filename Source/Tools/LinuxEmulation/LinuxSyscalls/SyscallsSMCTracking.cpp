@@ -791,6 +791,66 @@ void SyscallHandler::DrainSMCLazyDirtyRange(FEXCore::Core::InternalThreadState* 
   SoftInvalidateLazyPages(this, Thread, Batch);
 }
 
+bool SyscallHandler::ResolveMainExeIdentity() {
+  std::call_once(MainExeIdentityOnce, [this] {
+    FEX_CONFIG_OPT(RootFSPath, ROOTFS);
+    auto ProgramName = FEXCore::Config::Get(FEXCore::Config::CONFIG_APP_FILENAME);
+    if (!ProgramName || ProgramName.value()->c_str()[0] != '/') {
+      return;
+    }
+
+    // Check RootFS first, then the plain path -- same precedence
+    // OpenCodeMapFile uses for the same guest-path/host-path ambiguity.
+    int FD = open((RootFSPath() + ProgramName.value()->c_str()).c_str(), O_RDONLY);
+    if (FD == -1) {
+      FD = open(ProgramName.value()->c_str(), O_RDONLY);
+    }
+    if (FD == -1) {
+      return;
+    }
+
+    struct stat64 st;
+    if (fstat64(FD, &st) == 0) {
+      MainExeDev = st.st_dev;
+      MainExeIno = st.st_ino;
+      MainExeIdentityValid = true;
+    }
+    close(FD);
+  });
+  return MainExeIdentityValid;
+}
+
+void SyscallHandler::MaybeRecordMainExeMapping(uint64_t Dev, uint64_t Ino, uint64_t Base, uint64_t End) {
+  // Same config gate as the mono-library path: no consumer for the range if
+  // MonoHacks isn't configured, so don't pay ResolveMainExeIdentity's open()
+  // cost on the first executable mapping of every process.
+  FEX_CONFIG_OPT(MonoHacksConfig, MONOHACKS);
+  if (!MonoHacksConfig()) {
+    return;
+  }
+
+  if (!ResolveMainExeIdentity() || Dev != MainExeDev || Ino != MainExeIno) {
+    return;
+  }
+
+  // Grow [MainExeBase, MainExeEnd) across the executable's PT_LOAD segments,
+  // exactly like MonoBase/MonoEnd below.  This runs unconditionally (whether
+  // or not a Mono fallback signal ever fires) so the range is fully known by
+  // the time any signal could plausibly arrive.
+  uint64_t OldBase = MainExeBase.load(std::memory_order_relaxed);
+  while (OldBase == 0 || Base < OldBase) {
+    if (MainExeBase.compare_exchange_weak(OldBase, Base, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  uint64_t OldEnd = MainExeEnd.load(std::memory_order_relaxed);
+  while (End > OldEnd) {
+    if (MainExeEnd.compare_exchange_weak(OldEnd, End, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+}
+
 void SyscallHandler::MaybeRecordMonoMapping(std::string_view Path, uint64_t Base, uint64_t End) {
   if (!IsMonoRuntimeLibraryPath(Path)) {
     return;
@@ -801,8 +861,10 @@ void SyscallHandler::MaybeRecordMonoMapping(std::string_view Path, uint64_t Base
   MaybeDetectMonoFromPath(Path);
 
   // If the config gate rejected the hacks there is nothing to hook, so don't
-  // track a range or arm the fault-path check.
-  if (!MonoHacksActive.load(std::memory_order_acquire)) {
+  // track a range or arm the fault-path check.  Likewise, if the static-exe
+  // fallback already armed a range, never move it -- the dynamic path and
+  // the fallback path are mutually exclusive owners of [MonoBase, MonoEnd).
+  if (!MonoHacksActive.load(std::memory_order_acquire) || MonoFallbackArmed.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -1471,6 +1533,13 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
     // because it also gives us [MonoBase, MonoEnd).
     if (PathLength != -1 && ProtMapping.Executable) {
       MaybeRecordMonoMapping(std::string_view(Tmp, PathLength), addr, addr + Size);
+
+      // Independently record the main executable's own mapped range -- see
+      // MaybeDetectMonoFallbackFromPath for why: MonoKickstart-style titles
+      // statically link mono into the executable itself, so this is the
+      // range that gets registered as the backpatcher range if a fallback
+      // signal (mono data-file open, or FEX_FORCE_MONO_DETECT) ever fires.
+      MaybeRecordMainExeMapping(buf.st_dev, buf.st_ino, addr, addr + Size);
     }
 
     // Only handle FDs that are backed by regular files that are executable

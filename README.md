@@ -149,6 +149,18 @@ are off by default and must be opted into (globally or per-app).
 | `SMCMprotectDefer` | bool (false) | **Fork** | Treats a guest `mprotect` that removes `PROT_EXEC` (but adds write) from a tracked page as the real invalidation point rather than invalidating immediately: the page is marked deferred-dirty and left unprotected so guest writes run at full speed, with invalidation actually applied when/if the guest mprotects it back to `PROT_EXEC`. Only sound because the guest cannot execute code through the intermediate non-exec mapping; a W+X mprotect keeps legacy (immediate) behavior. |
 | `MonoHacks` | bool (true) | | Upstream option enabling a hook-based SMC approach and smaller JIT blocks specifically for Mono-hosted guests; several of this fork's SMC mechanisms (e.g. `LockOnlyTSO`'s forced-TSO ranges) key off it. |
 
+`MonoHacks`' dynamic-library detection (`libmono*.so`/`libmonobdwgc-2.0.so`/etc.) never fires for a
+statically-linked Mono runtime (MonoKickstart, the scheme Stardew Valley-class titles use to bundle
+mono directly into the game executable). Two raw environment variables — **not** part of the
+`FEX_<Name>` config-layering system above, so no JSON-config equivalent — extend detection to that
+case by registering the main executable's own mapped range as the backpatcher range instead of a
+library's:
+
+| Variable | Default | Fork? | Description |
+|---|---|---|---|
+| `FEX_MONO_DETECT` | on (`1`) | **Fork** | Set to `0` to disable the statically-linked-Mono fallback: watching guest `open`/`openat`/`openat2` calls for a path ending in `/mscorlib.dll` or `/machine.config` (mono's own canonical data files) and, on the first match, treating the main executable as the mono runtime. Does not affect dynamic `libmono*.so` detection. |
+| `FEX_FORCE_MONO_DETECT` | off | **Fork** | Set to `1` to unconditionally treat the main executable as the mono runtime from the first guest syscall on, bypassing both the dynamic-library and data-file signals — for experiments where neither is reachable. |
+
 ### Concurrency diagnostics — fork-specific
 
 | Flag | Type (default) | Fork? | Description |

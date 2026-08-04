@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <sys/types.h>
 
 namespace FEX::HLE::ThreadCensus {
@@ -69,6 +70,14 @@ void OnSetAffinity(int64_t TargetTID, const uint8_t* Mask, size_t MaskBytes, int
 // One rung of the Feature-2 degradation ladder. Value is a priority for the
 // "rr" step and a nice level for the "nice" steps.
 void OnSchedBoost(int64_t TargetTID, const char* Step, int Policy, int Value, int64_t HostResult, int64_t GuestResult);
+
+// The statically-linked ("MonoKickstart") Mono fallback armed the
+// backpatcher range from the main executable's own mapping instead of a
+// dynamic libmono*.so. Reason is the signal that triggered it ("mono data
+// file open" or "FEX_FORCE_MONO_DETECT"); Detail is the triggering path (or
+// "main executable" for the force case). [Base, End) is the range that got
+// registered.
+void OnMonoFallbackArmed(std::string_view Reason, std::string_view Detail, uint64_t Base, uint64_t End);
 
 } // namespace FEX::HLE::ThreadCensus
 

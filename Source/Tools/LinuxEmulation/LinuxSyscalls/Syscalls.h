@@ -645,8 +645,68 @@ public:
   // Returns true if the basename of Path is a known Mono runtime library.
   static bool IsMonoRuntimeLibraryPath(std::string_view Path);
 
+  // Statically-linked Mono fallback (MonoKickstart / Stardew-Valley class
+  // games): the mono runtime is compiled directly into the main executable,
+  // so no libmono*.so is ever opened and IsMonoRuntimeLibraryPath never
+  // matches.  Two independent signals substitute for the dynamic-library
+  // open:
+  //   - the guest opening one of mono's own data files (mscorlib.dll,
+  //     machine.config) -- called from the openat/openat2 handlers exactly
+  //     like MaybeDetectMonoFromPath;
+  //   - FEX_FORCE_MONO_DETECT=1, an unconditional override for experiments.
+  // Either one arms [MonoBase, MonoEnd) from the main executable's own
+  // mapped (executable) range instead of a runtime library's, since that's
+  // where the statically-linked mono code -- and its XCHG backpatcher --
+  // actually lives.  FEX_MONO_DETECT=0 disables just the path-signal half of
+  // this (dynamic libmono*.so detection via MaybeDetectMonoFromPath is
+  // unaffected either way).
+  void MaybeDetectMonoFallbackFromPath(std::string_view pathname);
+
+  // Returns true if the basename of Path is one of mono's canonical data
+  // files (mscorlib.dll, machine.config) at a path component boundary --
+  // i.e. the path ends with "/mscorlib.dll" or "/machine.config", not
+  // merely contains those names as a substring.
+  static bool IsMonoDataFilePath(std::string_view Path);
+
 private:
+  // Records the main executable's own mapped executable range into
+  // [MainExeBase, MainExeEnd), growing across its PT_LOAD segments.  Called
+  // unconditionally from TrackMmap (gated only by MonoHacksConfig, since we
+  // don't yet know whether a fallback signal will ever fire) so the range is
+  // fully known well before the guest can issue its first syscall -- the
+  // main ELF finishes loading before Execute() ever runs guest code.
+  void MaybeRecordMainExeMapping(uint64_t Dev, uint64_t Ino, uint64_t Base, uint64_t End);
+
+  // Resolves (once) the (dev, ino) identity of the main executable the same
+  // way OpenCodeMapFile does: RootFS-prefixed path first, falling back to
+  // the bare path.  Returns false if neither could be stat()'d.
+  bool ResolveMainExeIdentity();
+
+  // Common one-shot arm: claims [MonoBase, MonoEnd) from [MainExeBase,
+  // MainExeEnd) the first time any fallback signal fires, applies the same
+  // Multiblock/MaxInst gate as MaybeDetectMonoFromPath, and -- on success --
+  // calls CTX->MarkMonoDetected() and flips MonoHacksActive /
+  // MonoBackpatcherDetectionPending exactly like the dynamic-library path.
+  // A no-op if dynamic-library detection (or a previous fallback call) has
+  // already armed a range: MonoFallbackArmed and MonoHacksActive are both
+  // checked so the range, once set, is never moved or re-registered.
+  void ArmMonoFallbackRange(std::string_view Reason, std::string_view Detail);
+
+  // Checks FEX_FORCE_MONO_DETECT and, if set, arms the fallback range
+  // unconditionally (no path signal required).  Called from the same
+  // openat/openat2 hook points as the path-based fallback so it fires at
+  // the first guest syscall -- by which point the main executable is fully
+  // mapped.  Idempotent: MonoFallbackArmed short-circuits every call after
+  // the first.
+  void MaybeForceMonoDetect();
+
   std::atomic<bool> MonoDetectionComplete {false};
+
+  // Same short-circuit as MonoDetectionComplete, but for
+  // MaybeDetectMonoFallbackFromPath.  Kept separate from
+  // MonoDetectionComplete because the two paths can finish in either order
+  // (or not at all, independently of each other).
+  std::atomic<bool> MonoFallbackDetectionComplete {false};
 
   // True once MarkMonoDetected has actually fired (i.e. mono was seen *and* the
   // Multiblock/MaxInst gate passed).  Lets the mmap path avoid tracking a range
@@ -665,6 +725,28 @@ private:
   // Set by DisableSMCDetectionLocked.  Once set, MarkGuestExecutableRange stops
   // write-protecting VMAs that are both writable and executable.
   std::atomic<bool> SMCDetectionDisabled {false};
+
+  ///// Statically-linked ("MonoKickstart") Mono fallback /////
+
+  // Guest code range of the main executable's own mapped executable PT_LOAD
+  // segment(s), grown the same way as MonoBase/MonoEnd.  Populated
+  // unconditionally by MaybeRecordMainExeMapping; independent of whether a
+  // fallback signal ever fires.
+  std::atomic<uint64_t> MainExeBase {0};
+  std::atomic<uint64_t> MainExeEnd {0};
+
+  // One-shot: true once ArmMonoFallbackRange has claimed [MonoBase, MonoEnd)
+  // from [MainExeBase, MainExeEnd).  Guards the range from ever being
+  // re-armed or moved once set, and stops MaybeRecordMonoMapping's dynamic
+  // path from clobbering a fallback-armed range if a libmono*.so somehow
+  // gets opened afterwards.
+  std::atomic<bool> MonoFallbackArmed {false};
+
+  // Guards lazy resolution of the main executable's (dev, ino) identity.
+  std::once_flag MainExeIdentityOnce;
+  bool MainExeIdentityValid {false};
+  uint64_t MainExeDev {};
+  uint64_t MainExeIno {};
 
 private:
   FEX::HLE::SignalDelegator* SignalDelegation;

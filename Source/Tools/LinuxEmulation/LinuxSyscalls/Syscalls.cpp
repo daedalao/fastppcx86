@@ -1573,4 +1573,146 @@ void SyscallHandler::MaybeDetectMonoFromPath(std::string_view pathname) {
   }
 }
 
+namespace {
+// FEX_MONO_DETECT: gates the statically-linked-Mono fallback signal (mono
+// data-file opens -- mscorlib.dll / machine.config).  Default on.  Dynamic
+// libmono*.so detection (MaybeDetectMonoFromPath / IsMonoRuntimeLibraryPath)
+// is unaffected either way -- this only controls the *fallback*.
+bool MonoDetectFallbackEnabled() {
+  static const bool Enabled = [] {
+    const char* p = getenv("FEX_MONO_DETECT");
+    return !p || strtol(p, nullptr, 10) != 0;
+  }();
+  return Enabled;
+}
+
+// FEX_FORCE_MONO_DETECT: unconditionally treats the main executable as the
+// mono runtime, bypassing both the dynamic-library and data-file signals.
+// For experiments where neither signal is reachable -- default off.
+bool ForceMonoDetectRequested() {
+  static const bool Forced = [] {
+    const char* p = getenv("FEX_FORCE_MONO_DETECT");
+    return p && strtol(p, nullptr, 10) != 0;
+  }();
+  return Forced;
+}
+} // namespace
+
+bool SyscallHandler::IsMonoDataFilePath(std::string_view Path) {
+  // Require the match to land on a path-component boundary -- either the
+  // whole path is the name, or the character immediately before it is '/'.
+  // This is what keeps e.g. "custommscorlib.dll" from matching.
+  auto EndsWithComponent = [](std::string_view P, std::string_view Name) {
+    if (P.size() < Name.size() || !P.ends_with(Name)) {
+      return false;
+    }
+    return P.size() == Name.size() || P[P.size() - Name.size() - 1] == '/';
+  };
+  return EndsWithComponent(Path, "mscorlib.dll") || EndsWithComponent(Path, "machine.config");
+}
+
+void SyscallHandler::ArmMonoFallbackRange(std::string_view Reason, std::string_view Detail) {
+  // Dynamic-library detection (or an earlier fallback call) already owns a
+  // range -- never move or re-register it.
+  if (MonoHacksActive.load(std::memory_order_acquire) || MonoFallbackArmed.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  FEX_CONFIG_OPT(MonoHacksConfig, MONOHACKS);
+  if (!MonoHacksConfig()) {
+    return;
+  }
+
+  const uint64_t Base = MainExeBase.load(std::memory_order_relaxed);
+  const uint64_t End = MainExeEnd.load(std::memory_order_relaxed);
+  if (Base == 0 || End <= Base) {
+    // The main executable's own range isn't known yet.  This can't happen
+    // once the guest has started running (the main ELF finishes loading
+    // before Execute() ever runs guest code), but bail defensively rather
+    // than arming a bogus [0, 0) range; a later call can retry.
+    return;
+  }
+
+  // Same Multiblock/MaxInst gate MaybeDetectMonoFromPath applies to the
+  // dynamic-library path -- the backpatcher scheme assumes every SMC site
+  // is hookable inside a single recompiled block.
+  FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
+  FEX_CONFIG_OPT(MaxInst, MAXINST);
+  if (!Multiblock() || MaxInst() < 500) {
+    if (!MonoFallbackArmed.exchange(true, std::memory_order_acq_rel)) {
+      LogMan::Msg::IFmt("Mono runtime inferred from {} ('{}') but NOT applying mono hacks: "
+                        "Multiblock with MaxInst >= 500 required (Multiblock={}, MaxInst={}).",
+                        Reason, Detail, Multiblock(), MaxInst());
+    }
+    return;
+  }
+
+  // Claim the one-shot.  Whoever wins this is the only caller that mutates
+  // MonoBase/MonoEnd/MonoHacksActive/MonoBackpatcherDetectionPending; the
+  // range is immutable from here on.
+  bool expected = false;
+  if (!MonoFallbackArmed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  MonoBase.store(Base, std::memory_order_relaxed);
+  MonoEnd.store(End, std::memory_order_relaxed);
+  LogMan::Msg::IFmt("Mono runtime inferred from {} ('{}') — assuming a statically-linked runtime "
+                    "and registering the main executable's own range {:#x}-{:#x} as the backpatcher "
+                    "range (watching for the XCHG backpatcher block).",
+                    Reason, Detail, Base, End);
+  if (FEX::HLE::ThreadCensus::Enabled()) {
+    FEX::HLE::ThreadCensus::OnMonoFallbackArmed(Reason, Detail, Base, End);
+  }
+  CTX->MarkMonoDetected();
+  MonoHacksActive.store(true, std::memory_order_release);
+  MonoBackpatcherDetectionPending.store(true, std::memory_order_release);
+}
+
+void SyscallHandler::MaybeForceMonoDetect() {
+  if (MonoFallbackArmed.load(std::memory_order_acquire) || MonoHacksActive.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!ForceMonoDetectRequested()) {
+    return;
+  }
+  ArmMonoFallbackRange("FEX_FORCE_MONO_DETECT", "main executable");
+}
+
+void SyscallHandler::MaybeDetectMonoFallbackFromPath(std::string_view pathname) {
+  // Cheap relaxed gate: false for every process that isn't mono (or has
+  // MonoHacks configured off), and for every call after we're done looking.
+  if (MonoFallbackDetectionComplete.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  FEX_CONFIG_OPT(MonoHacksConfig, MONOHACKS);
+  if (!MonoHacksConfig()) {
+    MonoFallbackDetectionComplete.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  // Dynamic-library detection already gives us a range; nothing left for the
+  // fallback to do once that's happened.
+  if (MonoHacksActive.load(std::memory_order_acquire)) {
+    MonoFallbackDetectionComplete.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  // FEX_FORCE_MONO_DETECT is checked unconditionally (independent of
+  // FEX_MONO_DETECT, which only gates the path-signal half below) on every
+  // openat/openat2 call until something arms the range -- by the first
+  // guest syscall the main executable is already fully mapped, so this
+  // effectively fires "at startup" from the guest's perspective.
+  MaybeForceMonoDetect();
+
+  if (!MonoHacksActive.load(std::memory_order_acquire) && MonoDetectFallbackEnabled() && IsMonoDataFilePath(pathname)) {
+    ArmMonoFallbackRange("mono data file open", pathname);
+  }
+
+  if (MonoHacksActive.load(std::memory_order_acquire)) {
+    MonoFallbackDetectionComplete.store(true, std::memory_order_relaxed);
+  }
+}
+
 } // namespace FEX::HLE

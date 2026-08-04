@@ -42,6 +42,7 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL(open, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, int flags, uint32_t mode) -> uint64_t {
     flags = FEX::HLE::RemapFromX86Flags(flags);
+    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Open(pathname, flags, mode);
     SYSCALL_ERRNO();
   });
@@ -90,6 +91,7 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(openat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfs, const char* pathname, int flags, uint32_t mode) -> uint64_t {
     flags = FEX::HLE::RemapFromX86Flags(flags);
     FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(pathname);
+    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat(dirfs, pathname, flags, mode);
     SYSCALL_ERRNO();
   });
@@ -117,6 +119,7 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
 
       HostHow.flags = FEX::HLE::RemapFromX86Flags(HostHow.flags);
       FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(pathname);
+      FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
       uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat2(dirfs, pathname, &HostHow, HostSize);
       SYSCALL_ERRNO();
     });

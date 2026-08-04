@@ -220,6 +220,15 @@ void OnSchedBoost(int64_t TargetTID, const char* Step, int Policy, int Value, in
            HostResult, GuestResult);
 }
 
+void OnMonoFallbackArmed(std::string_view Reason, std::string_view Detail, uint64_t Base, uint64_t End) {
+  if (!Enabled()) {
+    return;
+  }
+
+  EmitLine(static_cast<int64_t>(FHU::Syscalls::gettid()), "mono_fallback_armed", " reason={} detail={} base={:#x} end={:#x}", Reason,
+           Detail, Base, End);
+}
+
 } // namespace FEX::HLE::ThreadCensus
 
 namespace FEX::HLE::SchedPassthrough {
