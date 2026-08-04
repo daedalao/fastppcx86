@@ -36,6 +36,27 @@ detection.
   stationary; zero signals to spinners; futex-wait crowd. Clamp
   inapplicable. Next tool: FEX_FUTEX_TRACE. Root fix: OPEN.
 
+## Special numbers — collected per title, analyzed for a pattern
+
+The working theory (user): each wedge reduces to a specific site waiting
+for a specific value — find every title's numbers, then look for the
+pattern across engine versions instead of generalizing structurally.
+
+| title | engine version | site (guest RIP) | wants | object/field | notes |
+|---|---|---|---|---|---|
+| ziggurat | Unity 4.x-era (2014, static player) | cmp @ 0x934d27 (loop 0x934d04-0x934d33, block 0x934a40) | RBX == 4 (R15) | loop bound in register, element count | value arrives via r15←r12; corruption class A |
+| hardwest | Unity 5.x-era | cmpxchg spin @ 0x84adb2 / head 0x84ad50 | [obj+0x70] == 1 | sync object @ heap 0x1f3a220: flag +0x70, waiters +0x74, +0x78==1 | flag never written — class B; compare upstream's displacement set below |
+| (upstream reference) | Unity 2015+ | n/a (decode-time hack) | force-TSO loads/stores | SPSC ringbuffer: cached ptrs/wait flags @ +0x80/+0x84/+0xC0/+0xC4 | Frontend.cpp IsKnownAtomicDisplacement — the prototype "special numbers" fix |
+| shadowrunhk | Unity 4.x/5.x | (agent in flight) | | | |
+
+Pattern candidates to test as rows accumulate: (1) the displacement set
+drifts by Unity major version (0x70/74/78 ↔ 0x80/84/C0/C4?) — if Hard
+West's offsets are the pre-2015 layout of the SAME object, widening
+IsKnownAtomicDisplacement per-version is the upstream-shaped fix for
+class B; (2) class A's "wants" are small loop bounds fed through a
+register shuffle — the special number is the bound register's value at
+entry, and the corruption window is the shuffle between xor and jmp.
+
 ## Census
 
 | title | engine | run date | verdict | evidence |
