@@ -112,9 +112,36 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
     auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
 
+    // Unprotect callback: mprotect(R+W) on the faulting page so the guest
+    // store can complete on re-entry. Failure is fatal — if we return
+    // without lifting the write-protect, sigreturn re-executes the same
+    // faulting store, re-enters the SMC handler, retries the mprotect,
+    // fails again, and loops until the alt-stack overflows. That is a
+    // silent hang today (LogMan::Throw::AFmt is compiled out in Release,
+    // per LogManager.h:69-74). Die loudly with a Release-live trap.
+    //
+    // A per-thread consecutive-identical-fault counter guards
+    // cause-agnostically: if the SAME faulting address enters the SMC
+    // handler more than a small threshold in a row, the process is stuck
+    // in the sigreturn loop above regardless of which mprotect leg failed.
+    // Kept thread-local so a legitimate hot page written by two threads
+    // does not trip it.
+    static thread_local uintptr_t LastFaultAddress = 0;
+    static thread_local unsigned LastFaultRepeat = 0;
+    if (FaultAddress == LastFaultAddress) {
+      if (++LastFaultRepeat >= 8) {
+        ERROR_AND_DIE_FMT("SMC handler entered {} consecutive times at addr={:#x}; sigreturn loop, aborting", LastFaultRepeat, FaultAddress);
+      }
+    } else {
+      LastFaultAddress = FaultAddress;
+      LastFaultRepeat = 1;
+    }
     auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
       auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
-      LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
+      if (rv != 0) {
+        ERROR_AND_DIE_FMT("SMC unprotect: mprotect({:#x}, {:#x}, R+W) failed errno={}; guest store cannot progress, sigreturn would re-fault forever", Start,
+                          Length, errno);
+      }
     };
 
     if (Entry->second.Flags.Shared) {
@@ -226,10 +253,24 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
               const auto MirroredBase = std::max(VMAOffsetBase, OffsetBase);
               const auto MirroredSize = std::min(OffsetTop, VMAOffsetTop) - MirroredBase;
 
-              auto rv = mprotect((void*)(MirroredBase - VMAOffsetBase + VMABase), MirroredSize, PROT_READ);
-              SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(),
-                        MirroredBase - VMAOffsetBase + VMABase, MirroredSize);
-              LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", MirroredBase, MirroredSize);
+              const uintptr_t MirroredAbsBase = MirroredBase - VMAOffsetBase + VMABase;
+              auto rv = mprotect((void*)MirroredAbsBase, MirroredSize, PROT_READ);
+              SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(), MirroredAbsBase, MirroredSize);
+              if (rv != 0) {
+                // Protect failure — realistic trigger is ENOMEM from
+                // vm.max_map_count (65530) under the VMA fragmentation that
+                // large SMC-heavy sessions produce. Do NOT abort (that would
+                // break mseal'd guests). Log EFmt (Release-live) once, and
+                // hard-invalidate any translations FEX has for this range
+                // so a subsequent execution goes through the normal
+                // fault-invalidate re-compile path rather than executing
+                // stale bytes. Coverage on this specific range is degraded
+                // (no write-protection to catch further modifications)
+                // until the next MarkGuestExecutableRange succeeds.
+                LogMan::Msg::EFmt("SMC PROTECT-mirror mprotect({:#x}, {:#x}, R) failed errno={}; hard-invalidating and continuing without coverage",
+                                  MirroredAbsBase, MirroredSize, errno);
+                InvalidateCodeRangeIfNecessary(Thread, MirroredAbsBase, MirroredSize);
+              }
             }
           } while ((VMA = VMA->ResourceNextVMA));
 
@@ -248,7 +289,19 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
 
           SMC_AUDIT("[%d] mark PROTECT base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
-          LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
+          if (rv != 0) {
+            // See the PROTECT-mirror site above — same reasoning. Realistic
+            // trigger is ENOMEM from vm.max_map_count under fragmentation.
+            // Do NOT abort (mseal). Log EFmt (Release-live) and hard-
+            // invalidate any translations FEX has for this range so the
+            // guest goes through the fault-invalidate re-compile path
+            // rather than executing stale bytes. Coverage on this specific
+            // range is degraded until the next MarkGuestExecutableRange
+            // succeeds.
+            LogMan::Msg::EFmt("SMC PROTECT mprotect({:#x}, {:#x}, R) failed errno={}; hard-invalidating and continuing without coverage", ProtectBase,
+                              ProtectSize, errno);
+            InvalidateCodeRangeIfNecessary(Thread, ProtectBase, ProtectSize);
+          }
         } else {
           SMC_AUDIT("[%d] mark SKIP base=%lx size=%lx shared=%d writable=%d\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize,
                     Mapping->second.Flags.Shared ? 1 : 0, Mapping->second.Prot.Writable ? 1 : 0);
