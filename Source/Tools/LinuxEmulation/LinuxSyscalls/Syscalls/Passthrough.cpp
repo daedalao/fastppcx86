@@ -417,7 +417,7 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
     static const bool Passthru = (getenv("FEX_FUTEX_EINTR_PASSTHRU") != nullptr);
     if (!Passthru && Restartable) {
       while (static_cast<int64_t>(result) == -EINTR) {
-        auto* TSO = FEX::HLE::ThreadStateObject::GetStateObjectFromCPUState(Frame);
+        auto* TSO = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
         if (!TSO->SignalInfo.DeferredSignalFrames.empty() ||
             (~TSO->SignalInfo.CurrentSignalMask.Val & TSO->SignalInfo.PendingSignals) != 0) {
           break; // real guest signal to deliver; EINTR is load-bearing
