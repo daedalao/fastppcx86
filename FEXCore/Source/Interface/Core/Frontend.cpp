@@ -1783,6 +1783,68 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   if (CTX->IsSpinLoopClampAutoActive()) {
     DetectSpinLoops();
   }
+
+  // FEX_DECODEDUMP=0xBEGIN-0xEND: one-shot log (per distinct PC) of FEX's
+  // OWN decoded view of guest instructions in the range — mnemonic, operand
+  // shape, REX flags. Root-cause tooling for the finalize-spin RBX-init hunt
+  // (docs/ZIGGURAT_FINALIZE_SPIN.md): shows which instruction FEX believes
+  // initializes the induction register and how its registers decoded. The
+  // guest binary itself is never dumped, only FEX's interpretation.
+  static const auto DecodeDump = []() -> std::pair<uint64_t, uint64_t> {
+    const char* Env = getenv("FEX_DECODEDUMP");
+    if (!Env) {
+      return {0, 0};
+    }
+    char* End {};
+    const uint64_t Begin = std::strtoull(Env, &End, 0);
+    if (*End != '-') {
+      return {0, 0};
+    }
+    return {Begin, std::strtoull(End + 1, nullptr, 0)};
+  }();
+  if (DecodeDump.second) {
+    static std::mutex DumpMutex;
+    static fextl::set<uint64_t> DumpedPCs;
+    auto Describe = [](const X86Tables::DecodedOperand& Operand) -> fextl::string {
+      if (Operand.IsNone()) {
+        return "-";
+      }
+      if (Operand.IsGPR()) {
+        return fextl::fmt::format("g{}{}", Operand.Data.GPR.GPR, Operand.Data.GPR.HighBits ? "h" : "");
+      }
+      if (Operand.IsGPRIndirect()) {
+        return fextl::fmt::format("[g{}{:+#x}]", Operand.Data.GPRIndirect.GPR, Operand.Data.GPRIndirect.Displacement);
+      }
+      if (Operand.IsLiteral()) {
+        return fextl::fmt::format("#{:#x}", Operand.Data.Literal.Value);
+      }
+      if (Operand.IsSIB()) {
+        return fextl::fmt::format("[b{}+i{}*{}{:+#x}]", Operand.Data.SIB.Base, Operand.Data.SIB.Index, Operand.Data.SIB.Scale,
+                                  Operand.Data.SIB.Offset);
+      }
+      return "?";
+    };
+    for (auto& Block : BlockInfo.Blocks) {
+      for (uint64_t i = 0; i < Block.NumInstructions; ++i) {
+        const auto* Inst = &Block.DecodedInstructions[i];
+        if (!Inst->TableInfo || Inst->PC < DecodeDump.first || Inst->PC >= DecodeDump.second) {
+          continue;
+        }
+        {
+          std::lock_guard lk {DumpMutex};
+          if (!DumpedPCs.insert(Inst->PC).second) {
+            continue;
+          }
+        }
+        const uint32_t F = Inst->Flags;
+        LogMan::Msg::IFmt("DecodeDump: 0x{:x} sz{} {} dst={} src0={} src1={} rex{}{}{}{}{}", Inst->PC, Inst->InstSize,
+                          Inst->TableInfo->Name ?: "?", Describe(Inst->Dest), Describe(Inst->Src[0]), Describe(Inst->Src[1]),
+                          (F & DecodeFlags::FLAG_REX_PREFIX) ? "P" : "", (F & DecodeFlags::FLAG_REX_WIDENING) ? "W" : "",
+                          (F & DecodeFlags::FLAG_REX_XGPR_R) ? "R" : "", (F & DecodeFlags::FLAG_REX_XGPR_X) ? "X" : "",
+                          (F & DecodeFlags::FLAG_REX_XGPR_B) ? "B" : "");
+      }
+    }
+  }
 }
 
 void Decoder::DetectSpinLoops() {

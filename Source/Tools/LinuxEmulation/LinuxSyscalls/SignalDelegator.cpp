@@ -491,6 +491,37 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+
+  // Root-cause tripwire for the Ziggurat finalize spin (docs/
+  // ZIGGURAT_FINALIZE_SPIN.md): FEX_SIGRIPWATCH=0xBEGIN-0xEND logs every
+  // in-JIT signal delivery whose RECONSTRUCTED guest RIP lands in the range,
+  // with the host PC and the loop's registers. The suspicion is a resume
+  // landing on the wrong instruction boundary so the induction-register init
+  // is skipped — this catches the reconstruction in the act, with the
+  // register values needed to judge whether they are consistent with the
+  // claimed RIP.
+  static const auto SigRIPWatch = []() -> std::pair<uint64_t, uint64_t> {
+    const char* Env = getenv("FEX_SIGRIPWATCH");
+    if (!Env) {
+      return {0, 0};
+    }
+    char* End {};
+    const uint64_t Begin = std::strtoull(Env, &End, 0);
+    if (*End != '-') {
+      return {0, 0};
+    }
+    return {Begin, std::strtoull(End + 1, nullptr, 0)};
+  }();
+  if (SigRIPWatch.second) {
+    const uint64_t RIP = Thread->CurrentFrame->State.rip;
+    if (RIP >= SigRIPWatch.first && RIP < SigRIPWatch.second) {
+      const auto& G = Thread->CurrentFrame->State.gregs;
+      LogMan::Msg::IFmt("SigRIPWatch: tid {} host pc 0x{:x} -> guest rip 0x{:x} RBX=0x{:x} R12=0x{:x} R14=0x{:x} R15=0x{:x}",
+                        FHU::Syscalls::gettid(), reinterpret_cast<uint64_t>(ArchHelpers::Context::GetPc(ucontext)), RIP,
+                        G[FEXCore::X86State::REG_RBX], G[FEXCore::X86State::REG_R12], G[FEXCore::X86State::REG_R14],
+                        G[FEXCore::X86State::REG_R15]);
+    }
+  }
 #endif
 }
 
