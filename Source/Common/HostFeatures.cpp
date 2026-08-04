@@ -721,6 +721,13 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     const unsigned long HWCAP2 = getauxval(AT_HWCAP2);
     HostFeatures.SupportsISA30 = (HWCAP2 & PPC_FEATURE2_ARCH_3_00_) != 0;
 
+    // Record-form VMX integer compares (vcmpequ{b,h,w}.) are Power ISA 2.03
+    // era -- available on every 64-bit POWER part FEX can run on, so this is
+    // unconditionally true here rather than probed. It is a *backend
+    // capability* flag, not a CPU feature: it says the PPC64LE JIT knows how
+    // to lower a vector-compare CondJump. Left false everywhere else.
+    HostFeatures.SupportsVCmpFlagBranch = true;
+
     // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
     if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
       HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);

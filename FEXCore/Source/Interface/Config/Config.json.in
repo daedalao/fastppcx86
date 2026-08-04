@@ -591,6 +591,22 @@
           "falls back to the normal path. Off: no effect."
         ]
       },
+      "VCmpFusion": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "Fuse the glibc vector-scan idiom -- pcmpeq{b,w,d} ; pmovmskb ;",
+          "test r32,r32 ; jz/jnz -- into a single conditional branch driven by",
+          "a record-form vector compare, so the lane mask never crosses from",
+          "the vector unit to a GPR on the loop back edge. This is the inner",
+          "loop of strlen/strchr/strcmp/memchr and friends. Only forms when the",
+          "backend advertises HostFeatures.SupportsVCmpFlagBranch (ppc64le).",
+          "The elided PMOVMSKB destination is still architecturally correct on",
+          "both edges: it is provably zero on the no-match edge, and is",
+          "recomputed on the match edge. Set to 0 as an escape hatch and to A/B",
+          "the win with a single variable changed."
+        ]
+      },
       "SMCStoreBackpatch": {
         "Type": "bool",
         "Default": "false",

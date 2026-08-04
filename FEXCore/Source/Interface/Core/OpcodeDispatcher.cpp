@@ -746,6 +746,267 @@ void OpDispatchBuilder::CondJUMPOp(OpcodeArgs) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// glibc vector-scan fusion.  Full rationale, rejected alternatives and the
+// soundness argument live in docs/VCMPEQ_FUSION_DESIGN.md; this comment only
+// records what the code does.
+//
+// Matches, as four CONTIGUOUS instructions in one decoded block:
+//
+//     pcmpeq{b,w,d} %xmmB, %xmmA      <- we are dispatching this one
+//     pmovmskb      %xmmA, %r32
+//     test          %r32, %r32
+//     jz/jnz        rel               <- necessarily the block's last insn
+//
+// and replaces the last three with a single conditional branch whose condition
+// comes straight out of a record-form vector compare (PPC64LE: vcmpequb. ->
+// CR6 -> bc).  The lane mask never reaches a GPR on the loop back edge, which
+// is the whole point: on POWER8 materialising it costs a ~10-op vector
+// reduction plus a VSU->FXU transfer, and it sits in the loop-carried
+// dependency of the branch.
+//
+// The elided PMOVMSKB destination stays architecturally correct:
+//   * the "no lane matched" edge is reached exactly when the mask is ZERO --
+//     that is literally what `test`/`jz` proved -- so a constant store before
+//     the branch suffices, and costs nothing on the hot edge;
+//   * the "some lane matched" edge gets a synthesised block that recomputes
+//     the real mask from the PCMPEQ result (which we still emit) before going
+//     where the guest Jcc would have gone.
+// Flags are handled the same way: set from the constant zero before the
+// branch, recomputed from the real mask on the match edge.
+bool OpDispatchBuilder::TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2,
+                                          Ref CompareResult) {
+  // --- Bail-outs.  Each one is load-bearing; see the design doc. ---
+
+  // (1) Escape hatch / A-B switch.
+  if (!VCmpFusion()) {
+    return false;
+  }
+
+  // (2) The backend must know how to lower a vector-compare CondJump. Only
+  //     PPC64LE advertises this.
+  if (!CTX->HostFeatures.SupportsVCmpFlagBranch) {
+    return false;
+  }
+
+  // (3) GenerateIR withholds the lookahead window whenever swallowing
+  //     instructions would be wrong (CONFIG_SMC_FULL / ForceFullSMCDetection,
+  //     which emits a per-instruction ValidateCode guard, and extended debug
+  //     info / IR dumping, which wants a _GuestOpcode marker per instruction).
+  if (!DecodeWindowBlock) {
+    return false;
+  }
+
+  // (4) 64-bit guests only. The 32-bit branch-target computation wraps at 4GB
+  //     (see CondJUMPOp) and this path would have to duplicate that; the
+  //     idiom's payoff is in x86-64 glibc, so it is simply not worth the
+  //     second, differently-tested arithmetic path.
+  if (!Is64BitMode) {
+    return false;
+  }
+
+  // (5) 128-bit XMM only. This rejects the MMX form of PCMPEQ/PMOVMSKB (which
+  //     shares MOVMSKOpOne) and the 256-bit AVX form, whose fused shape needs
+  //     an extra vector OR -- see the design doc's "Extending to AVX".
+  if (RegisterSize != OpSize::i128Bit) {
+    return false;
+  }
+
+  // (6) The PCMPEQ destination must be a register: the mask is derived from it
+  //     and we need to name it when matching the PMOVMSKB source.
+  if (!Op->Dest.IsGPR()) {
+    return false;
+  }
+
+  const auto& Block = *DecodeWindowBlock;
+  const size_t Index = DecodeWindowIndex;
+
+  // (7) The window must actually be pointing at us. Cheap self-check against
+  //     GenerateIR and the dispatcher drifting out of step.
+  if (Index >= Block.NumInstructions || &Block.DecodedInstructions[Index] != Op) {
+    return false;
+  }
+
+  // (8) Three more instructions have to exist in THIS block. Blocks end at
+  //     branches, so a window that runs off the end means the idiom was split
+  //     across blocks and there is nothing to fuse.
+  if (Index + 3 >= Block.NumInstructions) {
+    return false;
+  }
+
+  const auto& MovMsk = Block.DecodedInstructions[Index + 1];
+  const auto& Test = Block.DecodedInstructions[Index + 2];
+  const auto& Jcc = Block.DecodedInstructions[Index + 3];
+
+  // (9) Identify the three followers by the handler the decode tables bound to
+  //     them. This is exact -- far more so than re-decoding opcode bytes --
+  //     and automatically tracks table edits.
+  auto Handler = [](const FEXCore::X86Tables::DecodedInst& Inst) -> FEXCore::X86Tables::OpDispatchPtr {
+    if (!Inst.TableInfo || Inst.TableInfo->Type != FEXCore::X86Tables::TYPE_INST) {
+      return nullptr;
+    }
+    return Inst.TableInfo->OpcodeDispatcher.OpDispatch;
+  };
+
+  if (Handler(MovMsk) != &OpDispatchBuilder::MOVMSKOpOne) {
+    return false;
+  }
+  if (Handler(Test) != &OpDispatchBuilder::Bind<&OpDispatchBuilder::TESTOp, 0>) {
+    return false;
+  }
+  if (Handler(Jcc) != &OpDispatchBuilder::CondJUMPOp) {
+    return false;
+  }
+
+  // (10) No prefixes we are not modelling. REP/LOCK on any of the three would
+  //      change semantics we are about to reimplement by hand.
+  constexpr uint32_t RejectedFlags = FEXCore::X86Tables::DecodeFlags::FLAG_LOCK | FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX |
+                                     FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX;
+  if ((MovMsk.Flags | Test.Flags | Jcc.Flags) & RejectedFlags) {
+    return false;
+  }
+
+  // (11) PMOVMSKB must read the XMM that PCMPEQ just wrote, and must be the
+  //      128-bit (not MMX) form, and must write a plain GPR.
+  if (!MovMsk.Src[0].IsGPR() || !MovMsk.Dest.IsGPR()) {
+    return false;
+  }
+  if (MovMsk.Src[0].Data.GPR != Op->Dest.Data.GPR) {
+    return false;
+  }
+  if (OpSizeFromSrc(&MovMsk) != OpSize::i128Bit) {
+    return false;
+  }
+  const auto MaskGPR = MovMsk.Dest.Data.GPR;
+  if (MaskGPR.HighBits) {
+    return false;
+  }
+
+  // (12) TEST must be the reg-reg self-test of exactly that GPR at exactly
+  //      32 bits. Anything else (a different register, a memory operand, an
+  //      8/16-bit test that would see only part of the mask, a 64-bit test)
+  //      means the flags we are about to synthesise would not match.
+  if (!Test.Dest.IsGPR() || !Test.Src[0].IsGPR()) {
+    return false;
+  }
+  if (!(Test.Dest.Data.GPR == MaskGPR) || !(Test.Src[0].Data.GPR == MaskGPR)) {
+    return false;
+  }
+  if (OpSizeFromDst(&Test) != OpSize::i32Bit || OpSizeFromSrc(&Test) != OpSize::i32Bit) {
+    return false;
+  }
+
+  // (13) The branch must be JZ or JNZ: those are the only conditions that read
+  //      nothing but ZF, i.e. the only ones expressible as "did any lane
+  //      match". CondJUMPOp maps the low nibble of the opcode to the
+  //      condition; 4 = JZ, 5 = JNZ.
+  const auto JccCond = Jcc.OP & 0xF;
+  if (JccCond != 0x4 && JccCond != 0x5) {
+    return false;
+  }
+  if (!Jcc.Src[0].IsLiteral()) {
+    return false;
+  }
+
+  const uint64_t FallthroughRIP = Jcc.PC + Jcc.InstSize;
+  const uint64_t TargetRIP = FallthroughRIP + static_cast<int64_t>(Jcc.Src[0].Literal());
+
+  // (14) BOTH edges must go forward. A backward edge makes the PPC64LE backend
+  //      emit a deferred-signal drain poke (EmitSuspendInterruptCheck) INSIDE
+  //      the fused branch -- i.e. at a point where the guest's mask register
+  //      still holds the pre-branch constant zero rather than the real mask.
+  //      A signal delivered there would show the guest a wrong register. The
+  //      fallthrough edge is forward by construction; only the taken edge has
+  //      to be checked. glibc's scans branch forward to their exit path and
+  //      close the loop with a separate backward jmp, so this costs no
+  //      coverage where it matters.
+  if (TargetRIP <= Jcc.PC) {
+    return false;
+  }
+
+  // --- Match. Emit the fused form. ---
+
+  const auto GPRSize = GetGPROpSize();
+  // JNZ takes the branch when the mask is non-zero, i.e. when some lane matched.
+  const bool JumpIfMatch = JccCond == 0x5;
+  const uint64_t MatchRIP = JumpIfMatch ? TargetRIP : FallthroughRIP;
+  const uint64_t NoMatchRIP = JumpIfMatch ? FallthroughRIP : TargetRIP;
+
+  // The no-match edge is reached iff the mask is zero. Publish that -- and the
+  // flags `test 0,0` would leave -- before the branch, so the hot edge needs no
+  // code of its own at all and can jump straight to its real successor.
+  // NB: StoreGPRRegister forbids a direct i32-in-i64 store (it would preserve
+  // the upper half, where x86 zero-extends), so publish a full-width value.
+  Ref Zero = _Constant(0);
+  StoreGPRRegister(MaskGPR.GPR, Zero, GPRSize);
+  SetNZP_ZeroCV(OpSize::i32Bit, Zero);
+  InvalidateAF();
+  CalculateDeferredFlags();
+
+  BlockSetRIP = true;
+  auto CurrentBlock = GetCurrentBlock();
+  auto CondJump_ = CondJumpVCmpAnyLaneEQ(Vector1, Vector2, ElementSize, JumpIfMatch);
+
+  // Match edge: always a fresh block, because we have to emit into it.
+  auto MatchBlock = CreateNewCodeBlockAtEnd();
+  if (JumpIfMatch) {
+    SetTrueJumpTarget(CondJump_, MatchBlock);
+  } else {
+    SetFalseJumpTarget(CondJump_, MatchBlock);
+  }
+
+  // No-match edge: wired exactly the way CondJUMPOp wires an ordinary edge.
+  {
+    auto Existing = JumpTargets.find(NoMatchRIP);
+    if (Existing != JumpTargets.end()) {
+      if (JumpIfMatch) {
+        SetFalseJumpTarget(CondJump_, Existing->second.BlockEntry);
+      } else {
+        SetTrueJumpTarget(CondJump_, Existing->second.BlockEntry);
+      }
+    } else {
+      // Placed immediately after the current block so the backend's fallthrough
+      // layout still applies to the edge we care about.
+      auto NewBlock = CreateNewCodeBlockAfter(CurrentBlock);
+      if (JumpIfMatch) {
+        SetFalseJumpTarget(CondJump_, NewBlock);
+      } else {
+        SetTrueJumpTarget(CondJump_, NewBlock);
+      }
+      SetCurrentCodeBlock(NewBlock);
+      StartNewBlock();
+      ExitFunction(_InlineEntrypointOffset(GPRSize, NoMatchRIP - Entry));
+    }
+  }
+
+  // Match edge: recompute the mask the guest is about to read (glibc tzcnt's
+  // it to find the matching byte), redo the flags from it, then leave.
+  SetCurrentCodeBlock(MatchBlock);
+  StartNewBlock();
+  {
+    // PMOVMSKB writes a 32-bit destination, which zero-extends to 64. The mask
+    // itself is only 16 bits wide for an XMM source, but go through the same
+    // explicit Bfe(0,32) that StoreResult_WithOpSize would have applied rather
+    // than relying on EmitByteLaneMask's extraction width.
+    Ref Mask = EmitByteLaneMask(CompareResult, RegisterSize);
+    StoreGPRRegister(MaskGPR.GPR, _Bfe(GPRSize, 32, 0, Mask), GPRSize);
+    SetNZP_ZeroCV(OpSize::i32Bit, Mask);
+    InvalidateAF();
+    CalculateDeferredFlags();
+
+    auto Existing = JumpTargets.find(MatchRIP);
+    if (Existing != JumpTargets.end()) {
+      Jump(Existing->second.BlockEntry);
+    } else {
+      ExitFunction(_InlineEntrypointOffset(GPRSize, MatchRIP - Entry));
+    }
+  }
+
+  // Tell GenerateIR to skip PMOVMSKB, TEST and Jcc.
+  FusedInstructionCount = 3;
+  return true;
+}
+
 void OpDispatchBuilder::CondJUMPRCXOp(OpcodeArgs) {
   // Calculate flags early.
   CalculateDeferredFlags();

@@ -307,7 +307,22 @@
         "HasSideEffects": true,
         "RAOverride": "0"
       },
-      "CondJump SSA:$Cmp1, SSA:$Cmp2, SSA:$TrueBlock, SSA:$FalseBlock, CondClass:$Cond{CondClass::NEQ}, OpSize:$CompareSize{OpSize::iInvalid}, i1:$FromNZCV{false}": {
+      "CondJump SSA:$Cmp1, SSA:$Cmp2, SSA:$TrueBlock, SSA:$FalseBlock, CondClass:$Cond{CondClass::NEQ}, OpSize:$CompareSize{OpSize::iInvalid}, i1:$FromNZCV{false}, OpSize:$VCmpElementSize{OpSize::iInvalid}": {
+        "Desc": ["Conditional branch.",
+                 "Normally Cmp1/Cmp2 are GPR-class values compared per Cond/CompareSize, or",
+                 "FromNZCV selects the packed-flags side channel instead.",
+                 "",
+                 "VCmpElementSize != iInvalid selects a THIRD mode: Cmp1/Cmp2 are FPR-class",
+                 "vectors, compared lane-wise for equality at that element size, and the",
+                 "branch is taken on whether ANY lane matched (Cond == NEQ) or NO lane",
+                 "matched (Cond == EQ). No lane mask is materialised anywhere -- the whole",
+                 "point is that the branch reads the comparison out of a condition field",
+                 "directly. Only emitted when HostFeatures.SupportsVCmpFlagBranch; see",
+                 "docs/VCMPEQ_FUSION_DESIGN.md. Added as a trailing defaulted field on the",
+                 "existing op rather than as a new op so that every CFG-aware pass",
+                 "(IRValidation successor/predecessor construction, the dead-flag pass's",
+                 "successor flag union, RA liveness) keeps working with no edits."
+                ],
         "Inline": ["", "AddSub"],
         "HasSideEffects": true,
         "RAOverride": "2"

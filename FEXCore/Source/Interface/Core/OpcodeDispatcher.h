@@ -192,6 +192,22 @@ public:
     FlushRegisterCache();
     return _CondJump(InvalidNode, InvalidNode, InvalidNode, InvalidNode, Cond, OpSize::iInvalid, true);
   }
+  // Vector-compare conditional branch: takes the branch when ANY lane of
+  // Vector1 == Vector2 at ElementSize (JumpIfAnyLane), or when NO lane does
+  // (!JumpIfAnyLane). Cmp1/Cmp2 carry FPR-class values in this mode, which is
+  // why VCmpElementSize (the last field) is what distinguishes it — see
+  // IR.json's CondJump description and docs/VCMPEQ_FUSION_DESIGN.md.
+  //
+  // ONLY emit this when CTX->HostFeatures.SupportsVCmpFlagBranch. Backends
+  // that do not advertise it will fall into their normal CondJump lowering and
+  // silently compare two vector registers as if they were GPRs.
+  IRPair<IROp_CondJump> CondJumpVCmpAnyLaneEQ(Ref Vector1, Ref Vector2, IR::OpSize ElementSize, bool JumpIfAnyLane) {
+    LOGMAN_THROW_A_FMT(CTX->HostFeatures.SupportsVCmpFlagBranch, "Backend cannot lower a vector-compare CondJump");
+    FlushRegisterCache();
+    return _CondJump(Vector1, Vector2, InvalidNode, InvalidNode, JumpIfAnyLane ? CondClass::NEQ : CondClass::EQ, OpSize::iInvalid,
+                     false, ElementSize);
+  }
+
   IRPair<IROp_CondJump> CondJumpBit(Ref Src, unsigned Bit, bool Set) {
     FlushRegisterCache();
     auto InlineConst = _InlineConstant(Bit);
@@ -500,6 +516,16 @@ public:
   void MOVSSOp(OpcodeArgs);
   void VectorALUOp(OpcodeArgs, IROps IROp, IR::OpSize ElementSize);
   void VectorXOROp(OpcodeArgs);
+
+  // PCMPEQ{B,W,D}. Identical to VectorALUOp(OP_VCMPEQ, ElementSize) except that
+  // it additionally attempts the glibc vector-scan fusion described in
+  // docs/VCMPEQ_FUSION_DESIGN.md. Kept as its own entry point so the fusion
+  // only ever gets a lookahead window from the three opcodes that can start it.
+  void PCMPEQFusableOp(OpcodeArgs, IR::OpSize ElementSize);
+  bool TryFuseVectorScan(OpcodeArgs, IR::OpSize RegisterSize, IR::OpSize ElementSize, Ref Vector1, Ref Vector2, Ref CompareResult);
+  // The PMOVMSKB lane-mask sequence, factored out of MOVMSKOpOne so the fusion
+  // can re-materialise it on the match edge.
+  Ref EmitByteLaneMask(Ref Src, IR::OpSize SrcSize);
 
   void VectorALUROp(OpcodeArgs, IROps IROp, IR::OpSize ElementSize);
   void VectorUnaryOp(OpcodeArgs, IROps IROp, IR::OpSize ElementSize);
@@ -1191,6 +1217,27 @@ public:
 
   void SetMultiblock(bool _Multiblock) {
     Multiblock = _Multiblock;
+  }
+
+  ///// glibc vector-scan fusion (docs/VCMPEQ_FUSION_DESIGN.md) /////
+  //
+  // ContextImpl::GenerateIR hands the dispatcher a *window* into the block it
+  // is walking, so a handler can look ahead at instructions the main loop has
+  // not dispatched yet. GenerateIR only offers the window when swallowing
+  // instructions is safe -- see the bail-out list in TryFuseVectorScan -- and
+  // passes nullptr otherwise, which by itself disables the fusion.
+  void SetDecodeWindow(const FEXCore::Frontend::Decoder::DecodedBlocks* Block, size_t InstIndex) {
+    DecodeWindowBlock = Block;
+    DecodeWindowIndex = InstIndex;
+  }
+
+  // Number of ADDITIONAL decoded instructions the handler just swallowed.
+  // GenerateIR must skip exactly this many and account for their InstSize.
+  // Reads destructively so a stale count can never be applied twice.
+  uint32_t ConsumeFusedInstructionCount() {
+    const auto Count = FusedInstructionCount;
+    FusedInstructionCount = 0;
+    return Count;
   }
 
   // SMC Idea 4 (FEX_SMCSEMANTICPATCH). Called by ContextImpl::GenerateIR
@@ -2501,6 +2548,12 @@ private:
   bool Multiblock {};
   bool Is64BitMode {};
   uint64_t Entry {};
+
+  // Vector-scan fusion lookahead window, see SetDecodeWindow.
+  const FEXCore::Frontend::Decoder::DecodedBlocks* DecodeWindowBlock {};
+  size_t DecodeWindowIndex {};
+  uint32_t FusedInstructionCount {};
+  FEX_CONFIG_OPT(VCmpFusion, VCMPFUSION);
 
   // SMC Idea 4: the guest mov-immediate currently being translated, if any.
   // PatchableImmSite == 0 (the state with the flag off, and between recognised

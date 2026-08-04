@@ -308,7 +308,33 @@ DEF_OP(CondJump) {
   // `bc !cond, skip; b TrueBlock; skip: b FalseBlock`. Both `b` insns have
   // a 24-bit displacement (±32MB), well past any single-function code size.
   Cond CC;
-  if (Op->FromNZCV) {
+  if (Op->VCmpElementSize != IR::OpSize::iInvalid) {
+    // Vector-compare branch (glibc vector-scan fusion; see
+    // docs/VCMPEQ_FUSION_DESIGN.md and HostFeatures::SupportsVCmpFlagBranch).
+    // Cmp1/Cmp2 are FPR-class here, NOT GPRs.
+    //
+    // The record form of the VMX integer compares writes CR field 6:
+    //   CR6 bit 0 (CR bit 24) = every lane compared equal
+    //   CR6 bit 2 (CR bit 26) = NO lane compared equal
+    // so a single `bc` on CR bit 26 answers "did any lane match" with the lane
+    // mask never leaving the vector unit. VTMP1 absorbs the (unused) VRT.
+    //
+    //   Cond == NEQ -> TrueBlock when ANY lane matched  -> CR6[2] clear -> BO=4
+    //   Cond == EQ  -> TrueBlock when NO  lane matched  -> CR6[2] set   -> BO=12
+    const auto V1 = GetVReg(Op->Cmp1);
+    const auto V2 = GetVReg(Op->Cmp2);
+    switch (Op->VCmpElementSize) {
+    case IR::OpSize::i8Bit: vcmpequb_(VTMP1, V1, V2); break;
+    case IR::OpSize::i16Bit: vcmpequh_(VTMP1, V1, V2); break;
+    case IR::OpSize::i32Bit: vcmpequw_(VTMP1, V1, V2); break;
+    case IR::OpSize::i64Bit: vcmpequd_(VTMP1, V1, V2); break;
+    default: LOGMAN_MSG_A_FMT("CondJump: unhandled VCmpElementSize {}", static_cast<uint32_t>(Op->VCmpElementSize)); break;
+    }
+    LOGMAN_THROW_A_FMT(Op->Cond == IR::CondClass::NEQ || Op->Cond == IR::CondClass::EQ,
+                       "CondJump vector-compare mode only encodes EQ/NEQ over 'any lane matched'");
+    // BI 26 = CR6's "none matched" bit (CR field 6 occupies CR bits 24..27).
+    CC = (Op->Cond == IR::CondClass::NEQ) ? Cond {4, 26} : Cond {12, 26};
+  } else if (Op->FromNZCV) {
     CC = MapNZCVCC(Op->Cond);
   } else if (Op->Cond == IR::CondClass::TSTZ || Op->Cond == IR::CondClass::TSTNZ) {
     // Bit-test branch: Cmp2 is an inline constant giving the bit POSITION

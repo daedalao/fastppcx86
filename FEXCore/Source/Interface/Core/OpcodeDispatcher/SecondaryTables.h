@@ -254,9 +254,14 @@ constexpr DispatchTableEntry OpDispatch_SecondaryOpSizeModTables[] = {
   {0x6F, 1, &OpDispatchBuilder::MOVVectorAlignedOp},
   {0x70, 1, &OpDispatchBuilder::PSHUFDOp},
 
-  {0x74, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorALUOp, IR::OP_VCMPEQ, OpSize::i8Bit>},
-  {0x75, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorALUOp, IR::OP_VCMPEQ, OpSize::i16Bit>},
-  {0x76, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorALUOp, IR::OP_VCMPEQ, OpSize::i32Bit>},
+  // PCMPEQ{B,W,D} xmm. Semantically Bind<VectorALUOp, OP_VCMPEQ, ...>; the
+  // dedicated handler additionally tries the glibc vector-scan fusion
+  // (docs/VCMPEQ_FUSION_DESIGN.md). The MMX table above deliberately keeps the
+  // plain handler -- the idiom is an SSE2 one and the fusion rejects MMX sizes
+  // anyway.
+  {0x74, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::PCMPEQFusableOp, OpSize::i8Bit>},
+  {0x75, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::PCMPEQFusableOp, OpSize::i16Bit>},
+  {0x76, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::PCMPEQFusableOp, OpSize::i32Bit>},
   {0x78, 1, nullptr}, // GROUP 17
   {0x79, 1, &OpDispatchBuilder::Extrq},
   {0x7C, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorALUOp, IR::OP_VFADDP, OpSize::i64Bit>},

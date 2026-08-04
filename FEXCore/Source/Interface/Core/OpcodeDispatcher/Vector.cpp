@@ -832,12 +832,14 @@ void OpDispatchBuilder::MOVMSKOp(OpcodeArgs, IR::OpSize ElementSize) {
   }
 }
 
-void OpDispatchBuilder::MOVMSKOpOne(OpcodeArgs) {
-  const auto SrcSize = OpSizeFromSrc(Op);
+// The PMOVMSKB lane-mask sequence: one bit per byte lane, taken from each
+// lane's sign bit. Factored out of MOVMSKOpOne so the vector-scan fusion can
+// re-materialise the mask on the edge where the guest actually consumes it
+// (docs/VCMPEQ_FUSION_DESIGN.md).
+Ref OpDispatchBuilder::EmitByteLaneMask(Ref Src, IR::OpSize SrcSize) {
   const auto Is256Bit = SrcSize == OpSize::i256Bit;
   const auto ExtractSize = Is256Bit ? OpSize::i32Bit : OpSize::i16Bit;
 
-  Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
   Ref VMask = LoadAndCacheNamedVectorConstant(SrcSize, NAMED_VECTOR_MOVMASKB);
 
   auto VCMP = _VCMPLTZ(SrcSize, OpSize::i8Bit, Src);
@@ -852,9 +854,27 @@ void OpDispatchBuilder::MOVMSKOpOne(OpcodeArgs) {
   auto VAdd2 = _VAddP(VAdd2Size, OpSize::i8Bit, VAdd1, VAdd1);
   auto VAdd3 = _VAddP(OpSize::i64Bit, OpSize::i8Bit, VAdd2, VAdd2);
 
-  auto Result = _VExtractToGPR(SrcSize, ExtractSize, VAdd3, 0);
+  return _VExtractToGPR(SrcSize, ExtractSize, VAdd3, 0);
+}
 
-  StoreResultGPR(Op, Result);
+void OpDispatchBuilder::MOVMSKOpOne(OpcodeArgs) {
+  const auto SrcSize = OpSizeFromSrc(Op);
+  Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  StoreResultGPR(Op, EmitByteLaneMask(Src, SrcSize));
+}
+
+void OpDispatchBuilder::PCMPEQFusableOp(OpcodeArgs, IR::OpSize ElementSize) {
+  const auto Size = OpSizeFromSrc(Op);
+  Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+
+  // The architectural PCMPEQ is emitted unconditionally: its XMM destination is
+  // guest-visible and the fusion never elides it. Only the PMOVMSKB that
+  // follows is elided, and only onto edges where its value is recoverable.
+  auto Result = _VCMPEQ(Size, ElementSize, Dest, Src);
+  StoreResultFPR(Op, Result);
+
+  TryFuseVectorScan(Op, Size, ElementSize, Dest, Src, Result);
 }
 
 void OpDispatchBuilder::PUNPCKLOp(OpcodeArgs, IR::OpSize ElementSize) {

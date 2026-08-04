@@ -50,6 +50,18 @@ struct HostFeatures {
   // POWER8 path on POWER9 hardware — the only way the pre-3.0 paths stay tested.
   bool SupportsISA30 {};
 
+  // The backend implements OP_CONDJUMP with VCmpElementSize != iInvalid: a
+  // conditional branch whose condition is "did any lane of Cmp1 == Cmp2"
+  // evaluated straight out of a record-form vector compare's condition field,
+  // with no lane mask ever reaching a GPR. Only the PPC64LE backend does
+  // (vcmpequ{b,h,w}. -> CR6 -> bc); the frontend's glibc vector-scan fusion is
+  // gated on this so no other backend can be handed an IR shape it will not
+  // recognise. There is deliberately no FEX_HOSTFEATURES toggle for it: the
+  // A/B knob lives one level up as FEX_VCMPFUSION=0, which leaves the backend
+  // capable but stops the frontend from ever forming the pattern, so the two
+  // sides of a measurement differ in exactly one thing.
+  bool SupportsVCmpFlagBranch {};
+
   // Float exception behaviour
   bool SupportsAFP {};
   bool SupportsFloatExceptions {};

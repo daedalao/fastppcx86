@@ -853,6 +853,23 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
+
+          // Vector-scan fusion lookahead window (docs/VCMPEQ_FUSION_DESIGN.md).
+          // A handler may swallow the instructions that follow it in this block
+          // and emit their combined effect itself. Only offer the window when
+          // doing so cannot lose anything the surrounding loop is responsible
+          // for emitting per instruction:
+          //   * CONFIG_SMC_FULL / ForceFullSMCDetection wraps EVERY instruction
+          //     in a ValidateCode guard above; a swallowed instruction would
+          //     silently lose its guard and run stale semantics after an SMC
+          //     write.
+          //   * ExtendedDebugInfo asks for a _GuestOpcode marker per
+          //     instruction, which swallowed instructions would not get.
+          // Both are rare/one-off modes, so refusing to fuse in them costs
+          // nothing and removes two whole classes of interaction.
+          const bool FusionWindowSafe = !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !Block.ForceFullSMCDetection;
+          Thread->OpDispatcher->SetDecodeWindow(FusionWindowSafe ? &Block : nullptr, i);
+
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
@@ -864,6 +881,23 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             BlockInstructionsLength += DecodedInfo->InstSize;
             TotalInstructionsLength += DecodedInfo->InstSize;
             ++TotalInstructions;
+
+            // The handler may have fused the instructions that follow into its
+            // own emission (see SetDecodeWindow). Account for them and skip
+            // them: they must never be dispatched a second time.
+            if (const uint32_t Fused = Thread->OpDispatcher->ConsumeFusedInstructionCount(); Fused) {
+              LOGMAN_THROW_A_FMT(i + Fused < InstsInBlock, "Fusion swallowed past the end of the block");
+              for (uint32_t f = 1; f <= Fused; ++f) {
+                const auto& Swallowed = Block.DecodedInstructions[i + f];
+                BlockInstructionsLength += Swallowed.InstSize;
+                TotalInstructionsLength += Swallowed.InstSize;
+                ++TotalInstructions;
+              }
+              // DecodedInfo must name the LAST instruction the block consumed,
+              // because the loop tail uses it for FinishOp's next-RIP.
+              DecodedInfo = &Block.DecodedInstructions[i + Fused];
+              i += Fused;
+            }
 
             // Walk InstForceTSOIt forward past the handled instruction
             InstForceTSOIt =

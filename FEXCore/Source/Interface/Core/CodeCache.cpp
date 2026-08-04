@@ -322,6 +322,11 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(SMCCHEAPTIERMAXINST);
     HASH_OPT(SMCMPROTECTDEFER);
 
+    // Vector-scan fusion changes block *shape* (it swallows three guest
+    // instructions and grows an extra IR block on the match edge), so cached
+    // code produced with it on must not be reused with it off, or vice versa.
+    HASH_OPT(VCMPFUSION);
+
     // Lookup-cache shape: the dispatcher's inlined L1 probe is emitted into
     // every block exit on this backend.
     HASH_OPT(DISABLEL2CACHE);

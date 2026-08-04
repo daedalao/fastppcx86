@@ -1144,6 +1144,24 @@ public:
   void vcmpgtuw(VR vrt, VR vra, VR vrb)   { EmitVX(vrt.idx, vra.idx, vrb.idx, 646);  }
   void vcmpgtud(VR vrt, VR vra, VR vrb)   { EmitVX(vrt.idx, vra.idx, vrb.idx, 711);  } // POWER8+
 
+  // Record-form (Rc=1) integer compares. VC-form's XO field is 10 bits with the
+  // Rc bit immediately above it, so the 11-bit value EmitVX() splices in at
+  // 0:10 is simply `XO | 0x400`. EmitVX() itself has no Rc parameter -- every
+  // other caller wants Rc=0 -- hence these explicit twins rather than a flag.
+  //
+  // Besides writing VRT, Rc=1 sets CR field 6 (CR bits 24..27):
+  //   CR6[0] (CR bit 24) = 1 iff EVERY lane compared equal
+  //   CR6[1] (CR bit 25) = 0
+  //   CR6[2] (CR bit 26) = 1 iff NO lane compared equal
+  //   CR6[3] (CR bit 27) = 0
+  // A `bc` can therefore consume the comparison directly, with no VSU->FXU
+  // transfer of a lane mask. See the vector-scan fusion in
+  // docs/VCMPEQ_FUSION_DESIGN.md.
+  void vcmpequb_(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 6   | 0x400); }
+  void vcmpequh_(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 70  | 0x400); }
+  void vcmpequw_(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 134 | 0x400); }
+  void vcmpequd_(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 199 | 0x400); } // POWER8+
+
   // FP vector compare
   void vcmpeqfp(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 198);  }
   void vcmpgefp(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 454);  }
