@@ -35,6 +35,15 @@ detection.
   army atomically hammering one heap word; flag field never set; registers
   stationary; zero signals to spinners; futex-wait crowd. Clamp
   inapplicable. Next tool: FEX_FUTEX_TRACE. Root fix: OPEN.
+- **C — JIT flags clobber (CR0/NZCV)** (Hard West quiet startup wedge):
+  non-flag-writing vector op (CMPSS/SD, ROUNDSS/SD, wide shifts) between a
+  cmp/test and its jcc destroyed packed NZCV in CR0 → branch on garbage →
+  loop entered past its init / equality exit overshot. One or few threads,
+  low CPU, no syscalls, no signals; register state looks "impossible".
+  Root fix: **LANDED eb1a4c858** (all VectorOps CR0-scratch → cr1) +
+  regression test vector_scalar_flags_preserve.asm. Presents like A
+  (skipped init) — every A-classified wedge must be retested on ≥eb1a4c858
+  before the A verdict stands.
 
 ## Special numbers — collected per title, analyzed for a pattern
 
@@ -61,8 +70,8 @@ entry, and the corruption window is the shuffle between xor and jmp.
 
 | title | engine | run date | verdict | evidence |
 |---|---|---|---|---|
-| ziggurat | Unity (static player) / Mono | 2026-08-04 | **Class A** — wedges on load with workarounds off; playable with clamps on | docs/ZIGGURAT_FINALIZE_SPIN.md; entry ring clean; RBX restarts ~0, misses ==4 once |
-| hardwest | Unity / Mono | 2026-08-04 | **Class B** — 40 spinners on word @0x1f3a220, flag +0x70 never →1, ~2m15s into load | hardwest-jit-spin-loop memory 2026-08-04 section; ranges 0x84ab90-0x84adee |
+| ziggurat | Unity (static player) / Mono | 2026-08-04 | **Class A — RECLASSIFY CANDIDATE → C**: "init skipped / RBX misses ==4" is exactly what a CR0-clobbered jcc before the loop produces; RETEST on eb1a4c858 with clamps off before trusting injection theory | docs/ZIGGURAT_FINALIZE_SPIN.md; entry ring clean; RBX restarts ~0, misses ==4 once |
+| hardwest | Unity / Mono | 2026-08-04 | **SPLIT: two diseases.** (1) quiet startup wedge = **Class C** (CR0/NZCV clobber, FIXED eb1a4c858); (2) loud post-menu spin (Class-B shape, 40 spinners on word @0x1f3a220) persists on fixed build — displacement A/B rerunning on clean substrate | Opus capture 11:00-11:35: /tmp/hwquiet/ on op4k (b3.asm has the smoking gun fcmpu cr0); loud-wedge anatomy needs re-verification post-fix |
 | rimworld | Unity / Mono | 2026-08-04 | healthy so far (ran with clamps ON, default config; ~long session pending) | SpinLoopClampAuto audit: 1017 flagged lib loops, zero misfires observed |
 | shadowrunhk | Unity / Mono | 2026-08-04 | **wedged, class TBD** — title-menu wedge, ~68 cores hot across 182 threads for 25+ min, Player.log frozen at 10:12:05; `Failed to wait on a semaphore (Interrupted system call)` in Player.log despite SA_RESTART fixes present in build — EINTR-leak suspicion or third class; spin PCs unresolvable post-mortem (perf-3636.map gone) | /tmp/srhk1.perf + /tmp/srhk_poll.out on op4k (2026-08-04 10:15-10:37); needs instrumented re-run (BlockJITNaming + SIGTRACE) |
 | moonlighter | Unity 2018 / Mono | — | pending | prior perf data exists (moonlighter_perf.data in repo root) |
