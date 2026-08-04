@@ -63,6 +63,24 @@ co-dev's machine only, behind runtime gating.
    agents. A standing "top-10 by emitted bytes" measurement per title
    belongs in the perf workflow.
 
+## Finding 5 implementation design (PTest via record-form) — IN PROGRESS
+
+Current PTestOpImpl (Vector.cpp:4121): VAnd + VAndn + 2×VUMaxV(horizontal!)
++ 2×VExtractToGPR + To01 → ~30+ insns, two VSU→FXU crossings.
+Plan: new IR op `GPR = VAnyNonZero V:$Vector` (JITDispatch:false,
+hand-registered like VExtractSignBits). ppc64le lowering:
+  vspltisb VTMP1, 0
+  vcmpequb_rc VTMP2, Src, VTMP1     (Rc twin exists)
+  mfocrf TMP, 0x02                  (CR6 field; check emitter has mfocrf)
+  rlwinm TMP, TMP, 25, 31, 31      (CR6 bit0 "all lanes equal"=all-zero → LSB)
+  xori   Dst, TMP, 1               (→ any-nonzero 0/1)
+Dispatcher: #ifdef ARCHITECTURE_ppc64le in PTestOpImpl:
+  T1 = VAnyNonZero(VAnd(Dest,Src)); T2 = VAnyNonZero(VAndn(Src,Dest));
+  SetNZ_ZeroCV(i32, T1) (0/1: Z iff zero, N always clear — semantics
+  preserved); SetCFInverted(T2) directly (already 0/1, To01 skipped);
+  ZeroPF_AF(). AVX 256-bit path (AVX_128.cpp): VOr halves first, same ops.
+Validate: ASM suite ptest/vtestps cases + full jit subset.
+
 ## Next steps (continuation)
 - Measure: JITOpSizeProfile a Ziggurat session on 33bc66759; rank.
 - Read PTest/VDupElement/VInsElement/shuffle lowerings adversarially (the

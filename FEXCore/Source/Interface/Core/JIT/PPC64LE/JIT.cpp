@@ -3047,6 +3047,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // IRDefines_Dispatch.inc — wire them up explicitly.
     REGISTER_OP(VMADDPAIRWISE16,   VMaddPairwise16);
     REGISTER_OP(VEXTRACTSIGNBITS,  VExtractSignBits);
+    REGISTER_OP(VANYNONZERO,       VAnyNonZero);
 
     // x87 stack-bookkeeping ops (X87Ops.cpp). These are NOT in the
     // auto-generated IRDefines_Dispatch.inc — IR.json marks them as JIT-not-

@@ -594,6 +594,7 @@ private:
   // -----------------------------------------------------------------------
   DEF_OP(VMaddPairwise16);
   DEF_OP(VExtractSignBits);
+  DEF_OP(VAnyNonZero);
 
   // -----------------------------------------------------------------------
   // x87 stack bookkeeping ops (X87Ops.cpp).

@@ -2383,6 +2383,17 @@
         "DestSize": "OpSize::i32Bit",
         "JITDispatch": false
       },
+      "GPR = VAnyNonZero OpSize:#RegisterSize, FPR:$Vector": {
+        "Desc": [ "1 if any bit of the vector register is set, else 0.",
+                  "PPC64LE-only (JITDispatch:false, hand-registered like VExtractSignBits):",
+                  "lowers to a record-form vcmpequb. against zero and a CR6 bit extract,",
+                  "replacing the VUMaxV horizontal reduction + VExtractToGPR crossing the",
+                  "generic PTEST/VTESTP lowering pays twice per instruction.",
+                  "See docs/EMITTER_REVIEW.md finding 5."
+                ],
+        "DestSize": "OpSize::i64Bit",
+        "JITDispatch": false
+      },
       "FPR = VUMulH OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
         "Desc": "Wide unsigned multiply returning the high results",
         "DestSize": "RegisterSize",

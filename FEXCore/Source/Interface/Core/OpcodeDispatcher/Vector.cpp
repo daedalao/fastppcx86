@@ -4122,6 +4122,15 @@ void OpDispatchBuilder::PTestOpImpl(OpSize Size, Ref Dest, Ref Src) {
   Ref Test1 = _VAnd(Size, OpSize::i8Bit, Dest, Src);
   Ref Test2 = _VAndn(Size, OpSize::i8Bit, Src, Dest);
 
+#ifdef ARCHITECTURE_ppc64le
+  // Record-form path (docs/EMITTER_REVIEW.md finding 5): one vcmpequb.
+  // against zero + a CR6 bit extract per test, replacing a horizontal
+  // VUMaxV reduction + VSU->FXU VExtractToGPR crossing per test. Both
+  // results are already 0/1: Z semantics from SetNZ_ZeroCV hold (N clear,
+  // Z iff no common bits), and Test2 needs no To01.
+  Test1 = _VAnyNonZero(Size, Test1);
+  Test2 = _VAnyNonZero(Size, Test2);
+#else
   // Element size must be less than 32-bit for the sign bit tricks.
   Test1 = _VUMaxV(Size, OpSize::i16Bit, Test1);
   Test2 = _VUMaxV(Size, OpSize::i16Bit, Test2);
@@ -4130,6 +4139,7 @@ void OpDispatchBuilder::PTestOpImpl(OpSize Size, Ref Dest, Ref Src) {
   Test2 = _VExtractToGPR(Size, OpSize::i16Bit, Test2, 0);
 
   Test2 = To01(OpSize::i64Bit, Test2);
+#endif
 
   // Careful, these flags are different between {V,}PTEST and VTESTP{S,D}
   // Set ZF according to Test1. SF will be zeroed since we do a 32-bit test on

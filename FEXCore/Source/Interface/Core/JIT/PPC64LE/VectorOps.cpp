@@ -2693,6 +2693,22 @@ DEF_OP(VExtractSignBits) {
   }
 }
 
+// VAnyNonZero — 1 iff any bit set, via record-form compare against zero.
+// The generic path (VUMaxV horizontal reduction + VExtractToGPR) costs a
+// multi-instruction reduction plus a VSU->FXU crossing; this is 5 insns and
+// the only crossing is the mfcr. CR6 bit 0 ("all lanes equal") is CR bit 24;
+// rlwinm rotl 25 brings it to bit 31, mask to LSB, invert for any-nonzero.
+DEF_OP(VAnyNonZero) {
+  const auto Op = IROp->C<IR::IROp_VAnyNonZero>();
+  const auto Dst = GetReg(Node);
+  const auto Src = GetVReg(Op->Vector);
+  vspltisb(VTMP1, 0);
+  vcmpequb_(VTMP2, Src, VTMP1);
+  mfcr(TMP1);
+  rlwinm(TMP1, TMP1, 25, 31, 31);
+  xori(Dst, TMP1, 1);
+}
+
 DEF_OP(VUMulH) {
   const auto Op = IROp->C<IR::IROp_VUMulH>();
   const auto ElemSz = Op->Header.ElementSize;
