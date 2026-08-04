@@ -30,6 +30,32 @@
           "Enable expensive validation when loading code caches"
         ]
       },
+      "CodeCacheScope": {
+        "Type": "str",
+        "Default": "off",
+        "Desc": [
+          "Which guest files the code cache subsystem may write caches for at",
+          "runtime. EnableCodeCachingWIP remains the master switch: with it off",
+          "nothing is loaded or written regardless of this value.",
+          "\toff (default): legacy behaviour. Caches are LOADED for any file, but",
+          "\t     never written by the running process -- only FEXOfflineCompiler",
+          "\t     produces them.",
+          "\trootfs: load and write caches only for files whose resolved path lies",
+          "\t     under the configured RootFS. These are system libraries: immutable",
+          "\t     in practice and shared between titles, so their translations are",
+          "\t     the ones worth keeping across runs.",
+          "\tall: additionally load and write caches for game-side native libraries",
+          "\t     and the main executable.",
+          "Any value other than off makes the process a cache *generator*: FEX",
+          "keeps FEX relocations and decodes section-bounded for every block, which",
+          "costs memory and forbids cross-file multiblock. Unrecognised values are",
+          "treated as off.",
+          "NOTE: EnableCodeCacheValidation only applies to caches produced by",
+          "FEXOfflineCompiler. It recompiles in ascending guest order, while a",
+          "runtime-generated cache is laid out in execution order, so the two",
+          "legitimately differ and validation will report a mismatch."
+        ]
+      },
       "HostFeatures": {
         "Type": "strenum",
         "Default": "FEXCore::Config::HostFeatures::OFF",

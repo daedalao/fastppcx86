@@ -18,6 +18,8 @@ $end_info$
 #include "ArchHelpers/MContext.h"
 
 #include <FEXCore/Config/Config.h>
+#include <FEXCore/Core/CodeCache.h>
+#include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
@@ -238,6 +240,59 @@ public:
   FEX_CONFIG_OPT(SMCLazyScrub, SMCLAZYSCRUB);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
+  FEX_CONFIG_OPT(CodeCacheScopeStr, CODECACHESCOPE);
+
+  // Which guest files the code cache subsystem applies to. See the option's Desc
+  // in Config.json.in. EnableCodeCaching stays the master switch: with it off,
+  // none of these do anything.
+  enum class CodeCacheScopeType {
+    // Legacy FEX_ENABLECODECACHINGWIP behaviour: load caches for anything, write
+    // nothing (only FEXOfflineCompiler produces cache files).
+    Off,
+    // Rootfs system libraries only. Immutable in practice and shared between
+    // titles, so they are the translations worth persisting.
+    RootFS,
+    // Everything file-backed, including game-side native libraries.
+    All,
+  };
+
+  CodeCacheScopeType GetCodeCacheScope() const {
+    return CodeCacheScope;
+  }
+
+  // True when this process writes cache files itself. Implies the context was
+  // put into cache-generation mode at startup (relocations retained,
+  // section-bounded decode) — without that, saved code is not relocatable and
+  // multiblock can span files.
+  bool CodeCacheWriteEnabled() const {
+    return EnableCodeCaching() && CodeCacheScope != CodeCacheScopeType::Off;
+  }
+
+  // Applies the scope gate to a resolved host path.
+  bool IsPathInCodeCacheScope(std::string_view Path) const;
+
+  // Loads (if present and in scope) the on-disk cache for one mapped section.
+  void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::ExecutableFileSectionInfo& Section);
+
+  /**
+   * Writes a cache file for every in-scope mapped file that has newly compiled
+   * blocks, each through a temp file + rename(2).
+   *
+   * Must be called from a non-signal context with no VMATracking or FEXCore core
+   * lock held; it takes the code buffer and lookup cache locks itself. Cheap to
+   * call: returns immediately unless writing is enabled.
+   */
+  void SaveCodeCaches(FEXCore::Core::InternalThreadState* Thread, bool Force);
+
+  // Polls the FEXCore-side "enough new blocks / enough time" trigger and saves
+  // if it fires. Called from the tails of the memory-management syscalls, which
+  // are the safe points this process reliably passes through.
+  void MaybeSaveCodeCaches(FEXCore::Core::InternalThreadState* Thread) {
+    if (!CodeCacheWriteEnabled() || !CTX->GetCodeCache().WantsSave(false)) {
+      return;
+    }
+    SaveCodeCaches(Thread, false);
+  }
 
   uint32_t GetHostKernelVersion() const {
     return HostKernelVersion;
@@ -603,7 +658,33 @@ public:
 
   VMATracking::VMATracking VMATracking;
 
-  const uint64_t CodeCacheConfigId = 0; // TODO: Make unique to active configuration
+  // Identifies the code generator, so a cache file is only ever opened by a
+  // process whose codegen matches the one that wrote it. Combined with the
+  // content-derived FileId in the cache filename (`<FileId>-<ConfigId>`), a
+  // stale or mismatched key is a cache MISS — never a load of wrong code.
+  const uint64_t CodeCacheConfigId = FEXCore::ComputeCodeCacheConfigId();
+
+  // Parsed once from the CodeCacheScope string option.
+  const CodeCacheScopeType CodeCacheScope = [this]() {
+    const auto& Value = CodeCacheScopeStr();
+    if (Value == "rootfs") {
+      return CodeCacheScopeType::RootFS;
+    }
+    if (Value == "all") {
+      return CodeCacheScopeType::All;
+    }
+    if (Value != "off" && !Value.empty()) {
+      LogMan::Msg::EFmt("Unknown CodeCacheScope '{}', treating as 'off'", Value);
+    }
+    return CodeCacheScopeType::Off;
+  }();
+
+  // FileIds this process loaded a cache for. Those blocks were relocated on
+  // load and carry no relocation records of their own, so re-serializing them
+  // would produce a cache that is only valid at this run's base address. Never
+  // write a file we read.
+  std::mutex CodeCacheLoadedMutex;
+  fextl::set<uint64_t> CodeCacheLoadedFileIds;
 
   uint64_t read_ldt(FEXCore::Core::CpuStateFrame* Frame, void* ptr, unsigned long bytecount);
   uint64_t write_ldt(FEXCore::Core::CpuStateFrame* Frame, void* ptr, unsigned long bytecount, bool legacy);

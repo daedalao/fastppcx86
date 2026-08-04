@@ -116,7 +116,9 @@ static FEXCore::Core::InternalThreadState* SetupCompileThread(FEXCore::Context::
 
 // Returns filename of generated cache on success
 static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInfo& Binary, fextl::set<uintptr_t> BlockList, std::string_view OutDir) {
-  uint64_t CodeCacheConfigId = 0; // TODO: Make unique to active configuration
+  // Must match what the runtime computes (FEX::HLE::SyscallHandler), or the
+  // cache this writes is named something no runtime will ever look for.
+  const uint64_t CodeCacheConfigId = FEXCore::ComputeCodeCacheConfigId();
 
   ELFCodeLoader Loader(Binary.Filename.c_str(), -1, "", fextl::vector<fextl::string> {Binary.Filename.c_str()},
                        fextl::vector<fextl::string> {}, nullptr, nullptr, true /* skip interpreter */);
@@ -224,13 +226,28 @@ static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInf
 
     auto Filename = fmt::format("{}{}-{:016x}", OutDir, FEXCore::CodeMap::GetBaseFilename(Binary, false), CodeCacheConfigId);
     auto FilenameNew = Filename + ".new";
-    int fd = open(FilenameNew.c_str(), O_CREAT | O_WRONLY, 0644);
+    // O_TRUNC: a leftover .new from a killed run must not be appended to.
+    int fd = open(FilenameNew.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    bool Ok = false;
     {
       auto Entry = SyscallHandler->LookupExecutableFileSection(Thread, SyscallHandler->VAFileStart).value();
-      CTX->GetCodeCache().SaveData(*Thread, fd, Entry, 0 /* TODO: Use static base address information if available */);
+      // No GuestRanges filter: this process compiled exactly one binary, so
+      // every block in the buffer belongs to it.
+      Ok = CTX->GetCodeCache().SaveData(*Thread, fd, Entry, 0 /* TODO: Use static base address information if available */);
+    }
+    // Close (flushing) and only then publish. Renaming a file descriptor's worth
+    // of unwritten data over a good cache is how a crashed generator used to
+    // destroy a working one.
+    if (Ok) {
+      Ok = fsync(fd) == 0;
+    }
+    close(fd);
+    if (!Ok) {
+      fmt::print(stderr, "Failed to write cache data for {}\n", Binary.Filename);
+      std::filesystem::remove(FilenameNew.c_str());
+      return std::nullopt;
     }
     std::filesystem::rename(FilenameNew.c_str(), Filename.c_str());
-    close(fd);
     return Filename;
   }
 }

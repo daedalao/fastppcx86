@@ -146,6 +146,14 @@ struct VMATracking {
     return MappedResources.equal_range(mrid);
   }
 
+  // All tracked resources, for whole-process passes (the code cache writer walks
+  // this to find every mapped file with compiled code).
+  // - Mutex must be at least shared_locked before calling, and for as long as
+  //   the returned range is used.
+  inline const MappedResource::ContainerType& AllResources() const {
+    return MappedResources;
+  }
+
 private:
   MappedResource::ContainerType MappedResources;
 };

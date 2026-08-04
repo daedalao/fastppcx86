@@ -15,6 +15,7 @@
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+#include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/string.h>
@@ -85,8 +86,15 @@ public:
   FEX_CONFIG_OPT(EnableCodeCacheValidation, ENABLECODECACHEVALIDATION);
 
   uint64_t ComputeCodeMapId(std::string_view Filename, int FD) override;
-  bool SaveData(Core::InternalThreadState&, int TargetFD, const ExecutableFileSectionInfo&, uint64_t SerializedBaseAddress) override;
+  bool SaveData(Core::InternalThreadState&, int TargetFD, const ExecutableFileSectionInfo&, uint64_t SerializedBaseAddress,
+                std::span<const GuestAddressRange> GuestRanges = {}) override;
   bool LoadData(Core::InternalThreadState*, std::byte* MappedCacheFile, size_t MappedCacheFileSize, const ExecutableFileSectionInfo&) override;
+
+  // Buffer-relative offsets of one cached block, as stored on disk.
+  struct CachedBlockLocation {
+    uint64_t BlockBegin; ///< Offset of the JITCodeHeader
+    uint64_t HostCode;   ///< Offset of this entry point inside the block
+  };
 
   /**
    * Performs expensive extra validation on the loaded code cache data.
@@ -97,13 +105,47 @@ public:
    * - mismatches of the JIT configuration used during cache generation
    * - hidden position dependencies due to missing FEX relocations
    * - incorrect instruction padding
+   * - a guest->host block table that does not describe the code it ships with
+   *
+   * CachedBlocks maps absolute guest entry addresses to their buffer-relative
+   * locations, i.e. it is the block-mapping table exactly as the loader read it.
    */
-  void Validate(const ExecutableFileSectionInfo&, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& HostBlocks,
-                std::span<std::byte> CachedCode);
+  void Validate(const ExecutableFileSectionInfo&, const fextl::map<uint64_t, CachedBlockLocation>& CachedBlocks, std::span<std::byte> CachedCode);
 
   void InitiateCacheGeneration() override {
     IsGeneratingCache = true;
   }
+
+  /**
+   * Moves the relocations the given thread's backend has accumulated into the
+   * context-wide sink.
+   *
+   * Relocations are recorded per *thread* backend, but they describe offsets
+   * into the single shared code buffer. A process that writes caches at runtime
+   * saves from whichever thread reaches a safe point first, so leaving them in
+   * the compiling thread would silently drop every relocation belonging to a
+   * block another thread compiled — producing a cache that loads, relocates
+   * nothing, and branches to addresses from the generating process.
+   *
+   * GuestRIP relocations are absorbed with their *absolute* guest RIP (rebase
+   * against the file base happens per save), which also makes repeated saves
+   * idempotent — unlike CPUBackend::TakeRelocations, which is destructive and
+   * rebases in place.
+   *
+   * Called from ContextImpl::CompileBlock with the compile already finished.
+   */
+  void AbsorbRelocations(Core::InternalThreadState& Thread);
+
+  // Drops the sink. Must be called whenever the code buffer rotates: every
+  // offset in it refers to a buffer that no longer exists.
+  void ResetRelocations();
+
+  bool WantsSave(bool IgnoreInterval) override;
+  void NotifyCachesSaved() override;
+
+  // Number of blocks compiled since the last save pass; also drives
+  // WantsSave.
+  std::atomic<uint64_t> BlocksSinceSave {0};
 
   /**
    * Applies a set of FEX relocations to the given code section.
@@ -124,6 +166,15 @@ public:
    */
   [[nodiscard]]
   bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations, bool ForStorage);
+
+private:
+  // Context-wide relocation sink. See AbsorbRelocations. GuestRIP entries hold
+  // absolute guest addresses; Header.Offset is relative to the code buffer base.
+  std::mutex RelocationSinkMutex;
+  fextl::vector<CPU::Relocation> RelocationSink;
+
+  // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last save pass.
+  std::atomic<uint64_t> LastSaveTimeSeconds {0};
 };
 
 class ContextImpl final : public FEXCore::Context::Context, public CPU::CodeBufferManager {

@@ -22,7 +22,11 @@
 
 #include <xxhash.h>
 
+#include <cerrno>
 #include <fstream>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace FEXCore {
 
@@ -215,9 +219,236 @@ void CodeMapWriter::AppendData(std::span<const std::byte> Data) {
   memcpy(&Buffer.at(Offset), Data.data(), Data.size_bytes());
 }
 
+namespace {
+// Streaming xxhash helper. Length-prefixes strings so that concatenating two
+// values can never collide with a single longer one.
+struct StreamHasher {
+  XXH3_state_t* State;
+
+  void Add(uint64_t Value) {
+    XXH3_64bits_update(State, &Value, sizeof(Value));
+  }
+  void Add(std::string_view Value) {
+    Add(Value.size());
+    if (!Value.empty()) {
+      XXH3_64bits_update(State, Value.data(), Value.size());
+    }
+  }
+};
+
+// Reserved / sentinel FileId values that must never be produced by a hash.
+constexpr uint64_t InvalidFileId = 0xffff'ffff'ffff'ffff;
+
+uint64_t SanitizeId(uint64_t Id) {
+  // 0 means "unset" to FEXOfflineCompiler's code-map parser and
+  // InvalidFileId means "no file"; nudge rather than collide.
+  if (Id == 0 || Id == InvalidFileId) {
+    return 1;
+  }
+  return Id;
+}
+
+// Content-derived identity: size + the first and last 64 KiB of the file.
+//
+// The head covers the ELF header, program headers and the start of .text; the
+// tail covers the end of .text and whatever trails it. Any rebuild of a library
+// moves bytes in at least one of the two, and the size almost always changes as
+// well. A whole-file hash would be exact but would read hundreds of megabytes
+// across a Steam runtime's worth of libraries at mmap time.
+//
+// Deliberately NOT dev/ino/mtime: the same rootfs library is reached through
+// several paths (RootFS prefix, /proc/self/fd, bind mounts) and is copied
+// between machines by rootfs images, and mtime is not preserved by every
+// installer. Content is the property the cache actually depends on.
+uint64_t HashFileIdentity(std::string_view Filename, int FD) {
+  const uint64_t PathHash = XXH3_64bits(Filename.data(), Filename.size());
+  if (FD < 0) {
+    return PathHash;
+  }
+
+  // Plain stat/fstat: FEXCore is a 64-bit host component, so off_t is already
+  // 64-bit and the *64 variants would only add a glibc feature-macro dependency.
+  struct stat Stat;
+  if (::fstat(FD, &Stat) != 0 || !S_ISREG(Stat.st_mode)) {
+    return PathHash;
+  }
+
+  XXH3_state_t* State = XXH3_createState();
+  if (!State) {
+    return PathHash;
+  }
+  XXH3_64bits_reset(State);
+
+  StreamHasher Hasher {State};
+  const uint64_t FileSize = static_cast<uint64_t>(Stat.st_size);
+  Hasher.Add(FileSize);
+
+  bool Failed = false;
+  auto HashRange = [&](uint64_t Offset, uint64_t Length) {
+    uint8_t Buffer[8192];
+    uint64_t Done = 0;
+    while (Done < Length && !Failed) {
+      const size_t Want = std::min<uint64_t>(sizeof(Buffer), Length - Done);
+      const ssize_t Read = ::pread(FD, Buffer, Want, static_cast<off_t>(Offset + Done));
+      if (Read < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        Failed = true;
+        return;
+      }
+      if (Read == 0) {
+        // Shorter than stat claimed; not fatal, just stop.
+        return;
+      }
+      XXH3_64bits_update(State, Buffer, static_cast<size_t>(Read));
+      Done += static_cast<uint64_t>(Read);
+    }
+  };
+
+  constexpr uint64_t ChunkSize = 64 * 1024;
+  HashRange(0, std::min(FileSize, ChunkSize));
+  if (FileSize > 2 * ChunkSize) {
+    HashRange(FileSize - ChunkSize, ChunkSize);
+  }
+
+  const uint64_t Result = XXH3_64bits_digest(State);
+  XXH3_freeState(State);
+
+  // A failed read means we hashed an unknown prefix of the file, which is not a
+  // stable identity. Fall back rather than mint an id that depends on how far a
+  // signal-interrupted read happened to get.
+  return Failed ? PathHash : Result;
+}
+} // namespace
+
+uint64_t ComputeCodeCacheConfigId() {
+  // Computed once: config is loaded before any mapping is tracked and does not
+  // change afterwards, and every cache filename in the process must agree.
+  static const uint64_t Id = []() -> uint64_t {
+    XXH3_state_t* State = XXH3_createState();
+    if (!State) {
+      // Without a hash we cannot distinguish configurations, and silently
+      // sharing one cache namespace across configurations is the failure this
+      // whole mechanism exists to prevent. Use a value that no real
+      // configuration can produce so nothing loads.
+      return InvalidFileId;
+    }
+    XXH3_64bits_reset(State);
+    StreamHasher Hasher {State};
+
+    // 1. The FEX build. CodeCacheHeader::FEXVersion carries this too, but
+    //    hashing it into the *filename* means caches from different builds
+    //    coexist instead of one rejecting and deleting the other's file.
+    XXH3_64bits_update(State, GIT_HASH.data(), GIT_HASH.size());
+
+    // 2. Every option that changes emitted host code. When adding a codegen
+    //    option, add it here: an option missing from this list means a cache
+    //    generated with it set is loaded into a process without it, and the
+    //    difference is *executed*.
+#define HASH_OPT(NAME) Hasher.Add(static_cast<uint64_t>(FEXCore::Config::Get_##NAME()()))
+#define HASH_STR_OPT(NAME) Hasher.Add(std::string_view {FEXCore::Config::Get_##NAME()()})
+
+    // Block shape and mode.
+    HASH_OPT(IS64BIT_MODE);
+    HASH_OPT(MULTIBLOCK);
+    HASH_OPT(MAXINST);
+    HASH_OPT(O0);
+    HASH_OPT(SINGLESTEP);
+    HASH_OPT(HOSTFEATURES);
+    HASH_OPT(FORCESVEWIDTH);
+    HASH_OPT(X87REDUCEDPRECISION);
+    HASH_OPT(MONOHACKS);
+
+    // Memory model. These change the instructions emitted for essentially every
+    // guest load and store.
+    HASH_OPT(TSOENABLED);
+    HASH_OPT(LOCKONLYTSO);
+    HASH_OPT(VECTORTSOENABLED);
+    HASH_OPT(MEMCPYSETTSOENABLED);
+    HASH_OPT(HALFBARRIERTSOENABLED);
+    HASH_OPT(STRICTINPROCESSSPLITLOCKS);
+    HASH_OPT(SPLITLOCKINLINECONTAINED);
+    HASH_OPT(KERNELUNALIGNEDATOMICBACKPATCHING);
+    HASH_OPT(VOLATILEMETADATA);
+    HASH_STR_OPT(EXTENDEDVOLATILEMETADATA);
+
+    // SMC. SMCSemanticPatch in particular changes constant materialisation
+    // (fixed-width windows instead of the shortest sequence), and the cheap tier
+    // changes the block shape outright.
+    HASH_OPT(SMCCHECKS);
+    HASH_OPT(SMCSOFTINVALIDATE);
+    HASH_OPT(SMCFILEIMMUTABLE);
+    HASH_OPT(SMCLAZYINVAL);
+    HASH_OPT(SMCLAZYSCRUB);
+    HASH_OPT(SMCSTOREEMULATION);
+    HASH_OPT(SMCSEMANTICPATCH);
+    HASH_OPT(SMCSTOREBACKPATCH);
+    HASH_OPT(SMCCHEAPTIER);
+    HASH_OPT(SMCCHEAPTIERTHRESHOLD);
+    HASH_OPT(SMCCHEAPTIERMAXINST);
+    HASH_OPT(SMCMPROTECTDEFER);
+
+    // Lookup-cache shape: the dispatcher's inlined L1 probe is emitted into
+    // every block exit on this backend.
+    HASH_OPT(DISABLEL2CACHE);
+    HASH_OPT(DYNAMICL1CACHE);
+
+    // The scope option itself, because it decides whether the process runs as a
+    // cache generator (section-bounded decode, relocations retained).
+    HASH_STR_OPT(CODECACHESCOPE);
+
+    // NOT hashed: BlockLinking. JIT.cpp force-disables block linking whenever
+    // EnableCodeCachingWIP is set (see the block comment there — link thunks
+    // hold absolute host addresses with no relocation records), so the knob
+    // provably cannot change the bytes of a cache-mode compile. Do not "fix"
+    // this by enabling linking under caching.
+#undef HASH_OPT
+#undef HASH_STR_OPT
+
+    const uint64_t Result = XXH3_64bits_digest(State);
+    XXH3_freeState(State);
+    return SanitizeId(Result);
+  }();
+
+  return Id;
+}
+
 } // namespace FEXCore
 
 namespace FEXCore::Context {
+
+namespace {
+// ::write is allowed to write fewer bytes than requested and to fail with
+// EINTR. The original code ignored both, which turns a full disk or a signal
+// into a silently truncated cache file.
+bool WriteAll(int FD, const void* Data, size_t Size) {
+  const auto* Ptr = reinterpret_cast<const uint8_t*>(Data);
+  while (Size) {
+    const ssize_t Written = ::write(FD, Ptr, Size);
+    if (Written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (Written == 0) {
+      return false;
+    }
+    Ptr += Written;
+    Size -= static_cast<size_t>(Written);
+  }
+  return true;
+}
+
+uint64_t MonotonicSeconds() {
+  struct timespec TS {};
+  if (::clock_gettime(CLOCK_MONOTONIC, &TS) != 0) {
+    return 0;
+  }
+  return static_cast<uint64_t>(TS.tv_sec);
+}
+} // namespace
 
 CodeCache::CodeCache(ContextImpl& CTX_)
   : CTX(CTX_) {
@@ -244,12 +475,18 @@ CodeCache::~CodeCache() = default;
 
 uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
   if (Filename.empty()) {
-    return 0xffff'ffff'ffff'ffff;
+    return InvalidFileId;
   }
 
-  // For now, we just use the file path as an identifier.
-  // TODO: Ensure the hash is unique enough to distinguish executables while remaining independent of the installation location
-  return XXH3_64bits(Filename.data(), Filename.size());
+  // Was: XXH3 of the path string. That made cache identity a function of where
+  // a binary lives rather than what it contains, with two consequences that both
+  // end in executing wrong code rather than missing the cache:
+  //   - rebuilding or updating a library in place kept its id, so the old cache
+  //     loaded against new guest bytes;
+  //   - the same file reached through a different path (RootFS prefix vs host
+  //     path) got two ids, so caches never hit.
+  // Content identity fixes both directions. See HashFileIdentity.
+  return SanitizeId(HashFileIdentity(Filename, FD));
 }
 
 struct CodeCacheHeader {
@@ -280,86 +517,222 @@ struct CodeCacheHeader {
 template<typename T>
 concept OrderedContainer = requires { typename T::key_compare; };
 
-bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const ExecutableFileSectionInfo& SourceBinary, uint64_t SerializedBaseAddress) {
+void CodeCache::AbsorbRelocations(Core::InternalThreadState& Thread) {
+  // Pass 0 as the base: the sink stores absolute guest RIPs and each SaveData
+  // rebases its own copy. TakeRelocations subtracts the base in place and is
+  // therefore not idempotent, which is fine exactly once but wrong for a process
+  // that saves repeatedly and for more than one file.
+  auto New = Thread.CPUBackend->TakeRelocations(0);
+  if (New.empty()) {
+    return;
+  }
+
+  std::lock_guard lk {RelocationSinkMutex};
+  RelocationSink.insert(RelocationSink.end(), New.begin(), New.end());
+}
+
+void CodeCache::ResetRelocations() {
+  std::lock_guard lk {RelocationSinkMutex};
+  RelocationSink.clear();
+}
+
+bool CodeCache::WantsSave(bool IgnoreInterval) {
+  // Two independent triggers so neither a burst of compilation nor a long quiet
+  // stretch can leave an unbounded amount of work unsaved.
+  constexpr uint64_t BlocksPerSave = 2000;
+  constexpr uint64_t SecondsPerSave = 60;
+
+  if (!IsGeneratingCache) {
+    return false;
+  }
+  const uint64_t Blocks = BlocksSinceSave.load(std::memory_order_relaxed);
+  if (Blocks == 0) {
+    // Nothing new: never rewrite an identical file.
+    return false;
+  }
+  if (IgnoreInterval || Blocks >= BlocksPerSave) {
+    return true;
+  }
+
+  const uint64_t Now = MonotonicSeconds();
+  uint64_t Last = LastSaveTimeSeconds.load(std::memory_order_relaxed);
+  if (Last == 0) {
+    // First poll of the process: start the clock rather than treating "never
+    // saved" as "infinitely overdue".
+    LastSaveTimeSeconds.compare_exchange_strong(Last, Now, std::memory_order_relaxed);
+    return false;
+  }
+  return Now >= Last + SecondsPerSave;
+}
+
+void CodeCache::NotifyCachesSaved() {
+  BlocksSinceSave.store(0, std::memory_order_relaxed);
+  LastSaveTimeSeconds.store(MonotonicSeconds(), std::memory_order_relaxed);
+}
+
+bool CodeCache::SaveData(Core::InternalThreadState&, int fd, const ExecutableFileSectionInfo& SourceBinary, uint64_t SerializedBaseAddress,
+                         std::span<const GuestAddressRange> GuestRanges) {
+  auto InSelectedRanges = [&](uint64_t GuestAddress) {
+    if (GuestRanges.empty()) {
+      return true;
+    }
+    for (const auto& [Begin, End] : GuestRanges) {
+      if (GuestAddress >= Begin && GuestAddress < End) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Snapshot the code buffer and the block table under the same locks, taken in
+  // the same order, that LoadData uses. Without this a save issued from one
+  // guest thread races every other thread's compiler.
+  auto CodeBufferLock = std::unique_lock {CTX.CodeBufferWriteMutex};
   auto CodeBuffer = CTX.GetLatest();
-  auto& LookupCache = *Thread.LookupCache->Shared;
-  auto Relocations = Thread.CPUBackend->TakeRelocations(SourceBinary.FileStartVA);
+  auto& LookupCache = *CodeBuffer->LookupCache;
+  auto ReadLock = LookupCache.AcquireReadLock();
+
+  const uint64_t BufferBase = reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
+  const size_t CodeSize = CTX.LatestOffset;
+  if (CodeSize == 0) {
+    return false;
+  }
+
+  // Collect the block table first: an empty selection means there is nothing
+  // worth writing, and LoadData rejects NumBlocks == 0 anyway.
+  //
+  // Cache contents must be deterministic, so copy the unordered block list and then sort by key.
+  static_assert(!OrderedContainer<decltype(LookupCache.BlockList)>, "Already deterministic; drop temporary container");
+  fextl::vector<std::pair<uint64_t, const GuestToHostMap::BlockEntry*>> BlockList;
+  BlockList.reserve(LookupCache.BlockList.size());
+  for (auto& [Guest, BlockEntry] : LookupCache.BlockList) {
+    static_assert(sizeof(Guest) == 8, "Breaking change in code cache data layout");
+    if (!InSelectedRanges(Guest)) {
+      continue;
+    }
+    BlockList.emplace_back(Guest, &BlockEntry);
+  }
+  if (BlockList.empty()) {
+    return false;
+  }
+  std::ranges::sort(BlockList);
+
+  // Same filter for the guest code page table.
+  static_assert(OrderedContainer<decltype(LookupCache.CodePages)>, "Non-deterministic data source");
+  fextl::vector<const std::pair<const uint64_t, fextl::vector<uint64_t>>*> CodePages;
+  for (const auto& Entry : LookupCache.CodePages) {
+    if (!InSelectedRanges(Entry.first << 12)) {
+      continue;
+    }
+    CodePages.push_back(&Entry);
+  }
+
+  // Take a private copy of the code buffer before relocating it.
+  //
+  // ApplyCodeRelocations(ForStorage=true) rewrites patch sites to their
+  // position-independent form — zeroed symbol literals, guest RIPs rebased to
+  // SerializedBaseAddress. Doing that to the live buffer, as this used to, is
+  // only survivable in a process that is about to exit: at runtime it corrupts
+  // code other threads are executing right now.
+  fextl::vector<std::byte> CodeCopy(CodeSize);
+  ::memcpy(CodeCopy.data(), reinterpret_cast<const void*>(BufferBase), CodeSize);
+
+  // Copy (never take) the context-wide relocation sink, and rebase this copy
+  // against the file being written. Relocations belonging to other files are
+  // carried along and applied to bytes that this cache never registers a block
+  // for; they are dead weight in the file, not a hazard.
+  fextl::vector<FEXCore::CPU::Relocation> Relocations;
+  {
+    std::lock_guard lk {RelocationSinkMutex};
+    Relocations.assign(RelocationSink.begin(), RelocationSink.end());
+  }
+  for (auto& Reloc : Relocations) {
+    switch (Reloc.Header.Type) {
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Reloc.GuestRIP.GuestRIP -= SourceBinary.FileStartVA; break;
+    default: break;
+    }
+  }
 
   // Write file header
   CodeCacheHeader header {};
   static_assert(GIT_HASH.size() == sizeof(header.FEXVersion));
   std::ranges::copy(GIT_HASH, header.FEXVersion);
-  header.NumBlocks = LookupCache.BlockList.size();
-  header.NumCodePages = LookupCache.CodePages.size();
-  header.CodeBufferSize = CTX.LatestOffset;
+  header.NumBlocks = BlockList.size();
+  header.NumCodePages = CodePages.size();
+  header.CodeBufferSize = CodeSize;
   header.NumRelocations = Relocations.size();
   header.SerializedBaseAddress = SerializedBaseAddress;
-  ::write(fd, &header, sizeof(header));
+  if (!WriteAll(fd, &header, sizeof(header))) {
+    return false;
+  }
 
   // Dump guest<->host block mappings
-  {
-    // Cache contents must be deterministic, so copy the unordered block list and then sort by key
-    static_assert(!OrderedContainer<decltype(LookupCache.BlockList)>, "Already deterministic; drop temporary container");
-    fextl::vector<std::pair<uint64_t, const GuestToHostMap::BlockEntry*>> BlockList;
-    BlockList.reserve(LookupCache.BlockList.size());
-    for (auto& [Guest, BlockEntry] : LookupCache.BlockList) {
-      static_assert(sizeof(Guest) == 8, "Breaking change in code cache data layout");
-      BlockList.emplace_back(Guest, &BlockEntry);
+  for (auto [Guest, Host] : BlockList) {
+    static_assert(sizeof(Host->HostCode) == 8, "Breaking change in code cache data layout");
+    static_assert(sizeof(Host->CodePages[0]) == 8, "Breaking change in code cache data layout");
+
+    Guest -= SourceBinary.FileStartVA;
+    uint64_t HostCode = Host->HostCode - BufferBase;
+    // S3: write BlockBegin (buffer-relative) alongside HostCode. Format v2.
+    uint64_t BlockBegin = Host->BlockBegin - BufferBase;
+    uint64_t NumCodePages = Host->CodePages.size();
+    if (!WriteAll(fd, &Guest, sizeof(Guest)) || !WriteAll(fd, &HostCode, sizeof(HostCode)) ||
+        !WriteAll(fd, &BlockBegin, sizeof(BlockBegin)) || !WriteAll(fd, &NumCodePages, sizeof(NumCodePages))) {
+      return false;
     }
-    std::ranges::sort(BlockList);
-
-    for (auto [Guest, Host] : BlockList) {
-      static_assert(sizeof(Host->HostCode) == 8, "Breaking change in code cache data layout");
-      static_assert(sizeof(Host->CodePages[0]) == 8, "Breaking change in code cache data layout");
-
-      Guest -= SourceBinary.FileStartVA;
-      ::write(fd, &Guest, sizeof(Guest));
-      uint64_t HostCode = Host->HostCode - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
-      ::write(fd, &HostCode, sizeof(HostCode));
-      // S3: write BlockBegin (buffer-relative) alongside HostCode. Format v2.
-      uint64_t BlockBegin = Host->BlockBegin - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
-      ::write(fd, &BlockBegin, sizeof(BlockBegin));
-      uint64_t NumCodePages = Host->CodePages.size();
-      ::write(fd, &NumCodePages, sizeof(NumCodePages));
-      LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Host->CodePages), "Code pages aren't sorted");
-      for (auto CodePage : Host->CodePages) {
-        CodePage -= SourceBinary.FileStartVA;
-        ::write(fd, &CodePage, sizeof(CodePage));
+    LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Host->CodePages), "Code pages aren't sorted");
+    for (auto CodePage : Host->CodePages) {
+      CodePage -= SourceBinary.FileStartVA;
+      if (!WriteAll(fd, &CodePage, sizeof(CodePage))) {
+        return false;
       }
     }
   }
 
   // Dump relocations
   static_assert(sizeof(Relocations[0]) == 48, "Breaking change in code cache data layout");
-  ::write(fd, Relocations.data(), Relocations.size() * sizeof(Relocations[0]));
+  if (!Relocations.empty() && !WriteAll(fd, Relocations.data(), Relocations.size() * sizeof(Relocations[0]))) {
+    return false;
+  }
 
   // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load
   char Zero[64] {};
   auto Off = lseek(fd, 0, SEEK_CUR);
+  if (Off < 0) {
+    return false;
+  }
   while (Off != AlignUp(Off, Utils::FEX_PAGE_SIZE)) {
     auto BytesToWrite = std::min(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off, sizeof(Zero));
-    ::write(fd, Zero, BytesToWrite);
+    if (!WriteAll(fd, Zero, BytesToWrite)) {
+      return false;
+    }
     Off += BytesToWrite;
   }
 
   // Dump the host code (relocated for position-independent serialization)
-  std::span CodeBufferData(reinterpret_cast<std::byte*>(CodeBuffer->Ptr), reinterpret_cast<std::byte*>(CodeBuffer->Ptr) + CTX.LatestOffset);
+  std::span<std::byte> CodeBufferData {CodeCopy};
   if (!ApplyCodeRelocations(SerializedBaseAddress, CodeBufferData, Relocations, true)) {
-    LOGMAN_THROW_A_FMT(false, "Failed to apply code relocations");
+    LogMan::Msg::EFmt("Refusing to write code cache for {}: failed to apply storage relocations", SourceBinary.FileInfo.Filename);
     return false;
   }
-  ::write(fd, CodeBufferData.data(), CodeBufferData.size());
+  if (!WriteAll(fd, CodeBufferData.data(), CodeBufferData.size())) {
+    return false;
+  }
 
   // Dump code pages
-  static_assert(OrderedContainer<decltype(LookupCache.CodePages)>, "Non-deterministic data source");
-  for (const auto& [PageIndex, Entrypoints] : LookupCache.CodePages) {
+  for (const auto* Entry : CodePages) {
+    const auto& [PageIndex, Entrypoints] = *Entry;
     uint64_t PageAddr = (PageIndex << 12) - SourceBinary.FileStartVA;
-    ::write(fd, &PageAddr, sizeof(PageAddr));
     uint64_t NumEntrypoints = Entrypoints.size();
-    ::write(fd, &NumEntrypoints, sizeof(NumEntrypoints));
+    if (!WriteAll(fd, &PageAddr, sizeof(PageAddr)) || !WriteAll(fd, &NumEntrypoints, sizeof(NumEntrypoints))) {
+      return false;
+    }
     for (uint64_t Entrypoint : Entrypoints) {
       Entrypoint -= SourceBinary.FileStartVA;
-      ::write(fd, &Entrypoint, sizeof(Entrypoint));
+      if (!WriteAll(fd, &Entrypoint, sizeof(Entrypoint))) {
+        return false;
+      }
     }
   }
 
@@ -823,28 +1196,38 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   }
 
   if (EnableCodeCacheValidation) {
-    fextl::set<uint64_t> GuestBlocks, BlockBegins;
+    // S3.6: hand Validate BlockBegin (buffer-relative) alongside the entry
+    // offset, so its subspan lands at the start of the JITCodeHeader on every
+    // arch. On ppc64le the entry point is ~200-270 bytes past BlockBegin
+    // (FillStaticRegs + EmitEntryPoint sits between them), so the old
+    // `HostBlocks.begin() - sizeof(JITCodeHeader)` arithmetic landed
+    // mid-prologue and the byte-compare failed at offset 0x0 comparing
+    // unrelated instructions. BlockBegin identifies the header directly.
+    //
+    // The whole mapping (not just the two key sets it used to get) is passed so
+    // Validate can check the block table itself, not only the code it indexes.
+    fextl::map<uint64_t, CachedBlockLocation> CachedBlocks;
     for (auto& [Guest, Host] : BlockList) {
-      GuestBlocks.insert(Guest + BinarySection.FileStartVA);
-      // S3.6: pass BlockBegin (buffer-relative) instead of HostCode entry so
-      // Validate's subspan lands at the start of the JITCodeHeader on every
-      // arch. On ppc64le the entry point is ~200-270 bytes past BlockBegin
-      // (FillStaticRegs + EmitEntryPoint sits between them), so the old
-      // `HostBlocks.begin() - sizeof(JITCodeHeader)` arithmetic landed
-      // mid-prologue and the byte-compare failed at offset 0x0 comparing
-      // unrelated instructions. BlockBegin identifies the header directly.
-      BlockBegins.insert(Host.BlockBegin);
+      CachedBlocks.emplace(Guest + BinarySection.FileStartVA, CachedBlockLocation {.BlockBegin = Host.BlockBegin, .HostCode = Host.HostCode});
     }
 
-    Validate(BinarySection, std::move(GuestBlocks), BlockBegins, CodeBufferRange);
+    Validate(BinarySection, CachedBlocks, CodeBufferRange);
   }
 
   return true;
 }
 
-void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& BlockBegins,
+void CodeCache::Validate(const ExecutableFileSectionInfo& Section, const fextl::map<uint64_t, CachedBlockLocation>& CachedBlocks,
                          std::span<std::byte> CachedCode) {
-  LOGMAN_THROW_A_FMT(!BlockBegins.empty(), "Tried to validate without any host blocks");
+  LOGMAN_THROW_A_FMT(!CachedBlocks.empty(), "Tried to validate without any host blocks");
+
+  // Derived views of the block table, in the shapes the code below wants.
+  fextl::set<uint64_t> GuestBlocks;
+  fextl::set<uint64_t> BlockBegins;
+  for (const auto& [Guest, Location] : CachedBlocks) {
+    GuestBlocks.insert(Guest);
+    BlockBegins.insert(Location.BlockBegin);
+  }
   // Skip any cached data before the first block begin. BlockBegin points at
   // the JITCodeHeader on every arch (S3.6), so no per-arch arithmetic is
   // needed here — this used to be
@@ -910,6 +1293,9 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
       LogMan::Msg::EFmt("Cache validation skipped for {}: {} bytes of cached code do not fit the maximum validation code buffer ({} usable "
                         "bytes)",
                         Section.FileInfo.Filename, CachedCode.size_bytes(), NewCodeBuffer->UsableSize());
+      // Leave the validation context in the state the next call expects, like
+      // every other abandonment path does.
+      ResetValidationState();
       return;
     }
   }
@@ -933,6 +1319,73 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
                       Section.FileInfo.Filename);
     ResetValidationState();
     return;
+  }
+
+  // C1: check the guest -> host BLOCK MAPPING TABLE, not just the code it points
+  // into. Until now Validate compared bytes only, so a cache whose code was
+  // byte-perfect but whose table pointed the wrong guest address at it passed,
+  // and the mismatch was only ever discovered by executing it. LoadData's own
+  // structural check (B1) bounds the table against the code buffer and the
+  // block tails; this is the stronger statement, against a freshly compiled
+  // reference.
+  //
+  // Compared here, before the byte compare, because a mapping divergence
+  // explains a byte divergence and the reverse message reads like a codegen bug.
+  //
+  // NOTE on runtime-generated caches (CodeCacheScope != off): the reference
+  // compile walks the cached blocks in ascending guest order, which is the order
+  // FEXOfflineCompiler emitted them in but NOT the order a running guest hits
+  // them. Validation therefore only makes sense against an offline-generated
+  // cache; against a runtime-generated one the layout legitimately differs and
+  // both this check and the byte compare below will report it.
+  {
+    auto& RefMap = *ValidationThread->LookupCache->Shared;
+    const uint64_t RefBufferBase = reinterpret_cast<uintptr_t>(NewCodeBuffer->Ptr);
+    const uint64_t CachedOrigin = *BlockBegins.begin();
+
+    // The reference compile lays its blocks out from offset 0 of a fresh buffer;
+    // the cached blocks start at CachedOrigin within the loaded region (which is
+    // exactly where CachedCode was subspanned to). Normalise both to their own
+    // first block so the two layouts are comparable.
+    uint64_t RefOrigin = ~0ULL;
+    for (const auto& [Guest, Entry] : RefMap.BlockList) {
+      RefOrigin = std::min(RefOrigin, Entry.BlockBegin - RefBufferBase);
+    }
+
+    bool LayoutDiverged = false;
+    for (const auto& [Guest, Location] : CachedBlocks) {
+      auto RefIt = RefMap.BlockList.find(Guest);
+      if (RefIt == RefMap.BlockList.end()) {
+        // The compile loop above runs until every cached guest address has been
+        // compiled, so an absent entry means the reference compile produced no
+        // mapping for an address the cache claims to hold code for.
+        ERROR_AND_DIE_FMT("Cache validation failed for {}: cached block table claims guest {:#x}, which the reference compile never mapped",
+                          Section.FileInfo.Filename, Guest);
+      }
+
+      // Entry offset within its own block. Layout-order independent, so this is
+      // a statement about the table alone.
+      const uint64_t CachedEntryOffset = Location.HostCode - Location.BlockBegin;
+      const uint64_t RefEntryOffset = RefIt->second.HostCode - RefIt->second.BlockBegin;
+      if (CachedEntryOffset != RefEntryOffset) {
+        ERROR_AND_DIE_FMT("Cache validation failed for {}: guest block {:#x} enters its host block at {:#x}, but a fresh compile of the same "
+                          "block enters at {:#x}",
+                          Section.FileInfo.Filename, Guest, CachedEntryOffset, RefEntryOffset);
+      }
+
+      // Position of the block within the buffer. Order-dependent, and the byte
+      // compare below already assumes the two layouts agree — so report it here
+      // (where it is diagnosable) and let the byte compare be the thing that
+      // fails.
+      const uint64_t CachedRel = Location.BlockBegin - CachedOrigin;
+      const uint64_t RefRel = (RefIt->second.BlockBegin - RefBufferBase) - RefOrigin;
+      if (CachedRel != RefRel && !LayoutDiverged) {
+        LayoutDiverged = true;
+        LogMan::Msg::EFmt("Cache validation for {}: block layout diverges at guest {:#x} — cached at buffer offset {:#x}, reference at {:#x}. "
+                          "The byte comparison below is comparing unrelated blocks from this point on.",
+                          Section.FileInfo.Filename, Guest, CachedRel, RefRel);
+      }
+    }
   }
 
   // Size the reference span to what the reference compile actually emitted, not
@@ -1032,6 +1485,18 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     ERROR_AND_DIE_FMT("Cache validation failed at offset {:#x}: {:02x} <-> {:02x} (at {} <-> {}, guest block {})", Idx,
                       fmt::join(CachedCode.subspan(Idx, ContextSize), ""), fmt::join(CodeBufferRangeRef.subspan(Idx, ContextSize), ""),
                       fmt::ptr(CachedCode.data()), fmt::ptr(CodeBufferRangeRef.data()), GuestBlockInfo);
+  }
+
+  if (RefSize > CachedSize) {
+    // C2: length equality, in the direction where a difference can only be a
+    // defect. The reference compile of exactly the cached blocks emitted MORE
+    // bytes than the cache holds, so the cache is short of code it needs: the
+    // prefix matched only because the divergence lies past the end of the file.
+    // Nothing legitimate produces this — the benign asymmetry documented below
+    // is the cache being longer, never shorter. Fatal, like a byte mismatch.
+    ERROR_AND_DIE_FMT("Cache validation failed for {}: the reference compile emitted {:#x} bytes for the cached blocks, but the cache only "
+                      "holds {:#x}. The {:#x} byte common prefix matched, so the divergence is past the end of the cached code.",
+                      Section.FileInfo.Filename, RefSize, CachedSize, CommonSize);
   }
 
   if (RefSize != CachedSize) {
