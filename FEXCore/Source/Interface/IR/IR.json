@@ -2336,6 +2336,38 @@
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize << 1"
       },
+      "FPR = VMaddPairwise16 OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
+        "Desc": [ "Signed 16-bit pairwise multiply-accumulate into 32-bit lanes — exactly x86 PMADDWD.",
+                  "dst[i] = (v1[2i] * v2[2i]) + (v1[2i+1] * v2[2i+1]), computed modulo 2^32.",
+                  "ElementSize is the *source* element size (always 16-bit); the destination",
+                  "element size is twice that.",
+                  "PPC64LE-only: the OpcodeDispatcher only emits this under ARCHITECTURE_ppc64le,",
+                  "where it lowers to a single vmsumshm with a zero addend. Other backends keep",
+                  "the generic VSMull/VSMull2/VAddP decomposition, so this op is marked",
+                  "JITDispatch:false and is wired up by hand in the PPC64LE JIT's op table."
+                ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "ElementSize << 1",
+        "JITDispatch": false
+      },
+      "GPR = VExtractSignBits OpSize:#RegisterSize, FPR:$Vector, u8:$NumElements": {
+        "Desc": [ "Gathers the sign bit of every element into the low bits of a GPR.",
+                  "Result bit k = sign bit of element k; all higher bits are zero.",
+                  "This is the whole of x86 PMOVMSKB / MOVMSKPS / MOVMSKPD.",
+                  "The shape is described entirely by NumElements — 16 and 8 are byte elements",
+                  "(XMM and MMX PMOVMSKB), 4 is 32-bit (MOVMSKPS), 2 is 64-bit (MOVMSKPD).",
+                  "It is carried as a field rather than taken from the header because the",
+                  "header only keeps the *destination* size, which is always a GPR: a 64-bit",
+                  "MMX PMOVMSKB would otherwise be indistinguishable from the 128-bit form and",
+                  "would return eight bits of garbage from the undefined upper half.",
+                  "PPC64LE-only: the OpcodeDispatcher only emits this under ARCHITECTURE_ppc64le,",
+                  "where it lowers to a vbpermq with an lvsl-built control vector. Other backends",
+                  "keep their existing multi-op sequences, so this op is marked JITDispatch:false",
+                  "and is wired up by hand in the PPC64LE JIT's op table."
+                ],
+        "DestSize": "OpSize::i32Bit",
+        "JITDispatch": false
+      },
       "FPR = VUMulH OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
         "Desc": "Wide unsigned multiply returning the high results",
         "DestSize": "RegisterSize",

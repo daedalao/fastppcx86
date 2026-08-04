@@ -788,6 +788,15 @@ void OpDispatchBuilder::MOVMSKOp(OpcodeArgs, IR::OpSize ElementSize) {
 
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
 
+#ifdef ARCHITECTURE_ppc64le
+  // POWER8 vbpermq gathers all sixteen sign bits in one instruction; see
+  // DEF_OP(VExtractSignBits). Both 128-bit shapes collapse to it.
+  if (Size == OpSize::i128Bit && (ElementSize == OpSize::i64Bit || ElementSize == OpSize::i32Bit)) {
+    StoreResultGPR_WithOpSize(Op, Op->Dest, _VExtractSignBits(Size, Src, NumElements), GetGPROpSize());
+    return;
+  }
+#endif
+
   if (Size == OpSize::i128Bit && ElementSize == OpSize::i64Bit) {
     // UnZip2 the 64-bit elements as 32-bit to get the sign bits closer.
     // Sign bits are now in bit positions 31 and 63 after this.
@@ -838,6 +847,19 @@ void OpDispatchBuilder::MOVMSKOpOne(OpcodeArgs) {
   const auto ExtractSize = Is256Bit ? OpSize::i32Bit : OpSize::i16Bit;
 
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+#ifdef ARCHITECTURE_ppc64le
+  // PMOVMSKB is one vbpermq on POWER8 (see DEF_OP(VExtractSignBits)). glibc's
+  // string routines run this on every loop iteration, so the old
+  // VCMPLTZ/VAnd/3x VAddP chain — well over a hundred host instructions once
+  // each VAddP's vperm control is materialised — is worth removing.
+  // The 256-bit (VEX) shape is handled by AVX128_MOVMSKB, not here.
+  if (SrcSize == OpSize::i64Bit || SrcSize == OpSize::i128Bit) {
+    StoreResultGPR(Op, _VExtractSignBits(SrcSize, Src, IR::NumElements(SrcSize, OpSize::i8Bit)));
+    return;
+  }
+#endif
+
   Ref VMask = LoadAndCacheNamedVectorConstant(SrcSize, NAMED_VECTOR_MOVMASKB);
 
   auto VCMP = _VCMPLTZ(SrcSize, OpSize::i8Bit, Src);
@@ -3311,6 +3333,15 @@ Ref OpDispatchBuilder::PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
   //              xmm1[63:32] = (xmm1[47:32] * xmm2[47:32]) + (xmm1[63:48] * xmm2[63:48])
   //              etc.. for larger registers
 
+#ifdef ARCHITECTURE_ppc64le
+  // POWER8's vmsumshm is PMADDWD: signed 16x16 pairwise multiply-accumulate
+  // into 32-bit lanes with modulo (not saturating) accumulation, so the
+  // 0x8000*0x8000 + 0x8000*0x8000 = 0x80000000 wrap matches x86 bit for bit.
+  // The generic decomposition below costs ~64 host instructions on PPC64LE
+  // because each of VSMull/VSMull2/VAddP builds a vperm control vector from
+  // scratch; the direct op is one instruction plus a zero.
+  return _VMaddPairwise16(Size, OpSize::i16Bit, Src1, Src2);
+#else
   if (Size == OpSize::i64Bit) {
     // MMX implementation can be slightly more optimal
     Size = Size >> 1;
@@ -3323,6 +3354,7 @@ Ref OpDispatchBuilder::PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
 
   // [15:0 ] + [31:16], [32:47 ] + [63:48  ], [79:64] + [95:80], [111:96] + [127:112]
   return _VAddP(Size, OpSize::i32Bit, Lower, Upper);
+#endif
 }
 
 void OpDispatchBuilder::PMADDWD(OpcodeArgs) {

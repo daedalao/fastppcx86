@@ -3041,6 +3041,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 #define IROP_DISPATCH_DISPATCH
 #include <FEXCore/IR/IRDefines_Dispatch.inc>
 
+    // PPC64LE-only vector ops. IR.json marks them JITDispatch:false (they are
+    // emitted by the OpcodeDispatcher only under ARCHITECTURE_ppc64le, so no
+    // other backend has to grow a lowering), which keeps them out of
+    // IRDefines_Dispatch.inc — wire them up explicitly.
+    REGISTER_OP(VMADDPAIRWISE16,   VMaddPairwise16);
+    REGISTER_OP(VEXTRACTSIGNBITS,  VExtractSignBits);
+
     // x87 stack-bookkeeping ops (X87Ops.cpp). These are NOT in the
     // auto-generated IRDefines_Dispatch.inc — IR.json marks them as JIT-not-
     // dispatched (intended to be lowered by x87StackOptimizationPass) — but
