@@ -1859,11 +1859,18 @@ void Decoder::DetectSpinLoops() {
     return IsDirectGPR(Inst->Dest) && Inst->Dest.Data.GPR.GPR == Reg;
   };
 
-  // A positive-constant-step "ADD reg, imm" (group1 imm forms carry a literal
-  // Src; register-source ADDs don't qualify as a recognizable step).
+  // A positive-constant-step "ADD reg, imm". Group1 imm forms decode as
+  // Dest = reg, Src[0] = reg (same register), Src[1] = literal; accept a
+  // literal in either source slot. Register-source ADDs don't qualify.
   auto IsConstStepAdd = [&](const DecodedInst* Inst, uint8_t Reg) {
-    return Inst->TableInfo->Name && std::string_view {Inst->TableInfo->Name} == "ADD" && IsDirectGPR(Inst->Dest) &&
-           Inst->Dest.Data.GPR.GPR == Reg && Inst->Src[0].IsLiteral() && static_cast<int64_t>(Inst->Src[0].Literal()) > 0;
+    if (!(Inst->TableInfo->Name && std::string_view {Inst->TableInfo->Name} == "ADD" && IsDirectGPR(Inst->Dest) && Inst->Dest.Data.GPR.GPR == Reg)) {
+      return false;
+    }
+    // The literal sits in Src[0] or Src[1] depending on the form; group1 ops
+    // additionally leave a group-selector artifact in Src[0] that reads as a
+    // GPR, so no constraint is placed on the non-literal source slot.
+    const DecodedOperand* Imm = Inst->Src[0].IsLiteral() ? &Inst->Src[0] : Inst->Src[1].IsLiteral() ? &Inst->Src[1] : nullptr;
+    return Imm && static_cast<int64_t>(Imm->Data.Literal.Value) > 0;
   };
 
   for (auto& [BranchPC, Branch] : ByPC) {
