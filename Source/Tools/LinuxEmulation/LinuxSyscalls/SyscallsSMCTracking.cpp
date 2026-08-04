@@ -467,6 +467,20 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // argument above (record-before-unprotect) intact and unentangled.
       if (_SyscallHandler->SMCLazyScrubActive()) {
         Thread->CTX->ScrubThreadLookupCacheForLazySMC(Thread);
+
+        // FEX_SMCLAZYLINK: with block linking live, an empty L1 is NOT enough —
+        // a linked chain branches block-to-block without ever probing. Arm this
+        // thread's InterruptFaultPage: every block entry (linked arrivals
+        // included — links target entries) executes the fault-page poke, so the
+        // very next block transfer faults into SignalDelegator's fault-page
+        // branch, which settles the drain debt before anything else translated
+        // runs. The deferral machinery tolerates this spurious arming by
+        // design: with no deferred signals queued it unprotects, drains, and
+        // resumes. mprotect from a signal handler is the same call the
+        // delegator itself makes on this page.
+        if (_SyscallHandler->SMCLazyLinkActive()) {
+          mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+        }
       }
 
       if (FirstThisEpoch) {

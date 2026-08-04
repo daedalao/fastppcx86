@@ -1170,6 +1170,19 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
       mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_READ | PROT_WRITE);
 
+      // FEX_SMCLAZYLINK: the SMC fault handler arms this page after a lazy
+      // deferral, because with block linking live the fault-page poke at block
+      // entry is the only trap a linked chain cannot skip. Settle the drain
+      // debt BEFORE any resume path below — including the "no signals queued"
+      // return — or the thread could re-enter a linked chain and reach a stale
+      // translation of code it wrote itself. Unprotect-first ordering above is
+      // load-bearing: the drain compiles/relinks nothing, but the thread's
+      // next entry poke must not re-fault into a loop. No-op (one relaxed
+      // load) unless the lazy-link mode armed it.
+      if (FEX::HLE::_SyscallHandler && FEX::HLE::_SyscallHandler->SMCLazyLinkActive()) {
+        Thread->CTX->SettleLazySMCDrainIfPending(Thread);
+      }
+
       if (ThreadObject->SignalInfo.DeferredSignalFrames.empty()) {
         // No signals to defer. Just set the fault page back to RW and continue execution.
         // This occurs as a minor race condition between the refcount decrement and the access to the fault page.

@@ -246,6 +246,7 @@ public:
   FEX_CONFIG_OPT(SMCFileImmutable, SMCFILEIMMUTABLE);
   FEX_CONFIG_OPT(SMCLazyInval, SMCLAZYINVAL);
   FEX_CONFIG_OPT(SMCLazyScrub, SMCLAZYSCRUB);
+  FEX_CONFIG_OPT(SMCLazyLink, SMCLAZYLINK);
   FEX_CONFIG_OPT(NeedsSeccomp, NEEDSSECCOMP);
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
   FEX_CONFIG_OPT(CodeCacheScopeStr, CODECACHESCOPE);
@@ -590,6 +591,16 @@ public:
 
   bool SMCLazyScrubActive() const {
     return SMCLazyScrubEnabled.load(std::memory_order_relaxed);
+  }
+
+  // FEX_SMCLAZYLINK. Set only if lazy + scrub came up AND block linking is in
+  // play (no semantic patch). When active, the SMC fault handler arms the
+  // faulting thread's InterruptFaultPage so a linked block chain still drains
+  // at its next block entry; see SMCLazyInvalidate.h "LINKING UNDER LAZY".
+  std::atomic<bool> SMCLazyLinkEnabled {false};
+
+  bool SMCLazyLinkActive() const {
+    return SMCLazyLinkEnabled.load(std::memory_order_relaxed);
   }
 
   // Records a page as dirty-but-not-invalidated. Returns true if this is the

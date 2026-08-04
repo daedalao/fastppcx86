@@ -974,6 +974,18 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
     // it drain in the lookup slow path, which closes the same-thread
     // patch-then-call hole. Only meaningful once lazy is actually armed.
     SMCLazyScrubEnabled.store(SMCLazyScrub(), std::memory_order_relaxed);
+    // FEX_SMCLAZYLINK: fault-page-armed drains for linked chains. Only arms if
+    // the scrub (the guarantee being extended) is itself on, and never with
+    // semantic patch (which keeps linking hard-off in the JIT regardless —
+    // see PPC64JITCore BlockLinkingEnabled). The JIT makes the matching
+    // decision from the same three options; keep the predicates in sync.
+    if (SMCLazyLink() && SMCLazyScrub() && !SMCSemanticPatch()) {
+      SMCLazyLinkEnabled.store(true, std::memory_order_relaxed);
+      LogMan::Msg::IFmt("FEX_SMCLAZYLINK armed: SMC faults will arm the writer's InterruptFaultPage so "
+                        "linked block chains drain at their next block entry.");
+    } else if (SMCLazyLink()) {
+      LogMan::Msg::EFmt("FEX_SMCLAZYLINK needs FEX_SMCLAZYSCRUB=1 and no FEX_SMCSEMANTICPATCH; staying off.");
+    }
     if (SMCLazyScrub()) {
       LogMan::Msg::IFmt("FEX_SMCLAZYINVAL is ON: SMC invalidation is deferred to drain points. Same-thread "
                         "self-modifying code stays correct via FEX_SMCLAZYSCRUB; cross-thread modification "

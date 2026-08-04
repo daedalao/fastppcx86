@@ -1487,6 +1487,20 @@ void ContextImpl::ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThread
   Thread->LookupCache->ScrubForLazySMC();
 }
 
+void ContextImpl::SettleLazySMCDrainIfPending(FEXCore::Core::InternalThreadState* Thread) {
+  // FEX_SMCLAZYLINK. Same consume-then-drain sequence as the copy in
+  // PPC64JITCore::ExitFunctionLink, reachable from the frontend's fault-page
+  // SIGSEGV branch — the one trap a linked block chain cannot skip. Runs at a
+  // block-entry boundary (the poke is the block's first instruction), so guest
+  // state is consistent and the drain's lock acquisition is as legal here as
+  // it is on the lookup slow path.
+  if (Thread->LookupCache->TakeLazySMCDrainPending()) {
+    if (auto* LazyCount = SyscallHandler->LazySMCDirtyCount; LazyCount && LazyCount->load(std::memory_order_acquire) != 0) {
+      SyscallHandler->DrainLazySMCInvalidations(Thread);
+    }
+  }
+}
+
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
 }

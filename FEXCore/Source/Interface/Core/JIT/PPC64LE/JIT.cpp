@@ -2255,12 +2255,22 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   //  * FEX_SMCLAZYINVAL's soundness (FEX_SMCLAZYSCRUB) forces the faulting
   //    thread's next dispatch through ExitFunctionLink to drain; a linked exit
   //    skips ExitFunctionLink entirely, reopening the same-thread stale hole.
+  //    EXCEPT under FEX_SMCLAZYLINK: there the SMC fault handler additionally
+  //    arms the writer's InterruptFaultPage, and the per-EntryPoint fault-page
+  //    poke (EmitSuspendInterruptCheck — executed by linked arrivals too,
+  //    since links target block entries) faults the thread into a drain at its
+  //    next block transfer. See SignalDelegator's fault-page branch.
   // Soft-invalidate alone stays compatible with linking: it severs inbound
   // links via SeverBlockLinks(), same as legacy Erase.
-  if (BlockLinkingEnabled && (CTX->Config.SMCSemanticPatch() || FEXCore::Config::Get_SMCLAZYINVAL())) {
+  const bool LazyLinkArmed = FEXCore::Config::Get_SMCLAZYLINK() && FEXCore::Config::Get_SMCLAZYSCRUB() && !CTX->Config.SMCSemanticPatch();
+  if (BlockLinkingEnabled && (CTX->Config.SMCSemanticPatch() || (FEXCore::Config::Get_SMCLAZYINVAL() && !LazyLinkArmed))) {
     LogMan::Msg::IFmt("BlockLinking disabled: incompatible with FEX_SMCSEMANTICPATCH/FEX_SMCLAZYINVAL "
-                      "(both need every constant-target exit to re-probe the lookup path).");
+                      "(both need every constant-target exit to re-probe the lookup path; "
+                      "FEX_SMCLAZYLINK=1 lifts the LAZYINVAL restriction).");
     BlockLinkingEnabled = false;
+  } else if (BlockLinkingEnabled && FEXCore::Config::Get_SMCLAZYINVAL() && LazyLinkArmed) {
+    LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
+                      "same-thread drains ride the InterruptFaultPage poke.");
   }
 
   // Point the JIT's helper-address table at the static array in VectorOps.cpp.

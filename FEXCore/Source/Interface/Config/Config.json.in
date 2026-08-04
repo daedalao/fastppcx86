@@ -563,6 +563,24 @@
           "thread can execute a STALE translation of code it just wrote."
         ]
       },
+      "SMCLazyLink": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Only meaningful with SMCLazyInval=1 + SMCLazyScrub=1. Keep block",
+          "linking (direct block-to-block branches) enabled under lazy SMC",
+          "invalidation instead of hard-disabling it. The same-thread soundness",
+          "guarantee normally relies on every block exit re-probing the lookup",
+          "path; linked exits skip it, so this option additionally arms the",
+          "writing thread's InterruptFaultPage at SMC fault time — the fault-",
+          "page poke every block entry executes (including entries reached by",
+          "linked branches) then faults, and the deferred-drain debt is settled",
+          "in that handler before any further translated code runs. Costs one",
+          "extra mprotect + one extra fault per lazy SMC fault, on the writer",
+          "only. Incompatible with SMCSemanticPatch (linking stays off there:",
+          "a patched exit immediate does not retarget an already-linked branch)."
+        ]
+      },
       "SMCStoreEmulation": {
         "Type": "bool",
         "Default": "false",

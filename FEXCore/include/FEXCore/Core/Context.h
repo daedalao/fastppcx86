@@ -179,6 +179,16 @@ public:
    * Source/Tools/LinuxEmulation/LinuxSyscalls/SMCLazyInvalidate.h.
    */
   FEX_DEFAULT_VISIBILITY virtual void ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThreadState* Thread) = 0;
+
+  /**
+   * @brief FEX_SMCLAZYLINK: consume this thread's pending lazy-SMC drain debt,
+   * if any, and run the drain. Called from the frontend's InterruptFaultPage
+   * SIGSEGV branch — with block linking live under lazy invalidation, the
+   * fault page is the only trap a linked chain cannot skip, so the drain must
+   * be settled here before translated code resumes. Takes the same locks the
+   * ExitFunctionLink drain does; only call at a block-entry fault boundary.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void SettleLazySMCDrainIfPending(FEXCore::Core::InternalThreadState* Thread) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void
