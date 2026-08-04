@@ -825,9 +825,25 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
 
-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
-          Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
-        }
+        // Emit a RIP-table marker for EVERY instruction, not just those with
+        // side effects. ROOT CAUSE of the Ziggurat finalize spin
+        // (docs/ZIGGURAT_FINALIZE_SPIN.md): with sparse markers,
+        // RestoreRIPFromHostPC rounds a signal-time host PC DOWN to the last
+        // marked instruction, and sigreturn then RE-EXECUTES everything
+        // between that marker and the true interrupt point. Re-running a
+        // non-idempotent register op — the observed case is `add rbx, 4`
+        // replayed after a GC-storm signal landed in the unmarked `cmp`
+        // that follows it — double-steps the induction variable past an
+        // exact-equality loop exit, which then never fires again.
+        // Side-effect-free ops are precisely the ones the old gate skipped
+        // AND the ones whose re-execution is unsafe from an earlier marker,
+        // so the gate was backwards for signal precision. Per-instruction
+        // markers make resume instruction-granular: only the interrupted
+        // instruction restarts, from its own start, before its architectural
+        // commit is observable. Marker cost is 1-2 vl64pair bytes per
+        // instruction in the block tail and no emitted host code
+        // (DEF_OP(GuestOpcode) only records the cursor).
+        Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
           // Evidence gate for the accumulator-vs-decoder-PC audit: use
