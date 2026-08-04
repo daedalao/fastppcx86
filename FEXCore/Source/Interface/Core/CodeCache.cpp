@@ -24,6 +24,8 @@
 
 #include <cerrno>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -493,8 +495,13 @@ struct CodeCacheHeader {
   std::array<char, 4> Magic = ExpectedMagic;
   // Bump on any on-disk layout change so stale caches are rejected rather
   // than misread. Bumped from 1 -> 2 by S3 (BlockBegin added to each
-  // BlockList entry between HostCode and NumGuestPages).
-  uint32_t FormatVersion = 2;
+  // BlockList entry between HostCode and NumGuestPages). Bumped 2 -> 3 when
+  // SaveData stopped serializing the whole code buffer and started packing
+  // only the host blocks belonging to the file being written: the field layout
+  // is unchanged, but every HostCode/BlockBegin/relocation offset in a v3 file
+  // is relative to the *packed image*, not to the generating process's code
+  // buffer, so reading a v2 file as v3 would index the wrong bytes.
+  uint32_t FormatVersion = 3;
   uint8_t FEXVersion[20] = {};
   uint32_t NumBlocks;
   uint32_t NumCodePages;
@@ -627,40 +634,261 @@ bool CodeCache::SaveData(Core::InternalThreadState&, int fd, const ExecutableFil
     CodePages.push_back(&Entry);
   }
 
-  // Take a private copy of the code buffer before relocating it.
+  // ---------------------------------------------------------------------
+  // Pack the host code belonging to *this file* (format v3).
   //
-  // ApplyCodeRelocations(ForStorage=true) rewrites patch sites to their
-  // position-independent form — zeroed symbol literals, guest RIPs rebased to
-  // SerializedBaseAddress. Doing that to the live buffer, as this used to, is
-  // only survivable in a process that is about to exit: at runtime it corrupts
-  // code other threads are executing right now.
-  fextl::vector<std::byte> CodeCopy(CodeSize);
-  ::memcpy(CodeCopy.data(), reinterpret_cast<const void*>(BufferBase), CodeSize);
+  // This used to serialize the entire live code buffer and let the loader
+  // filter the block table afterwards. Two consequences, both fatal:
+  //
+  //  - Size. Every library's cache file carried every other library's code,
+  //    so a Ziggurat run wrote ~30 files of ~134 MB each (4.7 GB) whose
+  //    contents were almost entirely duplicates.
+  //  - Load. header.CodeBufferSize was the whole generating buffer, so the
+  //    second cache loaded into a process could not fit beside the first:
+  //    LoadData grew the code buffer, hit MAX_CODE_SIZE, and took the
+  //    "Refusing to spin re-allocating it" ERROR_AND_DIE. That is the SIGTRAP
+  //    at ~0.2s into a cache-loading run.
+  //
+  // Instead, walk the selected blocks, take each one's exact host extent from
+  // its JITCodeTail ([BlockBegin, BlockBegin + Tail->Size), which the JIT
+  // already 16-byte aligns and sizes to include the tail and its RIP entries),
+  // merge those extents, and emit only them. Every offset written below —
+  // HostCode, BlockBegin and each relocation site — is then relative to that
+  // packed image rather than to the generating code buffer.
+  //
+  // Correctness rests on cached host blocks being position-independent apart
+  // from their recorded relocations, which is already required for the cache
+  // to work at all and is why block linking is force-disabled while caching.
+  struct PackRegion {
+    uint64_t Begin;    // offset in the live code buffer
+    uint64_t End;      // exclusive
+    uint64_t NewBegin; // offset in the packed image
+  };
+  constexpr uint64_t kBlockAlignment = 16;
+  constexpr uint64_t HeaderSize = sizeof(CPU::CPUBackend::JITCodeHeader);
+  constexpr uint64_t TailSize = sizeof(CPU::CPUBackend::JITCodeTail);
 
-  // Copy (never take) the context-wide relocation sink, and rebase this copy
-  // against the file being written. Relocations belonging to other files are
-  // carried along and applied to bytes that this cache never registers a block
-  // for; they are dead weight in the file, not a hazard.
-  fextl::vector<FEXCore::CPU::Relocation> Relocations;
+  // Host extent of one block, or nullopt when the block does not describe
+  // itself consistently. Reading the live buffer is safe here: the code buffer
+  // write lock is held, so no compiler is moving these bytes.
+  auto BlockExtent = [&](uint64_t BlockBeginAbs) -> std::optional<std::pair<uint64_t, uint64_t>> {
+    if (BlockBeginAbs < BufferBase) {
+      return std::nullopt;
+    }
+    const uint64_t Begin = BlockBeginAbs - BufferBase;
+    if (Begin >= CodeSize || CodeSize - Begin < HeaderSize) {
+      return std::nullopt;
+    }
+    const auto* BlockHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BufferBase + Begin);
+    const uint64_t TailOffset = Begin + BlockHeader->OffsetToBlockTail;
+    if (TailOffset < Begin || CodeSize < TailSize || TailOffset > CodeSize - TailSize) {
+      return std::nullopt;
+    }
+    const auto* Tail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(BufferBase + TailOffset);
+    const uint64_t Size = Tail->Size;
+    if (Size < HeaderSize || Size > CodeSize - Begin) {
+      return std::nullopt;
+    }
+    // Tail (and its trailing RIP entries) must be inside the extent, otherwise
+    // the packed copy would drop bytes the loader's own validation reads.
+    if (TailOffset + TailSize > Begin + Size) {
+      return std::nullopt;
+    }
+    return std::pair {Begin, Begin + Size};
+  };
+
+  // Offsets of every named-thunk move in the buffer, sorted.
+  //
+  // A block containing one is not cacheable. The relocation materializes the
+  // *host* address of a thunk, which ApplyCodeRelocations resolves through
+  // ThunkHandler::LookupThunk when the cache is loaded — and a cache is loaded
+  // the moment its library is mapped, which for the thunk libraries themselves
+  // is long before the guest side has registered anything. LookupThunk then
+  // returns nullptr, the site is patched with 0, and the first execution of
+  // that block calls address 0. (Observed as a SIGSEGV at pc=0 with the
+  // preceding `lis/ori/sldi/oris/ori` window all zeroes.) Compiling the block
+  // instead costs one compile and is always correct, because at compile time
+  // the guest is by definition already running the thunked call.
+  fextl::vector<uint64_t> ThunkRelocOffsets;
   {
     std::lock_guard lk {RelocationSinkMutex};
-    Relocations.assign(RelocationSink.begin(), RelocationSink.end());
-  }
-  for (auto& Reloc : Relocations) {
-    switch (Reloc.Header.Type) {
-    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
-    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Reloc.GuestRIP.GuestRIP -= SourceBinary.FileStartVA; break;
-    default: break;
+    for (const auto& Reloc : RelocationSink) {
+      if (Reloc.Header.Type == FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE) {
+        ThunkRelocOffsets.push_back(Reloc.Header.Offset);
+      }
     }
+  }
+  std::ranges::sort(ThunkRelocOffsets);
+  auto ContainsThunkReloc = [&](uint64_t Begin, uint64_t End) {
+    auto It = std::ranges::lower_bound(ThunkRelocOffsets, Begin);
+    return It != ThunkRelocOffsets.end() && *It < End;
+  };
+
+  fextl::vector<PackRegion> Regions;
+  fextl::vector<uint64_t> UncacheableBlockBegins;
+  for (auto [Guest, Host] : BlockList) {
+    auto Extent = BlockExtent(Host->BlockBegin);
+    if (!Extent) {
+      continue;
+    }
+    if (ContainsThunkReloc(Extent->first, Extent->second)) {
+      UncacheableBlockBegins.push_back(Extent->first);
+      continue;
+    }
+    Regions.push_back({.Begin = Extent->first, .End = Extent->second, .NewBegin = 0});
+  }
+  std::ranges::sort(UncacheableBlockBegins);
+  if (Regions.empty()) {
+    return false;
+  }
+  std::ranges::sort(Regions, {}, &PackRegion::Begin);
+  {
+    // Merge overlapping/duplicate extents. Distinct entry points of one
+    // multiblock compile share a BlockBegin, so duplicates are the common case.
+    fextl::vector<PackRegion> Merged;
+    for (const auto& R : Regions) {
+      if (!Merged.empty() && R.Begin <= Merged.back().End) {
+        Merged.back().End = std::max(Merged.back().End, R.End);
+      } else {
+        Merged.push_back(R);
+      }
+    }
+    Regions = std::move(Merged);
+  }
+
+  // Build the packed image, assigning each region its offset within it. Region
+  // starts stay 16-byte aligned because the loader always places the image at a
+  // page-aligned offset, and the JIT requires 16-byte aligned blocks.
+  fextl::vector<std::byte> CodeCopy;
+  {
+    uint64_t Total = 0;
+    for (const auto& R : Regions) {
+      Total = AlignUp(Total, kBlockAlignment) + (R.End - R.Begin);
+    }
+    CodeCopy.reserve(Total);
+  }
+  for (auto& R : Regions) {
+    CodeCopy.resize(AlignUp(CodeCopy.size(), kBlockAlignment));
+    R.NewBegin = CodeCopy.size();
+    const auto* Src = reinterpret_cast<const std::byte*>(BufferBase + R.Begin);
+    CodeCopy.insert(CodeCopy.end(), Src, Src + (R.End - R.Begin));
+  }
+  if (CodeCopy.empty() || CodeCopy.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  // Live code buffer offset -> packed image offset. nullopt when the offset is
+  // not part of any emitted region, which is the signal to drop whatever
+  // referenced it rather than to write a dangling offset.
+  auto Remap = [&](uint64_t Offset) -> std::optional<uint64_t> {
+    auto It = std::ranges::upper_bound(Regions, Offset, std::less {}, &PackRegion::Begin);
+    if (It == Regions.begin()) {
+      return std::nullopt;
+    }
+    --It;
+    if (Offset >= It->End) {
+      return std::nullopt;
+    }
+    return It->NewBegin + (Offset - It->Begin);
+  };
+
+  // Rewrite the block table into packed-image coordinates. A block whose
+  // BlockBegin or HostCode did not survive packing is dropped; it is better to
+  // ship one fewer cached block than an offset that indexes the wrong bytes.
+  struct PackedBlock {
+    uint64_t Guest;
+    uint64_t HostCode;
+    uint64_t BlockBegin;
+    const fextl::vector<uint64_t>* CodePages;
+  };
+  fextl::vector<PackedBlock> PackedBlocks;
+  PackedBlocks.reserve(BlockList.size());
+  for (auto [Guest, Host] : BlockList) {
+    if (Host->BlockBegin < BufferBase || Host->HostCode < BufferBase) {
+      continue;
+    }
+    if (std::ranges::binary_search(UncacheableBlockBegins, Host->BlockBegin - BufferBase)) {
+      // Thunk-carrying block, see above. Remap would reject it anyway (its
+      // extent was never emitted); rejecting it by name keeps that an explicit
+      // decision rather than a consequence of region adjacency.
+      continue;
+    }
+    auto NewBlockBegin = Remap(Host->BlockBegin - BufferBase);
+    auto NewHostCode = Remap(Host->HostCode - BufferBase);
+    if (!NewBlockBegin || !NewHostCode) {
+      continue;
+    }
+    PackedBlocks.push_back({
+      .Guest = Guest,
+      .HostCode = *NewHostCode,
+      .BlockBegin = *NewBlockBegin,
+      .CodePages = &Host->CodePages,
+    });
+  }
+  if (PackedBlocks.empty()) {
+    return false;
+  }
+
+  // Copy (never take) the context-wide relocation sink, keep only the sites
+  // that landed inside the packed regions, and rebase those against the file
+  // being written.
+  //
+  // The filter is load-bearing in both directions: it drops relocations
+  // belonging to other files (which used to be written out and then applied
+  // with *this* file's base) and it guarantees every surviving Header.Offset
+  // addresses bytes this file actually ships.
+  fextl::vector<FEXCore::CPU::Relocation> Relocations;
+  {
+    // Width of the patch window each relocation type rewrites; the whole window
+    // has to be inside one region or the patch would run off the end of the
+    // copied block. Mirrors the widths ApplyCodeRelocations writes.
+    auto RelocWidth = [](FEXCore::CPU::RelocationTypes Type) -> uint64_t {
+      switch (Type) {
+      case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+      case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: return sizeof(uint64_t);
+      default:
+#ifdef ARCHITECTURE_ppc64le
+        return PPC64Emitter::Emitter::LoadConstantFixedBytes;
+#else
+        // Arm64Emitter::LoadConstant with DOPAD emits a fixed 4-instruction move.
+        return 4 * sizeof(uint32_t);
+#endif
+      }
+    };
+
+    std::lock_guard lk {RelocationSinkMutex};
+    Relocations.reserve(RelocationSink.size());
+    uint64_t DroppedByType[4] {};
+    for (const auto& Reloc : RelocationSink) {
+      const uint64_t Width = RelocWidth(Reloc.Header.Type);
+      auto NewOffset = Remap(Reloc.Header.Offset);
+      auto NewLast = Remap(Reloc.Header.Offset + Width - 1);
+      if (!NewOffset || !NewLast || *NewLast - *NewOffset != Width - 1) {
+        ++DroppedByType[std::min<uint32_t>(ToUnderlying(Reloc.Header.Type), 3)];
+        continue;
+      }
+      auto Copy = Reloc;
+      Copy.Header.Offset = *NewOffset;
+      switch (Copy.Header.Type) {
+      case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+      case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Copy.GuestRIP.GuestRIP -= SourceBinary.FileStartVA; break;
+      default: break;
+      }
+      Relocations.push_back(Copy);
+    }
+    LogMan::Msg::DFmt("Cache save {}: {} blocks ({} skipped for thunks), {} regions, {:#x} bytes; {} of {} relocs kept "
+                      "(dropped symlit={} thunk={} riplit={} ripmove={})",
+                      SourceBinary.FileInfo.Filename, PackedBlocks.size(), UncacheableBlockBegins.size(), Regions.size(), CodeCopy.size(),
+                      Relocations.size(), RelocationSink.size(), DroppedByType[0], DroppedByType[1], DroppedByType[2], DroppedByType[3]);
   }
 
   // Write file header
   CodeCacheHeader header {};
   static_assert(GIT_HASH.size() == sizeof(header.FEXVersion));
   std::ranges::copy(GIT_HASH, header.FEXVersion);
-  header.NumBlocks = BlockList.size();
+  header.NumBlocks = PackedBlocks.size();
   header.NumCodePages = CodePages.size();
-  header.CodeBufferSize = CodeSize;
+  header.CodeBufferSize = CodeCopy.size();
   header.NumRelocations = Relocations.size();
   header.SerializedBaseAddress = SerializedBaseAddress;
   if (!WriteAll(fd, &header, sizeof(header))) {
@@ -668,21 +896,20 @@ bool CodeCache::SaveData(Core::InternalThreadState&, int fd, const ExecutableFil
   }
 
   // Dump guest<->host block mappings
-  for (auto [Guest, Host] : BlockList) {
-    static_assert(sizeof(Host->HostCode) == 8, "Breaking change in code cache data layout");
-    static_assert(sizeof(Host->CodePages[0]) == 8, "Breaking change in code cache data layout");
+  for (const auto& Block : PackedBlocks) {
+    static_assert(sizeof((*Block.CodePages)[0]) == 8, "Breaking change in code cache data layout");
 
-    Guest -= SourceBinary.FileStartVA;
-    uint64_t HostCode = Host->HostCode - BufferBase;
-    // S3: write BlockBegin (buffer-relative) alongside HostCode. Format v2.
-    uint64_t BlockBegin = Host->BlockBegin - BufferBase;
-    uint64_t NumCodePages = Host->CodePages.size();
+    uint64_t Guest = Block.Guest - SourceBinary.FileStartVA;
+    uint64_t HostCode = Block.HostCode;
+    // S3: write BlockBegin (packed-image relative in v3) alongside HostCode.
+    uint64_t BlockBegin = Block.BlockBegin;
+    uint64_t NumCodePages = Block.CodePages->size();
     if (!WriteAll(fd, &Guest, sizeof(Guest)) || !WriteAll(fd, &HostCode, sizeof(HostCode)) ||
         !WriteAll(fd, &BlockBegin, sizeof(BlockBegin)) || !WriteAll(fd, &NumCodePages, sizeof(NumCodePages))) {
       return false;
     }
-    LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Host->CodePages), "Code pages aren't sorted");
-    for (auto CodePage : Host->CodePages) {
+    LOGMAN_THROW_A_FMT(std::ranges::is_sorted(*Block.CodePages), "Code pages aren't sorted");
+    for (auto CodePage : *Block.CodePages) {
       CodePage -= SourceBinary.FileStartVA;
       if (!WriteAll(fd, &CodePage, sizeof(CodePage))) {
         return false;
@@ -1061,6 +1288,16 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     CTX.LatestOffset -= header.CodeBufferSize;
     return false;
   }
+
+  // Publish the freshly written instructions to the fetch stream. The bytes
+  // above arrived through a memcpy plus in-place relocation patching, i.e. as
+  // *data* stores, and the region is about to be branched into. POWER8 has
+  // split, non-coherent I/D caches, so without a dcbst/sync/icbi/isync pass the
+  // dispatcher can fetch whatever the I-cache last held for those lines — the
+  // exact hazard the JIT's own Finalise (JIT/PPC64LE/JIT.cpp) flushes for after
+  // every compile. ARM64 needs the equivalent maintenance for the same reason.
+  __builtin___clear_cache(reinterpret_cast<char*>(CodeBufferRange.data()),
+                          reinterpret_cast<char*>(CodeBufferRange.data()) + CodeBufferRange.size_bytes());
 
   // B1: structural check of the guest -> host block mapping, before anything is
   // registered as an executable entry point. Deliberately NOT gated on
@@ -1540,7 +1777,10 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
     }
     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: {
       uint64_t Pointer = ForStorage ? 0 : reinterpret_cast<uint64_t>(CTX.ThunkHandler->LookupThunk(Reloc.NamedThunkMove.Symbol));
-      if (Pointer == ~0ULL) {
+      // See the ppc64le arm of this switch: an unregistered thunk resolves to
+      // nullptr and would be patched in as a call to address 0.
+      if (!ForStorage && (Pointer == 0 || Pointer == ~0ULL)) {
+        LogMan::Msg::EFmt("Code cache relocation references unresolvable thunk; rejecting cache");
         return false;
       }
       // TODO: Pointers are required to fit within 48-bit VA space.
@@ -1581,7 +1821,16 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
     }
     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: {
       uint64_t Pointer = ForStorage ? 0 : reinterpret_cast<uint64_t>(CTX.ThunkHandler->LookupThunk(Reloc.NamedThunkMove.Symbol));
-      if (Pointer == ~0ULL) {
+      // Fail closed on an unresolved thunk. LookupThunk returns nullptr for a
+      // thunk that is not registered yet, which is the normal state when a
+      // cache is loaded at mmap time, and patching that in produces a block
+      // that calls address 0 the first time it runs. SaveData refuses to cache
+      // blocks carrying this relocation for exactly that reason, so reaching
+      // here means the file predates that rule or came from elsewhere; reject
+      // it rather than arm the crash. ~0ULL is the pre-existing "known bad"
+      // sentinel and is kept.
+      if (!ForStorage && (Pointer == 0 || Pointer == ~0ULL)) {
+        LogMan::Msg::EFmt("Code cache relocation references unresolvable thunk; rejecting cache");
         return false;
       }
       // S3.7-C1: hard bounds check + fixed-width patch. The emitter's own
