@@ -993,7 +993,16 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   // owns: without that path there is no fault site to rewrite. Arm the page
   // filter once, here, so every hot-path entry point is a relaxed atomic load
   // that is false for the entire process when the feature is off.
-  if (SMCStoreBackpatch() && SMCStoreEmulation() && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+  if (SMCStoreBackpatch() && CodeCacheWriteEnabled()) {
+    // Backpatching rewrites a store site inside an already-compiled block into
+    // a branch to a stub carved out of the code buffer's free tail
+    // (Context::AllocateJITAuxMemory). That stub lives outside the block's
+    // JITCodeTail-recorded extent, which is exactly the extent the code cache
+    // serializes — so a patched block would be written to disk with a relative
+    // branch to bytes the cache file does not contain. Refuse the combination
+    // rather than emit a cache that jumps into whatever follows on load.
+    LogMan::Msg::EFmt("FEX_SMCSTOREBACKPATCH is incompatible with code cache writing; staying off.");
+  } else if (SMCStoreBackpatch() && SMCStoreEmulation() && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
     FEX::HLE::SMCBackpatch::SetEnabled(true);
     LogMan::Msg::IFmt("SMC store backpatching enabled (FEX_SMCSTOREBACKPATCH).");
   } else if (SMCStoreBackpatch()) {
