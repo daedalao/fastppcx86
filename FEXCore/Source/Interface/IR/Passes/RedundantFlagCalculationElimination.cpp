@@ -475,6 +475,15 @@ CondClass DeadFlagCalculationEliminination::X86ToArmFloatCond(CondClass X86) {
 }
 
 void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode) {
+  // A vector-compare CondJump (VCmpElementSize != iInvalid) carries FPR-class
+  // values in Cmp1/Cmp2, and the folds below REPLACE those arguments with a
+  // compare's GPR operands. Today we are unreachable for it -- the only caller
+  // gates on Op->FromNZCV, which that mode never sets -- but that is a
+  // coincidence of the caller, not a property of this function. Assert it, so
+  // relaxing the caller's guard fails loudly instead of silently branching on
+  // whatever GPR happened to be there.
+  LOGMAN_THROW_A_FMT(Op->VCmpElementSize == IR::OpSize::iInvalid, "FoldBranch cannot rewrite a vector-compare CondJump's operands");
+
   // Skip past StoreRegisters at the end -- they don't touch flags.
   auto PrevWrap = CodeNode->Header.Previous;
   while (CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREREGISTER ||

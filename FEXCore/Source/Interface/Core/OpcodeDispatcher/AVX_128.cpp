@@ -831,6 +831,11 @@ void OpDispatchBuilder::AVX128_MOVMSK(OpcodeArgs, IR::OpSize ElementSize) {
   auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
 
   auto Mask8Byte = [this](Ref Src) {
+#ifdef ARCHITECTURE_ppc64le
+    // One vbpermq per 128-bit half; the 256-bit shapes below then just OR the
+    // two halves together. See DEF_OP(VExtractSignBits).
+    return _VExtractSignBits(OpSize::i128Bit, Src, 2);
+#else
     // UnZip2 the 64-bit elements as 32-bit to get the sign bits closer.
     // Sign bits are now in bit positions 31 and 63 after this.
     Src = _VUnZip2(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
@@ -842,9 +847,13 @@ void OpDispatchBuilder::AVX128_MOVMSK(OpcodeArgs, IR::OpSize ElementSize) {
     GPR = _Bfi(OpSize::i64Bit, 32, 31, GPR, GPR);
     // Shift right to only get the two sign bits we care about.
     return _Lshr(OpSize::i64Bit, GPR, Constant(62));
+#endif
   };
 
   auto Mask4Byte = [this](Ref Src) {
+#ifdef ARCHITECTURE_ppc64le
+    return _VExtractSignBits(OpSize::i128Bit, Src, 4);
+#else
     // Shift all the sign bits to the bottom of their respective elements.
     Src = _VUShrI(OpSize::i128Bit, OpSize::i32Bit, Src, 31);
     // Load the specific 128-bit movmskps shift elements operator.
@@ -855,6 +864,7 @@ void OpDispatchBuilder::AVX128_MOVMSK(OpcodeArgs, IR::OpSize ElementSize) {
     Src = _VAddV(OpSize::i128Bit, OpSize::i32Bit, Src);
     // Extract to a GPR.
     return _VExtractToGPR(OpSize::i128Bit, OpSize::i32Bit, Src, 0);
+#endif
   };
 
   Ref GPR {};
@@ -881,9 +891,18 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
   const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
 
   auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
+#ifdef ARCHITECTURE_ppc64le
+  // vbpermq needs no mask vector; don't emit a dead constant load.
+  Ref VMask {};
+#else
   Ref VMask = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, NAMED_VECTOR_MOVMASKB);
+#endif
 
   auto Mask1Byte = [this](Ref Src, Ref VMask) {
+#ifdef ARCHITECTURE_ppc64le
+    (void)VMask;
+    return _VExtractSignBits(OpSize::i128Bit, Src, 16);
+#else
     auto VCMP = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src);
     auto VAnd = _VAnd(OpSize::i128Bit, OpSize::i8Bit, VCMP, VMask);
 
@@ -893,6 +912,7 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
 
     ///< 16-bits of data per 128-bit
     return _VExtractToGPR(OpSize::i128Bit, OpSize::i16Bit, VAdd3, 0);
+#endif
   };
 
   Ref Result = Mask1Byte(Src.Low, VMask);

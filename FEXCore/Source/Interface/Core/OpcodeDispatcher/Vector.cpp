@@ -788,6 +788,15 @@ void OpDispatchBuilder::MOVMSKOp(OpcodeArgs, IR::OpSize ElementSize) {
 
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
 
+#ifdef ARCHITECTURE_ppc64le
+  // POWER8 vbpermq gathers all sixteen sign bits in one instruction; see
+  // DEF_OP(VExtractSignBits). Both 128-bit shapes collapse to it.
+  if (Size == OpSize::i128Bit && (ElementSize == OpSize::i64Bit || ElementSize == OpSize::i32Bit)) {
+    StoreResultGPR_WithOpSize(Op, Op->Dest, _VExtractSignBits(Size, Src, NumElements), GetGPROpSize());
+    return;
+  }
+#endif
+
   if (Size == OpSize::i128Bit && ElementSize == OpSize::i64Bit) {
     // UnZip2 the 64-bit elements as 32-bit to get the sign bits closer.
     // Sign bits are now in bit positions 31 and 63 after this.
@@ -839,6 +848,26 @@ void OpDispatchBuilder::MOVMSKOp(OpcodeArgs, IR::OpSize ElementSize) {
 Ref OpDispatchBuilder::EmitByteLaneMask(Ref Src, IR::OpSize SrcSize) {
   const auto Is256Bit = SrcSize == OpSize::i256Bit;
   const auto ExtractSize = Is256Bit ? OpSize::i32Bit : OpSize::i16Bit;
+
+#ifdef ARCHITECTURE_ppc64le
+  // PMOVMSKB is one vbpermq on POWER8 (see DEF_OP(VExtractSignBits)). glibc's
+  // string routines run this on every loop iteration, so the old
+  // VCMPLTZ/VAnd/3x VAddP chain — well over a hundred host instructions once
+  // each VAddP's vperm control is materialised — is worth removing.
+  // The 256-bit (VEX) shape is handled by AVX128_MOVMSKB, not here.
+  //
+  // MERGE NOTE: this fast path arrived on the vbpermq branch inside
+  // MOVMSKOpOne. It belongs HERE, one level down, so that BOTH callers get it:
+  // the guest PMOVMSKB dispatcher above, and the vector-scan fusion's match
+  // edge, which re-materialises the same mask when the guest is about to read
+  // it. That also retires the "steal item" from
+  // docs/VCMPEQ_FUSION_DESIGN.md §10 — there is no longer a NAMED_VECTOR_MOVMASKB
+  // constant on the match edge whose materialisation would be worth
+  // lvsl-building, because the constant is gone entirely.
+  if (SrcSize == OpSize::i64Bit || SrcSize == OpSize::i128Bit) {
+    return _VExtractSignBits(SrcSize, Src, IR::NumElements(SrcSize, OpSize::i8Bit));
+  }
+#endif
 
   Ref VMask = LoadAndCacheNamedVectorConstant(SrcSize, NAMED_VECTOR_MOVMASKB);
 
@@ -3331,6 +3360,15 @@ Ref OpDispatchBuilder::PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
   //              xmm1[63:32] = (xmm1[47:32] * xmm2[47:32]) + (xmm1[63:48] * xmm2[63:48])
   //              etc.. for larger registers
 
+#ifdef ARCHITECTURE_ppc64le
+  // POWER8's vmsumshm is PMADDWD: signed 16x16 pairwise multiply-accumulate
+  // into 32-bit lanes with modulo (not saturating) accumulation, so the
+  // 0x8000*0x8000 + 0x8000*0x8000 = 0x80000000 wrap matches x86 bit for bit.
+  // The generic decomposition below costs ~64 host instructions on PPC64LE
+  // because each of VSMull/VSMull2/VAddP builds a vperm control vector from
+  // scratch; the direct op is one instruction plus a zero.
+  return _VMaddPairwise16(Size, OpSize::i16Bit, Src1, Src2);
+#else
   if (Size == OpSize::i64Bit) {
     // MMX implementation can be slightly more optimal
     Size = Size >> 1;
@@ -3343,6 +3381,7 @@ Ref OpDispatchBuilder::PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
 
   // [15:0 ] + [31:16], [32:47 ] + [63:48  ], [79:64] + [95:80], [111:96] + [127:112]
   return _VAddP(Size, OpSize::i32Bit, Lower, Upper);
+#endif
 }
 
 void OpDispatchBuilder::PMADDWD(OpcodeArgs) {

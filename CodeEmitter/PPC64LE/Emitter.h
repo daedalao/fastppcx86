@@ -968,6 +968,17 @@ public:
   void lvxl(VR vrt, GPR ra, GPR rb)   { EmitX(31, vrt.idx, ra.idx, rb.idx, 359,  0); }
   void stvx(VR vrs, GPR ra, GPR rb)   { EmitX(31, vrs.idx, ra.idx, rb.idx, 231,  0); }
   void stvxl(VR vrs, GPR ra, GPR rb)  { EmitX(31, vrs.idx, ra.idx, rb.idx, 487,  0); }
+  // lvsl VRT,RA,RB — "load vector for shift left".  Touches no memory: it
+  // computes sh = EA[60:63] (EA = (RA|0) + (RB)) and materialises the byte
+  // sequence {sh, sh+1, ..., sh+15} in *physical* (big-endian) byte order, so
+  // VRT.phys[i] == sh + i.  Unlike lvx it is NOT byte-reversed in LE mode,
+  // because it never performs a load — verified on POWER8 (op4k):
+  //   lvsl sh=0 -> phys[0..15] = 00 01 02 ... 0f
+  //   lvsl sh=4 -> phys[0..15] = 04 05 06 ... 13
+  // That makes it a free way to build a byte-index ramp for vbpermq/vperm
+  // control vectors without touching the constant pool.
+  void lvsl(VR vrt, GPR ra, GPR rb)   { EmitX(31, vrt.idx, ra.idx, rb.idx,   6,  0); }
+  void lvsr(VR vrt, GPR ra, GPR rb)   { EmitX(31, vrt.idx, ra.idx, rb.idx,  38,  0); }
   void lvewx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx,  71,  0); }
   void lvehx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx,  39,  0); }
   void lvebx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx,   7,  0); }

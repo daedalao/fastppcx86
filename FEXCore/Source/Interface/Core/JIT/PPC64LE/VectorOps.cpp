@@ -2582,6 +2582,116 @@ DEF_OP(VSMull2) {
 //                       0x18,0x19,0x08,0x09, 0x1C,0x1D,0x0C,0x0D]
 //   stack[0..7]  = ctrl_phys[15..8] = [0D,0C,1D,1C,09,08,19,18]  → 0x18190809_1C1D0C0D
 //   stack[8..15] = ctrl_phys[7..0]  = [05,04,15,14,01,00,11,10]  → 0x10110001_14150405
+// ---------------------------------------------------------------------------
+// VMaddPairwise16 — x86 PMADDWD in one VMX instruction.
+//
+// vmsumshm VRT,VRA,VRB,VRC computes, for each of the four 32-bit lanes i:
+//   VRT.word[i] = VRC.word[i] + VRA.hword[2i]*VRB.hword[2i]
+//                             + VRA.hword[2i+1]*VRB.hword[2i+1]
+// with signed 16x16->32 products and *modulo* 32-bit accumulation (the "m"
+// suffix; vmsumshs is the saturating form we specifically do NOT want).  With
+// VRC = 0 that is x86 PMADDWD exactly, including the one interesting edge:
+// 0x8000*0x8000 + 0x8000*0x8000 = 0x40000000 + 0x40000000 = 0x80000000, which
+// wraps rather than saturating on both architectures.  Verified on POWER8
+// (op4k) against a scalar reference over a sweep of boundary values: zero
+// mismatches, and the 0x8000-squared case produces 0x80000000 in all lanes.
+//
+// Lane correspondence needs no fixup: the JIT holds an x86 vector as its
+// natural LE image (x86 byte k at phys[15-k]), so x86 dword k is BE word 3-k,
+// and the two halfwords vmsumshm pairs within a lane are exactly the two x86
+// words of that dword.  Their sum is order-independent.
+//
+// The previous lowering was _VSMull + _VSMull2 + _VAddP, each of which
+// materialises a 128-bit vperm control through LoadConstant/std/std/lvx — a
+// little over 60 host instructions for one guest PMADDWD.  libavcodec has
+// ~10.5k PMADDWD sites, so this is the video-decode hot path.
+// ---------------------------------------------------------------------------
+DEF_OP(VMaddPairwise16) {
+  const auto Op  = IROp->C<IR::IROp_VMaddPairwise16>();
+  const auto Dst = GetVReg(Node);
+  const auto V1  = GetVReg(Op->Vector1);
+  const auto V2  = GetVReg(Op->Vector2);
+
+  // vspltisb (rather than vxor self,self,self) so we never read a register the
+  // allocator may have aliased with an operand — same rationale as
+  // LoadNamedVectorConstant's NAMED_VECTOR_ZERO path.
+  vspltisb(VTMP1, 0);
+
+  if (IROp->Size == IR::OpSize::i64Bit) {
+    // MMX form: only x86 dwords 0..1 (BE words 3..2, phys[8..15]) are defined.
+    // The upper half of the source registers holds whatever was left there, so
+    // vmsumshm produces garbage in BE words 0..1; force it to zero rather than
+    // letting it leak into a later 128-bit read of the same register.
+    // xxpermdi XT,XA,XB,DM -> XT.dw0 = XA.dw[DM>>1], XT.dw1 = XB.dw[DM&1].
+    // DM=1 gives XT.dw0 = zero.dw0 = 0, XT.dw1 = product.dw1.
+    vmsumshm(VTMP2, V1, V2, VTMP1);
+    xxpermdi(Dst, VTMP1, VTMP2, 1);
+    return;
+  }
+
+  vmsumshm(Dst, V1, V2, VTMP1);
+}
+
+// ---------------------------------------------------------------------------
+// VExtractSignBits — x86 PMOVMSKB / MOVMSKPS / MOVMSKPD via vbpermq.
+//
+// vbpermq VRT,VRA,VRB reads sixteen bit indices from VRB's sixteen bytes; for
+// each byte i, perm[i] = VRA.bit[VRB.byte[i]] using big-endian bit numbering
+// (bit 0 = MSB of phys[0]), or 0 when the index is >= 128.  The sixteen result
+// bits land in VRT bits 48:63 — i.e. the low halfword of BE doubleword 0 —
+// which is precisely what a plain mfvsrd reads, so no doubleword shuffle is
+// needed.  (Measured on POWER8; the ISA pseudocode's "(48)0 || perm" reads as
+// though it lands in the *other* doubleword, and it does not.)
+//
+// perm[15] becomes bit 0 of the mfvsrd result, so we want
+//   perm[15-k] = the sign bit of x86 element k.
+// x86 element k's most significant byte sits at phys[15 - (k*ES + ES-1)], and
+// its sign is that byte's MSB, i.e. BE bit 8 * (15 - k*ES - ES + 1).
+//
+// The control vector is built without touching the constant pool: lvsl gives
+// the ramp phys[i] = sh + i for free (it performs no load, so it is not
+// byte-reversed in LE mode), and one vslb scales it.  Choosing sh so that the
+// ramp wraps modulo 256 onto the indices we want:
+//
+//   i8  (PMOVMSKB): sh=0, <<3 -> phys[i] = 8i        = 00 08 10 ... 78
+//   i32 (MOVMSKPS): sh=4, <<5 -> phys[i] = (4+i)*32  = 80 a0 c0 e0 00 20 40 60 (x2)
+//   i64 (MOVMSKPD): sh=2, <<6 -> phys[i] = (2+i)*64  = 80 c0 00 40 (x4)
+//
+// For i32/i64 the ramp repeats, so bits above the ones we want are populated
+// from the wrapped-around copies; they are masked off afterwards.  The mask is
+// applied with clrldi, never andi., because CR0 holds the JIT's packed NZCV.
+// ---------------------------------------------------------------------------
+DEF_OP(VExtractSignBits) {
+  const auto Op  = IROp->C<IR::IROp_VExtractSignBits>();
+  const auto Dst = GetReg(Node);
+  const auto Src = GetVReg(Op->Vector);
+
+  // NumElements describes the shape completely; the header cannot, because
+  // IROp->Size is the *destination* (GPR) size rather than the vector width.
+  // One result bit per element, so it is also the number of bits to keep.
+  const uint32_t KeepBits = Op->NumElements;
+
+  uint32_t Shift;  // vslb amount
+  int32_t  Sh;     // lvsl ramp base
+  switch (Op->NumElements) {
+  case 16: Shift = 3; Sh = 0; break; // byte elements, XMM
+  case 8:  Shift = 3; Sh = 0; break; // byte elements, MMX (top 8 bits masked off)
+  case 4:  Shift = 5; Sh = 4; break; // 32-bit elements
+  case 2:  Shift = 6; Sh = 2; break; // 64-bit elements
+  default: Op_Unhandled(IROp, Node); return;
+  }
+
+  li(TMP1, Sh);
+  lvsl(VTMP1, r(0), TMP1);
+  vspltisb(VTMP2, (int32_t)Shift);
+  vslb(VTMP1, VTMP1, VTMP2);
+  vbpermq(VTMP1, Src, VTMP1);
+  mfvsrd(Dst, VTMP1);
+  if (KeepBits != 16) {
+    clrldi(Dst, Dst, 64 - KeepBits);
+  }
+}
+
 DEF_OP(VUMulH) {
   const auto Op = IROp->C<IR::IROp_VUMulH>();
   const auto ElemSz = Op->Header.ElementSize;

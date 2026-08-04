@@ -585,6 +585,17 @@ private:
 #include <FEXCore/IR/IRDefines_Dispatch.inc>
 
   // -----------------------------------------------------------------------
+  // PPC64LE-only vector ops (VectorOps.cpp).
+  // IR.json marks these JITDispatch:false so that adding them does not force
+  // every other backend to grow a lowering — the OpcodeDispatcher only emits
+  // them under ARCHITECTURE_ppc64le. That also keeps them out of the
+  // auto-generated dispatch table, so declare and register them by hand
+  // (same mechanism the x87 stack ops below use).
+  // -----------------------------------------------------------------------
+  DEF_OP(VMaddPairwise16);
+  DEF_OP(VExtractSignBits);
+
+  // -----------------------------------------------------------------------
   // x87 stack bookkeeping ops (X87Ops.cpp).
   // These IR ops are normally lowered away by the x87StackOptimization pass
   // into LoadContext/StoreContext primitives. The pass is conditional on
