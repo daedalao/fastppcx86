@@ -24,6 +24,24 @@ co-dev's machine only, behind runtime gating.
 ## VTESTPS record-form treatment (same as PTEST but sign-bit semantics);
 ## AVX-256 scan shape; co-dev's shuffle dispatcher gate.
 
+## ERRATA applied (2026-08-04, from the co-dev's response)
+- Finding 4 UPGRADE: the staging-pattern kill did NOT need the P9 tier —
+  mtvsrd(2.07)+xxpermdi(2.06) are P8-legal and were already in the emitter.
+  Implemented across the tree the same night (stages 3-4); the dm-selector
+  and byte-order were validated by the full ASM suite rather than derived
+  alone. The P9 tier note now covers only lxv/stxv/mfvsrld/xxperm/setb/
+  maddld/mtvsrdd-as-single-insn.
+- Finding 7 CORRECTED per their measured counterexample (ExitFunction = 50%
+  of emitted bytes, 0.55% of runtime): byte-ranking surfaces large-but-cold
+  ops and hides small-but-hot ones (C-helper calls look free). The size
+  profile is authoritative for per-op expansion and buffer-capacity
+  questions ONLY. For "what to fix next": weight by EXECUTION (perf cycles
+  per symbol/region), and treat compile-count fields as compile counts.
+- Finding 1, 64-bit path: answered by code shape — the i64 loaders never
+  had the reverse vperm (their comments predate this review and say "no
+  byte-reverse needed"); only the 128-bit path carried it, and only it was
+  deleted. The probe + full suite cover the deletion; no 64-bit gap exists.
+
 ## Ranked findings
 
 1. **[HARDWARE-PROVEN, unfixed] LoadNamedVectorConstant's byte-reverse vperm
