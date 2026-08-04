@@ -235,15 +235,25 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // in the sigreturn loop above regardless of which mprotect leg failed.
     // Kept thread-local so a legitimate hot page written by two threads
     // does not trip it.
-    static thread_local uintptr_t LastFaultAddress = 0;
-    static thread_local unsigned LastFaultRepeat = 0;
-    if (FaultAddress == LastFaultAddress) {
-      if (++LastFaultRepeat >= 8) {
-        ERROR_AND_DIE_FMT("SMC handler entered {} consecutive times at addr={:#x}; sigreturn loop, aborting", LastFaultRepeat, FaultAddress);
+    // OPT-IN ONLY (FEX_SMC_LOOPTRAP=1): consecutive same-address entries are
+    // NOT a valid stuck signal on this port — store-emulation, semantic-patch
+    // and mono-storm workloads legitimately fault one address hundreds of
+    // thousands of times in a row, each entry fully serviced (movchk trips
+    // this at iteration 8 of 200000). The stuck case this guessed at — a
+    // failed unprotect silently re-faulting forever — now dies loudly at its
+    // source (the hard mprotect checks below), with errno.
+    static const bool LoopTrapWanted = (getenv("FEX_SMC_LOOPTRAP") != nullptr);
+    if (LoopTrapWanted) {
+      static thread_local uintptr_t LastFaultAddress = 0;
+      static thread_local unsigned LastFaultRepeat = 0;
+      if (FaultAddress == LastFaultAddress) {
+        if (++LastFaultRepeat >= 8) {
+          ERROR_AND_DIE_FMT("SMC handler entered {} consecutive times at addr={:#x}; sigreturn loop, aborting", LastFaultRepeat, FaultAddress);
+        }
+      } else {
+        LastFaultAddress = FaultAddress;
+        LastFaultRepeat = 1;
       }
-    } else {
-      LastFaultAddress = FaultAddress;
-      LastFaultRepeat = 1;
     }
     auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
       auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
