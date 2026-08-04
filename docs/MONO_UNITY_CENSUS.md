@@ -31,10 +31,11 @@ detection.
   place; Mono GC signals active on the thread; dispatcher-entry ring clean;
   prime suspect INJIT RestoreThreadState resume. Workaround: SpinLoopClamp
   (manual exact + auto structural). Root fix: OPEN.
-- **B — lost wakeup on guest sync object** (Hard West load spin): worker
-  army atomically hammering one heap word; flag field never set; registers
-  stationary; zero signals to spinners; futex-wait crowd. Clamp
-  inapplicable. Next tool: FEX_FUTEX_TRACE. Root fix: OPEN.
+- **B — lost wakeup on guest sync object**: RETIRED 2026-08-04 — the sole
+  exemplar (Hard West load spin) was re-diagnosed as class D below. The
+  "flag never set" was a park gate that legitimately required zero
+  concurrent workers; nothing was lost. No known title currently
+  exhibits a true lost wakeup. Keep the definition in case one appears.
 - **C — JIT flags clobber (CR0/NZCV)** (Hard West quiet startup wedge):
   non-flag-writing vector op (CMPSS/SD, ROUNDSS/SD, wide shifts) between a
   cmp/test and its jcc destroyed packed NZCV in CR0 → branch on garbage →
@@ -44,6 +45,21 @@ detection.
   regression test vector_scalar_flags_preserve.asm. Presents like A
   (skipped init) — every A-classified wedge must be retested on ≥eb1a4c858
   before the A verdict stands.
+- **D — CPU-count-inflated spin-quiesce starvation** (Hard West load
+  "wedge", root-caused 2026-08-04): emulated /proc/cpuinfo ignored the
+  affinity cage (80 reported vs 16 usable), Unity sized its job pool from
+  SystemInfo.processorCount → 79 workers on 16 hw threads; the park gate
+  (lock cmpxchg [obj+0x74],0 — "no worker inside the steal window") is
+  statistically unreachable at that oversubscription (measured occupancy
+  20-51, never 0, in 13k samples/12s), so the pool never parks and starves
+  the game to ~2 fps. NOT corruption — every guest value sane; the wrong
+  number was the manufactured CPU count (79). Amplified by PPC64LE atomic
+  window cost (2 barriers + LL/SC per lock add/sub vs one x86 uop).
+  Root fix: **LANDED 9a0f8e1be** (CalculateNumberOfCPUs bounded by
+  sched_getaffinity). Workaround: FEX_REPORTED_CPUS=N (verified live).
+  Fingerprint: guest nproc != guest `grep -c ^processor /proc/cpuinfo`
+  under taskset = pre-fix build; pool-size fields in the sync object frozen
+  at (reported_cpus - 1).
 
 ## Special numbers — collected per title, analyzed for a pattern
 
@@ -54,7 +70,7 @@ pattern across engine versions instead of generalizing structurally.
 | title | engine version | site (guest RIP) | wants | object/field | notes |
 |---|---|---|---|---|---|
 | ziggurat | Unity 4.x-era (2014, static player) | cmp @ 0x934d27 (loop 0x934d04-0x934d33, block 0x934a40) | RBX == 4 (R15) | loop bound in register, element count | value arrives via r15←r12; corruption class A |
-| hardwest | Unity 5.x-era | cmpxchg spin @ 0x84adb2 / head 0x84ad50 | [obj+0x70] == 1 | sync object @ heap 0x1f3a220: flag +0x70, waiters +0x74, +0x78==1 | flag never written — class B; compare upstream's displacement set below |
+| hardwest | Unity 5.x-era | cmpxchg park gate @ 0x84adb2 / loop 0x84ad40 | [obj+0x74] == 0 (park only when NO worker in steal window) | job-queue object (this run 0x1f33070): +0x70 shutdown flag, +0x74 live steal-window count, +0x28/+0x38/+0x40 pool size | the true special number was **79** = inflated cpuinfo count − 1; RESOLVED as class D (9a0f8e1be); earlier "flag +0x70 wants ==1" reading was the shutdown check misread as the gate |
 | (upstream reference) | Unity 2015+ | n/a (decode-time hack) | force-TSO loads/stores | SPSC ringbuffer: cached ptrs/wait flags @ +0x80/+0x84/+0xC0/+0xC4 | Frontend.cpp IsKnownAtomicDisplacement — the prototype "special numbers" fix |
 | shadowrunhk | Unity 4.x/5.x | (unresolved — JIT map died with the process; instrumented re-run needed) | | | wedged AT TITLE MENU (music line last in Player.log); ~68 cores / 182 threads; hot PCs 0x3fff96068xxx-0x3fff9606bxxx in perf-3636 capture |
 
@@ -71,7 +87,7 @@ entry, and the corruption window is the shuffle between xor and jmp.
 | title | engine | run date | verdict | evidence |
 |---|---|---|---|---|
 | ziggurat | Unity (static player) / Mono | 2026-08-04 | **Class A — RECLASSIFY CANDIDATE → C**: "init skipped / RBX misses ==4" is exactly what a CR0-clobbered jcc before the loop produces; RETEST on eb1a4c858 with clamps off before trusting injection theory | docs/ZIGGURAT_FINALIZE_SPIN.md; entry ring clean; RBX restarts ~0, misses ==4 once |
-| hardwest | Unity / Mono | 2026-08-04 | **SPLIT: two diseases.** (1) quiet startup wedge = **Class C** (CR0/NZCV clobber, FIXED eb1a4c858); (2) loud post-menu spin (Class-B shape, 40 spinners on word @0x1f3a220) persists on fixed build — displacement A/B rerunning on clean substrate | Opus capture 11:00-11:35: /tmp/hwquiet/ on op4k (b3.asm has the smoking gun fcmpu cr0); loud-wedge anatomy needs re-verification post-fix |
+| hardwest | Unity / Mono | 2026-08-04 | **BOTH DISEASES ROOT-CAUSED.** (1) quiet startup wedge = **Class C** (CR0/NZCV clobber, FIXED eb1a4c858); (2) loud load spin = **Class D** (79-worker pool vs 16-thread cage, park gate unreachable; FIXED 9a0f8e1be / FEX_REPORTED_CPUS). Displacement A/B answered: force-ordering 0x70/74/78 does NOT touch it (and adds drag — drop it) | Opus captures: /tmp/hwquiet/ + /tmp/hwcounter/ on op4k (long.py 13k-sample field census; spin.asm loop reconstruction); playability confirmation run in flight |
 | rimworld | Unity / Mono | 2026-08-04 | healthy so far (ran with clamps ON, default config; ~long session pending) | SpinLoopClampAuto audit: 1017 flagged lib loops, zero misfires observed |
 | shadowrunhk | Unity / Mono | 2026-08-04 | **wedged, class TBD** — title-menu wedge, ~68 cores hot across 182 threads for 25+ min, Player.log frozen at 10:12:05; `Failed to wait on a semaphore (Interrupted system call)` in Player.log despite SA_RESTART fixes present in build — EINTR-leak suspicion or third class; spin PCs unresolvable post-mortem (perf-3636.map gone) | /tmp/srhk1.perf + /tmp/srhk_poll.out on op4k (2026-08-04 10:15-10:37); needs instrumented re-run (BlockJITNaming + SIGTRACE) |
 | moonlighter | Unity 2018 / Mono | — | pending | prior perf data exists (moonlighter_perf.data in repo root) |
