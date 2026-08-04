@@ -850,7 +850,7 @@
       },
       "SpinLoopClampAuto": {
         "Type": "uint32",
-        "Default": "1",
+        "Default": "0",
         "Desc": [
           "Systemic version of SpinLoopClamp: a post-decode pass structurally",
           "detects tight loops whose only exit for a register is exact equality",
@@ -860,10 +860,12 @@
           "SIGNED overshoot beyond a 2^30 margin, so negative inductions and",
           "small legitimate overshoots in multi-exit scan loops are never",
           "touched; unclassifiable loops are left alone entirely.",
-          "0 = off.",
-          "1 (default) = Mono-detected titles only, and only loops in the",
-          "low (< 4GiB) main-executable range — the observed wedge class is",
-          "game-binary text; shared libraries are never instrumented.",
+          "0 (default) = off — opt-in per title; the census showed most",
+          "Mono/Unity wedges are not this class, and surgical per-title",
+          "FEX_SPINLOOPCLAMP ranges are preferred.",
+          "1 = Mono-detected titles only, and only loops in the low (< 4GiB)",
+          "main-executable range — the observed wedge class is game-binary",
+          "text; shared libraries are never instrumented.",
           "2 = every process, every address (testing/diagnosis)."
         ]
       }
