@@ -168,6 +168,9 @@
 // Arm64 patches callsites to branch directly between blocks, so the same
 // scrub would leave a thread inside a linked chain running stale code; the
 // hook exists there for parity but the soundness claim is PPC64LE-only.
+// (PPC64LE block linking, when enabled, is normally interlocked OFF by lazy
+// invalidation for exactly this reason — unless FEX_SMCLAZYLINK restores the
+// guarantee another way; see "LINKING UNDER LAZY" below.)
 //
 // What the scrub still does NOT cover, by design:
 //   - The block the faulting thread is CURRENTLY executing runs to its next
@@ -183,6 +186,56 @@
 //     it is safe because the FIRST such store on that page already scrubbed
 //     this thread and left the drain owed, and the debt is only cleared by a
 //     drain that soft-invalidates every recorded page.
+//
+// ===========================================================================
+// LINKING UNDER LAZY   (FEX_SMCLAZYLINK=1, default 0)
+// --------------------------------------------------------------------
+// The scrub's soundness argument above leans on "every block-to-block
+// transfer re-probes L1", which is only true with block linking off — so the
+// PPC64LE JIT interlocks BlockLinking off whenever lazy invalidation is armed
+// (JIT.cpp, BlockLinkingEnabled).  That interlock costs real performance:
+// with linking off, EVERY constant-target block exit round-trips
+// PPC64JITCore::ExitFunctionLink (measured 7.3% of cycles as the top symbol
+// in Unity combat scenes, plus the indirect costs of the probe).
+//
+// FEX_SMCLAZYLINK lifts the interlock by rebuilding the same-thread guarantee
+// on a trap a linked chain CANNOT skip: the deferred-signal fault-page poke.
+// Every dispatcher-reachable block EntryPoint begins with a plain `stb` to
+// the thread's InterruptFaultPage (EmitSuspendInterruptCheck, emitted for the
+// deferred-signal machinery), and linked branches land on block entries — the
+// patched `b HostCode` targets exactly the address the dispatcher would have
+// dispatched to.  So:
+//
+//   1. FAULT SIDE (SyscallsSMCTracking.cpp, lazy branch): after the L1 scrub,
+//      additionally mprotect the faulting thread's OWN InterruptFaultPage to
+//      PROT_NONE.  One page, own thread, same call the signal delegator makes.
+//   2. TRAP SIDE (SignalDelegator.cpp, fault-page SIGSEGV branch): on the
+//      poke fault, after restoring the page to RW, settle the drain debt
+//      (Context::SettleLazySMCDrainIfPending — the same consume-then-drain
+//      sequence ExitFunctionLink performs) BEFORE any resume path, including
+//      the empty-queue resume.  The deferral machinery tolerates the spurious
+//      arming by construction: no queued signals means unprotect-and-return.
+//
+// The guarantee becomes: after a lazy fault on thread T, T's next block
+// ENTRY — reached by dispatcher probe, inlined exit probe, OR a linked
+// branch — faults and drains before the entered block's body runs.  Stronger
+// in reach than the ExitFunctionLink drain (which still exists and still
+// fires when the L1 miss route gets there first; both consume the same
+// per-thread flag, idempotently).
+//
+// Interactions:
+//   - Nested-deferral windows (refcount != 0): the poke fault takes the
+//     step-over branch and the page STAYS armed; the drain lands at the first
+//     poke outside the outermost deferring section.  FEX-internal code inside
+//     those sections reaches guest code only through drain points (a)-(c).
+//   - The in-flight current block: exactly the scrub's existing carve-out.
+//   - FEX_SMCSEMANTICPATCH: linking stays hard-off; a patched destination-RIP
+//     immediate cannot retarget an already-linked branch.  The two options
+//     refuse to combine (Syscalls.cpp arming, JIT.cpp interlock — keep the
+//     two predicates in sync).
+// Cost: one mprotect + one extra SIGSEGV per lazy SMC fault, writer thread
+// only, on top of a fault path that already costs microseconds.
+// ===========================================================================
 //
 // Cost model: the scrub is paid once per fault, on the writer, and it is a
 // single syscall.  The drain is paid at the writer's next dispatch, and only
