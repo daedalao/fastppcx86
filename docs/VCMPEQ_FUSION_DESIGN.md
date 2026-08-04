@@ -648,4 +648,22 @@ every match position — passes identically with the fusion on and off.)
 | --- | --- |
 | `smcstorm crossthread 2000000` | `checksum=0000000000001890 OK`, rate 10.0 M/s |
 | `movchk 50000` | `mismatches=0 -> OK` |
-| ASM differential suite (`ctest`) | see report |
+| ASM differential suite (`ctest`, 11 880 cases) | **no regressions** |
+
+The suite was run twice on the same binary — once with `FEX_VCMPFUSION=1`
+(6685 failures) and once with `=0` (6683) — and the two failure *sets* diffed.
+The absolute counts are large and meaningless here: this build dir enables the
+posix/gvisor/gcc-target/32-bit suites that the `docs/POWER9_PORT_PLAN.md`
+baseline build did not, and has no 32-bit thunk or sysroot setup, so whole
+families fail identically in both runs. The A/B diff is the meaningful control,
+and it is:
+
+```
+> getcpu_host_test.jit.gvisor
+> getcpu_test.jit.gvisor
+```
+
+i.e. two tests, and both are flaky. Re-running just those four cases three
+times each, with the fusion on and off, gives 0, 2, 2 failures with it on and
+1, 1, 2 with it off — they are scheduler-dependent and the host had CP2077
+running throughout. Nothing else in 11 880 cases moves.
