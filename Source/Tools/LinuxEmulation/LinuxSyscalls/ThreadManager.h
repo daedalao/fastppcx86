@@ -91,6 +91,27 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
 
     uint64_t PendingSignals {};
 
+    // Guest SA_RESTART bookkeeping.
+    //
+    // A guest signal delivered while this thread sits inside a host syscall is
+    // dispatched from the DeferredSignalRefCountGuard destructor at the tail of
+    // HandleSyscall (the InterruptFaultPage poke faults, the queue drains, the
+    // guest handler runs on this same host thread and sigreturns back into that
+    // destructor). Only after that does HandleSyscall return -EINTR to the JIT.
+    // The restart loop in HandleSyscall therefore needs to know, once the guard
+    // has destructed, whether any guest handler ran and whether every handler
+    // that ran was registered SA_RESTART.
+    //
+    // Both counters are monotonic and never reset: HandleSyscall snapshots them
+    // before an attempt and diffs afterwards. That is what makes them re-entrant
+    // -- guest signal handlers issue syscalls of their own, and a nested
+    // HandleSyscall must not be able to clear the outer frame's evidence.
+    //
+    // Written and read only by the owning thread (delivery happens on the same
+    // thread that is executing the syscall), so plain integers are sufficient.
+    uint32_t DeliveredGuestSignals {};
+    uint32_t DeliveredGuestSignalsWithoutRestart {};
+
     // Queue of thread local signal frames that have been deferred.
     // Async signals aren't guaranteed to be delivered in any particular order, but FEX treats them as FILO.
     fextl::vector<DeferredSignalState> DeferredSignalFrames;

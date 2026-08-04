@@ -157,6 +157,14 @@ public:
   // In the case that the syscall doesn't hit the optimized path then we still need to go here
   uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args) final override;
 
+  // One attempt at a guest syscall, with the async-signal deferral guard scoped
+  // to the attempt. Split out of HandleSyscall so guest SA_RESTART semantics can
+  // re-run an attempt after the guard destructs (which is where a deferred guest
+  // signal for a thread blocked in a host syscall gets delivered).
+  // JITPC is the JIT return address, captured by HandleSyscall itself because
+  // only that frame is called directly from JIT code.
+  uint64_t HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args, uint64_t JITPC);
+
   void DefaultProgramBreak(uint64_t Base, uint64_t Size);
   void DeserializeSeccompFD(FEX::HLE::ThreadStateObject* Thread, int FD) {
     if (FD == -1) {

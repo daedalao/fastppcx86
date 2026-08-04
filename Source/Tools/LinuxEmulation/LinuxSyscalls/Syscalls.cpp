@@ -22,6 +22,7 @@ $end_info$
 #include "LinuxSyscalls/Utils/Threads.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
+#include "LinuxSyscalls/x64/SyscallsEnum.h"
 #include "LinuxSyscalls/x32/Types.h"
 #include "LinuxSyscalls/x64/Types.h"
 #include "Thunks.h"
@@ -1039,7 +1040,142 @@ uint32_t SyscallHandler::CalculateGuestKernelVersion() {
   return std::max(KernelVersion(5, 15), std::min(KernelVersion(6, 11), GetHostKernelVersion()));
 }
 
+#ifdef ARCHITECTURE_ppc64le
+namespace {
+  // Guest SA_RESTART support: which x86-64 guest syscalls may be transparently
+  // re-issued after a guest signal handler with SA_RESTART ran.
+  //
+  // The list follows what a real Linux kernel restarts (-ERESTARTSYS): blocking
+  // I/O on slow objects, the socket families, the wait family, futex waits.
+  // Deliberately NOT here, matching the kernel:
+  //   - pause, rt_sigsuspend, rt_sigtimedwait: their whole contract is to return
+  //     EINTR once a handler has run.
+  //   - poll/ppoll, select/pselect6, epoll_wait/epoll_pwait, nanosleep,
+  //     clock_nanosleep: Linux converts these to EINTR whenever a handler runs
+  //     (they only auto-resume via restart_block, which carries the *remaining*
+  //     timeout). Re-issuing them here would restart the FULL timeout, so under
+  //     a signal storm -- which is exactly the Mono GC workload this feature
+  //     targets -- a 1s sleep pulsed every 100ms would never return.
+  // FEX_SA_RESTART_TIMED=1 opts the timeout-carrying set in anyway, for
+  // experiments; it is not on by default because of the hazard above.
+  bool IsRestartableGuestSyscall_x64(const FEXCore::HLE::SyscallArguments* Args) {
+    switch (Args->Argument[0]) {
+    case FEX::HLE::x64::SYSCALL_x64_read:
+    case FEX::HLE::x64::SYSCALL_x64_write:
+    case FEX::HLE::x64::SYSCALL_x64_ioctl:
+    case FEX::HLE::x64::SYSCALL_x64_pread_64:
+    case FEX::HLE::x64::SYSCALL_x64_pwrite_64:
+    case FEX::HLE::x64::SYSCALL_x64_readv:
+    case FEX::HLE::x64::SYSCALL_x64_writev:
+    case FEX::HLE::x64::SYSCALL_x64_connect:
+    case FEX::HLE::x64::SYSCALL_x64_accept:
+    case FEX::HLE::x64::SYSCALL_x64_sendto:
+    case FEX::HLE::x64::SYSCALL_x64_recvfrom:
+    case FEX::HLE::x64::SYSCALL_x64_sendmsg:
+    case FEX::HLE::x64::SYSCALL_x64_recvmsg:
+    case FEX::HLE::x64::SYSCALL_x64_wait4:
+    case FEX::HLE::x64::SYSCALL_x64_flock:
+    case FEX::HLE::x64::SYSCALL_x64_waitid:
+    case FEX::HLE::x64::SYSCALL_x64_accept4:
+    case FEX::HLE::x64::SYSCALL_x64_preadv:
+    case FEX::HLE::x64::SYSCALL_x64_pwritev:
+    case FEX::HLE::x64::SYSCALL_x64_recvmmsg:
+    case FEX::HLE::x64::SYSCALL_x64_sendmmsg:
+    case FEX::HLE::x64::SYSCALL_x64_preadv2:
+    case FEX::HLE::x64::SYSCALL_x64_pwritev2: return true;
+
+    case FEX::HLE::x64::SYSCALL_x64_futex: {
+      // Same shape restriction the internal-EINTR restart uses
+      // (Passthrough.cpp WrappedFutexObserved): only the wait commands, whose
+      // re-issue is either exact (WAIT_BITSET carries an absolute deadline) or
+      // over-waits by at most one interval (WAIT with a relative timeout).
+      constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)
+      const uint64_t Cmd = Args->Argument[2] & FUTEX_CMD_MASK_LOCAL;
+      return Cmd == 0 /* FUTEX_WAIT */ || Cmd == 9 /* FUTEX_WAIT_BITSET */;
+    }
+
+    case FEX::HLE::x64::SYSCALL_x64_poll:
+    case FEX::HLE::x64::SYSCALL_x64_select:
+    case FEX::HLE::x64::SYSCALL_x64_nanosleep:
+    case FEX::HLE::x64::SYSCALL_x64_epoll_wait: {
+      static const bool Timed = (getenv("FEX_SA_RESTART_TIMED") != nullptr);
+      return Timed;
+    }
+    case FEX::HLE::x64::SYSCALL_x64_clock_nanosleep: {
+      static const bool Timed = (getenv("FEX_SA_RESTART_TIMED") != nullptr);
+      // TIMER_ABSTIME(1) sleeps could be re-issued exactly, relative ones cannot.
+      return Timed && (Args->Argument[2] & 1) == 0;
+    }
+
+    default: return false;
+    }
+  }
+} // namespace
+#endif
+
 uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args) {
+  // Grab the return address which will be inside the JIT. Must be captured in
+  // this frame: it is the one the JIT calls directly.
+  const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
+
+#ifndef ARCHITECTURE_ppc64le
+  return HandleSyscallImpl(Frame, Args, JITPC);
+#else
+  // Guest SA_RESTART semantics.
+  //
+  // PPC64LE strips SA_RESTART from every *host* sigaction (SignalDelegator.cpp
+  // UpdateHostThunk) because the deferred-signal queue is drained by the -EINTR
+  // unwind of this very function -- host-kernel restart would strand the queued
+  // guest signal forever. The guest's SA_RESTART is recorded in GuestAction but
+  // was never acted on, so a guest whose handler asked for restart still saw
+  // EINTR. Unity's semaphore wrapper treats that as failure ("Failed to wait on
+  // a semaphore (Interrupted system call)") and parks its render thread.
+  //
+  // Implement the restart here rather than by rewriting the guest signal frame:
+  // the guest frame's RAX/RIP are built by HandleDispatcherGuestSignal from
+  // Frame->State, and at delivery time from the guard destructor that state has
+  // NOT yet been given the syscall's return value (the JIT writes RAX only after
+  // this function returns). There is nothing to rewrite -- the C++ frame here is
+  // merely suspended across the handler and resumes to return -EINTR. So: re-run
+  // the attempt.
+  //
+  // Conditions, all required:
+  //   - the attempt returned -EINTR,
+  //   - at least one guest signal was actually delivered during the attempt,
+  //   - every one of those handlers was registered SA_RESTART,
+  //   - the syscall is one Linux would restart (IsRestartableGuestSyscall_x64).
+  // An internal-only interruption (no guest delivery) is not restarted here;
+  // that case is handled per-syscall (Passthrough.cpp WrappedFutexObserved).
+  //
+  // Escape hatch: FEX_NO_GUEST_SA_RESTART=1 restores the old always-EINTR
+  // behaviour.
+  static const bool Disabled = (getenv("FEX_NO_GUEST_SA_RESTART") != nullptr);
+  if (Disabled || !Is64BitMode()) {
+    return HandleSyscallImpl(Frame, Args, JITPC);
+  }
+
+  auto* ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+  while (true) {
+    // Snapshot/diff rather than reset: a guest handler runs nested inside the
+    // attempt below and issues syscalls of its own, each of which re-enters
+    // this function. Resetting would let the innermost frame erase the outer
+    // frame's delivery record.
+    const uint32_t DeliveredBefore = ThreadObject->SignalInfo.DeliveredGuestSignals;
+    const uint32_t NoRestartBefore = ThreadObject->SignalInfo.DeliveredGuestSignalsWithoutRestart;
+
+    const uint64_t Result = HandleSyscallImpl(Frame, Args, JITPC);
+
+    const uint32_t Delivered = ThreadObject->SignalInfo.DeliveredGuestSignals - DeliveredBefore;
+    const uint32_t NoRestart = ThreadObject->SignalInfo.DeliveredGuestSignalsWithoutRestart - NoRestartBefore;
+
+    if (static_cast<int64_t>(Result) != -EINTR || Delivered == 0 || NoRestart != 0 || !IsRestartableGuestSyscall_x64(Args)) {
+      return Result;
+    }
+  }
+#endif
+}
+
+uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args, uint64_t JITPC) {
   // Phase 3 of signal-cluster fix: defer async signals across the entire
   // host syscall body. Background:
   //
@@ -1092,9 +1228,6 @@ uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXC
   if (SMCLazyInvalActive()) {
     DrainSMCLazyDirtyPages(Frame->Thread, FEX::HLE::SMCLazy::DrainPoint::Syscall);
   }
-
-  // Grab the return address which will be inside the JIT.
-  const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
 
   const auto SeccompResult = SeccompEmulator.ExecuteFilter(Frame, JITPC, Args);
 

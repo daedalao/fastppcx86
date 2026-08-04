@@ -1331,6 +1331,18 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
     if (Handler.GuestHandler &&
         Handler.GuestHandler(Thread, Signal, &SigInfo, UContext, &Handler.GuestAction, &ThreadObject->SignalInfo.GuestAltStack)) {
+      // Guest SA_RESTART bookkeeping. A guest handler is now committed to run on
+      // this thread; record whether the guest asked for interrupted syscalls to
+      // be restarted around it. HandleSyscall's restart loop reads these once
+      // its DeferredSignalRefCountGuard has destructed -- which, for a thread
+      // interrupted inside a host syscall, is exactly the point this delivery
+      // happens from (fault-page poke -> drain -> handler -> sigreturn -> back
+      // into the destructor). See ThreadManager.h for the field comments.
+      ++ThreadObject->SignalInfo.DeliveredGuestSignals;
+      if (!(Handler.GuestAction.sa_flags & SA_RESTART)) {
+        ++ThreadObject->SignalInfo.DeliveredGuestSignalsWithoutRestart;
+      }
+
       uint64_t NewMask = GetNewSigMask(Signal);
 
       // Update our host signal mask so we don't hit race conditions with signals
