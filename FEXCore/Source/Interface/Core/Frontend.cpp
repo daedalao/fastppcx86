@@ -2003,9 +2003,15 @@ void Decoder::DetectSpinLoops() {
       }
       if (MarkFlag) {
         Cmp->Flags |= MarkFlag;
-        LogMan::Msg::IFmt("SpinLoopClamp[auto]: equality-exit loop [0x{:x}, 0x{:x}) — clamping CMP at 0x{:x} (ind GPR {}, bound GPR {})", Head,
-                          BodyEnd, Cmp->PC, MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegA : RegB,
-                          MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegB : RegA);
+        // Log once per distinct site — Mono recompilation would otherwise
+        // repeat this for every recompile of the same block.
+        size_t TotalSites = 0;
+        if (CTX->MarkSpinClampSiteLogged(Cmp->PC, TotalSites)) {
+          LogMan::Msg::IFmt("SpinLoopClamp[auto]: equality-exit loop [0x{:x}, 0x{:x}) — clamping CMP at 0x{:x} (ind GPR {}, bound GPR {}; "
+                            "{} sites total)",
+                            Head, BodyEnd, Cmp->PC, MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegA : RegB,
+                            MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegB : RegA, TotalSites);
+        }
       }
     }
   }

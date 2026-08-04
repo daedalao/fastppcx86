@@ -856,9 +856,10 @@
           "detects tight loops whose only exit for a register is exact equality",
           "against a loop-invariant register while that register steps by a",
           "positive constant, and compiles their compare with the overshoot",
-          "clamp automatically (no RIPs needed). Only terminating-native",
-          "behavior is preserved by construction; unclassifiable loops are",
-          "left untouched.",
+          "clamp automatically (no RIPs needed). Auto sites clamp only on",
+          "SIGNED overshoot beyond a 2^30 margin, so negative inductions and",
+          "small legitimate overshoots in multi-exit scan loops are never",
+          "touched; unclassifiable loops are left alone entirely.",
           "0 = off, 1 = active when a Mono runtime is detected (Unity/Mono",
           "games; default), 2 = active for every process."
         ]

@@ -1402,10 +1402,13 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
   // frontend's structural detection (Decoder::DetectSpinLoops), or the
   // manually configured FEX_SPINLOOPCLAMP guest-RIP range.
   std::optional<bool> ClampDestIsInduction {};
+  bool AutoClamp = false;
   if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_DEST_IND) {
     ClampDestIsInduction = true;
+    AutoClamp = true;
   } else if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_SRC_IND) {
     ClampDestIsInduction = false;
+    AutoClamp = true;
   } else {
     const auto& Clamp = CTX->SpinLoopClamp;
     if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
@@ -1431,10 +1434,26 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
     const bool DestIsInduction = *ClampDestIsInduction;
     Ref Induction = DestIsInduction ? Dest : Src;
     Ref Bound = DestIsInduction ? Src : Dest;
-    Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
+    Ref Clamped;
+    if (AutoClamp) {
+      // Auto-detected sites clamp on SIGNED overshoot past a large margin,
+      // not plain unsigned-above. Two structurally-legal loop families make
+      // the tighter condition necessary (found in the RimWorld audit):
+      // negative inductions counting up to a bound sit unsigned-above it for
+      // their entire natively-terminating run, and multi-exit scan loops may
+      // legitimately step slightly past the bound before their other edge
+      // fires. Neither survives a 2^30 signed overshoot natively (a 1 GiB
+      // overrun faults first), while every captured wedge value clears it.
+      constexpr int64_t SpinClampAutoMargin = 1LL << 30;
+      Ref Diff = _Sub(OpSize::i64Bit, Induction, Bound);
+      Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SGT, Diff, Constant(SpinClampAutoMargin), Bound, Induction);
+    } else {
+      // Manually-aimed range: exact unsigned clamp, immediate cure, and loud.
+      Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
+      LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
+    }
     StoreGPRRegister((DestIsInduction ? Op->Dest : Op->Src[SrcIndex]).Data.GPR.GPR, Clamped, OpSize::i64Bit);
     (DestIsInduction ? Dest : Src) = Clamped;
-    LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
   }
 
   CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Src);

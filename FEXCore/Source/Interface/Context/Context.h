@@ -386,6 +386,16 @@ public:
     return Config.SpinLoopClampAuto() == 2 || (Config.SpinLoopClampAuto() == 1 && MonoDetected);
   }
 
+  // Detection-log dedupe for the auto spin-loop clamp: Mono recompiles the
+  // same blocks constantly, and per-compile logging was 86% of a RimWorld
+  // session log. Returns true only the first time a CMP PC is seen.
+  bool MarkSpinClampSiteLogged(uint64_t PC, size_t& TotalSites) {
+    std::lock_guard lk {SpinClampLogMutex};
+    const bool First = SpinClampLoggedPCs.insert(PC).second;
+    TotalSites = SpinClampLoggedPCs.size();
+    return First;
+  }
+
   // Parsed form of Config.SpinLoopClamp ("0xBEGIN-0xEND:ind:bound"). When
   // Active, OpDispatchBuilder::CMPOp compiles any 64-bit register-register
   // compare of InductionReg against BoundReg whose guest RIP lies in
@@ -544,6 +554,10 @@ private:
   fextl::set<uint64_t> ForceTSOInstructions;
 
   bool MonoDetected = false;
+
+  // See MarkSpinClampSiteLogged.
+  std::mutex SpinClampLogMutex;
+  fextl::set<uint64_t> SpinClampLoggedPCs;
   std::atomic<uint64_t> MonoBackpatcherBlock;
 
   std::mutex CodeBufferListLock;
