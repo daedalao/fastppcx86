@@ -1009,26 +1009,81 @@ DEF_OP(MemSet) {
     }
   }
 
-  // Loop pointer in TMP1 (TMP1 may already hold Base if prefix was applied).
-  if (Base != TMP1) mr(TMP1, Base);
-  mr(TMP4, LenIn);
+  // Fast path: REP STOSB, forward, 64-bit guest. This is libc/Mono memset —
+  // measured as the Hard West main thread's hottest block (Mono zeroes every
+  // allocation through it; the generic loop below costs ~6 host insns per
+  // BYTE). Byte-store to 8-byte alignment, then aligned std chunks (splat via
+  // one mulld), then byte tail. Aligned stds cannot cross a page, so a fault
+  // mid-set still leaves byte-granular-consistent memory, and guest RCX/RDI
+  // are only written back at op end in both paths — fault-visible state is
+  // unchanged from the generic loop. 32-bit guests keep the generic loop (the
+  // 4 GiB pointer wrap is per-store); backward/unknown direction likewise.
+  // Follow-up candidate (not done): dcbz 128-byte chunks for the zero case.
+  const bool ConstDir = IsInlineConstant(Op->Direction, &DirConst);
+  if (ConstDir && static_cast<int8_t>(DirConst) == 1 && Sz == 1 && CTX->Config.Is64BitMode()) {
+    if (Base != TMP1) mr(TMP1, Base);
+    // Splat the fill byte across 64 bits. Zero case stores r0 directly (the
+    // JIT keeps r0 == 0). Tail/align stores use the splat's low byte, which
+    // equals the fill byte, so TMP2 is always free as the alignment scratch
+    // even when ValIn aliases it.
+    GPR Splat = r0;
+    if (ValIn != r0) {
+      andi_(TMP3, ValIn, 0xFF);
+      LoadConstant(TMP4, 0x0101010101010101ULL);
+      mulld(TMP3, TMP3, TMP4);
+      Splat = TMP3;
+    }
+    mr(TMP4, LenIn);
 
-  PPC64Emitter::Label loop, done;
-  Bind(&loop);
-  cmpdi(TMP4, 0);
-  bc(CC_EQ, &done);
-  // 32-bit guest: wrap pointer at 4 GiB before each store iteration.
-  MaybeClrUpper32(TMP1);
-  switch (Sz) {
-  case 1: stb(ValIn, 0, TMP1); break;
-  case 2: sth(ValIn, 0, TMP1); break;
-  case 4: stw(ValIn, 0, TMP1); break;
-  case 8: std(ValIn, 0, TMP1); break;
+    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    Bind(&align_loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    andi_(TMP2, TMP1, 7);
+    bc(CC_EQ, &chunk_loop);
+    stb(Splat, 0, TMP1);
+    addi(TMP1, TMP1, 1);
+    addi(TMP4, TMP4, -1);
+    b(&align_loop);
+
+    Bind(&chunk_loop);
+    cmpldi(TMP4, 8);
+    bc(CC_ULT, &tail_loop);
+    std(Splat, 0, TMP1);
+    addi(TMP1, TMP1, 8);
+    addi(TMP4, TMP4, -8);
+    b(&chunk_loop);
+
+    Bind(&tail_loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    stb(Splat, 0, TMP1);
+    addi(TMP1, TMP1, 1);
+    addi(TMP4, TMP4, -1);
+    b(&tail_loop);
+    Bind(&done);
+  } else {
+    // Loop pointer in TMP1 (TMP1 may already hold Base if prefix was applied).
+    if (Base != TMP1) mr(TMP1, Base);
+    mr(TMP4, LenIn);
+
+    PPC64Emitter::Label loop, done;
+    Bind(&loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    // 32-bit guest: wrap pointer at 4 GiB before each store iteration.
+    MaybeClrUpper32(TMP1);
+    switch (Sz) {
+    case 1: stb(ValIn, 0, TMP1); break;
+    case 2: sth(ValIn, 0, TMP1); break;
+    case 4: stw(ValIn, 0, TMP1); break;
+    case 8: std(ValIn, 0, TMP1); break;
+    }
+    add(TMP1, TMP1, TMP3);
+    addi(TMP4, TMP4, -1);
+    b(&loop);
+    Bind(&done);
   }
-  add(TMP1, TMP1, TMP3);
-  addi(TMP4, TMP4, -1);
-  b(&loop);
-  Bind(&done);
 
   // Restore CR0 (saved at op entry) — REP STOS preserves flags.
   ld(TMP3, -8, r1);
