@@ -644,10 +644,14 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   auto Context = reinterpret_cast<ArchHelpers::Context::ContextBackup*>(NewSP);
 
 #ifdef ARCHITECTURE_ppc64le
-  SIGTRACE("RESTORE type=%d guest_rsp=0x%lx backup=0x%lx nip=0x%lx lr=0x%lx flags=0x%x isi=0x%x sig=%d",
+  // r10 is included because it is the SRA home of guest RBX: an INJIT resume
+  // that reinstates a stale r10 is the current prime suspect for the
+  // finalize-spin corruption (docs/ZIGGURAT_FINALIZE_SPIN.md), and this line
+  // is the only place that value is visible.
+  SIGTRACE("RESTORE type=%d guest_rsp=0x%lx backup=0x%lx nip=0x%lx lr=0x%lx r10=0x%lx flags=0x%x isi=0x%x sig=%d",
            (int)Type, (unsigned long)Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP], (unsigned long)NewSP,
-           (unsigned long)Context->GPRs[32], (unsigned long)Context->GPRs[36], Context->Flags, (unsigned)Context->InSyscallInfo,
-           Context->Signal);
+           (unsigned long)Context->GPRs[32], (unsigned long)Context->GPRs[36], (unsigned long)Context->GPRs[10], Context->Flags,
+           (unsigned)Context->InSyscallInfo, Context->Signal);
 #endif
 
   // Restore host state

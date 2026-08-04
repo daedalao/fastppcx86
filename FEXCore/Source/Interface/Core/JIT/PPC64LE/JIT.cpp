@@ -2329,6 +2329,41 @@ void PPC64JITCore::ClearCache() {
 }
 
 // -------------------------------------------------------------------------
+// FEX_ENTRYWATCH=0xBEGIN-0xEND (diagnostic; docs/ZIGGURAT_FINALIZE_SPIN.md):
+// every DISPATCHER entry into a JIT entry-point whose guest RIP falls in the
+// range stores host r10 (the SRA home of guest RBX) and a timebase stamp
+// into this ring and bumps a counter. Intra-block jumps land past the entry
+// prologue and are NOT recorded — so a corrupt RBX appearing here proves the
+// corruption arrived through the dispatcher's State fill, while a wedge with
+// a clean ring proves in-place register injection (INJIT signal resume).
+// Read live from a wedged process: gdb -p PID -batch -ex "p/x FEX_EntryWatch"
+extern "C" {
+struct FEXEntryWatchSlot {
+  uint64_t GuestRIP;
+  uint64_t LastRBX;
+  uint64_t LastTB;
+  uint64_t Count;
+};
+FEXEntryWatchSlot FEX_EntryWatch[64] {};
+}
+
+static std::pair<uint64_t, uint64_t> EntryWatchRange() {
+  static const auto Range = []() -> std::pair<uint64_t, uint64_t> {
+    const char* Env = getenv("FEX_ENTRYWATCH");
+    if (!Env) {
+      return {0, 0};
+    }
+    char* End {};
+    const uint64_t Begin = std::strtoull(Env, &End, 0);
+    if (*End != '-') {
+      return {0, 0};
+    }
+    return {Begin, std::strtoull(End + 1, nullptr, 0)};
+  }();
+  return Range;
+}
+static std::atomic<uint32_t> EntryWatchNextSlot {};
+
 // EmitStoreBlockBeginToInlineHeader
 // -------------------------------------------------------------------------
 // PPC64LE equivalent of the ARM64 sequence
@@ -3153,6 +3188,23 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // Warm-path store: dispatcher L1 hits land here, skipping FillStaticRegs
       // above. Re-emit so InlineJITBlockHeader is refreshed on every entry.
       EmitStoreBlockBeginToInlineHeader(HeaderLabel);
+      // FEX_ENTRYWATCH ring store (see the definition above). TMP1/TMP2 are
+      // clobberable here per the EmitStoreBlockBeginToInlineHeader contract;
+      // r10 already holds guest RBX (dispatcher FillStaticRegs ran before the
+      // bctr into this prologue).
+      if (const auto [WatchBegin, WatchEnd] = EntryWatchRange(); WatchEnd != 0 && GuestEntry >= WatchBegin && GuestEntry < WatchEnd) {
+        auto* Slot = &FEX_EntryWatch[EntryWatchNextSlot++ % std::size(FEX_EntryWatch)];
+        Slot->GuestRIP = GuestEntry;
+        LoadConstant(TMP1, reinterpret_cast<uint64_t>(Slot));
+        std(r10, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, LastRBX)), TMP1);
+        mftb(TMP2);
+        std(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, LastTB)), TMP1);
+        ld(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, Count)), TMP1);
+        addi(TMP2, TMP2, 1);
+        std(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, Count)), TMP1);
+        LogMan::Msg::IFmt("EntryWatch: slot {} watching dispatcher entries at guest RIP 0x{:x}", (EntryWatchNextSlot.load() - 1) % std::size(FEX_EntryWatch),
+                          GuestEntry);
+      }
       // Drain any deferred async signal at this guest instruction boundary.
       // Every dispatcher hit and linked block-to-block jump lands here, so a
       // guest loop spanning compile units cannot orbit without passing a
