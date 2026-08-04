@@ -183,3 +183,41 @@ This is a workaround, not the fix: something (still suspected to be
 signal-time resume skipping the loop init — see "Where to look next") hands
 the loop a corrupted induction variable. The clamp makes the wedge survivable
 while that hunt continues.
+
+## 2026-08-04 CORRECTION: 0x551330 was a BAD DECODE — real block is 0x934a40
+
+A live third capture (PID 339678, new build, clamp env confirmed present via
+`/proc/PID/environ`) still wedged, and the clamp had **never instrumented
+anything in any run** (no "instrumented CMP" line in any tmp/*.log; the lone
+log line was the parse-time "SpinLoopClamp active"). Diagnosis by subagent:
+
+- **The spin block's real guest RIP is `0x934a40`** (guest_size 4301,
+  582 RIP entries); the spinning CMP itself maps to guest **`0x934d15`**,
+  exit branch 0x934d2a, back edge 0x934d33, exit target 0x934e72. Still
+  inside Ziggurat.x86_64's text. Same loop shape, same R15=4/R12=0/R14=1,
+  RBX=0xab8107268 climbing.
+- **Why capture 2 got 0x551330:** its perf offset was added to the FIRST
+  16 MB FEXMemJIT mapping, which is *too small to contain the offset*;
+  `jitrip.py` then accepted a plausible-looking false header (it takes the
+  first self-consistent candidate within its scan window). The arithmetic
+  proof this time: perf offset 0x5ab9e40 + third mapping base 0x1112beee000
+  = live pc 0x111319a7e40. **Rule: reject any base where base+offset lands
+  outside that same mapping.**
+- The compare IS a 64-bit reg-reg CMP rbx,r15 (subfco. discards its result),
+  so the clamp matches once aimed correctly.
+- Tooling: `scratchpad/ripwalk.py` (also op4k:/tmp/ripwalk.py) walks the
+  vl64pair RIP table exactly like `RestoreRIPFromHostPC` — use it to map
+  host PC → guest RIP instead of trusting jitrip.py's header scan alone.
+
+**Corrected spec: `FEX_SPINLOOPCLAMP=0x934a40-0x935b0d:rbx:r15`** — now the
+fexplay-smc default. CMPOp additionally logs in-range-but-not-clamped CMPs so
+a mis-aimed range can never again look identical to a working one.
+
+Intriguing lead for the ROOT CAUSE (from the user's "41 or 43" recollection
+of the FEX arm64 talk): 0x41/0x43 are REX.B / REX.X|REX.B prefixes, and FEX
+has release-note history of REX misapplication; the loop's invariant regs are
+all REX-extended (R12/R14/R15) and the post-exit code indexes a load with RBX
+via SIB (REX.X territory). A decode slip in the instruction that INITIALIZES
+RBX would produce exactly "correct loop, garbage entry value". Check from the
+FEX decoder side (dump decoded IR for [0x934a40, 0x934d15)) — the game binary
+itself stays off-limits.

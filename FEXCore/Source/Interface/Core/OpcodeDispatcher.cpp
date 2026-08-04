@@ -1399,19 +1399,28 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
   // The architectural register is rewritten too — post-loop code must observe
   // the same ind == bound state a legitimate final iteration leaves behind.
   const auto& Clamp = CTX->SpinLoopClamp;
-  if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End && OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() &&
-      Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits && !Op->Src[SrcIndex].Data.GPR.HighBits) {
-    const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
-    const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
-    const bool DestIsInduction = DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg;
-    const bool SrcIsInduction = SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg;
-    if (DestIsInduction || SrcIsInduction) {
-      Ref Induction = DestIsInduction ? Dest : Src;
-      Ref Bound = DestIsInduction ? Src : Dest;
-      Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
-      StoreGPRRegister(Clamp.InductionReg, Clamped, OpSize::i64Bit);
-      (DestIsInduction ? Dest : Src) = Clamped;
-      LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
+  if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
+    bool Instrumented = false;
+    if (OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() && Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits &&
+        !Op->Src[SrcIndex].Data.GPR.HighBits) {
+      const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
+      const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
+      const bool DestIsInduction = DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg;
+      const bool SrcIsInduction = SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg;
+      if (DestIsInduction || SrcIsInduction) {
+        Ref Induction = DestIsInduction ? Dest : Src;
+        Ref Bound = DestIsInduction ? Src : Dest;
+        Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
+        StoreGPRRegister(Clamp.InductionReg, Clamped, OpSize::i64Bit);
+        (DestIsInduction ? Dest : Src) = Clamped;
+        LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
+        Instrumented = true;
+      }
+    }
+    // A mis-aimed range must not be silently indistinguishable from a working
+    // one (that already cost a session): say why an in-range CMP was skipped.
+    if (!Instrumented) {
+      LogMan::Msg::IFmt("SpinLoopClamp: CMP at guest RIP 0x{:x} in range but NOT clamped (size or operand mismatch)", Op->PC);
     }
   }
 
