@@ -21,7 +21,7 @@
   cmp rbx, 5
   %1
   lahf
-  movzx rdx, ah
+  movzx edx, ah
   and rdx, 0xC1        ; keep SF | ZF | CF
   shl rdi, 8
   or rdi, rdx
