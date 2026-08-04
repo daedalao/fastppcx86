@@ -1068,6 +1068,12 @@ public:
   void vnot(VR vrt, VR vra)  { vnor(vrt, vra, vra); }
 
   // Shifts (VX-form)
+  // Vector rotate left (element-wise; count = low log2(width) bits of each
+  // rb element). vrlb/vrlh/vrlw are original AltiVec; vrld is ISA 2.07 (P8).
+  void vrlb(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 4); }
+  void vrlh(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 68); }
+  void vrlw(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 132); }
+  void vrld(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 196); }
   void vslb(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 260); }
   void vslh(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 324); }
   void vslw(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 388); }

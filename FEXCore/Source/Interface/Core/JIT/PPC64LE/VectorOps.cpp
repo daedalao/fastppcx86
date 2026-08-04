@@ -1620,38 +1620,39 @@ DEF_OP(VRev64) {
   const auto ElemSz = Op->Header.ElementSize;
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
-  // Reverse bytes within each 64-bit element.
-  if (ElemSz == IR::OpSize::i8Bit) {
-    // perm: phys[0..7]=[7,6,5,4,3,2,1,0], phys[8..15]=[15,14,13,12,11,10,9,8]
-    // -16 → phys[8..15]; -8 → phys[0..7]. (Lo/Hi was previously swapped.)
-    LoadConstant(TMP2, 0x0F0E0D0C0B0A0908ULL);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0706050403020100ULL);
-    std(TMP2, -8, r1);
-    addi(TMP1, r1, -16);
-    lvx(VTMP1, r(0), TMP1);
-    vperm(Dst, Src, Src, VTMP1);
-  } else if (ElemSz == IR::OpSize::i16Bit) {
-    // perm: phys[0..7]=[6,7,4,5,2,3,0,1], phys[8..15]=[14,15,12,13,10,11,8,9]
-    LoadConstant(TMP2, 0x0E0F0C0D0A0B0809ULL);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0607040502030001ULL);
-    std(TMP2, -8, r1);
-    addi(TMP1, r1, -16);
-    lvx(VTMP1, r(0), TMP1);
-    vperm(Dst, Src, Src, VTMP1);
-  } else if (ElemSz == IR::OpSize::i32Bit) {
-    // perm: phys[0..7]=[4,5,6,7,0,1,2,3], phys[8..15]=[12,13,14,15,8,9,10,11]
-    LoadConstant(TMP2, 0x0C0D0E0F08090A0BULL);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0405060700010203ULL);
-    std(TMP2, -8, r1);
-    addi(TMP1, r1, -16);
-    lvx(VTMP1, r(0), TMP1);
-    vperm(Dst, Src, Src, VTMP1);
-  } else {
+  // Reverse ElemSz-sized elements within each 64-bit lane, via the P8-legal
+  // rotate cascade — no perm control, no stack staging, no lvx (the old
+  // lowering was 15 insns of LoadConstant+std+lvx+vperm per emission; see
+  // docs/EMITTER_REVIEW.md finding 6):
+  //   rotate each doubleword by 32  (vrld)  — swaps the two words
+  //   rotate each word by 16        (vrlw)  — swaps halfwords within words
+  //   rotate each halfword by 8     (vrlh)  — swaps bytes within halfwords
+  // i32 needs only the first, i16 the first two, i8 all three.
+  // Shift-amount vectors, all splat-built (no memory):
+  //   32 per doubleword: vspltisw 8, doubled twice (vrld reads low 6 bits).
+  //   16 per word:       vspltisw -16 (0xFFFFFFF0; vrlw reads low 5 = 16).
+  //   8 per halfword:    vspltish 8.
+  if (ElemSz == IR::OpSize::i64Bit) {
     if (Dst != Src) vmr(Dst, Src);
+    return;
   }
+  // VTMP1 = {32,32} per doubleword lane (as words: each word holds 8->16->32;
+  // vrld only consumes bits 58:63 of each doubleword, so the high word's
+  // copy of the value is harmless).
+  vspltisw(VTMP1, 8);
+  vadduwm(VTMP1, VTMP1, VTMP1);
+  vadduwm(VTMP1, VTMP1, VTMP1);
+  vrld(Dst, Src, VTMP1); // words swapped within each doubleword
+  if (ElemSz == IR::OpSize::i32Bit) {
+    return;
+  }
+  vspltisw(VTMP1, -16); // low 5 bits of each word = 16
+  vrlw(Dst, Dst, VTMP1); // halfwords swapped within each word
+  if (ElemSz == IR::OpSize::i16Bit) {
+    return;
+  }
+  vspltish(VTMP1, 8);
+  vrlh(Dst, Dst, VTMP1); // bytes swapped within each halfword
 }
 
 // ---------------------------------------------------------------------------
