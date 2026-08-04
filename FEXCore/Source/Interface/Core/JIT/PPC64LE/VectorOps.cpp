@@ -1519,10 +1519,10 @@ DEF_OP(VSQSHL) {
     case 4: extsw(TMP4, TMP2); break;
     case 8: mr   (TMP4, TMP2); break;
     }
-    cmpd(cr(0), TMP4, TMP2);
+    cmpd(cr(1), TMP4, TMP2);  // cr(1) so CR0 (packed NZCV) is preserved
     auto Saturate = PPC64Emitter::Label{};
     auto Done     = PPC64Emitter::Label{};
-    bc(CC_NE, &Saturate);
+    bc({4, 6}, &Saturate);    // bne on CR1.EQ
     switch (sz) {
     case 1: stb(TMP2, Off, r1); break;
     case 2: sth(TMP2, Off, r1); break;
@@ -3080,11 +3080,11 @@ DEF_OP(VUShrSWide) {
   mfvsrd(TMP1, VTMP1);
 
   LoadConstant(TMP2, IR::OpSizeAsBits(ElemSz));
-  cmpld(cr(0), TMP1, TMP2);
+  cmpld(cr(1), TMP1, TMP2);  // cr(1) so CR0 (packed NZCV) is preserved
 
   PPC64Emitter::Label Zero{};
   PPC64Emitter::Label Done{};
-  bc(CC_UGE, &Zero);
+  bc({4, 0 + 4}, &Zero);  // bge (CC_UGE) on cr(1)
   EmitWideShiftCore(this, Dst, Vec, TMP1, TMP2, ElemSz, false, false);
   b(&Done);
   Bind(&Zero);
@@ -3103,11 +3103,11 @@ DEF_OP(VSShrSWide) {
   mfvsrd(TMP1, VTMP1);
 
   LoadConstant(TMP2, IR::OpSizeAsBits(ElemSz));
-  cmpld(cr(0), TMP1, TMP2);
+  cmpld(cr(1), TMP1, TMP2);  // cr(1) so CR0 (packed NZCV) is preserved
 
   PPC64Emitter::Label Saturate{};
   PPC64Emitter::Label Done{};
-  bc(CC_UGE, &Saturate);
+  bc({4, 0 + 4}, &Saturate);  // bge (CC_UGE) on cr(1)
   EmitWideShiftCore(this, Dst, Vec, TMP1, TMP2, ElemSz, false, true);
   b(&Done);
   Bind(&Saturate);
@@ -3126,11 +3126,11 @@ DEF_OP(VUShlSWide) {
   mfvsrd(TMP1, VTMP1);
 
   LoadConstant(TMP2, IR::OpSizeAsBits(ElemSz));
-  cmpld(cr(0), TMP1, TMP2);
+  cmpld(cr(1), TMP1, TMP2);  // cr(1) so CR0 (packed NZCV) is preserved
 
   PPC64Emitter::Label Zero{};
   PPC64Emitter::Label Done{};
-  bc(CC_UGE, &Zero);
+  bc({4, 0 + 4}, &Zero);  // bge (CC_UGE) on cr(1)
   EmitWideShiftCore(this, Dst, Vec, TMP1, TMP2, ElemSz, true, false);
   b(&Done);
   Bind(&Zero);
@@ -4112,9 +4112,10 @@ DEF_OP(VFToIScalarInsert) {
   default: {
     PPC64Emitter::Label skip_roundtrip{};
 
-    // Bypass #1: NaN.  f0 != f0 iff NaN; fcmpu sets CR0.UN (PPC bit 3).
-    fcmpu(cr(0), f0, f0);
-    bc({12, 3}, &skip_roundtrip);  // BO=12 BI=3 → branch if CR0.UN set
+    // Bypass #1: NaN.  f0 != f0 iff NaN; fcmpu sets CR1.UN (bit 7).
+    // cr(1) so CR0 (packed NZCV) is preserved — ROUNDSS/SD writes no flags.
+    fcmpu(cr(1), f0, f0);
+    bc({12, 7}, &skip_roundtrip);  // BO=12 BI=7 → branch if CR1.UN set
 
     // Bypass #2: |f0| >= 2^52. f64 mantissa is 52 bits; magnitudes at or
     // above this boundary are integer-valued exactly and need no rounding.
@@ -4123,8 +4124,8 @@ DEF_OP(VFToIScalarInsert) {
     std(TMP3, -64, r1);
     lfd(f2, -64, r1);
     fabs(f3, f0);
-    fcmpu(cr(0), f3, f2);
-    bc({12, 1}, &skip_roundtrip);  // BO=12 BI=1 → branch if CR0.GT (f3 > 2^52)
+    fcmpu(cr(1), f3, f2);
+    bc({12, 5}, &skip_roundtrip);  // BO=12 BI=5 → branch if CR1.GT (f3 > 2^52)
 
     fctid(f1, f0);  // f64 → i64 using FPSCR.RN (banker's by default)
     fcfid(f0, f1);  // i64 → f64 (exact for values within precision boundary)
@@ -4166,33 +4167,36 @@ DEF_OP(VFCMPScalarInsert) {
     lfd(f0, -32, r1);
     lfd(f1, -16, r1);
   }
-  fcmpu(cr(0), f0, f1);
-  // CR0: bit 0=LT (a<b), bit 1=GT (a>b), bit 2=EQ (a==b), bit 3=SO (NaN).
-  // Normalize predicate result into CR0.EQ (bit 2) so we can branch on CC_NE.
+  // cr(1) throughout: guest CMPSS/CMPSD writes NO EFLAGS, and CR0 holds the
+  // packed NZCV — clobbering it here corrupts a pending cmp/test's flags
+  // (Hard West wedged forever in a cmp → cmpltss → jne normalize loop).
+  fcmpu(cr(1), f0, f1);
+  // CR1: bit 4=LT (a<b), bit 5=GT (a>b), bit 6=EQ (a==b), bit 7=SO (NaN).
+  // Normalize predicate result into CR1.EQ (bit 6) so we can branch on it.
   switch (Pred) {
   case IR::FloatCompareOp::EQ:
-    /* CR0.EQ already correct */
+    /* CR1.EQ already correct */
     break;
   case IR::FloatCompareOp::LT:
-    cror(2, 0, 0);   // EQ = LT
+    cror(6, 4, 4);   // EQ = LT
     break;
   case IR::FloatCompareOp::LE:
-    cror(2, 0, 2);   // EQ = LT || EQ
+    cror(6, 4, 6);   // EQ = LT || EQ
     break;
   case IR::FloatCompareOp::UNO:
-    cror(2, 3, 3);   // EQ = SO
+    cror(6, 7, 7);   // EQ = SO
     break;
   case IR::FloatCompareOp::NEQ:
-    crnor(2, 2, 2);  // EQ = !EQ
+    crnor(6, 6, 6);  // EQ = !EQ
     break;
   case IR::FloatCompareOp::ORD:
-    crnor(2, 3, 3);  // EQ = !SO
+    crnor(6, 7, 7);  // EQ = !SO
     break;
   }
 
   PPC64Emitter::Label done{};
   li(TMP3, 0);
-  bc(CC_NE, &done);              // skip if predicate false
+  bc({4, 6}, &done);             // bne on CR1.EQ: skip if predicate false
   li(TMP3, -1);                  // mask = all-ones
   Bind(&done);
 
