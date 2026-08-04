@@ -1023,10 +1023,13 @@ DEF_OP(MemSet) {
   // at runtime on the computed step in TMP3.
   // Follow-up candidate (not done): dcbz 128-byte chunks for the zero case.
   const bool ConstDir = IsInlineConstant(Op->Direction, &DirConst);
-  const bool AlwaysFast = ConstDir && static_cast<int8_t>(DirConst) == 1;
-  const bool NeverFast = ConstDir && static_cast<int8_t>(DirConst) != 1;
+  // Eligibility must fold in size/bitness: AlwaysFast may only suppress the
+  // generic loop when the fast path was actually emitted for this op —
+  // getting this wrong makes constant-forward stosw/d/q emit NO loop at all.
+  const bool FastEligible = Sz == 1 && CTX->Config.Is64BitMode() && !(ConstDir && static_cast<int8_t>(DirConst) != 1);
+  const bool AlwaysFast = FastEligible && ConstDir && static_cast<int8_t>(DirConst) == 1;
   PPC64Emitter::Label generic_path, out;
-  if (!NeverFast && Sz == 1 && CTX->Config.Is64BitMode()) {
+  if (FastEligible) {
     if (!AlwaysFast) {
       // TMP3 holds the sign-extended step; +1 selects the fast path.
       cmpdi(TMP3, 1);
