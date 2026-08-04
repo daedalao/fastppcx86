@@ -83,6 +83,24 @@ uint32_t CalculateNumberOfCPUs() {
   if (const uint32_t Override = GetCPUCountOverride()) {
     return Override;
   }
+  // The process affinity mask (taskset, cpuset) bounds what the guest can
+  // actually run on, and glibc's sched_getaffinity path (nproc) already
+  // reflects it. The emulated /proc/cpuinfo must agree, or guests that size
+  // thread pools from cpuinfo instead (Unity's SystemInfo.processorCount)
+  // oversubscribe the cage — Hard West built a 79-worker pool inside a
+  // 16-thread cage, and its park gate ("no worker inside the steal window")
+  // became statistically unreachable: permanent spin at ~2 fps.
+  uint32_t AffinityCount = 0;
+  {
+    cpu_set_t Set;
+    CPU_ZERO(&Set);
+    if (sched_getaffinity(0, sizeof(Set), &Set) == 0) {
+      AffinityCount = static_cast<uint32_t>(CPU_COUNT(&Set));
+    }
+  }
+  const auto BoundByAffinity = [AffinityCount](uint32_t Count) {
+    return (AffinityCount != 0 && AffinityCount < Count) ? AffinityCount : Count;
+  };
   // Prefer /sys/devices/system/cpu/online — this reports only CPUs that are
   // actually online for scheduling. The legacy approach of counting
   // /sys/devices/system/cpu/cpu{N} directory entries incorrectly returns
@@ -102,7 +120,7 @@ uint32_t CalculateNumberOfCPUs() {
     }
     uint32_t parsed = ParseCPUList(buf);
     if (parsed > 0) {
-      return parsed;
+      return BoundByAffinity(parsed);
     }
   }
 
@@ -121,7 +139,7 @@ uint32_t CalculateNumberOfCPUs() {
     }
   }
 
-  return CPUs;
+  return BoundByAffinity(CPUs);
 }
 #else
 uint32_t CalculateNumberOfCPUs() {
