@@ -543,6 +543,13 @@ path five times cheaper. Neither change makes the other redundant; the
 instruction counts in §9.1 are measured **without** `vbpermq` and should be
 re-taken once the two are merged.
 
+> **This section's prediction was half right, and §11 has the measurement.**
+> The two do compose, the back edge really is `vcmpequb. ; bc ; b ; b`, and the
+> `vbpermq` sequence really does relocate to the match edge. What did not
+> survive contact is the assumption that the surviving `mfvsrd` costs anything:
+> on POWER9 it is fully overlapped, and the fusion measures **1.3% slower** than
+> `vbpermq` alone. `FEX_VCMPFUSION` is default off as a result.
+
 Two things from that branch are worth adopting here:
 
 1. **`"JITDispatch": false` as the backend-gating mechanism.** That branch adds
@@ -561,6 +568,13 @@ Two things from that branch are worth adopting here:
    that, but the same "build it, don't load it" instinct applies to
    `LoadNamedVectorConstant`, whose `movmaskb` case measures at 68 bytes / 17
    instructions in §9.1.
+
+   **Retired by the merge, in a better way than planned.** The intent was to
+   `lvsl`-build the `movmaskb` constant on the fusion's match edge. Instead the
+   merge moved the `vbpermq` fast path from `MOVMSKOpOne` down into
+   `EmitByteLaneMask`, so the match edge takes it too and there is no
+   `movmaskb` constant left to build — 24 bytes total, constant pool untouched.
+   Deleting the constant beat optimising its materialisation.
 
 ---
 
