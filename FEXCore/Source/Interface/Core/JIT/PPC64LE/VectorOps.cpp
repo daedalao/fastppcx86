@@ -196,24 +196,30 @@ DEF_OP(LoadNamedVectorConstant) {
   // INT_MIN into the result's upper qword — corrupting `cvtpd2dq xmm`.
   if (IROp->Size <= IR::OpSize::i64Bit) {
     // Load just the low 8 bytes of the table entry, zero the upper 8.
+    // mtvsrd staging: no stack round-trip, no store-forwarding stall
+    // (docs/EMITTER_REVIEW.md finding 2). mtvsrd puts the value in the
+    // VSR's BE dw0; xxpermdi dm=0b00 takes zero.dw0 into phys[0..7] and
+    // value.dw0 into phys[8..15] — the same image the old std/lvx pair
+    // produced (LE u64 at the lower address → phys[8..15], LSB at phys[15]).
     LoadConstant(TMP1, Off);
     add(TMP3, STATE, TMP1);
     ld(TMP2, 0, TMP3);
-    std(TMP2, -16, r1);
-    std(r(0), -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(Dst, r(0), TMP3);
+    mtvsrd(VTMP1, TMP2);
+    vspltisb(Dst, 0);
+    xxpermdi(Dst, Dst, VTMP1, 0b00);
     return;
   }
 
   LoadConstant(TMP1, Off);
-  lvx(VTMP1, STATE, TMP1);
-  // NamedVectorConstants are stored LE in memory; lvx places byte 0 at physical
-  // byte 0 (MSB of VR), so LE byte order is reversed.  Byte-reverse to fix.
-  LoadConstant(TMP1, 0x08090A0B0C0D0E0FULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x0001020304050607ULL);  std(TMP1, -8,  r1);
-  addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
-  vperm(Dst, VTMP1, VTMP1, VTMP2);
+  lvx(Dst, STATE, TMP1);
+  // The "LE byte-reverse fix" vperm that used to follow (5-word control
+  // build + vperm, ~14 insns) was an IDENTITY permute: in LE mode lvx
+  // already places mem[A+i] at phys[15-i], so the reversal it tried to
+  // apply had been applied by the load itself, and the control vector —
+  // itself loaded through the same reversing lvx — composed to identity.
+  // Proven on hardware (lnvc_probe.c, 2026-08-03) and by the ASM suite
+  // running clean without it. Every consumer's phys[] conventions were
+  // built against the post-lvx layout, which is unchanged by the deletion.
 }
 
 DEF_OP(LoadNamedVectorIndexedConstant) {
@@ -274,27 +280,24 @@ DEF_OP(LoadNamedVectorIndexedConstant) {
     break;
   case IR::OpSize::i32Bit:
     lwz(TMP2, 0, TMP1);
-    std(TMP2, -16, r1);                       // low 32 in low 4B
-    LoadConstant(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, TMP2, r0);
-    // No additional byte-reversal: lwz already loads LE→GPR-natural,
-    // std lays out LE in memory, lvx reads BE-physical so the 4B value
-    // ends up at LE element 0 with our existing convention (other lanes 0).
+    mtvsrd(VTMP1, TMP2);
+    vspltisb(Dst, 0);
+    xxpermdi(Dst, Dst, VTMP1, 0b00); // zero:phys[0..7], value:phys[8..15]
+    // No byte-reversal needed: lwz loads LE->GPR-natural and mtvsrd's dw0,
+    // placed into phys[8..15], reproduces the old std/lvx image exactly
+    // (value at LE element 0, other lanes 0).
     break;
   case IR::OpSize::i16Bit:
     lhz(TMP2, 0, TMP1);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, TMP2, r0);
+    mtvsrd(VTMP1, TMP2);
+    vspltisb(Dst, 0);
+    xxpermdi(Dst, Dst, VTMP1, 0b00); // zero:phys[0..7], value:phys[8..15]
     break;
   case IR::OpSize::i8Bit:
     lbz(TMP2, 0, TMP1);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, TMP2, r0);
+    mtvsrd(VTMP1, TMP2);
+    vspltisb(Dst, 0);
+    xxpermdi(Dst, Dst, VTMP1, 0b00); // zero:phys[0..7], value:phys[8..15]
     break;
   default:
     Op_Unhandled(IROp, Node);
@@ -1555,63 +1558,24 @@ DEF_OP(VSQSHL) {
 // ---------------------------------------------------------------------------
 
 DEF_OP(VRev32) {
-  // Reverse bytes within each 32-bit element.
+  // Reverse ElemSz-sized elements within each 32-bit container, via the
+  // rotate cascade (docs/EMITTER_REVIEW.md finding 6; same construction as
+  // VRev64 below): rotate each word 16 swaps its halfwords; rotate each
+  // halfword 8 swaps its bytes. i16 = one rotate, i8 = both. No perm
+  // control, no stack staging, no load.
   const auto Op = IROp->C<IR::IROp_VRev32>();
   const auto ElemSz = Op->Header.ElementSize;
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
-
-  // Use vperm with a reversal permutation control vector.
-  // Build perm ctrl on stack: for each output byte B (phys 0-15),
-  // we select phys byte that reverses within 4-byte groups.
-  // Physical byte layout in BE register: [0,1,2,...,15]
-  // For 32-bit reverse: output[0]=in[3], out[1]=in[2], out[2]=in[1], out[3]=in[0],
-  //                     output[4]=in[7], ...
-  // But ElemSz tells us the element size of the *source* data.
-  if (ElemSz == IR::OpSize::i8Bit) {
-    // Reverse every 4 bytes for Rev32 of bytes -> words
-    // perm = [3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12]
-    // Store to stack, load into VTMP1
-    addi(TMP1, r1, -16);
-    LoadConstant(TMP2, 0x0001020310111213ULL);
-    std(TMP2, 0, TMP1);
-    LoadConstant(TMP2, 0x0203000102030001ULL);  // wrong, let me compute
-    // Actually compute: [3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12] in phys bytes
-    // As two 64-bit values (phys bytes 0-7 and 8-15):
-    // phys[0..7]:  3,2,1,0,7,6,5,4
-    // phys[8..15]: 11,10,9,8,15,14,13,12
-    // VAddP convention: value at -16 lands in phys[8..15] (MSB at phys[8]),
-    // value at -8 lands in phys[0..7]. Intent above ⇒ phys[8..15]=11,10,9,8,
-    // 15,14,13,12 ⇒ -16 holds 0x0B0A09080F0E0D0C; phys[0..7]=3,2,1,0,7,6,5,4
-    // ⇒ -8 holds 0x0302010007060504. The previous lines had these swapped.
-    LoadConstant(TMP2, 0x0B0A09080F0E0D0CULL);
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0302010007060504ULL);
-    std(TMP2, -8, r1);
-    addi(TMP1, r1, -16);
-    lvx(VTMP1, r(0), TMP1);
-    vperm(Dst, Src, Src, VTMP1);
-  } else if (ElemSz == IR::OpSize::i16Bit) {
-    // VRev32 with i16Bit element size = swap halfword pairs within each
-    // 32-bit container (ARM REV32 Vd.8H semantics). LE bytes [0,1,2,3]
-    // → [2,3,0,1], not byte-reverse-within-halfword. The dispatcher's
-    // PHMINPOSUW chain (Vector.cpp:4164) relies on this to convert
-    // (Src[Min] << 16) | Index → (Index << 16) | Src[Min].
-    //
-    // Phys-byte ctrl (LE-mode lvx loads mem[addr+i] → phys[15-i]):
-    //   phys[0..15] = [2,3,0,1, 6,7,4,5, 10,11,8,9, 14,15,12,13]
-    // After lvx of two LE doublewords at -16, -8 — encoded so that
-    // mem[-1] becomes phys[0] etc., the LE bytes are packed in reverse-
-    // phys order.
-    LoadConstant(TMP2, 0x0A0B08090E0F0C0DULL);  // -16 → phys[15..8]
-    std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0203000106070405ULL);  // -8  → phys[7..0]
-    std(TMP2, -8, r1);
-    addi(TMP1, r1, -16);
-    lvx(VTMP1, r(0), TMP1);
-    vperm(Dst, Src, Src, VTMP1);
-  } else {
+  if (ElemSz != IR::OpSize::i8Bit && ElemSz != IR::OpSize::i16Bit) {
     if (Dst != Src) vmr(Dst, Src);
+    return;
+  }
+  vspltisw(VTMP1, -16); // vrlw reads low 5 bits of each word = 16
+  vrlw(Dst, Src, VTMP1); // halfwords swapped within each word
+  if (ElemSz == IR::OpSize::i8Bit) {
+    vspltish(VTMP1, 8);
+    vrlh(Dst, Dst, VTMP1); // bytes swapped within each halfword
   }
 }
 
