@@ -22,6 +22,10 @@
 
 #include <xxhash.h>
 
+// ComputeCodeMapId streams the mapped file to derive a content-based cache
+// identity. close() was already used unguarded in this file, so POSIX is
+// assumed here rather than newly introduced.
+#include <array>
 #include <cerrno>
 #include <fstream>
 #include <limits>
@@ -249,79 +253,6 @@ uint64_t SanitizeId(uint64_t Id) {
   }
   return Id;
 }
-
-// Content-derived identity: size + the first and last 64 KiB of the file.
-//
-// The head covers the ELF header, program headers and the start of .text; the
-// tail covers the end of .text and whatever trails it. Any rebuild of a library
-// moves bytes in at least one of the two, and the size almost always changes as
-// well. A whole-file hash would be exact but would read hundreds of megabytes
-// across a Steam runtime's worth of libraries at mmap time.
-//
-// Deliberately NOT dev/ino/mtime: the same rootfs library is reached through
-// several paths (RootFS prefix, /proc/self/fd, bind mounts) and is copied
-// between machines by rootfs images, and mtime is not preserved by every
-// installer. Content is the property the cache actually depends on.
-uint64_t HashFileIdentity(std::string_view Filename, int FD) {
-  const uint64_t PathHash = XXH3_64bits(Filename.data(), Filename.size());
-  if (FD < 0) {
-    return PathHash;
-  }
-
-  // Plain stat/fstat: FEXCore is a 64-bit host component, so off_t is already
-  // 64-bit and the *64 variants would only add a glibc feature-macro dependency.
-  struct stat Stat;
-  if (::fstat(FD, &Stat) != 0 || !S_ISREG(Stat.st_mode)) {
-    return PathHash;
-  }
-
-  XXH3_state_t* State = XXH3_createState();
-  if (!State) {
-    return PathHash;
-  }
-  XXH3_64bits_reset(State);
-
-  StreamHasher Hasher {State};
-  const uint64_t FileSize = static_cast<uint64_t>(Stat.st_size);
-  Hasher.Add(FileSize);
-
-  bool Failed = false;
-  auto HashRange = [&](uint64_t Offset, uint64_t Length) {
-    uint8_t Buffer[8192];
-    uint64_t Done = 0;
-    while (Done < Length && !Failed) {
-      const size_t Want = std::min<uint64_t>(sizeof(Buffer), Length - Done);
-      const ssize_t Read = ::pread(FD, Buffer, Want, static_cast<off_t>(Offset + Done));
-      if (Read < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        Failed = true;
-        return;
-      }
-      if (Read == 0) {
-        // Shorter than stat claimed; not fatal, just stop.
-        return;
-      }
-      XXH3_64bits_update(State, Buffer, static_cast<size_t>(Read));
-      Done += static_cast<uint64_t>(Read);
-    }
-  };
-
-  constexpr uint64_t ChunkSize = 64 * 1024;
-  HashRange(0, std::min(FileSize, ChunkSize));
-  if (FileSize > 2 * ChunkSize) {
-    HashRange(FileSize - ChunkSize, ChunkSize);
-  }
-
-  const uint64_t Result = XXH3_64bits_digest(State);
-  XXH3_freeState(State);
-
-  // A failed read means we hashed an unknown prefix of the file, which is not a
-  // stable identity. Fall back rather than mint an id that depends on how far a
-  // signal-interrupted read happened to get.
-  return Failed ? PathHash : Result;
-}
 } // namespace
 
 uint64_t ComputeCodeCacheConfigId() {
@@ -480,15 +411,82 @@ uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
     return InvalidFileId;
   }
 
-  // Was: XXH3 of the path string. That made cache identity a function of where
-  // a binary lives rather than what it contains, with two consequences that both
-  // end in executing wrong code rather than missing the cache:
-  //   - rebuilding or updating a library in place kept its id, so the old cache
-  //     loaded against new guest bytes;
-  //   - the same file reached through a different path (RootFS prefix vs host
-  //     path) got two ids, so caches never hit.
-  // Content identity fixes both directions. See HashFileIdentity.
-  return SanitizeId(HashFileIdentity(Filename, FD));
+  // Identity is derived from the file's CONTENT, never from its path.
+  //
+  // Keying on the path was a silent stale-code bug once the cache is enabled:
+  // rebuild a binary, or let a game updater replace it, and the new file at the
+  // same path loads the OLD file's cached translations — executing host code
+  // compiled from guest bytes that no longer exist, persisted across restarts.
+  // It also failed in the other direction, giving one binary two unrelated
+  // caches when installed at two paths, which is what the original TODO here
+  // asked to avoid ("independent of the installation location").
+  //
+  // The Windows path already keys on image identity rather than the name
+  // (Source/Windows/Common/ImageTracker.cpp folds in TimeDateStamp and
+  // SizeOfImage); this brings the Linux path to the same standard.
+  //
+  // Cost is one streamed hash per mapped executable file, once, at mmap time.
+  // pread() throughout: FD is the descriptor the caller is mapping from, so its
+  // file offset must not move.
+  auto FallbackId = [&]() -> uint64_t {
+    // Degrade to path+size+mtime rather than bare path. Strictly stronger than
+    // the old behaviour, and any disagreement with the content hash costs a
+    // cache miss (safe) rather than a stale hit (not).
+    XXH3_state_t* S = XXH3_createState();
+    if (!S) {
+      return XXH3_64bits(Filename.data(), Filename.size());
+    }
+    XXH3_64bits_reset(S);
+    XXH3_64bits_update(S, Filename.data(), Filename.size());
+    struct stat St;
+    if (FD >= 0 && ::fstat(FD, &St) == 0) {
+      const uint64_t Size = static_cast<uint64_t>(St.st_size);
+      const uint64_t MTime = static_cast<uint64_t>(St.st_mtime);
+      XXH3_64bits_update(S, &Size, sizeof(Size));
+      XXH3_64bits_update(S, &MTime, sizeof(MTime));
+    }
+    const uint64_t R = XXH3_64bits_digest(S);
+    XXH3_freeState(S);
+    return R;
+  };
+
+  struct stat Stat;
+  if (FD < 0 || ::fstat(FD, &Stat) != 0 || !S_ISREG(Stat.st_mode)) {
+    return FallbackId();
+  }
+
+  XXH3_state_t* State = XXH3_createState();
+  if (!State) {
+    return FallbackId();
+  }
+  XXH3_64bits_reset(State);
+
+  // Fold the length in first so a truncated file can never hash equal to the
+  // longer original that shares its prefix.
+  const uint64_t FileSize = static_cast<uint64_t>(Stat.st_size);
+  XXH3_64bits_update(State, &FileSize, sizeof(FileSize));
+
+  std::array<uint8_t, 64 * 1024> Buffer;
+  off_t Offset = 0;
+  while (Offset < Stat.st_size) {
+    const ssize_t BytesRead = ::pread(FD, Buffer.data(), Buffer.size(), Offset);
+    if (BytesRead > 0) {
+      XXH3_64bits_update(State, Buffer.data(), static_cast<size_t>(BytesRead));
+      Offset += BytesRead;
+      continue;
+    }
+    if (BytesRead < 0 && errno == EINTR) {
+      continue;
+    }
+    // Short read or hard error: the content hash would be over a partial file
+    // and is not trustworthy as an identity. Degrade rather than guess.
+    XXH3_freeState(State);
+    return FallbackId();
+  }
+
+  const uint64_t Result = XXH3_64bits_digest(State);
+  XXH3_freeState(State);
+  return Result;
 }
 
 struct CodeCacheHeader {

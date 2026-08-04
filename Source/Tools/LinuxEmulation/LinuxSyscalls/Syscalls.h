@@ -377,6 +377,18 @@ public:
           // This also handles the MREMAP_DONTUNMAP case
           TM.InvalidateGuestCodeRange(Thread, OldAddress, OldSize);
         }
+        // Also invalidate the destination. With MREMAP_FIXED landing on a
+        // mapping that previously held compiled code, the destination's
+        // JIT'd blocks survive while the bytes under them are replaced by
+        // the source's. The pre-fix version only invalidated the source
+        // range, leaving stale translations at the destination — latent
+        // without MREMAP_FIXED only because the kernel otherwise picks an
+        // unused address. NewSize covers the full incoming range, so
+        // any pre-existing compiled blocks anywhere inside NewAddress ..
+        // NewAddress+NewSize get invalidated.
+        if (NewSize != 0) {
+          TM.InvalidateGuestCodeRange(Thread, NewAddress, NewSize);
+        }
       } else {
         // If mapping shrunk, flush the unmapped region
         if (OldSize > NewSize) {

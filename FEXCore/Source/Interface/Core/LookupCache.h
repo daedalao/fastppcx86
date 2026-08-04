@@ -181,23 +181,25 @@ struct GuestToHostMap {
     return &HostCode->second;
   }
 
-  // Runs the delinker for every direct (dispatch-bypassing) block link that
-  // targets this guest address, so no other block can branch straight into its
-  // host code anymore. Factored out of Erase so soft-invalidation can reuse the
-  // exact same severing behaviour.
-  void SeverBlockLinks(uint64_t Address) {
+  // Walk every inbound block link targeting `Address`, invoke each link's
+  // delinker to restore the original branch, and remove the link record.
+  // Returns the number of severed links — Nimbus's lazy-relink argument
+  // rests on measuring inbound fan-in per unit, and soft-invalidation reuses
+  // the same severing (retained blocks must lose inbound direct branches
+  // without leaving BlockList's history). Token-enforced.
+  size_t SeverLinks(uint64_t Address, const LookupCacheWriteLockToken&) {
     auto lower = BlockLinks->lower_bound({Address, nullptr});
     auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    size_t Severed = 0;
     for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
       it->second(it->first.HostLink);
+      ++Severed;
     }
+    return Severed;
   }
 
-  bool Erase(uint64_t Address, const LookupCacheWriteLockToken&) {
-    // Sever any links to this block
-    SeverBlockLinks(Address);
-
-    // Remove from BlockList
+  bool Erase(uint64_t Address, const LookupCacheWriteLockToken& token) {
+    SeverLinks(Address, token);
     return BlockList.erase(Address) != 0;
   }
 
@@ -229,13 +231,13 @@ struct GuestToHostMap {
   // erases it from BlockList so every dispatch misses into CompileBlock.
   // Blocks that carry no content hash cannot be revalidated and are simply
   // erased, exactly like legacy invalidation.
-  void SoftEraseBlock(uint64_t Address, const LookupCacheWriteLockToken&) {
+  void SoftEraseBlock(uint64_t Address, const LookupCacheWriteLockToken& Token) {
     auto BlockIt = BlockList.find(Address);
     if (BlockIt == BlockList.end()) {
       return;
     }
 
-    SeverBlockLinks(Address);
+    SeverLinks(Address, Token);
 
     if (BlockIt->second.GuestRangeLength == 0 || BlockIt->second.CodePages.empty()) {
       BlockList.erase(Address);
