@@ -56,9 +56,32 @@ host):
   runtime writes caches when `CodeCacheScope != off`, periodically from the memory-management syscalls and
   once at exit, via temp file + `rename(2)`.
 
-Still open: cached code carries no SMC metadata (correct and documented in `LookupCache.h`); a cache file
-holds the whole code buffer rather than just its own file's blocks; and files with `Skip` code relocations
-are excluded wholesale rather than per block.
+**Update — cached code now runs.** Two defects stood between "the cache loads" and "the cache executes",
+both verified live on op4k with Ziggurat:
+
+- **A cache file held the whole code buffer.** ~30 files of ~134 MB each, near-identical copies. On load
+  `header.CodeBufferSize` was that whole buffer, so the *second* cache mapped into a process could not fit
+  beside the first: the code buffer grew to `MAX_CODE_SIZE`, stopped growing, and took the anti-spin
+  `ERROR_AND_DIE` — the SIGTRAP 0.2 s into every cache-loading run. `SaveData` now packs only the extents
+  its own blocks occupy (`[BlockBegin, BlockBegin + JITCodeTail::Size)`), and every offset in the file —
+  `HostCode`, `BlockBegin`, relocation sites — is relative to that packed image. Format version 2 → 3.
+- **Named-thunk relocations resolved to null.** A cache is loaded when its library is mapped, which for the
+  thunk libraries is before the guest side has registered anything, so `LookupThunk` returned `nullptr`,
+  the patch window was filled with zero, and the block's first execution branched to address 0. Blocks
+  carrying a thunk relocation are no longer cached at all, and `ApplyCodeRelocations` fails closed on a
+  null thunk pointer.
+
+`LoadData` also flushes the I-cache over the region it memcpy'd and patched (POWER8 split I/D caches), and
+`FEX_SMCSTOREBACKPATCH` refuses to arm alongside cache writing — its stubs live outside any block extent.
+
+Measured: 120 s Ziggurat run, `FEX_CODECACHESCOPE=all`, 45 caches loaded and 0 rejected, **16217 compiles
+with caches vs 28134 with them hidden**; largest cache file 134 MB → 42 MB.
+
+Still open: cached code carries no SMC metadata (correct and documented in `LookupCache.h`, and the load
+path preserves it — a cache-loaded block takes the legacy hard-invalidate path); files with `Skip` code
+relocations are excluded wholesale rather than per block; and blocks whose exits materialise a guest RIP
+belonging to a *different* file are rebased against the saving file's base, which is only correct because
+cross-module direct branches go through an in-file PLT.
 
 Detail is in the commit messages and `docs/POWER9_PORT_PLAN.md`.
 
