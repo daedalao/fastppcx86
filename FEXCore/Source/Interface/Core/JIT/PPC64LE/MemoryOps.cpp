@@ -1017,10 +1017,21 @@ DEF_OP(MemSet) {
   // mid-set still leaves byte-granular-consistent memory, and guest RCX/RDI
   // are only written back at op end in both paths — fault-visible state is
   // unchanged from the generic loop. 32-bit guests keep the generic loop (the
-  // 4 GiB pointer wrap is per-store); backward/unknown direction likewise.
+  // 4 GiB pointer wrap is per-store); backward direction likewise. When the
+  // direction is NOT an inline constant (guest DF loaded from state — Hard
+  // West's second-hottest stos site), the forward/backward split is decided
+  // at runtime on the computed step in TMP3.
   // Follow-up candidate (not done): dcbz 128-byte chunks for the zero case.
   const bool ConstDir = IsInlineConstant(Op->Direction, &DirConst);
-  if (ConstDir && static_cast<int8_t>(DirConst) == 1 && Sz == 1 && CTX->Config.Is64BitMode()) {
+  const bool AlwaysFast = ConstDir && static_cast<int8_t>(DirConst) == 1;
+  const bool NeverFast = ConstDir && static_cast<int8_t>(DirConst) != 1;
+  PPC64Emitter::Label generic_path, out;
+  if (!NeverFast && Sz == 1 && CTX->Config.Is64BitMode()) {
+    if (!AlwaysFast) {
+      // TMP3 holds the sign-extended step; +1 selects the fast path.
+      cmpdi(TMP3, 1);
+      bc(CC_NE, &generic_path);
+    }
     if (Base != TMP1) mr(TMP1, Base);
     // Splat the fill byte across 64 bits. Zero case stores r0 directly (the
     // JIT keeps r0 == 0). Tail/align stores use the splat's low byte, which
@@ -1062,7 +1073,12 @@ DEF_OP(MemSet) {
     addi(TMP4, TMP4, -1);
     b(&tail_loop);
     Bind(&done);
-  } else {
+    if (!AlwaysFast) {
+      b(&out);
+    }
+  }
+  if (!AlwaysFast) {
+    Bind(&generic_path);
     // Loop pointer in TMP1 (TMP1 may already hold Base if prefix was applied).
     if (Base != TMP1) mr(TMP1, Base);
     mr(TMP4, LenIn);
@@ -1084,6 +1100,7 @@ DEF_OP(MemSet) {
     b(&loop);
     Bind(&done);
   }
+  Bind(&out);
 
   // Restore CR0 (saved at op entry) — REP STOS preserves flags.
   ld(TMP3, -8, r1);
