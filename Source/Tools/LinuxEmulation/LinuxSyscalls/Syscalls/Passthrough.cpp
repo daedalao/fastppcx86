@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "LinuxSyscalls/ThreadManager.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
@@ -388,8 +389,43 @@ static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
 static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
                                     uint64_t uaddr, uint64_t futex_op, uint64_t val,
                                     uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
-  const uint64_t result =
+  uint64_t result =
     SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
+
+  // PPC64LE strips SA_RESTART from every host sigaction (SignalDelegator.cpp:
+  // the deferred-signal queue drains on the -EINTR unwind of HandleSyscall).
+  // Consequence: FEX-INTERNAL async signals — thread-suspend pokes, code-
+  // invalidation IPIs — interrupt guest futex waits and leak a spurious EINTR
+  // the guest never asked for. Native x86 apps see EINTR only for signals they
+  // actually receive; Unity's semaphore wrapper logs "Failed to wait on a
+  // semaphore (Interrupted system call)" and its render thread parks forever
+  // (Ziggurat wedges at init with a black window).
+  //
+  // Restart the wait when the interruption was internal-only: nothing queued
+  // for guest delivery (no deferred frame, no newly-pending signal) means the
+  // guest must not observe an interruption at all. Restart is restricted to
+  // shapes with no timeout-recalculation hazard:
+  //   FUTEX_WAIT with timeout==NULL      (infinite; sem_wait's shape)
+  //   FUTEX_WAIT_BITSET                  (absolute deadline; re-issue is exact)
+  // A guest-deliverable signal keeps the EINTR return — that unwind is what
+  // delivers it. Escape hatch: FEX_FUTEX_EINTR_PASSTHRU=1 restores the old
+  // always-surface behaviour.
+  {
+    constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)
+    const uint64_t cmd = futex_op & FUTEX_CMD_MASK_LOCAL;
+    const bool Restartable = (cmd == 0 /* FUTEX_WAIT */ && timeout == 0) || cmd == 9 /* FUTEX_WAIT_BITSET */;
+    static const bool Passthru = (getenv("FEX_FUTEX_EINTR_PASSTHRU") != nullptr);
+    if (!Passthru && Restartable) {
+      while (static_cast<int64_t>(result) == -EINTR) {
+        auto* TSO = FEX::HLE::ThreadStateObject::GetStateObjectFromCPUState(Frame);
+        if (!TSO->SignalInfo.DeferredSignalFrames.empty() ||
+            (~TSO->SignalInfo.CurrentSignalMask.Val & TSO->SignalInfo.PendingSignals) != 0) {
+          break; // real guest signal to deliver; EINTR is load-bearing
+        }
+        result = SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
+      }
+    }
+  }
 
   // Diagnostic: catch any futex syscall whose errno is something glibc
   // pthread treats as fatal — that's what produces "The futex facility
