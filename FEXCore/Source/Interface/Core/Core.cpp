@@ -538,6 +538,12 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
 
   if (NewCodeBuffer) {
+    // Every offset in the relocation sink is relative to the buffer that is
+    // about to be abandoned, and every block it describes goes with it. Applying
+    // them to the new buffer would patch unrelated code.
+    CodeCache.ResetRelocations();
+    CodeCache.BlocksSinceSave.store(0, std::memory_order_relaxed);
+
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
     Thread->CPUBackend->ClearCache();
   } else {
@@ -1108,6 +1114,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Clear any relocations that might have been generated
   if (!CodeCache.IsGeneratingCache) {
     Thread->CPUBackend->ClearRelocations();
+  } else {
+    // Cache generation: hand them to the context-wide sink instead of leaving
+    // them to pile up in this thread's backend. See CodeCache::AbsorbRelocations
+    // — a runtime cache writer saves from whichever thread reaches a safe point
+    // first, and per-thread relocation lists would make it save a cache missing
+    // every relocation another thread produced.
+    CodeCache.AbsorbRelocations(*Thread);
+    CodeCache.BlocksSinceSave.fetch_add(1, std::memory_order_relaxed);
   }
 
   fextl::vector<uint64_t> CodePages;

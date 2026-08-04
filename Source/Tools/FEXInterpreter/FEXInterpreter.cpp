@@ -581,6 +581,19 @@ int main(int argc, char** argv, char** const envp) {
     CTX->SetCodeMapWriter(fextl::make_unique<FEXCore::CodeMapWriter>(*SyscallHandler));
   }
 
+  // A process that writes its own cache files has to compile in cache-generation
+  // mode from the very first block: relocations must be retained (they are
+  // discarded per block otherwise) and decoding must be bounded to the mapped
+  // section (otherwise multiblock can pull instructions from another file into
+  // a block attributed to this one). Both are properties of every block ever
+  // compiled, so this cannot be turned on later.
+  //
+  // Only when a scope was selected — CodeCacheScope=off keeps the legacy
+  // load-only behaviour and pays none of this cost.
+  if (SyscallHandler->CodeCacheWriteEnabled()) {
+    CTX->GetCodeCache().InitiateCacheGeneration();
+  }
+
   FEX_CONFIG_OPT(GdbServer, GDBSERVER);
   fextl::unique_ptr<FEX::GdbServer> DebugServer;
   if (GdbServer) {
@@ -649,6 +662,12 @@ int main(int argc, char** argv, char** const envp) {
   // ourselves with a stale ReturningStackLocation would corrupt r1 and crash.
   // Pass IgnoreCurrentThread=true so only other (worker) threads are stopped.
   SyscallHandler->TM.Stop(true);
+
+  // Final checkpoint, after every other thread has stopped and before any thread
+  // state is torn down. Force it: the periodic trigger only fires from the
+  // memory-management syscalls, and a guest that exits shortly after its last
+  // mmap would otherwise throw away everything compiled since.
+  SyscallHandler->SaveCodeCaches(ParentThread->Thread, true);
 
   auto ProgramStatus = ParentThread->StatusCode;
 

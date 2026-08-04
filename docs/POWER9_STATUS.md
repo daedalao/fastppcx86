@@ -37,6 +37,29 @@ cached code is safe to run. Remaining before it can be trusted: `Validate`'s own
 check the block-mapping table, and has no length-equality check) and cache invalidation, which currently
 keys on the guest binary's *path string* rather than its identity.
 
+**Update — cache identity, Validate's blind spots and crash-safe saving are addressed.** All three items
+above landed under the `CodeCache:` prefix, unverified on hardware (the backend only builds on the POWER8
+host):
+
+- **Identity.** `ComputeCodeMapId` now hashes file *content* (size + first/last 64 KiB) instead of the
+  path, and `CodeCacheConfigId` — previously hardcoded `0` with a TODO in two places — is a hash of
+  `GIT_HASH` plus every codegen-affecting option (SMC flags incl. `SMCSemanticPatch`, the TSO/atomics
+  knobs, block shape, host features, L1/L2 lookup shape). A stale or mismatched key names a file that does
+  not exist, so it is a miss rather than a load.
+- **Validate.** It now checks the guest→host block-mapping table against the reference compile (presence,
+  per-block entry offset, layout) before comparing bytes, and treats "reference compile emitted more bytes
+  than the cache holds" as fatal. The reverse (cache longer than the reference) stays non-fatal — a cache
+  legitimately covers more than one section of a file.
+- **Saving.** `SaveData` was previously called only by `FEXOfflineCompiler`, and it relocated the *live*
+  code buffer in place. It now snapshots into a private copy, filters the block table to the file being
+  written, and draws relocations from a context-wide sink instead of the compiling thread's backend. The
+  runtime writes caches when `CodeCacheScope != off`, periodically from the memory-management syscalls and
+  once at exit, via temp file + `rename(2)`.
+
+Still open: cached code carries no SMC metadata (correct and documented in `LookupCache.h`); a cache file
+holds the whole code buffer rather than just its own file's blocks; and files with `Skip` code relocations
+are excluded wholesale rather than per block.
+
 Detail is in the commit messages and `docs/POWER9_PORT_PLAN.md`.
 
 ## Milestone — the thread-spawn corruption is fixed

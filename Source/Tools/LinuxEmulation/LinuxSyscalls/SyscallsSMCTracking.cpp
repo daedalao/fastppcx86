@@ -964,13 +964,40 @@ static ReadELFHeadersResult ReadELFHeaders(int FD, std::span<std::byte> HeaderDa
   return ReadELFHeadersResult {std::move(Parser.phdrs), std::move(Relocations), HasCodeRelocations};
 }
 
-static void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::ExecutableFileSectionInfo& Section, uint64_t CodeCacheConfigId) {
-  auto CacheFilename = fextl::fmt::format("{}cache/{}-{:016x}", FEX::Config::GetCacheDirectory(),
-                                          FEXCore::CodeMap::GetBaseFilename(Section.FileInfo, false), CodeCacheConfigId);
+// Path of the cache file for one guest file.
+//
+// `<cache dir>/cache/<basename>-<FileId>-<ConfigId>`: FileId is derived from the
+// file's content (CodeCache::ComputeCodeMapId) and ConfigId from the FEX build
+// plus every codegen-affecting option (FEXCore::ComputeCodeCacheConfigId). A
+// rebuilt library, a rebuilt FEX, or a flipped codegen flag therefore names a
+// different file, which simply does not exist yet — a miss, not a mismatched
+// load.
+static fextl::string CodeCacheFilename(const FEXCore::ExecutableFileInfo& FileInfo, uint64_t CodeCacheConfigId) {
+  return fextl::fmt::format("{}cache/{}-{:016x}", FEX::Config::GetCacheDirectory(), FEXCore::CodeMap::GetBaseFilename(FileInfo, false),
+                            CodeCacheConfigId);
+}
+
+void SyscallHandler::LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::ExecutableFileSectionInfo& Section) {
+  // Scope gate. In "rootfs" scope only system libraries participate, so a title
+  // shares one cache namespace of immutable libraries with every other title
+  // instead of re-caching its own frequently-rebuilt binaries.
+  if (!IsPathInCodeCacheScope(Section.FileInfo.Filename)) {
+    return;
+  }
+
+  auto CacheFilename = CodeCacheFilename(Section.FileInfo, CodeCacheConfigId);
   int CacheFD = open(CacheFilename.c_str(), O_RDONLY);
   if (CacheFD == -1) {
     LogMan::Msg::IFmt("Cache file does not exist: {}", CacheFilename);
     return;
+  }
+
+  {
+    // Remember that this file's code came from disk: see
+    // CodeCacheLoadedFileIds. Recorded before the load attempt on purpose — a
+    // partially-applied load leaves relocated blocks registered too.
+    std::lock_guard lk {CodeCacheLoadedMutex};
+    CodeCacheLoadedFileIds.insert(Section.FileInfo.FileId);
   }
 
   struct stat buf;
@@ -1005,6 +1032,172 @@ static void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::E
   }
   FEXCore::Allocator::munmap(MappedCache, CacheFileSize);
   close(CacheFD);
+}
+
+bool SyscallHandler::IsPathInCodeCacheScope(std::string_view Path) const {
+  switch (CodeCacheScope) {
+  case CodeCacheScopeType::Off:
+    // The gate is disabled, not the subsystem: this is the legacy
+    // FEX_ENABLECODECACHINGWIP behaviour, where any file may be *loaded* from
+    // disk. Writing is gated separately (CodeCacheWriteEnabled).
+    return true;
+  case CodeCacheScopeType::All: return !Path.empty();
+  case CodeCacheScopeType::RootFS: {
+    // Filenames come from /proc/self/fd, so a rootfs library appears with the
+    // RootFS prefix already applied. An empty RootFS means every path would
+    // match the empty prefix, which is the opposite of what "rootfs" asks for.
+    const auto& Root = RootFSPath();
+    if (Root.empty() || Path.empty()) {
+      return false;
+    }
+    if (!Path.starts_with(std::string_view {Root})) {
+      return false;
+    }
+    // Require a path separator at the join so "/rootfs" does not match
+    // "/rootfs-backup/lib.so".
+    return Root.back() == '/' || Path.size() == Root.size() || Path[Root.size()] == '/';
+  }
+  }
+  return false;
+}
+
+void SyscallHandler::SaveCodeCaches(FEXCore::Core::InternalThreadState* Thread, bool Force) {
+  if (!CodeCacheWriteEnabled() || !Thread) {
+    return;
+  }
+  if (!CTX->GetCodeCache().WantsSave(Force)) {
+    return;
+  }
+
+  // Rearm first. A save pass is best-effort: if it partly fails we want the next
+  // trigger to come from newly compiled blocks, not to retry immediately in a
+  // loop at every mmap.
+  CTX->GetCodeCache().NotifyCachesSaved();
+
+  const auto CacheDir = fextl::fmt::format("{}cache/", FEX::Config::GetCacheDirectory());
+  std::error_code EC;
+  std::filesystem::create_directories(std::string_view {CacheDir}, EC);
+  if (EC) {
+    LogMan::Msg::EFmt("Code cache: cannot create {}: {}", CacheDir, EC.message());
+    return;
+  }
+
+  // One entry per file we intend to write.
+  struct SaveCandidate {
+    const FEXCore::ExecutableFileInfo* FileInfo;
+    uint64_t FileStartVA;
+    uint64_t BeginVA;
+    uint64_t EndVA;
+    fextl::vector<FEXCore::GuestAddressRange> GuestRanges;
+  };
+  fextl::vector<SaveCandidate> Candidates;
+
+  {
+    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+
+    for (const auto& ResourcePair : VMATracking.AllResources()) {
+      const auto& Resource = ResourcePair.second;
+      if (!Resource.MappedFile || !Resource.FirstVMA) {
+        continue;
+      }
+      const auto& FileInfo = *Resource.MappedFile;
+      if (!IsPathInCodeCacheScope(FileInfo.Filename)) {
+        continue;
+      }
+
+      // See ExecutableFileInfo::HasUncacheableRelocations: a file carrying a
+      // Skip code relocation cannot be cached at block granularity by a runtime
+      // writer, so it is not cached at all.
+      if (FileInfo.HasUncacheableRelocations) {
+        continue;
+      }
+
+      {
+        // Never rewrite a file we loaded: those blocks were relocated into this
+        // process at load time and shipped no relocation records of their own,
+        // so re-serializing them bakes in this run's base address.
+        std::lock_guard LoadedLock {CodeCacheLoadedMutex};
+        if (CodeCacheLoadedFileIds.contains(FileInfo.FileId)) {
+          continue;
+        }
+      }
+
+      SaveCandidate Candidate {
+        .FileInfo = &FileInfo,
+        .FileStartVA = static_cast<uint64_t>(Resource.FirstVMA->Base),
+        .BeginVA = static_cast<uint64_t>(Resource.FirstVMA->Base),
+        .EndVA = static_cast<uint64_t>(Resource.FirstVMA->Base + Resource.FirstVMA->Length),
+      };
+      for (auto* VMA = Resource.FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
+        Candidate.GuestRanges.emplace_back(VMA->Base, VMA->Base + VMA->Length);
+        Candidate.EndVA = std::max<uint64_t>(Candidate.EndVA, VMA->Base + VMA->Length);
+      }
+      Candidates.push_back(std::move(Candidate));
+    }
+  }
+
+  for (const auto& Candidate : Candidates) {
+    // NOTE: Candidate.FileInfo points into a MappedResource owned by
+    // VMATracking, and that lock has already been released. This mirrors the
+    // existing delayed-cache-load path in GuestMprotect, which likewise builds
+    // section infos under the lock and consumes them after.
+    //
+    // It is not optional here. SaveData takes CodeBufferWriteMutex, and a thread
+    // compiling a block holds CodeBufferWriteMutex while it looks a guest
+    // address up in VMATracking. VMATracking's mutex gives writers priority, so
+    // holding a shared lock across SaveData deadlocks the moment any thread
+    // queues for it exclusively: the compiler waits for the (now blocked)
+    // shared lock while we wait for its code buffer lock.
+    //
+    // The residual hazard — a guest thread unmapping this library between the
+    // two — is the pre-existing property of that pattern, not a new one.
+    FEXCore::ExecutableFileSectionInfo Section {*Candidate.FileInfo, Candidate.FileStartVA, Candidate.BeginVA, Candidate.EndVA};
+
+    const auto Final = CodeCacheFilename(*Candidate.FileInfo, CodeCacheConfigId);
+
+    // Crash safety: write a fresh temp file in the SAME directory, then
+    // rename(2) over the target.
+    //
+    // rename(2) within a directory is atomic, so a reader either sees the whole
+    // old file or the whole new one — never a mixture, and never a truncated
+    // file. A process killed at any point before the rename leaves only the
+    // temp file behind; the previously saved cache stays intact and loadable,
+    // and at most the translations compiled since the last save are lost. The
+    // temp name carries the pid so concurrent FEX processes caching the same
+    // library cannot collide, and O_EXCL means we never adopt a stale one.
+    const auto Temp = fextl::fmt::format("{}.{}.tmp", Final, ::getpid());
+
+    int FD = ::open(Temp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+    if (FD == -1) {
+      LogMan::Msg::EFmt("Code cache: cannot create {}: {}", Temp, strerror(errno));
+      continue;
+    }
+
+    bool Ok = CTX->GetCodeCache().SaveData(*Thread, FD, Section, 0 /* SerializedBaseAddress: LoadData only accepts 0 */,
+                                           std::span<const FEXCore::GuestAddressRange> {Candidate.GuestRanges});
+
+    // The data has to be on disk before the directory entry points at it,
+    // otherwise a crash between rename and writeback can leave the final name
+    // referring to a file with a hole in it.
+    if (Ok && ::fsync(FD) != 0) {
+      LogMan::Msg::EFmt("Code cache: fsync of {} failed: {}", Temp, strerror(errno));
+      Ok = false;
+    }
+    ::close(FD);
+
+    if (!Ok) {
+      ::unlink(Temp.c_str());
+      continue;
+    }
+
+    if (::rename(Temp.c_str(), Final.c_str()) != 0) {
+      LogMan::Msg::EFmt("Code cache: cannot rename {} -> {}: {}", Temp, Final, strerror(errno));
+      ::unlink(Temp.c_str());
+      continue;
+    }
+
+    LogMan::Msg::IFmt("Code cache: wrote {} for {}", Final, Candidate.FileInfo->Filename);
+  }
 }
 
 void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int prot, int flags,
@@ -1066,8 +1259,13 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   }
 
   if (EnableCodeCaching && CachedSection) {
-    LoadCodeCache(*Thread, *CachedSection, CodeCacheConfigId);
+    LoadCodeCache(*Thread, *CachedSection);
   }
+
+  // Periodic checkpoint. The memory-management syscalls are the safe points this
+  // process reliably passes through: a real (non-signal) syscall context, with
+  // every VMATracking and core lock already released.
+  MaybeSaveCodeCaches(Thread);
 
   return reinterpret_cast<void*>(Result);
 }
@@ -1128,6 +1326,9 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
     auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), Thread);
     CTX->RemoveForceTSOInformation(reinterpret_cast<uint64_t>(addr), length);
   }
+
+  // Periodic checkpoint; see GuestMmap.
+  MaybeSaveCodeCaches(Thread);
 
   return Result;
 }
@@ -1371,8 +1572,11 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
   // Trigger delayed cache load. This must be done separately since
   // LoadCodeCache will call interfaces that acquire the VMATracking mutex.
   for (auto& CachedSection : CachedSections) {
-    LoadCodeCache(*Thread, CachedSection, CodeCacheConfigId);
+    LoadCodeCache(*Thread, CachedSection);
   }
+
+  // Periodic checkpoint; see GuestMmap.
+  MaybeSaveCodeCaches(Thread);
 
   return Result;
 }
@@ -1495,9 +1699,16 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
 
           // GuestRelocationType::Skip indicates to FEXOfflineCompiler that
           // any blocks covered by the relocation may not be cached.
-          // At runtime, we can safely drop these relocations.
+          // At runtime, we must drop these relocations: keeping them makes the
+          // decoder read the covered displacement as zero (Frontend.cpp), i.e.
+          // compile wrong code. Dropping them also drops the frontend's
+          // HitBadRelocation signal, so a runtime cache writer can no longer
+          // tell which blocks are affected — record the fact at file level and
+          // refuse to cache the file at all. See
+          // ExecutableFileInfo::HasUncacheableRelocations.
           for (auto it = Resource->MappedFile->Relocations.begin(); it != Resource->MappedFile->Relocations.end();) {
             if (it->second == FEXCore::GuestRelocationType::Skip) {
+              Resource->MappedFile->HasUncacheableRelocations = true;
               it = Resource->MappedFile->Relocations.erase(it);
             } else {
               ++it;
