@@ -76,6 +76,40 @@ Config file locations follow XDG conventions, with a legacy fallback:
   this is what lets you enable a flag (e.g. `SMCLazyInval`) for one game without affecting every
   other guest process.
 
+## Running games — Mono/Unity titles REQUIRE a CPU cage
+
+**Always launch Mono/Unity games under `taskset`** (or another affinity cage) on many-core hosts.
+Unity sizes its worker/job pools from the reported CPU count; on an 80-thread POWER8 an uncaged
+guest builds ~79-worker pools whose quiesce/park handshakes are statistically unreachable at that
+scale — the pool spins instead of parking, saturating the machine while the game crawls (Hard
+West: 79 workers, park gate `[obj+0x74]==0` never satisfied, ~2 fps). Since commit `9a0f8e1be`
+the emulated `/proc/cpuinfo` is bounded by the process affinity mask, so the cage also shrinks
+the guest-visible CPU count and the pools stay sane.
+
+Recommended launch shape (POWER8 in SMT4; 8 cores × 2 threads — online CPU numbering is sparse,
+`0-3,8-11,...`, so list explicit thread pairs):
+
+```sh
+taskset -c 0-1,8-9,16-17,24-25,32-33,40-41,48-49,56-57 FEX <game>
+```
+
+- `FEX_REPORTED_CPUS=N` forces the guest-visible count regardless of cage — use it when you want
+  a small pool but a wide cage, or on pre-`9a0f8e1be` builds.
+- One thread per core (`taskset -c 0,8,16,...`) trades parallelism for POWER8 single-thread mode
+  throughput — worth trying for main-thread-bound titles.
+- Host clock matters: the `ondemand` governor often never ramps under JIT'd load (observed parked
+  at 59% of max mid-game). Set `performance` while gaming:
+  `sudo cpupower frequency-set -g performance` (or via sysfs `scaling_governor`).
+- `FEX_ENABLEAVX=0` pushes guest code onto SSE paths, which emulate much faster on 128-bit vector
+  hardware (36–67% measured on glibc string routines).
+- SMC recipe is per-title: `lazy` batches invalidation (best where Mono churns code) but disables
+  block linking; `strict`/`off` keep linking. Profile before assuming — a flat guest profile means
+  raw throughput, not recipe overhead, is the limit.
+- `SpinLoopClampAuto=1` short-circuits recognized library spin-wait loops — no longer needed for
+  correctness anywhere (see docs/MONO_UNITY_CENSUS.md), but measurable as a perf opt-in.
+
+Per-disease history and per-title verdicts live in `docs/MONO_UNITY_CENSUS.md`.
+
 ## Flags reference
 
 Grouped by area. **Fork** marks an option added in this port and not present in upstream FEX-Emu;
