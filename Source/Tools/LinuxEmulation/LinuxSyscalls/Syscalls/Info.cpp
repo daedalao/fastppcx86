@@ -114,6 +114,26 @@ void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
       case PTRACE_DETACH:
         // Passthrough these requests. Allows Wine to run the Ubisoft launcher.
         Result = ::syscall(SYSCALL_DEF(ptrace), request, pid, addr, data);
+        // POKETEXT / POKEDATA writes guest bytes with no fault path FEX can
+        // observe — the kernel services them via FOLL_FORCE, which writes
+        // through PROT_READ so mtrack cannot see the store even in principle.
+        // If the tracee is in this same address space (our own tgid), a
+        // block compiled from the poked word continues executing the pre-poke
+        // translation. Invalidate the word (host quadword: 8 bytes on 64-bit,
+        // 4 bytes on 32-bit) after a successful POKE. Cross-process POKE is
+        // unclosable: the tracee's translations live in the tracee's FEX,
+        // which our FEX has no handle to.
+        if (Result != static_cast<uint64_t>(-1) && (request == PTRACE_POKETEXT || request == PTRACE_POKEDATA)) {
+          // Same-tgid check: /proc/self/task/<pid> exists iff pid is one of
+          // our own threads (same address space). Avoids syscall overhead of
+          // reading /proc/<pid>/status Tgid.
+          char task_path[64];
+          snprintf(task_path, sizeof(task_path), "/proc/self/task/%d", pid);
+          if (access(task_path, F_OK) == 0 || pid == 0) {
+            const size_t Word = sizeof(long);
+            FEX::HLE::_SyscallHandler->InvalidateCodeRangeIfNecessary(Frame->Thread, reinterpret_cast<uint64_t>(addr), Word);
+          }
+        }
         SYSCALL_ERRNO();
       default: break;
       }
