@@ -253,15 +253,12 @@ DEF_OP(LoadNamedVectorIndexedConstant) {
 
   switch (Size) {
   case IR::OpSize::i128Bit:
-    // Same LE-fixup pattern as LoadNamedVectorConstant: lvx loads as BE so
-    // byte-reverse via vperm. Table entries are 16-byte aligned (IR.json
-    // says "Index needs to be aligned register size").
-    lvx(VTMP1, TMP1, r0);
-    LoadConstant(TMP2, 0x08090A0B0C0D0E0FULL); std(TMP2, -16, r1);
-    LoadConstant(TMP2, 0x0001020304050607ULL); std(TMP2, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP2, TMP2, r0);
-    vperm(Dst, VTMP1, VTMP1, VTMP2);
+    // Table entries are 16-byte aligned (IR.json: "Index needs to be
+    // aligned register size"). The byte-reverse vperm that used to follow
+    // was an identity permute, same proof as LoadNamedVectorConstant:
+    // LE-mode lvx already reverses, and the control loaded through the
+    // same reversing lvx composed to identity (lnvc_probe.c, 2026-08-03).
+    lvx(Dst, TMP1, r0);
     break;
   case IR::OpSize::i64Bit:
     // Load 8 LE bytes into low 8 bytes of bounce, zero high 8, single lvx.
@@ -273,10 +270,9 @@ DEF_OP(LoadNamedVectorIndexedConstant) {
     // values that hit the default path (not 0x00 / 0xFF fast-path) produce
     // a broadcast of the source's LE byte 0.
     ld(TMP2, 0, TMP1);
-    std(TMP2, -16, r1);
-    std(r(0), -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(Dst, r(0), TMP3);
+    mtvsrd(VTMP1, TMP2);
+    vspltisb(Dst, 0);
+    xxpermdi(Dst, Dst, VTMP1, 0b00); // zero:phys[0..7], value:phys[8..15]
     break;
   case IR::OpSize::i32Bit:
     lwz(TMP2, 0, TMP1);
@@ -2137,12 +2133,16 @@ DEF_OP(VUnZip2) {
 // hi = phys[8..15] packed (byte 7 = phys[8], byte 0 = phys[15]).
 // lo = phys[0..7]  packed (byte 7 = phys[0], byte 0 = phys[7]).
 void PPC64JITCore::LoadPermCtrl(VR Dst, uint64_t hi, uint64_t lo) {
-  LoadConstant(TMP2, hi);
-  std(TMP2, -16, r1);
+  // mtvsrd staging: no stack round-trip, no store-forwarding stall
+  // (docs/EMITTER_REVIEW.md finding 2). Image identical to the old
+  // std(-16)/std(-8)/lvx: the -16 value (hi) lands in phys[8..15] and the
+  // -8 value (lo) in phys[0..7]; mtvsrd's dw0 carries each 64-bit value
+  // MSB-first, exactly as the LE store + reversing lvx did.
   LoadConstant(TMP2, lo);
-  std(TMP2, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(Dst, r(0), TMP1);
+  mtvsrd(Dst, TMP2);      // lo -> dw0 -> phys[0..7] after merge
+  LoadConstant(TMP2, hi);
+  mtvsrd(VTMP2, TMP2);    // hi -> dw0
+  xxpermdi(Dst, Dst, VTMP2, 0b00); // dw0=lo(phys[0..7]), dw1=hi(phys[8..15])
 }
 
 DEF_OP(VTrn) {
@@ -3181,14 +3181,9 @@ DEF_OP(VInsElement) {
   for (int b = 8; b < 16; b++)
     ctrl_lo = (ctrl_lo << 8) | perm[b];
 
-  // Swap which half goes at -16 vs -8 (see VInsGPR comment) so that lvx's
-  // LE byte-reversal lands perm[i] at VTMP1.phys[i] correctly.
-  LoadConstant(TMP2, ctrl_lo);
-  std(TMP2, -16, r1);
-  LoadConstant(TMP2, ctrl_hi);
-  std(TMP2, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP1, r(0), TMP1);
+  // LoadPermCtrl's first parameter is the old -16 slot (-> phys[8..15]);
+  // this site's swap convention (see VInsGPR comment) maps ctrl_lo there.
+  LoadPermCtrl(VTMP1, ctrl_lo, ctrl_hi);
 
   vperm(Dst, DestVec, SrcVec, VTMP1);
 }
