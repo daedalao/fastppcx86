@@ -795,7 +795,43 @@ re-validating on the last cycle before merge, to chase a number that small, is
 a worse trade than shipping the measurement. The analysis is written down here
 so whoever picks it up starts with data rather than a hypothesis.
 
-### 11.6 Recommendation
+### 11.6 Validation of the merged tree
+
+Three full `ctest` runs, all binaries built in both trees so the suites are
+identical, box idle:
+
+| tree / config | cases | failed |
+| --- | ---: | ---: |
+| `15b130fde` (baseline) | 11170 | **15** |
+| merged, `FEX_VCMPFUSION=0` (default) | 11170 | **15** |
+| merged, `FEX_VCMPFUSION=1` | 11170 | **15** |
+
+The failure **sets** are byte-identical across all three — `diff` of the sorted
+lists is empty both for baseline-vs-merged and for fusion-off-vs-fusion-on.
+**Delta vs baseline is zero.** The 15 are all pre-existing and unrelated: one
+posix `clock_getres` conformance case, eight gvisor syscall tests
+(`chmod`/`chown`/`getcpu`×2/`mremap`/`rename`/`shm`/`symlink`), and six SSSE3
+`psign` gcc-target cases.
+
+(The §9.4 run reported 6685 failures. That build dir had only `FEX` and
+`FEXServer` built, so every unit-test binary reported `*_NOT_BUILT` and the
+32-bit suites had no thunk/sysroot setup. Building everything is what makes the
+absolute number meaningful; the A/B conclusion was the same either way.)
+
+Everything else, run on the merged tree with the fusion both off and on:
+
+| | `=0` | `=1` |
+| --- | --- | --- |
+| `smcstorm crossthread 2000000` | OK, 9.94 M/s | OK, 10.3 M/s |
+| `movchk 50000` | mismatches=0 | mismatches=0 |
+| `vcmpbench` correctness sweep | 0 failures | 0 failures |
+| `vecchk` (their differential harness) | 5691968 checks, 0 mismatches | 5691968 checks, 0 mismatches |
+| `vecchk_sse` | 3184436 checks, 0 mismatches | 3184436 checks, 0 mismatches |
+
+8.88 M differential checks clean, matching the figure the `vbpermq` branch
+reported for itself — the fusion does not disturb it in either direction.
+
+### 11.7 Recommendation
 
 **`FEX_VCMPFUSION` defaults to off.** The `vbpermq` lowering is the change that
 matters for glibc string performance on this port; it is unconditional, it helps
