@@ -1,0 +1,159 @@
+# Ziggurat dungeon-load finalize spin — live capture, 2026-08-04
+
+Build `09449d7b1` (all of the 2026-08-03/04 correctness + vector work), recipe
+`off` (legacy SMC), absorb tripwires on, POWER8 op4k, performance governor.
+Captured by Claude Fable with the game paused at the wedge and ptrace enabled.
+
+## What the failure actually is
+
+**Not** a slow load and **not** a deadlock. The level finishes loading, then a
+single guest thread enters a bounded loop whose exit condition is already
+unreachable, and spins forever at ~140% CPU while the renderer and audio
+threads stay healthy.
+
+Evidence it fully loaded:
+- `Player.log` last line: `Unloading 0 unused Assets... Loaded Objects now:
+  **138438**` (the pre-fix stalls died at 2312 objects — this is a complete
+  dungeon).
+- Music plays continuously through the wedge; the window renders Ziggurat's
+  normal loading art (a **still image by design** — frame-identical
+  screenshots are NOT a wedge signal for this title; that cost earlier
+  sessions several wrong calls).
+- Only the transition into the dungeon never fires.
+
+## The spin, disassembled
+
+Hot region = 58% of samples across ~128 bytes, zero FEX symbols (so the cost
+is guest code executing, not FEX machinery). Guest regs via the PPC64LE SRA
+map (`PPC64Emitter.h`: r7=RAX r8=RCX r9=RDX **r10=RBX** r11=RSP r12=RBP
+r14=RSI r15=RDI r16..r23 = R8..**R15**):
+
+```
+li      r6,4
+addco.  r28,r10,r6        # RBX + 4
+mr      r10,r28           # RBX = RBX + 4
+...
+xor     r29,r10,r23       # RBX ^ R15
+subfco. r28,r23,r10       # RBX - R15  (sets flags)
+bne     <loop body>       # continue while RBX != R15
+b       <exit>            # exit only on RBX == R15
+```
+
+Live values, sampled twice two seconds apart:
+
+| reg | guest | t | t+2s |
+|---|---|---|---|
+| r10 | RBX | `0xc6a99649c` | `0xc7b4e5490` |
+| r23 | R15 | `0x4` | `0x4` |
+| r20 | R12 | `0` | `0` |
+| r22 | R14 | `1` | `1` |
+
+RBX climbs by 4 per iteration (~53e9 already, ~13e9 iterations in) and is
+≡ 0 mod 4, so it stepped **past** the `== 4` exit long ago and can never
+return. R15 is a constant 4 — this reads as a loop meant to run **once**
+over 4 bytes / one element.
+
+**Conclusion: RBX (or R15) was already wrong when the loop was entered.** The
+loop itself is executing correctly; its induction variable or bound arrived
+corrupted, or the initialisation that should have zeroed RBX was skipped.
+This matches the long-standing "RBX misses ==4 exit" note in
+`ziggurat-dispatcher-window-corruption` — first time it has been caught with
+values attached.
+
+## Where to look next (ranked)
+
+1. **Signal-delivery register restore.** The historical suspect is
+   `RestoreRIPFromHostPC` resuming one instruction off, which would skip a
+   loop's init. Related fixes exist but were never verified against this
+   wedge: RIP-reconstruction candidates `667b59685` / `244075383`, and the
+   `InSyscallInfo` leak fix `1e5a99b7d`. Mono fires GC suspend signals
+   constantly during level finalize — highest-prior mechanism.
+2. **SRA spill/fill around the block.** RBX is SRA-mapped to r10; a spill
+   path that writes the wrong slot would produce exactly this. Note today's
+   SA_RESTART work touches the syscall/signal return path; test with
+   `FEX_NO_GUEST_SA_RESTART=1` to rule tonight's changes in or out.
+3. **MonoHacks interaction.** `MonoHacks` was ACTIVE in this capture (Mono
+   detected via `libmono.so`). A/B with `FEX_MONOHACKS=0` is the cheapest
+   discriminator and was started immediately after this capture.
+4. SMC is **not** implicated in this capture: recipe was `off`, and the audit
+   shows no patch/relink traffic (62008 lines, 271 `UNHANDLED`, nothing else).
+
+## Reproduce + capture (procedure that worked)
+
+```sh
+sudo sysctl -w kernel.yama.ptrace_scope=0        # op4k HAS passwordless sudo
+SMC_RECIPE=off SMC_ABSORB=1 SMC_AUDIT=1 SMC_CENSUS=1 fexplay-smc ziggurat
+# drive to New Game; wedge = Player.log silent >120s at the asset-GC line
+P=$(pgrep -f Ziggurat.x86_64 | head -1)
+perf record -o /tmp/z.perf -p $P -F 400 -g -- sleep 10
+perf report -i /tmp/z.perf --stdio --no-children | head
+```
+
+**Trap:** `perf` reports **offsets within the `[anon:FEXMemJIT]` mapping**,
+and there are several such mappings. Add the offset to the base of the *large*
+one (`grep FEXMemJIT /proc/$P/maps` — the 128 MB entry), not the first.
+
+Dump and disassemble the block, then read guest regs:
+
+```sh
+gdb -p $P -batch -ex "dump binary memory /tmp/sb.bin <va> <va+512>"
+objdump -D -b binary -m powerpc:common64 -EL /tmp/sb.bin
+gdb -p $P -batch -ex "info registers r10 r23 r20 r22"   # RBX R15 R12 R14
+```
+
+`/proc/PID/mem` reads are **denied even with ptrace_scope=0** for a
+non-descendant; use gdb's `dump binary memory` instead.
+
+## Guest RIP decoding (built, not yet exercised on a live wedge)
+
+`scratchpad/jitrip.py` (also `/tmp/jitrip.py` on op4k) scans backwards from a
+host PC for the `JITCodeHeader {u32 OffsetToBlockTail}` whose `JITCodeTail
+{size_t Size; u64 RIP; size_t GuestSize; u32 NumberOfRIPEntries; ...}`
+(`CPUBackend.h:175-208`) is self-consistent and covers the PC, printing the
+block's **guest RIP**. That RIP plus `/proc/PID/maps` names the guest module —
+i.e. whether this loop belongs to Mono, UnityPlayer, or game code, which is
+the one fact this capture is still missing. Run it at the next wedge before
+killing the process.
+
+## Second capture, 2026-08-04 — guest RIP resolved, MonoHacks exonerated
+
+Independent run, **`FEX_MONOHACKS=0`** (everything else identical). Same wedge.
+
+**Guest RIP of the hot block: `0x551330`.** Decoded with `jitrip.py` after
+trying every `[anon:FEXMemJIT]` base — the correct one was the **first, 16 MB**
+mapping (`0x10011001000`), not the large buffer; `perf` offsets do not say
+which mapping they belong to, so try all of them:
+
+```
+block_begin=0x10011712860 (pc-0x468) size=0x2d30
+guest_rip=0x551330 guest_size=693 rip_entries=124
+```
+
+`0x551330` falls inside `00400000-01585000 r-xp .../Ziggurat.x86_64` — the
+**game's own executable text**. Ziggurat statically links its Unity player, so
+this is engine/game code, *not* `libmono.so` and *not* a separate
+`UnityPlayer.so`. (A second plausible decode, `0x3fff5baca1d6`, lands in the
+high mmap region — that one is JIT'd/managed code, a different block.)
+
+**Register signature reproduces exactly with MonoHacks off:**
+
+| reg | guest | capture 1 (MonoHacks ON) | capture 2 (MonoHacks OFF) |
+|---|---|---|---|
+| r23 | R15 | `4` | `4` |
+| r20 | R12 | `0` | `0` |
+| r22 | R14 | `1` | `1` |
+| r10 | RBX | `0xc6a99649c`, +4/iter | `0x4ffab9c0`, ≡0 mod 4 |
+
+R15/R12/R14 are bit-identical across two independent runs; RBX differs in
+magnitude but is again far past the `== 4` exit and again 4-aligned.
+
+**Therefore: the mono backpatcher hook is not the cause** — disabling it
+changes nothing about the wedge. The loop lives in the game's own text, runs
+correctly, and is entered with an induction variable that already exceeds its
+bound.
+
+Also visible in capture 2's profile: `PPC64_SplitLockEmulate` at ~0.8%, and
+the sample spread is flat (top entry 1.5%) rather than the concentrated
+15/10/9% of capture 1 — i.e. this sample caught the process across many
+blocks, so the concentrated spin is intermittent within the wedge rather than
+the process's only activity.
