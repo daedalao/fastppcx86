@@ -1,0 +1,72 @@
+# Adversarial review: PPC64LE emitter + backend emission patterns
+
+Reviewer: Claude Fable, 2026-08-04, tree at 33bc66759. Method: instruction
+inventory vs ISA, caller counts for powerful-but-idle instructions, reading
+the hot DEF_OPs adversarially, and hardware facts from tonight's agent work.
+Discipline note: one early "finding" (isel unused) was FALSE — the Select
+lowering uses it with measured justification ("5.7 ns/op loss" for the
+branchy alternative, marked SETTLED). Verify every negative.
+
+MACHINE FACT (verified /proc/cpuinfo): op4k is POWER8 (PVR 004d 2.0).
+Agent reports calling it POWER9 were wrong. Consequences: the vcmp fusion's
+1.3%-slower measurement IS the POWER8 number (off-by-default stands, its
+"re-measure on P8" caveat is void); any ISA 3.0 emission is for the
+co-dev's machine only, behind runtime gating.
+
+## Ranked findings
+
+1. **[HARDWARE-PROVEN, unfixed] LoadNamedVectorConstant's byte-reverse vperm
+   is an identity permute** — ~14 wasted instructions on EVERY 128-bit
+   named-constant load, across many ops. Proven by lnvc_probe.c (agent 1,
+   2026-08-03). Deletion is small but touches broad codegen — was left as
+   the co-dev's call. HIGHEST measured-value item in this review.
+
+2. **[VERIFIED shape] Per-emission construction of vector control constants.**
+   VAddP (VectorOps.cpp:1804) builds TWO 128-bit perm controls per emission
+   via 2×(LoadImm64 5-insn + std) + addi + lvx ≈ 30 insns; the same pattern
+   recurs in shuffle lowerings. Systemic fix candidates, in order:
+   (a) per-block (or per-code-buffer) constant pool with a dedicated pool
+   base register — controls become 1×lvx after first use; (b) lvsl-generated
+   controls where the pattern allows (proven tonight: lvsl performs no load,
+   is NOT LE-byte-reversed, needs no pool); (c) at minimum, dedupe identical
+   controls within a block. Note the co-dev's related dispatcher finding:
+   Single128Bit4ByteVectorShuffle's ~44 ARM64-tuned cases assume 1-insn
+   zip/rev/ext and select IR that costs MORE than the generic path here —
+   their fix (fewer IR ops selected on POWER) composes with this one.
+
+3. **[VERIFIED gaps, P8-legal] Missing ISA 2.06/2.07 forms in the emitter:**
+   lxvw4x (word-arranged VSX load), xxspltw (splat word, 1 insn — current
+   splats go through longer sequences; check DEF_OP(VDupElement)), cnttzd is
+   ISA 3.0 (skip). Each is a small add; payoff depends on caller sites —
+   measure with FEX_JITOPSIZEPROFILE before/after.
+
+4. **[INVENTORY, P9-gated tier for co-dev's machine] Absent ISA 3.0 forms
+   worth runtime-gating:** mtvsrdd (GPR pair→VSR in 1 insn — replaces the
+   std+std+lvx staging pattern wholesale), lxv/stxv D-form, mfvsrld, xxperm
+   (2-src permute without the VRT=VC copy dance), setb, maddld, addpcis.
+   The staging-pattern kill (mtvsrdd) is the big one: grep std.*lvx staging
+   sequences; every one is 4+ insns → 1 on P9.
+
+5. **[LEAD, unmeasured] Record-form coverage now exists (Rc twins from the
+   fusion work) but only vcmpequ*. PTEST/VPTEST-style guest idioms and
+   any "compare then branch on all/none" IR could use CR6 directly without
+   the fusion machinery — audit PTest lowering.
+
+6. **[LEAD] VRev64 = 15 instructions** (per co-dev). On P8, xxpermdi +
+   vperm-with-cached-control should be ≤3 with finding 2's pool; on P9,
+   xxbrd is 1 (gated). Blocked on finding 2 for the cheap form.
+
+7. **[PROCESS] The JITOpSizeProfile infrastructure exists (build-gated,
+   FEX_JITOPSIZEPROFILE) and is the right tool for prioritizing: run it on
+   a real game session, rank total bytes by IR op, attack the top. Tonight's
+   wins (VAddP relocation, PMADDWD) were found exactly this way by the
+   agents. A standing "top-10 by emitted bytes" measurement per title
+   belongs in the perf workflow.
+
+## Next steps (continuation)
+- Measure: JITOpSizeProfile a Ziggurat session on 33bc66759; rank.
+- Read PTest/VDupElement/VInsElement/shuffle lowerings adversarially (the
+  remaining unread hot vector ops).
+- Prototype finding 2(a) constant pool: scope = emitter helper + block
+  prologue; measure on the profile's top shuffle-heavy ops.
+- Hand findings 1 (approval) + 4 (P9 tier) + dispatcher-gate item to co-dev.
