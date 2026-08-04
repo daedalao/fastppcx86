@@ -213,6 +213,33 @@ log line was the parse-time "SpinLoopClamp active"). Diagnosis by subagent:
 fexplay-smc default. CMPOp additionally logs in-range-but-not-clamped CMPs so
 a mis-aimed range can never again look identical to a working one.
 
+## 2026-08-04 WEDGE CLEARED + SYSTEMIC DETECTION SHIPPED
+
+With the corrected spec the user reached the dungeon **for the first time** —
+the every-entry clamp succeeds where the 2026-07-31 one-shot gdb poke failed
+(the outer structure re-enters, but each re-entry now exits immediately).
+
+Systemic follow-up, `FEX_SPINLOOPCLAMPAUTO` (0 off / 1 Mono-detected,
+default / 2 everywhere): `Decoder::DetectSpinLoops` (Frontend.cpp) runs after
+multiblock decode and structurally recognizes equality-exit loops — backward
+direct branch closing a contiguously-decoded body of ≤48 instructions,
+containing a 64-bit reg-reg CMP whose equality edge exits (both shapes:
+`cmp; jne head` and `cmp; je out ... jmp head`), where one compared register
+takes exactly one positive-constant ADD step in the body and the other is
+never written. The CMP gets FLAG_SPINCLAMP_{DEST,SRC}_IND and CMPOp emits the
+same overshoot clamp with no configured RIPs. Calls/rets/indirect branches,
+compare-skipping internal branches, or unclassifiable writes disqualify the
+loop; only natively-non-terminating executions are altered.
+
+Decode gotcha that cost an hour: group1 imm ALU ops carry the immediate in
+**Src[1]**, and Src[0] holds a group-selector artifact that reads as a GPR
+(RAX) — operand matching must accept the literal from either slot.
+
+Verified (op4k, repros/): spinrepro, spinrepro2, spinrepro_b all exit 0 under
+AUTO=2 with no RIPs; spinctl (induction also written by a mov) correctly
+refused; Mono gating holds (no clamp for plain binaries at default 1);
+manual range path unaffected. Commits 7df72dd17 + 5f040bd24.
+
 Intriguing lead for the ROOT CAUSE (from the user's "41 or 43" recollection
 of the FEX arm64 talk): 0x41/0x43 are REX.B / REX.X|REX.B prefixes, and FEX
 has release-note history of REX misapplication; the loop's invariant regs are
