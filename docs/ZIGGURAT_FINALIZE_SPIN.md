@@ -157,3 +157,29 @@ the sample spread is flat (top entry 1.5%) rather than the concentrated
 15/10/9% of capture 1 — i.e. this sample caught the process across many
 blocks, so the concentrated spin is intermittent within the wedge rather than
 the process's only activity.
+
+## Workaround shipped: SpinLoopClamp (`37fd3ada8`)
+
+`FEX_SPINLOOPCLAMP=0xBEGIN-0xEND:ind:bound` — for Ziggurat:
+`FEX_SPINLOOPCLAMP=0x551330-0x5515e5:rbx:r15` (End = 0x551330 + guest_size
+693). `fexplay-smc ziggurat` now exports this by default; set
+`FEX_SPINLOOPCLAMP=disable` to turn it off.
+
+Mechanism: every 64-bit reg-reg CMP of ind vs bound whose guest RIP falls in
+the range is compiled (`OpDispatchBuilder::CMPOp`) with an overshoot clamp —
+if ind is unsigned-above bound at the compare, both the flag input and the
+architectural register are forced to the bound, so the `==` exit fires and
+post-loop state equals a legitimate final iteration (`RBX == R15 == 4`). A
+sane execution never trips it (legal values here are 0 and 4), and an empty
+option emits nothing anywhere.
+
+Verified on `repros/spinclamp_repro.s` (op4k) — the loop shape with RBX
+pre-corrupted to `0x4ffab9c0`: spins forever without the clamp, exits 0 with
+it, in both `cmp rbx,r15` and `cmp r15,rbx` encodings. Not yet observed
+firing on a live wedge; the compile-time hit logs
+`SpinLoopClamp: instrumented CMP at guest RIP 0x...`.
+
+This is a workaround, not the fix: something (still suspected to be
+signal-time resume skipping the loop init — see "Where to look next") hands
+the loop a corrupted induction variable. The clamp makes the wedge survivable
+while that hunt continues.
