@@ -18,6 +18,13 @@ FEX_TRACE_CLONE.
 
 ## Disease classes
 
+Policy (2026-08-04, user call): workarounds are SURGICAL, not structural.
+`SpinLoopClampAuto` now defaults **off** (opt-in per launcher entry;
+ziggurat arms it). Per-title `FEX_SPINLOOPCLAMP` ranges are the preferred
+containment — "the special number the game wants a response to" — mirroring
+upstream's own per-displacement Unity hack pattern rather than blanket
+detection.
+
 - **A — register injection under signal resume** (Ziggurat finalize spin):
   one thread; equality-exit induction loop in game text; compilation
   correct; induction restarts near 0 then misses the == exit once, in
