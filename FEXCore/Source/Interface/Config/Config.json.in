@@ -847,6 +847,21 @@
           "equality exit fires instead of spinning forever. A sane loop never",
           "trips the clamp; empty string disables it."
         ]
+      },
+      "SpinLoopClampAuto": {
+        "Type": "uint32",
+        "Default": "1",
+        "Desc": [
+          "Systemic version of SpinLoopClamp: a post-decode pass structurally",
+          "detects tight loops whose only exit for a register is exact equality",
+          "against a loop-invariant register while that register steps by a",
+          "positive constant, and compiles their compare with the overshoot",
+          "clamp automatically (no RIPs needed). Only terminating-native",
+          "behavior is preserved by construction; unclassifiable loops are",
+          "left untouched.",
+          "0 = off, 1 = active when a Mono runtime is detected (Unity/Mono",
+          "games; default), 2 = active for every process."
+        ]
       }
     },
     "Misc": {

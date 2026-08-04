@@ -377,7 +377,14 @@ public:
     FEX_CONFIG_OPT(BlockLinking, BLOCKLINKING);
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
     FEX_CONFIG_OPT(SpinLoopClamp, SPINLOOPCLAMP);
+    FEX_CONFIG_OPT(SpinLoopClampAuto, SPINLOOPCLAMPAUTO);
   } Config;
+
+  // Automatic spin-loop clamp (Decoder::DetectSpinLoops): 0 = off,
+  // 1 = when Mono detected (default), 2 = everywhere.
+  bool IsSpinLoopClampAutoActive() const {
+    return Config.SpinLoopClampAuto() == 2 || (Config.SpinLoopClampAuto() == 1 && MonoDetected);
+  }
 
   // Parsed form of Config.SpinLoopClamp ("0xBEGIN-0xEND:ind:bound"). When
   // Active, OpDispatchBuilder::CMPOp compiles any 64-bit register-register

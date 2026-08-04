@@ -48,6 +48,13 @@ namespace DecodeFlags {
   constexpr uint32_t FLAG_DECODED_SIB = (1 << 16);
   constexpr uint32_t FLAG_REP_PREFIX = (1 << 17);
   constexpr uint32_t FLAG_REPNE_PREFIX = (1 << 18);
+  // Set by Decoder::DetectSpinLoops on the compare of an equality-exit loop
+  // whose induction register steps by a positive constant: which operand is
+  // the induction register. OpDispatchBuilder::CMPOp emits an overshoot clamp
+  // for flagged compares (see SpinLoopClampInfo in Context.h). Bits 29/30 are
+  // above every field below (FLAG_OPADDR_MASK ends at bit 28).
+  constexpr uint32_t FLAG_SPINCLAMP_DEST_IND = (1u << 29);
+  constexpr uint32_t FLAG_SPINCLAMP_SRC_IND = (1u << 30);
   // Size flags
   constexpr uint32_t FLAG_SIZE_DST_OFF = 19;
   constexpr uint32_t FLAG_SIZE_SRC_OFF = FLAG_SIZE_DST_OFF + 3;

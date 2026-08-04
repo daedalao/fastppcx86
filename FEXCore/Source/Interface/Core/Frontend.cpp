@@ -17,6 +17,7 @@ $end_info$
 #include <cstring>
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/X86Enums.h>
+#include <FEXCore/fextl/map.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -25,6 +26,8 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/fextl/set.h>
+#include <optional>
+#include <string_view>
 
 // Debug RIP tracing from the PPC64LE dispatcher. These are defined in
 // PPC64Dispatcher.cpp and only maintained by the emitted dispatcher in
@@ -1775,6 +1778,229 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
 
   for (auto& Block : BlockInfo.Blocks) {
     Block.IsEntryPoint = BlockInfo.EntryPoints.contains(Block.Entry);
+  }
+
+  if (CTX->IsSpinLoopClampAutoActive()) {
+    DetectSpinLoops();
+  }
+}
+
+void Decoder::DetectSpinLoops() {
+  // Systemic form of the FEX_SPINLOOPCLAMP workaround (Ziggurat finalize
+  // spin, docs/ZIGGURAT_FINALIZE_SPIN.md): find loops whose ONLY exit for one
+  // register is exact equality against a loop-invariant register while that
+  // register steps by a positive constant, and flag the compare so CMPOp
+  // emits an overshoot clamp. Such a loop is already non-terminating in
+  // native execution if the induction register ever passes the bound, so
+  // forcing an overshot value back onto the bound cannot change the behavior
+  // of any execution that terminates natively. Every classification doubt
+  // below resolves to "don't mark" — a missed loop costs nothing (the manual
+  // range option still exists), a false mark could corrupt a guest.
+  using namespace FEXCore::X86Tables;
+  namespace X86State = FEXCore::X86State;
+  constexpr size_t MaxBodyInstructions = 48;
+
+  // Flat PC -> instruction view of the whole multiblock.
+  fextl::map<uint64_t, DecodedInst*> ByPC;
+  for (auto& Block : BlockInfo.Blocks) {
+    for (uint64_t i = 0; i < Block.NumInstructions; ++i) {
+      DecodedInst* Inst = &Block.DecodedInstructions[i];
+      if (Inst->TableInfo && Inst->InstSize) {
+        ByPC[Inst->PC] = Inst;
+      }
+    }
+  }
+
+  // OP values collide between the one-byte and two-byte tables (a 0F-table
+  // inst keeps its raw second byte), so identification below leans on
+  // TableInfo flags/Name and treats anything ambiguous as a bail-out.
+  auto IsCondBranch = [](const DecodedInst* Inst) {
+    return (Inst->TableInfo->Flags & InstFlags::FLAGS_SETS_RIP) && !(Inst->TableInfo->Flags & InstFlags::FLAGS_CALL) &&
+           ((Inst->OP >= 0x70 && Inst->OP <= 0x7F) || (Inst->OP >= 0x80 && Inst->OP <= 0x8F)) && Inst->Src[0].IsLiteral();
+  };
+  auto IsUncondJmp = [](const DecodedInst* Inst) {
+    return (Inst->TableInfo->Flags & InstFlags::FLAGS_SETS_RIP) && !(Inst->TableInfo->Flags & InstFlags::FLAGS_CALL) &&
+           (Inst->OP == 0xE9 || Inst->OP == 0xEB) && Inst->Src[0].IsLiteral();
+  };
+  auto BranchTarget = [](const DecodedInst* Inst) {
+    return Inst->PC + Inst->InstSize + Inst->Src[0].Literal();
+  };
+  auto IsDirectGPR = [](const DecodedOperand& Operand) {
+    return Operand.IsGPR() && !Operand.Data.GPR.HighBits;
+  };
+
+  // Whether Inst can write GPR `Reg`, through any channel we can classify.
+  // nullopt = unclassifiable instruction; caller must reject the loop.
+  auto WritesGPR = [&](const DecodedInst* Inst, uint8_t Reg) -> std::optional<bool> {
+    const auto Flags = Inst->TableInfo->Flags;
+    if (Flags & InstFlags::FLAGS_SETS_RIP) {
+      // Branches write no GPR; calls/rets/indirects were already rejected in
+      // the body scan before this is consulted.
+      return false;
+    }
+    // XCHG (one-byte 86/87; the 0F 86/87 collision is SETS_RIP, handled above)
+    // writes both operands.
+    if (Inst->OP == 0x86 || Inst->OP == 0x87) {
+      return (IsDirectGPR(Inst->Dest) && Inst->Dest.Data.GPR.GPR == Reg) || (IsDirectGPR(Inst->Src[0]) && Inst->Src[0].Data.GPR.GPR == Reg);
+    }
+    // Implicit-dest one-byte forms (their 0F collisions are vector/setcc ops;
+    // over-matching them merely bails). Group3 mul/div: RAX/RDX. CBW/CWD
+    // family: RAX/RDX. String/in-out string ops: RSI/RDI/RCX.
+    if ((Inst->OP == 0xF6 || Inst->OP == 0xF7 || Inst->OP == 0x98 || Inst->OP == 0x99) && (Reg == X86State::REG_RAX || Reg == X86State::REG_RDX)) {
+      return true;
+    }
+    if (((Inst->OP >= 0xA4 && Inst->OP <= 0xAF) || (Inst->OP >= 0x6C && Inst->OP <= 0x6F)) &&
+        (Reg == X86State::REG_RSI || Reg == X86State::REG_RDI || Reg == X86State::REG_RCX)) {
+      return true;
+    }
+    if (Inst->TableInfo->Name == nullptr) {
+      return std::nullopt;
+    }
+    return IsDirectGPR(Inst->Dest) && Inst->Dest.Data.GPR.GPR == Reg;
+  };
+
+  // A positive-constant-step "ADD reg, imm" (group1 imm forms carry a literal
+  // Src; register-source ADDs don't qualify as a recognizable step).
+  auto IsConstStepAdd = [&](const DecodedInst* Inst, uint8_t Reg) {
+    return Inst->TableInfo->Name && std::string_view {Inst->TableInfo->Name} == "ADD" && IsDirectGPR(Inst->Dest) &&
+           Inst->Dest.Data.GPR.GPR == Reg && Inst->Src[0].IsLiteral() && static_cast<int64_t>(Inst->Src[0].Literal()) > 0;
+  };
+
+  for (auto& [BranchPC, Branch] : ByPC) {
+    // A loop is closed by a backward direct branch (conditional `jne head` or
+    // unconditional `jmp head`).
+    if (!(IsCondBranch(Branch) || IsUncondJmp(Branch))) {
+      continue;
+    }
+    const uint64_t Head = BranchTarget(Branch);
+    if (Head >= Branch->PC) {
+      continue;
+    }
+    const uint64_t BodyEnd = Branch->PC + Branch->InstSize;
+
+    // Walk the body [Head, BodyEnd): must tile contiguously with decoded
+    // instructions and stay small (spin loops are tight).
+    fextl::vector<DecodedInst*> Body;
+    bool Bail = false;
+    for (uint64_t PC = Head; PC < BodyEnd;) {
+      auto It = ByPC.find(PC);
+      if (It == ByPC.end() || Body.size() >= MaxBodyInstructions) {
+        Bail = true;
+        break;
+      }
+      Body.push_back(It->second);
+      PC += It->second->InstSize;
+    }
+    if (Bail || Body.empty() || Body.back() != Branch) {
+      continue;
+    }
+
+    // Control flow inside the body: only direct conditional branches, and
+    // none may skip forward past instructions we haven't accounted for in a
+    // way that could bypass the compare (in-body forward targets are checked
+    // per-candidate below); calls/rets/indirect branches disqualify the loop.
+    for (DecodedInst* Inst : Body) {
+      if (Inst == Branch) {
+        continue;
+      }
+      if ((Inst->TableInfo->Flags & InstFlags::FLAGS_SETS_RIP) && !IsCondBranch(Inst)) {
+        Bail = true;
+        break;
+      }
+    }
+    if (Bail) {
+      continue;
+    }
+
+    // Candidate compares: 64-bit reg-reg CMP whose equality edge EXITS the
+    // loop — either `cmp; jne head` (the closing branch itself: exit is the
+    // fallthrough) or `cmp; je <outside the body>`.
+    for (size_t i = 0; i + 1 < Body.size(); ++i) {
+      DecodedInst* Cmp = Body[i];
+      DecodedInst* Jcc = Body[i + 1];
+      if (!((Cmp->OP == 0x39 || Cmp->OP == 0x3B) && Cmp->TableInfo->Name && std::string_view {Cmp->TableInfo->Name} == "CMP")) {
+        continue;
+      }
+      if (!(Cmp->Flags & DecodeFlags::FLAG_REX_WIDENING) || !IsDirectGPR(Cmp->Dest) || !IsDirectGPR(Cmp->Src[0])) {
+        continue;
+      }
+      if (!IsCondBranch(Jcc)) {
+        continue;
+      }
+      const uint8_t Cond = Jcc->OP & 0xF;
+      const uint64_t JccTarget = BranchTarget(Jcc);
+      const bool ShapeJneHead = Cond == 0x5 && Jcc == Branch;                                 // cmp; jne head — equality exit falls through
+      const bool ShapeJeExit = Cond == 0x4 && (JccTarget < Head || JccTarget >= BodyEnd);     // cmp; je out-of-loop
+      if (!(ShapeJneHead || ShapeJeExit)) {
+        continue;
+      }
+
+      // No other in-body branch may jump forward past this compare (a path
+      // that re-runs the step without re-running the compare could overshoot
+      // natively, which would make the clamp observable).
+      bool SkipsCompare = false;
+      for (DecodedInst* Inst : Body) {
+        if (Inst != Jcc && Inst != Branch && IsCondBranch(Inst)) {
+          const uint64_t T = BranchTarget(Inst);
+          if (T > Cmp->PC && T < BodyEnd) {
+            SkipsCompare = true;
+            break;
+          }
+        }
+      }
+      if (SkipsCompare) {
+        continue;
+      }
+
+      const uint8_t RegA = Cmp->Dest.Data.GPR.GPR;
+      const uint8_t RegB = Cmp->Src[0].Data.GPR.GPR;
+      if (RegA == RegB) {
+        continue;
+      }
+
+      // Classify: exactly one positive-constant ADD to one register (the
+      // induction), zero writes of any kind to the other (the bound), and no
+      // other writes to the induction either.
+      int StepsA = 0, StepsB = 0;
+      bool OtherWriteA = false, OtherWriteB = false;
+      for (DecodedInst* Inst : Body) {
+        if (Inst == Cmp) {
+          continue;
+        }
+        if (IsConstStepAdd(Inst, RegA)) {
+          ++StepsA;
+          continue;
+        }
+        if (IsConstStepAdd(Inst, RegB)) {
+          ++StepsB;
+          continue;
+        }
+        auto WA = WritesGPR(Inst, RegA);
+        auto WB = WritesGPR(Inst, RegB);
+        if (!WA.has_value() || !WB.has_value()) {
+          Bail = true;
+          break;
+        }
+        OtherWriteA |= *WA;
+        OtherWriteB |= *WB;
+      }
+      if (Bail) {
+        break;
+      }
+
+      uint32_t MarkFlag = 0;
+      if (StepsA == 1 && StepsB == 0 && !OtherWriteA && !OtherWriteB) {
+        MarkFlag = DecodeFlags::FLAG_SPINCLAMP_DEST_IND;
+      } else if (StepsB == 1 && StepsA == 0 && !OtherWriteA && !OtherWriteB) {
+        MarkFlag = DecodeFlags::FLAG_SPINCLAMP_SRC_IND;
+      }
+      if (MarkFlag) {
+        Cmp->Flags |= MarkFlag;
+        LogMan::Msg::IFmt("SpinLoopClamp[auto]: equality-exit loop [0x{:x}, 0x{:x}) — clamping CMP at 0x{:x} (ind GPR {}, bound GPR {})", Head,
+                          BodyEnd, Cmp->PC, MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegA : RegB,
+                          MarkFlag == DecodeFlags::FLAG_SPINCLAMP_DEST_IND ? RegB : RegA);
+      }
+    }
   }
 }
 

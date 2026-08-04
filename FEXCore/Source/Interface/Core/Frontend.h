@@ -76,6 +76,10 @@ public:
     ExecutableRangeBase = ExecutableRangeEnd = 0;
   }
 
+  // Post-decode pass: flag equality-exit loop compares for the spin-loop
+  // overshoot clamp (see DetectSpinLoops in Frontend.cpp).
+  void DetectSpinLoops();
+
   // True if the block just decoded was compiled in the cheap/disposable tier
   // (FEX_SMCCHEAPTIER): its entry RIP sits on a guest page that has been
   // invalidated often enough that a full-size multiblock compile is not worth

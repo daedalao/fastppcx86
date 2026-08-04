@@ -26,6 +26,7 @@ $end_info$
 #include <FEXHeaderUtils/BitUtils.h>
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <cstdint>
 
@@ -1392,36 +1393,48 @@ void OpDispatchBuilder::CMPOp(OpcodeArgs, uint32_t SrcIndex) {
   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.AllowUpperGarbage = true});
   Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
 
-  // Spin-loop overshoot clamp (see SpinLoopClampInfo in Context.h): if this is
-  // the configured induction-vs-bound compare, force an induction value that
-  // is unsigned-above the bound back onto the bound before the flags are
-  // computed, so the loop's equality exit fires instead of spinning forever.
-  // The architectural register is rewritten too — post-loop code must observe
-  // the same ind == bound state a legitimate final iteration leaves behind.
-  const auto& Clamp = CTX->SpinLoopClamp;
-  if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
-    bool Instrumented = false;
-    if (OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() && Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits &&
-        !Op->Src[SrcIndex].Data.GPR.HighBits) {
-      const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
-      const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
-      const bool DestIsInduction = DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg;
-      const bool SrcIsInduction = SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg;
-      if (DestIsInduction || SrcIsInduction) {
-        Ref Induction = DestIsInduction ? Dest : Src;
-        Ref Bound = DestIsInduction ? Src : Dest;
-        Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
-        StoreGPRRegister(Clamp.InductionReg, Clamped, OpSize::i64Bit);
-        (DestIsInduction ? Dest : Src) = Clamped;
-        LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
-        Instrumented = true;
+  // Spin-loop overshoot clamp (see SpinLoopClampInfo in Context.h): force an
+  // induction value that is unsigned-above the bound back onto the bound
+  // before the flags are computed, so the loop's equality exit fires instead
+  // of spinning forever. The architectural register is rewritten too —
+  // post-loop code must observe the same ind == bound state a legitimate
+  // final iteration leaves behind. Two triggers: flags placed by the
+  // frontend's structural detection (Decoder::DetectSpinLoops), or the
+  // manually configured FEX_SPINLOOPCLAMP guest-RIP range.
+  std::optional<bool> ClampDestIsInduction {};
+  if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_DEST_IND) {
+    ClampDestIsInduction = true;
+  } else if (Op->Flags & X86Tables::DecodeFlags::FLAG_SPINCLAMP_SRC_IND) {
+    ClampDestIsInduction = false;
+  } else {
+    const auto& Clamp = CTX->SpinLoopClamp;
+    if (Clamp.Active && Op->PC >= Clamp.Begin && Op->PC < Clamp.End) {
+      if (OpSizeFromSrc(Op) == OpSize::i64Bit && Op->Dest.IsGPR() && Op->Src[SrcIndex].IsGPR() && !Op->Dest.Data.GPR.HighBits &&
+          !Op->Src[SrcIndex].Data.GPR.HighBits) {
+        const uint8_t DestReg = Op->Dest.Data.GPR.GPR;
+        const uint8_t SrcReg = Op->Src[SrcIndex].Data.GPR.GPR;
+        if (DestReg == Clamp.InductionReg && SrcReg == Clamp.BoundReg) {
+          ClampDestIsInduction = true;
+        } else if (SrcReg == Clamp.InductionReg && DestReg == Clamp.BoundReg) {
+          ClampDestIsInduction = false;
+        }
+      }
+      // A mis-aimed range must not be silently indistinguishable from a
+      // working one (that already cost a session): say why an in-range CMP
+      // was skipped.
+      if (!ClampDestIsInduction.has_value()) {
+        LogMan::Msg::IFmt("SpinLoopClamp: CMP at guest RIP 0x{:x} in range but NOT clamped (size or operand mismatch)", Op->PC);
       }
     }
-    // A mis-aimed range must not be silently indistinguishable from a working
-    // one (that already cost a session): say why an in-range CMP was skipped.
-    if (!Instrumented) {
-      LogMan::Msg::IFmt("SpinLoopClamp: CMP at guest RIP 0x{:x} in range but NOT clamped (size or operand mismatch)", Op->PC);
-    }
+  }
+  if (ClampDestIsInduction.has_value()) {
+    const bool DestIsInduction = *ClampDestIsInduction;
+    Ref Induction = DestIsInduction ? Dest : Src;
+    Ref Bound = DestIsInduction ? Src : Dest;
+    Ref Clamped = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGT, Induction, Bound, Bound, Induction);
+    StoreGPRRegister((DestIsInduction ? Op->Dest : Op->Src[SrcIndex]).Data.GPR.GPR, Clamped, OpSize::i64Bit);
+    (DestIsInduction ? Dest : Src) = Clamped;
+    LogMan::Msg::IFmt("SpinLoopClamp: instrumented CMP at guest RIP 0x{:x}", Op->PC);
   }
 
   CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Src);
