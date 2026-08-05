@@ -474,7 +474,29 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
     Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmGPRs(ucontext)[SRAIdxMap];
   }
 
-  if (SupportsAVX) {
+  // Spill the SRA-mapped host FPRs (guest XMM low-128) back into guest State.
+  //
+  // The destination view depends on whether the host keeps XMM/YMM in CONVERGED
+  // 256-bit registers (arm64 SVE256): converged hosts interleave low+high in the
+  // 32-byte-stride xmm.avx.data slots (low at [i][0], high at [i][2]); every
+  // other host keeps the low 128 in the 16-byte-stride xmm.sse.data view (high
+  // 128 lives separately in State.avx_high). This must match the JIT's own SRA
+  // fill/spill (PPC64Emitter/ARM emitter) or the values scatter — see the same
+  // branch in ContextImpl::SetXMMRegistersFromState.
+  //
+  // PPC64LE advertises AVX (guest CPUID) but has NO converged registers, and its
+  // JIT stores SRA XMMs in sse.data. Gating only on SupportsAVX — which on arm64
+  // implies SVE256 — silently selected the 32-byte avx.data stride here, writing
+  // xmm[k] into sse.data[2k] and zeroing the odd slots (the movss/movsd store in
+  // fpr_store_pattern.asm faults on its own code page under SMC mtrack, and this
+  // spill then corrupted the live XMM file). On ppc64le the low 128 must land in
+  // sse.data, exactly as the non-AVX path does.
+#ifdef ARCHITECTURE_ppc64le
+  constexpr bool UseConvergedAVXStorage = false;
+#else
+  const bool UseConvergedAVXStorage = SupportsAVX;
+#endif
+  if (UseConvergedAVXStorage) {
     // TODO: This doesn't save the upper 128-bits of the 256-bit registers.
     // This needs to be implemented still.
     for (size_t i = 0; i < Config.SRAFPRCount; i++) {
