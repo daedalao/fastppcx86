@@ -59,18 +59,26 @@ struct X11Manager {
   std::unordered_map<_XDisplay*, _XDisplay*> displays;
   std::unordered_map<const _XDisplay*, _XDisplay*> displays_reverse;
 
-  // Restores the pre-2026-08-05 behavior of syncing the guest connection on
-  // EVERY Display-taking call instead of only on first mapping. Triage lever:
-  // if a title starts throwing BadDrawable/BadWindow from host-side GLX after
-  // the sync elision (guest created a new XID and the host connection raced
-  // ahead of the guest's unflushed create), set this to confirm, then teach
-  // the specific entry point to sync instead of turning the firehose back on.
+  // Per-call guest sync is currently the DEFAULT; FEX_X11_SYNC_FIRST_ONLY=1
+  // opts into syncing only on first mapping (plus the XID-taking entry
+  // points' explicit syncs) and enables the lock-free memo below.
+  //
+  // The first-only mode is measurably the right thing — the per-call sync is
+  // a host->guest trampoline + guest X round trip under every glXSwapBuffers
+  // — but Grimrock proved the entry-point coverage is incomplete in a way we
+  // don't understand yet: its bootstrap issues GLXGetDrawableAttributes +
+  // GLXMakeCurrent wire requests on the host connection WITHOUT ever passing
+  // through the glXMakeCurrent/glXMakeContextCurrent/glXCreateWindow custom
+  // impls (their debug prints never fire, in working runs either). Until that
+  // dispatch path is identified, defaulting to first-only would trade a known
+  // per-frame win for unknown per-title BadDrawable breakage. Flip the
+  // default once the bypass is found and covered.
   static bool SyncEveryCall() {
-    static const bool v = [] {
-      const char* e = getenv("FEX_X11_SYNC_EVERY_CALL");
+    static const bool FirstOnly = [] {
+      const char* e = getenv("FEX_X11_SYNC_FIRST_ONLY");
       return e && *e == '1';
     }();
-    return v;
+    return !FirstOnly;
   }
 
   _XDisplay* GuestToHostDisplay(_XDisplay* GuestDisplay) {
