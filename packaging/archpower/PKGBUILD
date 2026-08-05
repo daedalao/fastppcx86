@@ -13,7 +13,7 @@
 pkgname=fastppcx86
 pkgver=r0.0000000
 pkgrel=1
-pkgdesc='Fast x86 and x86-64 emulation for 64-bit POWER (FEX-Emu ppc64le port)'
+pkgdesc='Fast x86 and x86-64 emulation for 64-bit POWER'
 arch=('powerpc64le')
 url='https://github.com/daedalao/fastppcx86'
 license=('MIT')

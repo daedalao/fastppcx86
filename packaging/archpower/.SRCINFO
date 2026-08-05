@@ -1,5 +1,5 @@
 pkgbase = fastppcx86
-	pkgdesc = Fast x86 and x86-64 emulation for 64-bit POWER (FEX-Emu ppc64le port)
+	pkgdesc = Fast x86 and x86-64 emulation for 64-bit POWER
 	pkgver = r14608.23f2884
 	pkgrel = 1
 	url = https://github.com/daedalao/fastppcx86
