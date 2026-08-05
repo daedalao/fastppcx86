@@ -537,7 +537,23 @@ static void AssertNonZeroBase(const MemAddrForm& A) {
   LOGMAN_THROW_A_FMT(A.Base != r0, "PPC64 D-form base register must not be r0");
 }
 
-static void EmitLoadGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Dst, const MemAddrForm& A) {
+// A displacement that no D/DS-form can hold must move into the X-form's RB;
+// the X-form has no displacement field, so leaving it in the form would drop it
+// silently. That is not hypothetical: `mov rbx, qword [data+2]` folds a
+// displacement of 2, which DS-form ld cannot encode.
+static MemAddrForm LegalizeForm(PPC64EmitterBase& E, const MemAddrForm& A, IR::OpSize Size) {
+  if (A.HasIndex || CanUseDForm(A, Size)) {
+    return A;
+  }
+  MemAddrForm R = A;
+  E.LoadConstant(TMP3, static_cast<uint64_t>(static_cast<int64_t>(A.Disp)));
+  R.Index = TMP3;
+  R.HasIndex = true;
+  return R;
+}
+
+static void EmitLoadGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Dst, const MemAddrForm& A_) {
+  const MemAddrForm A = LegalizeForm(E, A_, Size);
   if (CanUseDForm(A, Size)) {
     AssertNonZeroBase(A);
     const int16_t D = static_cast<int16_t>(A.Disp);
@@ -562,7 +578,8 @@ static void EmitLoadGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Dst, const Mem
   }
 }
 
-static void EmitStoreGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Src, const MemAddrForm& A) {
+static void EmitStoreGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Src, const MemAddrForm& A_) {
+  const MemAddrForm A = LegalizeForm(E, A_, Size);
   if (CanUseDForm(A, Size)) {
     AssertNonZeroBase(A);
     const int16_t D = static_cast<int16_t>(A.Disp);
