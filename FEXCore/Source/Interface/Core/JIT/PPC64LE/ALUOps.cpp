@@ -30,6 +30,31 @@ static inline IR::CondClass IntegerNZCVCond(IR::CondClass C) {
   return C;
 }
 
+// -------------------------------------------------------------------------
+// SplitAddisAddi: express a 33-bit-or-narrower signed addend as the (Hi, Lo)
+// pair consumed by `addis rD, rA, Hi ; addi rD, rD, Lo`, which adds
+// (Hi << 16) + Lo to rA. Both immediates are sign-extended by the hardware,
+// so Lo being negative eats 0x10000 out of the high part — hence the
+// `V - Lo` before the shift, which is the standard +1 correction to Hi when
+// the low half has its top bit set. `V - Lo` is exact and always a multiple
+// of 65536, and it is done in int64 so the near-INT32_MAX cases cannot wrap.
+//
+// Returns false when Hi does not fit a signed 16-bit field, i.e. whenever V
+// is outside roughly +/-2^31; callers fall back to LoadConstant + add.
+//
+// NOTE for callers: addi/addis interpret an RA field of 0 as the literal
+// value 0, not as GPR[r0]. Guest registers never map to r0 (it is the JIT's
+// zero-index invariant), but callers still guard on the register index so a
+// future allocator change cannot silently miscompile.
+static inline bool SplitAddisAddi(int64_t V, int16_t& Hi, int16_t& Lo) {
+  const int64_t L = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint64_t>(V)));
+  const int64_t H = (V - L) >> 16;
+  if (H < -32768 || H > 32767) return false;
+  Hi = static_cast<int16_t>(H);
+  Lo = static_cast<int16_t>(L);
+  return true;
+}
+
 // =========================================================================
 // Constants and inline values
 // =========================================================================
@@ -90,8 +115,24 @@ DEF_OP(Add) {
                static_cast<int64_t>(Const) <= 32767) {
       addi(Dst, S1, static_cast<int16_t>(Const));
     } else {
-      LoadConstant(TMP4, Const);
-      add(Dst, S1, TMP4);
+      // 17..32-bit addends: addis + addi is two instructions and needs no
+      // scratch register, versus LoadConstant (lis+ori, two instructions for
+      // this range) plus a separate add. At i32Bit the result is masked to 32
+      // bits below, so a constant whose bit 31 is set can be fed through as
+      // its sign-extended int32 form — the low 32 bits of the sum are the
+      // same either way.
+      int64_t V = static_cast<int64_t>(Const);
+      if (IROp->Size == IR::OpSize::i32Bit) {
+        V = static_cast<int32_t>(static_cast<uint32_t>(Const));
+      }
+      int16_t Hi, Lo;
+      if (S1.idx != 0 && SplitAddisAddi(V, Hi, Lo)) {
+        addis(Dst, S1, Hi);
+        addi(Dst, Dst, Lo);
+      } else {
+        LoadConstant(TMP4, Const);
+        add(Dst, S1, TMP4);
+      }
     }
   } else {
     add(Dst, S1, GetReg(Op->Src2));
@@ -112,12 +153,26 @@ DEF_OP(Sub) {
   if (S2Inline) {
     // Dst = Src1 - C2  →  addi/subf with negated constant
     auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
+    // Negate in unsigned so C2 = 0x8000...0 cannot trip signed-overflow UB.
+    int64_t NegC = static_cast<int64_t>(~C2 + 1);
     if (NegC >= -32768 && NegC <= 32767) {
       addi(Dst, S1, static_cast<int16_t>(NegC));
     } else {
-      LoadConstant(TMP4, C2);
-      subf(Dst, TMP4, S1);
+      // Same addis+addi form as DEF_OP(Add): subtracting C2 is adding -C2,
+      // and at i32Bit only the low 32 bits survive the mask below, so the
+      // int32-truncated negation is equivalent there.
+      int64_t V = NegC;
+      if (IROp->Size == IR::OpSize::i32Bit) {
+        V = static_cast<int32_t>(static_cast<uint32_t>(NegC));
+      }
+      int16_t Hi, Lo;
+      if (S1.idx != 0 && SplitAddisAddi(V, Hi, Lo)) {
+        addis(Dst, S1, Hi);
+        addi(Dst, Dst, Lo);
+      } else {
+        LoadConstant(TMP4, C2);
+        subf(Dst, TMP4, S1);
+      }
     }
   } else if (S1Inline) {
     // Dst = C1 - Src2. _Sub is a value-only op — it MUST NOT touch XER.CA
