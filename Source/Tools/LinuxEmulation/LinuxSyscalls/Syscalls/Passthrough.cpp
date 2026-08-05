@@ -12,6 +12,7 @@ $end_info$
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
 #include "LinuxSyscalls/ThreadCensus.h"
+#include "VDSO_Emulation.h"
 
 #ifdef ARCHITECTURE_ppc64le
 #include "LinuxSyscalls/PPC64LE/TermiosTranslation.h"
@@ -634,6 +635,56 @@ static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
   return Result;
 }
 
+// -----------------------------------------------------------------------------
+// Clock reads via the host vDSO
+// -----------------------------------------------------------------------------
+// A guest that goes through its own vDSO never reaches these handlers -- the
+// guest-vDSO thunks in VDSO_Emulation.cpp already call the host vDSO directly.
+// But plenty of guest code issues the raw syscall regardless: Mono's
+// mono_100ns_ticks, static binaries with no vDSO wired up, and anything calling
+// syscall(2) by hand. Those paid a full kernel entry for a clock read that the
+// host can serve entirely in userspace, on a path hot enough that Mono profiles
+// it as a top-of-list syscall.
+//
+// Route them through the same pointers the guest-vDSO path uses, falling back
+// to the raw `sc` when the host kernel exposes no vDSO (or no such symbol), in
+// which case the pointer stays null forever.
+//
+// The pointers are resolved once by LoadHostVDSO(), from LoadVDSOThunks() on
+// the main thread, before any guest instruction runs -- so a guest syscall can
+// never observe them half-initialised, and every read here is of immutable
+// data. Re-read the accessor per call rather than caching: the cost is a load
+// from a static, and caching would only add a second copy to keep coherent.
+//
+// Return convention: these pointers carry the negative-errno convention (on
+// ppc64le they are ppc_kernel_vdso's sign-flipping shims, see VDSO_Emulation.h),
+// which is exactly what a passthrough handler must return, so the result is
+// sign-extended straight through with no SYSCALL_ERRNO() dance.
+static uint64_t VDSOClockGetTime(FEXCore::Core::CpuStateFrame* Frame, uint64_t clk_id, uint64_t tp) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().ClockGetTime;
+  if (Fn) {
+    return static_cast<uint64_t>(static_cast<int64_t>(Fn(static_cast<clockid_t>(clk_id), reinterpret_cast<struct timespec*>(tp))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>(Frame, clk_id, tp);
+}
+
+static uint64_t VDSOClockGetRes(FEXCore::Core::CpuStateFrame* Frame, uint64_t clk_id, uint64_t tp) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().ClockGetRes;
+  if (Fn) {
+    return static_cast<uint64_t>(static_cast<int64_t>(Fn(static_cast<clockid_t>(clk_id), reinterpret_cast<struct timespec*>(tp))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(clock_getres)>(Frame, clk_id, tp);
+}
+
+static uint64_t VDSOGetTimeOfDay(FEXCore::Core::CpuStateFrame* Frame, uint64_t tv, uint64_t tz) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().GetTimeOfDay;
+  if (Fn) {
+    return static_cast<uint64_t>(
+      static_cast<int64_t>(Fn(reinterpret_cast<struct timeval*>(tv), reinterpret_cast<struct timezone*>(tz))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>(Frame, tv, tz);
+}
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -1041,7 +1092,7 @@ namespace x64 {
 #else
     REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
 #endif
-    REGISTER_SYSCALL_IMPL_X64(gettimeofday, SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>);
+    REGISTER_SYSCALL_IMPL_X64(gettimeofday, VDSOGetTimeOfDay);
     REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);
     REGISTER_SYSCALL_IMPL_X64(sysinfo, SyscallPassthrough1<SYSCALL_DEF(sysinfo)>);
@@ -1062,8 +1113,8 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X64(clock_settime, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_gettime, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_getres, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+    REGISTER_SYSCALL_IMPL_X64(clock_gettime, VDSOClockGetTime);
+    REGISTER_SYSCALL_IMPL_X64(clock_getres, VDSOClockGetRes);
     REGISTER_SYSCALL_IMPL_X64(clock_nanosleep, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X64(mq_open, SyscallPassthrough4<SYSCALL_DEF(mq_open)>);
     REGISTER_SYSCALL_IMPL_X64(mq_timedsend, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
@@ -1130,10 +1181,10 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(setfsuid32, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
     REGISTER_SYSCALL_IMPL_X32(setfsgid32, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
     REGISTER_SYSCALL_IMPL_X32(sendfile64, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
-    REGISTER_SYSCALL_IMPL_X32(clock_gettime64, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
+    REGISTER_SYSCALL_IMPL_X32(clock_gettime64, VDSOClockGetTime);
     REGISTER_SYSCALL_IMPL_X32(clock_settime64, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
     REGISTER_SYSCALL_IMPL_X32(clock_adjtime64, SyscallPassthrough2<SYSCALL_DEF(clock_adjtime)>);
-    REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+    REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, VDSOClockGetRes);
     REGISTER_SYSCALL_IMPL_X32(clock_nanosleep_time64, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X32(timer_gettime64, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X32(timer_settime64, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
