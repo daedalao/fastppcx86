@@ -144,16 +144,24 @@ DEF_OP(Neg) {
   if (Op->Cond == IR::CondClass::AL) {
     neg(Dst, Src);
   } else {
-    // Conditional: emit "Dst = Src; if Cond { Dst = -Src; }" using a forward
-    // branch on the inverted condition. Use TMP4 to hold -Src so we don't
-    // clobber Src before the final move (Dst may alias Src).
+    // Conditional: Dst = Cond ? -Src : Src, branch-free via isel. isel reads
+    // both source operands before writing RT, so Dst aliasing Src is fine and
+    // the old mr/bc/mr dance (plus its Label and forward branch) is
+    // unnecessary. The condition is decoded from the architecturally packed
+    // NZCV in CR0 that a preceding *NZCV op set, and CC.BI is an absolute CR
+    // bit index in CR0's 0..3 range, which is what isel's BC field wants.
+    //
+    // A branch here would be the worst case for it: a data-dependent condition
+    // feeding pure dataflow, i.e. unpredictable. That is the same reasoning
+    // recorded at DEF_OP(NZCVSelect), where making the analogous select
+    // branchy was measured as a 5.7 ns/op regression.
+    //
+    // isel's RA = 0 encoding means literal zero rather than GPR[r0], so a
+    // source in the RA slot must not be r0 — TMP4 is r6 and Src is a mapped
+    // guest register, neither of which is r0.
     neg(TMP4, Src);
-    if (Dst != Src) mr(Dst, Src);
     auto CC = MapNZCVCC(IntegerNZCVCond(Op->Cond));
-    PPC64Emitter::Label Skip{};
-    bc(InvertCond(CC), &Skip);
-    mr(Dst, TMP4);
-    Bind(&Skip);
+    iselcc(Dst, CC, TMP4, Src);
   }
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
 }
