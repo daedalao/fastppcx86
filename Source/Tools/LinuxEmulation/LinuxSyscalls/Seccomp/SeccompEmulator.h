@@ -8,7 +8,10 @@ $end_info$
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/fextl/list.h>
+#include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+
+#include <linux/filter.h>
 
 #include <atomic>
 #include <csignal>
@@ -38,11 +41,12 @@ class SignalDelegator;
 class SyscallHandler;
 struct ThreadStateObject;
 
-using SeccompFilterFunc = uint64_t (*)(uint32_t Acc, uint32_t Index, uint32_t Tmp, uint32_t Tmp2, void* Data);
+/// An installed filter. Holds the guest's cBPF program itself: filters are interpreted, never compiled, so there is no executable
+/// mapping here and nothing may treat one as callable. Entries live in a fextl::list so that a SeccompFilterInfo* stays stable and can
+/// serve as the filter's identity for TSYNC comparisons.
 struct SeccompFilterInfo final {
-  SeccompFilterFunc Func;
+  fextl::vector<sock_filter> Program;
   uint64_t RefCount;
-  size_t MappedSize;
   uint32_t FilterInstructions;
   bool ShouldLog;
 };

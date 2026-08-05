@@ -5,14 +5,13 @@ tags: LinuxSyscalls|syscalls-shared
 $end_info$
 */
 
-#include "LinuxSyscalls/Seccomp/BPFEmitter.h"
+#include "LinuxSyscalls/Seccomp/BPFInterpreter.h"
 #include "LinuxSyscalls/Seccomp/SeccompEmulator.h"
 
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 
-#include <CodeEmitter/Emitter.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -197,23 +196,20 @@ void SeccompEmulator::FreeSeccompFilters(FEX::HLE::ThreadStateObject* Thread) {
   Thread->Filters.clear();
 
   if (HasFiltersToDelete) {
-    // Garbage collect filters
+    // Garbage collect filters. The program is plain memory owned by the info, so erasing the entry is all the cleanup needed.
     std::erase_if(Filters, [](auto& Filter) {
-      if (std::atomic_ref<uint64_t>(Filter.RefCount).load(std::memory_order_relaxed) != 0) {
-        return false;
-      }
-
-      FEXCore::Allocator::munmap(reinterpret_cast<void*>(Filter.Func), Filter.MappedSize);
-      return true;
+      return std::atomic_ref<uint64_t>(Filter.RefCount).load(std::memory_order_relaxed) == 0;
     });
   }
 }
 
+// Serialized form of an installed filter, handed across execve through a sealed memfd. This carries the guest's cBPF program, so a
+// deserializing process re-validates it rather than trusting the payload.
 struct SerializedFilter {
-  size_t CodeSize;
+  size_t ProgramSize;
   uint32_t FilterInstructions;
   bool ShouldLog;
-  char Code[];
+  char Program[];
 };
 
 struct SerializationHeader {
@@ -249,8 +245,9 @@ std::optional<int> SeccompEmulator::SerializeFilters(FEXCore::Core::CpuStateFram
   }
 
   for (auto& Filter : Thread->Filters) {
+    const size_t ProgramSize = Filter->Program.size() * sizeof(sock_filter);
     SerializedFilter SFilter {
-      .CodeSize = Filter->MappedSize,
+      .ProgramSize = ProgramSize,
       .FilterInstructions = Filter->FilterInstructions,
       .ShouldLog = Filter->ShouldLog,
     };
@@ -262,7 +259,7 @@ std::optional<int> SeccompEmulator::SerializeFilters(FEXCore::Core::CpuStateFram
       return -1;
     }
 
-    Res = write(FD, (const void*)Filter->Func, Filter->MappedSize);
+    Res = write(FD, Filter->Program.data(), ProgramSize);
     if (Res == -1) {
       LogMan::Msg::EFmt("Couldn't write filter!");
       close(FD);
@@ -301,26 +298,35 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
       close(FD);
       return;
     }
-    auto Ptr = FEXCore::Allocator::mmap(nullptr, SFilter.CodeSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (Ptr == (void*)~0ULL) {
-      LogMan::Msg::EFmt("Couldn't allocate ptr for filter!");
+    // The header is only as trustworthy as whoever handed us the FD, and the sizes index a heap allocation.
+    if (SFilter.FilterInstructions == 0 || SFilter.FilterInstructions > BPF_MAXINSNS ||
+        SFilter.ProgramSize != SFilter.FilterInstructions * sizeof(sock_filter)) {
+      LogMan::Msg::EFmt("Seccomp Filter header is inconsistent!");
       close(FD);
       return;
     }
 
-    Res = read(FD, Ptr, SFilter.CodeSize);
-    if (Res == -1 || Res != SFilter.CodeSize) {
-      LogMan::Msg::EFmt("Couldn't read Seccomp Filter code!");
+    fextl::vector<sock_filter> Program(SFilter.FilterInstructions);
+
+    Res = read(FD, Program.data(), SFilter.ProgramSize);
+    if (Res == -1 || Res != SFilter.ProgramSize) {
+      LogMan::Msg::EFmt("Couldn't read Seccomp Filter program!");
       close(FD);
       return;
     }
 
-    ::mprotect(Ptr, SFilter.CodeSize, PROT_READ | PROT_EXEC);
+    // Re-validate rather than trusting the serialized program; the interpreter's contract is that it only runs accepted programs.
+    const sock_fprog prog {
+      .len = static_cast<unsigned short>(SFilter.FilterInstructions),
+      .filter = Program.data(),
+    };
+    if (BPFInterpreter::ValidateProgram(&prog) != 0) {
+      LogMan::Msg::EFmt("Seccomp Filter program failed validation!");
+      close(FD);
+      return;
+    }
 
-    FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(Ptr), SFilter.CodeSize);
-
-    auto& it =
-      Filters.emplace_back(SeccompFilterInfo {(SeccompFilterFunc)Ptr, 1, SFilter.CodeSize, SFilter.FilterInstructions, SFilter.ShouldLog});
+    auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, SFilter.FilterInstructions, SFilter.ShouldLog});
     TotalFilterInstructions += SFilter.FilterInstructions;
 
     // Append the filter to the thread.
@@ -348,7 +354,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   uint32_t SeccompResult {};
 
   {
-    BPFEmitter::WorkingBuffer Data {
+    BPFInterpreter::WorkingBuffer Data {
       .Data =
         {
           .nr = static_cast<int32_t>(Args->Argument[0]),
@@ -372,7 +378,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
       // Explicitly zero scratch memory.
       memset(&Data.ScratchMemory, 0, sizeof(Data.ScratchMemory));
 
-      uint32_t CurrentResult = (*it)->Func(0, 0, 0, 0, &Data);
+      uint32_t CurrentResult = BPFInterpreter::Execute((*it)->Program.data(), (*it)->Program.size(), &Data);
 
       if (!HasResult) {
         SeccompResult = CurrentResult;
@@ -577,10 +583,11 @@ uint64_t SeccompEmulator::CanDoTSync(FEXCore::Core::CpuStateFrame* Frame) {
       return Thread->ThreadInfo.TID;
     }
 
-    // Walk each filter and ensure the entry points are the same and in the same order.
+    // Walk each filter and ensure they are the same filters in the same order. Every install creates exactly one SeccompFilterInfo and
+    // the list keeps it at a stable address, so pointer identity is filter identity.
     for (size_t i = 0; i < ParentThread->Filters.size(); ++i) {
-      if (Thread->Filters[i]->Func != ParentThread->Filters[i]->Func) {
-        /// Entry point mismatch, not the same filter.
+      if (Thread->Filters[i] != ParentThread->Filters[i]) {
+        /// Filter mismatch, not the same filter.
         /// Not tsync compatible.
         return Thread->ThreadInfo.TID;
       }
@@ -653,7 +660,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     return -EINVAL;
   }
 
-  // Don't interrupt me while I'm jitting.
+  // Don't interrupt me while I'm installing a filter.
   auto lk = FEXCore::MaskSignalsAndLockMutex(FilterMutex);
 
   const size_t TotalFinalInstructions = TotalFilterInstructions + prog->len + Thread->Filters.size() * BPF_MULTIFILTERPENALTY;
@@ -679,11 +686,12 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     }
   }
 
-  BPFEmitter emit {};
   const bool LoggingEnabled = flags & SECCOMP_FILTER_FLAG_LOG;
-  auto Result = emit.JITFilter(flags, prog);
+  auto Result = BPFInterpreter::ValidateProgram(prog);
   if (Result == 0) {
-    auto& it = Filters.emplace_back(SeccompFilterInfo {(SeccompFilterFunc)emit.GetFunc(), 1, emit.AllocationSize(), prog->len, LoggingEnabled});
+    // Copy the program out of guest memory: the guest may reuse or unmap its buffer the moment this returns.
+    fextl::vector<sock_filter> Program(prog->filter, prog->filter + prog->len);
+    auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, prog->len, LoggingEnabled});
     TotalFilterInstructions += prog->len;
 
     // Append the filter to the thread.

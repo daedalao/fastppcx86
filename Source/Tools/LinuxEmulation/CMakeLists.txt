@@ -11,7 +11,7 @@ add_library(LinuxEmulation STATIC
   LinuxSyscalls/FileManagement.cpp
   LinuxSyscalls/LinuxAllocator.cpp
   LinuxSyscalls/Seccomp/SeccompEmulator.cpp
-  LinuxSyscalls/Seccomp/BPFEmitter.cpp
+  LinuxSyscalls/Seccomp/BPFInterpreter.cpp
   LinuxSyscalls/Seccomp/Dumper.cpp
   LinuxSyscalls/SignalDelegator.cpp
   LinuxSyscalls/SMCStoreBackpatch.cpp
