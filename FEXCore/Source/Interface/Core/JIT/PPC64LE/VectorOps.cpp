@@ -3810,40 +3810,49 @@ DEF_OP(VFNMLS) {
 // SSE-style scalar FP ops: result = Vec1 with element 0 replaced by
 //   (Vec1.elem[0] OP Vec2.elem[0]).  Upper elements are preserved from Vec1.
 //
-// Stack-roundtrip strategy (same as the existing VFSqrtScalarInsert):
-//   1. stvx Vec1 → buf[-32..-17].  In FEX's PPC64LE convention, stvx reverses
-//      byte order so x86 LE element 0 of Vec1 lands at buf[-32..-32+ESize-1].
-//   2. stvx Vec2 → buf[-16..-1].
-//   3. lfs/lfd both element-0 scalars into f0,f1; do the FP op; stfs/stfd
-//      back over Vec1's element-0 slot at buf[-32..].
-//   4. lvx the patched buf[-32..-17] into Dst.
-#define DEF_SCALAR_INSERT(NAME, FOP_S, FOP_D)                                  \
+// Vector-domain strategy (replaces the stack round trip through lfs/fadds):
+//   1. Splat each operand's LE element 0 across all lanes — f32 elem0 is BE
+//      word 3, f64 elem0 is dw1 (LE lvx element reversal; the dm=3 splat is
+//      the same hardware-verified idiom as VUShlS).
+//   2. One xv* vector op. All lanes hold identical values, so the FPSCR
+//      sticky bits raised are exactly those the one real computation raises,
+//      and rounding follows FPSCR.RN like the scalar op did.
+//   3. Merge the result lane back over Vec1's element 0: xxpermdi for f64
+//      (dw-granular), xxsel with a pooled lane mask for f32.
+//
+// Why vector-domain and not xs* scalar: measured on op4k (2026-08-05,
+// notes/denormal_bench.c), xs*/f* SCALAR float ops take a ~22.8x denormal
+// assist penalty on POWER8 while xv* VECTOR ops run denormal-flat. Guest
+// audio DSP (IIR/reverb tails) decays into denormals by design and x86 games
+// mask it with MXCSR.FTZ, which we do not emulate — routing scalar SSE math
+// through xv* removes the cliff without any MXCSR machinery. It also deletes
+// the two GPR-store->vector-load forwarding stalls of the old lowering.
+//   old: 9 instructions + 2 store-hit-load stalls + denormal cliff
+//   new: f64 = 4 instructions, f32 = 7 (3 of them the pool load), no stalls
+#define DEF_SCALAR_INSERT(NAME, XVOP_S, XVOP_D)                                \
 DEF_OP(NAME) {                                                                 \
   const auto Op   = IROp->C<IR::IROp_##NAME>();                                \
   const auto Dst  = GetVReg(Node);                                             \
   const auto Vec1 = GetVReg(Op->Vector1);                                      \
   const auto Vec2 = GetVReg(Op->Vector2);                                      \
-  addi(TMP1, r1, -32);                                                         \
-  stvx(Vec1, r(0), TMP1);                                                      \
-  addi(TMP2, r1, -16);                                                         \
-  stvx(Vec2, r(0), TMP2);                                                      \
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
-    lfs(f0, -32, r1);                                                          \
-    lfs(f1, -16, r1);                                                          \
-    FOP_S(f0, f0, f1);                                                         \
-    stfs(f0, -32, r1);                                                         \
+    xxspltw(VTMP1, Vec1, 3);                                                   \
+    xxspltw(VTMP2, Vec2, 3);                                                   \
+    XVOP_S(VTMP1, VTMP1, VTMP2);                                               \
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
+                        TMP1, TMP2);                                           \
+    xxsel(Dst, Vec1, VTMP1, VTMP2);                                            \
   } else {                                                                     \
-    lfd(f0, -32, r1);                                                          \
-    lfd(f1, -16, r1);                                                          \
-    FOP_D(f0, f0, f1);                                                         \
-    stfd(f0, -32, r1);                                                         \
+    xxpermdi(VTMP1, Vec1, Vec1, 3);                                            \
+    xxpermdi(VTMP2, Vec2, Vec2, 3);                                            \
+    XVOP_D(VTMP1, VTMP1, VTMP2);                                               \
+    xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */                \
   }                                                                            \
-  lvx(Dst, r(0), TMP1);                                                        \
 }
-DEF_SCALAR_INSERT(VFAddScalarInsert, fadds, fadd)
-DEF_SCALAR_INSERT(VFSubScalarInsert, fsubs, fsub)
-DEF_SCALAR_INSERT(VFMulScalarInsert, fmuls, fmul)
-DEF_SCALAR_INSERT(VFDivScalarInsert, fdivs, fdiv)
+DEF_SCALAR_INSERT(VFAddScalarInsert, xvaddsp, xvadddp)
+DEF_SCALAR_INSERT(VFSubScalarInsert, xvsubsp, xvsubdp)
+DEF_SCALAR_INSERT(VFMulScalarInsert, xvmulsp, xvmuldp)
+DEF_SCALAR_INSERT(VFDivScalarInsert, xvdivsp, xvdivdp)
 #undef DEF_SCALAR_INSERT
 
 // VFMin / VFMax scalar insert: x86 minss/maxss specifically return src2 when
@@ -5281,6 +5290,11 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 1] = 0x8000000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 0] = 0x040506070C0D0E0FULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 1] = 0x1010101010101010ULL,
+    // All-ones over guest bytes 0-3 (LE f32 element 0), zero elsewhere. In
+    // the register image after lvx this covers exactly the elem0 lane, so
+    // `xxsel(Dst, Vec1, Result, MASK)` implements SSE scalar-insert merges.
+    [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 0] = 0x00000000FFFFFFFFULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 1] = 0x0000000000000000ULL,
   },
 };
 } // namespace

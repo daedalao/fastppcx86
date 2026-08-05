@@ -840,6 +840,15 @@ public:
   void xxland (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 130); }
   void xxlandc(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 138); }
   void xxlnor (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 162); }
+  // xxspltw XT,XB,UIM — splat BE word UIM of XB across XT (XX2-form with the
+  // 2-bit UIM in the low bits of the RA field). Encoding verified against gas
+  // on op4k: `xxspltw vs34,vs35,2` == f0 42 1a 93 (LE), matching op=60,
+  // T=2/TX, UIM=2, B=3/BX, XO=164.
+  void xxspltw(VR t, VR b, uint32_t uim) {
+    assert(uim < 4);
+    Emit32((60u << 26) | (t.idx << 21) | ((uim & 3u) << 16) | (b.idx << 11) |
+           ((164u & 0x1FFu) << 2) | (1u << 1) /*BX*/ | 1u /*TX*/);
+  }
   // Convert (XX2-form, single operand).  TX bit at LE bit 0; AX bit unused; BX at bit 1.
   void EmitXX2(uint32_t vrt, uint32_t vrb, uint32_t xo) {
     Emit32((60u << 26) | (vrt << 21) | (vrb << 11) | ((xo & 0x1FFu) << 2) |
