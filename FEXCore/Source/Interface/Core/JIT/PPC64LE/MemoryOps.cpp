@@ -2150,14 +2150,16 @@ DEF_OP(VBroadcastFromMem) {
     vspltw(Dst, VTMP1, 3);
     break;
   case IR::OpSize::i64Bit:
-    // Stack-roundtrip 64-bit duplicate. Avoids the undefined-doubleword
-    // hazard of `vsldoi VTMP1,VTMP1,VTMP1,8` after `mtvsrd` (which only
-    // defines the high doubleword per ISA).
-    ldx(TMP1, MemReg, r0);
-    std(TMP1, -16, r1);
-    std(TMP1,  -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, TMP2, r0);
+    // lxvdsx is exactly this operation in one instruction: load a doubleword
+    // and splat it into both halves. It replaces a GPR load, two stores, an
+    // addi and a vector load whose data comes straight from those stores --
+    // a store-hit-load on the path glibc takes through memory-source
+    // vpbroadcastq during arena init. Byte-identical to the old sequence on
+    // POWER8, checked with an asymmetric value at a non-16-byte-aligned
+    // address (lxvdsx does not truncate the EA the way lvx does, and does
+    // not byte-reverse). Still no vsldoi-after-mtvsrd: that would read the
+    // ISA-undefined doubleword.
+    lxvdsx(Dst, r(0), MemReg);
     break;
   case IR::OpSize::i128Bit:
     // 128-bit "broadcast" is just a 128-bit load.

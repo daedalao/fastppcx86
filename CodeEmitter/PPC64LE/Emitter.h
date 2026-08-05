@@ -1011,6 +1011,11 @@ public:
   // dword[1] = the 8-byte LE integer at EA+8 — i.e. the DOUBLEWORD-SWAPPED
   // image of what lxvx produces; follow with xxpermdi(v,v,v,2) to fix up.
   void lxvd2x(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 844, 1); }
+  // lxvdsx XT, RA, RB (ISA 2.06): load one doubleword from (RA|0)+RB and splat
+  // it into both doublewords of XT. XO 332, TX=1 for the VMX half of the VSR
+  // file -- checked against GAS: `lxvdsx 32,0,3` assembles to 0x7c001a99 and
+  // `lxvdsx 45,4,5` to 0x7da42a99, both of which this reproduces.
+  void lxvdsx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 332, 1); }
   // stxvd2x XS,RA,RB — ISA 2.06 (POWER7+) — p.508, XO=972. Store form: writes
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
