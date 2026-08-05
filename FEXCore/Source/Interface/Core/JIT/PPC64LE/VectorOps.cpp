@@ -978,52 +978,40 @@ DEF_OP(VUShrNI) {
     // i=1: out 13←src 11, out 12←src 10
     // i=2: out 11←src  7, out 10←src  6
     // i=3: out  9←src  3, out  8←src  2
-    // → mask PPC bytes [8..15] = [02,03,06,07, 0A,0B,0E,0F]
-    // → constant V (at -16, mapping into PPC bytes [8..15] MSB-first)
-    //   = 0x020306070A0B0E0F
-    // mask PPC bytes [0..7] = 0x10 (selects VTMP1=zero) → 0x1010...
+    // → mask PPC bytes [8..15] = [02,03,06,07, 0A,0B,0E,0F], PPC bytes [0..7]
+    //   all zero.  That is exactly vpkuwum(Dst, ZERO, VTMP2): vpkuwum keeps
+    //   the low halfword of each BE word, VRA's four into phys[0..7] and
+    //   VRB's four into phys[8..15].  Hardware-verified ("VUShrNI i32->i16").
     vspltisw(VTMP1, (int32_t)N);
     vsrw(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x020306070A0B0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkuwum(Dst, VTMP1, VTMP2);
   } else if (OutSz == IR::OpSize::i8Bit) {
     // i16→i8 narrow.  Source: VTMP2 = vsrh(Vec, N).  Output i8 lane i at
     // LE byte i = out PPC byte (15-i).  Source low byte of LE i16 lane i
     // sits at src PPC byte (15-2i).
     //   out PPC[15-i] = src PPC[15-2i]    (i=0..7)
     // i=0: out 15←src 15  i=1: out 14←src 13 … i=7: out 8←src 1
-    // → mask PPC bytes [8..15] = [01,03,05,07, 09,0B,0D,0F]
-    // → constant V (at -16) = 0x01030507090B0D0F
+    // → mask PPC bytes [8..15] = [01,03,05,07, 09,0B,0D,0F], [0..7] zero =
+    //   vpkuhum(Dst, ZERO, VTMP2).  Hardware-verified ("VUShrNI i16->i8").
     vspltish(VTMP1, (int16_t)N);
     vsrh(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x01030507090B0D0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkuhum(Dst, VTMP1, VTMP2);
   } else if (OutSz == IR::OpSize::i32Bit) {
     // i64→i32 narrow.  Source: VTMP2 = vsrd(Vec, N).  Source low 32 bits
     // of LE i64 lane i at src PPC bytes [15-8i..12-8i] (LSB at 15-8i, MSB
     // at 12-8i).  Output i32 lane i at out PPC bytes [15-4i..12-4i].
     //   i=0: out 15..12 ← src 15..12
     //   i=1: out 11..8  ← src  7..4
-    // → mask PPC bytes [8..15] = [04,05,06,07, 0C,0D,0E,0F]
-    // → constant V (at -16) = 0x040506070C0D0E0F
+    // → mask PPC bytes [8..15] = [04,05,06,07, 0C,0D,0E,0F], [0..7] zero =
+    //   vpkudum(Dst, ZERO, VTMP2).  Hardware-verified ("VUShrNI i64->i32").
     LoadConstant(TMP1, (uint64_t)N);
     mtvsrd(VTMP1, TMP1);
     xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkudum(Dst, VTMP1, VTMP2);
   } else {
     Op_Unhandled(IROp, Node);
   }
@@ -1058,35 +1046,33 @@ DEF_OP(VUShrNI2) {
     // i=1: out 5←src 11, out 4←src 10
     // i=2: out 3←src  7, out 2←src  6
     // i=3: out 1←src  3, out 0←src  2
-    // → mask PPC bytes [0..7] = [02,03,06,07, 0A,0B,0E,0F]
-    // → constant W (at -8, mapping into PPC[0..7] MSB-first) = 0x020306070A0B0E0F
-    // Mask PPC bytes [8..15] preserve VLow PPC[8..15] via idx 0x18..0x1F
-    // → constant V (at -16) = 0x18191A1B1C1D1E1F
+    // → mask PPC bytes [0..7] = [02,03,06,07, 0A,0B,0E,0F], PPC bytes [8..15]
+    //   preserve VLow PPC[8..15].
+    // Split into the same narrow-pack VUShrNI uses (vpkuwum against zero puts
+    // the gathered halfwords at VTMP2.phys[8..15] = dw1) followed by a
+    // dw-blend: Dst.dw0 = narrowed.dw1, Dst.dw1 = VLow.dw1 = xxpermdi(...,3).
+    // Hardware-verified ("VUShrNI2 i32->i16").
     vspltw(VTMP1, VTMP1, 1);
     vsrw(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x020306070A0B0E0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkuwum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else if (OutSz == IR::OpSize::i8Bit) {
     // i16→i8 narrow on VUpp, insert into upper LE half of VLow.
+    // Hardware-verified ("VUShrNI2 i16->i8").
     vsplth(VTMP1, VTMP1, 3);
     vsrh(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x01030507090B0D0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkuhum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else if (OutSz == IR::OpSize::i32Bit) {
     // i64→i32 narrow on VUpp, insert into upper LE half of VLow.
+    // Hardware-verified ("VUShrNI2 i64->i32").
     xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkudum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else {
     Op_Unhandled(IROp, Node);
   }
@@ -1274,20 +1260,13 @@ DEF_OP(VSQXTN2) {
   case IR::OpSize::i16Bit: vpkswss(VTMP2, VTMP2, VUpp); break;
   default: Op_Unhandled(IROp, Node); return;
   }
-  // Step 2: vsldoi to move VTMP2 LE[0-7] → phys 0-7 (becomes LE[8-15]).
-  // vsldoi(D,A,B,8) = A[8:15] ++ B[0:7].  VTMP2 phys 8-15 → phys 0-7.
-  vsldoi(VTMP2, VTMP2, VTMP2, 8);
-  // Now VTMP2: phys 0-7 = narrow(VUpp), phys 8-15 = 0.
-  // Step 3: blend: take phys 0-7 from VTMP2, phys 8-15 from VLow.
-  // ctrl (vA=VTMP2, vB=VLow): phys[0..7]=[0..7], phys[8..15]=[24..31].
-  // VAddP convention: -16 → phys[8..15] (MSB at phys[8] = 0x18); -8 → phys[0..7].
-  LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x0001020304050607ULL);
-  std(TMP1, -8, r1);
-  addi(TMP2, r1, -16);
-  lvx(Dst, r(0), TMP2);
-  vperm(Dst, VTMP2, VLow, Dst);
+  // Step 2: blend directly out of the pack result — Dst.dw0 must be the
+  // narrowed VUpp (which vpkXXss already left at VTMP2.phys[8..15] = dw1)
+  // and Dst.dw1 must be VLow.dw1.  That is xxpermdi(Dst, VTMP2, VLow, 3),
+  // which subsumes the old `vsldoi ...,8` staging step (now deleted) and the
+  // whole perm-control materialisation.  Hardware-verified against the old
+  // sequence on POWER8 ("VSQXTN2 i8" / "VSQXTN2 i16").
+  xxpermdi(Dst, VTMP2, VLow, 3);
 }
 
 DEF_OP(VSQXTNPair) {
@@ -1355,15 +1334,9 @@ DEF_OP(VSQXTUN2) {
   case IR::OpSize::i16Bit: vpkswus(VTMP2, VTMP2, VUpp); break;
   default: Op_Unhandled(IROp, Node); return;
   }
-  vsldoi(VTMP2, VTMP2, VTMP2, 8);
-  // Same blend ctrl as VSQXTN2: phys[0..7]=[0..7], phys[8..15]=[24..31].
-  LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x0001020304050607ULL);
-  std(TMP1, -8, r1);
-  addi(TMP2, r1, -16);
-  lvx(Dst, r(0), TMP2);
-  vperm(Dst, VTMP2, VLow, Dst);
+  // Same dw-blend as VSQXTN2 (the `vsldoi ...,8` staging step is subsumed).
+  // Hardware-verified ("VSQXTUN2 i8" / "VSQXTUN2 i16").
+  xxpermdi(Dst, VTMP2, VLow, 3);
 }
 
 DEF_OP(VSQXTUNPair) {
@@ -2433,14 +2406,14 @@ DEF_OP(VUMull) {
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
     // Unsigned widening of lower LE halfwords {0..3} → words {0..3}.
-    // Intent phys[0..7]=[18,19,1A,1B,08,09,0A,0B], phys[8..15]=[1C,1D,1E,1F,0C,0D,0E,0F].
-    // VAddP convention: -16 → phys[8..15] (MSB at phys[8]); -8 → phys[0..7].
+    // Wanted phys[0..7]=[18,19,1A,1B,08,09,0A,0B], phys[8..15]=[1C,1D,1E,1F,0C,0D,0E,0F],
+    // i.e. Dst BE words = [VTMP2.w2, VTMP1.w2, VTMP2.w3, VTMP1.w3] — exactly
+    // vmrglw(Dst, VTMP2, VTMP1) (the ISA definition is in BE word numbering and
+    // is endian-independent at the instruction level).  Hardware-verified on
+    // POWER8 against the old vperm sequence (see report: "VUMull i32").
     vmulouh(VTMP1, V1, V2);
     vmuleuh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1C1D1E1F0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B08090A0BULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrglw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
@@ -2449,14 +2422,13 @@ DEF_OP(VUMull) {
     //                   so t.phys[8..15] = LE_word[0] product (=LE_dword[0] of result).
     // vmuleuw(t,a,b): t.BE_dword[i] = a.BE_word[2i]*b.BE_word[2i]   = LE_word[3-2i] product
     //                   so t.phys[8..15] = LE_word[1] product (=LE_dword[1] of result).
-    // Output: phys[8..15]=VTMP1.phys[8..15], phys[0..7]=VTMP2.phys[8..15].
-    // ctrl phys = [18,19,1A,1B,1C,1D,1E,1F, 08,09,0A,0B,0C,0D,0E,0F].
+    // Output: phys[8..15]=VTMP1.phys[8..15], phys[0..7]=VTMP2.phys[8..15],
+    // i.e. Dst.dw0 = VTMP2.dw1 and Dst.dw1 = VTMP1.dw1.  xxpermdi(D,A,B,dm)
+    // gives dw0 = A.dw[dm>>1], dw1 = B.dw[dm&1], so dm=3 with A=VTMP2,
+    // B=VTMP1.  Hardware-verified ("VUMull i64").
     vmulouw(VTMP1, V1, V2);
     vmuleuw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x08090A0B0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 3);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2469,23 +2441,19 @@ DEF_OP(VSMull) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
-    // Signed widening of lower LE halfwords {0..3} → words {0..3}. Same ctrl as VUMull.
+    // Signed widening of lower LE halfwords {0..3} → words {0..3}. Same gather
+    // as VUMull i32Bit — see there.  Hardware-verified ("VSMull i32").
     vmulosh(VTMP1, V1, V2);
     vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1C1D1E1F0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B08090A0BULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrglw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 signed widening (for PMULDQ). Same gather as VUMull i64Bit.
+    // Hardware-verified ("VSMull i64").
     vmulosw(VTMP1, V1, V2);
     vmulesw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x08090A0B0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 3);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2499,26 +2467,26 @@ DEF_OP(VUMull2) {
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
     // Unsigned widening of upper LE halfwords {4..7} → words {0..3}.
-    // Intent phys[0..7]=[10,11,12,13,00,01,02,03], phys[8..15]=[14,15,16,17,04,05,06,07].
+    // Wanted phys[0..7]=[10,11,12,13,00,01,02,03], phys[8..15]=[14,15,16,17,04,05,06,07],
+    // i.e. Dst BE words = [VTMP2.w0, VTMP1.w0, VTMP2.w1, VTMP1.w1] =
+    // vmrghw(Dst, VTMP2, VTMP1).  Hardware-verified ("VUMull2 i32").
     vmulouh(VTMP1, V1, V2);
     vmuleuh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1415161704050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121300010203ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrghw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 unsigned widening of upper LE words {2,3} → dwords {0,1}.
     // LE_word[2] product = vmulouw.BE_dword[0] = VTMP1.phys[0..7].
     // LE_word[3] product = vmuleuw.BE_dword[0] = VTMP2.phys[0..7].
-    // ctrl phys = [10,11,12,13,14,15,16,17, 00,01,02,03,04,05,06,07].
+    // ctrl phys = [10,11,12,13,14,15,16,17, 00,01,02,03,04,05,06,07], i.e.
+    // Dst.dw0 (phys[8..15]) = VTMP1.dw0 and Dst.dw1 (phys[0..7]) = VTMP2.dw0
+    // → xxpermdi(Dst, VTMP2, VTMP1, 0).  NOTE the operand order: the naive
+    // reading (VTMP1, VTMP2) produces the two halves SWAPPED — caught by the
+    // POWER8 differential test ("VUMull2 i64"), which failed on (T1,T2,0).
     vmulouw(VTMP1, V1, V2);
     vmuleuw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x0001020304050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121314151617ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 0);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2531,23 +2499,19 @@ DEF_OP(VSMull2) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
-    // Signed widening of upper LE halfwords {4..7} → words {0..3}. Same ctrl as VUMull2.
+    // Signed widening of upper LE halfwords {4..7} → words {0..3}. Same gather
+    // as VUMull2 i32Bit.  Hardware-verified ("VSMull2 i32").
     vmulosh(VTMP1, V1, V2);
     vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1415161704050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121300010203ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrghw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 signed widening of upper LE words {2,3} → dwords {0,1}.
+    // Same blend as VUMull2 i64Bit.  Hardware-verified ("VSMull2 i64").
     vmulosw(VTMP1, V1, V2);
     vmulesw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x0001020304050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121314151617ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 0);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -3178,6 +3142,25 @@ DEF_OP(VInsElement) {
   const auto DestVec  = GetVReg(Op->DestVector);
   const auto SrcVec   = GetVReg(Op->SrcVector);
 
+  // i64 elements are a pure doubleword blend — one xxpermdi, no perm control.
+  // Under the lvx-reverse layout LE dword 0 is phys[8..15] (= VSR dw1) and LE
+  // dword 1 is phys[0..7] (= VSR dw0), so LE index j maps to VSR dw (1-j).
+  // xxpermdi(D,A,B,dm): D.dw0 = A.dw[dm>>1], D.dw1 = B.dw[dm&1].
+  //   DestIdx==0: keep DestVec's LE dword 1 (= dw0) and take SrcVec's LE dword
+  //               SrcIdx (= dw 1-SrcIdx) into LE dword 0 (= dw1)
+  //               → xxpermdi(Dst, DestVec, SrcVec, 1-SrcIdx)
+  //   DestIdx==1: → xxpermdi(Dst, SrcVec, DestVec, 2*(1-SrcIdx)+1)
+  // Single instruction, so Dst may alias either source.  Hardware-verified for
+  // all four (DestIdx,SrcIdx) combinations ("VInsElement i64 D=.. S=..").
+  if (ElemSz == IR::OpSize::i64Bit) {
+    if (DestIdx == 0) {
+      xxpermdi(Dst, DestVec, SrcVec, (uint32_t)(1u - SrcIdx));
+    } else {
+      xxpermdi(Dst, SrcVec, DestVec, (uint32_t)(2u * (1u - SrcIdx) + 1u));
+    }
+    return;
+  }
+
   // Strategy: copy DestVec to Dst, then use vperm to insert.
   // Build a 16-byte perm control vector where:
   //   perm[byte] selects from [DestVec (indices 0-15) : SrcVec (indices 16-31)]
@@ -3230,6 +3213,23 @@ DEF_OP(VInsGPR) {
   // Move Src GPR to a vector register element, then use VInsElement logic.
   // Put Src into low element of VTMP2.
   mtvsrd(VTMP2, Src);  // puts into high 64-bits of VTMP2 (phys bytes 0-7)
+
+  // i64: mtvsrd already leaves Src in VTMP2.dw0, so the insert is one
+  // doubleword blend (see VInsElement i64 for the LE dword ↔ VSR dw mapping).
+  //   DestIdx==0 → Dst.dw1 = VTMP2.dw0, Dst.dw0 = DestVec.dw0
+  //              → xxpermdi(Dst, DestVec, VTMP2, 0)
+  //   DestIdx==1 → Dst.dw0 = VTMP2.dw0, Dst.dw1 = DestVec.dw1
+  //              → xxpermdi(Dst, VTMP2, DestVec, 1)
+  // Hardware-verified for both DestIdx ("VInsGPR i64 DestIdx=0/1"); the same
+  // test also confirms mtvsrd lands the GPR in dw0 (phys[0..7]).
+  if (ElemSz == IR::OpSize::i64Bit) {
+    if (DestIdx == 0) {
+      xxpermdi(Dst, DestVec, VTMP2, 0);
+    } else {
+      xxpermdi(Dst, VTMP2, DestVec, 1);
+    }
+    return;
+  }
 
   // Now insert element 0 of VTMP2 into DestIdx of DestVec.
   // Reuse VInsElement pattern:
@@ -3410,35 +3410,26 @@ DEF_OP(VExtr) {
     return;
   }
 
-  // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad].
-  // Source slot B receives a zero vector; perm indices >=16 (slot B) read 0.
-  uint8_t perm[16];
-  auto VSrc1 = VLow;
-  auto VSrc2 = VHigh;
-  {
-    const uint8_t ZeroPad = (uint8_t)(N - 16u);
-    for (int b = 0; b < 16; b++) {
-      perm[b] = (b < ZeroPad) ? (uint8_t)16 : (uint8_t)(b - ZeroPad);
-    }
-    vspltisb(VTMP2, 0);
-    VSrc2 = VTMP2;
+  // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad],
+  // with ZeroPad = N-16 in [0..15].
+  //
+  // vsldoi(VRT, VRA, VRB, SHB) computes VRT.phys[i] = (VRA||VRB).phys[i+SHB].
+  // With VRA = ZERO and VRB = VLow the concatenation is 16 zero bytes followed
+  // by VLow, so VRT.phys[i] = 0 for i+SHB < 16 and VLow.phys[i+SHB-16]
+  // otherwise.  Choosing SHB = 16-ZeroPad makes those two conditions become
+  // exactly `i < ZeroPad` and `VLow.phys[i-ZeroPad]`.  ✓
+  //
+  // ZeroPad == 0 (N == 16) would need SHB == 16, which is not encodable — but
+  // that case is just a copy of VLow.  Otherwise SHB is 1..15, always legal.
+  // Hardware-verified for every N in [16..31] against the old vperm sequence
+  // ("VExtr N=16".."VExtr N=31").
+  const uint8_t ZeroPad = (uint8_t)(N - 16u);
+  if (ZeroPad == 0) {
+    if (Dst != VLow) vmr(Dst, VLow);
+    return;
   }
-
-  // Same LE perm-vector hazard as VInsGPR/VInsElement: lvx byte-reverses,
-  // so put ctrl_lo at the LOWER address (-16) and ctrl_hi at the higher (-8)
-  // — opposite of the obvious order — so VTMP1.phys[i] = perm[i].
-  uint64_t ctrl_hi = 0, ctrl_lo = 0;
-  for (int b = 0; b < 8; b++) ctrl_hi = (ctrl_hi << 8) | perm[b];
-  for (int b = 8; b < 16; b++) ctrl_lo = (ctrl_lo << 8) | perm[b];
-
-  LoadConstant(TMP1, ctrl_lo);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, ctrl_hi);
-  std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP1, r(0), TMP1);
-
-  vperm(Dst, VSrc1, VSrc2, VTMP1);
+  vspltisb(VTMP2, 0);
+  vsldoi(Dst, VTMP2, VLow, (uint32_t)(16u - ZeroPad));
 }
 
 // ---------------------------------------------------------------------------
@@ -4580,7 +4571,14 @@ DEF_OP(Vector_FToZS) {
   if (ElemSz == IR::OpSize::i32Bit) {
     vrfiz(VTMP1, Src);    // round towards zero
     vctsxs(Dst, VTMP1, 0);
-    // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
+    // INT_MIN sentinel for +overflow. This fix-up is LOAD-BEARING, not dead:
+    // hardware-measured on POWER8, vctsxs of {+2^40, NaN, -2^40, 1.5} gives
+    // {7fffffff, 00000000, 80000000, 1} — +overflow saturates to INT_MAX, so
+    // without the select the +overflow lane would be 0x7fffffff not x86's
+    // 0x80000000. KNOWN BUG (not fixed here): vctsxs maps NaN -> 0x00000000
+    // (VMX), and xvcmpgesp returns 0 for NaN, so the select leaves 0 where
+    // x86 CVTTPS2DQ(NaN) wants 0x80000000. Unlike the VSX converts, VMX vctsxs
+    // does NOT map NaN to INT_MIN. Needs a separate NaN mask to fully match.
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
     xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
