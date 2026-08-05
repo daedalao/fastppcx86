@@ -216,9 +216,11 @@ DEF_OP(ExitFunction) {
   // Hit. Carry the GuestCode value into the HostCode load's address so the
   // hardware cannot hoist it above the GuestCode load and observe
   // {stale HostCode, new GuestCode} mid-Publish. TMP3 is 0 by construction.
+  // Same one-instruction fold as the dispatcher's match_label leg: the data
+  // dependency rides ldx's index operand (TMP3 == 0), preserving the
+  // load-load ordering the comment above requires.
   xor_(TMP3, TMP4, TMP4);
-  add(TMP2, TMP2, TMP3);
-  ld(TMP3, 0, TMP2);             // TMP3 = HostCode (loaded under address-dep)
+  ldx(TMP3, TMP2, TMP3);         // TMP3 = HostCode (loaded under address-dep)
   mtctr(TMP3);
   if (!Linkable) {
     // P5.0.1: store the destination RIP into State.rip on the hit leg too.

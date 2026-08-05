@@ -363,9 +363,11 @@ void PPC64Dispatcher::EmitDispatcher() {
     // is unchanged, but the load's address now carries a data dependency on
     // TMP4 -- which is what Power's memory model actually orders on.  The
     // conditional branch above is NOT sufficient (see the ORDERING NOTE).
+    // The dependency rides the X-form index operand directly: ldx's EA is
+    // TMP2 + TMP3 with TMP3 == 0, same ordering guarantee as the old
+    // xor_/add/ld sequence, one instruction shorter on this hottest-path leg.
     xor_(TMP3, TMP4, TMP4);   // TMP3 = 0, data-dependent on the GuestCode load
-    add(TMP2, TMP2, TMP3);    // address of the HostCode load now depends on it
-    ld(TMP3, 0, TMP2);   // TMP3 = HostCode (loaded under address-dep)
+    ldx(TMP3, TMP2, TMP3);    // TMP3 = HostCode (loaded under address-dep)
     mtctr(TMP3);
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();
