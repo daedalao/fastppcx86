@@ -4,6 +4,8 @@
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
+#include <bit>
+
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -197,9 +199,18 @@ DEF_OP(ExitFunction) {
   auto MissLabel = PPC64Emitter::Label{};
 
   ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
-  ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled)
-  sldi(TMP4, RIPReg, 4);         // log2(sizeof(LookupCacheEntry)) == 4
-  and_(TMP4, TMP4, TMP3);
+  if (!CTX->Config.DynamicL1Cache()) {
+    // Static L1: constant-mask probe, one rldic instead of L1Mask load +
+    // sldi + and_. Same derivation as the dispatcher's DispatcherLoopTop.
+    static_assert((FEXCore::LookupCache::MAX_L1_ENTRIES & (FEXCore::LookupCache::MAX_L1_ENTRIES - 1)) == 0,
+                  "rldic probe requires a power-of-two L1");
+    constexpr uint32_t L1MB = 64 - (std::countr_zero(FEXCore::LookupCache::MAX_L1_ENTRIES) + 4);
+    rldic(TMP4, RIPReg, 4, L1MB);
+  } else {
+    ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled)
+    sldi(TMP4, RIPReg, 4);         // log2(sizeof(LookupCacheEntry)) == 4
+    and_(TMP4, TMP4, TMP3);
+  }
   add(TMP2, TMP2, TMP4);         // TMP2 = &L1[hash]
 
   ld(TMP4, 8, TMP2);             // TMP4 = GuestCode (the "key"), loaded FIRST
