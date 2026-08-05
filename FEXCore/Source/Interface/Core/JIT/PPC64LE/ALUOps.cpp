@@ -250,8 +250,11 @@ DEF_OP(MulH) {
     extsb(TMP1, S1);
     extsb(TMP2, S2);
     mulld(Dst, TMP1, TMP2);
-    rldicl(Dst, Dst, 64 - 8, 8);   // srdi by 8 (no Rc; equivalent to ASR here)
-    rldicl(Dst, Dst, 0, 56);
+    // (Dst >> 8) & 0xFF in one rotate-and-mask: rldicl RA,RS,sh,mb computes
+    // ROTL64(RS, sh) & MASK(mb, 63), so sh = 56 (= 64 - 8) brings bits 15:8
+    // down to 7:0 and mb = 56 keeps exactly those low 8 bits. The two-step
+    // srdi-then-clear this replaces produced the identical value.
+    rldicl(Dst, Dst, 56, 56);
     break;
   case IR::OpSize::i16Bit:
     // Same trick: 16x16→32 signed product, sign-extended to 64 by mulld.
@@ -259,8 +262,7 @@ DEF_OP(MulH) {
     extsh(TMP1, S1);
     extsh(TMP2, S2);
     mulld(Dst, TMP1, TMP2);
-    rldicl(Dst, Dst, 64 - 16, 16);
-    rldicl(Dst, Dst, 0, 48);
+    rldicl(Dst, Dst, 48, 48);   // (Dst >> 16) & 0xFFFF, one rotate-and-mask
     break;
   case IR::OpSize::i32Bit:
     mulhw(Dst, S1, S2);
@@ -285,15 +287,13 @@ DEF_OP(UMulH) {
     rldicl(TMP1, S1, 0, 56);
     rldicl(TMP2, S2, 0, 56);
     mulld(Dst, TMP1, TMP2);
-    srdi(Dst, Dst, 8);
-    rldicl(Dst, Dst, 0, 56);
+    rldicl(Dst, Dst, 56, 56);   // (Dst >> 8) & 0xFF, one rotate-and-mask
     break;
   case IR::OpSize::i16Bit:
     rldicl(TMP1, S1, 0, 48);
     rldicl(TMP2, S2, 0, 48);
     mulld(Dst, TMP1, TMP2);
-    srdi(Dst, Dst, 16);
-    rldicl(Dst, Dst, 0, 48);
+    rldicl(Dst, Dst, 48, 48);   // (Dst >> 16) & 0xFFFF, one rotate-and-mask
     break;
   case IR::OpSize::i32Bit:
     mulhwu(Dst, S1, S2);
