@@ -181,6 +181,119 @@ DEF_OP(ExitFunction) {
   }
 
   // ---------------------------------------------------------------------
+  // Shadow return stack (FEX_SHADOWRETSTACK). See JITClass.h, the
+  // resolution+interlock in JIT.cpp, and the CallReturnEntryLabels bind in
+  // CompileCode's block loop.
+  //
+  // RET pop: peek the top {guest_ret_rip, host_trampoline}; if the recorded
+  // guest RIP equals this RET's target, branch straight to the trampoline
+  // (which re-enters the return block at its L1-hit landing), skipping the L1
+  // probe. The pop is unconditional (mirrors the stack discipline): a mismatch,
+  // an empty stack, or any prior invalidation just falls through to the probe,
+  // which is the correctness net.
+  //
+  // CALL push: record {guest_ret_rip, &trampoline} so a matching RET can take
+  // the fast path. Emitted BEFORE the existing (possibly linkable) exit to the
+  // callee, which is left byte-for-byte unchanged.
+  //
+  // Discipline: every compare targets cr7 with a no-Rc form, so CR0's packed
+  // NZCV and XER reach the target block / the miss-leg spill exactly as the
+  // block left them (identical to the L1 probe below). r0 is rewritten (to 0)
+  // only on the taken RET fast path, immediately before the bctr, preserving
+  // the X-form zero-index invariant. base is read per-op from
+  // Frame->Thread->CallRetStackBase — the code buffer is shared across threads
+  // so the bound cannot be an immediate — and [base, base+SIZE) is exactly the
+  // R/W region between the frontend's two guard pages, so the bounds checks
+  // never fault. Overflow (push) resets to empty and skips the store; empty
+  // (pop) skips the fast path; neither ever corrupts memory.
+  // ---------------------------------------------------------------------
+  PPC64Emitter::Label ShadowRetReprobe{};
+  const bool ShadowActive = ShadowRetStackEnabled &&
+    (Op->Hint == IR::BranchHint::Return || Op->Hint == IR::BranchHint::Call);
+  if (ShadowActive) {
+    const int16_t sp_off = static_cast<int16_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+    const int16_t thread_off = static_cast<int16_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, Thread));
+    const int16_t base_off = static_cast<int16_t>(
+      offsetof(FEXCore::Core::InternalThreadState, CallRetStackBase));
+    // SIZE == 0x400000 == 0x40 << 16, materialised with a single addis.
+    static_assert(FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE == 0x400000,
+                  "shadow bounds addis assumes a 4 MiB call-ret stack");
+
+    if (Op->Hint == IR::BranchHint::Return) {
+      ld(TMP2, sp_off, STATE);            // TMP2 = sp
+      ld(TMP3, thread_off, STATE);
+      ld(TMP3, base_off, TMP3);           // TMP3 = base
+      addis(TMP3, TMP3, 0x40);            // TMP3 = base + SIZE (empty / top guard)
+      cmpd(cr(7), TMP2, TMP3);
+      bc({4, 28}, &ShadowRetReprobe);     // sp >= base+SIZE -> empty -> probe
+      ld(TMP3, 0, TMP2);                  // TMP3 = guest_ret_rip (top slot)
+      if (CTX->Config.Is64BitMode()) {
+        cmpd(cr(7), TMP3, RIPReg);
+      } else {
+        cmpw(cr(7), TMP3, RIPReg);        // 32-bit guest: compare low 32 only
+      }
+      addi(TMP2, TMP2, 16);               // pop (unconditional, mirrors ARM64)
+      std(TMP2, sp_off, STATE);
+      bc({4, 30}, &ShadowRetReprobe);     // guest_ret_rip != target -> probe
+      ld(TMP3, -8, TMP2);                 // TMP3 = host trampoline (== old sp + 8)
+      std(RIPReg, rip_off, STATE);        // P5.0.1: store rip before the jump
+      mtctr(TMP3);
+      li(r(0), 0);                        // P5.0.2: restore zero-index invariant
+      bctr();
+      // Empty / mismatch fall through into the unchanged L1 probe (ShadowRetReprobe).
+    } else {
+      // BranchHint::Call push.
+      const GPR HostPtr = TMP2;           // host trampoline pointer (0 if no in-buffer return block)
+      if (!Op->CallReturnBlock.IsInvalid()) {
+        // host trampoline = &l_cont, discovered PC-relatively so it is
+        // position-independent and needs no relocation across code-cache
+        // save/load. Fixed 3-instruction layout after mflr keeps the addi
+        // delta a hard constant (= 12 bytes, {mflr, addi, b}):
+        //     bcl 20,31,$+4 ; mflr TMP2      TMP2 = &mflr  (LK form: no link-stack push)
+        //     addi TMP2, TMP2, 12            TMP2 = &l_cont
+        //     b l_skip                       jump over the 1-insn trampoline
+        //   l_cont: b CallReturnEntryLabels[return-block]
+        //   l_skip:
+        PPC64Emitter::Label l_skip{};
+        const uint32_t CRBID = IR->GetOp<IR::IROp_CodeBlock>(Op->CallReturnBlock)->ID;
+        bcl(20, 31, 4);
+        mflr(TMP2);
+        addi(TMP2, TMP2, 12);
+        b(&l_skip);
+        b(&CallReturnEntryLabels[CRBID]); // l_cont trampoline (reached only via a matching RET)
+        Bind(&l_skip);
+      } else {
+        li(TMP2, 0);                      // no return block: push a zero entry (never matches)
+      }
+      ld(TMP3, sp_off, STATE);            // TMP3 = sp
+      ld(TMP4, thread_off, STATE);
+      ld(TMP4, base_off, TMP4);           // TMP4 = base
+      addi(TMP3, TMP3, -16);              // TMP3 = new sp
+      cmpd(cr(7), TMP3, TMP4);
+      PPC64Emitter::Label l_do_push{}, l_push_done{};
+      bc({4, 28}, &l_do_push);            // new sp >= base -> room to push
+      // Overflow: reset to empty (base+SIZE), skip the store, never write below
+      // the low guard page.
+      addis(TMP4, TMP4, 0x40);
+      std(TMP4, sp_off, STATE);
+      b(&l_push_done);
+      Bind(&l_do_push);
+      if (!Op->CallReturnBlock.IsInvalid()) {
+        std(GetReg(Op->CallReturnAddress), 0, TMP3); // slot0 = guest_ret_rip
+      } else {
+        std(HostPtr, 0, TMP3);            // slot0 = 0
+      }
+      std(HostPtr, 8, TMP3);              // slot8 = host trampoline (0 if invalid)
+      std(TMP3, sp_off, STATE);           // callret_sp = new sp
+      Bind(&l_push_done);
+      // Fall through to the existing exit (linkable hoist + L1 probe to callee);
+      // RIPReg (= TMP1 for const targets) was deliberately left untouched.
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // Block-linking hoist + patch-site registration (see header comment).
   // Only for constant-target plain jumps with the knob on; every other exit
   // shape keeps the exact non-linking lowering below.
@@ -213,6 +326,13 @@ DEF_OP(ExitFunction) {
     offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
 
   auto MissLabel = PPC64Emitter::Label{};
+
+  // A shadow RET that found an empty stack or a mismatched top re-enters the
+  // normal lookup here, so the fast path degrades to exactly the L1-probe
+  // behaviour on any miss.
+  if (ShadowActive && Op->Hint == IR::BranchHint::Return) {
+    Bind(&ShadowRetReprobe);
+  }
 
   ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
   if (!FEXCore::Config::Get_DYNAMICL1CACHE()) {

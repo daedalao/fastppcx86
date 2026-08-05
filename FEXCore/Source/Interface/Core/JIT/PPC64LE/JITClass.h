@@ -276,6 +276,25 @@ private:
   // See the resolution site in JIT.cpp for the hard-gate rationale.
   bool BlockLinkingEnabled {};
 
+  // Shadow return stack (FEX_SHADOWRETSTACK). Resolved once at construction,
+  // mirroring BlockLinkingEnabled. Default OFF; the SMC interlock at the
+  // resolution site forces it off in the one lazy-SMC configuration where the
+  // RET fast path would reopen a same-thread stale-code window. When false,
+  // DEF_OP(ExitFunction) emits the byte-for-byte legacy Call/Return sequences
+  // and the block loop skips the entry-label bind, so the default path is
+  // provably unchanged.
+  bool ShadowRetStackEnabled {};
+
+  // One shadow-return fast-path entry label per IR block, indexed by
+  // IROp_CodeBlock::ID (the same ID space JumpTargets uses). Sized once per
+  // CompileCode (before any emission) so element addresses are stable for the
+  // pending forward-branch fixups a Call push records. Bound at each block's
+  // EntryPoint landing -- BEFORE the spill-frame stdu -- so a shadow RET fast
+  // path enters exactly where a dispatcher L1 hit would (full entry prologue,
+  // incl. the deferred-signal poke and the stdu). Only populated when
+  // ShadowRetStackEnabled; empty (and untouched) otherwise.
+  fextl::vector<PPC64Emitter::Label> CallReturnEntryLabels;
+
   // Resolved once at construction: code caching OR SMCSemanticPatch on, i.e.
   // somebody rewrites the exit-RIP window in place and it has to stay a
   // fixed-width 20-byte site. Off means InsertExitRIPMove may use the ordinary

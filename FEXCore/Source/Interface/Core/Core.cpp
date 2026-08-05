@@ -1482,8 +1482,18 @@ void ContextImpl::ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThread
   // Deliberately does NOT touch L2/L3, CachedCodePages, the frontend's
   // executable-range cache, or the CallRet stack: all of those need a lock this
   // handler must not take, and none of them is reachable without first going
-  // through the lookup slow path, which drains. The PPC64LE backend does not
-  // use the CallRet predictor stack at all (see JIT/PPC64LE/JIT.cpp).
+  // through the lookup slow path, which drains.
+  //
+  // The CallRet (shadow-return) stack is left alone even when the PPC64LE
+  // FEX_SHADOWRETSTACK feature is enabled. That is sound because this scrub is
+  // only part of the FEX_SMCLAZYINVAL soundness machinery, and the shadow
+  // return stack is force-disabled under FEX_SMCLAZYINVAL unless
+  // FEX_SMCLAZYLINK is also set (see PPC64JITCore's ShadowRetStack interlock).
+  // Under LAZYLINK the real drain — DrainLazySMCInvalidations ->
+  // InvalidateThreadCachedCodeRange — zeroes the CallRet stack, and it is
+  // reached via the InterruptFaultPage poke at every block entry, including
+  // the return-block entry a shadow RET fast path lands on. So no stale host
+  // trampoline outlives the scrub's drain window.
   Thread->LookupCache->ScrubForLazySMC();
 }
 
