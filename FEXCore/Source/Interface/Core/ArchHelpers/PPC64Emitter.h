@@ -265,10 +265,29 @@ public:
   // re-emit patched constants in place.
   void LoadConstantFixed(GPR rt, uint64_t Constant);
 
+  // Which slice of the SRA a fill reloads.
+  //
+  // `SkipNonVolatileGPRs` and `NonVolatileGPRsOnly` are exact complements:
+  // emitting both, in either order, is equivalent to `All`. That is the whole
+  // point — DEF_OP(Syscall) emits the non-volatile half under a runtime
+  // branch and the rest unconditionally, so the two halves must partition the
+  // work with no overlap and no gap.
+  //
+  // PF/AF deliberately live in the `SkipNonVolatileGPRs` half even though
+  // REG_PF/REG_AF (r28/r29) are ELFv2 callee-saved: they are 32-bit fields
+  // filled with `lwz`, i.e. the fill is what guarantees their upper halves are
+  // zero, and no caller may skip that. Same for the XMM (v0-v15, all volatile)
+  // and NZCV (CR0/XER, both volatile) restores.
+  enum class FillMode {
+    All,                 // every SRA GPR, PF/AF, XMM0-15, NZCV
+    SkipNonVolatileGPRs, // All minus the SRA GPRs ELFv2 preserves across a call
+    NonVolatileGPRsOnly, // ONLY the SRA GPRs ELFv2 preserves across a call
+  };
+
   // Fill/spill x86 SRA registers from/to the CpuStateFrame.
   // These are called on entry/exit from the JIT dispatcher.
   void SpillStaticRegs(GPR tmp);
-  void FillStaticRegs();
+  void FillStaticRegs(FillMode Mode = FillMode::All);
 
   // Push/pop all callee-saved registers per PPC64LE ELFv2 ABI.
   void PushCalleeSavedRegisters();

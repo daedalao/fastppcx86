@@ -171,7 +171,7 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
 }
 
 // Fill static registers from CpuStateFrame → host regs
-void PPC64EmitterBase::FillStaticRegs() {
+void PPC64EmitterBase::FillStaticRegs(FillMode Mode) {
   // SRA[i] ↔ gregs[i]; see SpillStaticRegs comment.
   // 64-bit guest: 16 GPRs filled via ld (8 bytes each).
   // 32-bit guest:  8 GPRs filled via lwz (4 bytes, zero-extending) so the
@@ -182,7 +182,25 @@ void PPC64EmitterBase::FillStaticRegs() {
   const auto& SRA = Is64Bit ? std::span<const GPR>(x64::SRA)
                             : std::span<const GPR>(x32::SRA);
   const size_t NumGuestGPRs = Is64Bit ? 16u : 8u;
+
+  // A 32-bit guest may never elide a GPR fill. The `lwz` above is not just a
+  // value transfer: it is what re-establishes "upper 32 bits are zero" for
+  // ALU/MEM ops. A host register that merely survived a call untouched keeps
+  // whatever garbage the JIT left in its upper half (SpillStaticRegs even
+  // masks on the way out precisely because it cannot assume otherwise), so
+  // "callee-saved, therefore still correct" does not hold in i686 mode.
+  LOGMAN_THROW_A_FMT(Mode == FillMode::All || Is64Bit,
+                     "Partial SRA fill requested for a 32-bit guest; the lwz "
+                     "zero-extension invariant forbids it");
+
+  const bool WantVolatile    = Mode != FillMode::NonVolatileGPRsOnly;
+  const bool WantNonVolatile = Mode != FillMode::SkipNonVolatileGPRs;
+
   for (size_t i = 0; i < NumGuestGPRs; ++i) {
+    const bool NonVolatile = SRA[i].idx >= RegVolatility::kFirstNonVolatileGPR;
+    if (NonVolatile ? !WantNonVolatile : !WantVolatile) {
+      continue;
+    }
     int32_t off = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame,
                                                  State.gregs[i]));
     if (Is64Bit) {
@@ -202,6 +220,12 @@ void PPC64EmitterBase::FillStaticRegs() {
         lwzx(SRA[i], STATE, TMP1);
       }
     }
+  }
+
+  if (Mode == FillMode::NonVolatileGPRsOnly) {
+    // Everything below belongs to the complementary half. Returning here is
+    // what makes NonVolatileGPRsOnly + SkipNonVolatileGPRs == All.
+    return;
   }
 
   // Symmetric to SpillStaticRegs — use lwz so we don't load adjacent fields.

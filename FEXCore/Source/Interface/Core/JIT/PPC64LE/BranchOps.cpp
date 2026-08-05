@@ -471,6 +471,31 @@ DEF_OP(Break) {
   bctr();
 }
 
+// Value parked in CpuStateFrame::InSyscallInfo for the duration of a
+// JIT-emitted Syscall op.
+//
+//   bits 0..15  : the SpillSRA IgnoreMask. 0xFFFF = "all 16 x64 SRA GPRs are
+//                 already spilled to the frame", exactly as before. This is
+//                 the only part any consumer outside this file looks at
+//                 (SignalDelegator.cpp:684 and SyscallsSMCTracking.cpp:151
+//                 both mask with 0xFFFF).
+//   bits 16..23 : deliberately ZERO. GdbServer.cpp:113 passes the raw
+//                 InSyscallInfo into SpillSRA's `uint32_t IgnoreMask` with no
+//                 masking, and SpillSRA tests `1U << SRAIdxMap` where
+//                 SRAIdxMap is the host register number — r16..r23 are SRA
+//                 members, so a sentinel bit in this window would silently
+//                 suppress their re-spill. Bit 24 is above every SRA register
+//                 number (max r23) and therefore inert in that path.
+//   bit  24     : the tripwire. ArchHelpers::Context::ContextBackup stores
+//                 InSyscallInfo as a *uint16_t* (MContext_ppc64le.h:77), so
+//                 this bit CANNOT survive a signal-delivery round trip:
+//                 HandleDispatcherGuestSignal zeroes the field, and
+//                 RestoreThreadState reinstates it truncated to 0xFFFF. Any
+//                 value read back with no bit above 15 set therefore means
+//                 "the guest state in the frame was republished by somebody
+//                 while we were inside the host call".
+static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
+
 DEF_OP(Syscall) {
   auto Op = IROp->C<IR::IROp_Syscall>();
 
@@ -485,10 +510,14 @@ DEF_OP(Syscall) {
   // Without this, an async signal arriving between SpillStaticRegs and
   // FillStaticRegs causes the handler to re-spill from post-bctrl volatile
   // registers, overwriting the freshly-stored gregs[RAX] with junk.
+  //
+  // Bit 24 on top of that mask is a "nobody has touched the guest state
+  // behind our back" tripwire, read back by the fill below. See
+  // kInSyscallSentinel.
   {
     const int32_t isi_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
-    LoadConstant(TMP1, 0xFFFFu);
+    LoadConstant(TMP1, kInSyscallSentinel);
     std(TMP1, static_cast<int16_t>(isi_off), STATE);
   }
 
@@ -619,7 +648,46 @@ DEF_OP(Syscall) {
 
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
   addi(r1, r1, FrameSize);
-  FillStaticRegs();
+
+  // ---- Fill elision -----------------------------------------------------
+  // SRA slots 6..15 map to r14..r23, which ELFv2 preserves across the bctrl
+  // above. Nothing between SpillStaticRegs and here touches them: the arg
+  // pack and the result move use the dynamic RA pool (r24-r26/r30-r31 in
+  // x64), the call sequence uses r3/r4/r5/r12, and TMP1..TMP4 are r3-r6. So
+  // in the common case those ten host registers still hold the live guest
+  // values and reloading them from the frame is pure overhead.
+  //
+  // The uncommon case is a signal: HandleDispatcherGuestSignal / the guest
+  // handler / RestoreThreadState can rewrite ANY greg in the frame while the
+  // host registers keep their pre-signal contents, so those ten loads are
+  // mandatory there. kInSyscallSentinel's bit 24 detects exactly that — it is
+  // erased by the uint16_t ContextBackup round trip, so "some bit above 15 is
+  // still set" is a sound proof that no signal republished the frame.
+  //
+  // NOT applied to i686 guests: their fill uses lwz for its zero-extension
+  // side effect, which a surviving host register does not provide.
+  //
+  // NOTE this only elides the *fill*. The spill must stay complete: syscalls
+  // that snapshot guest state read it straight out of the frame — e.g.
+  // Thread.cpp:103 `TM.CreateThread(0, 0, &Frame->State, ...)` hands the
+  // parent's whole CPUState to a new guest thread — and a partial spill would
+  // hand them a stale RSI/RDI/R8-R15.
+  if (CTX->Config.Is64BitMode()) {
+    const int32_t isi_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    PPC64Emitter::Label SentinelIntact;
+    ld(TMP1, isi_off, STATE);
+    // TMP1 = InSyscallInfo >> 16, recording into CR0: EQ iff nothing above
+    // bit 15 survived, i.e. iff the frame was republished behind us.
+    rldicl_(TMP1, TMP1, 48, 16);
+    // BO=4 (branch if false), BI=2 (CR0.EQ) — i.e. bne cr0.
+    bc({4, 2}, &SentinelIntact);
+    FillStaticRegs(FillMode::NonVolatileGPRsOnly);
+    Bind(&SentinelIntact);
+    FillStaticRegs(FillMode::SkipNonVolatileGPRs);
+  } else {
+    FillStaticRegs();
+  }
   // HandleSyscall is a host C function; r0 was clobbered. Restore the JIT's
   // r0=0 zero-index invariant before falling back into JIT code that uses
   // ldx/stdx.
