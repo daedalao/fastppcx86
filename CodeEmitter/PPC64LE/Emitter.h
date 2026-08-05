@@ -23,6 +23,22 @@ namespace PPC64Emitter {
 struct Label {
   int64_t offset = -1;  // set when bound; -1 = unbound
   bool bound = false;
+
+  // Head of this label's intrusive singly-linked list of pending forward-branch
+  // fixups: an index into Emitter::PendingBranches, or -1 for "no fixups".
+  // Each entry stores the index of the next fixup for the *same* label, so
+  // Bind() walks only its own chain instead of scanning the whole vector.
+  //
+  // COPY HAZARD: copying a Label duplicates this head index, and binding one
+  // copy patches the chain and resets only that copy's head — the other copy
+  // would then re-walk indices that have already been patched (and, after a
+  // ClearPendingBranches(), indices into a *different* compile's vector).
+  // The port never copies a live Label: every Label is a fresh stack local or
+  // an element of JITClass::JumpTargets, which is only ever grown by
+  // `resize(N, {})` from a default-constructed (head == -1) value. Keep it
+  // that way; if a Label ever needs to move, move the head index with it and
+  // clear the source.
+  int32_t pending_head = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -1336,7 +1352,7 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       b(offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((18u << 26) | 0u);  // placeholder
     }
   }
@@ -1346,7 +1362,7 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       bl(offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((18u << 26) | 1u);  // placeholder with LK=1
     }
   }
@@ -1380,7 +1396,7 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       bc(cond.BO, cond.BI, offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((16u << 26) | (cond.BO << 21) | (cond.BI << 16) | 0u);  // placeholder
     }
   }
@@ -1642,23 +1658,55 @@ private:
   size_t   BufferSize = 0;
   size_t   Offset     = 0;
 
-  // Pending branch list for forward-label fixup
+  // Pending branch list for forward-label fixup.
+  //
+  // This used to be a flat vector scanned linearly by PatchPending(), with a
+  // vector::erase() per matching entry: O(pending) per Bind() and O(pending^2)
+  // per compile unit, plus an O(n) memmove for every fixup resolved. Unity/Mono
+  // app configs run MaxInst=50000 multiblock compile units, where "pending" is
+  // large enough for that quadratic term to show up as compiler CPU time.
+  //
+  // Now it is append-only storage for an intrusive singly-linked list per
+  // Label: Label::pending_head is the index of the label's first fixup and
+  // `next` chains to the rest, so Bind() touches only its own label's fixups
+  // and nothing is ever erased or shifted. Total work per compile unit is
+  // O(number of forward branches).
+  //
+  // LIFECYCLE (unchanged): the vector is append-only *within* a compile unit
+  // and dropped wholesale by ClearPendingBranches(), which CompileCode calls
+  // once at the top of every compilation (JIT.cpp) right after JumpTargets is
+  // cleared and re-resized. Indices are therefore only ever interpreted while
+  // the vector that produced them is still live. Entries for labels that are
+  // never bound are simply dropped by that reset, exactly as before.
   struct PendingBranchEntry {
     int64_t patch_offset;
-    Label*  target;
+    int32_t next;  // index of next fixup for the same label, -1 = end of chain
   };
   std::vector<PendingBranchEntry> PendingBranches;
 
+  // Record a forward-branch fixup at the current Offset against an unbound
+  // label, pushing it onto the front of that label's chain.
+  void AddPendingBranch(Label* lbl) {
+    PendingBranches.push_back({static_cast<int64_t>(Offset), lbl->pending_head});
+    lbl->pending_head = static_cast<int32_t>(PendingBranches.size() - 1);
+  }
+
   void PatchPending(Label* lbl) {
-    for (auto it = PendingBranches.begin(); it != PendingBranches.end(); ) {
-      if (it->target == lbl) {
-        PatchBranchAt(static_cast<size_t>(it->patch_offset),
-                      static_cast<size_t>(lbl->offset));
-        it = PendingBranches.erase(it);
-      } else {
-        ++it;
-      }
+    int32_t idx = lbl->pending_head;
+    while (idx >= 0) {
+      // A head index that outruns the vector means the Label survived a
+      // ClearPendingBranches() (stale label reused across compilations) or was
+      // copied. Both are bugs; catch them here rather than patching a random
+      // offset in the new buffer. Kept out of NDEBUG's reach on purpose.
+      LOGMAN_THROW_A_FMT(static_cast<size_t>(idx) < PendingBranches.size(),
+                         "PPC64 PatchPending: stale pending-branch index {} (size {}); Label reused across compiles?",
+                         idx, PendingBranches.size());
+      const auto& Entry = PendingBranches[static_cast<size_t>(idx)];
+      PatchBranchAt(static_cast<size_t>(Entry.patch_offset),
+                    static_cast<size_t>(lbl->offset));
+      idx = Entry.next;
     }
+    lbl->pending_head = -1;
   }
 
   // -------------------------------------------------------------------------
