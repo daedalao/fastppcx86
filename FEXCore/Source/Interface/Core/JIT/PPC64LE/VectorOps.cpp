@@ -4115,71 +4115,48 @@ DEF_OP(VFToIScalarInsert) {
   const auto ESize = Op->Header.ElementSize;
   const auto Round = Op->Round;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
-  // Load source scalar (lfs auto-promotes f32→f64 in FPR).
-  if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-  } else {
-    lfd(f0, -16, r1);
-  }
-
-  // Round-to-integral, output is float.  Nearest / Host route through
-  // fctid+fcfid which honors FPSCR.RN (default RN=0 = banker's), since the
-  // direct `frin` instruction is "round-half-away-from-zero" — wrong for x86
-  // Nearest semantics.  Other modes have direct in-mode round-to-FP scalar ops.
+  // Fully in-register via the VSX scalar round-to-integral family. xsrdpi*
+  // are FP->FP: NaN propagates quietly and |x| >= 2^52 is an identity by
+  // construction, so the fctid/fcfid saturation bug this op used to guard
+  // against (NaN/huge -> -2^63) cannot occur — no compare-and-branch
+  // bypasses, no runtime 2^52 constant, no stack bounce. xsrdpic honors
+  // FPSCR.RN for the Nearest/Host modes (banker's at the x86 default);
+  // signal-safety of FPSCR.RN is guaranteed since the PPC64ContextBackup
+  // FPSCR fix. The f32 path converts through f64 with the NON-SIGNALLING
+  // converts (xscvspdpn/xscvdpspn), which are bit-preserving for NaN —
+  // matching x86 ROUNDSS's pass-through-unchanged even for SNaN patterns,
+  // which the old lfs/stfs bounce could not promise. The f64->f32 narrow is
+  // exact: the rounded value is integral and within f32's range because the
+  // input was an f32.
   //
-  // ROUNDSS/ROUNDSD on PPC64LE: project_vftoiscalarinsert_nan_inf bug — the
-  // fctid+fcfid round-trip SATURATES NaN and out-of-range FP to INT64_MIN,
-  // which fcfid converts back to a finite -2^63 instead of propagating the
-  // original value. x86 ROUNDSS/ROUNDSD spec: NaN passes through unchanged,
-  // and values with |f0| >= 2^52 are already integer-valued (no fractional
-  // bits in f64) so need no rounding. Bypass the round-trip for both classes.
-  // Other rounding modes (NegInf/PosInf/TowardsZero) use frim/frip/friz which
-  // are FP→FP and already NaN-correct, so they need no special handling.
-  switch (Round) {
-  case IR::RoundMode::NegInfinity: frim(f0, f0); break;
-  case IR::RoundMode::PosInfinity: frip(f0, f0); break;
-  case IR::RoundMode::TowardsZero: friz(f0, f0); break;
-  case IR::RoundMode::Nearest:
-  case IR::RoundMode::Host:
-  default: {
-    PPC64Emitter::Label skip_roundtrip{};
+  // Lane math (LE lvx element reversal): elem0 = BE word 3 / dw1. xsrdpi*
+  // and the converts operate on dw0 / word 0, so splat elem0 across the
+  // register first (dm=3 / UIM=3 splat, the hardware-verified idiom).
+  auto EmitRound = [&](VR t, VR b) {
+    switch (Round) {
+    case IR::RoundMode::NegInfinity: xsrdpim(t, b); break;
+    case IR::RoundMode::PosInfinity: xsrdpip(t, b); break;
+    case IR::RoundMode::TowardsZero: xsrdpiz(t, b); break;
+    case IR::RoundMode::Nearest:
+    case IR::RoundMode::Host:
+    default:                         xsrdpic(t, b); break;
+    }
+  };
 
-    // Bypass #1: NaN.  f0 != f0 iff NaN; fcmpu sets CR1.UN (bit 7).
-    // cr(1) so CR0 (packed NZCV) is preserved — ROUNDSS/SD writes no flags.
-    fcmpu(cr(1), f0, f0);
-    bc({12, 7}, &skip_roundtrip);  // BO=12 BI=7 → branch if CR1.UN set
-
-    // Bypass #2: |f0| >= 2^52. f64 mantissa is 52 bits; magnitudes at or
-    // above this boundary are integer-valued exactly and need no rounding.
-    // This also covers +/-Infinity (fabs(±Inf) = +Inf > +2^52).
-    LoadConstant(TMP3, 0x4330000000000000ULL);  // double 2^52
-    std(TMP3, -64, r1);
-    lfd(f2, -64, r1);
-    fabs(f3, f0);
-    fcmpu(cr(1), f3, f2);
-    bc({12, 5}, &skip_roundtrip);  // BO=12 BI=5 → branch if CR1.GT (f3 > 2^52)
-
-    fctid(f1, f0);  // f64 → i64 using FPSCR.RN (banker's by default)
-    fcfid(f0, f1);  // i64 → f64 (exact for values within precision boundary)
-
-    Bind(&skip_roundtrip);
-    break;
-  }
-  }
-
-  // Store the rounded *float* back at element 0 of the result image.
   if (ESize == IR::OpSize::i32Bit) {
-    frsp(f0, f0);              // narrow to f32 precision
-    stfs(f0, 0, TMP1);
+    xxspltw(VTMP1, Vec2, 3);       // elem0 f32 in every word incl. word 0
+    xscvspdpn(VTMP1, VTMP1);       // f32 (word 0) -> f64 (dw0), NaN-bit-exact
+    EmitRound(VTMP1, VTMP1);
+    xscvdpspn(VTMP1, VTMP1);       // f64 (dw0) -> f32 (word 0), exact here
+    xxspltw(VTMP1, VTMP1, 0);      // result to every word incl. elem0's
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,
+                        TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
   } else {
-    stfd(f0, 0, TMP1);
+    xxpermdi(VTMP1, Vec2, Vec2, 3);  // elem0 f64 -> dw0 (and dw1)
+    EmitRound(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 0);   // {Vec1.dw0, result.dw0}
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VFCMPScalarInsert: scalar FP compare with predicate, result is all-ones / zero

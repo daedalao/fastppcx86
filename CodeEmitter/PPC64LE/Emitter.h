@@ -890,6 +890,17 @@ public:
   void xvrspic(VR t, VR b)   { EmitXX2(t.idx, b.idx, 171); }  // round using FPSCR.RN
   // Scalar DP round-to-integer using current FPSCR.RN rounding mode (banker's by default).
   void xsrdpic(VR t, VR b)   { EmitXX2(t.idx, b.idx, 107); }
+  // Scalar round-to-integral, fixed modes (gas-verified on op4k:
+  // xsrdpim/p/z vs34,vs35 = f04019e7/f04019a7/f0401967). NaN-quiet,
+  // identity for |x| >= 2^52, unlike the fctid/fcfid round trip.
+  void xsrdpim(VR t, VR b)   { EmitXX2(t.idx, b.idx, 121); }  // floor
+  void xsrdpip(VR t, VR b)   { EmitXX2(t.idx, b.idx, 105); }  // ceil
+  void xsrdpiz(VR t, VR b)   { EmitXX2(t.idx, b.idx,  89); }  // trunc
+  // Scalar single<->double converts, non-signalling (bit-preserving for NaN,
+  // ISA 2.07). Operate on dw0 / word 0. gas: xscvspdpn = f0401d2f (XO 331),
+  // xscvdpspn = f0401c2f (XO 267).
+  void xscvspdpn(VR t, VR b) { EmitXX2(t.idx, b.idx, 331); }
+  void xscvdpspn(VR t, VR b) { EmitXX2(t.idx, b.idx, 267); }
   void xvrdpi (VR t, VR b)   { EmitXX2(t.idx, b.idx, 201); }
   void xvrdpip(VR t, VR b)   { EmitXX2(t.idx, b.idx, 233); }
   void xvrdpim(VR t, VR b)   { EmitXX2(t.idx, b.idx, 249); }
