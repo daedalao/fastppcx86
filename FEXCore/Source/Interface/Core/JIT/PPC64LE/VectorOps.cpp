@@ -908,10 +908,10 @@ DEF_OP(VUShraI) {
   case IR::OpSize::i32Bit:
     vspltisw(VTMP1, (int32_t)Shift); vsrw(VTMP2, V, VTMP1); break;
   case IR::OpSize::i64Bit:
+    // Same shift-count splat as VUShrI i64Bit: see BuildSplatDW.
     li(TMP4, static_cast<int16_t>(Shift));
-    std(TMP4, -16, r1); std(TMP4, -8, r1);
-    addi(TMP1, r1, -16); li(TMP2, 0);
-    lvx(VTMP1, TMP1, TMP2);
+    mtvsrd(VTMP1, TMP4);
+    xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, V, VTMP1); break;
   default: Op_Unhandled(IROp, Node); return;
   }
@@ -1399,15 +1399,20 @@ DEF_OP(VSQXTUNPair) {
   }
 }
 
-// Build a vector with `val` replicated to every doubleword via stack roundtrip.
+// Build a vector with `val` replicated to every doubleword.
 // Used when an immediate exceeds the 5-bit range of vspltisb/h/w.
+//
+// mtvsrd defines the doubleword that xxpermdi index 0 reads (BE dword 0, the
+// half mfvsrd/mtvsrd see, which is FEX's LE element 1); dm=0 then duplicates
+// that half into both. Byte-for-byte identical to the std/std/lvx roundtrip
+// this replaces -- verified on POWER8 by storing both forms back through stvx
+// and comparing the 16 bytes -- but without the guaranteed store-hit-load
+// stall of feeding a vector load from two GPR stores issued two cycles
+// earlier.
 static void BuildSplatDW(PPC64JITCore* j, VR Dst, uint64_t val) {
   j->LoadConstant(TMP4, val);
-  j->std(TMP4, -16, r1);
-  j->std(TMP4, -8,  r1);
-  j->addi(TMP1, r1, -16);
-  j->li(TMP2, 0);
-  j->lvx(Dst, TMP1, TMP2);
+  j->mtvsrd(Dst, TMP4);
+  j->xxpermdi(Dst, Dst, Dst, 0);
 }
 
 // VSRSHR: signed rounding shift right by immediate.  Per ARM srshr:
@@ -2796,7 +2801,7 @@ DEF_OP(VUABDL2) {
 // logical shift) or sign-extend them (for arithmetic right shift).
 //
 // Builds: VTMP2 = 0xFF...FF per element where Shift < ElemBits, else 0.
-// Uses VTMP1 as scratch; clobbers TMP1/TMP2/TMP3 for i64Bit only.
+// Uses VTMP1 as scratch; clobbers TMP1 for i64Bit only.
 static void BuildVShiftInRangeMask(PPC64JITCore* j, IR::OpSize ElemSz, VR Shift) {
   using namespace IR;
   switch (ElemSz) {
@@ -2817,13 +2822,10 @@ static void BuildVShiftInRangeMask(PPC64JITCore* j, IR::OpSize ElemSz, VR Shift)
     j->vcmpgtuw(VTMP2, VTMP2, Shift);
     break;
   case OpSize::i64Bit:
-    // Build splat(64) via stack roundtrip (no 5-bit-imm path for 64).
+    // Build splat(64) (no 5-bit-imm path for 64). See BuildSplatDW.
     j->li(TMP1, 64);
-    j->std(TMP1, -16, r1);
-    j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16);
-    j->li(TMP3, 0);
-    j->lvx(VTMP2, TMP2, TMP3);
+    j->mtvsrd(VTMP2, TMP1);
+    j->xxpermdi(VTMP2, VTMP2, VTMP2, 0);
     j->vcmpgtud(VTMP2, VTMP2, Shift);
     break;
   default: break;
@@ -3050,8 +3052,10 @@ static void EmitWideShiftCore(PPC64JITCore* j, VR Dst, VR Vec, GPR TMP1, GPR TMP
     else              j->vsrw(Dst, Vec, VTMP2);
     break;
   case IR::OpSize::i64Bit:
-    j->std(TMP1, -16, r1); j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16); j->lvx(VTMP2, r(0), TMP2);
+    // VTMP1 already holds TMP1 in the mtvsrd-defined doubleword (above), so
+    // duplicating it into both halves is the whole splat -- one instruction
+    // in place of two stores, an addi and a vector load. See BuildSplatDW.
+    j->xxpermdi(VTMP2, VTMP1, VTMP1, 0);
     if (isLeft)       j->vsld(Dst, Vec, VTMP2);
     else if (isSigned) j->vsrad(Dst, Vec, VTMP2);
     else              j->vsrd(Dst, Vec, VTMP2);
@@ -3068,9 +3072,9 @@ static void EmitArithSaturate(PPC64JITCore* j, VR Dst, VR Vec, GPR TMP1, GPR TMP
   case IR::OpSize::i16Bit: j->vspltish(VTMP2, 15); j->vsrah(Dst, Vec, VTMP2); break;
   case IR::OpSize::i32Bit: j->vspltisw(VTMP2, -1); j->vsraw(Dst, Vec, VTMP2); break;
   case IR::OpSize::i64Bit:
-    j->LoadConstant(TMP1, 63);
-    j->std(TMP1, -16, r1); j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16); j->lvx(VTMP2, r(0), TMP2);
+    j->li(TMP1, 63);
+    j->mtvsrd(VTMP2, TMP1);
+    j->xxpermdi(VTMP2, VTMP2, VTMP2, 0);
     j->vsrad(Dst, Vec, VTMP2);
     break;
   default: break;
