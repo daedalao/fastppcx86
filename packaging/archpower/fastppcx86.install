@@ -1,0 +1,37 @@
+post_install() {
+  cat <<'EOF'
+
+FastPPCx86 installed.
+
+  Getting started:
+    FEXRootFSFetcher              # fetch/extract an x86-64 RootFS
+    FEX /path/to/x86_64-binary    # run an x86-64 executable
+    FEXBash                       # a bash running under emulation
+    FEXConfig                     # GUI for per-application settings
+
+  Gaming notes, per-title workarounds and tuning:
+    /usr/share/doc/fastppcx86/GAMING.md
+
+  binfmt_misc handlers for x86/x86-64 ELF binaries are installed to
+  /usr/lib/binfmt.d. Activate them with:
+    systemctl restart systemd-binfmt
+
+  Note: the SMC (self-modifying code) mtrack path needs a 4K-page kernel.
+  On a 64K-page kernel FEX falls back to a slower software path.
+
+EOF
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  cat <<'EOF'
+
+binfmt_misc handlers were removed. Run
+  systemctl restart systemd-binfmt
+to drop the registrations from the running kernel.
+
+EOF
+}

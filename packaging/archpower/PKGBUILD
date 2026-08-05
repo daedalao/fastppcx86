@@ -1,0 +1,185 @@
+# Maintainer: daedalao <daedalao@hotmail.com>
+#
+# FastPPCx86 -- x86 / x86-64 emulation for 64-bit POWER (ppc64le).
+# Downstream port of FEX-Emu; the installed binaries keep their FEX names.
+#
+# Building straight out of a local checkout:
+#   cd packaging/archpower && makepkg -s
+# The default source is the git repo this PKGBUILD lives in (two levels up).
+# Override it with FASTPPCX86_GIT_URL, e.g. to build a specific fork/branch:
+#   FASTPPCX86_GIT_URL='file:///home/you/src/fex-ppc64le' makepkg -s
+# Once the repo is public, swap _repourl for the https line below.
+
+pkgname=fastppcx86
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc='Fast x86 and x86-64 emulation for 64-bit POWER (FEX-Emu ppc64le port)'
+arch=('powerpc64le')
+url='https://github.com/daedalao/fastppcx86'
+license=('MIT')
+
+# Runtime: fmt is linked as a shared library (the build prefers the system copy
+# over External/fmt); the Qt6 bits are only needed by the FEXConfig GUI.
+depends=(
+  'gcc-libs'
+  'glibc'
+  'fmt'
+  'xxhash'
+  'qt6-base'
+  'qt6-declarative'
+)
+makedepends=(
+  'clang'          # FEX refuses to build with GCC (hard FATAL_ERROR in CMakeLists)
+  'cmake'
+  'gdb'            # jit-reader.h, for ENABLE_GDB_SYMBOLS
+  'git'
+  'lld'            # default linker for the clang build
+  'llvm'
+  'ninja'
+  'python'
+  'range-v3'       # optional: avoids compiling the bundled copy
+)
+optdepends=(
+  'squashfuse: mount squashfs x86-64 RootFS images'
+  'erofs-utils: mount EROFS x86-64 RootFS images'
+  'wget: used by FEXRootFSFetcher to download a RootFS'
+  'xz: RootFS extraction'
+)
+# nasm is deliberately absent: it is only needed by the ASM unit tests, and
+# BUILD_TESTING is off here.
+# LTO is off to match the known-good POWER9 build configuration.
+options=('!lto')
+install="$pkgname.install"
+
+# Local checkout by default: makepkg parses the PKGBUILD with the cwd set to the
+# directory containing it, so $PWD/../.. is the repository root.
+# Public URL, for when the repo goes public -- swap the two lines then:
+#_repourl='https://github.com/daedalao/fastppcx86.git'
+_repourl="${FASTPPCX86_GIT_URL:-file://$(realpath -m "$PWD/../..")}"
+
+# The bundled third-party trees are git submodules. They are listed here as
+# real makepkg sources (rather than fetched inside prepare()) so that the
+# download phase stays in makepkg's hands and prepare() needs no network.
+# Only the submodules this configuration actually compiles are listed:
+# Catch2/vixl (tests), zydis (ENABLE_ZYDIS), tracy (profiler),
+# Vulkan-Headers (thunks) and the *-tests-bins are all skipped. drm-headers is
+# *not* optional despite thunks being off: the 32-bit ioctl emulation in
+# LinuxEmulation includes fex-drm/ headers from it.
+source=(
+  "$pkgname::git+$_repourl"
+  'drm-headers::git+https://github.com/FEX-Emu/drm-headers.git'
+  'fmt::git+https://github.com/fmtlib/fmt.git'
+  'xxhash::git+https://github.com/Cyan4973/xxHash.git'
+  'range-v3::git+https://github.com/ericniebler/range-v3.git'
+  'unordered_dense::git+https://github.com/martinus/unordered_dense.git'
+  'jemalloc_glibc::git+https://github.com/FEX-Emu/jemalloc.git'
+  'rpmalloc::git+https://github.com/FEX-Emu/rpmalloc.git'
+  'cpp-optparse::git+https://github.com/Sonicadvance1/cpp-optparse.git'
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+# Submodule name -> source directory name. Note that the submodule *name* is
+# not always its path (cpp-optparse lives in Source/Common/).
+_submodules=(
+  'External/drm-headers:drm-headers:External/drm-headers'
+  'External/fmt:fmt:External/fmt'
+  'External/xxhash:xxhash:External/xxhash'
+  'External/range-v3:range-v3:External/range-v3'
+  'External/unordered_dense:unordered_dense:External/unordered_dense'
+  'External/jemalloc_glibc:jemalloc_glibc:External/jemalloc_glibc'
+  'External/rpmalloc:rpmalloc:External/rpmalloc'
+  'External/cpp-optparse:cpp-optparse:Source/Common/cpp-optparse'
+)
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  # No release tags exist yet, so use the usual commit-count + short-hash form.
+  # Replace with `git describe --long --tags | sed ...` once tags land.
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/$pkgname"
+
+  local _entry _name _src _path _paths=()
+  for _entry in "${_submodules[@]}"; do
+    IFS=: read -r _name _src _path <<<"$_entry"
+    git submodule init -- "$_path"
+    git config "submodule.$_name.url" "$srcdir/$_src"
+    _paths+=("$_path")
+  done
+
+  # protocol.file.allow: git refuses file:// submodules by default (CVE-2022-39253).
+  # The sources here are makepkg's own checkouts, so this is safe.
+  git -c protocol.file.allow=always submodule update -- "${_paths[@]}"
+}
+
+build() {
+  local _hash
+  _hash="$(git -C "$srcdir/$pkgname" rev-parse HEAD)"
+
+  # Mirrors the known-good POWER9 configuration (build-smc): clang, Ninja,
+  # RelWithDebInfo, jemalloc-glibc + FEX allocator on, LTO off, tests off.
+  # TUNE_CPU is forced to 'none' -- the upstream default of 'native' bakes
+  # -march=native into a package that other machines then install.
+  # Set it to power9/power10 for a machine-specific rebuild.
+  cmake -S "$srcdir/$pkgname" -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_FEX_LINUX_TESTS=OFF \
+    -DBUILD_THUNKS=OFF \
+    -DBUILD_FEXCONFIG=ON \
+    -DENABLE_LTO=OFF \
+    -DENABLE_CCACHE=OFF \
+    -DENABLE_ASSERTIONS=OFF \
+    -DENABLE_FEX_ALLOCATOR=ON \
+    -DENABLE_JEMALLOC_GLIBC_ALLOC=ON \
+    -DENABLE_GDB_SYMBOLS=ON \
+    -DENABLE_OFFLINE_TELEMETRY=ON \
+    -DENABLE_ZYDIS=OFF \
+    -DUSE_LEGACY_BINFMTMISC=OFF \
+    -DTUNE_CPU=none \
+    -DTUNE_ARCH=generic \
+    -DOVERRIDE_VERSION="FEX-$pkgver" \
+    -DOVERRIDE_HASH="$_hash" \
+    -Wno-dev
+
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+
+  cd "$srcdir/$pkgname"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # binfmt_misc registration. Upstream only installs these on aarch64 hosts
+  # (Data/binfmts is added from CMakeLists under ARCHITECTURE_arm64), so
+  # generate them here from the same templates.
+  install -dm755 "$pkgdir/usr/lib/binfmt.d"
+  local _tpl _fmt
+  for _tpl in Data/binfmts/*.conf.in; do
+    _fmt="${_tpl##*/}"
+    sed 's|@CMAKE_INSTALL_PREFIX@|/usr|g' "$_tpl" \
+      >"$pkgdir/usr/lib/binfmt.d/${_fmt%.in}"
+    chmod 644 "$pkgdir/usr/lib/binfmt.d/${_fmt%.in}"
+  done
+
+  local _doc
+  for _doc in README.md docs/GAMING.md docs/CPUID.md; do
+    if [[ -f $_doc ]]; then
+      install -Dm644 "$_doc" "$pkgdir/usr/share/doc/$pkgname/${_doc##*/}"
+    fi
+  done
+
+  # The uninstall/binfmt helper scripts are build-system scaffolding, and the
+  # legacy FEXInterpreter alias is a plain copy of FEX; drop the duplicate.
+  if [[ -f $pkgdir/usr/bin/FEXInterpreter && -f $pkgdir/usr/bin/FEX ]]; then
+    ln -sf FEX "$pkgdir/usr/bin/FEXInterpreter"
+  fi
+}
