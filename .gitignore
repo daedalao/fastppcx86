@@ -46,3 +46,11 @@ perfdata/
 *.perf.data
 perf.data
 perf.data.old
+
+# Loose profiling/analysis dumps at repo root (game_* asm/report/objdump/gc captures)
+/hardwest_*
+/moonlighter_*
+/*_perf_report.txt
+/*_all_asm.txt
+/*_gc_asm.txt
+/*_objdump.txt
