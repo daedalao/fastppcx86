@@ -4565,13 +4565,9 @@ DEF_OP(Vector_FToS) {
     // indefinite") sentinel.  Detect Src >= 2^31 and substitute INT_MIN.
     // NaN comparisons return 0 from xvcmpgesp (and POWER already maps NaN
     // → INT_MIN), so the mask correctly captures only +overflow / +Inf.
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);  // VTMP2 = splat f32(2^31)
-    xvcmpgesp(VTMP1, Src, VTMP2);                  // mask: 1 where Src >= 2^31
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);                        // VTMP2 = splat INT_MIN
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);                 // overflow ? INT_MIN : Dst
     return;
   }
@@ -4580,13 +4576,9 @@ DEF_OP(Vector_FToS) {
     xvrdpic(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
     // Same INT_MIN sentinel fix for f64 → i64.  Bound = 2^63 as f64.
-    LoadConstant(TMP1, 0x43E0000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4603,13 +4595,9 @@ DEF_OP(Vector_FToZS) {
     vrfiz(VTMP1, Src);    // round towards zero
     vctsxs(Dst, VTMP1, 0);
     // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
-    xvcmpgesp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4617,13 +4605,9 @@ DEF_OP(Vector_FToZS) {
     xvrdpiz(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
     // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
-    LoadConstant(TMP1, 0x43E0000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4860,13 +4844,9 @@ DEF_OP(Vector_FToISized) {
     // INT_MIN (0x80000000) as the integer-indefinite sentinel.  See
     // commit c9db77322 for the rationale.  xvcmpgesp NaN compare returns
     // 0, so NaN (already INT_MIN per POWER) is correctly preserved.
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);  // splat f32(2^31)
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
     xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);                      // splat INT_MIN
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);               // overflow ? INT_MIN : Dst
     return;
   }
@@ -4878,13 +4858,9 @@ DEF_OP(Vector_FToISized) {
     }
     xvcvdpsxds(Dst, VTMP1);
     // INT_MIN sentinel for f64 -> i64 +overflow (matches CVT{T}SD2SI etc.).
-    LoadConstant(TMP1, 0x43E0000000000000ULL);  // f64(2^63)
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4941,24 +4917,14 @@ DEF_OP(Vector_F64ToI32) {
   //      bytes of each dw — i.e. for each i64 lane, either preserve all
   //      32 bits of POWER's result word OR substitute INT_MIN.
   //   4. AFTER the substitution, do the existing vperm-pack to LE-low.
-  LoadConstant(TMP1, 0x43E0000000000000ULL);  // 2^31 as f64
-  std(TMP1, -16, r1); std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP2, r(0), TMP1);                     // VTMP2 = splat f64(2^31)
+  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
   xvcmpgedp(VTMP2, Src, VTMP2);               // per-i64-lane overflow mask
-  // Per-32-bit INT_MIN, splatted across the whole quadword.
-  LoadConstant(TMP1, 0x8000000080000000ULL);
-  std(TMP1, -16, r1); std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP1, r(0), TMP1);                     // VTMP1 = splat i32(INT_MIN)
+  EmitLoadPPC64VConst(VTMP1, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
   xxsel(Dst, Dst, VTMP1, VTMP2);              // mask ? INT_MIN : Dst (per-byte == per-i32-lane here)
 
   // Now pack the (possibly INT_MIN-substituted) i32 results to LE-low.
+  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32, TMP1, TMP2);
   vspltisw(VTMP1, 0);
-  LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP2, r(0), TMP1);
   vperm(Dst, Dst, VTMP1, VTMP2);
   (void)Zero;
 }
@@ -5264,7 +5230,8 @@ extern "C" void PPC64_VSha256U1(uint8_t*, const uint8_t*, const uint8_t*);
 // enum ↔ helper impossible to get subtly wrong. Enumerator additions
 // require a matching row here.
 namespace {
-static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
+static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
+  .Helpers = {
   [::FEXCore::CPU::PPC64_HELPER_SplitLockEmulate] =
       reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate),
   [::FEXCore::CPU::PPC64_HELPER_F16HiToF32x4]     = reinterpret_cast<uint64_t>(&PPC64_F16HiToF32x4),
@@ -5296,13 +5263,35 @@ static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
   [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
   [::FEXCore::CPU::PPC64_HELPER_F64F2XM1]         = reinterpret_cast<uint64_t>(F64F2XM1Impl),
+  },
+  // 128-bit constant pool. Each entry is written the way the inline
+  // LoadConstant/std/std/lvx sequences it replaces wrote it: the first
+  // doubleword is what went to the low address (r1-16) and the second is what
+  // went to r1-8. An lvx of the pair therefore reproduces the same register
+  // image, so no endianness argument is needed to justify a conversion --
+  // it is the identical 16 bytes.
+  .Constants = {
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F32_2P31 + 0] = 0x4F0000004F000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F32_2P31 + 1] = 0x4F0000004F000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I32_MIN  + 0] = 0x8000000080000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I32_MIN  + 1] = 0x8000000080000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 0] = 0x43E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 1] = 0x43E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 0] = 0x8000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 1] = 0x8000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 0] = 0x040506070C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 1] = 0x1010101010101010ULL,
+  },
 };
 } // namespace
 
 // Handed to CpuStateFrame::PPC64_HelperTable at thread-JIT construction.
-// The pointer is stable for program lifetime.
+// The pointer is stable for program lifetime. It addresses the whole
+// table/pool allocation: Helpers is at offset 0 (so every existing helper
+// call site is unaffected) and the 128-bit constant pool sits at
+// PPC64VConstPoolOffset from the same base.
 uint64_t* GetPPC64HelperTable() {
-  return const_cast<uint64_t*>(PPC64Helpers);
+  return const_cast<uint64_t*>(PPC64Tables.Helpers);
 }
 
 // (Crypto FABI mini-frame constants are hoisted to the top of the file so
