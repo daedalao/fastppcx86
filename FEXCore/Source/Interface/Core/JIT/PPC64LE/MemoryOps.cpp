@@ -1203,24 +1203,39 @@ DEF_OP(MemSet) {
     }
     mr(TMP4, LenIn);
 
-    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
     andi_(TMP2, TMP1, 7);
-    bc(CC_EQ, &chunk_loop);
+    bc(CC_EQ, &chunk_setup);
     stb(Splat, 0, TMP1);
     addi(TMP1, TMP1, 1);
     addi(TMP4, TMP4, -1);
     b(&align_loop);
 
+    // CTR-counted chunk loop: 2 instructions + one CTR back-edge per 8 bytes,
+    // versus the previous cmpldi/bc/std/addi/addi/b (6 insns + 2 branches). CTR
+    // is free mid-block here (the JIT only loads it at block exits for bctr).
+    //
+    // stdu Splat,8(ptr) writes to ptr+8 and then sets ptr = ptr+8, so ptr is
+    // pre-biased by -8 before entering. After N iterations ptr = base+8*(N-1),
+    // hence the +8 fixup on exit. Both the aligned-store and the
+    // fault-visibility argument above are preserved: TMP1 enters the loop
+    // 8-byte aligned so ptr-8 is too, every EA is 8-byte aligned and cannot
+    // cross a page, and on a faulting update-form store RA is architecturally
+    // left unmodified (and TMP1 is not guest-visible until op end regardless).
+    Bind(&chunk_setup);
+    srdi(TMP2, TMP4, 3);      // chunk count = len >> 3
+    cmpdi(TMP2, 0);
+    bc(CC_EQ, &tail_loop);
+    mtctr(TMP2);
+    andi_(TMP4, TMP4, 7);     // remaining tail length after the chunks
+    addi(TMP1, TMP1, -8);
     Bind(&chunk_loop);
-    cmpldi(TMP4, 8);
-    bc(CC_ULT, &tail_loop);
-    std(Splat, 0, TMP1);
+    stdu(Splat, 8, TMP1);
+    bdnz(&chunk_loop);
     addi(TMP1, TMP1, 8);
-    addi(TMP4, TMP4, -8);
-    b(&chunk_loop);
 
     Bind(&tail_loop);
     cmpdi(TMP4, 0);
@@ -1375,12 +1390,12 @@ DEF_OP(MemCpy) {
     cmpldi(r(0), 8);
     bc(CC_ULT, &generic_path);
 
-    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
     andi_(TMP3, TMP1, 7);
-    bc(CC_EQ, &chunk_loop);
+    bc(CC_EQ, &chunk_setup);
     lbz(r(0), 0, TMP2);
     stb(r(0), 0, TMP1);
     addi(TMP1, TMP1, 1);
@@ -1388,18 +1403,33 @@ DEF_OP(MemCpy) {
     addi(TMP4, TMP4, -1);
     b(&align_loop);
 
-    Bind(&chunk_loop);
-    cmpldi(TMP4, 8);
-    bc(CC_ULT, &tail_loop);
+    // CTR-counted chunk loop: ldu/stdu + one CTR back-edge per 8 bytes, versus
+    // the previous cmpldi/bc/ld/std/addi/addi/addi/b. Both pointers are
+    // pre-biased by -8 because the update forms compute EA = RA+8 and then set
+    // RA = EA; after N iterations each sits at base+8*(N-1), hence the +8
+    // fixups on exit. TMP3 is dead here (the direction test and the overlap
+    // guard are both behind us, and no path from inside these loops reaches
+    // the generic loop, which is the only consumer of Step).
+    //
     // Source may be unaligned: POWER8 handles unaligned cacheable loads in
-    // hardware, and the DS-form displacement constraint is on the immediate
-    // (0 here), not on the address.
-    ld(r(0), 0, TMP2);
-    std(r(0), 0, TMP1);
+    // hardware, and the DS-form constraint is on the immediate (8, 4-aligned),
+    // not on the address. The stores stay 8-byte aligned, so the fault
+    // granularity argument above is unchanged; a faulting update-form access
+    // also leaves RA architecturally unmodified.
+    Bind(&chunk_setup);
+    srdi(TMP3, TMP4, 3);      // chunk count = len >> 3
+    cmpdi(TMP3, 0);
+    bc(CC_EQ, &tail_loop);
+    mtctr(TMP3);
+    andi_(TMP4, TMP4, 7);     // remaining tail length after the chunks
+    addi(TMP1, TMP1, -8);
+    addi(TMP2, TMP2, -8);
+    Bind(&chunk_loop);
+    ldu(r(0), 8, TMP2);
+    stdu(r(0), 8, TMP1);
+    bdnz(&chunk_loop);
     addi(TMP1, TMP1, 8);
     addi(TMP2, TMP2, 8);
-    addi(TMP4, TMP4, -8);
-    b(&chunk_loop);
 
     Bind(&tail_loop);
     cmpdi(TMP4, 0);

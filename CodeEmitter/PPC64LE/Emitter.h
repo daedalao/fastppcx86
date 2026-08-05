@@ -1385,6 +1385,17 @@ public:
     }
   }
 
+  // bdnz target — decrement CTR, branch if CTR != 0 afterwards.
+  // B-form bc with BO=16 ("decrement CTR, branch if CTR != 0, CR bit ignored")
+  // and BI=0 (unused, must still be encoded). Restricted to *bound* (backward)
+  // labels on purpose: every user is a bottom-of-loop back-edge, and keeping it
+  // out of the forward-fixup path means this needs no PendingBranches support.
+  void bdnz(Label* lbl) {
+    assert(lbl->bound && "bdnz requires an already-bound (backward) target");
+    int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
+    bc(16u, 0u, offset);
+  }
+
   // blr: branch to link register (return)
   void blr() { Emit32((19u << 26) | (20u << 21) | (0u << 16) | (16u << 1) | 0u); }
 
