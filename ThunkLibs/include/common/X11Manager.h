@@ -64,15 +64,19 @@ struct X11Manager {
   // points' explicit syncs) and enables the lock-free memo below.
   //
   // The first-only mode is measurably the right thing — the per-call sync is
-  // a host->guest trampoline + guest X round trip under every glXSwapBuffers
-  // — but Grimrock proved the entry-point coverage is incomplete in a way we
-  // don't understand yet: its bootstrap issues GLXGetDrawableAttributes +
-  // GLXMakeCurrent wire requests on the host connection WITHOUT ever passing
-  // through the glXMakeCurrent/glXMakeContextCurrent/glXCreateWindow custom
-  // impls (their debug prints never fire, in working runs either). Until that
-  // dispatch path is identified, defaulting to first-only would trade a known
-  // per-frame win for unknown per-title BadDrawable breakage. Flip the
-  // default once the bypass is found and covered.
+  // a host->guest trampoline + guest X round trip under every glXSwapBuffers.
+  //
+  // Grimrock used to break under it (GLXGetDrawableAttributes + GLXMakeCurrent
+  // BadDrawable at bootstrap) because its GLX entry points were reached
+  // through glXGetProcAddress, which bypasses the fexfn_impl_* wrappers
+  // entirely: libGL_Guest.cpp links the returned *host* address to the generic
+  // HostPtrInvokers entry, and the later guest call lands in
+  // GuestWrapperForHostFunction<Sig>::Call (Host.h), which branches straight
+  // at that address. So none of the impls' GuestSyncForHostDisplay calls ran.
+  // Fixed by returning the impls from fexfn_impl_libGL_glXGetProcAddress for
+  // the XID-taking entry points (libGL_Host.cpp). Any *new* custom_host_impl
+  // whose extra work matters must be listed there too, or it is dead code for
+  // procaddr-resolving callers.
   static bool SyncEveryCall() {
     static const bool FirstOnly = [] {
       const char* e = getenv("FEX_X11_SYNC_FIRST_ONLY");

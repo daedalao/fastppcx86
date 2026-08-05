@@ -186,6 +186,35 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glXGetVisualFromFBConfigSGIX;
   } else if (name_sv == "glXChooseVisual") {
     return (VoidFn)fexfn_impl_libGL_glXChooseVisual;
+    // The XID-taking GLX entry points MUST be listed here, not just annotated
+    // custom_host_impl.
+    //
+    // A name resolved through glXGetProcAddress does NOT reach its
+    // fexfn_impl_* wrapper. libGL_Guest.cpp:68 links the *returned host
+    // address* to the generic HostPtrInvokers entry for that name, so a later
+    // guest call lands in GuestWrapperForHostFunction<Sig>::Call (Host.h:913),
+    // which repacks the arguments and then branches straight to whatever
+    // address we returned here. Return the raw host symbol and the custom impl
+    // is bypassed entirely — the guest_layout conversions still happen (that is
+    // why this worked at all), but everything the impl adds around the call
+    // does not. Confirmed by gdb: glXMakeCurrent in libGLX.so.0 called from
+    // GuestWrapperForHostFunction<int (_XDisplay*, unsigned long,
+    // __GLXcontextRec*), ...>::Call, never from fexfn_impl_libGL_glXMakeCurrent.
+    //
+    // For these four that missing extra is GuestSyncForHostDisplay: the
+    // Window/Pixmap they name was minted on the guest connection and may still
+    // sit in the guest Xlib request buffer. Without the sync the host
+    // connection hits BadDrawable on GLXGetDrawableAttributes (Grimrock
+    // bootstrap, serials ~28/30) whenever the per-call sync in
+    // GuestToHostDisplay is not covering for it (FEX_X11_SYNC_FIRST_ONLY=1).
+  } else if (name_sv == "glXMakeCurrent") {
+    return (VoidFn)fexfn_impl_libGL_glXMakeCurrent;
+  } else if (name_sv == "glXMakeContextCurrent") {
+    return (VoidFn)fexfn_impl_libGL_glXMakeContextCurrent;
+  } else if (name_sv == "glXCreateWindow") {
+    return (VoidFn)fexfn_impl_libGL_glXCreateWindow;
+  } else if (name_sv == "glXCreatePixmap") {
+    return (VoidFn)fexfn_impl_libGL_glXCreatePixmap;
   } else if (name_sv == "glXCreateContext") {
     return (VoidFn)fexfn_impl_libGL_glXCreateContext;
   } else if (name_sv == "glXCreateGLXPixmap") {
