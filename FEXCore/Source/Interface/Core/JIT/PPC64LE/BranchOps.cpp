@@ -79,7 +79,8 @@ DEF_OP(CallbackReturn) {
 // every linked call/ret pair, and that redesign is not done), the exit is
 // reordered so the WHOLE L1 probe becomes the patch target:
 //
-//     InsertGuestRIPMove TMP1, NewRIP     (5 insns, fixed width)
+//     InsertExitRIPMove TMP1, NewRIP      (1-5 insns; 5 fixed when
+//                                          ExitRIPFixedWidth -- see below)
 //     std   TMP1, State.rip(STATE)        hoisted from BOTH probe legs
 //     li    r0, 0                         hoisted from the hit leg (P5.0.2)
 //   PatchSite:                            4-byte aligned by construction
@@ -137,13 +138,16 @@ DEF_OP(ExitFunction) {
     // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
     // the 32-bit mask so the recorded value matches the emitted immediate.
     // SMC Idea 4: this is the ONLY guest-RIP constant the semantic-patch fault
-    // handler is allowed to rewrite, so it is the only one recorded (via
-    // InsertExitRIPMove, which wraps InsertGuestRIPMove and is identical to it
-    // with the flag off). See Interface/Core/SMCSemanticPatch.h.
-    // (Under BlockLinkingEnabled there is no code cache — the knob is hard-
-    // gated off when caching is on — but the relocation is recorded anyway
-    // so the emitted bytes do not depend on the knob's interaction with
-    // cache-validation builds. Note BlockLinking is also interlocked off when
+    // handler is allowed to rewrite, so it is the only one recorded.
+    //
+    // WIDTH: InsertExitRIPMove emits the fixed 20-byte window only when
+    // something rewrites it in place — code caching (ApplyCodeRelocations) or
+    // FEX_SMCSEMANTICPATCH (the fault handler's SynthesizeRIPWindow). With
+    // both off it degrades to a variable-width LoadConstant and records no
+    // relocation; see PPC64JITCore::ExitRIPFixedWidth in JIT.cpp. Neither the
+    // hoist below nor the linker cares about the width — PatchSite is captured
+    // from the cursor after this call, not computed from a fixed offset.
+    // (Note BlockLinking is separately interlocked off when
     // FEX_SMCSEMANTICPATCH is enabled; see JIT.cpp BlockLinkingEnabled.)
     InsertExitRIPMove(TMP1, NewRIP);
     RIPReg = TMP1;

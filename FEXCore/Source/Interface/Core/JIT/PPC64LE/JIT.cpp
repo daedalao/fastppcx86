@@ -1276,6 +1276,24 @@ void PPC64JITCore::InsertGuestRIPMove(GPR Reg, uint64_t Constant) {
 // future change to LoadImm64Fixed must fail here rather than silently turn
 // every fault-time match into a miss.
 void PPC64JITCore::InsertExitRIPMove(GPR Reg, uint64_t Constant) {
+  if (!ExitRIPFixedWidth) {
+    // Neither consumer of the fixed-width window exists in this configuration
+    // (see the ExitRIPFixedWidth resolution in the constructor), so emit the
+    // ordinary variable-width load: 1-5 instructions instead of always 5.
+    // Guest RIPs below 4 GiB -- every 32-bit guest, and non-PIE 64-bit ones --
+    // collapse to 1-3, and the sequence is never longer than the fixed form.
+    //
+    // No RELOC_GUEST_RIP_MOVE is recorded here, deliberately: a relocation
+    // promises ApplyCodeRelocations a 20-byte window it can re-emit into, and
+    // there is no such window now. Recording one anyway would let a cache
+    // loader overrun the following instructions. Correct because relocations
+    // are only ever consumed by the code cache, which ExitRIPFixedWidth
+    // already proved to be off -- the same construction-time assumption
+    // BlockLinkingEnabled has always made.
+    LoadConstant(Reg, Constant);
+    return;
+  }
+
   if (!CTX->Config.SMCSemanticPatch()) {
     InsertGuestRIPMove(Reg, Constant);
     return;
@@ -2271,6 +2289,41 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   } else if (BlockLinkingEnabled && FEXCore::Config::Get_SMCLAZYINVAL() && LazyLinkArmed) {
     LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
                       "same-thread drains ride the InterruptFaultPage poke.");
+  }
+
+  // Resolve the exit-RIP constant width ONCE, at backend construction, from
+  // the same config sources and with the same "read once" assumption as
+  // BlockLinkingEnabled above.
+  //
+  // DEF_OP(ExitFunction)'s constant destination used to be materialised with
+  // LoadConstantFixed unconditionally -- always 5 instructions, whatever the
+  // value. Exactly two consumers need that fixed 20-byte window:
+  //   * CodeCache::ApplyCodeRelocations re-emits RELOC_GUEST_RIP_MOVE in place
+  //     with a rebased address, so the window must be wide enough for any
+  //     value it might produce.
+  //   * FEX_SMCSEMANTICPATCH's fault handler rewrites this exact window in
+  //     place from SMCSemanticPatch.h's dependency-free re-encoder
+  //     (SynthesizeRIPWindow); a variable-width site would be unrecognisable
+  //     to it, and repatching it would splice a 5-instruction sequence over
+  //     whatever followed a shorter one.
+  // With BOTH off nothing ever rewrites the emitted bytes, so the ordinary
+  // variable-width LoadConstant is correct and shorter. Note the caching gate
+  // is deliberately NOT the BlockLinking one: SMCSemanticPatch forces
+  // BlockLinkingEnabled off, so testing BlockLinkingEnabled here would silently
+  // pick the variable form in exactly the configuration that must not have it.
+  ExitRIPFixedWidth = FEXCore::Config::Get_ENABLECODECACHINGWIP() || CTX->Config.SMCSemanticPatch();
+
+  // Announce the decision once per process (this constructor runs per guest
+  // thread). This is the only externally observable statement of which form
+  // block exits are being emitted in, and the thing to check when a
+  // semantic-patch or code-cache run misbehaves.
+  {
+    static std::once_flag Announce;
+    std::call_once(Announce, [this]() {
+      LogMan::Msg::IFmt("PPC64 JIT: exit-RIP constants are {} (code caching {}, SMCSemanticPatch {})",
+                        ExitRIPFixedWidth ? "FIXED width (5 insns, patchable window)" : "variable width (1-5 insns)",
+                        FEXCore::Config::Get_ENABLECODECACHINGWIP() ? "on" : "off", CTX->Config.SMCSemanticPatch() ? "on" : "off");
+    });
   }
 
   // Point the JIT's helper-address table at the static array in VectorOps.cpp.

@@ -229,6 +229,12 @@ private:
   // See the resolution site in JIT.cpp for the hard-gate rationale.
   bool BlockLinkingEnabled {};
 
+  // Resolved once at construction: code caching OR SMCSemanticPatch on, i.e.
+  // somebody rewrites the exit-RIP window in place and it has to stay a
+  // fixed-width 20-byte site. Off means InsertExitRIPMove may use the ordinary
+  // variable-width LoadConstant. See the resolution site in JIT.cpp.
+  bool ExitRIPFixedWidth {};
+
   // Spill slots management.
   //
   // SpillSlots is sampled from IR->SpillSlots() at the top of CompileCode.
@@ -500,6 +506,10 @@ private:
   // the fault handler identifies a window by the RIP value it materialises, and
   // recording any other guest-RIP constant would make that lookup ambiguous.
   // See Interface/Core/SMCSemanticPatch.h.
+  //
+  // When ExitRIPFixedWidth is false (no code cache, no semantic patching) this
+  // drops to a plain variable-width LoadConstant with no relocation and no
+  // site record -- nothing rewrites the window in that configuration.
   void InsertExitRIPMove(GPR Reg, uint64_t Constant);
 
   // SMC Idea 4, mov-immediate half: materialise a constant the frontend tagged
