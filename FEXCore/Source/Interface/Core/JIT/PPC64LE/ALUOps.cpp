@@ -2218,7 +2218,12 @@ DEF_OP(Select) {
         else
           cmpdi(S1, static_cast<int16_t>(sc));
       } else {
-        LoadConstant(TMP4, Const);
+        // No LoadConstant here: EmitCompare (JIT.cpp) re-materialises the
+        // inline constant itself on every path it can take for this operand
+        // — TMP4 for the 32/64-bit signed and unsigned wide-constant cases,
+        // TMP2 (pre-shifted by Const << Sh) for the 8/16-bit case — and it
+        // reads Op->Cmp2 rather than any register we could have primed. A
+        // LoadConstant here was therefore pure dead weight.
         EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
       }
     } else {
