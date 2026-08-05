@@ -1036,6 +1036,11 @@ public:
   // dword[1] = the 8-byte LE integer at EA+8 — i.e. the DOUBLEWORD-SWAPPED
   // image of what lxvx produces; follow with xxpermdi(v,v,v,2) to fix up.
   void lxvd2x(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 844, 1); }
+  // lxvdsx XT, RA, RB (ISA 2.06): load one doubleword from (RA|0)+RB and splat
+  // it into both doublewords of XT. XO 332, TX=1 for the VMX half of the VSR
+  // file -- checked against GAS: `lxvdsx 32,0,3` assembles to 0x7c001a99 and
+  // `lxvdsx 45,4,5` to 0x7da42a99, both of which this reproduces.
+  void lxvdsx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 332, 1); }
   // stxvd2x XS,RA,RB — ISA 2.06 (POWER7+) — p.508, XO=972. Store form: writes
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
@@ -1408,6 +1413,17 @@ public:
       AddPendingBranch(lbl);
       Emit32((16u << 26) | (cond.BO << 21) | (cond.BI << 16) | 0u);  // placeholder
     }
+  }
+
+  // bdnz target — decrement CTR, branch if CTR != 0 afterwards.
+  // B-form bc with BO=16 ("decrement CTR, branch if CTR != 0, CR bit ignored")
+  // and BI=0 (unused, must still be encoded). Restricted to *bound* (backward)
+  // labels on purpose: every user is a bottom-of-loop back-edge, and keeping it
+  // out of the forward-fixup path means this needs no PendingBranches support.
+  void bdnz(Label* lbl) {
+    assert(lbl->bound && "bdnz requires an already-bound (backward) target");
+    int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
+    bc(16u, 0u, offset);
   }
 
   // blr: branch to link register (return)

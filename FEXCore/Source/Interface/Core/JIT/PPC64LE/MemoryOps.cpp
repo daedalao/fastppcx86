@@ -7,6 +7,8 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 
+#include <bit>
+
 namespace FEXCore::CPU {
 
 // =========================================================================
@@ -255,14 +257,42 @@ DEF_OP(StoreContextPair) {
   }
 }
 
+// Out = BaseOffset + Idx * Stride, the context-relative displacement shared by
+// Load/StoreContextIndexed. Stride is a register-array element size, so in
+// practice always a power of two (8 for GPRs, 16 for XMM), and BaseOffset is a
+// CpuStateFrame field offset that comfortably fits addi's signed 16-bit
+// immediate. That collapses two LoadConstants, a mulld and an add into a shift
+// and an addi -- and leaves TMP1/TMP2 untouched. FormContextAddress below is
+// the existing precedent for the shift. Anything that does not fit keeps the
+// general multiply.
+static void FormIndexedContextOffset(PPC64JITCore* j, GPR Out, GPR Idx, uint32_t Stride, uint32_t BaseOffset) {
+  const bool Pow2 = Stride != 0 && (Stride & (Stride - 1)) == 0;
+  if (Pow2 && BaseOffset <= 32767) {
+    if (Stride == 1) {
+      if (BaseOffset != 0) {
+        j->addi(Out, Idx, static_cast<int16_t>(BaseOffset));
+      } else if (Out != Idx) {
+        j->mr(Out, Idx);
+      }
+    } else {
+      j->sldi(Out, Idx, static_cast<uint32_t>(__builtin_ctz(Stride)));
+      if (BaseOffset != 0) {
+        j->addi(Out, Out, static_cast<int16_t>(BaseOffset));
+      }
+    }
+    return;
+  }
+  j->LoadConstant(TMP1, static_cast<uint32_t>(BaseOffset));
+  j->LoadConstant(TMP2, static_cast<uint64_t>(Stride));
+  j->mulld(Out, Idx, TMP2);
+  j->add(Out, Out, TMP1);
+}
+
 DEF_OP(LoadContextIndexed) {
   auto Op = IROp->C<IR::IROp_LoadContextIndexed>();
   auto Idx = GetReg(Op->Index);
   // EA = STATE + BaseOffset + Idx * Stride. Compute into TMP3.
-  LoadConstant(TMP1, static_cast<uint32_t>(Op->BaseOffset));
-  LoadConstant(TMP2, static_cast<uint64_t>(Op->Stride));
-  mulld(TMP3, Idx, TMP2);
-  add(TMP3, TMP3, TMP1);
+  FormIndexedContextOffset(this, TMP3, Idx, Op->Stride, Op->BaseOffset);
   if (Op->Class == IR::RegClass::FPR) {
     // Vector / XMM context load (e.g. fxsave/fxrstor stride-16 dispatch).
     // EA goes through STATE + TMP3; LoadFPRSized expects a single GPR EA.
@@ -283,10 +313,7 @@ DEF_OP(LoadContextIndexed) {
 DEF_OP(StoreContextIndexed) {
   auto Op  = IROp->C<IR::IROp_StoreContextIndexed>();
   auto Idx = GetReg(Op->Index);
-  LoadConstant(TMP1, static_cast<uint32_t>(Op->BaseOffset));
-  LoadConstant(TMP2, static_cast<uint64_t>(Op->Stride));
-  mulld(TMP3, Idx, TMP2);
-  add(TMP3, TMP3, TMP1);
+  FormIndexedContextOffset(this, TMP3, Idx, Op->Stride, Op->BaseOffset);
   if (Op->Class == IR::RegClass::FPR) {
     add(TMP4, STATE, TMP3);
     StoreFPRSized(GetVReg(Op->Value), TMP4, IR::OpSizeToSize(IROp->Size));
@@ -687,12 +714,17 @@ DEF_OP(LoadMemPair) {
     GPR Base = ComputeOffsetAddrInto(*this, Addr, Offset, TMP1);
     auto D1 = GetReg(Op->OutValue1);
     auto D2 = GetReg(Op->OutValue2);
-    li(TMP4, static_cast<int16_t>(Stride));
+    // D-form: Stride is 1/2/4/8, so the second half's displacement always
+    // fits the 16-bit field, and 8 satisfies ld's DS-form 4-byte alignment.
+    // The index registers this drops (an li of the stride, plus r0 for the
+    // first half) were pure overhead in a sequence Mono runs in every
+    // function prologue.
+    const int16_t S = static_cast<int16_t>(Stride);
     switch (IROp->Size) {
-    case IR::OpSize::i8Bit:  lbzx(D1, Base, r0); lbzx(D2, Base, TMP4); break;
-    case IR::OpSize::i16Bit: lhzx(D1, Base, r0); lhzx(D2, Base, TMP4); break;
-    case IR::OpSize::i32Bit: lwzx(D1, Base, r0); lwzx(D2, Base, TMP4); break;
-    case IR::OpSize::i64Bit: ldx (D1, Base, r0); ldx (D2, Base, TMP4); break;
+    case IR::OpSize::i8Bit:  lbz(D1, 0, Base); lbz(D2, S, Base); break;
+    case IR::OpSize::i16Bit: lhz(D1, 0, Base); lhz(D2, S, Base); break;
+    case IR::OpSize::i32Bit: lwz(D1, 0, Base); lwz(D2, S, Base); break;
+    case IR::OpSize::i64Bit: ld (D1, 0, Base); ld (D2, S, Base); break;
     default: break;
     }
   } else {
@@ -765,12 +797,13 @@ DEF_OP(StoreMemPair) {
     GPR Base = ComputeOffsetAddrInto(*this, Addr, Offset, TMP1);
     auto S1 = GetReg(Op->Value1);
     auto S2 = GetReg(Op->Value2);
-    li(TMP4, static_cast<int16_t>(Stride));
+    // D-form, same reasoning as LoadMemPair.
+    const int16_t S = static_cast<int16_t>(Stride);
     switch (IROp->Size) {
-    case IR::OpSize::i8Bit:  stbx(S1, Base, r0); stbx(S2, Base, TMP4); break;
-    case IR::OpSize::i16Bit: sthx(S1, Base, r0); sthx(S2, Base, TMP4); break;
-    case IR::OpSize::i32Bit: stwx(S1, Base, r0); stwx(S2, Base, TMP4); break;
-    case IR::OpSize::i64Bit: stdx(S1, Base, r0); stdx(S2, Base, TMP4); break;
+    case IR::OpSize::i8Bit:  stb(S1, 0, Base); stb(S2, S, Base); break;
+    case IR::OpSize::i16Bit: sth(S1, 0, Base); sth(S2, S, Base); break;
+    case IR::OpSize::i32Bit: stw(S1, 0, Base); stw(S2, S, Base); break;
+    case IR::OpSize::i64Bit: std(S1, 0, Base); std(S2, S, Base); break;
     default: break;
     }
   } else {
@@ -976,14 +1009,12 @@ DEF_OP(PushTwo) {
   auto S2 = GetReg(Op->Value2);
   switch (SZ) {
   case 4:
-    stwx(S1, RSP, r0);
-    li(TMP4, 4);
-    stwx(S2, RSP, TMP4);
+    stw(S1, 0, RSP);
+    stw(S2, 4, RSP);
     break;
   case 8:
-    stdx(S1, RSP, r0);
-    li(TMP4, 8);
-    stdx(S2, RSP, TMP4);
+    std(S1, 0, RSP);
+    std(S2, 8, RSP);
     break;
   default:
     LOGMAN_MSG_A_FMT("PushTwo: unsupported ValueSize {}", SZ);
@@ -1058,15 +1089,14 @@ DEF_OP(PopTwo) {
     rldicl(TMP3, Addr, 0, 32);
     LoadBase = TMP3;
   }
-  li(TMP4, static_cast<int16_t>(SZ));
   switch (SZ) {
   case 4:
-    lwzx(TMP1, LoadBase, r0);          // TMP1 = [Addr+0]
-    lwzx(TMP2, LoadBase, TMP4);        // TMP2 = [Addr+SZ]
+    lwz(TMP1, 0, LoadBase);            // TMP1 = [Addr+0]
+    lwz(TMP2, 4, LoadBase);            // TMP2 = [Addr+SZ]
     break;
   case 8:
-    ldx(TMP1, LoadBase, r0);
-    ldx(TMP2, LoadBase, TMP4);
+    ld(TMP1, 0, LoadBase);
+    ld(TMP2, 8, LoadBase);
     break;
   default:
     LOGMAN_MSG_A_FMT("PopTwo: unsupported Size {}", SZ);
@@ -1203,24 +1233,114 @@ DEF_OP(MemSet) {
     }
     mr(TMP4, LenIn);
 
-    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    // dcbz block-zero path, zero fill only. dcbz clears one d-cache block per
+    // instruction with no store-queue traffic, so a large memset(0) runs at
+    // roughly cache-fill bandwidth instead of one store per 8 bytes.
+    //
+    // Line size comes from HostFeatures.DCacheLineSize, which is
+    // AT_DCACHEBSIZE as the kernel reports it (Source/Common/HostFeatures.cpp
+    // :731-736, with a 128 fallback) -- never a hardcoded constant, because
+    // dcbz's block size *is* that value and getting it wrong zeroes the wrong
+    // span. We additionally require a power of two in [32, 256] so the
+    // align-up mask and the shift below are well-formed, and bail to the plain
+    // std path otherwise.
+    //
+    // CACHE-INHIBITED STORAGE. dcbz on caching-inhibited or write-through
+    // memory takes an alignment interrupt rather than zeroing. Guest heap,
+    // stack and anonymous mappings -- everything a memset(0) of >= 2 blocks
+    // realistically targets -- are ordinary cacheable memory; POWER glibc's
+    // own memset uses dcbz on arbitrary user pointers for exactly this reason.
+    // The guard is kept narrow anyway: 64-bit guest, forward direction, byte
+    // element, zero fill value, and at least two full blocks remaining.
+    // Anything else keeps the std loop.
+    //
+    // The zero test is a *runtime* compare on the splat, not a compile-time
+    // one. Keying it on `Splat == r0` (the inline-constant-zero case) looked
+    // natural but is dead code in practice: measured with a JIT-time probe on
+    // the ASM tests, every `xor eax,eax; rep stosb` still arrives here with
+    // Value as a live register, so the fill byte is only known at run time.
+    // One cmpdi+bc per rep-stos op is nothing against a >= 256-byte fill.
+    //
+    // FAULT GRANULARITY is unchanged from the std path: TMP1 is block-aligned
+    // before the loop, a block is a power of two no larger than a page, so a
+    // dcbz can neither cross a page nor partially write, and blocks are zeroed
+    // in increasing address order -- on a fault the destination still holds a
+    // byte-exact prefix, and RCX/RDI are still written back only at op end.
+    const uint32_t DBlock = CTX->HostFeatures.DCacheLineSize;
+    const bool UseDcbz = DBlock >= 32 && DBlock <= 256 && (DBlock & (DBlock - 1)) == 0;
+    const uint32_t DBlockShift = UseDcbz ? static_cast<uint32_t>(std::countr_zero(DBlock)) : 0;
+
+    PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label dcbz_entry, dcbz_align, dcbz_setup, dcbz_loop;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
     andi_(TMP2, TMP1, 7);
-    bc(CC_EQ, &chunk_loop);
+    bc(CC_EQ, UseDcbz ? &dcbz_entry : &chunk_setup);
     stb(Splat, 0, TMP1);
     addi(TMP1, TMP1, 1);
     addi(TMP4, TMP4, -1);
     b(&align_loop);
 
+    if (UseDcbz) {
+      Bind(&dcbz_entry);
+      // Non-zero fill, or fewer than two blocks left (where the block align-up
+      // would dominate): stay on the std chunk loop.
+      if (Splat != r0) {
+        cmpdi(Splat, 0);
+        bc(CC_NE, &chunk_setup);
+      }
+      cmpldi(TMP4, static_cast<uint16_t>(2 * DBlock));
+      bc(CC_ULT, &chunk_setup);
+
+      // Align up to a block boundary with 8-byte stores. TMP1 is already
+      // 8-byte aligned here, so this runs at most DBlock/8 - 1 times and
+      // consumes at most DBlock-8 bytes -- leaving at least one whole block.
+      Bind(&dcbz_align);
+      andi_(TMP2, TMP1, static_cast<uint16_t>(DBlock - 1));
+      bc(CC_EQ, &dcbz_setup);
+      std(Splat, 0, TMP1);
+      addi(TMP1, TMP1, 8);
+      addi(TMP4, TMP4, -8);
+      b(&dcbz_align);
+
+      Bind(&dcbz_setup);
+      srdi(TMP2, TMP4, DBlockShift);   // number of whole blocks left
+      mtctr(TMP2);
+      andi_(TMP4, TMP4, static_cast<uint16_t>(DBlock - 1));
+      Bind(&dcbz_loop);
+      // r0 in the RA slot of an X-form cache op is the literal-zero form, so
+      // the effective address is exactly TMP1 -- and TMP1 is block-aligned, so
+      // dcbz's truncation to a block boundary is a no-op.
+      dcbz(r(0), TMP1);
+      addi(TMP1, TMP1, static_cast<int16_t>(DBlock));
+      bdnz(&dcbz_loop);
+      // Falls through with TMP4 < DBlock: the std chunk loop and byte tail
+      // finish the remainder.
+    }
+
+    // CTR-counted chunk loop: 2 instructions + one CTR back-edge per 8 bytes,
+    // versus the previous cmpldi/bc/std/addi/addi/b (6 insns + 2 branches). CTR
+    // is free mid-block here (the JIT only loads it at block exits for bctr).
+    //
+    // stdu Splat,8(ptr) writes to ptr+8 and then sets ptr = ptr+8, so ptr is
+    // pre-biased by -8 before entering. After N iterations ptr = base+8*(N-1),
+    // hence the +8 fixup on exit. Both the aligned-store and the
+    // fault-visibility argument above are preserved: TMP1 enters the loop
+    // 8-byte aligned so ptr-8 is too, every EA is 8-byte aligned and cannot
+    // cross a page, and on a faulting update-form store RA is architecturally
+    // left unmodified (and TMP1 is not guest-visible until op end regardless).
+    Bind(&chunk_setup);
+    srdi(TMP2, TMP4, 3);      // chunk count = len >> 3
+    cmpdi(TMP2, 0);
+    bc(CC_EQ, &tail_loop);
+    mtctr(TMP2);
+    andi_(TMP4, TMP4, 7);     // remaining tail length after the chunks
+    addi(TMP1, TMP1, -8);
     Bind(&chunk_loop);
-    cmpldi(TMP4, 8);
-    bc(CC_ULT, &tail_loop);
-    std(Splat, 0, TMP1);
+    stdu(Splat, 8, TMP1);
+    bdnz(&chunk_loop);
     addi(TMP1, TMP1, 8);
-    addi(TMP4, TMP4, -8);
-    b(&chunk_loop);
 
     Bind(&tail_loop);
     cmpdi(TMP4, 0);
@@ -1375,12 +1495,12 @@ DEF_OP(MemCpy) {
     cmpldi(r(0), 8);
     bc(CC_ULT, &generic_path);
 
-    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
     andi_(TMP3, TMP1, 7);
-    bc(CC_EQ, &chunk_loop);
+    bc(CC_EQ, &chunk_setup);
     lbz(r(0), 0, TMP2);
     stb(r(0), 0, TMP1);
     addi(TMP1, TMP1, 1);
@@ -1388,18 +1508,33 @@ DEF_OP(MemCpy) {
     addi(TMP4, TMP4, -1);
     b(&align_loop);
 
-    Bind(&chunk_loop);
-    cmpldi(TMP4, 8);
-    bc(CC_ULT, &tail_loop);
+    // CTR-counted chunk loop: ldu/stdu + one CTR back-edge per 8 bytes, versus
+    // the previous cmpldi/bc/ld/std/addi/addi/addi/b. Both pointers are
+    // pre-biased by -8 because the update forms compute EA = RA+8 and then set
+    // RA = EA; after N iterations each sits at base+8*(N-1), hence the +8
+    // fixups on exit. TMP3 is dead here (the direction test and the overlap
+    // guard are both behind us, and no path from inside these loops reaches
+    // the generic loop, which is the only consumer of Step).
+    //
     // Source may be unaligned: POWER8 handles unaligned cacheable loads in
-    // hardware, and the DS-form displacement constraint is on the immediate
-    // (0 here), not on the address.
-    ld(r(0), 0, TMP2);
-    std(r(0), 0, TMP1);
+    // hardware, and the DS-form constraint is on the immediate (8, 4-aligned),
+    // not on the address. The stores stay 8-byte aligned, so the fault
+    // granularity argument above is unchanged; a faulting update-form access
+    // also leaves RA architecturally unmodified.
+    Bind(&chunk_setup);
+    srdi(TMP3, TMP4, 3);      // chunk count = len >> 3
+    cmpdi(TMP3, 0);
+    bc(CC_EQ, &tail_loop);
+    mtctr(TMP3);
+    andi_(TMP4, TMP4, 7);     // remaining tail length after the chunks
+    addi(TMP1, TMP1, -8);
+    addi(TMP2, TMP2, -8);
+    Bind(&chunk_loop);
+    ldu(r(0), 8, TMP2);
+    stdu(r(0), 8, TMP1);
+    bdnz(&chunk_loop);
     addi(TMP1, TMP1, 8);
     addi(TMP2, TMP2, 8);
-    addi(TMP4, TMP4, -8);
-    b(&chunk_loop);
 
     Bind(&tail_loop);
     cmpdi(TMP4, 0);
@@ -2015,14 +2150,16 @@ DEF_OP(VBroadcastFromMem) {
     vspltw(Dst, VTMP1, 3);
     break;
   case IR::OpSize::i64Bit:
-    // Stack-roundtrip 64-bit duplicate. Avoids the undefined-doubleword
-    // hazard of `vsldoi VTMP1,VTMP1,VTMP1,8` after `mtvsrd` (which only
-    // defines the high doubleword per ISA).
-    ldx(TMP1, MemReg, r0);
-    std(TMP1, -16, r1);
-    std(TMP1,  -8, r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, TMP2, r0);
+    // lxvdsx is exactly this operation in one instruction: load a doubleword
+    // and splat it into both halves. It replaces a GPR load, two stores, an
+    // addi and a vector load whose data comes straight from those stores --
+    // a store-hit-load on the path glibc takes through memory-source
+    // vpbroadcastq during arena init. Byte-identical to the old sequence on
+    // POWER8, checked with an asymmetric value at a non-16-byte-aligned
+    // address (lxvdsx does not truncate the EA the way lvx does, and does
+    // not byte-reverse). Still no vsldoi-after-mtvsrd: that would read the
+    // ISA-undefined doubleword.
+    lxvdsx(Dst, r(0), MemReg);
     break;
   case IR::OpSize::i128Bit:
     // 128-bit "broadcast" is just a 128-bit load.
