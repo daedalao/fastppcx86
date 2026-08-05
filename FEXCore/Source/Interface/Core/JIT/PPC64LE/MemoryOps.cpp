@@ -257,14 +257,42 @@ DEF_OP(StoreContextPair) {
   }
 }
 
+// Out = BaseOffset + Idx * Stride, the context-relative displacement shared by
+// Load/StoreContextIndexed. Stride is a register-array element size, so in
+// practice always a power of two (8 for GPRs, 16 for XMM), and BaseOffset is a
+// CpuStateFrame field offset that comfortably fits addi's signed 16-bit
+// immediate. That collapses two LoadConstants, a mulld and an add into a shift
+// and an addi -- and leaves TMP1/TMP2 untouched. FormContextAddress below is
+// the existing precedent for the shift. Anything that does not fit keeps the
+// general multiply.
+static void FormIndexedContextOffset(PPC64JITCore* j, GPR Out, GPR Idx, uint32_t Stride, uint32_t BaseOffset) {
+  const bool Pow2 = Stride != 0 && (Stride & (Stride - 1)) == 0;
+  if (Pow2 && BaseOffset <= 32767) {
+    if (Stride == 1) {
+      if (BaseOffset != 0) {
+        j->addi(Out, Idx, static_cast<int16_t>(BaseOffset));
+      } else if (Out != Idx) {
+        j->mr(Out, Idx);
+      }
+    } else {
+      j->sldi(Out, Idx, static_cast<uint32_t>(__builtin_ctz(Stride)));
+      if (BaseOffset != 0) {
+        j->addi(Out, Out, static_cast<int16_t>(BaseOffset));
+      }
+    }
+    return;
+  }
+  j->LoadConstant(TMP1, static_cast<uint32_t>(BaseOffset));
+  j->LoadConstant(TMP2, static_cast<uint64_t>(Stride));
+  j->mulld(Out, Idx, TMP2);
+  j->add(Out, Out, TMP1);
+}
+
 DEF_OP(LoadContextIndexed) {
   auto Op = IROp->C<IR::IROp_LoadContextIndexed>();
   auto Idx = GetReg(Op->Index);
   // EA = STATE + BaseOffset + Idx * Stride. Compute into TMP3.
-  LoadConstant(TMP1, static_cast<uint32_t>(Op->BaseOffset));
-  LoadConstant(TMP2, static_cast<uint64_t>(Op->Stride));
-  mulld(TMP3, Idx, TMP2);
-  add(TMP3, TMP3, TMP1);
+  FormIndexedContextOffset(this, TMP3, Idx, Op->Stride, Op->BaseOffset);
   if (Op->Class == IR::RegClass::FPR) {
     // Vector / XMM context load (e.g. fxsave/fxrstor stride-16 dispatch).
     // EA goes through STATE + TMP3; LoadFPRSized expects a single GPR EA.
@@ -285,10 +313,7 @@ DEF_OP(LoadContextIndexed) {
 DEF_OP(StoreContextIndexed) {
   auto Op  = IROp->C<IR::IROp_StoreContextIndexed>();
   auto Idx = GetReg(Op->Index);
-  LoadConstant(TMP1, static_cast<uint32_t>(Op->BaseOffset));
-  LoadConstant(TMP2, static_cast<uint64_t>(Op->Stride));
-  mulld(TMP3, Idx, TMP2);
-  add(TMP3, TMP3, TMP1);
+  FormIndexedContextOffset(this, TMP3, Idx, Op->Stride, Op->BaseOffset);
   if (Op->Class == IR::RegClass::FPR) {
     add(TMP4, STATE, TMP3);
     StoreFPRSized(GetVReg(Op->Value), TMP4, IR::OpSizeToSize(IROp->Size));
