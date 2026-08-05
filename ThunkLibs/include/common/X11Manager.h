@@ -31,6 +31,12 @@ struct X11Manager {
 
   xcb_connection_t* GuestToHostConnection(xcb_connection_t* GuestConnection) {
     std::unique_lock lock(mutex);
+    // find-before-insert: libstdc++'s emplace allocates the node BEFORE probing
+    // for an existing key and frees it again on a duplicate, so the old
+    // emplace-always shape was a malloc/free pair on every repeat call.
+    if (auto it = connections.find(GuestConnection); it != connections.end()) {
+      return it->second;
+    }
     auto [it, inserted] = connections.emplace(GuestConnection, nullptr);
     if (inserted) {
       // NOTE: There's no easy way to query the display name from the guest, so just connect to the default display.
@@ -46,10 +52,39 @@ struct X11Manager {
     return it->second;
   }
 
-  // Maps guest display to intermediary host display
+  // Maps guest display to intermediary host display, plus the reverse index
+  // for HostToGuestDisplay. Entries are only ever inserted, never erased (there
+  // is no XCloseDisplay unmapping), which is what makes the lock-free memo in
+  // GuestToHostDisplay safe: a cached pair can never refer to a dead mapping.
   std::unordered_map<_XDisplay*, _XDisplay*> displays;
+  std::unordered_map<const _XDisplay*, _XDisplay*> displays_reverse;
+
+  // Restores the pre-2026-08-05 behavior of syncing the guest connection on
+  // EVERY Display-taking call instead of only on first mapping. Triage lever:
+  // if a title starts throwing BadDrawable/BadWindow from host-side GLX after
+  // the sync elision (guest created a new XID and the host connection raced
+  // ahead of the guest's unflushed create), set this to confirm, then teach
+  // the specific entry point to sync instead of turning the firehose back on.
+  static bool SyncEveryCall() {
+    static const bool v = [] {
+      const char* e = getenv("FEX_X11_SYNC_EVERY_CALL");
+      return e && *e == '1';
+    }();
+    return v;
+  }
 
   _XDisplay* GuestToHostDisplay(_XDisplay* GuestDisplay) {
+    // Hot path: one repeat display looked up per Display-taking GL call,
+    // usually from a single render thread. The thread_local memo makes that
+    // lock-free and allocation-free. Never invalidated — see the map comment.
+    struct Memo {
+      _XDisplay* guest = nullptr;
+      _XDisplay* host = nullptr;
+    };
+    static thread_local Memo memo;
+    if (GuestDisplay == memo.guest && !SyncEveryCall()) {
+      return memo.host;
+    }
     // Flush event queue to make effects of the guest-side connection visible.
     //
     // Both `GuestXSync` and `GuestXDisplayString` are populated when the
@@ -89,13 +124,28 @@ struct X11Manager {
       }
     }
 
-    if (GuestXSync) {
+    // Sync the guest connection only around the FIRST mapping of a display
+    // (or always, under the triage env above). The sync exists because guest
+    // and host hold separate connections to the same server: an XID the guest
+    // just created may still sit in the guest Xlib's request buffer, and a
+    // host-side GLX request naming it would hit BadDrawable. But per call it
+    // was a full host->guest trampoline (guest-stack bump, JIT re-entry) plus
+    // a guest X round trip — hundreds of instructions under EVERY
+    // glXSwapBuffers, for drawables that have existed for thousands of frames.
+    // First-use covers the bootstrap case that motivated the sync; anything
+    // that mints new XIDs mid-session (rare: a second GLX window) is what the
+    // env lever and per-entry-point syncs are for.
+    const bool KnownDisplay = [&] {
+      std::unique_lock lock(mutex);
+      return displays.find(GuestDisplay) != displays.end();
+    }();
+    if (GuestXSync && (!KnownDisplay || SyncEveryCall())) {
       GuestXSync(GuestDisplay, 0);
     }
 
     std::unique_lock lock(mutex);
-    auto [it, inserted] = displays.emplace(GuestDisplay, nullptr);
-    if (inserted) {
+    auto it = displays.find(GuestDisplay);
+    if (it == displays.end()) {
       const char* display_name = GuestXDisplayString ? GuestXDisplayString(GuestDisplay) : nullptr;
       auto host_display = HostXOpenDisplay(display_name);
       fprintf(stderr, "Opening host-side X11 display: %p -> %p (name=%s)\n",
@@ -103,10 +153,12 @@ struct X11Manager {
       if (!host_display) {
         fprintf(stderr, "ERROR: Could not open X display\n");
         std::abort();
-      } else {
-        it->second = host_display;
       }
+      it = displays.emplace(GuestDisplay, host_display).first;
+      displays_reverse.emplace(host_display, GuestDisplay);
     }
+    memo.guest = GuestDisplay;
+    memo.host = it->second;
     return it->second;
   }
 
@@ -116,12 +168,13 @@ struct X11Manager {
     }
 
     std::unique_lock lock(mutex);
-    for (auto& [guest, host] : displays) {
-      if (host == from) {
-        guest_layout<_XDisplay*> ret;
-        ret.data = reinterpret_cast<uintptr_t>(guest);
-        return ret;
-      }
+    // O(1) via the reverse index kept in GuestToHostDisplay (this used to be a
+    // linear scan of `displays` under the same lock, paid by every function
+    // RETURNING a Display*).
+    if (auto it = displays_reverse.find(from); it != displays_reverse.end()) {
+      guest_layout<_XDisplay*> ret;
+      ret.data = reinterpret_cast<uintptr_t>(it->second);
+      return ret;
     }
 
     fprintf(stderr, "ERROR: Could not map host display %p back to guest\n", from);

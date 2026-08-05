@@ -74,8 +74,22 @@ host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
 }
 
 host_layout<_XDisplay*>::~host_layout() {
-  // Flush host-side event queue to make effects of the guest-side connection visible
-  if (data) x11_manager.HostXFlush(data);
+  // This used to XFlush the host connection unconditionally — a write(2) to
+  // the X socket per Display-taking GL call, defeating Xlib request batching
+  // entirely. It is not needed for rendering: glXSwapBuffers issues its own
+  // flush as part of the swap protocol, and non-swap GLX requests that a guest
+  // could observe cross-connection get pushed out by the server round trips
+  // libX11 already performs for reply-carrying requests. Kept behind a triage
+  // env: if a title's window updates lag or GLX state appears stale
+  // cross-connection, set FEX_X11_FLUSH_EVERY_CALL=1 to confirm this elision
+  // is the cause, then give the specific entry point its own flush.
+  static const bool FlushEveryCall = [] {
+    const char* e = getenv("FEX_X11_FLUSH_EVERY_CALL");
+    return e && *e == '1';
+  }();
+  if (data && FlushEveryCall) {
+    x11_manager.HostXFlush(data);
+  }
 }
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
