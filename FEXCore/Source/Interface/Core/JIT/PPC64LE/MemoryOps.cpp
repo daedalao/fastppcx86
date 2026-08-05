@@ -7,6 +7,8 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 
+#include <bit>
+
 namespace FEXCore::CPU {
 
 // =========================================================================
@@ -1203,16 +1205,91 @@ DEF_OP(MemSet) {
     }
     mr(TMP4, LenIn);
 
+    // dcbz block-zero path, zero fill only. dcbz clears one d-cache block per
+    // instruction with no store-queue traffic, so a large memset(0) runs at
+    // roughly cache-fill bandwidth instead of one store per 8 bytes.
+    //
+    // Line size comes from HostFeatures.DCacheLineSize, which is
+    // AT_DCACHEBSIZE as the kernel reports it (Source/Common/HostFeatures.cpp
+    // :731-736, with a 128 fallback) -- never a hardcoded constant, because
+    // dcbz's block size *is* that value and getting it wrong zeroes the wrong
+    // span. We additionally require a power of two in [32, 256] so the
+    // align-up mask and the shift below are well-formed, and bail to the plain
+    // std path otherwise.
+    //
+    // CACHE-INHIBITED STORAGE. dcbz on caching-inhibited or write-through
+    // memory takes an alignment interrupt rather than zeroing. Guest heap,
+    // stack and anonymous mappings -- everything a memset(0) of >= 2 blocks
+    // realistically targets -- are ordinary cacheable memory; POWER glibc's
+    // own memset uses dcbz on arbitrary user pointers for exactly this reason.
+    // The guard is kept narrow anyway: 64-bit guest, forward direction, byte
+    // element, zero fill value, and at least two full blocks remaining.
+    // Anything else keeps the std loop.
+    //
+    // The zero test is a *runtime* compare on the splat, not a compile-time
+    // one. Keying it on `Splat == r0` (the inline-constant-zero case) looked
+    // natural but is dead code in practice: measured with a JIT-time probe on
+    // the ASM tests, every `xor eax,eax; rep stosb` still arrives here with
+    // Value as a live register, so the fill byte is only known at run time.
+    // One cmpdi+bc per rep-stos op is nothing against a >= 256-byte fill.
+    //
+    // FAULT GRANULARITY is unchanged from the std path: TMP1 is block-aligned
+    // before the loop, a block is a power of two no larger than a page, so a
+    // dcbz can neither cross a page nor partially write, and blocks are zeroed
+    // in increasing address order -- on a fault the destination still holds a
+    // byte-exact prefix, and RCX/RDI are still written back only at op end.
+    const uint32_t DBlock = CTX->HostFeatures.DCacheLineSize;
+    const bool UseDcbz = DBlock >= 32 && DBlock <= 256 && (DBlock & (DBlock - 1)) == 0;
+    const uint32_t DBlockShift = UseDcbz ? static_cast<uint32_t>(std::countr_zero(DBlock)) : 0;
+
     PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label dcbz_entry, dcbz_align, dcbz_setup, dcbz_loop;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
     andi_(TMP2, TMP1, 7);
-    bc(CC_EQ, &chunk_setup);
+    bc(CC_EQ, UseDcbz ? &dcbz_entry : &chunk_setup);
     stb(Splat, 0, TMP1);
     addi(TMP1, TMP1, 1);
     addi(TMP4, TMP4, -1);
     b(&align_loop);
+
+    if (UseDcbz) {
+      Bind(&dcbz_entry);
+      // Non-zero fill, or fewer than two blocks left (where the block align-up
+      // would dominate): stay on the std chunk loop.
+      if (Splat != r0) {
+        cmpdi(Splat, 0);
+        bc(CC_NE, &chunk_setup);
+      }
+      cmpldi(TMP4, static_cast<uint16_t>(2 * DBlock));
+      bc(CC_ULT, &chunk_setup);
+
+      // Align up to a block boundary with 8-byte stores. TMP1 is already
+      // 8-byte aligned here, so this runs at most DBlock/8 - 1 times and
+      // consumes at most DBlock-8 bytes -- leaving at least one whole block.
+      Bind(&dcbz_align);
+      andi_(TMP2, TMP1, static_cast<uint16_t>(DBlock - 1));
+      bc(CC_EQ, &dcbz_setup);
+      std(Splat, 0, TMP1);
+      addi(TMP1, TMP1, 8);
+      addi(TMP4, TMP4, -8);
+      b(&dcbz_align);
+
+      Bind(&dcbz_setup);
+      srdi(TMP2, TMP4, DBlockShift);   // number of whole blocks left
+      mtctr(TMP2);
+      andi_(TMP4, TMP4, static_cast<uint16_t>(DBlock - 1));
+      Bind(&dcbz_loop);
+      // r0 in the RA slot of an X-form cache op is the literal-zero form, so
+      // the effective address is exactly TMP1 -- and TMP1 is block-aligned, so
+      // dcbz's truncation to a block boundary is a no-op.
+      dcbz(r(0), TMP1);
+      addi(TMP1, TMP1, static_cast<int16_t>(DBlock));
+      bdnz(&dcbz_loop);
+      // Falls through with TMP4 < DBlock: the std chunk loop and byte tail
+      // finish the remainder.
+    }
 
     // CTR-counted chunk loop: 2 instructions + one CTR back-edge per 8 bytes,
     // versus the previous cmpldi/bc/std/addi/addi/b (6 insns + 2 branches). CTR
