@@ -3971,13 +3971,13 @@ struct fex_gen_param<vkGetRandROutputDisplayEXT, 1, Display*> : fexgen::ptr_pass
 
 // vulkan_wayland.h
 template<>
-struct fex_gen_config<vkCreateWaylandSurfaceKHR> {};
+struct fex_gen_config<vkCreateWaylandSurfaceKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceWaylandPresentationSupportKHR> {};
 
 // vulkan_xcb.h
 template<>
-struct fex_gen_config<vkCreateXcbSurfaceKHR> {};
+struct fex_gen_config<vkCreateXcbSurfaceKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceXcbPresentationSupportKHR> : fexgen::custom_host_impl {};
 template<>
@@ -3985,7 +3985,7 @@ struct fex_gen_param<vkGetPhysicalDeviceXcbPresentationSupportKHR, 2, xcb_connec
 
 // vulkan_xlib.h
 template<>
-struct fex_gen_config<vkCreateXlibSurfaceKHR> {};
+struct fex_gen_config<vkCreateXlibSurfaceKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceXlibPresentationSupportKHR> : fexgen::custom_host_impl {};
 template<>

@@ -503,12 +503,45 @@ static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a_0, VkSurfaceKHR a_1, co
   LDR_PTR(vkDestroySurfaceKHR)(a_0, a_1, nullptr);
 }
 
-// vkCreateXlib/Xcb/WaylandSurfaceKHR are intentionally left thunkgen-default:
-// they have fex_custom_repack_entry hooks that translate the embedded
-// Display*/xcb_connection_t* via x11_manager, and bypassing thunkgen would
-// drop that translation.  The auto-generated path still forwards the guest
-// pAllocator unchanged; that is a latent issue but in practice Xorg/Wayland
-// loaders ignore pAllocator (it is never invoked from inside the WSI path).
+// WSI surface creators (vkCreateXlib/Xcb/WaylandSurfaceKHR).
+//
+// These were previously thunkgen-default because their Vk*SurfaceCreateInfoKHR
+// embeds a Display*/xcb_connection_t* that must be translated via x11_manager
+// (through the fex_custom_repack_entry hooks above).  But the auto-generated
+// unpacker forwarded the guest pAllocator VERBATIM to the native driver.
+// VkAllocationCallbacks is an opaque_type embedding five GUEST function
+// pointers; if a guest supplies a custom allocator the native driver interprets
+// those guest VAs as host code and SEGVs -- the same hazard class as the
+// allocator-nulling family below.  (The WSI path rarely allocates through
+// pAllocator today, which is why this was latent, but "rarely" is not "never":
+// e.g. layered/driver-internal surface bookkeeping can honor it.)
+//
+// Convert them to custom_host_impl so pAllocator can be forced to nullptr.  The
+// Display*/xcb_connection_t* translation is unaffected: the parameter is left
+// non-passthrough, so the generated unpacker still wraps pCreateInfo in a
+// repack_wrapper -- applying the custom entry-repack (dpy/connection + pNext)
+// before this impl runs and the custom exit-repack (HostXFlush) after it
+// returns -- and hands us the already-translated native host pointer.  The only
+// deviation from the auto-generated path is substituting nullptr for the guest
+// pAllocator, exactly like vkCreateDisplayPlaneSurfaceKHR / vkCreateHeadless-
+// SurfaceEXT.  Defined unconditionally so 32-bit and 64-bit thunks both work.
+static VkResult FEXFN_IMPL(vkCreateXlibSurfaceKHR)(VkInstance a_0, const VkXlibSurfaceCreateInfoKHR* a_1,
+                                                   const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateXlibSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateXlibSurfaceKHR");
+  return LDR_PTR(vkCreateXlibSurfaceKHR)(a_0, a_1, nullptr, a_3);
+}
+
+static VkResult FEXFN_IMPL(vkCreateXcbSurfaceKHR)(VkInstance a_0, const VkXcbSurfaceCreateInfoKHR* a_1,
+                                                  const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateXcbSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateXcbSurfaceKHR");
+  return LDR_PTR(vkCreateXcbSurfaceKHR)(a_0, a_1, nullptr, a_3);
+}
+
+static VkResult FEXFN_IMPL(vkCreateWaylandSurfaceKHR)(VkInstance a_0, const VkWaylandSurfaceCreateInfoKHR* a_1,
+                                                      const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateWaylandSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateWaylandSurfaceKHR");
+  return LDR_PTR(vkCreateWaylandSurfaceKHR)(a_0, a_1, nullptr, a_3);
+}
 
 static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplate)(VkDevice a_0, const VkDescriptorUpdateTemplateCreateInfo* a_1,
                                                              const VkAllocationCallbacks* a_2, VkDescriptorUpdateTemplate* a_3) {
@@ -884,6 +917,20 @@ VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipeline
   X(vkCreateValidationCacheEXT)                     \
   X(vkDestroyValidationCacheEXT)
 
+// WSI surface creators.  Same procaddr-routing requirement as the
+// allocator-nulling family: their custom_host_impl wrappers (which force
+// pAllocator = nullptr while translating the embedded Display*/xcb_connection_t*
+// via x11_manager) are only reached on the packed-thunk path.  A name resolved
+// through vkGetInstanceProcAddr / vkGetDeviceProcAddr -- the path volk / layers /
+// most engines actually take -- branches straight to the raw driver entry unless
+// this table returns the wrapper, re-opening the exact pAllocator hole the
+// wrapper closes.  Defined unconditionally (the impl bodies are not bitness-
+// guarded), so this expands outside the IS_32BIT_THUNK guard below.
+#define FEX_VULKAN_WSI_SURFACE_IMPLS(X) \
+  X(vkCreateXlibSurfaceKHR)             \
+  X(vkCreateXcbSurfaceKHR)              \
+  X(vkCreateWaylandSurfaceKHR)
+
 static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   using namespace std::string_view_literals;
 
@@ -893,6 +940,7 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   }
   FEX_VULKAN_CALLBACK_DEFUSING_IMPLS(FEX_VULKAN_PROCADDR_CASE)
   FEX_VULKAN_ALLOCATOR_NULLING_IMPLS(FEX_VULKAN_PROCADDR_CASE)
+  FEX_VULKAN_WSI_SURFACE_IMPLS(FEX_VULKAN_PROCADDR_CASE)
 #ifndef IS_32BIT_THUNK
   FEX_VULKAN_ALLOCATOR_NULLING_IMPLS_64BIT(FEX_VULKAN_PROCADDR_CASE)
 #endif
