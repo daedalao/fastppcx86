@@ -530,6 +530,9 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 }
 
 Bool fexfn_impl_libGL_glXMakeCurrent(Display* Display, GLXDrawable Drawable, GLXContext Context) {
+  // XID args may name a guest-created drawable the host connection has not
+  // seen yet (see X11Manager::GuestSyncForHostDisplay). Rare call; cheap here.
+  x11_manager.GuestSyncForHostDisplay(Display);
   if (FexLibGLDebug()) {
     fprintf(stderr, "[fex-libGL] glXMakeCurrent: display=%p drawable=0x%lx context=%p\n",
             Display, (unsigned long)Drawable, (void*)Context);
@@ -542,6 +545,9 @@ Bool fexfn_impl_libGL_glXMakeCurrent(Display* Display, GLXDrawable Drawable, GLX
 }
 
 Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, GLXDrawable Read, GLXContext Context) {
+  // XID args may name a guest-created drawable the host connection has not
+  // seen yet (see X11Manager::GuestSyncForHostDisplay). Rare call; cheap here.
+  x11_manager.GuestSyncForHostDisplay(Display);
   if (FexLibGLDebug()) {
     fprintf(stderr, "[fex-libGL] glXMakeContextCurrent: display=%p draw=0x%lx read=0x%lx context=%p\n",
             Display, (unsigned long)Draw, (unsigned long)Read, (void*)Context);
@@ -554,6 +560,7 @@ Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, 
 }
 
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display* Display, guest_layout<XVisualInfo*> Info, Pixmap Pixmap) {
+  x11_manager.GuestSyncForHostDisplay(Display);
   auto HostInfo = LookupHostVisualInfo(Display, Info);
   auto ret = fexldr_ptr_libGL_glXCreateGLXPixmap(Display, HostInfo, Pixmap);
   x11_manager.HostXFree(HostInfo);
@@ -561,6 +568,7 @@ GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display* Display, guest_layout<XVi
 }
 
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmapMESA(Display* Display, guest_layout<XVisualInfo*> Info, Pixmap Pixmap, Colormap Colormap) {
+  x11_manager.GuestSyncForHostDisplay(Display);
   auto HostInfo = LookupHostVisualInfo(Display, Info);
   auto ret = fexldr_ptr_libGL_glXCreateGLXPixmapMESA(Display, HostInfo, Pixmap, Colormap);
   x11_manager.HostXFree(HostInfo);

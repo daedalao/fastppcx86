@@ -162,6 +162,33 @@ struct X11Manager {
     return it->second;
   }
 
+  // Sync the GUEST connection for a display we only know by its host handle.
+  // For the XID-taking GLX entry points (glXMakeCurrent and friends): the
+  // Window/Pixmap they name was created on the guest connection and may still
+  // sit in the guest Xlib's request buffer — the host connection would hit
+  // BadDrawable (Grimrock's bootstrap does exactly this: XCreateWindow lands
+  // between the first Display-taking call and glXMakeCurrent, so the
+  // first-mapping sync in GuestToHostDisplay has already come and gone).
+  // These entry points are bootstrap/mode-change rare, so paying the guest
+  // trampoline here costs nothing per-frame. Must NOT be called with `mutex`
+  // held: GuestXSync re-enters the guest, which may call back into this
+  // manager.
+  void GuestSyncForHostDisplay(const _XDisplay* host) {
+    if (!GuestXSync) {
+      return;
+    }
+    _XDisplay* guest = nullptr;
+    {
+      std::unique_lock lock(mutex);
+      if (auto it = displays_reverse.find(host); it != displays_reverse.end()) {
+        guest = it->second;
+      }
+    }
+    if (guest) {
+      GuestXSync(guest, 0);
+    }
+  }
+
   guest_layout<_XDisplay*> HostToGuestDisplay(const _XDisplay* from) {
     if (from == nullptr) {
       return {.data = 0};
