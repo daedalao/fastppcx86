@@ -53,7 +53,7 @@ DEF_OP(EntrypointOffset) {
   // S3.7-C2: `Entry + Op->Offset` is a guest RIP baked into 20 bytes of
   // host constant-load; mirrors ARM64 JIT/ALUOps.cpp:67. The mask is
   // applied at emit time so the recorded value equals the emitted value.
-  InsertGuestRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
+  InsertEntrypointRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
 }
 
 DEF_OP(InlineConstant)         { /* nop — handled by IsInlineConstant */ }
