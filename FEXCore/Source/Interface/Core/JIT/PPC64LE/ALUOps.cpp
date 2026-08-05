@@ -797,10 +797,22 @@ DEF_OP(AndWithFlags) {
   // retain prior values. Without this clear, x86 TEST/AND followed by LAHF/
   // PUSHF / Jcc-on-CF reads stale CA — manifests as a phantom CF=1 in
   // Primary_84/85, Primary_A9, BLSI_flags, BLSR_flags, etc.
-  mfspr(TMP1, 1);
-  LoadConstant(TMP4, 0x60000000ull);   // mask: bits 29 (CA) + 30 (OV)
-  andc(TMP1, TMP1, TMP4);
-  mtspr(1, TMP1);
+  //
+  // A single OE=1 add of 0+0 replaces the mfspr/LoadConstant/andc/mtspr XER
+  // round trip — see the full equivalence proof above the identical
+  // `addco(TMP1, r0, r0)` in DEF_OP(TestNZ). In brief:
+  //   * the old mask 0x60000000 = LSB bits 30|29 = OV|CA, andc'd off, so the
+  //     old sequence cleared exactly CA and OV and preserved the sticky SO.
+  //   * addco writes CA = carry-out and OV = signed overflow of the add;
+  //     0 + 0 produces neither, so CA = OV = 0.  SO is sticky (hardware only
+  //     ORs OV into it, never clears it), so SO survives — matching andc.
+  //   * Rc = 0 (`addco`, not `addco_`), so CR0 — which holds the guest N/Z
+  //     just set by the and./andi. above and refined by EmitTestNZSetCR
+  //     below — is NOT touched.
+  // r0 is the JIT's zero-index invariant register (see PPC64Dispatcher.cpp),
+  // so this really is 0 + 0.  TMP1 is dead here: nothing in this handler
+  // reads it before this point, and EmitTestNZSetCR overwrites it next.
+  addco(TMP1, r0, r0);
   // CR0 from and./andi. covers full 64 bits; refine to operand size so SF/ZF
   // reflect only the low N bits (high garbage from S1 must not leak into Z/N).
   if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(Dst, IROp->Size);
