@@ -689,12 +689,17 @@ DEF_OP(LoadMemPair) {
     GPR Base = ComputeOffsetAddrInto(*this, Addr, Offset, TMP1);
     auto D1 = GetReg(Op->OutValue1);
     auto D2 = GetReg(Op->OutValue2);
-    li(TMP4, static_cast<int16_t>(Stride));
+    // D-form: Stride is 1/2/4/8, so the second half's displacement always
+    // fits the 16-bit field, and 8 satisfies ld's DS-form 4-byte alignment.
+    // The index registers this drops (an li of the stride, plus r0 for the
+    // first half) were pure overhead in a sequence Mono runs in every
+    // function prologue.
+    const int16_t S = static_cast<int16_t>(Stride);
     switch (IROp->Size) {
-    case IR::OpSize::i8Bit:  lbzx(D1, Base, r0); lbzx(D2, Base, TMP4); break;
-    case IR::OpSize::i16Bit: lhzx(D1, Base, r0); lhzx(D2, Base, TMP4); break;
-    case IR::OpSize::i32Bit: lwzx(D1, Base, r0); lwzx(D2, Base, TMP4); break;
-    case IR::OpSize::i64Bit: ldx (D1, Base, r0); ldx (D2, Base, TMP4); break;
+    case IR::OpSize::i8Bit:  lbz(D1, 0, Base); lbz(D2, S, Base); break;
+    case IR::OpSize::i16Bit: lhz(D1, 0, Base); lhz(D2, S, Base); break;
+    case IR::OpSize::i32Bit: lwz(D1, 0, Base); lwz(D2, S, Base); break;
+    case IR::OpSize::i64Bit: ld (D1, 0, Base); ld (D2, S, Base); break;
     default: break;
     }
   } else {
@@ -767,12 +772,13 @@ DEF_OP(StoreMemPair) {
     GPR Base = ComputeOffsetAddrInto(*this, Addr, Offset, TMP1);
     auto S1 = GetReg(Op->Value1);
     auto S2 = GetReg(Op->Value2);
-    li(TMP4, static_cast<int16_t>(Stride));
+    // D-form, same reasoning as LoadMemPair.
+    const int16_t S = static_cast<int16_t>(Stride);
     switch (IROp->Size) {
-    case IR::OpSize::i8Bit:  stbx(S1, Base, r0); stbx(S2, Base, TMP4); break;
-    case IR::OpSize::i16Bit: sthx(S1, Base, r0); sthx(S2, Base, TMP4); break;
-    case IR::OpSize::i32Bit: stwx(S1, Base, r0); stwx(S2, Base, TMP4); break;
-    case IR::OpSize::i64Bit: stdx(S1, Base, r0); stdx(S2, Base, TMP4); break;
+    case IR::OpSize::i8Bit:  stb(S1, 0, Base); stb(S2, S, Base); break;
+    case IR::OpSize::i16Bit: sth(S1, 0, Base); sth(S2, S, Base); break;
+    case IR::OpSize::i32Bit: stw(S1, 0, Base); stw(S2, S, Base); break;
+    case IR::OpSize::i64Bit: std(S1, 0, Base); std(S2, S, Base); break;
     default: break;
     }
   } else {
@@ -978,14 +984,12 @@ DEF_OP(PushTwo) {
   auto S2 = GetReg(Op->Value2);
   switch (SZ) {
   case 4:
-    stwx(S1, RSP, r0);
-    li(TMP4, 4);
-    stwx(S2, RSP, TMP4);
+    stw(S1, 0, RSP);
+    stw(S2, 4, RSP);
     break;
   case 8:
-    stdx(S1, RSP, r0);
-    li(TMP4, 8);
-    stdx(S2, RSP, TMP4);
+    std(S1, 0, RSP);
+    std(S2, 8, RSP);
     break;
   default:
     LOGMAN_MSG_A_FMT("PushTwo: unsupported ValueSize {}", SZ);
@@ -1060,15 +1064,14 @@ DEF_OP(PopTwo) {
     rldicl(TMP3, Addr, 0, 32);
     LoadBase = TMP3;
   }
-  li(TMP4, static_cast<int16_t>(SZ));
   switch (SZ) {
   case 4:
-    lwzx(TMP1, LoadBase, r0);          // TMP1 = [Addr+0]
-    lwzx(TMP2, LoadBase, TMP4);        // TMP2 = [Addr+SZ]
+    lwz(TMP1, 0, LoadBase);            // TMP1 = [Addr+0]
+    lwz(TMP2, 4, LoadBase);            // TMP2 = [Addr+SZ]
     break;
   case 8:
-    ldx(TMP1, LoadBase, r0);
-    ldx(TMP2, LoadBase, TMP4);
+    ld(TMP1, 0, LoadBase);
+    ld(TMP2, 8, LoadBase);
     break;
   default:
     LOGMAN_MSG_A_FMT("PopTwo: unsupported Size {}", SZ);
