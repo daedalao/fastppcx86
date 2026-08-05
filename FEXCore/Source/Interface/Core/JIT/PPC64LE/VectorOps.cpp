@@ -2203,8 +2203,16 @@ DEF_OP(VTrn2) {
 }
 
 // ---------------------------------------------------------------------------
-// Float binary ops — f32 uses AltiVec vaddfp/vsubfp/vminfp/vmaxfp where
-// possible; everything else (and f64) goes through VSX xv* instructions.
+// Float binary ops — f32 min/max still use AltiVec vminfp/vmaxfp; arithmetic
+// (add/sub/mul/div) and everything f64 goes through VSX xv* instructions.
+//
+// Add and sub deliberately use xvaddsp/xvsubsp rather than AltiVec
+// vaddfp/vsubfp. The AltiVec forms are Java/IEEE-mode VMX float ops: they
+// always round to nearest and ignore FPSCR.RN entirely, whereas VFMul and
+// VFDiv have always lowered to xvmulsp/xvdivsp, which honour it. Mixing the
+// two meant a single guest expression could round its multiplies under the
+// guest's selected MXCSR rounding mode and its adds under round-to-nearest.
+// Making all four VSX removes that inconsistency.
 // xv* op on a 128-bit VR operates element-wise on either 4×f32 or 2×f64;
 // since both x86 and PPC operate per-lane and our VR layout matches LE-natural
 // element ordering after `lvx`, no byte-swap is needed.
@@ -2217,7 +2225,7 @@ DEF_OP(VFAdd) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   switch (ElemSz) {
-  case IR::OpSize::i32Bit: vaddfp (Dst, V1, V2); break;
+  case IR::OpSize::i32Bit: xvaddsp(Dst, V1, V2); break;
   case IR::OpSize::i64Bit: xvadddp(Dst, V1, V2); break;
   default: Op_Unhandled(IROp, Node); break;
   }
@@ -2265,7 +2273,7 @@ DEF_OP(VFSub) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   switch (ElemSz) {
-  case IR::OpSize::i32Bit: vsubfp (Dst, V1, V2); break;
+  case IR::OpSize::i32Bit: xvsubsp(Dst, V1, V2); break;
   case IR::OpSize::i64Bit: xvsubdp(Dst, V1, V2); break;
   default: Op_Unhandled(IROp, Node); break;
   }
