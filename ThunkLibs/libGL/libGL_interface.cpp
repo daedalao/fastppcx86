@@ -214,9 +214,12 @@ struct fex_gen_config<glXCreateGLXPixmap> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<glXCreateGLXPixmap, 1, XVisualInfo*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glXCreatePixmap> {};
+struct fex_gen_config<glXCreatePixmap> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<glXCreateWindow> {};
+// custom_host_impl for the guest-XID sync (see GuestSyncForHostDisplay): these
+// take a guest-created Window/Pixmap, and SDL2's GLX 1.3 path reaches
+// glXCreateWindow without ever calling glXMakeCurrent first (Grimrock).
+struct fex_gen_config<glXCreateWindow> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXGetConfig> : fexgen::custom_host_impl {};
 template<>

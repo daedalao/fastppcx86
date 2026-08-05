@@ -559,6 +559,23 @@ Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, 
   return ret;
 }
 
+GLXWindow fexfn_impl_libGL_glXCreateWindow(Display* Display, GLXFBConfig Config, Window Win, const int* AttribList) {
+  // `Win` was created on the guest connection; sync it visible to the host
+  // connection first. This is the path SDL2/GLX-1.3 titles take INSTEAD of
+  // glXMakeCurrent-first (Grimrock: BadDrawable on GLXGetDrawableAttributes,
+  // "failed to create drawable", before any MakeCurrent).
+  x11_manager.GuestSyncForHostDisplay(Display);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXCreateWindow: display=%p win=0x%lx\n", Display, (unsigned long)Win);
+  }
+  return fexldr_ptr_libGL_glXCreateWindow(Display, Config, Win, AttribList);
+}
+
+GLXPixmap fexfn_impl_libGL_glXCreatePixmap(Display* Display, GLXFBConfig Config, Pixmap Pixmap, const int* AttribList) {
+  x11_manager.GuestSyncForHostDisplay(Display);
+  return fexldr_ptr_libGL_glXCreatePixmap(Display, Config, Pixmap, AttribList);
+}
+
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display* Display, guest_layout<XVisualInfo*> Info, Pixmap Pixmap) {
   x11_manager.GuestSyncForHostDisplay(Display);
   auto HostInfo = LookupHostVisualInfo(Display, Info);
