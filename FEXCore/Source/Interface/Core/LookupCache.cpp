@@ -56,7 +56,9 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
   LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
 
-  // Disable THP on the Lookup cache.
+  // Disable THP across the whole reservation by default: the L2 *entry pool*
+  // (the CODE_SIZE middle region) is bump-allocated sparsely and does not want
+  // 2 MiB granularity. The two randomly-indexed tables re-enable it below.
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
 
   FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
@@ -73,6 +75,37 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // L1 Cache
   L1Pointer = PageMemory + CODE_SIZE;
   FEXCore::Allocator::VirtualName("FEXMem_Lookup_L1", reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
+
+  // THP hints for the two tables that are indexed by a *hash of the guest RIP*
+  // rather than walked, so every lookup is an independent dTLB miss candidate.
+  // Both are advisory: madvise failure (no THP in the kernel, THP set to
+  // "never", MADV_HUGEPAGE unsupported) changes nothing but the miss rate,
+  // and VirtualTHPControl is already a no-op when the allocator has no THP
+  // hook. Neither call changes any address, size or access rule.
+  //
+  //  * L1: MAX_L1_ENTRIES * 16 == 16 MiB of reservation, indexed by
+  //    (RIP & L1PointerMask). It is densely used from L1Pointer upwards --
+  //    the mask only ever selects a prefix -- so THP costs at most one huge
+  //    page of slack past the live prefix even at MIN_L1_ENTRIES.
+  //  * L2 page-pointer array: one pointer per guest page over the whole
+  //    VirtualMemSize (128 MiB at 64 GiB), indexed by guest page number. A
+  //    single huge page covers 256K guest pages == 1 GiB of guest VA, so the
+  //    resident set stays proportional to how far apart the guest's code
+  //    mappings actually are.
+  //
+  // Interaction with MADV_DONTNEED (ScrubForLazySMC, the DynamicL1Cache resize
+  // path, ClearL2Cache, ClearThreadLocalCaches): DONTNEED over a THP-backed
+  // range is well defined -- the kernel zaps whole huge pages inside the range
+  // and splits the PMD only for a huge page the range partially covers. The L1
+  // scrubs always pass the *entire* MAX_L1_SIZE so they zap whole pages and
+  // never split. Signal-safety of ScrubForLazySMC is unaffected either way: it
+  // is still exactly one madvise() syscall with no userspace allocation, and
+  // the memset fallback still works if it fails. The only behavioural change
+  // is that the first touch after a scrub re-faults at huge-page granularity.
+  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(L1Pointer), MAX_L1_SIZE, FEXCore::Allocator::THPControl::Enable);
+  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer),
+                                        ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8,
+                                        FEXCore::Allocator::THPControl::Enable);
 
   VirtualMemSize = ctx->Config.VirtualMemSize;
 

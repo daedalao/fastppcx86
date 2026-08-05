@@ -851,6 +851,11 @@ public:
       const auto FlushWholeL1 = [&] {
         // Same failure-hardening as ScrubForLazySMC: a failed madvise must not
         // silently leave stale entries.
+        // A "resize" only moves L1PointerMask inside the MAX_L1_SIZE mapping
+        // reserved by the constructor -- nothing is reallocated -- so the
+        // constructor's MADV_HUGEPAGE hint keeps covering the table at every
+        // size. This DONTNEED spans the whole mapping, so it zaps whole huge
+        // pages and never has to split one.
         if (::madvise(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, MADV_DONTNEED) != 0) {
           std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
         }
@@ -1051,6 +1056,12 @@ public:
     // stale L1 entries in place and reopen the same-thread hole this exists to
     // close, so the result must be checked; fall back to zeroing by hand.
     // Both paths are async-signal-safe.
+    //
+    // The L1 carries a MADV_HUGEPAGE hint (LookupCache's constructor). That
+    // does not weaken anything here: this range is the ENTIRE L1 mapping, so
+    // DONTNEED zaps whole huge pages rather than splitting a PMD, and the call
+    // is still one syscall with no userspace allocation. The only difference
+    // is that the post-scrub refill faults at huge-page granularity.
     if (::madvise(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE, MADV_DONTNEED) != 0) {
       std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
     }
