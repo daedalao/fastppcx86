@@ -4355,13 +4355,10 @@ DEF_OP(VDupFromGPR) {
     vspltw(Dst, VTMP1, SplatWordIdx(0));
     break;
   case IR::OpSize::i64Bit:
-    // Stack-roundtrip 64-bit duplicate (avoids the undefined-doubleword hazard
-    // of vsldoi(VTMP1, VTMP1, ..., 8)).
-    std(Src, -16, r1);
-    std(Src,  -8, r1);
-    addi(TMP1, r1, -16);
-    li(TMP2, 0);
-    lvx(Dst, TMP1, TMP2);
+    // VTMP1 above is already Src duplicated into both doublewords, which is
+    // exactly the i64 result -- the old stack roundtrip recomputed it. Still
+    // no vsldoi(VTMP1, VTMP1, ..., 8): that would read the ISA-undefined half.
+    vmr(Dst, VTMP1);
     break;
   default:
     break;
@@ -4375,17 +4372,19 @@ DEF_OP(VLoadTwoGPRs) {
   const auto Hi  = GetReg(Op->Upper);
 
   // Build a 128-bit vector with Lo at LE element 0 (low 64 bits, memory
-  // bytes 0-7) and Hi at LE element 1 (memory bytes 8-15). On PPC64LE Linux
-  // (MSR.LE=1), `lvx`/`stvx` use little-endian byte semantics — the same
-  // convention that the FABI bridge stubs rely on with `stvx; lfd offset 0`
-  // to extract a double from LE element 0. So store Lo at the low address
-  // (-16) and Hi at the high address (-8); lvx then puts Lo bytes into
-  // physical positions 0-7 and Hi bytes into 8-15.
-  std(Lo, -16, r1);
-  std(Hi,  -8, r1);
-  addi(TMP1, r1, -16);
-  li(TMP2, 0);
-  lvx(Dst, TMP1, TMP2);
+  // bytes 0-7) and Hi at LE element 1 (memory bytes 8-15).
+  //
+  // mtvsrd defines the doubleword that xxpermdi reads as index 0 -- the same
+  // half mfvsrd sees, which in FEX's LE layout is element 1. xxpermdi(XT, XA,
+  // XB, DM) takes XT's index-0 half from XA's index-(DM>>1) half and XT's
+  // index-1 half from XB's index-(DM&1) half, so with Hi and Lo each parked
+  // in their register's index-0 half, dm=0 lands Hi at LE element 1 and Lo at
+  // LE element 0. Byte-identical to the std/std/lvx roundtrip it replaces
+  // (checked on POWER8 by stvx'ing both forms with distinguishable halves),
+  // three instructions instead of five and no store-hit-load.
+  mtvsrd(VTMP1, Hi);
+  mtvsrd(VTMP2, Lo);
+  xxpermdi(Dst, VTMP1, VTMP2, 0);
 }
 
 DEF_OP(Float_FromGPR_S) {
