@@ -1803,18 +1803,20 @@ DEF_OP(SubNZCV) {
 void PPC64JITCore::EmitTestNZSetCR(GPR Result, IR::OpSize Size) {
   // Sign-extend into TMP1 (don't clobber Result — callers may pass an SSA
   // Dst whose natural value must remain zero-extended for downstream uses).
+  // The record forms collapse the old `extsX ; cmpdi 0` pair into one
+  // instruction: extsX. writes CR0 from a signed comparison of the 64-bit
+  // sign-extended result against zero — bit-for-bit what the cmpdi produced
+  // (LT = sign bit of the <Size>-wide value = N, EQ = low <Size> bits zero
+  // = Z, SO copied from XER.SO exactly as cmpdi copies it).
   switch (Size) {
     case IR::OpSize::i8Bit:
-      extsb(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsb_(TMP1, Result);
       return;
     case IR::OpSize::i16Bit:
-      extsh(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsh_(TMP1, Result);
       return;
     case IR::OpSize::i32Bit:
-      extsw(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsw_(TMP1, Result);
       return;
     case IR::OpSize::i64Bit:
     default:
@@ -1863,7 +1865,12 @@ DEF_OP(TestNZ) {
   // use of it ended at the mtspr, and EmitTestNZSetCR overwrites it next.
   addco(TMP1, r0, r0);
   // Refine CR0 to reflect ONLY the IR operand-size's worth of bits.
-  EmitTestNZSetCR(TMP3, IROp->Size);
+  // At i64 there is nothing to refine: the and./andi. above already set CR0
+  // from a signed comparison of the full 64-bit result against zero, which is
+  // precisely what EmitTestNZSetCR's i64 case (`cmpdi Result, 0`) recomputes,
+  // and the intervening addco has Rc=0 so CR0 still holds it. Skip it — same
+  // guard DEF_OP(AndWithFlags) already applies.
+  if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(TMP3, IROp->Size);
 }
 
 DEF_OP(TestZ) {
@@ -1884,7 +1891,9 @@ DEF_OP(TestZ) {
   // (CA/OV cleared, sticky SO preserved, CR0 untouched because Rc=0).
   // TMP1 is dead here for the same reason: EmitTestNZSetCR writes it next.
   addco(TMP1, r0, r0);
-  EmitTestNZSetCR(TMP3, IROp->Size);
+  // Same i64 redundancy as TestNZ above: and./andi. already set CR0 over the
+  // full 64 bits and addco (Rc=0) left it alone, so the cmpdi is a no-op.
+  if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(TMP3, IROp->Size);
 }
 
 DEF_OP(Adc) {

@@ -438,6 +438,15 @@ public:
   // extsw RA, RS (extend word sign, XO 986)
   void extsw(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 986, 0); }
 
+  // Record forms of the sign-extends (Rc=1). ISA: "extsb.", "extsh.", "extsw.".
+  // CR0 is set exactly as by a `cmpdi RA, 0` on the 64-bit sign-extended
+  // result — LT/GT/EQ from the signed comparison of the full doubleword
+  // against zero, SO copied from XER.SO — so `extsX. rT, rS` is a drop-in
+  // replacement for the two-instruction `extsX rT, rS ; cmpdi rT, 0` pair.
+  void extsb_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 954, 1); }
+  void extsh_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 922, 1); }
+  void extsw_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 986, 1); }
+
   // cntlzw RA, RS (count leading zeros word, XO 26)
   void cntlzw(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 26, 0); }
 
