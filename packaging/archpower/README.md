@@ -1,19 +1,19 @@
 # Arch Linux POWER packaging for FastPPCx86
 
-`PKGBUILD` for `fastppcx86` — the ppc64le x86/x86-64 emulator (downstream port of
+`PKGBUILD` for `fastppcx86`, the ppc64le x86/x86-64 emulator (downstream port of
 FEX-Emu). Targets [Arch Linux POWER](https://archlinuxpower.org/), whose
 architecture name is `powerpc64le`.
 
 ## Host requirements
 
-* An Arch POWER (`powerpc64le`) machine — POWER8 or newer. Cross-building is not
+* An Arch POWER (`powerpc64le`) machine, POWER8 or newer. Cross-building is not
   supported here.
 * `clang` **and** `lld`. FEX hard-fails on GCC (`FATAL_ERROR` in the top-level
   `CMakeLists.txt`); clang 13+ is the minimum, and the build is validated with
   the current Arch POWER clang.
 * `cmake`, `ninja`, `python`, `git`, `gdb` (for `jit-reader.h`, used by the
   GDB symbol integration), `llvm`.
-* Optional: `range-v3` — if the system package is installed it is used, otherwise
+* Optional: `range-v3`. If the system package is installed it is used, otherwise
   the bundled submodule is compiled.
 * Network access for the first build: the third-party submodules (`fmt`,
   `xxhash`, `range-v3`, `unordered_dense`, `jemalloc_glibc`, `rpmalloc`,
@@ -23,8 +23,8 @@ architecture name is `powerpc64le`.
 
 ### 4K page kernel
 
-The SMC (self-modifying-code) `mtrack` path — which is what makes Mono/Unity
-titles usable — needs a **4 KiB page-size kernel**. Arch POWER's stock kernel
+The SMC (self-modifying-code) `mtrack` path, which is what makes Mono/Unity
+titles usable, needs a **4 KiB page-size kernel**. Arch POWER's stock kernel
 builds exist in both 4K and 64K page flavours; check with `getconf PAGESIZE`
 (must print `4096`). On a 64K-page kernel the emulator still runs but falls back
 to a slower software SMC path.
@@ -42,7 +42,7 @@ makepkg -s
 
 The `source` array points at the git repository this PKGBUILD lives in
 (`$startdir/../..`), so the package always builds the checkout you are standing
-in — including uncommitted *commits*, though not uncommitted working-tree
+in, including uncommitted *commits*, though not uncommitted working-tree
 changes (makepkg clones from `HEAD` of the repo, not from the dirty tree).
 
 To build a different checkout or a remote:
@@ -96,27 +96,27 @@ The CMake options mirror the known-good POWER9 development build:
 ### Thunks
 
 Host/guest thunk libraries (GL, Vulkan, X11, SDL2, ALSA, …) are **not** built by
-this package. They need an `x86_64-pc-linux-gnu` cross toolchain — and the
+this package. They need an `x86_64-pc-linux-gnu` cross toolchain, and the
 32-bit set additionally an i686 one, which Arch POWER does not ship. Build them
 out of tree with `-DBUILD_THUNKS=ON` and install into `/usr/lib/fex-emu` and
 `/usr/share/fex-emu` alongside the package if you need them.
 
 ## What gets installed
 
-* `/usr/bin/` — `FEX` (the loader/interpreter), `FEXInterpreter` (compat symlink
+* `/usr/bin/`: `FEX` (the loader/interpreter), `FEXInterpreter` (compat symlink
   to `FEX`), `FEXServer`, `FEXBash`, `FEXConfig`, `FEXGetConfig`,
   `FEXRootFSFetcher`, `FEXOfflineCompiler`, `FEXpidof`
 * `/usr/lib/libFEXCore.so`, `/usr/lib/gdb/libFEXGDBReader.so` and the FEXCore
   headers under `/usr/include/FEXCore/` (upstream's `Development` install
   component; they are the companion to the installed shared library)
-* `/usr/share/fex-emu/` — `ThunksDB.json` and the per-application config JSONs
+* `/usr/share/fex-emu/`: `ThunksDB.json` and the per-application config JSONs
   from `Data/AppConfig/`
-* `/usr/lib/binfmt.d/FEX-x86.conf`, `FEX-x86_64.conf` — binfmt_misc handlers.
+* `/usr/lib/binfmt.d/FEX-x86.conf`, `FEX-x86_64.conf`: binfmt_misc handlers.
   Upstream only installs these on aarch64 hosts, so the PKGBUILD generates them
   from the same `.conf.in` templates. Activate with
   `systemctl restart systemd-binfmt`.
 * `/usr/share/man/man1/FEX.1.gz`
-* `/usr/share/doc/fastppcx86/` — `README.md` and, when present, `GAMING.md`
+* `/usr/share/doc/fastppcx86/`: `README.md` and, when present, `GAMING.md`
 * `/usr/share/licenses/fastppcx86/LICENSE` (MIT, from upstream FEX)
 
 ## Validation
@@ -131,7 +131,7 @@ pacman -Qlp fastppcx86-*.pkg.tar.zst
 
 `namcap PKGBUILD` is clean. On the package itself the only remaining warnings
 are `Dependency included, but may not be needed` for `glibc`, `gcc-libs`, `fmt`,
-`xxhash` and `qt6-base` — namcap's provider resolution on Arch POWER is
+`xxhash` and `qt6-base`. Namcap's provider resolution on Arch POWER is
 inconsistent here (it simultaneously reports those same libraries as referenced
 by the binaries), and all five really are linked. The `fastppcx86-debug`
 package's `Symlink ... points to non-existing` errors are the normal artefact of
@@ -143,4 +143,4 @@ produces a `fastppcx86-debug` package. FEX resolves its own SIGILL/JIT frames
 from symbols, so keep that package around when debugging emulation problems.
 
 The build was validated on a POWER9 host (Arch POWER, clang 22.1.8, cmake 4.4,
-ninja 1.13) — see the top of this file for the polite-build invocation.
+ninja 1.13). See the top of this file for the polite-build invocation.

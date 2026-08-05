@@ -16,8 +16,8 @@ told. On a host booted with 64K pages, mtrack misbehaves or aborts. Boot a 4K ke
 everything with `FEX_SMCCHECKS=full`, which validates code before every run and is much slower.
 Check with `getconf PAGESIZE`.
 
-**An x86-64 root filesystem.** Everything the guest links against — glibc, SDL, libX11, Mesa's
-guest-side stubs — comes from the rootfs, not from the host. `FEXRootFSFetcher` downloads a
+**An x86-64 root filesystem.** Everything the guest links against (glibc, SDL, libX11, Mesa's
+guest-side stubs) comes from the rootfs, not from the host. `FEXRootFSFetcher` downloads a
 prebuilt image, or point `FEX_ROOTFS` at a directory you populated yourself. Games that ship their
 own bundled libraries still need the rootfs for libc.
 
@@ -45,7 +45,7 @@ export DISPLAY=:0
 export XAUTHORITY=$(ls -t "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/xauth_* | head -1)
 ```
 
-A stale `XAUTHORITY` fails late — after the guest has started and linked — with "Unable to open
+A stale `XAUTHORITY` fails late, after the guest has started and linked, with "Unable to open
 display", which reads like a graphics bug and is not one.
 
 ## The CPU cage
@@ -56,14 +56,14 @@ unplayable.
 Unity sizes its worker and job pools from the CPU count the guest reports. On an 80-thread POWER8
 an uncaged guest builds a pool of about 79 workers, and the pool's park gate is a check that no
 worker is currently inside the steal window. At that oversubscription the gate is never satisfied
-— occupancy was measured between 20 and 51 across 13000 samples and never reached zero — so the
+(occupancy was measured between 20 and 51 across 13000 samples and never reached zero), so the
 pool spins instead of parking, saturating the machine while the game crawls. Hard West ran at
 roughly 2 fps this way. The cage fixes it by shrinking the pool: since commit `9a0f8e1be` the
 emulated `/proc/cpuinfo` is bounded by the process affinity mask, so a caged process reports the
 caged count and Unity sizes its pools accordingly.
 
-POWER8 and POWER9 number online CPUs sparsely — in SMT4 the online set looks like `0-3,8-11,…`,
-one group of four per core — so list explicit threads rather than a range.
+POWER8 and POWER9 number online CPUs sparsely. In SMT4 the online set looks like `0-3,8-11,...`,
+one group of four per core, so list explicit threads rather than a range.
 
 Two threads per core, eight cores:
 
@@ -86,7 +86,7 @@ you want a small pool but a wide affinity mask, or on a build older than `9a0f8e
 
 ## SMC recipes
 
-Guests that generate code at runtime — every Mono or .NET title — write to pages the emulator has
+Guests that generate code at runtime, which is every Mono or .NET title, write to pages the emulator has
 translated. The tracker faults on those writes and throws away the affected translations. How
 aggressively it does that is a per-title tradeoff, and the recipes below are the combinations
 worth trying. All of them require `FEX_SMCCHECKS=mtrack`.
@@ -130,7 +130,7 @@ Pair lazy with `FEX_SMCLAZYLINK=1`. Without it, lazy invalidation turns off bloc
 and in Moonlighter combat profiling `ExitFunctionLink` became the hottest symbol at 7.3%; with
 lazy linking it drops to 0.10%, and the improvement scales with the number of on-screen entities.
 
-The recipes stack — everything at once is a valid experiment — but each piece has far more
+The recipes stack, and everything at once is a valid experiment, but each piece has far more
 mileage individually than the full combination does. Prefer semantic patching or lazy.
 
 Profile before assuming a recipe is the answer. A flat guest profile means raw emulated throughput
@@ -141,16 +141,16 @@ count, not by invalidation.
 
 These are the ones that earned their place in real sessions.
 
-`FEX_ENABLEAVX=0` — pushes guest code onto SSE paths. POWER's vector units are 128-bit, so
+`FEX_ENABLEAVX=0` pushes guest code onto SSE paths. POWER's vector units are 128-bit, so
 emulating 256-bit AVX costs more than the guest saves by using it; glibc string routines measured
-36–67% faster with AVX reporting off. Not a universal win — A/B it. Moonlighter was faster with
+36 to 67% faster with AVX reporting off. Not a universal win, so A/B it. Moonlighter was faster with
 AVX left on.
 
-`FEX_REPORTED_CPUS=N` — see the cage section above.
+`FEX_REPORTED_CPUS=N`: see the cage section above.
 
-`FEX_SMCLAZYLINK=1` — see the lazy recipe above.
+`FEX_SMCLAZYLINK=1`: see the lazy recipe above.
 
-`FEX_LOCKONLYTSO=1` — the emulator normally emits acquire/release sequences around every guest
+`FEX_LOCKONLYTSO=1` restricts ordering work: the emulator normally emits acquire/release sequences around every guest
 load and store to preserve x86's memory ordering on a weakly-ordered host. This restricts that to
 instructions actually carrying a `LOCK` prefix, plus ranges explicitly forced by Mono detection.
 Plain loads become cheap loads. **This is a real correctness tradeoff, not free speed:** guest code
@@ -158,7 +158,7 @@ that relies on a non-`LOCK` volatile read being visible across threads can race 
 glibc futex and lazy-symbol-resolution paths are understood to be safe, which is why it is usable
 at all; anything beyond that is your risk. It does nothing if `FEX_TSOENABLED=0`.
 
-`FEX_SPINLOOPCLAMP` / `FEX_SPINLOOPCLAMPAUTO=1` — short-circuits recognized library spin-wait
+`FEX_SPINLOOPCLAMP` / `FEX_SPINLOOPCLAMPAUTO=1` short-circuits recognized library spin-wait
 loops. No longer required for correctness anywhere in the census, but the automatic form was
 short-circuiting around 1017 library spin loops in Ziggurat, so it remains a measurable
 performance opt-in. Off by default; arm it per title.
@@ -182,7 +182,7 @@ measurement of it. More templates are in [AppConfigRecipes.md](AppConfigRecipes.
 
 Steam runs, logs in, and launches titles, with caveats.
 
-Launch it through `FEXBash` rather than `FEX` — `steam.sh` is a shell script, and the whole client
+Launch it through `FEXBash` rather than `FEX`. `steam.sh` is a shell script, and the whole client
 is a tree of scripts and helper processes that must all end up inside the guest:
 
 ```sh
@@ -206,13 +206,13 @@ If a session ends suspiciously punctually, check for a timeout wrapper first.
 **Keep the ALSA thunk off.** `"asound": 1` in the `ThunksDB` block crash-loops `steamwebhelper`
 every ten seconds with a "steamwebhelper is not responding" dialog: the guest-side stub exports no
 ELF symbol versions, so every versioned ALSA lookup out of `libcef.so` fails. Set `"asound": 0`.
-Nothing needs it — game audio goes through PulseAudio.
+Nothing needs it; game audio goes through PulseAudio.
 
 ### Adding a library folder on another drive
 
 Steam enumerates mountable drives through udisks, which is not present in the guest rootfs, so
 "Add Library Folder" will not offer your other disks. Add the mount to the rootfs's own
-`/etc/fstab` instead — an entry there makes the path visible to the guest as a mount, and Steam
+`/etc/fstab` instead. An entry there makes the path visible to the guest as a mount, and Steam
 will accept it as a library location. The host must have the filesystem mounted at the same path.
 
 ## Troubleshooting
@@ -220,7 +220,7 @@ will accept it as a library location. The host must have the filesystem mounted 
 **Unity games swallow their own output.** The Unity player redirects stdout and stderr into its
 own log, so anything the emulator prints after the player starts will not appear in your terminal
 or your `tee`'d log file. Read `~/.config/unity3d/<Company>/<Product>/Player.log`. This includes
-the emulator's diagnostics, not just the game's — if a trace flag "produced no output", look there
+the emulator's diagnostics, not just the game's. If a trace flag "produced no output", look there
 before concluding it did not arm.
 
 **A running FEXServer swallows banner lines.** `OutputLog` defaults to `server`, so log output
@@ -232,7 +232,7 @@ looking. For a session you want to read directly:
 FEX_SILENTLOG=0 FEX_OUTPUTLOG=stderr FEX ...
 ```
 
-**Verify a flag actually armed.** Do not trust that an export reached the process — config layers,
+**Verify a flag actually armed.** Do not trust that an export reached the process. Config layers,
 AppConfig files and launcher defaults all get between you and the guest. Read the environment off
 the live process:
 
@@ -250,7 +250,7 @@ does. A wedge sits on a handful of addresses; real work moves.
 ## Host tuning
 
 Set the CPU governor to `performance` while gaming. The `ondemand` governor frequently fails to
-ramp under emulated load — clock was observed parked at 59% of maximum mid-game — because the JIT's
+ramp under emulated load (clock was observed parked at 59% of maximum mid-game) because the JIT's
 access pattern does not look like the sustained busy loop the governor is watching for.
 
 ```sh

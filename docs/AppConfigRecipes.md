@@ -3,14 +3,14 @@
 The config layering already gives us a per-title registry: a JSON at
 `~/.config/fex-emu/AppConfig/<guest-binary-basename>.json` overrides the global
 config for that title only. **Environment variables override AppConfig**, so a
-launcher export always wins — and conversely, an AppConfig can silently disarm
+launcher export always wins. Conversely, an AppConfig can silently disarm
 a recipe you thought you enabled (see the trap below).
 
 ## The trap that voided a test session
 
 `SMCChecks: "none"` in an AppConfig disables mtrack, and every fork SMC
 feature (`SMCSoftInvalidate`, `SMCLazyInval`, `SMCSemanticPatch`) gates on
-mtrack — they all stay silently off. Ziggurat's live config does exactly this.
+mtrack, they all stay silently off. Ziggurat's live config does exactly this.
 `fexplay-smc`'s armed recipes therefore export `FEX_SMCCHECKS=mtrack`.
 Before interpreting any per-title run, read its AppConfig first.
 
@@ -19,7 +19,7 @@ Before interpreting any per-title run, read its AppConfig first.
 Copy, rename to the guest binary's basename + `.json`, adjust.
 
 **Non-SMC title, maximum speed** (only if proven to never write code after
-load — a wrong guess here produces stale-code corruption, cf. the Stardew
+load. A wrong guess here produces stale-code corruption, cf. the Stardew
 CoreCLR wedge that `SMCChecks: "none"` caused):
 
 ```json
