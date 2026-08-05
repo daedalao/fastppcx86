@@ -1569,57 +1569,51 @@ DEF_OP(AddWithFlags) {
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
 
-  // For 8/16-bit ops, x86 CF is the carry-out of bit 7/15 and OF is the signed
+  // For sub-64-bit ops, x86 CF is the carry-out of bit N-1 and OF is the signed
   // overflow at the same boundary. PPC's addco. produces those for bit 63.
   // Trick: shift both operands left by (64-N) so the operand-size carry/overflow
   // boundary lines up at bit 63, do the 64-bit addco., then shift the result
-  // back. Dst gets the right value and XER.CA/OV match x86 semantics for N bits.
-  if (IROp->Size == IR::OpSize::i8Bit || IROp->Size == IR::OpSize::i16Bit) {
-    uint32_t Sh = (IROp->Size == IR::OpSize::i8Bit) ? 56 : 48;
+  // back. XER.CA/OV then match x86 semantics for N bits.
+  //
+  // The shifted addco_ is now the ONLY arithmetic on this path. Previously the
+  // value was computed twice — a plain 64-bit add/addic_/addco_ into Dst plus
+  // this shifted redo purely for the flags — and a trailing cmpwi/extsX+cmpdi
+  // recomputed N/Z that the shifted addco_ had already produced. Both are
+  // dropped:
+  //   * VALUE: the shifted sum is (a + b) << Sh; its low Sh bits are zero, so
+  //     `srdi Dst, TMP1, Sh` yields exactly the low-N-bit sum, zero-extended
+  //     into the upper bits. That is precisely the writeback x86-64 requires
+  //     for sub-64-bit destinations (and what StoreResult_WithOpSize assumes),
+  //     so the zero-extension comes for free instead of via a separate rldicl.
+  //   * FLAGS: this is the equivalence already written out at DEF_OP(AddNZCV)
+  //     below. CR0 from addco_ on the shifted value has LT = bit 63 of
+  //     (sum << Sh) = bit N-1 of sum = x86 SF, and EQ = (sum << Sh) == 0
+  //     <=> low N bits of sum == 0 = x86 ZF. The srdi that follows is an
+  //     rldicl with Rc=0, so it does not disturb CR0.
+  if (IROp->Size <= IR::OpSize::i32Bit) {
+    uint32_t Sh = 64 - IR::OpSizeToSize(IROp->Size) * 8;
     sldi(TMP1, S1, Sh);
     if (S2Inline) {
       LoadConstant(TMP2, Const << Sh);
     } else {
       sldi(TMP2, GetReg(Op->Src2), Sh);
     }
-    addco_(TMP1, TMP1, TMP2);   // CA/OV reflect bit-(N-1) carry / signed overflow
-    srdi(Dst, TMP1, Sh);         // Dst keeps natural (zero-extended) operand value
-    if (IROp->Size == IR::OpSize::i16Bit) extsh(TMP1, Dst); else extsb(TMP1, Dst);
-    cmpdi(TMP1, 0);              // SF/ZF on truncated/sign-extended result (last CR0 update)
+    addco_(TMP1, TMP1, TMP2);   // CA/OV reflect bit-(N-1) carry / signed overflow; CR0 = N/Z
+    srdi(Dst, TMP1, Sh);        // zero-extended operand-size value, CR0 untouched
     return;
   }
 
+  // 64-bit only from here (everything narrower returned above). There is no
+  // shifted redo at this width, so the flag-producing instruction must write
+  // CA *and* OV itself: addic_ never writes OV, which is why it used to leak a
+  // stale x86 OF (FEX_bugs/add_sub_inline_imm_of.asm) and why it is not used.
+  // Materialising the constant and using addco_ costs the same two
+  // instructions an addic_-plus-OV-redo would, without adding a second add.
   if (S2Inline) {
-    // addic. sets CA + CR0 but NOT OV. That is only tolerable at 32-bit,
-    // where the shifted addco_ redo below rewrites CA/OV anyway; at 64-bit
-    // there is no redo, so the stale XER.OV leaked straight through to x86 OF
-    // (FEX_bugs/add_sub_inline_imm_of.asm). Gate the fast path on i32Bit.
-    // Tradeoff considered: keeping addic_ at 64-bit and appending an
-    // OV-setting redo (addco_ into a scratch) costs the same two instructions
-    // as li+addco_ while executing the addition twice — materialising the
-    // constant is strictly no worse, and simpler.
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(Const));  // CA + CR0; OV fixed by the i32 redo below
-    } else {
-      LoadConstant(TMP4, Const);
-      addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, Const);
+    addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
   } else {
     addco_(Dst, S1, GetReg(Op->Src2));
-  }
-  if (IROp->Size == IR::OpSize::i32Bit) {
-    // 32-bit: operands are zero-extended, so the 64-bit CA from bit 63 is wrong.
-    // Repeat the trick at 32 bits.
-    sldi(TMP1, S1, 32);
-    if (S2Inline) {
-      LoadConstant(TMP2, Const << 32);
-    } else {
-      sldi(TMP2, GetReg(Op->Src2), 32);
-    }
-    addco_(TMP1, TMP1, TMP2);    // sets correct CA/OV for 32-bit boundary
-    rldicl(Dst, Dst, 0, 32);     // x86-64 zero-extends 32-bit writebacks
-    cmpwi(Dst, 0);                // SF/ZF
   }
 }
 
@@ -1630,73 +1624,49 @@ DEF_OP(SubWithFlags) {
   bool S1Inline = IsInlineConstant(Op->Src1, &C1);
   bool S2Inline = IsInlineConstant(Op->Src2, &C2);
 
-  // 8/16-bit: shift-up trick to move the borrow boundary to bit 63 so XER.CA/OV
-  // reflect operand-size CF/OF. Compute Dst from a separate 64-bit subtract.
-  if (IROp->Size == IR::OpSize::i8Bit || IROp->Size == IR::OpSize::i16Bit) {
-    uint32_t Sh = (IROp->Size == IR::OpSize::i8Bit) ? 56 : 48;
+  // Sub-64-bit: shift-up trick to move the borrow boundary to bit 63 so XER.CA/OV
+  // reflect operand-size CF/OF. As in AddWithFlags above, the shifted subfco_
+  // is now the ONLY arithmetic:
+  //   * VALUE: the shifted difference is (a - b) << Sh with its low Sh bits
+  //     zero, so `srdi Dst, TMP1, Sh` gives the low-N-bit difference
+  //     zero-extended — the writeback x86-64 wants for a sub-64-bit dest.
+  //     This replaces both the separate 64-bit `subf Dst, S2, S1` (whose upper
+  //     bits were whatever the sources happened to carry) and, at 32-bit, the
+  //     `rldicl Dst, Dst, 0, 32` that had to clean up after it.
+  //   * FLAGS: CR0 from subfco_ on the shifted operands has LT = bit 63 of
+  //     (diff << Sh) = bit N-1 of diff = x86 SF, and EQ = (diff << Sh) == 0
+  //     <=> low N bits of diff == 0 = x86 ZF. So the trailing extsX+cmpdi
+  //     (8/16-bit) and cmpwi (32-bit) recomputed what CR0 already held. Same
+  //     equivalence spelled out at DEF_OP(AddNZCV). srdi is rldicl with Rc=0
+  //     and leaves CR0 alone.
+  if (IROp->Size <= IR::OpSize::i32Bit) {
+    uint32_t Sh = 64 - IR::OpSizeToSize(IROp->Size) * 8;
     GPR S1Reg, S2Reg;
     if (S1Inline) { LoadConstant(TMP3, C1); S1Reg = TMP3; } else S1Reg = GetReg(Op->Src1);
     if (S2Inline) { LoadConstant(TMP4, C2); S2Reg = TMP4; } else S2Reg = GetReg(Op->Src2);
     sldi(TMP1, S1Reg, Sh);
     sldi(TMP2, S2Reg, Sh);
-    subfco_(TMP1, TMP2, TMP1);   // CA/OV at correct boundary
-    subf(Dst, S2Reg, S1Reg);     // raw 64-bit difference (Dst is operand-size value)
-    if (IROp->Size == IR::OpSize::i16Bit) extsh(TMP1, Dst); else extsb(TMP1, Dst);
-    cmpdi(TMP1, 0);
+    subfco_(TMP1, TMP2, TMP1);   // CA/OV at the correct boundary; CR0 = N/Z
+    srdi(Dst, TMP1, Sh);         // zero-extended operand-size value, CR0 untouched
     return;
   }
 
+  // 64-bit only from here. The flag-producing instruction must write CA *and*
+  // OV itself, so neither addic_ (no OV; and addic_ with imm 0 yields CA=0
+  // where the CFInverted=true subtract convention needs CA=1 for x-0) nor
+  // subfic (no OV, no CR0) is usable — both were 32-bit-only fast paths and
+  // the 32-bit path no longer reaches here. subfco_ is the canonical sub-form
+  // carry: for C != 0 its CA (carry of S1 + ~C + 1) is identical to addic_'s
+  // carry of S1 + (-C), and it additionally writes OV and CR0.
   if (S2Inline) {
-    auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
-    // CARE: addic_ with imm=0 sets CA=0 (no unsigned overflow on x+0), but
-    // FEX's subtract convention (CFInverted=true downstream) needs CA=1
-    // (no-borrow) for x-0. Force subfco_ path for C2=0 to match the SUB-style
-    // carry semantic. Same pitfall as the CondSubNZCV fix earlier today.
-    // ALSO: addic_ never writes OV, so the fast path is only legal at 32-bit
-    // where the shifted subfco_ redo below rewrites CA/OV (stale-OF bug,
-    // FEX_bugs/add_sub_inline_imm_of.asm). At 64-bit materialise C2 and use
-    // subfco_: for C2 != 0 its CA (carry of S1 + ~C2 + 1) is identical to
-    // addic_'s carry of S1 + (-C2), so the CF semantics documented above are
-    // preserved — subfco_ is the canonical sub-form carry either way.
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(NegC));  // CA + CR0; OV fixed by the i32 redo below
-    } else {
-      LoadConstant(TMP4, C2);
-      subfco_(Dst, TMP4, S1);  // sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, C2);
+    subfco_(Dst, TMP4, GetReg(Op->Src1));  // sets CA + SO/OV + CR0
   } else if (S1Inline) {
-    // Dst = C1 - Src2 with flags. subfic computes the value and sets CA but
-    // doesn't set CR0 or OV, so it is likewise only usable at 32-bit where
-    // the redo fixes both (and cmpwi provides SF/ZF).
-    auto S2 = GetReg(Op->Src2);
-    int64_t SignedC = static_cast<int64_t>(C1);
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        SignedC >= -32768 && SignedC <= 32767) {
-      subfic(Dst, S2, static_cast<int16_t>(SignedC));
-    } else {
-      LoadConstant(TMP4, C1);
-      subfco_(Dst, S2, TMP4);  // sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, C1);
+    subfco_(Dst, GetReg(Op->Src2), TMP4);  // sets CA + SO/OV + CR0
   } else {
-    auto S1 = GetReg(Op->Src1);
-    subfco_(Dst, GetReg(Op->Src2), S1);
+    subfco_(Dst, GetReg(Op->Src2), GetReg(Op->Src1));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) {
-    // 32-bit borrow boundary is bit 31, not bit 63 — redo CA/OV via shifted op.
-    GPR S1Reg, S2Reg;
-    if (S1Inline) { LoadConstant(TMP3, C1); S1Reg = TMP3; } else S1Reg = GetReg(Op->Src1);
-    if (S2Inline) { LoadConstant(TMP4, C2); S2Reg = TMP4; } else S2Reg = GetReg(Op->Src2);
-    sldi(TMP1, S1Reg, 32);
-    sldi(TMP2, S2Reg, 32);
-    subfco_(TMP1, TMP2, TMP1);   // CA/OV reflect 32-bit borrow / overflow
-    rldicl(Dst, Dst, 0, 32);     // zero-extend writeback
-    cmpwi(Dst, 0);
-  }
-  // (No trailing cmpdi needed any more: the 64-bit S1Inline case now goes
-  // through subfco_, which sets CR0 itself; subfic survives only at 32-bit,
-  // where the cmpwi above supplies SF/ZF.)
 }
 
 // IMPORTANT: never use r0 as the destination of *NZCV / Test ops. r0 is the
