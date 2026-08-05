@@ -72,14 +72,29 @@ DEF_OP(CallbackReturn) {
 //   does NOT order load->load on Power, so the GuestCode value is fed into the
 //   HostCode load's base register.
 //
-// BLOCK LINKING (constant-target JUMP exits only, BlockLinking knob).
+// BLOCK LINKING (constant-target exits, BlockLinking knob).
 //
-// When BlockLinkingEnabled and this exit is a plain jump to a constant RIP
-// (Hint == None — calls, returns and CheckTF exits are excluded; patching a
-// call exit to `bl` would push the probe's second instruction onto POWER9's
-// link stack while the architectural return goes elsewhere, mispredicting
-// every linked call/ret pair, and that redesign is not done), the exit is
-// reordered so the WHOLE L1 probe becomes the patch target:
+// When BlockLinkingEnabled and this exit has a constant target RIP —
+// Hint == None (plain jumps) or Hint == Call (guest CALL, whose target is a
+// constant and whose x86 return address is an EntrypointOffset constant the
+// guest pushed to ITS stack, entirely independent of host control flow) —
+// the exit is reordered so the WHOLE L1 probe becomes the patch target.
+//
+// Calls were HISTORICALLY excluded by an objection about patching to `bl`:
+// that would push the probe's second instruction onto the hardware link
+// stack while the architectural return goes elsewhere, mispredicting every
+// call/ret pair. But the linker below never emits `bl` — it patches a plain
+// `b` (or `b Thunk`), creating no link-stack entry, and a 2026-08-05 storm
+// profile put the unlinked path (ExitFunctionLink->FindBlock) at 4.1% of
+// CPU in a call-dense Mono workload, so the exclusion cost real time for a
+// hazard the mechanism doesn't have. The backend consults Hint nowhere else
+// (verified by audit), and linked targets land on the callee's EntryPoint
+// prologue, whose deferred-signal drain is hint-agnostic.
+//
+// Still excluded: Return (dynamic target — nothing constant to link) and
+// CheckTF (must reach the dispatcher's trap check every time). A shadow
+// return stack for the Return side is the remaining, genuinely
+// design-heavy half.
 //
 //     InsertExitRIPMove TMP1, NewRIP      (1-5 insns; 5 fixed when
 //                                          ExitRIPFixedWidth -- see below)
@@ -171,7 +186,8 @@ DEF_OP(ExitFunction) {
   // shape keeps the exact non-linking lowering below.
   // ---------------------------------------------------------------------
   const bool Linkable =
-    ConstRIP && Op->Hint == IR::BranchHint::None && BlockLinkingEnabled;
+    ConstRIP && BlockLinkingEnabled &&
+    (Op->Hint == IR::BranchHint::None || Op->Hint == IR::BranchHint::Call);
   PPC64Emitter::Label* LinkPathLabel = nullptr;
   if (Linkable) {
     // Hoisted region: rip store + r0 re-zero, then the patch site. Both
