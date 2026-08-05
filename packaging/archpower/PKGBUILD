@@ -3,12 +3,10 @@
 # FastPPCx86 -- x86 / x86-64 emulation for 64-bit POWER (ppc64le).
 # Downstream port of FEX-Emu; the installed binaries keep their FEX names.
 #
-# Building straight out of a local checkout:
+# Builds from the public repository by default:
 #   cd packaging/archpower && makepkg -s
-# The default source is the git repo this PKGBUILD lives in (two levels up).
-# Override it with FASTPPCX86_GIT_URL, e.g. to build a specific fork/branch:
-#   FASTPPCX86_GIT_URL='file:///home/you/src/fex-ppc64le' makepkg -s
-# Once the repo is public, swap _repourl for the https line below.
+# Point it at a local checkout or a fork with FASTPPCX86_GIT_URL:
+#   FASTPPCX86_GIT_URL='file:///home/you/src/fastppcx86' makepkg -s
 
 pkgname=fastppcx86
 pkgver=r0.0000000
@@ -51,11 +49,7 @@ optdepends=(
 options=('!lto')
 install="$pkgname.install"
 
-# Local checkout by default: makepkg parses the PKGBUILD with the cwd set to the
-# directory containing it, so $PWD/../.. is the repository root.
-# Public URL, for when the repo goes public -- swap the two lines then:
-#_repourl='https://github.com/daedalao/fastppcx86.git'
-_repourl="${FASTPPCX86_GIT_URL:-file://$(realpath -m "$PWD/../..")}"
+_repourl="${FASTPPCX86_GIT_URL:-https://github.com/daedalao/fastppcx86.git}"
 
 # The bundled third-party trees are git submodules. They are listed here as
 # real makepkg sources (rather than fetched inside prepare()) so that the

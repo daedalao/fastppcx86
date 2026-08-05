@@ -1,6 +1,6 @@
 pkgbase = fastppcx86
 	pkgdesc = Fast x86 and x86-64 emulation for 64-bit POWER
-	pkgver = r14608.23f2884
+	pkgver = r14618.0375cce
 	pkgrel = 1
 	url = https://github.com/daedalao/fastppcx86
 	install = fastppcx86.install
