@@ -441,7 +441,10 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     uint64_t Mask = 1ULL << (KillSignal - 1);
     SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
     SignalDelegation->UninstallHostHandler(KillSignal);
-    kill(0, KillSignal);
+    // kill(0, sig) signals the whole process group, so a guest tripping this
+    // filter would take its siblings -- and under a shell, job-control peers --
+    // down with it. The kernel kills only the offending thread group.
+    kill(::getpid(), KillSignal);
     break;
   }
   case SECCOMP_RET_KILL_THREAD: {
