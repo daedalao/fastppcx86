@@ -2409,16 +2409,76 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
 // EmitEntryPoint: prologue emitted at the start of each JIT block
 // -------------------------------------------------------------------------
 // The caller binds HeaderLabel and reserves the JITCodeHeader before calling
-// us. We emit an InlineJITBlockHeader store, then FillStaticRegs, then the
-// optional TF check.
+// us. This used to emit, unconditionally, an InlineJITBlockHeader store, then
+// FillStaticRegs, then the optional TF check -- ~70 instructions / ~280 bytes
+// at BlockBegin+4.
 //
-// WARNING: none of it is reachable. See the comment on FillStaticRegs below.
-// The per-block loop emits its own InlineJITBlockHeader store and records the
-// entry points the dispatcher actually branches to; this sequence sits at
-// BlockBegin+4, which nothing branches to. Treat it as a structural
-// placeholder kept in parity with ARM64, and keep it correct against the day
+// None of it is reachable, and as of 2026-08-04 that is verified at runtime,
+// not just by inspection (see DeadPrologueMode below). Emission is therefore
+// gated OFF by default. The body is kept compiled and re-enablable for the day
 // trap-flag support makes it live.
+//
+// WHY IT IS DEAD
+//   The only recorded entry into a compile unit is CodeData.EntryPoints[...],
+//   and both sites that write it (the caller's post-EmitEntryPoint record and
+//   the per-IR-block loop's `BlockIROp->EntryPoint` record) resolve to the
+//   SAME cursor address: nothing is emitted between EmitEntryPoint returning
+//   and the first loop iteration. So the dispatcher/link target has always
+//   been *past* this sequence, and nothing branches to BlockBegin+4.
+//   BlockBegin itself is only ever consumed as a header/tail base and as a
+//   bounds check (Core.cpp GetFrameBlockInfo / RestoreRIPFromHostPC, which use
+//   it as `InlineJITBlockHeader` and as the low end of the [BlockBegin,
+//   BlockBegin+Tail->Size) containment test; CodeCache.cpp likewise walks
+//   BlockBegin -> JITCodeHeader::OffsetToBlockTail and range-checks it) --
+//   never as a branch target. Both remain valid: the JITCodeHeader at
+//   BlockBegin+0 is emitted by the caller and is untouched by this gate.
+//   The per-block loop re-emits its own InlineJITBlockHeader store, and SRA is
+//   filled by DispatcherLoopTopFillSRA, by ExitFunctionLinker, and by the
+//   signal-return path.
+//
+// HOW IT WAS VERIFIED (2026-08-04)
+//   FEX_DEADPROLOGUE=trap builds the full prologue with an unconditional
+//   `tw 31,r0,r0` in front of it, so any arrival at BlockBegin+4 SIGTRAPs
+//   immediately. The whole jit_1 harness suite plus guest smoke runs completed
+//   with zero traps. Re-run that mode before ever concluding otherwise.
+namespace {
+enum class DeadPrologueModeType {
+  Off,   // default: emit nothing (the ~70 dead instructions are not emitted)
+  Trap,  // FEX_DEADPROLOGUE=trap: emit the prologue behind an unconditional trap
+  Emit,  // FEX_DEADPROLOGUE=emit: emit the prologue exactly as before the gate
+};
+
+DeadPrologueModeType DeadPrologueMode() {
+  static const DeadPrologueModeType Mode = []() {
+    const char* Env = getenv("FEX_DEADPROLOGUE");
+    if (!Env) {
+      return DeadPrologueModeType::Off;
+    }
+    if (::strcmp(Env, "trap") == 0) {
+      return DeadPrologueModeType::Trap;
+    }
+    if (::strcmp(Env, "emit") == 0) {
+      return DeadPrologueModeType::Emit;
+    }
+    return DeadPrologueModeType::Off;
+  }();
+  return Mode;
+}
+} // namespace
+
 void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF) {
+  const auto Mode = DeadPrologueMode();
+  if (Mode == DeadPrologueModeType::Off) {
+    return;
+  }
+
+  if (Mode == DeadPrologueModeType::Trap) {
+    // TO=31 traps unconditionally. If execution ever reaches BlockBegin+4 the
+    // guest dies here with SIGTRAP instead of quietly running a prologue we
+    // believe to be dead.
+    tw(31, r(0), r(0));
+  }
+
   // Would keep InlineJITBlockHeader pointing at this block's header rather
   // than a stale one from the previous block if a signal arrived during
   // FillStaticRegs -- but see above, execution never gets here.
@@ -2427,20 +2487,8 @@ void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF
   // Fill SRA registers from the CpuStateFrame.
   //
   // CORRECTION: an earlier comment here claimed this "only runs on the cold
-  // path (ExitFunctionLink slow return)". That is wrong. Everything this
-  // function emits is UNCONDITIONALLY UNREACHABLE in the current design.
-  // The only recorded entry into the block is CodeData.EntryPoints[Entry],
-  // which the caller sets AFTER this function returns and then overwrites
-  // again in the per-IR-block loop; nothing ever branches to BlockBegin+4.
-  // BlockBegin itself is only ever consumed as a header/tail base and a
-  // bounds check (Core.cpp:133-187, CodeCache.cpp), never as a branch target.
-  // SRA is filled instead by DispatcherLoopTopFillSRA, by ExitFunctionLinker,
-  // and by the signal-return path.
-  //
-  // So this is dead code -- roughly 70 unreachable instructions per compiled
-  // block -- kept only for structural parity with ARM64. Whether it should
-  // exist at all is a separate question; while it does, it must stay correct,
-  // because the day someone wires up trap-flag support it becomes live.
+  // path (ExitFunctionLink slow return)". That is wrong -- see the
+  // unreachability analysis above.
   FillStaticRegs();
 
   if (CheckTF) {
@@ -3007,9 +3055,10 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // -------------------------------------------------------------------------
   // Bind the label at BlockBegin, then reserve 4 bytes for the header. The
   // OffsetToBlockTail field is backpatched after the tail is placed. The
-  // cold-path entry (FillStaticRegs) starts at BlockBegin+4; dispatcher
-  // entries land past that. See CPUBackend::JITCodeHeader / JITCodeTail for
-  // the layout GetFrameBlockInfo (Core.cpp:132) consumes.
+  // (unreachable, and now un-emitted by default) cold-path prologue used to
+  // start at BlockBegin+4; dispatcher entries land past it either way. See
+  // CPUBackend::JITCodeHeader / JITCodeTail for the layout GetFrameBlockInfo
+  // (Core.cpp:132) consumes, and EmitEntryPoint for the gate.
   PPC64Emitter::Label HeaderLabel{};
   Bind(&HeaderLabel);
   auto* CodeHeader = GetCursorAddress<CPUBackend::JITCodeHeader*>();
@@ -3040,18 +3089,19 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // -------------------------------------------------------------------------
   // Emit entry point
   // -------------------------------------------------------------------------
-  // HeaderLabel is already bound above. EmitEntryPoint emits the cold-path
-  // InlineJITBlockHeader store, then FillStaticRegs / TF check.
+  // HeaderLabel is already bound above. EmitEntryPoint is a no-op unless
+  // FEX_DEADPROLOGUE re-enables the unreachable cold-path prologue; see the
+  // unreachability analysis on its definition.
   EmitEntryPoint(HeaderLabel, CheckTF);
 
   // The entry point map: guest RIP -> host code address.
-  // NOTE: this is the COLD-PATH entry recorded right after EmitEntryPoint
-  // (post-FillStaticRegs). The per-IR-block loop below OVERWRITES this with
-  // the same Entry key when BlockIROp->EntryPoint && GuestEntryOffset == 0,
-  // so the address the dispatcher actually branches to is the block's
-  // bound JumpTarget. The spill-frame stdu therefore has to be emitted
-  // INSIDE the for-loop, immediately after the EntryPoint recording, not
-  // here.
+  // NOTE: the per-IR-block loop below OVERWRITES this with the same Entry key
+  // when BlockIROp->EntryPoint && GuestEntryOffset == 0. Nothing is emitted
+  // between here and that first loop iteration, so the two records resolve to
+  // the SAME address whether or not the overwrite happens -- which is what
+  // makes gating EmitEntryPoint's body off address-neutral. The spill-frame
+  // stdu therefore has to be emitted INSIDE the for-loop, immediately after
+  // the EntryPoint recording, not here.
   CodeData.EntryPoints[Entry] = GetCursorAddress<uint8_t*>();
 
   // Everything emitted since SetBuffer (JITCodeHeader + EmitEntryPoint) is
@@ -3195,8 +3245,9 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // in the prologue should map back to (block-entry guest RIP).
       DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset,
                                          GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
-      // Warm-path store: dispatcher L1 hits land here, skipping FillStaticRegs
-      // above. Re-emit so InlineJITBlockHeader is refreshed on every entry.
+      // Warm-path store: dispatcher L1 hits land here. This is the ONLY
+      // InlineJITBlockHeader store that ever executes (EmitEntryPoint's copy is
+      // unreachable and gated off). Re-emit so it is refreshed on every entry.
       EmitStoreBlockBeginToInlineHeader(HeaderLabel);
       // FEX_ENTRYWATCH ring store (see the definition above). TMP1/TMP2 are
       // clobberable here per the EmitStoreBlockBeginToInlineHeader contract;
