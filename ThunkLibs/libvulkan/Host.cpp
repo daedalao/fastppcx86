@@ -739,8 +739,42 @@ VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipeline
 
 #endif
 
+// Single-source list of custom_host_impl functions whose ONLY safe caller is
+// their fexfn_impl_* wrapper because the wrapper DEFUSES a guest function
+// pointer the application always supplies (a debug-callback pointer inside the
+// create-info struct).  A name resolved via vkGetInstanceProcAddr /
+// vkGetDeviceProcAddr never reaches its fexfn_impl_* wrapper unless it is
+// returned from LookupCustomVulkanFunction below: MakeGuestCallable (Guest.cpp)
+// links the returned host address to a signature-generic invoker
+// (GetCallerForHostFunction -> CallHostFunction<fexthunks_invoke_callback<Sig>>),
+// which lands on the host at GuestWrapperForHostFunction<Sig>::Call and branches
+// straight to whatever host address procaddr returned.  If that address is the
+// raw driver entry (the default LDR_PTR return), the guest's pfn*Callback is
+// passed through verbatim; native libvulkan then invokes a guest VA as host
+// code and SEGVs the first time a debug message fires.  These two entry points
+// are extension functions resolved exclusively via vkGetInstanceProcAddr, so
+// the bypass is the common path, not the exception.  Same hazard class the
+// vkCreateInstance impl already handles for the pNext-embedded callback.
+//
+// INVARIANT: every custom_host_impl that defuses or repacks a guest pointer the
+// generic GuestWrapperForHostFunction path would pass verbatim MUST be listed
+// here (or in the explicit branches below) or it is unreachable via GIPA/GDPA.
+// This cannot be asserted at compile time from this translation unit (the set
+// of custom_host_impl configs lives in libvulkan_interface.cpp / thunkgen and
+// is not visible here), so it is enforced by review against that file.
+#define FEX_VULKAN_CALLBACK_DEFUSING_IMPLS(X) \
+  X(vkCreateDebugReportCallbackEXT)           \
+  X(vkCreateDebugUtilsMessengerEXT)
+
 static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   using namespace std::string_view_literals;
+
+#define FEX_VULKAN_PROCADDR_CASE(name)                      \
+  if (a_1 == std::string_view {#name}) {                    \
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_##name; \
+  }
+  FEX_VULKAN_CALLBACK_DEFUSING_IMPLS(FEX_VULKAN_PROCADDR_CASE)
+#undef FEX_VULKAN_PROCADDR_CASE
 
   if (a_1 == "vkCreateShaderModule"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateShaderModule;
