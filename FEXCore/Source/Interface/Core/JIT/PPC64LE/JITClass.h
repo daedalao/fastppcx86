@@ -499,6 +499,15 @@ private:
   // before serialization; the patcher adds the new base back on load.
   void InsertGuestRIPMove(GPR Reg, uint64_t Constant);
 
+  // DEF_OP(EntrypointOffset)'s guest RIP -- the return address a guest `call`
+  // pushes, so one of the hottest constants the JIT materialises. Same gating
+  // argument as InsertExitRIPMove: the fixed 20-byte window and its
+  // RELOC_GUEST_RIP_MOVE exist solely so the code cache can re-emit a rebased
+  // address into it, so with ExitRIPFixedWidth false this drops to a plain
+  // variable-width LoadConstant (1-3 instructions for any sub-4GiB RIP) and
+  // records no relocation.
+  void InsertEntrypointRIPMove(GPR Reg, uint64_t Constant);
+
   // SMC Idea 4 (FEX_SMCSEMANTICPATCH): as InsertGuestRIPMove, but additionally
   // records the host address of the 20-byte window in CodeData.ExitRIPSites so
   // the SMC fault handler can repatch this destination when the guest rewrites
