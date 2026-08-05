@@ -45,13 +45,38 @@ namespace FEX::HLE {
 // be tighter, but we use a simple "neg r3 ; mfcr ; isel" idiom that the
 // compiler can fold.  Easier: just test SO bit and conditionally negate.
 
-#define PPC64_SYSCALL_RESULT(r3_out)                                                                              \
+// The `sc` and the CR0 read MUST live in the same asm block.
+//
+// This used to be two statements: `__asm volatile("sc" ...)` followed by a
+// separate `__asm volatile("mfcr %0" ...)`. Two problems with that:
+//
+//  1. Correctness. Nothing tied the two blocks together. The compiler is free
+//     to schedule any CR0-writing instruction between them -- a compare from
+//     surrounding code, a dot-suffixed op the instruction selector picked,
+//     anything -- at which point the SO bit read back belongs to that
+//     instruction rather than to the kernel. The `sc` block clobbers "cr0",
+//     which tells the compiler CR0 is *dead* after the syscall: precisely the
+//     licence it needs to overwrite CR0 before the mfcr runs. A latent
+//     miscompile that would surface as syscalls randomly reporting bogus
+//     errors (or, worse, negating a valid positive result).
+//
+//  2. Cost. `mfcr` reads all eight CR fields and on POWER8 is cracked into
+//     multiple internal ops, serialising against the whole condition register.
+//     `mfocrf RT, 0x80` reads only CR0 and stays a single non-cracked op.
+//     FXM=0x80 leaves CR0's bits in their architectural position (bits 32..35
+//     of the GPR, i.e. mask 0xF000'0000; the rest are undefined), so the SO
+//     test below is bit-for-bit the same test as before.
+//
+// This is glibc's ppc64 INTERNAL_SYSCALL shape -- sc, then mfocrf of CR0 in the
+// same asm, then test the SO bit. See sysdeps/unix/sysv/linux/powerpc/
+// powerpc64/sysdep.h.
+#define PPC64_SYSCALL_SC_MFOCRF "sc\n\tmfocrf %[_cr0], 0x80"
+
+#define PPC64_SYSCALL_RESULT(r3_out, cr0_in)                                                                      \
   /* If SO bit (bit 0 of cr0) set, kernel returned positive errno; negate to match Linux's -errno convention. */  \
   ({                                                                                                              \
     long _r = (long)(r3_out);                                                                                     \
-    uint64_t _cr;                                                                                                 \
-    __asm volatile("mfcr %0" : "=r"(_cr));                                                                        \
-    if (_cr & 0x10000000u) _r = -_r; /* SO bit lives at bit 28 of cr in CR0 position */                           \
+    if ((cr0_in) & 0x10000000u) _r = -_r; /* SO bit lives at bit 28 of cr in CR0 position */                       \
     (uint64_t)_r;                                                                                                 \
   })
 
@@ -60,8 +85,11 @@ requires (syscall_num != -1)
 uint64_t SyscallPassthrough0(FEXCore::Core::CpuStateFrame* Frame) {
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3");
-  __asm volatile("sc" : "=r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "=r"(r3), "+r"(r0)
+                 : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -69,8 +97,11 @@ requires (syscall_num != -1)
 uint64_t SyscallPassthrough1(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1) {
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3") = (long)arg1;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0)
+                 : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -79,8 +110,11 @@ uint64_t SyscallPassthrough2(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3") = (long)arg1;
   register long r4 asm("r4") = (long)arg2;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4) : : "memory", "r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4)
+                 : : "memory", "r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -90,8 +124,11 @@ uint64_t SyscallPassthrough3(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r3 asm("r3") = (long)arg1;
   register long r4 asm("r4") = (long)arg2;
   register long r5 asm("r5") = (long)arg3;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5) : : "memory", "r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5)
+                 : : "memory", "r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -102,8 +139,11 @@ uint64_t SyscallPassthrough4(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r4 asm("r4") = (long)arg2;
   register long r5 asm("r5") = (long)arg3;
   register long r6 asm("r6") = (long)arg4;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6) : : "memory", "r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6)
+                 : : "memory", "r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -115,8 +155,11 @@ uint64_t SyscallPassthrough5(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r5 asm("r5") = (long)arg3;
   register long r6 asm("r6") = (long)arg4;
   register long r7 asm("r7") = (long)arg5;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7) : : "memory", "r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7)
+                 : : "memory", "r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -130,8 +173,11 @@ uint64_t SyscallPassthrough6(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r6 asm("r6") = (long)arg4;
   register long r7 asm("r7") = (long)arg5;
   register long r8 asm("r8") = (long)arg6;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8) : : "memory", "r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8)
+                 : : "memory", "r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -146,8 +192,11 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r7 asm("r7") = (long)arg5;
   register long r8 asm("r8") = (long)arg6;
   register long r9 asm("r9") = (long)arg7;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8), "+r"(r9) : : "memory", "r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8), "+r"(r9)
+                 : : "memory", "r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 #elif defined(ARCHITECTURE_arm64)
 template<int syscall_num>
