@@ -2951,14 +2951,18 @@ DEF_OP(VUShlS) {
   const auto Dst   = GetVReg(Node);
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
-  // Broadcast LE element 0 of Shift to all lanes in VTMP1.  For i64 we have
-  // to copy the doubleword by hand: mfvsrd reads phys[0..7] (= LE element 1),
-  // so we vsldoi by 8 first to bring LE element 0 into the readable half.
+  // Broadcast LE element 0 of Shift to all lanes in VTMP1.
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
@@ -2978,10 +2982,16 @@ DEF_OP(VUShrS) {
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
@@ -3001,10 +3011,16 @@ DEF_OP(VSShrS) {
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
