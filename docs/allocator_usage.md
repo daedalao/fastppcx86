@@ -1,5 +1,5 @@
 # Dual allocator usage
-FEX-Emu uses two different heap allocators at once, each for different purposes:
+FastPPCx86 uses two different heap allocators at once, each for different purposes:
 - rpmalloc: The primary heap allocator (to keep FEX's internal allocations out of the 32-bit address space used by guest applications)
 - jemalloc_glibc: The second heap allocator (to add allocation introspection features used by thunks)
 

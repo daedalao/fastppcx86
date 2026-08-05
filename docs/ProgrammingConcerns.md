@@ -1,6 +1,6 @@
 # Memory allocation routines
 ## What is the problem?
-FEX-Emu needs to allocate memory differently than regular applications. This problem happens because FEX runs both 32-bit and 64-bit guest
+FastPPCx86 needs to allocate memory differently than regular applications. This problem happens because FEX runs both 32-bit and 64-bit guest
 applications in the same address space as FEX itself. When running 32-bit applications, FEX reserves up all memory above 4GB in order to correctly
 emulate the 32-bit address space. We then use that reserved space for FEX allocations, so we don't interrupt application's own allocations.
 
@@ -33,7 +33,7 @@ Don't use getcwd with a nullptr buffer. It will allocate memory behind our back 
 
 ### `strerror`
 This allocates and frees memory based on locale! Even with C local it'll attempt to free(0).
-FEX-Emu should avoid using this function and instead just return the number.
+FastPPCx86 should avoid using this function and instead just return the number.
 If necessary FEX will provide its own routine for getting this string back.
 
 ### `std::make_unique`

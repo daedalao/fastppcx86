@@ -1,6 +1,6 @@
 ---
 name: Potential Game Bug
-about: A bug in FEX-Emu that causes a problem in a game
+about: A bug in FastPPCx86 that causes a problem in a game
 title: "[Game]: [Short Problem Description]"
 labels: Game related
 assignees: ''

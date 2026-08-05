@@ -47,4 +47,4 @@
 
 ## 4000_0010h - 4FFF_FFFFh
 * **Undefined**
-* FEX-Emu will return zero until implemented
+* FastPPCx86 will return zero until implemented

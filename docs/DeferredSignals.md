@@ -1,6 +1,6 @@
 # Deferred signals and why FEX needs them
 
-FEX-Emu has locations in its code which are effectively "uninterruptible". In the sense that if the guest application receives a signal during an
+FastPPCx86 has locations in its code which are effectively "uninterruptible". In the sense that if the guest application receives a signal during an
 "uninterruptible" code section, then FEX is likely to hang or crash in spurious and terrible ways.
 
 ## Example
@@ -84,7 +84,7 @@ We then modify the permissions on the thread local `InterruptFaultPage` to be `P
 We then immediately return from the signal handler so that FEX can resume its "uninterruptible" code section without breaking anything.
 Once the "uninterruptible" code section finishes, FEX will intentionally trigger a SIGSEGV by storing to the page.
 
-Once FEX-Emu is in its SIGSEGV handler, it will determine that it is handling a deferred signal. This will pull the previously saved `siginfo_t` and
+Once FastPPCx86 is in its SIGSEGV handler, it will determine that it is handling a deferred signal. This will pull the previously saved `siginfo_t` and
 start processing the signal.
 
 Once a guest signal handler has finished what it was working on, it will call `rt_sigreturn` or `sigreturn` which triggers FEX's SIGILL signal

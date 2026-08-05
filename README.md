@@ -1,11 +1,10 @@
-# ppcFEX — a PPC64LE fork of FEX-Emu
+# FastPPCx86 — run x86 programs on POWER
 
-ppcFEX is a permanent fork of [FEX-Emu](https://github.com/FEX-Emu/FEX) that targets **PPC64LE**
-(POWER8 and later, little-endian) as a JIT host instead of ARM64. FEX is an x86/x86-64 user-mode
-emulator: it JITs guest x86 code to host machine code and thunks guest libraries (GL, Vulkan, EGL,
-etc.) through to host implementations. This fork replaces the ARM64 codegen backend with a
-PPC64LE one and adapts the parts of the runtime (TSO/memory-model emulation, self-modifying-code
-detection, atomics) that are architecture-sensitive.
+FastPPCx86 is an x86/x86-64 user-mode emulator for **PPC64LE** hosts (POWER8 and later,
+little-endian). It JITs guest x86 code to PPC64LE machine code and thunks guest libraries (GL,
+Vulkan, EGL, etc.) through to the host's own implementations, so graphics and compute do not go
+through the emulator. The codegen backend, the memory-model work (weak-ordering TSO emulation,
+split-lock handling) and the self-modifying-code subsystem are written for POWER.
 
 - **Minimum ISA: POWER8.** All emitted code must stay POWER8-legal; POWER9-only instructions are
   gated behind runtime feature detection, not assumed.
@@ -16,23 +15,26 @@ detection, atomics) that are architecture-sensitive.
   with a larger page size, mtrack-based SMC detection is unsupported and will misbehave or abort;
   boot a 4K-page kernel, or run with `FEX_SMCCHECKS=full` on larger-page hosts.
 
-## Relationship to upstream FEX-Emu
+## Provenance
 
-**This is a permanent fork. It will not be upstreamed to FEX-Emu.** The PPC64LE codegen backend,
-the PPC64LE-specific memory-model work (weak-ordering TSO emulation, split-lock handling), and the
-self-modifying-code (SMC) subsystem rewrite in this repo are PPC-specific and diverge deliberately
-from how upstream FEX-Emu's ARM64/x86-64 hosts solve the same problems. There is no intent to
-reconcile this fork's design back into upstream.
+FastPPCx86 is derived from the FEX-Emu project (<https://github.com/FEX-Emu/FEX>) and is
+distributed under the same MIT license — see [`LICENSE`](LICENSE), which is unmodified.
 
-- Upstream credit and license are unchanged — see [License](#license).
-- The original upstream README (as of the point this fork's README was rewritten) is preserved at
-  [`README.upstream.md`](README.upstream.md) for reference.
-- Everything in this document describes *this* fork's state, build, and configuration surface —
-  not upstream FEX-Emu's.
+This is a permanent fork with no plan to merge back. The PPC64LE backend, the memory-model work
+and the SMC subsystem diverge deliberately from how upstream solves the same problems on ARM64.
+Two upstream documents are preserved verbatim for reference and are not maintained here:
+[`Readme.md`](Readme.md) (with its translation [`docs/Readme_CN.md`](docs/Readme_CN.md)) and
+[`README.upstream.md`](README.upstream.md), an earlier README of this port. Everything else in
+`docs/` describes *this* project.
+
+**Binaries and environment variables keep the historical `FEX` prefix** — the programs are still
+called `FEX`, `FEXBash`, `FEXServer`, `FEXRootFSFetcher`, config keys are unchanged, and every
+environment variable is still `FEX_<NAME>`. Only the documentation has been renamed; renaming the
+code would break every existing config file, launcher and script for no benefit.
 
 ## Build
 
-Standard CMake/Ninja build, same as upstream FEX:
+Standard CMake/Ninja build:
 
 ```sh
 mkdir build && cd build
@@ -108,11 +110,13 @@ taskset -c 0-1,8-9,16-17,24-25,32-33,40-41,48-49,56-57 FEX <game>
 - `SpinLoopClampAuto=1` short-circuits recognized library spin-wait loops — no longer needed for
   correctness anywhere (see docs/MONO_UNITY_CENSUS.md), but measurable as a perf opt-in.
 
-Per-disease history and per-title verdicts live in `docs/MONO_UNITY_CENSUS.md`.
+[`docs/GAMING.md`](docs/GAMING.md) is the full launch guide — prerequisites, launch shapes, SMC
+recipes, Steam, and where the logs actually go. Per-title verdicts live in
+[`docs/MONO_UNITY_CENSUS.md`](docs/MONO_UNITY_CENSUS.md).
 
 ## Flags reference
 
-Grouped by area. **Fork** marks an option added in this port and not present in upstream FEX-Emu;
+Grouped by area. **Fork** marks an option added in this port and not present upstream;
 everything else is inherited from upstream (though some upstream options — SMCChecks, TSOEnabled,
 the vector/memcpy TSO knobs, MonoHacks — carry PPC64LE-specific behavior or caveats noted inline.
 Types: bool options accept 0/1/true/false; `strenum` options take one of the listed string values.
@@ -163,7 +167,7 @@ Types: bool options accept 0/1/true/false; `strenum` options take one of the lis
 
 ### Self-modifying code (SMC) — fork-specific subsystem
 
-Upstream FEX has one SMC knob (`SMCChecks`). This fork adds a family of PPC64LE-oriented SMC
+Upstream has one SMC knob (`SMCChecks`). This fork adds a family of PPC64LE-oriented SMC
 mechanisms layered on top of it, aimed at cutting the cost of mprotect-fault-driven invalidation
 for guests that write frequently near their own code (JIT runtimes, packers/DRM, Mono AOT). Most
 are off by default and must be opted into (globally or per-app).
@@ -251,6 +255,6 @@ library's:
 
 ## License
 
-ppcFEX is distributed under the same MIT license as upstream FEX-Emu — see [`LICENSE`](LICENSE).
-Upstream copyright (Ryan Houdek and the FEX-Emu contributors) is unchanged; this fork's PPC64LE
-backend and SMC/memory-model work are additional contributions under the same terms.
+MIT — see [`LICENSE`](LICENSE), which is preserved unmodified, original copyright notice
+included. The PPC64LE backend and the SMC/memory-model work in this repository are additional
+contributions under the same terms. See [Provenance](#provenance).

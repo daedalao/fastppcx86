@@ -1,4 +1,4 @@
-# FEX-PPC64LE — POWER9 Port Plan
+# FastPPCx86 — POWER9 port plan
 
 Status: **living document.** Branch `power9`, forked from `main` at `0f17626ac`. It began as a pure
 planning document; code has since landed, and the sections below are a mix of plan, measured result

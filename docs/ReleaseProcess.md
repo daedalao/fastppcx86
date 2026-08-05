@@ -1,5 +1,10 @@
-# FEX tagged version (release) process
-A FEX tagged version happens near the start of each month.
+# Tagged version (release) process
+
+**Inherited document.** This describes the upstream project's monthly release machinery — PPA,
+website, rootfs bucket — none of which FastPPCx86 operates. Kept for reference; it does not
+describe how this fork ships.
+
+A tagged version happens near the start of each month.
 
 The tagged versioning is `FEX-<YYMM>` with the month being the current month.
 
