@@ -1939,14 +1939,29 @@ DEF_OP(AdcWithFlags) {
   xor_(TMP3, TMP3, TMP1);
   andc(TMP3, TMP3, TMP2);
 
-  // Patch XER: clear CA + OV, OR in new CA (TMP4 LSB) at LSB29, OV (TMP3 LSB) at LSB30.
+  // Patch XER: new CA = TMP4's LSB, new OV = TMP3's LSB.
+  //
+  // rlwimi does clear-and-set in one instruction, so the LoadConstant-mask /
+  // andc / sldi / or_ chain collapses. The canonical form used at every XER
+  // patch site in this file:
+  //
+  //   rlwimi RA, RS, SH, MB, ME
+  //     RA <- (ROTL32(RS, SH) & MASK(MB, ME)) | (RA & ~MASK(MB, ME))
+  //
+  // with PPC (MSB=0) bit numbering, where PPC bit p == LSB bit (31 - p) in
+  // the low word, and the mask lives entirely in bits 32..63 of the 64-bit
+  // register so mfspr's upper half is preserved exactly as andc preserved it.
+  // ROTL32 by SH moves a bit at PPC position q to position (q - SH) mod 32.
+  // The two inserts we need, both from an LSB-0 source bit (PPC 31):
+  //
+  //   CA at LSB 29 = PPC 2:  (31 - SH) mod 32 = 2  =>  SH = 29, MB = ME = 2
+  //   OV at LSB 30 = PPC 1:  (31 - SH) mod 32 = 1  =>  SH = 30, MB = ME = 1
+  //
+  // Single-bit masks, so whatever the source carries above its LSB is
+  // discarded — the same guarantee the sldi/or_ pair relied on.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
   mtspr(1, TMP1);
 }
 
@@ -1989,13 +2004,10 @@ DEF_OP(SbbWithFlags) {
   xor_(TMP3, TMP3, TMP1);                  // S1^Dst
   and_(TMP3, TMP3, TMP2);                  // (S1^S2) AND (S1^Dst) = OF
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
   mtspr(1, TMP1);
 }
 
@@ -2056,13 +2068,10 @@ DEF_OP(AdcZeroWithFlags) {
   rldicl(TMP4, Dst, 33, 63);                  // Dst[31]
   and_(TMP4, TMP4, TMP1);                     // OF in LSB
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2121,13 +2130,10 @@ DEF_OP(AdcNZCV) {
   andc(TMP4, TMP4, TMP2);                   // OF
 
   // Patch XER: CA = TMP3 LSB (= !x86_CF_out), OV = TMP4 LSB.
+  // rlwimi SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2159,13 +2165,10 @@ DEF_OP(SbbNZCV) {
   xor_(TMP4, TMP4, TMP1);                  // S1^Result
   and_(TMP4, TMP4, TMP2);                  // (S1^S2) AND (S1^Result) = OF
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2766,13 +2769,14 @@ DEF_OP(ShiftFlags) {
     xor_(OFReg, OFReg, TMP4);
   }
 
+  // XER patch via rlwimi (clear-and-set in one instruction) — SH/MB/ME
+  // derived in DEF_OP(AdcWithFlags) above: CA sits at LSB 29 = PPC bit 2, so
+  // an LSB-0 source needs SH=29 with MB=ME=2; OV at LSB 30 = PPC bit 1 needs
+  // SH=30 with MB=ME=1. Single-bit masks discard everything above the
+  // source's LSB, exactly as the old sldi/or_ pair did.
   mfspr(TMP4, 1);
-  LoadConstant(TMP1, 0x60000000ULL);  // mask OV (bit 30) + CA (bit 29)
-  andc(TMP4, TMP4, TMP1);
-  sldi(TMP3, TMP3, 29);
-  or_(TMP4, TMP4, TMP3);
-  sldi(OFReg, OFReg, 30);
-  or_(TMP4, TMP4, OFReg);
+  rlwimi(TMP4, TMP3,  29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP4, OFReg, 30, 1, 1);   // OV <- OFReg LSB
   mtspr(1, TMP4);
 
   // New raw PF = parity of low byte of Result. rldicl-only masking.
@@ -2858,14 +2862,12 @@ DEF_OP(RotateFlags) {
   // Invert CF for the CFInverted=true contract.
   xori(TMP3, TMP3, 1);
 
-  // Splat C → XER.CA (LSB 29) and V → XER.OV (LSB 30) without disturbing CR0.
+  // Splat C → XER.CA (LSB 29 = PPC bit 2) and V → XER.OV (LSB 30 = PPC bit 1)
+  // without disturbing CR0. rlwimi clears and sets in one instruction; the
+  // SH/MB/ME derivation is written out in DEF_OP(AdcWithFlags) above.
   mfspr(TMP4, 1);
-  LoadConstant(TMP1, 0x60000000ULL);  // mask: clear OV+CA
-  andc(TMP4, TMP4, TMP1);
-  sldi(TMP3, TMP3, 29);
-  or_(TMP4, TMP4, TMP3);
-  sldi(TMP2, TMP2, 30);
-  or_(TMP4, TMP4, TMP2);
+  rlwimi(TMP4, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP4, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP4);
 
   Bind(&noRotate);
@@ -3546,13 +3548,16 @@ DEF_OP(LoadNZCV) {
   //   Z: PPC 2 → 1  (sh=1,  mask 1..1)
   //   C: PPC 2 → 2  (sh=0,  mask 2..2)
   //   V: PPC 1 → 3  (sh=30, mask 3..3)
-  rlwinm(Dst,  TMP1, 0,  0, 0);
-  rlwinm(TMP3, TMP1, 1,  1, 1);
-  or_(Dst, Dst, TMP3);
-  rlwinm(TMP3, TMP2, 0,  2, 2);
-  or_(Dst, Dst, TMP3);
-  rlwinm(TMP3, TMP2, 30, 3, 3);
-  or_(Dst, Dst, TMP3);
+  // The first rlwinm seeds Dst (its mask covers only bits 32..63, so the
+  // upper half of the 64-bit Dst is zeroed and every unselected low bit with
+  // it); the three rlwimi then insert directly rather than extracting into a
+  // scratch and OR-ing. SH/MB/ME are unchanged from the extracts above —
+  // rlwimi uses the identical rotate-and-mask, it just merges into RA instead
+  // of replacing it. 7 instructions become 4.
+  rlwinm(Dst, TMP1, 0,  0, 0);   // N
+  rlwimi(Dst, TMP1, 1,  1, 1);   // Z
+  rlwimi(Dst, TMP2, 0,  2, 2);   // C
+  rlwimi(Dst, TMP2, 30, 3, 3);   // V
 }
 
 DEF_OP(StoreNZCV) {
@@ -3571,19 +3576,20 @@ DEF_OP(StoreNZCV) {
   //   C: Src LSB 29 → XER.CA  LSB 29 (no shift). sh=0,  mb=2,  me=2.
   //   V: Src LSB 28 → XER.OV  LSB 30 (shift left 2 = rotate left 2). sh=2,  mb=1,  me=1.
 
+  // CR0 assembly: rlwinm lays down N (and zeroes everything else, including
+  // the CR0.GT and CR0.SO slots, exactly as the old rlwinm/or_ pair did),
+  // then rlwimi inserts Z on top instead of building it in a scratch and
+  // OR-ing. Same SH/MB/ME as the extracts they replace.
   rlwinm(TMP1, Src, 0,  0, 0);   // N → CR0.LT
-  rlwinm(TMP3, Src, 31, 2, 2);   // Z → CR0.EQ
-  or_(TMP1, TMP1, TMP3);
+  rlwimi(TMP1, Src, 31, 2, 2);   // Z → CR0.EQ
   mtocrf(0x80, TMP1);
 
-  // XER: clear OV+CA (LSB bits 30+29 = 0x60000000), OR in new bits.
+  // XER: rlwimi clears and sets each target bit in one instruction, so the
+  // LoadConstant-mask / andc / rlwinm / or_ chain collapses to two inserts
+  // with the SH/MB/ME values the old rlwinm extracts already used.
   mfspr(TMP1, 1);
-  LoadConstant(TMP3, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, Src, 0, 2, 2);    // C → XER.CA at LSB 29
-  or_(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, Src, 2, 1, 1);    // V → XER.OV at LSB 30
-  or_(TMP1, TMP1, TMP3);
+  rlwimi(TMP1, Src, 0, 2, 2);    // C: Src LSB 29 → XER.CA LSB 29 (no rotate)
+  rlwimi(TMP1, Src, 2, 1, 1);    // V: Src LSB 28 (PPC 3) → XER.OV LSB 30 (PPC 1)
   mtspr(1, TMP1);
 }
 
@@ -3867,15 +3873,21 @@ DEF_OP(FCmp) {
   // mfocrf 0x80: both bits read (CR0.LT, CR0.SO) are inside the defined
   // field-0 nibble; the rlwinm masks discard the undefined remainder.
   mfocrf(TMP1, 0x80);
-  rlwinm(TMP2, TMP1, 2, 1, 1);     // V (CR0.SO at PPC 3) → PPC 1 (XER.OV slot)
   rlwinm(TMP3, TMP1, 1, 31, 31);   // LT (PPC 0) → LSB 0
   xori(TMP3, TMP3, 1);             // !LT at LSB 0
-  rlwinm(TMP3, TMP3, 29, 2, 2);    // !LT → PPC 2 (XER.CA slot)
+  // Insert both bits with rlwimi (clear-and-set in one instruction; SH/MB/ME
+  // derivation in DEF_OP(AdcWithFlags) above).
+  //   V: source CR0.SO is at PPC bit 3 of TMP1, target XER.OV is PPC bit 1.
+  //      ROTL32 by SH sends PPC q to (q - SH) mod 32, so 3 - SH ≡ 1 → SH = 2,
+  //      MB = ME = 1.
+  //   C: source !LT is at LSB 0 = PPC 31, target XER.CA is PPC bit 2, so
+  //      31 - SH ≡ 2 → SH = 29, MB = ME = 2.
+  // Both masks are a single bit, so the undefined bits mfocrf may have left
+  // in TMP1 outside CR0's nibble are discarded just as the old rlwinm masks
+  // discarded them.
   mfspr(TMP4, 1);                  // read XER
-  LoadConstant(TMP1, 0x60000000ULL);
-  andc(TMP4, TMP4, TMP1);          // clear old OV+CA
-  or_(TMP4, TMP4, TMP2);           // OR in new V
-  or_(TMP4, TMP4, TMP3);           // OR in new C
+  rlwimi(TMP4, TMP1, 2, 1, 1);     // OV <- CR0.SO
+  rlwimi(TMP4, TMP3, 29, 2, 2);    // CA <- !CR0.LT
   mtspr(1, TMP4);                  // write XER
 }
 
