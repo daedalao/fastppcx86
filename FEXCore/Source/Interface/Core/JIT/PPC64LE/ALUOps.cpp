@@ -2075,13 +2075,20 @@ DEF_OP(AdcNZCV) {
 
   if (IROp->Size == IR::OpSize::i64Bit) {
     // CFInverted=true: pre-flip XER.CA so addeo_ sees x86_CF; post-flip CA-out.
-    mfspr(TMP1, 1);
-    xoris(TMP1, TMP1, 0x2000);
-    mtspr(1, TMP1);
+    // Each flip is the subfe/addic pair documented at DEF_OP(CarryInvert):
+    // subfe TMP1,r0,r0 leaves 0 when CA=1 and -1 when CA=0 (and preserves CA),
+    // then addic TMP1,TMP1,1 sets CA from that value's carry-out — 0 and 1
+    // respectively — so CA is inverted in two non-serializing instructions
+    // instead of an mfspr/xoris/mtspr round trip.
+    //
+    // Critically for the POST-flip: neither subfe nor addic writes OV, SO or
+    // CR0, so the overflow and N/Z that addeo_ just produced pass through
+    // untouched. TMP1 was already this path's only scratch.
+    subfe(TMP1, r0, r0);
+    addic(TMP1, TMP1, 1);
     addeo_(TMP3, S1, S2);
-    mfspr(TMP1, 1);
-    xoris(TMP1, TMP1, 0x2000);
-    mtspr(1, TMP1);
+    subfe(TMP1, r0, r0);
+    addic(TMP1, TMP1, 1);
     return;
   }
 
@@ -3583,11 +3590,26 @@ DEF_OP(StoreNZCV) {
 DEF_OP(CarryInvert) {
   // Flip x86 CF, which we route through XER.CA. PPC subtract sets CA = !borrow,
   // so this op is what the IR uses to convert PPC's CA convention to x86's CF.
-  // XER.CA sits at LSB bit 29 of mfspr-1's low-32 result; toggle it via xoris
-  // with imm 0x2000 (which becomes 0x2000_0000, bit 29 set).
-  mfspr(TMP1, 1);
-  xoris(TMP1, TMP1, 0x2000);
-  mtspr(1, TMP1);
+  //
+  // Done without touching the XER SPR at all. mtspr XER is execution-
+  // serializing on POWER8, so the old mfspr/xoris/mtspr toggle stalled the
+  // pipeline on an op that appears after essentially every emulated SUB/CMP
+  // whose carry is consumed.
+  //
+  // The two-instruction flip:
+  //   subfe TMP1, r0, r0   ->  ~r0 + r0 + CA = all-ones + CA
+  //                            CA = 1  =>  TMP1 =  0
+  //                            CA = 0  =>  TMP1 = -1
+  //   addic TMP1, TMP1, 1  ->  writes CA = carry-out of TMP1 + 1
+  //                            TMP1 =  0  =>  0 + 1, no carry  =>  CA = 0
+  //                            TMP1 = -1  => -1 + 1, carries   =>  CA = 1
+  // so CA ends up inverted. subfe's carry-out equals its carry-in, so the
+  // value addic sees is the original CA. Neither instruction writes OV or SO
+  // (addic is the non-record, non-OE form) and neither writes CR0, so the
+  // packed guest N/Z living in CR0 survives. Only TMP1 is clobbered, and it
+  // is a scratch with no live value at any CarryInvert site.
+  subfe(TMP1, r0, r0);
+  addic(TMP1, TMP1, 1);
 }
 
 DEF_OP(LoadDF) {
