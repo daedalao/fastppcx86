@@ -4542,6 +4542,14 @@ DEF_OP(Vector_FToS) {
     // indefinite") sentinel.  Detect Src >= 2^31 and substitute INT_MIN.
     // NaN comparisons return 0 from xvcmpgesp (and POWER already maps NaN
     // → INT_MIN), so the mask correctly captures only +overflow / +Inf.
+    //
+    // This select is LOAD-BEARING, not dead — do NOT remove it. Hardware-
+    // measured on POWER8 (op4k, notes/vperm-verify): xvrspic+xvcvspsxws on
+    // {+2^40, NaN, -2^40, 1.5} = {7fffffff, 80000000, 80000000, 2}. The
+    // +overflow lane is INT_MAX (7fffffff), so without the substitution x86
+    // CVTPS2DQ of an out-of-range positive would return 0x7fffffff instead of
+    // 0x80000000. The xvcvspsxws/xvcvdpsxds "+overflow → INT_MAX" behaviour is
+    // the reason every FToS/FToISized site keeps this block.
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
     xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
