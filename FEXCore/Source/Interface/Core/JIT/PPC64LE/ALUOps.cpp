@@ -30,6 +30,31 @@ static inline IR::CondClass IntegerNZCVCond(IR::CondClass C) {
   return C;
 }
 
+// -------------------------------------------------------------------------
+// SplitAddisAddi: express a 33-bit-or-narrower signed addend as the (Hi, Lo)
+// pair consumed by `addis rD, rA, Hi ; addi rD, rD, Lo`, which adds
+// (Hi << 16) + Lo to rA. Both immediates are sign-extended by the hardware,
+// so Lo being negative eats 0x10000 out of the high part — hence the
+// `V - Lo` before the shift, which is the standard +1 correction to Hi when
+// the low half has its top bit set. `V - Lo` is exact and always a multiple
+// of 65536, and it is done in int64 so the near-INT32_MAX cases cannot wrap.
+//
+// Returns false when Hi does not fit a signed 16-bit field, i.e. whenever V
+// is outside roughly +/-2^31; callers fall back to LoadConstant + add.
+//
+// NOTE for callers: addi/addis interpret an RA field of 0 as the literal
+// value 0, not as GPR[r0]. Guest registers never map to r0 (it is the JIT's
+// zero-index invariant), but callers still guard on the register index so a
+// future allocator change cannot silently miscompile.
+static inline bool SplitAddisAddi(int64_t V, int16_t& Hi, int16_t& Lo) {
+  const int64_t L = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint64_t>(V)));
+  const int64_t H = (V - L) >> 16;
+  if (H < -32768 || H > 32767) return false;
+  Hi = static_cast<int16_t>(H);
+  Lo = static_cast<int16_t>(L);
+  return true;
+}
+
 // =========================================================================
 // Constants and inline values
 // =========================================================================
@@ -53,7 +78,7 @@ DEF_OP(EntrypointOffset) {
   // S3.7-C2: `Entry + Op->Offset` is a guest RIP baked into 20 bytes of
   // host constant-load; mirrors ARM64 JIT/ALUOps.cpp:67. The mask is
   // applied at emit time so the recorded value equals the emitted value.
-  InsertGuestRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
+  InsertEntrypointRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
 }
 
 DEF_OP(InlineConstant)         { /* nop — handled by IsInlineConstant */ }
@@ -90,8 +115,24 @@ DEF_OP(Add) {
                static_cast<int64_t>(Const) <= 32767) {
       addi(Dst, S1, static_cast<int16_t>(Const));
     } else {
-      LoadConstant(TMP4, Const);
-      add(Dst, S1, TMP4);
+      // 17..32-bit addends: addis + addi is two instructions and needs no
+      // scratch register, versus LoadConstant (lis+ori, two instructions for
+      // this range) plus a separate add. At i32Bit the result is masked to 32
+      // bits below, so a constant whose bit 31 is set can be fed through as
+      // its sign-extended int32 form — the low 32 bits of the sum are the
+      // same either way.
+      int64_t V = static_cast<int64_t>(Const);
+      if (IROp->Size == IR::OpSize::i32Bit) {
+        V = static_cast<int32_t>(static_cast<uint32_t>(Const));
+      }
+      int16_t Hi, Lo;
+      if (S1.idx != 0 && SplitAddisAddi(V, Hi, Lo)) {
+        addis(Dst, S1, Hi);
+        addi(Dst, Dst, Lo);
+      } else {
+        LoadConstant(TMP4, Const);
+        add(Dst, S1, TMP4);
+      }
     }
   } else {
     add(Dst, S1, GetReg(Op->Src2));
@@ -112,12 +153,26 @@ DEF_OP(Sub) {
   if (S2Inline) {
     // Dst = Src1 - C2  →  addi/subf with negated constant
     auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
+    // Negate in unsigned so C2 = 0x8000...0 cannot trip signed-overflow UB.
+    int64_t NegC = static_cast<int64_t>(~C2 + 1);
     if (NegC >= -32768 && NegC <= 32767) {
       addi(Dst, S1, static_cast<int16_t>(NegC));
     } else {
-      LoadConstant(TMP4, C2);
-      subf(Dst, TMP4, S1);
+      // Same addis+addi form as DEF_OP(Add): subtracting C2 is adding -C2,
+      // and at i32Bit only the low 32 bits survive the mask below, so the
+      // int32-truncated negation is equivalent there.
+      int64_t V = NegC;
+      if (IROp->Size == IR::OpSize::i32Bit) {
+        V = static_cast<int32_t>(static_cast<uint32_t>(NegC));
+      }
+      int16_t Hi, Lo;
+      if (S1.idx != 0 && SplitAddisAddi(V, Hi, Lo)) {
+        addis(Dst, S1, Hi);
+        addi(Dst, Dst, Lo);
+      } else {
+        LoadConstant(TMP4, C2);
+        subf(Dst, TMP4, S1);
+      }
     }
   } else if (S1Inline) {
     // Dst = C1 - Src2. _Sub is a value-only op — it MUST NOT touch XER.CA
@@ -144,16 +199,24 @@ DEF_OP(Neg) {
   if (Op->Cond == IR::CondClass::AL) {
     neg(Dst, Src);
   } else {
-    // Conditional: emit "Dst = Src; if Cond { Dst = -Src; }" using a forward
-    // branch on the inverted condition. Use TMP4 to hold -Src so we don't
-    // clobber Src before the final move (Dst may alias Src).
+    // Conditional: Dst = Cond ? -Src : Src, branch-free via isel. isel reads
+    // both source operands before writing RT, so Dst aliasing Src is fine and
+    // the old mr/bc/mr dance (plus its Label and forward branch) is
+    // unnecessary. The condition is decoded from the architecturally packed
+    // NZCV in CR0 that a preceding *NZCV op set, and CC.BI is an absolute CR
+    // bit index in CR0's 0..3 range, which is what isel's BC field wants.
+    //
+    // A branch here would be the worst case for it: a data-dependent condition
+    // feeding pure dataflow, i.e. unpredictable. That is the same reasoning
+    // recorded at DEF_OP(NZCVSelect), where making the analogous select
+    // branchy was measured as a 5.7 ns/op regression.
+    //
+    // isel's RA = 0 encoding means literal zero rather than GPR[r0], so a
+    // source in the RA slot must not be r0 — TMP4 is r6 and Src is a mapped
+    // guest register, neither of which is r0.
     neg(TMP4, Src);
-    if (Dst != Src) mr(Dst, Src);
     auto CC = MapNZCVCC(IntegerNZCVCond(Op->Cond));
-    PPC64Emitter::Label Skip{};
-    bc(InvertCond(CC), &Skip);
-    mr(Dst, TMP4);
-    Bind(&Skip);
+    iselcc(Dst, CC, TMP4, Src);
   }
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
 }
@@ -242,8 +305,11 @@ DEF_OP(MulH) {
     extsb(TMP1, S1);
     extsb(TMP2, S2);
     mulld(Dst, TMP1, TMP2);
-    rldicl(Dst, Dst, 64 - 8, 8);   // srdi by 8 (no Rc; equivalent to ASR here)
-    rldicl(Dst, Dst, 0, 56);
+    // (Dst >> 8) & 0xFF in one rotate-and-mask: rldicl RA,RS,sh,mb computes
+    // ROTL64(RS, sh) & MASK(mb, 63), so sh = 56 (= 64 - 8) brings bits 15:8
+    // down to 7:0 and mb = 56 keeps exactly those low 8 bits. The two-step
+    // srdi-then-clear this replaces produced the identical value.
+    rldicl(Dst, Dst, 56, 56);
     break;
   case IR::OpSize::i16Bit:
     // Same trick: 16x16→32 signed product, sign-extended to 64 by mulld.
@@ -251,8 +317,7 @@ DEF_OP(MulH) {
     extsh(TMP1, S1);
     extsh(TMP2, S2);
     mulld(Dst, TMP1, TMP2);
-    rldicl(Dst, Dst, 64 - 16, 16);
-    rldicl(Dst, Dst, 0, 48);
+    rldicl(Dst, Dst, 48, 48);   // (Dst >> 16) & 0xFFFF, one rotate-and-mask
     break;
   case IR::OpSize::i32Bit:
     mulhw(Dst, S1, S2);
@@ -277,15 +342,13 @@ DEF_OP(UMulH) {
     rldicl(TMP1, S1, 0, 56);
     rldicl(TMP2, S2, 0, 56);
     mulld(Dst, TMP1, TMP2);
-    srdi(Dst, Dst, 8);
-    rldicl(Dst, Dst, 0, 56);
+    rldicl(Dst, Dst, 56, 56);   // (Dst >> 8) & 0xFF, one rotate-and-mask
     break;
   case IR::OpSize::i16Bit:
     rldicl(TMP1, S1, 0, 48);
     rldicl(TMP2, S2, 0, 48);
     mulld(Dst, TMP1, TMP2);
-    srdi(Dst, Dst, 16);
-    rldicl(Dst, Dst, 0, 48);
+    rldicl(Dst, Dst, 48, 48);   // (Dst >> 16) & 0xFFFF, one rotate-and-mask
     break;
   case IR::OpSize::i32Bit:
     mulhwu(Dst, S1, S2);
@@ -797,10 +860,22 @@ DEF_OP(AndWithFlags) {
   // retain prior values. Without this clear, x86 TEST/AND followed by LAHF/
   // PUSHF / Jcc-on-CF reads stale CA — manifests as a phantom CF=1 in
   // Primary_84/85, Primary_A9, BLSI_flags, BLSR_flags, etc.
-  mfspr(TMP1, 1);
-  LoadConstant(TMP4, 0x60000000ull);   // mask: bits 29 (CA) + 30 (OV)
-  andc(TMP1, TMP1, TMP4);
-  mtspr(1, TMP1);
+  //
+  // A single OE=1 add of 0+0 replaces the mfspr/LoadConstant/andc/mtspr XER
+  // round trip — see the full equivalence proof above the identical
+  // `addco(TMP1, r0, r0)` in DEF_OP(TestNZ). In brief:
+  //   * the old mask 0x60000000 = LSB bits 30|29 = OV|CA, andc'd off, so the
+  //     old sequence cleared exactly CA and OV and preserved the sticky SO.
+  //   * addco writes CA = carry-out and OV = signed overflow of the add;
+  //     0 + 0 produces neither, so CA = OV = 0.  SO is sticky (hardware only
+  //     ORs OV into it, never clears it), so SO survives — matching andc.
+  //   * Rc = 0 (`addco`, not `addco_`), so CR0 — which holds the guest N/Z
+  //     just set by the and./andi. above and refined by EmitTestNZSetCR
+  //     below — is NOT touched.
+  // r0 is the JIT's zero-index invariant register (see PPC64Dispatcher.cpp),
+  // so this really is 0 + 0.  TMP1 is dead here: nothing in this handler
+  // reads it before this point, and EmitTestNZSetCR overwrites it next.
+  addco(TMP1, r0, r0);
   // CR0 from and./andi. covers full 64 bits; refine to operand size so SF/ZF
   // reflect only the low N bits (high garbage from S1 must not leak into Z/N).
   if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(Dst, IROp->Size);
@@ -983,18 +1058,22 @@ DEF_OP(Ror) {
       rldicl(Dst, S1, (64 - rot) & 63, 0);
     }
   } else {
+    // Rotate-right by n is rotate-left by (width - n), and both rlwnm and
+    // rldcl read only the low bits of RB — 5 bits (bits 59:63) for the 32-bit
+    // form, 6 bits (58:63) for the 64-bit form — so the count is masked by the
+    // hardware. That makes a plain `neg` sufficient: the low k bits of -count
+    // are (-count) mod 2^k = (2^k - (count mod 2^k)) mod 2^k, which is exactly
+    // the left-rotate amount wanted, including the count ≡ 0 case (neg gives
+    // 0 mod 2^k, the identity rotation). No explicit masking of the count and
+    // no `width - count` materialisation are needed.
+    //
+    // neg has OE = 0 and Rc = 0, so it touches neither XER.CA (the canonical
+    // x86 CF store under CFInverted=true, which _Ror must not disturb) nor
+    // CR0 — the same CA-safety the li/subf pair was chosen for.
+    neg(TMP4, GetReg(Op->Src2));
     if (IROp->Size <= IR::OpSize::i32Bit) {
-      // 32-bit variable rotate-right: rlwnm with sh = (32 - rot) & 31.
-      // Mask the count to 5 bits via rldicl (no Rc — andi_ would clobber CR0)
-      // then compute 32 - count without subfic (which sets XER.CA).
-      rldicl(TMP4, GetReg(Op->Src2), 0, 59);
-      li(TMP3, 32);
-      subf(TMP4, TMP4, TMP3);             // TMP4 = 32 - count, CA-safe
       rlwnm(Dst, S1, TMP4, 0, 31);
     } else {
-      // 64-bit variable rotate: negate shift amount via subf (CA-safe).
-      li(TMP3, 64);
-      subf(TMP4, GetReg(Op->Src2), TMP3); // TMP4 = 64 - count
       rldcl(Dst, S1, TMP4, 0);
     }
   }
@@ -1136,30 +1215,32 @@ DEF_OP(Rev) {
   // For POWER8: combine rotate+mask to do byte swap.
   switch (IROp->Size) {
   case IR::OpSize::i16Bit: {
-    // Swap 2 bytes: rotate left 8 and mask
-    rlwinm(Dst, Src, 8, 16, 23);  // get high byte of low 16 into position
-    rlwinm(TMP1, Src, 24, 24, 31); // get low byte into high position
-    or_(Dst, Dst, TMP1);
-    rlwinm(Dst, Dst, 0, 16, 31);
+    // Swap the two bytes of the low halfword, zero-extending the result.
+    // PPC (MSB=0) bit numbering: the low halfword's high byte H is at PPC
+    // 16..23, its low byte L at PPC 24..31. ROTL32 by SH moves PPC q to
+    // (q - SH) mod 32.
+    //   L (24..31) -> 16..23 needs SH = 8;  mask MB=16, ME=23.
+    //   H (16..23) -> 24..31 needs SH = 24; mask MB=24, ME=31.
+    // rlwinm zeroes everything outside its mask (including bits 0..31 of the
+    // 64-bit register), and rlwimi then merges the second byte in, so the
+    // separate or_ and the trailing zero-extension mask both disappear.
+    rlwinm(Dst, Src, 8,  16, 23);   // L into the high byte slot
+    rlwimi(Dst, Src, 24, 24, 31);   // H into the low byte slot
     break;
   }
   case IR::OpSize::i32Bit: {
-    // 4-byte swap: use stwbrx trick via store/load, or do it with rotates
-    // Via rotates:
-    rlwinm(TMP1, Src, 8,  0, 31);   // rotate left 8
-    rlwinm(TMP2, Src, 24, 0, 31);   // rotate right 8
-    // Mask and combine bytes.
-    // TMP1 = rotl8(Src)  = 0xBBCCDDAA for Src=0xAABBCCDD
-    // TMP2 = rotl24(Src) = 0xDDAABBCC for Src=0xAABBCCDD
-    // DD lives at bits31:24 of TMP2; CC at bits23:16 of TMP1;
-    // BB at bits15:8 of TMP2;        AA at bits7:0 of TMP1.
-    rlwinm(TMP3, TMP2, 0, 0, 7);    // TMP3 = DD000000
-    rlwinm(TMP4, TMP1, 0, 8, 15);   // TMP4 = 00CC0000
-    or_(TMP3, TMP3, TMP4);           // TMP3 = DDCC0000
-    rlwinm(TMP4, TMP2, 0, 16, 23);  // TMP4 = 0000BB00
-    rlwinm(TMP1, TMP1, 0, 24, 31);  // TMP1 = 000000AA
-    or_(TMP4, TMP4, TMP1);           // TMP4 = 0000BBAA
-    or_(Dst, TMP3, TMP4);
+    // Canonical 3-instruction PPC bswap32. For Src = AABBCCDD (PPC bytes
+    // 0..7 = AA, 8..15 = BB, 16..23 = CC, 24..31 = DD) we want DDCCBBAA.
+    //   rlwinm Dst, Src, 8, 0, 31   -> Dst = ROTL32(Src, 8)  = BBCCDDAA
+    //        which already has CC in byte 1 and AA in byte 3 — correct.
+    //   ROTL32(Src, 24) = DDAABBCC has DD in byte 0 and BB in byte 2, so two
+    //   rlwimi with SH = 24 insert exactly those two byte lanes:
+    //   mask 0..7 for DD and mask 16..23 for BB.
+    // The first rlwinm zeroes bits 0..31 of the 64-bit register, and rlwimi
+    // preserves them, so the result is zero-extended as before.
+    rlwinm(Dst, Src, 8,  0,  31);
+    rlwimi(Dst, Src, 24, 0,  7);
+    rlwimi(Dst, Src, 24, 16, 23);
     break;
   }
   default: {  // 64-bit
@@ -1557,57 +1638,51 @@ DEF_OP(AddWithFlags) {
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
 
-  // For 8/16-bit ops, x86 CF is the carry-out of bit 7/15 and OF is the signed
+  // For sub-64-bit ops, x86 CF is the carry-out of bit N-1 and OF is the signed
   // overflow at the same boundary. PPC's addco. produces those for bit 63.
   // Trick: shift both operands left by (64-N) so the operand-size carry/overflow
   // boundary lines up at bit 63, do the 64-bit addco., then shift the result
-  // back. Dst gets the right value and XER.CA/OV match x86 semantics for N bits.
-  if (IROp->Size == IR::OpSize::i8Bit || IROp->Size == IR::OpSize::i16Bit) {
-    uint32_t Sh = (IROp->Size == IR::OpSize::i8Bit) ? 56 : 48;
+  // back. XER.CA/OV then match x86 semantics for N bits.
+  //
+  // The shifted addco_ is now the ONLY arithmetic on this path. Previously the
+  // value was computed twice — a plain 64-bit add/addic_/addco_ into Dst plus
+  // this shifted redo purely for the flags — and a trailing cmpwi/extsX+cmpdi
+  // recomputed N/Z that the shifted addco_ had already produced. Both are
+  // dropped:
+  //   * VALUE: the shifted sum is (a + b) << Sh; its low Sh bits are zero, so
+  //     `srdi Dst, TMP1, Sh` yields exactly the low-N-bit sum, zero-extended
+  //     into the upper bits. That is precisely the writeback x86-64 requires
+  //     for sub-64-bit destinations (and what StoreResult_WithOpSize assumes),
+  //     so the zero-extension comes for free instead of via a separate rldicl.
+  //   * FLAGS: this is the equivalence already written out at DEF_OP(AddNZCV)
+  //     below. CR0 from addco_ on the shifted value has LT = bit 63 of
+  //     (sum << Sh) = bit N-1 of sum = x86 SF, and EQ = (sum << Sh) == 0
+  //     <=> low N bits of sum == 0 = x86 ZF. The srdi that follows is an
+  //     rldicl with Rc=0, so it does not disturb CR0.
+  if (IROp->Size <= IR::OpSize::i32Bit) {
+    uint32_t Sh = 64 - IR::OpSizeToSize(IROp->Size) * 8;
     sldi(TMP1, S1, Sh);
     if (S2Inline) {
       LoadConstant(TMP2, Const << Sh);
     } else {
       sldi(TMP2, GetReg(Op->Src2), Sh);
     }
-    addco_(TMP1, TMP1, TMP2);   // CA/OV reflect bit-(N-1) carry / signed overflow
-    srdi(Dst, TMP1, Sh);         // Dst keeps natural (zero-extended) operand value
-    if (IROp->Size == IR::OpSize::i16Bit) extsh(TMP1, Dst); else extsb(TMP1, Dst);
-    cmpdi(TMP1, 0);              // SF/ZF on truncated/sign-extended result (last CR0 update)
+    addco_(TMP1, TMP1, TMP2);   // CA/OV reflect bit-(N-1) carry / signed overflow; CR0 = N/Z
+    srdi(Dst, TMP1, Sh);        // zero-extended operand-size value, CR0 untouched
     return;
   }
 
+  // 64-bit only from here (everything narrower returned above). There is no
+  // shifted redo at this width, so the flag-producing instruction must write
+  // CA *and* OV itself: addic_ never writes OV, which is why it used to leak a
+  // stale x86 OF (FEX_bugs/add_sub_inline_imm_of.asm) and why it is not used.
+  // Materialising the constant and using addco_ costs the same two
+  // instructions an addic_-plus-OV-redo would, without adding a second add.
   if (S2Inline) {
-    // addic. sets CA + CR0 but NOT OV. That is only tolerable at 32-bit,
-    // where the shifted addco_ redo below rewrites CA/OV anyway; at 64-bit
-    // there is no redo, so the stale XER.OV leaked straight through to x86 OF
-    // (FEX_bugs/add_sub_inline_imm_of.asm). Gate the fast path on i32Bit.
-    // Tradeoff considered: keeping addic_ at 64-bit and appending an
-    // OV-setting redo (addco_ into a scratch) costs the same two instructions
-    // as li+addco_ while executing the addition twice — materialising the
-    // constant is strictly no worse, and simpler.
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(Const));  // CA + CR0; OV fixed by the i32 redo below
-    } else {
-      LoadConstant(TMP4, Const);
-      addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, Const);
+    addco_(Dst, S1, TMP4);  // addco. sets CA + SO/OV + CR0
   } else {
     addco_(Dst, S1, GetReg(Op->Src2));
-  }
-  if (IROp->Size == IR::OpSize::i32Bit) {
-    // 32-bit: operands are zero-extended, so the 64-bit CA from bit 63 is wrong.
-    // Repeat the trick at 32 bits.
-    sldi(TMP1, S1, 32);
-    if (S2Inline) {
-      LoadConstant(TMP2, Const << 32);
-    } else {
-      sldi(TMP2, GetReg(Op->Src2), 32);
-    }
-    addco_(TMP1, TMP1, TMP2);    // sets correct CA/OV for 32-bit boundary
-    rldicl(Dst, Dst, 0, 32);     // x86-64 zero-extends 32-bit writebacks
-    cmpwi(Dst, 0);                // SF/ZF
   }
 }
 
@@ -1618,73 +1693,49 @@ DEF_OP(SubWithFlags) {
   bool S1Inline = IsInlineConstant(Op->Src1, &C1);
   bool S2Inline = IsInlineConstant(Op->Src2, &C2);
 
-  // 8/16-bit: shift-up trick to move the borrow boundary to bit 63 so XER.CA/OV
-  // reflect operand-size CF/OF. Compute Dst from a separate 64-bit subtract.
-  if (IROp->Size == IR::OpSize::i8Bit || IROp->Size == IR::OpSize::i16Bit) {
-    uint32_t Sh = (IROp->Size == IR::OpSize::i8Bit) ? 56 : 48;
+  // Sub-64-bit: shift-up trick to move the borrow boundary to bit 63 so XER.CA/OV
+  // reflect operand-size CF/OF. As in AddWithFlags above, the shifted subfco_
+  // is now the ONLY arithmetic:
+  //   * VALUE: the shifted difference is (a - b) << Sh with its low Sh bits
+  //     zero, so `srdi Dst, TMP1, Sh` gives the low-N-bit difference
+  //     zero-extended — the writeback x86-64 wants for a sub-64-bit dest.
+  //     This replaces both the separate 64-bit `subf Dst, S2, S1` (whose upper
+  //     bits were whatever the sources happened to carry) and, at 32-bit, the
+  //     `rldicl Dst, Dst, 0, 32` that had to clean up after it.
+  //   * FLAGS: CR0 from subfco_ on the shifted operands has LT = bit 63 of
+  //     (diff << Sh) = bit N-1 of diff = x86 SF, and EQ = (diff << Sh) == 0
+  //     <=> low N bits of diff == 0 = x86 ZF. So the trailing extsX+cmpdi
+  //     (8/16-bit) and cmpwi (32-bit) recomputed what CR0 already held. Same
+  //     equivalence spelled out at DEF_OP(AddNZCV). srdi is rldicl with Rc=0
+  //     and leaves CR0 alone.
+  if (IROp->Size <= IR::OpSize::i32Bit) {
+    uint32_t Sh = 64 - IR::OpSizeToSize(IROp->Size) * 8;
     GPR S1Reg, S2Reg;
     if (S1Inline) { LoadConstant(TMP3, C1); S1Reg = TMP3; } else S1Reg = GetReg(Op->Src1);
     if (S2Inline) { LoadConstant(TMP4, C2); S2Reg = TMP4; } else S2Reg = GetReg(Op->Src2);
     sldi(TMP1, S1Reg, Sh);
     sldi(TMP2, S2Reg, Sh);
-    subfco_(TMP1, TMP2, TMP1);   // CA/OV at correct boundary
-    subf(Dst, S2Reg, S1Reg);     // raw 64-bit difference (Dst is operand-size value)
-    if (IROp->Size == IR::OpSize::i16Bit) extsh(TMP1, Dst); else extsb(TMP1, Dst);
-    cmpdi(TMP1, 0);
+    subfco_(TMP1, TMP2, TMP1);   // CA/OV at the correct boundary; CR0 = N/Z
+    srdi(Dst, TMP1, Sh);         // zero-extended operand-size value, CR0 untouched
     return;
   }
 
+  // 64-bit only from here. The flag-producing instruction must write CA *and*
+  // OV itself, so neither addic_ (no OV; and addic_ with imm 0 yields CA=0
+  // where the CFInverted=true subtract convention needs CA=1 for x-0) nor
+  // subfic (no OV, no CR0) is usable — both were 32-bit-only fast paths and
+  // the 32-bit path no longer reaches here. subfco_ is the canonical sub-form
+  // carry: for C != 0 its CA (carry of S1 + ~C + 1) is identical to addic_'s
+  // carry of S1 + (-C), and it additionally writes OV and CR0.
   if (S2Inline) {
-    auto S1 = GetReg(Op->Src1);
-    int64_t NegC = -static_cast<int64_t>(C2);
-    // CARE: addic_ with imm=0 sets CA=0 (no unsigned overflow on x+0), but
-    // FEX's subtract convention (CFInverted=true downstream) needs CA=1
-    // (no-borrow) for x-0. Force subfco_ path for C2=0 to match the SUB-style
-    // carry semantic. Same pitfall as the CondSubNZCV fix earlier today.
-    // ALSO: addic_ never writes OV, so the fast path is only legal at 32-bit
-    // where the shifted subfco_ redo below rewrites CA/OV (stale-OF bug,
-    // FEX_bugs/add_sub_inline_imm_of.asm). At 64-bit materialise C2 and use
-    // subfco_: for C2 != 0 its CA (carry of S1 + ~C2 + 1) is identical to
-    // addic_'s carry of S1 + (-C2), so the CF semantics documented above are
-    // preserved — subfco_ is the canonical sub-form carry either way.
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        C2 != 0 && NegC >= -32768 && NegC <= 32767) {
-      addic_(Dst, S1, static_cast<int16_t>(NegC));  // CA + CR0; OV fixed by the i32 redo below
-    } else {
-      LoadConstant(TMP4, C2);
-      subfco_(Dst, TMP4, S1);  // sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, C2);
+    subfco_(Dst, TMP4, GetReg(Op->Src1));  // sets CA + SO/OV + CR0
   } else if (S1Inline) {
-    // Dst = C1 - Src2 with flags. subfic computes the value and sets CA but
-    // doesn't set CR0 or OV, so it is likewise only usable at 32-bit where
-    // the redo fixes both (and cmpwi provides SF/ZF).
-    auto S2 = GetReg(Op->Src2);
-    int64_t SignedC = static_cast<int64_t>(C1);
-    if (IROp->Size == IR::OpSize::i32Bit &&
-        SignedC >= -32768 && SignedC <= 32767) {
-      subfic(Dst, S2, static_cast<int16_t>(SignedC));
-    } else {
-      LoadConstant(TMP4, C1);
-      subfco_(Dst, S2, TMP4);  // sets CA + SO/OV + CR0
-    }
+    LoadConstant(TMP4, C1);
+    subfco_(Dst, GetReg(Op->Src2), TMP4);  // sets CA + SO/OV + CR0
   } else {
-    auto S1 = GetReg(Op->Src1);
-    subfco_(Dst, GetReg(Op->Src2), S1);
+    subfco_(Dst, GetReg(Op->Src2), GetReg(Op->Src1));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) {
-    // 32-bit borrow boundary is bit 31, not bit 63 — redo CA/OV via shifted op.
-    GPR S1Reg, S2Reg;
-    if (S1Inline) { LoadConstant(TMP3, C1); S1Reg = TMP3; } else S1Reg = GetReg(Op->Src1);
-    if (S2Inline) { LoadConstant(TMP4, C2); S2Reg = TMP4; } else S2Reg = GetReg(Op->Src2);
-    sldi(TMP1, S1Reg, 32);
-    sldi(TMP2, S2Reg, 32);
-    subfco_(TMP1, TMP2, TMP1);   // CA/OV reflect 32-bit borrow / overflow
-    rldicl(Dst, Dst, 0, 32);     // zero-extend writeback
-    cmpwi(Dst, 0);
-  }
-  // (No trailing cmpdi needed any more: the 64-bit S1Inline case now goes
-  // through subfco_, which sets CR0 itself; subfic survives only at 32-bit,
-  // where the cmpwi above supplies SF/ZF.)
 }
 
 // IMPORTANT: never use r0 as the destination of *NZCV / Test ops. r0 is the
@@ -1791,18 +1842,20 @@ DEF_OP(SubNZCV) {
 void PPC64JITCore::EmitTestNZSetCR(GPR Result, IR::OpSize Size) {
   // Sign-extend into TMP1 (don't clobber Result — callers may pass an SSA
   // Dst whose natural value must remain zero-extended for downstream uses).
+  // The record forms collapse the old `extsX ; cmpdi 0` pair into one
+  // instruction: extsX. writes CR0 from a signed comparison of the 64-bit
+  // sign-extended result against zero — bit-for-bit what the cmpdi produced
+  // (LT = sign bit of the <Size>-wide value = N, EQ = low <Size> bits zero
+  // = Z, SO copied from XER.SO exactly as cmpdi copies it).
   switch (Size) {
     case IR::OpSize::i8Bit:
-      extsb(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsb_(TMP1, Result);
       return;
     case IR::OpSize::i16Bit:
-      extsh(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsh_(TMP1, Result);
       return;
     case IR::OpSize::i32Bit:
-      extsw(TMP1, Result);
-      cmpdi(TMP1, 0);
+      extsw_(TMP1, Result);
       return;
     case IR::OpSize::i64Bit:
     default:
@@ -1851,7 +1904,12 @@ DEF_OP(TestNZ) {
   // use of it ended at the mtspr, and EmitTestNZSetCR overwrites it next.
   addco(TMP1, r0, r0);
   // Refine CR0 to reflect ONLY the IR operand-size's worth of bits.
-  EmitTestNZSetCR(TMP3, IROp->Size);
+  // At i64 there is nothing to refine: the and./andi. above already set CR0
+  // from a signed comparison of the full 64-bit result against zero, which is
+  // precisely what EmitTestNZSetCR's i64 case (`cmpdi Result, 0`) recomputes,
+  // and the intervening addco has Rc=0 so CR0 still holds it. Skip it — same
+  // guard DEF_OP(AndWithFlags) already applies.
+  if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(TMP3, IROp->Size);
 }
 
 DEF_OP(TestZ) {
@@ -1872,7 +1930,9 @@ DEF_OP(TestZ) {
   // (CA/OV cleared, sticky SO preserved, CR0 untouched because Rc=0).
   // TMP1 is dead here for the same reason: EmitTestNZSetCR writes it next.
   addco(TMP1, r0, r0);
-  EmitTestNZSetCR(TMP3, IROp->Size);
+  // Same i64 redundancy as TestNZ above: and./andi. already set CR0 over the
+  // full 64 bits and addco (Rc=0) left it alone, so the cmpdi is a no-op.
+  if (IROp->Size != IR::OpSize::i64Bit) EmitTestNZSetCR(TMP3, IROp->Size);
 }
 
 DEF_OP(Adc) {
@@ -1881,13 +1941,24 @@ DEF_OP(Adc) {
   auto S1  = GetReg(Op->Src1);
   auto S2  = GetReg(Op->Src2);
   // CFInverted=true: stored XER.CA = !x86_CF. PPC `adde` would inject !x86_CF
-  // as the carry-in, producing a result that is off by one. Compute manually
-  // without disturbing XER.
-  mfspr(TMP1, 1);
-  rldicl(TMP2, TMP1, 64 - 29, 63);  // TMP2 = stored_CA in LSB
-  xori(TMP2, TMP2, 1);                // TMP2 = x86_CF in LSB
+  // as the carry-in, producing a result that is off by one. Materialise the
+  // carry instead, without disturbing XER.
+  //
+  // `subfe rT, r0, r0` = ~r0 + r0 + CA. With the JIT's r0 == 0 invariant that
+  // is 0xFFFF_FFFF_FFFF_FFFF + 0 + CA, i.e.
+  //     CA = 1  ->  rT =  0
+  //     CA = 0  ->  rT = -1
+  // so rT == -(!CA) == -x86_CF for this op's CFInverted=true convention.
+  // (The identity actually holds for any r0 value: ~x + x is all-ones.)
+  // Its carry-out is 1 iff CA was 1, so XER.CA is left exactly as found;
+  // OE = 0 and Rc = 0, so OV/SO/CR0 are untouched too — which matters here
+  // because _Adc is a value-only op that must not perturb flags.
+  //
+  // Dst = S1 + S2 + x86_CF = (S1 + S2) - (-x86_CF), so the third addend
+  // folds into a subf instead of an add.
+  subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
   add(TMP3, S1, S2);
-  add(Dst, TMP3, TMP2);
+  subf(Dst, TMP2, TMP3);      // subf RT,RA,RB = RB - RA = (S1+S2) + x86_CF
 }
 
 DEF_OP(Sbb) {
@@ -1912,13 +1983,17 @@ DEF_OP(AdcWithFlags) {
 
   // i32Bit: zero-extend, do a 64-bit add with x86_CF as the third addend, take
   // bit-32 as x86_CF_out, store directly (CFInverted=false convention).
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);          // TMP4 = stored CA = x86_CF
-
+  //
+  // Because the convention here is DIRECT (stored XER.CA == x86_CF, see the
+  // i64 comment above), the carry-in needs no flip and `adde` injects exactly
+  // the right bit — no mfspr/rldicl extraction, no separate add for it.
+  // Both addends are zero-extended 32-bit values, so the sum is at most
+  // 2*(2^32 - 1) + 1 < 2^33: adde's own CA-out (the carry at bit 63) is always
+  // 0. Clobbering XER.CA here is harmless regardless — the tail below rewrites
+  // CA and OV wholesale and only reads XER for the sticky SO.
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
-  add(TMP3, TMP1, TMP2);
-  add(TMP3, TMP3, TMP4);                    // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
+  adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
   rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
 
@@ -1933,14 +2008,29 @@ DEF_OP(AdcWithFlags) {
   xor_(TMP3, TMP3, TMP1);
   andc(TMP3, TMP3, TMP2);
 
-  // Patch XER: clear CA + OV, OR in new CA (TMP4 LSB) at LSB29, OV (TMP3 LSB) at LSB30.
+  // Patch XER: new CA = TMP4's LSB, new OV = TMP3's LSB.
+  //
+  // rlwimi does clear-and-set in one instruction, so the LoadConstant-mask /
+  // andc / sldi / or_ chain collapses. The canonical form used at every XER
+  // patch site in this file:
+  //
+  //   rlwimi RA, RS, SH, MB, ME
+  //     RA <- (ROTL32(RS, SH) & MASK(MB, ME)) | (RA & ~MASK(MB, ME))
+  //
+  // with PPC (MSB=0) bit numbering, where PPC bit p == LSB bit (31 - p) in
+  // the low word, and the mask lives entirely in bits 32..63 of the 64-bit
+  // register so mfspr's upper half is preserved exactly as andc preserved it.
+  // ROTL32 by SH moves a bit at PPC position q to position (q - SH) mod 32.
+  // The two inserts we need, both from an LSB-0 source bit (PPC 31):
+  //
+  //   CA at LSB 29 = PPC 2:  (31 - SH) mod 32 = 2  =>  SH = 29, MB = ME = 2
+  //   OV at LSB 30 = PPC 1:  (31 - SH) mod 32 = 1  =>  SH = 30, MB = ME = 1
+  //
+  // Single-bit masks, so whatever the source carries above its LSB is
+  // discarded — the same guarantee the sldi/or_ pair relied on.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
   mtspr(1, TMP1);
 }
 
@@ -1983,13 +2073,10 @@ DEF_OP(SbbWithFlags) {
   xor_(TMP3, TMP3, TMP1);                  // S1^Dst
   and_(TMP3, TMP3, TMP2);                  // (S1^S2) AND (S1^Dst) = OF
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
   mtspr(1, TMP1);
 }
 
@@ -1997,11 +2084,14 @@ DEF_OP(AdcZero) {
   auto Op  = IROp->C<IR::IROp_AdcZero>();
   auto Dst = GetReg(Node);
   auto Src = GetReg(Op->Src1);
-  // CFInverted=true: PPC `addze` would add !x86_CF. Extract x86_CF and add manually.
-  mfspr(TMP1, 1);
-  rldicl(TMP2, TMP1, 64 - 29, 63);
-  xori(TMP2, TMP2, 1);
-  add(Dst, Src, TMP2);
+  // CFInverted=true: PPC `addze` would add !x86_CF. Materialise x86_CF instead.
+  // subfe(TMP2, r0, r0) = ~r0 + r0 + CA = all-ones + CA, i.e. 0 when CA=1 and
+  // -1 when CA=0 — that is -(!CA) = -x86_CF under this op's inverted
+  // convention. Its carry-out equals its carry-in so XER.CA survives, and
+  // OE=Rc=0 leaves OV/SO/CR0 alone (this is a value-only op).
+  // Dst = Src + x86_CF = Src - (-x86_CF), so the add becomes a subf.
+  subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
+  subf(Dst, TMP2, Src);       // Dst = Src - TMP2 = Src + x86_CF
 }
 
 DEF_OP(AdcZeroWithFlags) {
@@ -2009,10 +2099,14 @@ DEF_OP(AdcZeroWithFlags) {
   auto Dst = GetReg(Node);
   auto Src = GetReg(Op->Src1);
 
-  // Extract x86_CF from CFInverted-stored XER.CA.
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);
-  xori(TMP4, TMP4, 1);                       // TMP4 = x86_CF (0 or 1)
+  // Materialise x86_CF from the CFInverted-stored XER.CA. subfe(TMP4, r0, r0)
+  // = ~r0 + r0 + CA = all-ones + CA, giving 0 for CA=1 and -1 for CA=0, i.e.
+  // -(!CA) = -x86_CF; negate to get x86_CF itself. Both instructions leave XER
+  // untouched (subfe's carry-out equals its carry-in; neg has OE=0), so the CA
+  // that addco_ below consumes-and-replaces is still the stored one, and CR0
+  // is undisturbed until addco_ writes it.
+  subfe(TMP4, r0, r0);                       // TMP4 = -x86_CF
+  neg(TMP4, TMP4);                           // TMP4 = x86_CF (0 or 1)
 
   if (IROp->Size == IR::OpSize::i64Bit) {
     // addco_(Dst, Src, TMP4): Dst = Src + x86_CF, CA = carry-out, OV = ovf, CR0 from Dst.
@@ -2043,13 +2137,10 @@ DEF_OP(AdcZeroWithFlags) {
   rldicl(TMP4, Dst, 33, 63);                  // Dst[31]
   and_(TMP4, TMP4, TMP1);                     // OF in LSB
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2062,25 +2153,36 @@ DEF_OP(AdcNZCV) {
 
   if (IROp->Size == IR::OpSize::i64Bit) {
     // CFInverted=true: pre-flip XER.CA so addeo_ sees x86_CF; post-flip CA-out.
-    mfspr(TMP1, 1);
-    xoris(TMP1, TMP1, 0x2000);
-    mtspr(1, TMP1);
+    // Each flip is the subfe/addic pair documented at DEF_OP(CarryInvert):
+    // subfe TMP1,r0,r0 leaves 0 when CA=1 and -1 when CA=0 (and preserves CA),
+    // then addic TMP1,TMP1,1 sets CA from that value's carry-out — 0 and 1
+    // respectively — so CA is inverted in two non-serializing instructions
+    // instead of an mfspr/xoris/mtspr round trip.
+    //
+    // Critically for the POST-flip: neither subfe nor addic writes OV, SO or
+    // CR0, so the overflow and N/Z that addeo_ just produced pass through
+    // untouched. TMP1 was already this path's only scratch.
+    subfe(TMP1, r0, r0);
+    addic(TMP1, TMP1, 1);
     addeo_(TMP3, S1, S2);
-    mfspr(TMP1, 1);
-    xoris(TMP1, TMP1, 0x2000);
-    mtspr(1, TMP1);
+    subfe(TMP1, r0, r0);
+    addic(TMP1, TMP1, 1);
     return;
   }
 
-  // i32Bit: extract x86_CF, manually compute, store !bit-32 as CFInverted CA.
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);
-  xori(TMP4, TMP4, 1);                       // TMP4 = x86_CF
+  // i32Bit: materialise x86_CF, compute manually, store !bit-32 as CFInverted CA.
+  // subfe(TMP4, r0, r0) = ~r0 + r0 + CA = all-ones + CA => 0 for CA=1, -1 for
+  // CA=0, i.e. -(!CA) = -x86_CF under CFInverted=true. XER survives it (its
+  // carry-out equals its carry-in, OE=Rc=0), which matters because the stored
+  // CA must still be readable... it is not read again here, but the XER tail
+  // below reads XER for the sticky SO, and CR0 must stay clean until
+  // EmitTestNZSetCR. Adding x86_CF then becomes subtracting -x86_CF.
+  subfe(TMP4, r0, r0);                      // TMP4 = -x86_CF
 
   rldicl(TMP1, S1, 0, 32);
   rldicl(TMP2, S2, 0, 32);
   add(TMP3, TMP1, TMP2);
-  add(TMP3, TMP3, TMP4);                    // TMP3 = sum + x86_CF (33-bit)
+  subf(TMP3, TMP4, TMP3);                   // TMP3 = sum + x86_CF (33-bit)
   rldicl(TMP4, TMP3, 0, 32);                 // TMP4 = low-32 result
   EmitTestNZSetCR(TMP4, IR::OpSize::i32Bit);
 
@@ -2097,13 +2199,10 @@ DEF_OP(AdcNZCV) {
   andc(TMP4, TMP4, TMP2);                   // OF
 
   // Patch XER: CA = TMP3 LSB (= !x86_CF_out), OV = TMP4 LSB.
+  // rlwimi SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2135,13 +2234,10 @@ DEF_OP(SbbNZCV) {
   xor_(TMP4, TMP4, TMP1);                  // S1^Result
   and_(TMP4, TMP4, TMP2);                  // (S1^S2) AND (S1^Result) = OF
 
+  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP3, 29);
-  or_(TMP1, TMP1, TMP2);
-  sldi(TMP2, TMP4, 30);
-  or_(TMP1, TMP1, TMP2);
+  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
 
@@ -2197,7 +2293,12 @@ DEF_OP(Select) {
         else
           cmpdi(S1, static_cast<int16_t>(sc));
       } else {
-        LoadConstant(TMP4, Const);
+        // No LoadConstant here: EmitCompare (JIT.cpp) re-materialises the
+        // inline constant itself on every path it can take for this operand
+        // — TMP4 for the 32/64-bit signed and unsigned wide-constant cases,
+        // TMP2 (pre-shifted by Const << Sh) for the 8/16-bit case — and it
+        // reads Op->Cmp2 rather than any register we could have primed. A
+        // LoadConstant here was therefore pure dead weight.
         EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
       }
     } else {
@@ -2737,13 +2838,14 @@ DEF_OP(ShiftFlags) {
     xor_(OFReg, OFReg, TMP4);
   }
 
+  // XER patch via rlwimi (clear-and-set in one instruction) — SH/MB/ME
+  // derived in DEF_OP(AdcWithFlags) above: CA sits at LSB 29 = PPC bit 2, so
+  // an LSB-0 source needs SH=29 with MB=ME=2; OV at LSB 30 = PPC bit 1 needs
+  // SH=30 with MB=ME=1. Single-bit masks discard everything above the
+  // source's LSB, exactly as the old sldi/or_ pair did.
   mfspr(TMP4, 1);
-  LoadConstant(TMP1, 0x60000000ULL);  // mask OV (bit 30) + CA (bit 29)
-  andc(TMP4, TMP4, TMP1);
-  sldi(TMP3, TMP3, 29);
-  or_(TMP4, TMP4, TMP3);
-  sldi(OFReg, OFReg, 30);
-  or_(TMP4, TMP4, OFReg);
+  rlwimi(TMP4, TMP3,  29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP4, OFReg, 30, 1, 1);   // OV <- OFReg LSB
   mtspr(1, TMP4);
 
   // New raw PF = parity of low byte of Result. rldicl-only masking.
@@ -2829,14 +2931,12 @@ DEF_OP(RotateFlags) {
   // Invert CF for the CFInverted=true contract.
   xori(TMP3, TMP3, 1);
 
-  // Splat C → XER.CA (LSB 29) and V → XER.OV (LSB 30) without disturbing CR0.
+  // Splat C → XER.CA (LSB 29 = PPC bit 2) and V → XER.OV (LSB 30 = PPC bit 1)
+  // without disturbing CR0. rlwimi clears and sets in one instruction; the
+  // SH/MB/ME derivation is written out in DEF_OP(AdcWithFlags) above.
   mfspr(TMP4, 1);
-  LoadConstant(TMP1, 0x60000000ULL);  // mask: clear OV+CA
-  andc(TMP4, TMP4, TMP1);
-  sldi(TMP3, TMP3, 29);
-  or_(TMP4, TMP4, TMP3);
-  sldi(TMP2, TMP2, 30);
-  or_(TMP4, TMP4, TMP2);
+  rlwimi(TMP4, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP4, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP4);
 
   Bind(&noRotate);
@@ -3517,13 +3617,16 @@ DEF_OP(LoadNZCV) {
   //   Z: PPC 2 → 1  (sh=1,  mask 1..1)
   //   C: PPC 2 → 2  (sh=0,  mask 2..2)
   //   V: PPC 1 → 3  (sh=30, mask 3..3)
-  rlwinm(Dst,  TMP1, 0,  0, 0);
-  rlwinm(TMP3, TMP1, 1,  1, 1);
-  or_(Dst, Dst, TMP3);
-  rlwinm(TMP3, TMP2, 0,  2, 2);
-  or_(Dst, Dst, TMP3);
-  rlwinm(TMP3, TMP2, 30, 3, 3);
-  or_(Dst, Dst, TMP3);
+  // The first rlwinm seeds Dst (its mask covers only bits 32..63, so the
+  // upper half of the 64-bit Dst is zeroed and every unselected low bit with
+  // it); the three rlwimi then insert directly rather than extracting into a
+  // scratch and OR-ing. SH/MB/ME are unchanged from the extracts above —
+  // rlwimi uses the identical rotate-and-mask, it just merges into RA instead
+  // of replacing it. 7 instructions become 4.
+  rlwinm(Dst, TMP1, 0,  0, 0);   // N
+  rlwimi(Dst, TMP1, 1,  1, 1);   // Z
+  rlwimi(Dst, TMP2, 0,  2, 2);   // C
+  rlwimi(Dst, TMP2, 30, 3, 3);   // V
 }
 
 DEF_OP(StoreNZCV) {
@@ -3542,30 +3645,46 @@ DEF_OP(StoreNZCV) {
   //   C: Src LSB 29 → XER.CA  LSB 29 (no shift). sh=0,  mb=2,  me=2.
   //   V: Src LSB 28 → XER.OV  LSB 30 (shift left 2 = rotate left 2). sh=2,  mb=1,  me=1.
 
+  // CR0 assembly: rlwinm lays down N (and zeroes everything else, including
+  // the CR0.GT and CR0.SO slots, exactly as the old rlwinm/or_ pair did),
+  // then rlwimi inserts Z on top instead of building it in a scratch and
+  // OR-ing. Same SH/MB/ME as the extracts they replace.
   rlwinm(TMP1, Src, 0,  0, 0);   // N → CR0.LT
-  rlwinm(TMP3, Src, 31, 2, 2);   // Z → CR0.EQ
-  or_(TMP1, TMP1, TMP3);
+  rlwimi(TMP1, Src, 31, 2, 2);   // Z → CR0.EQ
   mtocrf(0x80, TMP1);
 
-  // XER: clear OV+CA (LSB bits 30+29 = 0x60000000), OR in new bits.
+  // XER: rlwimi clears and sets each target bit in one instruction, so the
+  // LoadConstant-mask / andc / rlwinm / or_ chain collapses to two inserts
+  // with the SH/MB/ME values the old rlwinm extracts already used.
   mfspr(TMP1, 1);
-  LoadConstant(TMP3, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, Src, 0, 2, 2);    // C → XER.CA at LSB 29
-  or_(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, Src, 2, 1, 1);    // V → XER.OV at LSB 30
-  or_(TMP1, TMP1, TMP3);
+  rlwimi(TMP1, Src, 0, 2, 2);    // C: Src LSB 29 → XER.CA LSB 29 (no rotate)
+  rlwimi(TMP1, Src, 2, 1, 1);    // V: Src LSB 28 (PPC 3) → XER.OV LSB 30 (PPC 1)
   mtspr(1, TMP1);
 }
 
 DEF_OP(CarryInvert) {
   // Flip x86 CF, which we route through XER.CA. PPC subtract sets CA = !borrow,
   // so this op is what the IR uses to convert PPC's CA convention to x86's CF.
-  // XER.CA sits at LSB bit 29 of mfspr-1's low-32 result; toggle it via xoris
-  // with imm 0x2000 (which becomes 0x2000_0000, bit 29 set).
-  mfspr(TMP1, 1);
-  xoris(TMP1, TMP1, 0x2000);
-  mtspr(1, TMP1);
+  //
+  // Done without touching the XER SPR at all. mtspr XER is execution-
+  // serializing on POWER8, so the old mfspr/xoris/mtspr toggle stalled the
+  // pipeline on an op that appears after essentially every emulated SUB/CMP
+  // whose carry is consumed.
+  //
+  // The two-instruction flip:
+  //   subfe TMP1, r0, r0   ->  ~r0 + r0 + CA = all-ones + CA
+  //                            CA = 1  =>  TMP1 =  0
+  //                            CA = 0  =>  TMP1 = -1
+  //   addic TMP1, TMP1, 1  ->  writes CA = carry-out of TMP1 + 1
+  //                            TMP1 =  0  =>  0 + 1, no carry  =>  CA = 0
+  //                            TMP1 = -1  => -1 + 1, carries   =>  CA = 1
+  // so CA ends up inverted. subfe's carry-out equals its carry-in, so the
+  // value addic sees is the original CA. Neither instruction writes OV or SO
+  // (addic is the non-record, non-OE form) and neither writes CR0, so the
+  // packed guest N/Z living in CR0 survives. Only TMP1 is clobbered, and it
+  // is a scratch with no live value at any CarryInvert site.
+  subfe(TMP1, r0, r0);
+  addic(TMP1, TMP1, 1);
 }
 
 DEF_OP(LoadDF) {
@@ -3823,15 +3942,21 @@ DEF_OP(FCmp) {
   // mfocrf 0x80: both bits read (CR0.LT, CR0.SO) are inside the defined
   // field-0 nibble; the rlwinm masks discard the undefined remainder.
   mfocrf(TMP1, 0x80);
-  rlwinm(TMP2, TMP1, 2, 1, 1);     // V (CR0.SO at PPC 3) → PPC 1 (XER.OV slot)
   rlwinm(TMP3, TMP1, 1, 31, 31);   // LT (PPC 0) → LSB 0
   xori(TMP3, TMP3, 1);             // !LT at LSB 0
-  rlwinm(TMP3, TMP3, 29, 2, 2);    // !LT → PPC 2 (XER.CA slot)
+  // Insert both bits with rlwimi (clear-and-set in one instruction; SH/MB/ME
+  // derivation in DEF_OP(AdcWithFlags) above).
+  //   V: source CR0.SO is at PPC bit 3 of TMP1, target XER.OV is PPC bit 1.
+  //      ROTL32 by SH sends PPC q to (q - SH) mod 32, so 3 - SH ≡ 1 → SH = 2,
+  //      MB = ME = 1.
+  //   C: source !LT is at LSB 0 = PPC 31, target XER.CA is PPC bit 2, so
+  //      31 - SH ≡ 2 → SH = 29, MB = ME = 2.
+  // Both masks are a single bit, so the undefined bits mfocrf may have left
+  // in TMP1 outside CR0's nibble are discarded just as the old rlwinm masks
+  // discarded them.
   mfspr(TMP4, 1);                  // read XER
-  LoadConstant(TMP1, 0x60000000ULL);
-  andc(TMP4, TMP4, TMP1);          // clear old OV+CA
-  or_(TMP4, TMP4, TMP2);           // OR in new V
-  or_(TMP4, TMP4, TMP3);           // OR in new C
+  rlwimi(TMP4, TMP1, 2, 1, 1);     // OV <- CR0.SO
+  rlwimi(TMP4, TMP3, 29, 2, 2);    // CA <- !CR0.LT
   mtspr(1, TMP4);                  // write XER
 }
 

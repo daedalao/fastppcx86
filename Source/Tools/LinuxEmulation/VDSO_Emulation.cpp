@@ -44,6 +44,11 @@ namespace VDSOHandlers {
   GetRandomType GetRandomPtr;
 } // namespace VDSOHandlers
 
+// Published snapshot of the resolved (and, on ppc64le, shimmed) clock entry
+// points, for the raw-syscall passthrough handlers. Filled at the very end of
+// LoadHostVDSO(); see HostVDSOClocks in the header for the lifecycle rules.
+static HostVDSOClocks HostClocks {};
+
 using HandlerPtr = void (*)(void*);
 namespace x64 {
   static uint64_t SyscallRet(uint64_t Result) {
@@ -645,6 +650,22 @@ void LoadHostVDSO() {
   }
   LogMan::Msg::IFmt("PPC64LE: kernel vDSO fast-path enabled via sign-flipping shims ({} of 5 symbols)", ShimmedCount);
 #endif
+
+  // Publish the resolved clock entry points for the raw-syscall passthrough
+  // handlers. Must be the LAST thing this function does: on ppc64le the
+  // pointers above are rewritten in place to the sign-flipping shims, and it
+  // is the shims -- not the bare kernel entries -- that carry the negative-
+  // errno convention the passthrough handlers return. Snapshotting earlier
+  // would hand out raw kernel pointers whose +errno returns would be read as
+  // enormous positive success values. See HostVDSOClocks in the header.
+  HostClocks.ClockGetTime = VDSOHandlers::ClockGetTimePtr;
+  HostClocks.ClockGetRes  = VDSOHandlers::ClockGetResPtr;
+  HostClocks.GetTimeOfDay = VDSOHandlers::GetTimeOfDayPtr;
+  HostClocks.Time         = VDSOHandlers::TimePtr;
+}
+
+const HostVDSOClocks& GetHostVDSOClocks() {
+  return HostClocks;
 }
 
 static std::array<FEXCore::IR::ThunkDefinition, 7> VDSODefinitions = {{

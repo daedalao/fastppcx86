@@ -1269,6 +1269,36 @@ void PPC64JITCore::InsertGuestRIPMove(GPR Reg, uint64_t Constant) {
   Relocations.emplace_back(Reloc);
 }
 
+// EntrypointOffset's guest RIP. Structurally identical to the gate in
+// InsertExitRIPMove below, and correct for the same reason.
+//
+// The fixed-width form exists only so CodeCache::ApplyCodeRelocations has a
+// 20-byte window to re-emit RELOC_GUEST_RIP_MOVE into with a rebased address.
+// Relocations are consumed by nothing else, so when ExitRIPFixedWidth is false
+// -- neither code caching nor SMCSemanticPatch is on, which is the default --
+// there is no consumer for either the window or the record. Emitting the
+// ordinary variable-width load is then both correct and strictly shorter: every
+// sub-4GiB guest RIP (all of a 32-bit guest, and non-PIE 64-bit ones) collapses
+// to 1-3 instructions instead of always 5, and the sequence is never longer
+// than the fixed form.
+//
+// This matters more than the exit-RIP case it copies: EntrypointOffset is how
+// the return address of every guest `call` is materialised, so it is on the
+// hot emission path of essentially every block.
+//
+// Gating on ExitRIPFixedWidth rather than the caching knob alone is deliberate
+// conservatism: SMCSemanticPatch never repatches an *entrypoint* window, but
+// keeping the two RIP paths on one predicate means a future consumer that
+// scans for fixed-width RIP windows cannot find one path converted and the
+// other not.
+void PPC64JITCore::InsertEntrypointRIPMove(GPR Reg, uint64_t Constant) {
+  if (!ExitRIPFixedWidth) {
+    LoadConstant(Reg, Constant);
+    return;
+  }
+  InsertGuestRIPMove(Reg, Constant);
+}
+
 // SMC Idea 4: see JITClass.h. Records the emitted window so the fault handler
 // can repatch it, and (flag on only) verifies that SMCSemanticPatch.h's
 // dependency-free re-encoder still agrees with the emitter byte for byte --
@@ -2940,7 +2970,18 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // owns it we are about to deadlock against ourselves and take every other
   // thread down with us (they all block here on the next compile).  Report the
   // re-entry with a host backtrace instead of hanging silently.
-  const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
+  // Cached per-thread: this used to be a `::syscall(SYS_gettid)` on *every*
+  // CompileCode entry — a full kernel round-trip per compiled block, paid only
+  // to feed this diagnostic and the OwnerTracker below. A thread's TID is
+  // immutable for its lifetime, so fetch it once.
+  //
+  // Fork caveat: a thread that continues in a forked child keeps the cached
+  // parent-side TID (the child's real TID differs). Nothing here depends on
+  // the TID being a *real* TID — it is only used as a per-thread identity token
+  // compared against CodeBufferWriteOwner, which lives in the same address
+  // space and is written by the same cached value. The only observable effect
+  // of staleness is the number printed in the re-entrancy log message below.
+  static thread_local const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
   if (CodeBuffers.CodeBufferWriteOwner.load(std::memory_order_relaxed) == SelfTID) {
     LogMan::Msg::EFmt("PPC64 JIT: re-entrant CompileCode on tid {} for Entry {:#x} -- "
                       "CodeBufferWriteMutex is already held by this thread. Host backtrace:",
@@ -3541,7 +3582,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // use CodeBuffers.LatestOffset — it is bumped at :2526 and would be off by
   // CodeSize. Do NOT port PlaceNamedSymbolLiteral: nothing in emitted code
   // reads Tail->RIP (only C++ does), so there is no literal-pool label.
-  {
+  //
+  // Gated on ExitRIPFixedWidth (the same predicate the RIP-move sites use):
+  // the comment above already says this record only "kicks in" when
+  // relocations are retained, i.e. when code caching is on. With it off the
+  // push was pure overhead -- a Relocation appended to a vector on every
+  // single compiled block, for a consumer that does not exist -- and the
+  // vector is discarded unread at the end of CompileCode.
+  if (ExitRIPFixedWidth) {
     Relocation Reloc {};
     Reloc.GuestRIP.Header = {
       .Offset = BlockBufferOffset + static_cast<uint64_t>(CodeSize) + offsetof(CPUBackend::JITCodeTail, RIP),

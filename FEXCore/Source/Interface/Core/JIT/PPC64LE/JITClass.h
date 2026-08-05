@@ -103,6 +103,53 @@ uint64_t* GetPPC64HelperTable();
 static constexpr int16_t PPC64HelperSlotSize = 8;
 
 // -------------------------------------------------------------------------
+// 128-bit constant pool
+// -------------------------------------------------------------------------
+// Several vector lowerings need a 16-byte constant that vspltis* cannot
+// build. Each such site used to materialise it inline: LoadConstant (up to
+// five instructions for a full 64-bit immediate), two stds to the red zone,
+// an addi, and an lvx reading back what those stds had just written -- a
+// store-hit-load on POWER8, per constant, per emission. A pooled load is
+// three instructions and touches no store queue.
+//
+// The pool shares one allocation with the helper-address table so that the
+// existing CpuStateFrame::PPC64_HelperTable pointer reaches both and no new
+// CpuStateFrame field is needed. Helpers is first (so the published pointer
+// is unchanged and still points at helper slot 0) and Constants is forced to
+// a 16-byte boundary within a 16-byte-aligned object, which is what lvx
+// requires -- it truncates the low four bits of the effective address, so a
+// misaligned pool would silently read the wrong 16 bytes.
+//
+// Entries are stored exactly as the inline sequences wrote them: element
+// [2*i] is the doubleword that went to the *low* address (r1-16) and [2*i+1]
+// the one that went to r1-8, so a pooled lvx reproduces the old register
+// image byte for byte with no endianness reasoning required.
+//
+// Enumerator order defines the offset, same caveat as the helper table.
+enum PPC64VConstIndex : uint32_t {
+  PPC64_VCONST_F32_2P31 = 0,   // splat f32(2^31)   -- f32->i32 overflow bound
+  PPC64_VCONST_I32_MIN,        // splat i32 INT_MIN -- x86 integer-indefinite
+  PPC64_VCONST_F64_2P63,       // splat f64(2^63)   -- f64->i64 overflow bound
+  PPC64_VCONST_I64_MIN,        // splat i64 INT64_MIN
+  PPC64_VCONST_PACK_DW_LO_I32, // vperm control: pack each dw's low i32 to LE-low
+  PPC64_VCONST_LANE0_MASK_F32, // {~0u,0,0,0} in guest byte order: selects LE elem0 for xxsel
+  PPC64_VCONST_F64_2P31,       // splat f64(2^31)   -- f64->i32 overflow bound (CVTPD2DQ)
+  PPC64_VCONST_MAX,
+};
+
+struct alignas(16) PPC64RuntimeTables {
+  uint64_t Helpers[PPC64_HELPER_MAX];
+  alignas(16) uint64_t Constants[2 * PPC64_VCONST_MAX];
+};
+
+// Byte offset of the constant pool from the published helper-table pointer.
+static constexpr int16_t PPC64VConstPoolOffset = offsetof(PPC64RuntimeTables, Constants);
+static constexpr int16_t PPC64VConstSlotSize = 16;
+static_assert(PPC64VConstPoolOffset % 16 == 0, "lvx truncates the low 4 EA bits; pool must be 16-byte aligned");
+static_assert(PPC64VConstPoolOffset + PPC64VConstSlotSize * (PPC64_VCONST_MAX - 1) <= INT16_MAX,
+              "constant pool displacement must fit li's signed 16-bit immediate");
+
+// -------------------------------------------------------------------------
 // Block linking (constant-target JUMP exits only)
 // -------------------------------------------------------------------------
 // Data record emitted directly after each per-exit jump thunk in the code
@@ -499,6 +546,15 @@ private:
   // before serialization; the patcher adds the new base back on load.
   void InsertGuestRIPMove(GPR Reg, uint64_t Constant);
 
+  // DEF_OP(EntrypointOffset)'s guest RIP -- the return address a guest `call`
+  // pushes, so one of the hottest constants the JIT materialises. Same gating
+  // argument as InsertExitRIPMove: the fixed 20-byte window and its
+  // RELOC_GUEST_RIP_MOVE exist solely so the code cache can re-emit a rebased
+  // address into it, so with ExitRIPFixedWidth false this drops to a plain
+  // variable-width LoadConstant (1-3 instructions for any sub-4GiB RIP) and
+  // records no relocation.
+  void InsertEntrypointRIPMove(GPR Reg, uint64_t Constant);
+
   // SMC Idea 4 (FEX_SMCSEMANTICPATCH): as InsertGuestRIPMove, but additionally
   // records the host address of the 20-byte window in CodeData.ExitRIPSites so
   // the SMC fault handler can repatch this destination when the guest rewrites
@@ -542,6 +598,22 @@ private:
        static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, PPC64_HelperTable)),
        STATE);
     ld(dst, static_cast<int16_t>(idx * PPC64HelperSlotSize), dst);
+  }
+
+  // Load 128-bit constant `idx` from the pool into `dst`:
+  //   ld  base, PPC64_HelperTable_off(STATE)   ; base = table/pool allocation
+  //   li  off,  PoolOffset + idx*16
+  //   lvx dst,  base, off
+  // Three instructions and no store queue traffic, versus LoadConstant + two
+  // stds + addi + lvx per constant. `base` and `off` are caller-supplied
+  // scratch GPRs; base must not be r0 (lvx would read it as literal zero).
+  void EmitLoadPPC64VConst(PPC64Emitter::VR dst, FEXCore::CPU::PPC64VConstIndex idx, PPC64Emitter::GPR base,
+                           PPC64Emitter::GPR off) {
+    static_assert(offsetof(FEXCore::Core::CpuStateFrame, PPC64_HelperTable) <= INT16_MAX,
+                  "PPC64_HelperTable offset must fit int16_t for d-form ld");
+    ld(base, static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, PPC64_HelperTable)), STATE);
+    li(off, static_cast<int16_t>(FEXCore::CPU::PPC64VConstPoolOffset + idx * FEXCore::CPU::PPC64VConstSlotSize));
+    lvx(dst, base, off);
   }
 
   // Store the address of the JITCodeHeader (bound at HeaderLabel) into

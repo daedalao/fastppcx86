@@ -12,6 +12,7 @@ $end_info$
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
 #include "LinuxSyscalls/ThreadCensus.h"
+#include "VDSO_Emulation.h"
 
 #ifdef ARCHITECTURE_ppc64le
 #include "LinuxSyscalls/PPC64LE/TermiosTranslation.h"
@@ -45,13 +46,38 @@ namespace FEX::HLE {
 // be tighter, but we use a simple "neg r3 ; mfcr ; isel" idiom that the
 // compiler can fold.  Easier: just test SO bit and conditionally negate.
 
-#define PPC64_SYSCALL_RESULT(r3_out)                                                                              \
+// The `sc` and the CR0 read MUST live in the same asm block.
+//
+// This used to be two statements: `__asm volatile("sc" ...)` followed by a
+// separate `__asm volatile("mfcr %0" ...)`. Two problems with that:
+//
+//  1. Correctness. Nothing tied the two blocks together. The compiler is free
+//     to schedule any CR0-writing instruction between them -- a compare from
+//     surrounding code, a dot-suffixed op the instruction selector picked,
+//     anything -- at which point the SO bit read back belongs to that
+//     instruction rather than to the kernel. The `sc` block clobbers "cr0",
+//     which tells the compiler CR0 is *dead* after the syscall: precisely the
+//     licence it needs to overwrite CR0 before the mfcr runs. A latent
+//     miscompile that would surface as syscalls randomly reporting bogus
+//     errors (or, worse, negating a valid positive result).
+//
+//  2. Cost. `mfcr` reads all eight CR fields and on POWER8 is cracked into
+//     multiple internal ops, serialising against the whole condition register.
+//     `mfocrf RT, 0x80` reads only CR0 and stays a single non-cracked op.
+//     FXM=0x80 leaves CR0's bits in their architectural position (bits 32..35
+//     of the GPR, i.e. mask 0xF000'0000; the rest are undefined), so the SO
+//     test below is bit-for-bit the same test as before.
+//
+// This is glibc's ppc64 INTERNAL_SYSCALL shape -- sc, then mfocrf of CR0 in the
+// same asm, then test the SO bit. See sysdeps/unix/sysv/linux/powerpc/
+// powerpc64/sysdep.h.
+#define PPC64_SYSCALL_SC_MFOCRF "sc\n\tmfocrf %[_cr0], 0x80"
+
+#define PPC64_SYSCALL_RESULT(r3_out, cr0_in)                                                                      \
   /* If SO bit (bit 0 of cr0) set, kernel returned positive errno; negate to match Linux's -errno convention. */  \
   ({                                                                                                              \
     long _r = (long)(r3_out);                                                                                     \
-    uint64_t _cr;                                                                                                 \
-    __asm volatile("mfcr %0" : "=r"(_cr));                                                                        \
-    if (_cr & 0x10000000u) _r = -_r; /* SO bit lives at bit 28 of cr in CR0 position */                           \
+    if ((cr0_in) & 0x10000000u) _r = -_r; /* SO bit lives at bit 28 of cr in CR0 position */                       \
     (uint64_t)_r;                                                                                                 \
   })
 
@@ -60,8 +86,11 @@ requires (syscall_num != -1)
 uint64_t SyscallPassthrough0(FEXCore::Core::CpuStateFrame* Frame) {
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3");
-  __asm volatile("sc" : "=r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "=r"(r3), "+r"(r0)
+                 : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -69,8 +98,11 @@ requires (syscall_num != -1)
 uint64_t SyscallPassthrough1(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1) {
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3") = (long)arg1;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0) : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0)
+                 : : "memory", "r4","r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -79,8 +111,11 @@ uint64_t SyscallPassthrough2(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r0 asm("r0") = syscall_num;
   register long r3 asm("r3") = (long)arg1;
   register long r4 asm("r4") = (long)arg2;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4) : : "memory", "r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4)
+                 : : "memory", "r5","r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -90,8 +125,11 @@ uint64_t SyscallPassthrough3(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r3 asm("r3") = (long)arg1;
   register long r4 asm("r4") = (long)arg2;
   register long r5 asm("r5") = (long)arg3;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5) : : "memory", "r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5)
+                 : : "memory", "r6","r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -102,8 +140,11 @@ uint64_t SyscallPassthrough4(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r4 asm("r4") = (long)arg2;
   register long r5 asm("r5") = (long)arg3;
   register long r6 asm("r6") = (long)arg4;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6) : : "memory", "r7","r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6)
+                 : : "memory", "r7","r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -115,8 +156,11 @@ uint64_t SyscallPassthrough5(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r5 asm("r5") = (long)arg3;
   register long r6 asm("r6") = (long)arg4;
   register long r7 asm("r7") = (long)arg5;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7) : : "memory", "r8","r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7)
+                 : : "memory", "r8","r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -130,8 +174,11 @@ uint64_t SyscallPassthrough6(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r6 asm("r6") = (long)arg4;
   register long r7 asm("r7") = (long)arg5;
   register long r8 asm("r8") = (long)arg6;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8) : : "memory", "r9","r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8)
+                 : : "memory", "r9","r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 
 template<int syscall_num>
@@ -146,8 +193,11 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
   register long r7 asm("r7") = (long)arg5;
   register long r8 asm("r8") = (long)arg6;
   register long r9 asm("r9") = (long)arg7;
-  __asm volatile("sc" : "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8), "+r"(r9) : : "memory", "r10","r11","r12","cr0","ctr");
-  return PPC64_SYSCALL_RESULT(r3);
+  uint64_t _cr0;
+  __asm volatile(PPC64_SYSCALL_SC_MFOCRF
+                 : [_cr0] "=&r"(_cr0), "+r"(r3), "+r"(r0), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "+r"(r8), "+r"(r9)
+                 : : "memory", "r10","r11","r12","cr0","ctr");
+  return PPC64_SYSCALL_RESULT(r3, _cr0);
 }
 #elif defined(ARCHITECTURE_arm64)
 template<int syscall_num>
@@ -585,6 +635,56 @@ static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
   return Result;
 }
 
+// -----------------------------------------------------------------------------
+// Clock reads via the host vDSO
+// -----------------------------------------------------------------------------
+// A guest that goes through its own vDSO never reaches these handlers -- the
+// guest-vDSO thunks in VDSO_Emulation.cpp already call the host vDSO directly.
+// But plenty of guest code issues the raw syscall regardless: Mono's
+// mono_100ns_ticks, static binaries with no vDSO wired up, and anything calling
+// syscall(2) by hand. Those paid a full kernel entry for a clock read that the
+// host can serve entirely in userspace, on a path hot enough that Mono profiles
+// it as a top-of-list syscall.
+//
+// Route them through the same pointers the guest-vDSO path uses, falling back
+// to the raw `sc` when the host kernel exposes no vDSO (or no such symbol), in
+// which case the pointer stays null forever.
+//
+// The pointers are resolved once by LoadHostVDSO(), from LoadVDSOThunks() on
+// the main thread, before any guest instruction runs -- so a guest syscall can
+// never observe them half-initialised, and every read here is of immutable
+// data. Re-read the accessor per call rather than caching: the cost is a load
+// from a static, and caching would only add a second copy to keep coherent.
+//
+// Return convention: these pointers carry the negative-errno convention (on
+// ppc64le they are ppc_kernel_vdso's sign-flipping shims, see VDSO_Emulation.h),
+// which is exactly what a passthrough handler must return, so the result is
+// sign-extended straight through with no SYSCALL_ERRNO() dance.
+static uint64_t VDSOClockGetTime(FEXCore::Core::CpuStateFrame* Frame, uint64_t clk_id, uint64_t tp) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().ClockGetTime;
+  if (Fn) {
+    return static_cast<uint64_t>(static_cast<int64_t>(Fn(static_cast<clockid_t>(clk_id), reinterpret_cast<struct timespec*>(tp))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>(Frame, clk_id, tp);
+}
+
+static uint64_t VDSOClockGetRes(FEXCore::Core::CpuStateFrame* Frame, uint64_t clk_id, uint64_t tp) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().ClockGetRes;
+  if (Fn) {
+    return static_cast<uint64_t>(static_cast<int64_t>(Fn(static_cast<clockid_t>(clk_id), reinterpret_cast<struct timespec*>(tp))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(clock_getres)>(Frame, clk_id, tp);
+}
+
+static uint64_t VDSOGetTimeOfDay(FEXCore::Core::CpuStateFrame* Frame, uint64_t tv, uint64_t tz) {
+  const auto Fn = FEX::VDSO::GetHostVDSOClocks().GetTimeOfDay;
+  if (Fn) {
+    return static_cast<uint64_t>(
+      static_cast<int64_t>(Fn(reinterpret_cast<struct timeval*>(tv), reinterpret_cast<struct timezone*>(tz))));
+  }
+  return SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>(Frame, tv, tz);
+}
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -992,7 +1092,7 @@ namespace x64 {
 #else
     REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
 #endif
-    REGISTER_SYSCALL_IMPL_X64(gettimeofday, SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>);
+    REGISTER_SYSCALL_IMPL_X64(gettimeofday, VDSOGetTimeOfDay);
     REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);
     REGISTER_SYSCALL_IMPL_X64(sysinfo, SyscallPassthrough1<SYSCALL_DEF(sysinfo)>);
@@ -1013,8 +1113,8 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X64(clock_settime, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_gettime, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_getres, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+    REGISTER_SYSCALL_IMPL_X64(clock_gettime, VDSOClockGetTime);
+    REGISTER_SYSCALL_IMPL_X64(clock_getres, VDSOClockGetRes);
     REGISTER_SYSCALL_IMPL_X64(clock_nanosleep, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X64(mq_open, SyscallPassthrough4<SYSCALL_DEF(mq_open)>);
     REGISTER_SYSCALL_IMPL_X64(mq_timedsend, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
@@ -1081,10 +1181,10 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(setfsuid32, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
     REGISTER_SYSCALL_IMPL_X32(setfsgid32, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
     REGISTER_SYSCALL_IMPL_X32(sendfile64, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
-    REGISTER_SYSCALL_IMPL_X32(clock_gettime64, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
+    REGISTER_SYSCALL_IMPL_X32(clock_gettime64, VDSOClockGetTime);
     REGISTER_SYSCALL_IMPL_X32(clock_settime64, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
     REGISTER_SYSCALL_IMPL_X32(clock_adjtime64, SyscallPassthrough2<SYSCALL_DEF(clock_adjtime)>);
-    REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+    REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, VDSOClockGetRes);
     REGISTER_SYSCALL_IMPL_X32(clock_nanosleep_time64, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X32(timer_gettime64, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X32(timer_settime64, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);

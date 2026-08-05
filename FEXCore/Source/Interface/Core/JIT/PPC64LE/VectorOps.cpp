@@ -908,10 +908,10 @@ DEF_OP(VUShraI) {
   case IR::OpSize::i32Bit:
     vspltisw(VTMP1, (int32_t)Shift); vsrw(VTMP2, V, VTMP1); break;
   case IR::OpSize::i64Bit:
+    // Same shift-count splat as VUShrI i64Bit: see BuildSplatDW.
     li(TMP4, static_cast<int16_t>(Shift));
-    std(TMP4, -16, r1); std(TMP4, -8, r1);
-    addi(TMP1, r1, -16); li(TMP2, 0);
-    lvx(VTMP1, TMP1, TMP2);
+    mtvsrd(VTMP1, TMP4);
+    xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, V, VTMP1); break;
   default: Op_Unhandled(IROp, Node); return;
   }
@@ -978,52 +978,40 @@ DEF_OP(VUShrNI) {
     // i=1: out 13←src 11, out 12←src 10
     // i=2: out 11←src  7, out 10←src  6
     // i=3: out  9←src  3, out  8←src  2
-    // → mask PPC bytes [8..15] = [02,03,06,07, 0A,0B,0E,0F]
-    // → constant V (at -16, mapping into PPC bytes [8..15] MSB-first)
-    //   = 0x020306070A0B0E0F
-    // mask PPC bytes [0..7] = 0x10 (selects VTMP1=zero) → 0x1010...
+    // → mask PPC bytes [8..15] = [02,03,06,07, 0A,0B,0E,0F], PPC bytes [0..7]
+    //   all zero.  That is exactly vpkuwum(Dst, ZERO, VTMP2): vpkuwum keeps
+    //   the low halfword of each BE word, VRA's four into phys[0..7] and
+    //   VRB's four into phys[8..15].  Hardware-verified ("VUShrNI i32->i16").
     vspltisw(VTMP1, (int32_t)N);
     vsrw(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x020306070A0B0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkuwum(Dst, VTMP1, VTMP2);
   } else if (OutSz == IR::OpSize::i8Bit) {
     // i16→i8 narrow.  Source: VTMP2 = vsrh(Vec, N).  Output i8 lane i at
     // LE byte i = out PPC byte (15-i).  Source low byte of LE i16 lane i
     // sits at src PPC byte (15-2i).
     //   out PPC[15-i] = src PPC[15-2i]    (i=0..7)
     // i=0: out 15←src 15  i=1: out 14←src 13 … i=7: out 8←src 1
-    // → mask PPC bytes [8..15] = [01,03,05,07, 09,0B,0D,0F]
-    // → constant V (at -16) = 0x01030507090B0D0F
+    // → mask PPC bytes [8..15] = [01,03,05,07, 09,0B,0D,0F], [0..7] zero =
+    //   vpkuhum(Dst, ZERO, VTMP2).  Hardware-verified ("VUShrNI i16->i8").
     vspltish(VTMP1, (int16_t)N);
     vsrh(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x01030507090B0D0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkuhum(Dst, VTMP1, VTMP2);
   } else if (OutSz == IR::OpSize::i32Bit) {
     // i64→i32 narrow.  Source: VTMP2 = vsrd(Vec, N).  Source low 32 bits
     // of LE i64 lane i at src PPC bytes [15-8i..12-8i] (LSB at 15-8i, MSB
     // at 12-8i).  Output i32 lane i at out PPC bytes [15-4i..12-4i].
     //   i=0: out 15..12 ← src 15..12
     //   i=1: out 11..8  ← src  7..4
-    // → mask PPC bytes [8..15] = [04,05,06,07, 0C,0D,0E,0F]
-    // → constant V (at -16) = 0x040506070C0D0E0F
+    // → mask PPC bytes [8..15] = [04,05,06,07, 0C,0D,0E,0F], [0..7] zero =
+    //   vpkudum(Dst, ZERO, VTMP2).  Hardware-verified ("VUShrNI i64->i32").
     LoadConstant(TMP1, (uint64_t)N);
     mtvsrd(VTMP1, TMP1);
     xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, Vec, VTMP1);
-    LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(Dst, r(0), TMP2);
     vspltisw(VTMP1, 0);
-    vperm(Dst, VTMP2, VTMP1, Dst);
+    vpkudum(Dst, VTMP1, VTMP2);
   } else {
     Op_Unhandled(IROp, Node);
   }
@@ -1058,35 +1046,33 @@ DEF_OP(VUShrNI2) {
     // i=1: out 5←src 11, out 4←src 10
     // i=2: out 3←src  7, out 2←src  6
     // i=3: out 1←src  3, out 0←src  2
-    // → mask PPC bytes [0..7] = [02,03,06,07, 0A,0B,0E,0F]
-    // → constant W (at -8, mapping into PPC[0..7] MSB-first) = 0x020306070A0B0E0F
-    // Mask PPC bytes [8..15] preserve VLow PPC[8..15] via idx 0x18..0x1F
-    // → constant V (at -16) = 0x18191A1B1C1D1E1F
+    // → mask PPC bytes [0..7] = [02,03,06,07, 0A,0B,0E,0F], PPC bytes [8..15]
+    //   preserve VLow PPC[8..15].
+    // Split into the same narrow-pack VUShrNI uses (vpkuwum against zero puts
+    // the gathered halfwords at VTMP2.phys[8..15] = dw1) followed by a
+    // dw-blend: Dst.dw0 = narrowed.dw1, Dst.dw1 = VLow.dw1 = xxpermdi(...,3).
+    // Hardware-verified ("VUShrNI2 i32->i16").
     vspltw(VTMP1, VTMP1, 1);
     vsrw(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x020306070A0B0E0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkuwum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else if (OutSz == IR::OpSize::i8Bit) {
     // i16→i8 narrow on VUpp, insert into upper LE half of VLow.
+    // Hardware-verified ("VUShrNI2 i16->i8").
     vsplth(VTMP1, VTMP1, 3);
     vsrh(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x01030507090B0D0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkuhum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else if (OutSz == IR::OpSize::i32Bit) {
     // i64→i32 narrow on VUpp, insert into upper LE half of VLow.
+    // Hardware-verified ("VUShrNI2 i64->i32").
     xxpermdi(VTMP1, VTMP1, VTMP1, 0);
     vsrd(VTMP2, VUpp, VTMP1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -8,  r1);
-    addi(TMP2, r1, -16);
-    lvx(VTMP1, r(0), TMP2);
-    vperm(Dst, VTMP2, VLow, VTMP1);
+    vspltisw(VTMP1, 0);
+    vpkudum(VTMP2, VTMP1, VTMP2);
+    xxpermdi(Dst, VTMP2, VLow, 3);
   } else {
     Op_Unhandled(IROp, Node);
   }
@@ -1274,20 +1260,13 @@ DEF_OP(VSQXTN2) {
   case IR::OpSize::i16Bit: vpkswss(VTMP2, VTMP2, VUpp); break;
   default: Op_Unhandled(IROp, Node); return;
   }
-  // Step 2: vsldoi to move VTMP2 LE[0-7] → phys 0-7 (becomes LE[8-15]).
-  // vsldoi(D,A,B,8) = A[8:15] ++ B[0:7].  VTMP2 phys 8-15 → phys 0-7.
-  vsldoi(VTMP2, VTMP2, VTMP2, 8);
-  // Now VTMP2: phys 0-7 = narrow(VUpp), phys 8-15 = 0.
-  // Step 3: blend: take phys 0-7 from VTMP2, phys 8-15 from VLow.
-  // ctrl (vA=VTMP2, vB=VLow): phys[0..7]=[0..7], phys[8..15]=[24..31].
-  // VAddP convention: -16 → phys[8..15] (MSB at phys[8] = 0x18); -8 → phys[0..7].
-  LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x0001020304050607ULL);
-  std(TMP1, -8, r1);
-  addi(TMP2, r1, -16);
-  lvx(Dst, r(0), TMP2);
-  vperm(Dst, VTMP2, VLow, Dst);
+  // Step 2: blend directly out of the pack result — Dst.dw0 must be the
+  // narrowed VUpp (which vpkXXss already left at VTMP2.phys[8..15] = dw1)
+  // and Dst.dw1 must be VLow.dw1.  That is xxpermdi(Dst, VTMP2, VLow, 3),
+  // which subsumes the old `vsldoi ...,8` staging step (now deleted) and the
+  // whole perm-control materialisation.  Hardware-verified against the old
+  // sequence on POWER8 ("VSQXTN2 i8" / "VSQXTN2 i16").
+  xxpermdi(Dst, VTMP2, VLow, 3);
 }
 
 DEF_OP(VSQXTNPair) {
@@ -1355,15 +1334,9 @@ DEF_OP(VSQXTUN2) {
   case IR::OpSize::i16Bit: vpkswus(VTMP2, VTMP2, VUpp); break;
   default: Op_Unhandled(IROp, Node); return;
   }
-  vsldoi(VTMP2, VTMP2, VTMP2, 8);
-  // Same blend ctrl as VSQXTN2: phys[0..7]=[0..7], phys[8..15]=[24..31].
-  LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x0001020304050607ULL);
-  std(TMP1, -8, r1);
-  addi(TMP2, r1, -16);
-  lvx(Dst, r(0), TMP2);
-  vperm(Dst, VTMP2, VLow, Dst);
+  // Same dw-blend as VSQXTN2 (the `vsldoi ...,8` staging step is subsumed).
+  // Hardware-verified ("VSQXTUN2 i8" / "VSQXTUN2 i16").
+  xxpermdi(Dst, VTMP2, VLow, 3);
 }
 
 DEF_OP(VSQXTUNPair) {
@@ -1399,15 +1372,20 @@ DEF_OP(VSQXTUNPair) {
   }
 }
 
-// Build a vector with `val` replicated to every doubleword via stack roundtrip.
+// Build a vector with `val` replicated to every doubleword.
 // Used when an immediate exceeds the 5-bit range of vspltisb/h/w.
+//
+// mtvsrd defines the doubleword that xxpermdi index 0 reads (BE dword 0, the
+// half mfvsrd/mtvsrd see, which is FEX's LE element 1); dm=0 then duplicates
+// that half into both. Byte-for-byte identical to the std/std/lvx roundtrip
+// this replaces -- verified on POWER8 by storing both forms back through stvx
+// and comparing the 16 bytes -- but without the guaranteed store-hit-load
+// stall of feeding a vector load from two GPR stores issued two cycles
+// earlier.
 static void BuildSplatDW(PPC64JITCore* j, VR Dst, uint64_t val) {
   j->LoadConstant(TMP4, val);
-  j->std(TMP4, -16, r1);
-  j->std(TMP4, -8,  r1);
-  j->addi(TMP1, r1, -16);
-  j->li(TMP2, 0);
-  j->lvx(Dst, TMP1, TMP2);
+  j->mtvsrd(Dst, TMP4);
+  j->xxpermdi(Dst, Dst, Dst, 0);
 }
 
 // VSRSHR: signed rounding shift right by immediate.  Per ARM srshr:
@@ -2203,8 +2181,16 @@ DEF_OP(VTrn2) {
 }
 
 // ---------------------------------------------------------------------------
-// Float binary ops — f32 uses AltiVec vaddfp/vsubfp/vminfp/vmaxfp where
-// possible; everything else (and f64) goes through VSX xv* instructions.
+// Float binary ops — f32 min/max still use AltiVec vminfp/vmaxfp; arithmetic
+// (add/sub/mul/div) and everything f64 goes through VSX xv* instructions.
+//
+// Add and sub deliberately use xvaddsp/xvsubsp rather than AltiVec
+// vaddfp/vsubfp. The AltiVec forms are Java/IEEE-mode VMX float ops: they
+// always round to nearest and ignore FPSCR.RN entirely, whereas VFMul and
+// VFDiv have always lowered to xvmulsp/xvdivsp, which honour it. Mixing the
+// two meant a single guest expression could round its multiplies under the
+// guest's selected MXCSR rounding mode and its adds under round-to-nearest.
+// Making all four VSX removes that inconsistency.
 // xv* op on a 128-bit VR operates element-wise on either 4×f32 or 2×f64;
 // since both x86 and PPC operate per-lane and our VR layout matches LE-natural
 // element ordering after `lvx`, no byte-swap is needed.
@@ -2217,7 +2203,7 @@ DEF_OP(VFAdd) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   switch (ElemSz) {
-  case IR::OpSize::i32Bit: vaddfp (Dst, V1, V2); break;
+  case IR::OpSize::i32Bit: xvaddsp(Dst, V1, V2); break;
   case IR::OpSize::i64Bit: xvadddp(Dst, V1, V2); break;
   default: Op_Unhandled(IROp, Node); break;
   }
@@ -2265,7 +2251,7 @@ DEF_OP(VFSub) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   switch (ElemSz) {
-  case IR::OpSize::i32Bit: vsubfp (Dst, V1, V2); break;
+  case IR::OpSize::i32Bit: xvsubsp(Dst, V1, V2); break;
   case IR::OpSize::i64Bit: xvsubdp(Dst, V1, V2); break;
   default: Op_Unhandled(IROp, Node); break;
   }
@@ -2420,14 +2406,14 @@ DEF_OP(VUMull) {
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
     // Unsigned widening of lower LE halfwords {0..3} → words {0..3}.
-    // Intent phys[0..7]=[18,19,1A,1B,08,09,0A,0B], phys[8..15]=[1C,1D,1E,1F,0C,0D,0E,0F].
-    // VAddP convention: -16 → phys[8..15] (MSB at phys[8]); -8 → phys[0..7].
+    // Wanted phys[0..7]=[18,19,1A,1B,08,09,0A,0B], phys[8..15]=[1C,1D,1E,1F,0C,0D,0E,0F],
+    // i.e. Dst BE words = [VTMP2.w2, VTMP1.w2, VTMP2.w3, VTMP1.w3] — exactly
+    // vmrglw(Dst, VTMP2, VTMP1) (the ISA definition is in BE word numbering and
+    // is endian-independent at the instruction level).  Hardware-verified on
+    // POWER8 against the old vperm sequence (see report: "VUMull i32").
     vmulouh(VTMP1, V1, V2);
     vmuleuh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1C1D1E1F0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B08090A0BULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrglw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
@@ -2436,14 +2422,13 @@ DEF_OP(VUMull) {
     //                   so t.phys[8..15] = LE_word[0] product (=LE_dword[0] of result).
     // vmuleuw(t,a,b): t.BE_dword[i] = a.BE_word[2i]*b.BE_word[2i]   = LE_word[3-2i] product
     //                   so t.phys[8..15] = LE_word[1] product (=LE_dword[1] of result).
-    // Output: phys[8..15]=VTMP1.phys[8..15], phys[0..7]=VTMP2.phys[8..15].
-    // ctrl phys = [18,19,1A,1B,1C,1D,1E,1F, 08,09,0A,0B,0C,0D,0E,0F].
+    // Output: phys[8..15]=VTMP1.phys[8..15], phys[0..7]=VTMP2.phys[8..15],
+    // i.e. Dst.dw0 = VTMP2.dw1 and Dst.dw1 = VTMP1.dw1.  xxpermdi(D,A,B,dm)
+    // gives dw0 = A.dw[dm>>1], dw1 = B.dw[dm&1], so dm=3 with A=VTMP2,
+    // B=VTMP1.  Hardware-verified ("VUMull i64").
     vmulouw(VTMP1, V1, V2);
     vmuleuw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x08090A0B0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 3);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2456,23 +2441,19 @@ DEF_OP(VSMull) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
-    // Signed widening of lower LE halfwords {0..3} → words {0..3}. Same ctrl as VUMull.
+    // Signed widening of lower LE halfwords {0..3} → words {0..3}. Same gather
+    // as VUMull i32Bit — see there.  Hardware-verified ("VSMull i32").
     vmulosh(VTMP1, V1, V2);
     vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1C1D1E1F0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B08090A0BULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrglw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 signed widening (for PMULDQ). Same gather as VUMull i64Bit.
+    // Hardware-verified ("VSMull i64").
     vmulosw(VTMP1, V1, V2);
     vmulesw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x08090A0B0C0D0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x18191A1B1C1D1E1FULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 3);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2486,26 +2467,26 @@ DEF_OP(VUMull2) {
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
     // Unsigned widening of upper LE halfwords {4..7} → words {0..3}.
-    // Intent phys[0..7]=[10,11,12,13,00,01,02,03], phys[8..15]=[14,15,16,17,04,05,06,07].
+    // Wanted phys[0..7]=[10,11,12,13,00,01,02,03], phys[8..15]=[14,15,16,17,04,05,06,07],
+    // i.e. Dst BE words = [VTMP2.w0, VTMP1.w0, VTMP2.w1, VTMP1.w1] =
+    // vmrghw(Dst, VTMP2, VTMP1).  Hardware-verified ("VUMull2 i32").
     vmulouh(VTMP1, V1, V2);
     vmuleuh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1415161704050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121300010203ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrghw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 unsigned widening of upper LE words {2,3} → dwords {0,1}.
     // LE_word[2] product = vmulouw.BE_dword[0] = VTMP1.phys[0..7].
     // LE_word[3] product = vmuleuw.BE_dword[0] = VTMP2.phys[0..7].
-    // ctrl phys = [10,11,12,13,14,15,16,17, 00,01,02,03,04,05,06,07].
+    // ctrl phys = [10,11,12,13,14,15,16,17, 00,01,02,03,04,05,06,07], i.e.
+    // Dst.dw0 (phys[8..15]) = VTMP1.dw0 and Dst.dw1 (phys[0..7]) = VTMP2.dw0
+    // → xxpermdi(Dst, VTMP2, VTMP1, 0).  NOTE the operand order: the naive
+    // reading (VTMP1, VTMP2) produces the two halves SWAPPED — caught by the
+    // POWER8 differential test ("VUMull2 i64"), which failed on (T1,T2,0).
     vmulouw(VTMP1, V1, V2);
     vmuleuw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x0001020304050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121314151617ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 0);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2518,23 +2499,19 @@ DEF_OP(VSMull2) {
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
   if (ElemSz == IR::OpSize::i32Bit) {
-    // Signed widening of upper LE halfwords {4..7} → words {0..3}. Same ctrl as VUMull2.
+    // Signed widening of upper LE halfwords {4..7} → words {0..3}. Same gather
+    // as VUMull2 i32Bit.  Hardware-verified ("VSMull2 i32").
     vmulosh(VTMP1, V1, V2);
     vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1415161704050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121300010203ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    vmrghw(Dst, VTMP2, VTMP1);
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
     // 32×32→64 signed widening of upper LE words {2,3} → dwords {0,1}.
+    // Same blend as VUMull2 i64Bit.  Hardware-verified ("VSMull2 i64").
     vmulosw(VTMP1, V1, V2);
     vmulesw(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x0001020304050607ULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1011121314151617ULL); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(Dst, r(0), TMP2);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    xxpermdi(Dst, VTMP2, VTMP1, 0);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -2788,7 +2765,7 @@ DEF_OP(VUABDL2) {
 // logical shift) or sign-extend them (for arithmetic right shift).
 //
 // Builds: VTMP2 = 0xFF...FF per element where Shift < ElemBits, else 0.
-// Uses VTMP1 as scratch; clobbers TMP1/TMP2/TMP3 for i64Bit only.
+// Uses VTMP1 as scratch; clobbers TMP1 for i64Bit only.
 static void BuildVShiftInRangeMask(PPC64JITCore* j, IR::OpSize ElemSz, VR Shift) {
   using namespace IR;
   switch (ElemSz) {
@@ -2809,13 +2786,10 @@ static void BuildVShiftInRangeMask(PPC64JITCore* j, IR::OpSize ElemSz, VR Shift)
     j->vcmpgtuw(VTMP2, VTMP2, Shift);
     break;
   case OpSize::i64Bit:
-    // Build splat(64) via stack roundtrip (no 5-bit-imm path for 64).
+    // Build splat(64) (no 5-bit-imm path for 64). See BuildSplatDW.
     j->li(TMP1, 64);
-    j->std(TMP1, -16, r1);
-    j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16);
-    j->li(TMP3, 0);
-    j->lvx(VTMP2, TMP2, TMP3);
+    j->mtvsrd(VTMP2, TMP1);
+    j->xxpermdi(VTMP2, VTMP2, VTMP2, 0);
     j->vcmpgtud(VTMP2, VTMP2, Shift);
     break;
   default: break;
@@ -2941,14 +2915,18 @@ DEF_OP(VUShlS) {
   const auto Dst   = GetVReg(Node);
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
-  // Broadcast LE element 0 of Shift to all lanes in VTMP1.  For i64 we have
-  // to copy the doubleword by hand: mfvsrd reads phys[0..7] (= LE element 1),
-  // so we vsldoi by 8 first to bring LE element 0 into the readable half.
+  // Broadcast LE element 0 of Shift to all lanes in VTMP1.
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
@@ -2968,10 +2946,16 @@ DEF_OP(VUShrS) {
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
@@ -2991,10 +2975,16 @@ DEF_OP(VSShrS) {
   const auto Vec   = GetVReg(Op->Vector);
   const auto Shift = GetVReg(Op->ShiftScalar);
   if (ElemSz == IR::OpSize::i64Bit) {
-    vsldoi(VTMP1, Shift, Shift, 8);
-    mfvsrd(TMP1, VTMP1);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(VTMP1, TMP2, TMP3);
+    // Broadcast LE element 0 of Shift to both doublewords in one instruction.
+    // xxpermdi(XT, XA, XB, DM) takes XT's index-0 half from XA's index-(DM>>1)
+    // half and XT's index-1 half from XB's index-(DM&1) half; index 1 is LE
+    // element 0, so dm=3 with XA==XB==Shift puts LE element 0 in both halves.
+    // That is precisely what the six-instruction sequence it replaces did:
+    // vsldoi 8 swapped the halves so LE element 0 landed in the mfvsrd-visible
+    // doubleword, mfvsrd pulled it into a GPR, and the two stds plus lvx put
+    // it back into both halves -- with a store-hit-load stall in the middle.
+    // Verified byte-identical on POWER8 against the old sequence.
+    xxpermdi(VTMP1, Shift, Shift, 3);
   } else {
     EmitVSplat(this, VTMP1, Shift, ElemSz, 0);
   }
@@ -3042,8 +3032,10 @@ static void EmitWideShiftCore(PPC64JITCore* j, VR Dst, VR Vec, GPR TMP1, GPR TMP
     else              j->vsrw(Dst, Vec, VTMP2);
     break;
   case IR::OpSize::i64Bit:
-    j->std(TMP1, -16, r1); j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16); j->lvx(VTMP2, r(0), TMP2);
+    // VTMP1 already holds TMP1 in the mtvsrd-defined doubleword (above), so
+    // duplicating it into both halves is the whole splat -- one instruction
+    // in place of two stores, an addi and a vector load. See BuildSplatDW.
+    j->xxpermdi(VTMP2, VTMP1, VTMP1, 0);
     if (isLeft)       j->vsld(Dst, Vec, VTMP2);
     else if (isSigned) j->vsrad(Dst, Vec, VTMP2);
     else              j->vsrd(Dst, Vec, VTMP2);
@@ -3060,9 +3052,9 @@ static void EmitArithSaturate(PPC64JITCore* j, VR Dst, VR Vec, GPR TMP1, GPR TMP
   case IR::OpSize::i16Bit: j->vspltish(VTMP2, 15); j->vsrah(Dst, Vec, VTMP2); break;
   case IR::OpSize::i32Bit: j->vspltisw(VTMP2, -1); j->vsraw(Dst, Vec, VTMP2); break;
   case IR::OpSize::i64Bit:
-    j->LoadConstant(TMP1, 63);
-    j->std(TMP1, -16, r1); j->std(TMP1, -8, r1);
-    j->addi(TMP2, r1, -16); j->lvx(VTMP2, r(0), TMP2);
+    j->li(TMP1, 63);
+    j->mtvsrd(VTMP2, TMP1);
+    j->xxpermdi(VTMP2, VTMP2, VTMP2, 0);
     j->vsrad(Dst, Vec, VTMP2);
     break;
   default: break;
@@ -3150,6 +3142,25 @@ DEF_OP(VInsElement) {
   const auto DestVec  = GetVReg(Op->DestVector);
   const auto SrcVec   = GetVReg(Op->SrcVector);
 
+  // i64 elements are a pure doubleword blend — one xxpermdi, no perm control.
+  // Under the lvx-reverse layout LE dword 0 is phys[8..15] (= VSR dw1) and LE
+  // dword 1 is phys[0..7] (= VSR dw0), so LE index j maps to VSR dw (1-j).
+  // xxpermdi(D,A,B,dm): D.dw0 = A.dw[dm>>1], D.dw1 = B.dw[dm&1].
+  //   DestIdx==0: keep DestVec's LE dword 1 (= dw0) and take SrcVec's LE dword
+  //               SrcIdx (= dw 1-SrcIdx) into LE dword 0 (= dw1)
+  //               → xxpermdi(Dst, DestVec, SrcVec, 1-SrcIdx)
+  //   DestIdx==1: → xxpermdi(Dst, SrcVec, DestVec, 2*(1-SrcIdx)+1)
+  // Single instruction, so Dst may alias either source.  Hardware-verified for
+  // all four (DestIdx,SrcIdx) combinations ("VInsElement i64 D=.. S=..").
+  if (ElemSz == IR::OpSize::i64Bit) {
+    if (DestIdx == 0) {
+      xxpermdi(Dst, DestVec, SrcVec, (uint32_t)(1u - SrcIdx));
+    } else {
+      xxpermdi(Dst, SrcVec, DestVec, (uint32_t)(2u * (1u - SrcIdx) + 1u));
+    }
+    return;
+  }
+
   // Strategy: copy DestVec to Dst, then use vperm to insert.
   // Build a 16-byte perm control vector where:
   //   perm[byte] selects from [DestVec (indices 0-15) : SrcVec (indices 16-31)]
@@ -3202,6 +3213,23 @@ DEF_OP(VInsGPR) {
   // Move Src GPR to a vector register element, then use VInsElement logic.
   // Put Src into low element of VTMP2.
   mtvsrd(VTMP2, Src);  // puts into high 64-bits of VTMP2 (phys bytes 0-7)
+
+  // i64: mtvsrd already leaves Src in VTMP2.dw0, so the insert is one
+  // doubleword blend (see VInsElement i64 for the LE dword ↔ VSR dw mapping).
+  //   DestIdx==0 → Dst.dw1 = VTMP2.dw0, Dst.dw0 = DestVec.dw0
+  //              → xxpermdi(Dst, DestVec, VTMP2, 0)
+  //   DestIdx==1 → Dst.dw0 = VTMP2.dw0, Dst.dw1 = DestVec.dw1
+  //              → xxpermdi(Dst, VTMP2, DestVec, 1)
+  // Hardware-verified for both DestIdx ("VInsGPR i64 DestIdx=0/1"); the same
+  // test also confirms mtvsrd lands the GPR in dw0 (phys[0..7]).
+  if (ElemSz == IR::OpSize::i64Bit) {
+    if (DestIdx == 0) {
+      xxpermdi(Dst, DestVec, VTMP2, 0);
+    } else {
+      xxpermdi(Dst, VTMP2, DestVec, 1);
+    }
+    return;
+  }
 
   // Now insert element 0 of VTMP2 into DestIdx of DestVec.
   // Reuse VInsElement pattern:
@@ -3382,35 +3410,26 @@ DEF_OP(VExtr) {
     return;
   }
 
-  // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad].
-  // Source slot B receives a zero vector; perm indices >=16 (slot B) read 0.
-  uint8_t perm[16];
-  auto VSrc1 = VLow;
-  auto VSrc2 = VHigh;
-  {
-    const uint8_t ZeroPad = (uint8_t)(N - 16u);
-    for (int b = 0; b < 16; b++) {
-      perm[b] = (b < ZeroPad) ? (uint8_t)16 : (uint8_t)(b - ZeroPad);
-    }
-    vspltisb(VTMP2, 0);
-    VSrc2 = VTMP2;
+  // N in [16..31]: result.phys[i] = (i < ZeroPad) ? 0 : VLow.phys[i-ZeroPad],
+  // with ZeroPad = N-16 in [0..15].
+  //
+  // vsldoi(VRT, VRA, VRB, SHB) computes VRT.phys[i] = (VRA||VRB).phys[i+SHB].
+  // With VRA = ZERO and VRB = VLow the concatenation is 16 zero bytes followed
+  // by VLow, so VRT.phys[i] = 0 for i+SHB < 16 and VLow.phys[i+SHB-16]
+  // otherwise.  Choosing SHB = 16-ZeroPad makes those two conditions become
+  // exactly `i < ZeroPad` and `VLow.phys[i-ZeroPad]`.  ✓
+  //
+  // ZeroPad == 0 (N == 16) would need SHB == 16, which is not encodable — but
+  // that case is just a copy of VLow.  Otherwise SHB is 1..15, always legal.
+  // Hardware-verified for every N in [16..31] against the old vperm sequence
+  // ("VExtr N=16".."VExtr N=31").
+  const uint8_t ZeroPad = (uint8_t)(N - 16u);
+  if (ZeroPad == 0) {
+    if (Dst != VLow) vmr(Dst, VLow);
+    return;
   }
-
-  // Same LE perm-vector hazard as VInsGPR/VInsElement: lvx byte-reverses,
-  // so put ctrl_lo at the LOWER address (-16) and ctrl_hi at the higher (-8)
-  // — opposite of the obvious order — so VTMP1.phys[i] = perm[i].
-  uint64_t ctrl_hi = 0, ctrl_lo = 0;
-  for (int b = 0; b < 8; b++) ctrl_hi = (ctrl_hi << 8) | perm[b];
-  for (int b = 8; b < 16; b++) ctrl_lo = (ctrl_lo << 8) | perm[b];
-
-  LoadConstant(TMP1, ctrl_lo);
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, ctrl_hi);
-  std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP1, r(0), TMP1);
-
-  vperm(Dst, VSrc1, VSrc2, VTMP1);
+  vspltisb(VTMP2, 0);
+  vsldoi(Dst, VTMP2, VLow, (uint32_t)(16u - ZeroPad));
 }
 
 // ---------------------------------------------------------------------------
@@ -3782,40 +3801,49 @@ DEF_OP(VFNMLS) {
 // SSE-style scalar FP ops: result = Vec1 with element 0 replaced by
 //   (Vec1.elem[0] OP Vec2.elem[0]).  Upper elements are preserved from Vec1.
 //
-// Stack-roundtrip strategy (same as the existing VFSqrtScalarInsert):
-//   1. stvx Vec1 → buf[-32..-17].  In FEX's PPC64LE convention, stvx reverses
-//      byte order so x86 LE element 0 of Vec1 lands at buf[-32..-32+ESize-1].
-//   2. stvx Vec2 → buf[-16..-1].
-//   3. lfs/lfd both element-0 scalars into f0,f1; do the FP op; stfs/stfd
-//      back over Vec1's element-0 slot at buf[-32..].
-//   4. lvx the patched buf[-32..-17] into Dst.
-#define DEF_SCALAR_INSERT(NAME, FOP_S, FOP_D)                                  \
+// Vector-domain strategy (replaces the stack round trip through lfs/fadds):
+//   1. Splat each operand's LE element 0 across all lanes — f32 elem0 is BE
+//      word 3, f64 elem0 is dw1 (LE lvx element reversal; the dm=3 splat is
+//      the same hardware-verified idiom as VUShlS).
+//   2. One xv* vector op. All lanes hold identical values, so the FPSCR
+//      sticky bits raised are exactly those the one real computation raises,
+//      and rounding follows FPSCR.RN like the scalar op did.
+//   3. Merge the result lane back over Vec1's element 0: xxpermdi for f64
+//      (dw-granular), xxsel with a pooled lane mask for f32.
+//
+// Why vector-domain and not xs* scalar: measured on op4k (2026-08-05,
+// notes/denormal_bench.c), xs*/f* SCALAR float ops take a ~22.8x denormal
+// assist penalty on POWER8 while xv* VECTOR ops run denormal-flat. Guest
+// audio DSP (IIR/reverb tails) decays into denormals by design and x86 games
+// mask it with MXCSR.FTZ, which we do not emulate — routing scalar SSE math
+// through xv* removes the cliff without any MXCSR machinery. It also deletes
+// the two GPR-store->vector-load forwarding stalls of the old lowering.
+//   old: 9 instructions + 2 store-hit-load stalls + denormal cliff
+//   new: f64 = 4 instructions, f32 = 7 (3 of them the pool load), no stalls
+#define DEF_SCALAR_INSERT(NAME, XVOP_S, XVOP_D)                                \
 DEF_OP(NAME) {                                                                 \
   const auto Op   = IROp->C<IR::IROp_##NAME>();                                \
   const auto Dst  = GetVReg(Node);                                             \
   const auto Vec1 = GetVReg(Op->Vector1);                                      \
   const auto Vec2 = GetVReg(Op->Vector2);                                      \
-  addi(TMP1, r1, -32);                                                         \
-  stvx(Vec1, r(0), TMP1);                                                      \
-  addi(TMP2, r1, -16);                                                         \
-  stvx(Vec2, r(0), TMP2);                                                      \
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
-    lfs(f0, -32, r1);                                                          \
-    lfs(f1, -16, r1);                                                          \
-    FOP_S(f0, f0, f1);                                                         \
-    stfs(f0, -32, r1);                                                         \
+    xxspltw(VTMP1, Vec1, 3);                                                   \
+    xxspltw(VTMP2, Vec2, 3);                                                   \
+    XVOP_S(VTMP1, VTMP1, VTMP2);                                               \
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
+                        TMP1, TMP2);                                           \
+    xxsel(Dst, Vec1, VTMP1, VTMP2);                                            \
   } else {                                                                     \
-    lfd(f0, -32, r1);                                                          \
-    lfd(f1, -16, r1);                                                          \
-    FOP_D(f0, f0, f1);                                                         \
-    stfd(f0, -32, r1);                                                         \
+    xxpermdi(VTMP1, Vec1, Vec1, 3);                                            \
+    xxpermdi(VTMP2, Vec2, Vec2, 3);                                            \
+    XVOP_D(VTMP1, VTMP1, VTMP2);                                               \
+    xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */                \
   }                                                                            \
-  lvx(Dst, r(0), TMP1);                                                        \
 }
-DEF_SCALAR_INSERT(VFAddScalarInsert, fadds, fadd)
-DEF_SCALAR_INSERT(VFSubScalarInsert, fsubs, fsub)
-DEF_SCALAR_INSERT(VFMulScalarInsert, fmuls, fmul)
-DEF_SCALAR_INSERT(VFDivScalarInsert, fdivs, fdiv)
+DEF_SCALAR_INSERT(VFAddScalarInsert, xvaddsp, xvadddp)
+DEF_SCALAR_INSERT(VFSubScalarInsert, xvsubsp, xvsubdp)
+DEF_SCALAR_INSERT(VFMulScalarInsert, xvmulsp, xvmuldp)
+DEF_SCALAR_INSERT(VFDivScalarInsert, xvdivsp, xvdivdp)
 #undef DEF_SCALAR_INSERT
 
 // VFMin / VFMax scalar insert: x86 minss/maxss specifically return src2 when
@@ -4078,71 +4106,48 @@ DEF_OP(VFToIScalarInsert) {
   const auto ESize = Op->Header.ElementSize;
   const auto Round = Op->Round;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
-  // Load source scalar (lfs auto-promotes f32→f64 in FPR).
-  if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-  } else {
-    lfd(f0, -16, r1);
-  }
-
-  // Round-to-integral, output is float.  Nearest / Host route through
-  // fctid+fcfid which honors FPSCR.RN (default RN=0 = banker's), since the
-  // direct `frin` instruction is "round-half-away-from-zero" — wrong for x86
-  // Nearest semantics.  Other modes have direct in-mode round-to-FP scalar ops.
+  // Fully in-register via the VSX scalar round-to-integral family. xsrdpi*
+  // are FP->FP: NaN propagates quietly and |x| >= 2^52 is an identity by
+  // construction, so the fctid/fcfid saturation bug this op used to guard
+  // against (NaN/huge -> -2^63) cannot occur — no compare-and-branch
+  // bypasses, no runtime 2^52 constant, no stack bounce. xsrdpic honors
+  // FPSCR.RN for the Nearest/Host modes (banker's at the x86 default);
+  // signal-safety of FPSCR.RN is guaranteed since the PPC64ContextBackup
+  // FPSCR fix. The f32 path converts through f64 with the NON-SIGNALLING
+  // converts (xscvspdpn/xscvdpspn), which are bit-preserving for NaN —
+  // matching x86 ROUNDSS's pass-through-unchanged even for SNaN patterns,
+  // which the old lfs/stfs bounce could not promise. The f64->f32 narrow is
+  // exact: the rounded value is integral and within f32's range because the
+  // input was an f32.
   //
-  // ROUNDSS/ROUNDSD on PPC64LE: project_vftoiscalarinsert_nan_inf bug — the
-  // fctid+fcfid round-trip SATURATES NaN and out-of-range FP to INT64_MIN,
-  // which fcfid converts back to a finite -2^63 instead of propagating the
-  // original value. x86 ROUNDSS/ROUNDSD spec: NaN passes through unchanged,
-  // and values with |f0| >= 2^52 are already integer-valued (no fractional
-  // bits in f64) so need no rounding. Bypass the round-trip for both classes.
-  // Other rounding modes (NegInf/PosInf/TowardsZero) use frim/frip/friz which
-  // are FP→FP and already NaN-correct, so they need no special handling.
-  switch (Round) {
-  case IR::RoundMode::NegInfinity: frim(f0, f0); break;
-  case IR::RoundMode::PosInfinity: frip(f0, f0); break;
-  case IR::RoundMode::TowardsZero: friz(f0, f0); break;
-  case IR::RoundMode::Nearest:
-  case IR::RoundMode::Host:
-  default: {
-    PPC64Emitter::Label skip_roundtrip{};
+  // Lane math (LE lvx element reversal): elem0 = BE word 3 / dw1. xsrdpi*
+  // and the converts operate on dw0 / word 0, so splat elem0 across the
+  // register first (dm=3 / UIM=3 splat, the hardware-verified idiom).
+  auto EmitRound = [&](VR t, VR b) {
+    switch (Round) {
+    case IR::RoundMode::NegInfinity: xsrdpim(t, b); break;
+    case IR::RoundMode::PosInfinity: xsrdpip(t, b); break;
+    case IR::RoundMode::TowardsZero: xsrdpiz(t, b); break;
+    case IR::RoundMode::Nearest:
+    case IR::RoundMode::Host:
+    default:                         xsrdpic(t, b); break;
+    }
+  };
 
-    // Bypass #1: NaN.  f0 != f0 iff NaN; fcmpu sets CR1.UN (bit 7).
-    // cr(1) so CR0 (packed NZCV) is preserved — ROUNDSS/SD writes no flags.
-    fcmpu(cr(1), f0, f0);
-    bc({12, 7}, &skip_roundtrip);  // BO=12 BI=7 → branch if CR1.UN set
-
-    // Bypass #2: |f0| >= 2^52. f64 mantissa is 52 bits; magnitudes at or
-    // above this boundary are integer-valued exactly and need no rounding.
-    // This also covers +/-Infinity (fabs(±Inf) = +Inf > +2^52).
-    LoadConstant(TMP3, 0x4330000000000000ULL);  // double 2^52
-    std(TMP3, -64, r1);
-    lfd(f2, -64, r1);
-    fabs(f3, f0);
-    fcmpu(cr(1), f3, f2);
-    bc({12, 5}, &skip_roundtrip);  // BO=12 BI=5 → branch if CR1.GT (f3 > 2^52)
-
-    fctid(f1, f0);  // f64 → i64 using FPSCR.RN (banker's by default)
-    fcfid(f0, f1);  // i64 → f64 (exact for values within precision boundary)
-
-    Bind(&skip_roundtrip);
-    break;
-  }
-  }
-
-  // Store the rounded *float* back at element 0 of the result image.
   if (ESize == IR::OpSize::i32Bit) {
-    frsp(f0, f0);              // narrow to f32 precision
-    stfs(f0, 0, TMP1);
+    xxspltw(VTMP1, Vec2, 3);       // elem0 f32 in every word incl. word 0
+    xscvspdpn(VTMP1, VTMP1);       // f32 (word 0) -> f64 (dw0), NaN-bit-exact
+    EmitRound(VTMP1, VTMP1);
+    xscvdpspn(VTMP1, VTMP1);       // f64 (dw0) -> f32 (word 0), exact here
+    xxspltw(VTMP1, VTMP1, 0);      // result to every word incl. elem0's
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,
+                        TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
   } else {
-    stfd(f0, 0, TMP1);
+    xxpermdi(VTMP1, Vec2, Vec2, 3);  // elem0 f64 -> dw0 (and dw1)
+    EmitRound(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 0);   // {Vec1.dw0, result.dw0}
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VFCMPScalarInsert: scalar FP compare with predicate, result is all-ones / zero
@@ -4343,13 +4348,10 @@ DEF_OP(VDupFromGPR) {
     vspltw(Dst, VTMP1, SplatWordIdx(0));
     break;
   case IR::OpSize::i64Bit:
-    // Stack-roundtrip 64-bit duplicate (avoids the undefined-doubleword hazard
-    // of vsldoi(VTMP1, VTMP1, ..., 8)).
-    std(Src, -16, r1);
-    std(Src,  -8, r1);
-    addi(TMP1, r1, -16);
-    li(TMP2, 0);
-    lvx(Dst, TMP1, TMP2);
+    // VTMP1 above is already Src duplicated into both doublewords, which is
+    // exactly the i64 result -- the old stack roundtrip recomputed it. Still
+    // no vsldoi(VTMP1, VTMP1, ..., 8): that would read the ISA-undefined half.
+    vmr(Dst, VTMP1);
     break;
   default:
     break;
@@ -4363,17 +4365,19 @@ DEF_OP(VLoadTwoGPRs) {
   const auto Hi  = GetReg(Op->Upper);
 
   // Build a 128-bit vector with Lo at LE element 0 (low 64 bits, memory
-  // bytes 0-7) and Hi at LE element 1 (memory bytes 8-15). On PPC64LE Linux
-  // (MSR.LE=1), `lvx`/`stvx` use little-endian byte semantics — the same
-  // convention that the FABI bridge stubs rely on with `stvx; lfd offset 0`
-  // to extract a double from LE element 0. So store Lo at the low address
-  // (-16) and Hi at the high address (-8); lvx then puts Lo bytes into
-  // physical positions 0-7 and Hi bytes into 8-15.
-  std(Lo, -16, r1);
-  std(Hi,  -8, r1);
-  addi(TMP1, r1, -16);
-  li(TMP2, 0);
-  lvx(Dst, TMP1, TMP2);
+  // bytes 0-7) and Hi at LE element 1 (memory bytes 8-15).
+  //
+  // mtvsrd defines the doubleword that xxpermdi reads as index 0 -- the same
+  // half mfvsrd sees, which in FEX's LE layout is element 1. xxpermdi(XT, XA,
+  // XB, DM) takes XT's index-0 half from XA's index-(DM>>1) half and XT's
+  // index-1 half from XB's index-(DM&1) half, so with Hi and Lo each parked
+  // in their register's index-0 half, dm=0 lands Hi at LE element 1 and Lo at
+  // LE element 0. Byte-identical to the std/std/lvx roundtrip it replaces
+  // (checked on POWER8 by stvx'ing both forms with distinguishable halves),
+  // three instructions instead of five and no store-hit-load.
+  mtvsrd(VTMP1, Hi);
+  mtvsrd(VTMP2, Lo);
+  xxpermdi(Dst, VTMP1, VTMP2, 0);
 }
 
 DEF_OP(Float_FromGPR_S) {
@@ -4399,16 +4403,12 @@ DEF_OP(Float_FromGPR_S) {
     }
     fcfid(f0, f0);
     frsp(f0, f0);
-    // Store f0 back as float, load into vector
+    // Store f0 back as a 4-byte float, then bring it in through a GPR: the
+    // value reaches the vector via mtvsrd below, so neither an lvx of the
+    // spill slot nor a pre-zeroed Dst is needed. vspltw overwrites all 128
+    // bits of Dst and VTMP1 is not read before mtvsrd defines it, so both of
+    // those (a dead lvx and a doubly-emitted vspltisw(Dst,0)) are dropped.
     stfs(f0, -8, r1);
-    addi(TMP1, r1, -8);
-    lvx(VTMP1, r(0), TMP1);
-    // The float is at the low 4 bytes of the 8-byte store, adjust...
-    // Actually stfs writes 4 bytes; we want those in element 0 of Dst.
-    vspltisw(Dst, 0);
-    // Load 4-byte float into element 0 (LE: phys bytes [12:15]).
-    // Use lvewx + vperm to place correctly.
-    vspltisw(Dst, 0);
     lwz(TMP1, -8, r1);
     mtvsrd(VTMP1, TMP1);        // 32-bit value in upper bits
     vsldoi(VTMP1, VTMP1, VTMP1, 8);  // move to both halves
@@ -4542,13 +4542,17 @@ DEF_OP(Vector_FToS) {
     // indefinite") sentinel.  Detect Src >= 2^31 and substitute INT_MIN.
     // NaN comparisons return 0 from xvcmpgesp (and POWER already maps NaN
     // → INT_MIN), so the mask correctly captures only +overflow / +Inf.
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);  // VTMP2 = splat f32(2^31)
-    xvcmpgesp(VTMP1, Src, VTMP2);                  // mask: 1 where Src >= 2^31
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);                        // VTMP2 = splat INT_MIN
+    //
+    // This select is LOAD-BEARING, not dead — do NOT remove it. Hardware-
+    // measured on POWER8 (op4k, notes/vperm-verify): xvrspic+xvcvspsxws on
+    // {+2^40, NaN, -2^40, 1.5} = {7fffffff, 80000000, 80000000, 2}. The
+    // +overflow lane is INT_MAX (7fffffff), so without the substitution x86
+    // CVTPS2DQ of an out-of-range positive would return 0x7fffffff instead of
+    // 0x80000000. The xvcvspsxws/xvcvdpsxds "+overflow → INT_MAX" behaviour is
+    // the reason every FToS/FToISized site keeps this block.
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);                 // overflow ? INT_MIN : Dst
     return;
   }
@@ -4557,13 +4561,9 @@ DEF_OP(Vector_FToS) {
     xvrdpic(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
     // Same INT_MIN sentinel fix for f64 → i64.  Bound = 2^63 as f64.
-    LoadConstant(TMP1, 0x43E0000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4579,14 +4579,17 @@ DEF_OP(Vector_FToZS) {
   if (ElemSz == IR::OpSize::i32Bit) {
     vrfiz(VTMP1, Src);    // round towards zero
     vctsxs(Dst, VTMP1, 0);
-    // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
-    xvcmpgesp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    // INT_MIN sentinel for +overflow. This fix-up is LOAD-BEARING, not dead:
+    // hardware-measured on POWER8, vctsxs of {+2^40, NaN, -2^40, 1.5} gives
+    // {7fffffff, 00000000, 80000000, 1} — +overflow saturates to INT_MAX, so
+    // without the select the +overflow lane would be 0x7fffffff not x86's
+    // 0x80000000. KNOWN BUG (not fixed here): vctsxs maps NaN -> 0x00000000
+    // (VMX), and xvcmpgesp returns 0 for NaN, so the select leaves 0 where
+    // x86 CVTTPS2DQ(NaN) wants 0x80000000. Unlike the VSX converts, VMX vctsxs
+    // does NOT map NaN to INT_MIN. Needs a separate NaN mask to fully match.
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
+    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4594,13 +4597,9 @@ DEF_OP(Vector_FToZS) {
     xvrdpiz(VTMP1, Src);
     xvcvdpsxds(Dst, VTMP1);
     // INT_MIN sentinel for +overflow (see Vector_FToS for rationale)
-    LoadConstant(TMP1, 0x43E0000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4837,13 +4836,9 @@ DEF_OP(Vector_FToISized) {
     // INT_MIN (0x80000000) as the integer-indefinite sentinel.  See
     // commit c9db77322 for the rationale.  xvcmpgesp NaN compare returns
     // 0, so NaN (already INT_MIN per POWER) is correctly preserved.
-    LoadConstant(TMP1, 0x4F0000004F000000ULL);  // splat f32(2^31)
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
     xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
-    LoadConstant(TMP1, 0x8000000080000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);                      // splat INT_MIN
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);               // overflow ? INT_MIN : Dst
     return;
   }
@@ -4855,13 +4850,9 @@ DEF_OP(Vector_FToISized) {
     }
     xvcvdpsxds(Dst, VTMP1);
     // INT_MIN sentinel for f64 -> i64 +overflow (matches CVT{T}SD2SI etc.).
-    LoadConstant(TMP1, 0x43E0000000000000ULL);  // f64(2^63)
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    addi(TMP2, r1, -16); lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
     xvcmpgedp(VTMP1, Src, VTMP2);
-    LoadConstant(TMP1, 0x8000000000000000ULL);
-    std(TMP1, -16, r1); std(TMP1, -8, r1);
-    lvx(VTMP2, r(0), TMP2);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I64_MIN, TMP1, TMP2);
     xxsel(Dst, Dst, VTMP2, VTMP1);
     return;
   }
@@ -4918,28 +4909,22 @@ DEF_OP(Vector_F64ToI32) {
   //      bytes of each dw — i.e. for each i64 lane, either preserve all
   //      32 bits of POWER's result word OR substitute INT_MIN.
   //   4. AFTER the substitution, do the existing vperm-pack to LE-low.
-  LoadConstant(TMP1, 0x43E0000000000000ULL);  // 2^31 as f64
-  std(TMP1, -16, r1); std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP2, r(0), TMP1);                     // VTMP2 = splat f64(2^31)
-  xvcmpgedp(VTMP2, Src, VTMP2);               // per-i64-lane overflow mask
-  LoadConstant(TMP1, 0x80000000ULL);          // INT_MIN as i32; broadcast via mtvsrd-splat
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x80000000ULL);
-  std(TMP1, -8, r1);
-  // Actually need per-32-bit INT_MIN.  Splat 0x80000000 8 times (16 bytes):
-  LoadConstant(TMP1, 0x8000000080000000ULL);
-  std(TMP1, -16, r1); std(TMP1, -8, r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP1, r(0), TMP1);                     // VTMP1 = splat i32(INT_MIN)
+  // BOUND FIX (2026-08-05): this compared against 2^63 while claiming to be
+  // 2^31 — f64 values in [2^31, 2^63) kept POWER's INT_MAX saturation
+  // instead of x86's 0x80000000 indefinite. The i32 overflow boundary is
+  // 2^31, and the compare uses the ROUNDED value (VTMP1), not Src: an input
+  // like 2^31 - 0.4 rounds up to exactly 2^31 and must also go indefinite.
+  // Negative overflow needs no mask: POWER already saturates to INT_MIN,
+  // which IS the sentinel. NaN: xvcmpgedp returns 0 (unordered), and POWER's
+  // NaN convert is already INT_MIN — correct either way.
+  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P31, TMP1, TMP2);
+  xvcmpgedp(VTMP2, VTMP1, VTMP2);             // per-i64-lane overflow mask (rounded src)
+  EmitLoadPPC64VConst(VTMP1, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
   xxsel(Dst, Dst, VTMP1, VTMP2);              // mask ? INT_MIN : Dst (per-byte == per-i32-lane here)
 
   // Now pack the (possibly INT_MIN-substituted) i32 results to LE-low.
+  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32, TMP1, TMP2);
   vspltisw(VTMP1, 0);
-  LoadConstant(TMP1, 0x040506070C0D0E0FULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1010101010101010ULL); std(TMP1, -8,  r1);
-  addi(TMP1, r1, -16);
-  lvx(VTMP2, r(0), TMP1);
   vperm(Dst, Dst, VTMP1, VTMP2);
   (void)Zero;
 }
@@ -5245,7 +5230,8 @@ extern "C" void PPC64_VSha256U1(uint8_t*, const uint8_t*, const uint8_t*);
 // enum ↔ helper impossible to get subtly wrong. Enumerator additions
 // require a matching row here.
 namespace {
-static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
+static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
+  .Helpers = {
   [::FEXCore::CPU::PPC64_HELPER_SplitLockEmulate] =
       reinterpret_cast<uint64_t>(&FEXCore::ArchHelpers::PPC64::PPC64_SplitLockEmulate),
   [::FEXCore::CPU::PPC64_HELPER_F16HiToF32x4]     = reinterpret_cast<uint64_t>(&PPC64_F16HiToF32x4),
@@ -5277,13 +5263,42 @@ static const uint64_t PPC64Helpers[::FEXCore::CPU::PPC64_HELPER_MAX] = {
   [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
   [::FEXCore::CPU::PPC64_HELPER_F64F2XM1]         = reinterpret_cast<uint64_t>(F64F2XM1Impl),
+  },
+  // 128-bit constant pool. Each entry is written the way the inline
+  // LoadConstant/std/std/lvx sequences it replaces wrote it: the first
+  // doubleword is what went to the low address (r1-16) and the second is what
+  // went to r1-8. An lvx of the pair therefore reproduces the same register
+  // image, so no endianness argument is needed to justify a conversion --
+  // it is the identical 16 bytes.
+  .Constants = {
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F32_2P31 + 0] = 0x4F0000004F000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F32_2P31 + 1] = 0x4F0000004F000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I32_MIN  + 0] = 0x8000000080000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I32_MIN  + 1] = 0x8000000080000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 0] = 0x43E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 1] = 0x43E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P31 + 0] = 0x41E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P31 + 1] = 0x41E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 0] = 0x8000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 1] = 0x8000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 0] = 0x040506070C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 1] = 0x1010101010101010ULL,
+    // All-ones over guest bytes 0-3 (LE f32 element 0), zero elsewhere. In
+    // the register image after lvx this covers exactly the elem0 lane, so
+    // `xxsel(Dst, Vec1, Result, MASK)` implements SSE scalar-insert merges.
+    [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 0] = 0x00000000FFFFFFFFULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 1] = 0x0000000000000000ULL,
+  },
 };
 } // namespace
 
 // Handed to CpuStateFrame::PPC64_HelperTable at thread-JIT construction.
-// The pointer is stable for program lifetime.
+// The pointer is stable for program lifetime. It addresses the whole
+// table/pool allocation: Helpers is at offset 0 (so every existing helper
+// call site is unaffected) and the 128-bit constant pool sits at
+// PPC64VConstPoolOffset from the same base.
 uint64_t* GetPPC64HelperTable() {
-  return const_cast<uint64_t*>(PPC64Helpers);
+  return const_cast<uint64_t*>(PPC64Tables.Helpers);
 }
 
 // (Crypto FABI mini-frame constants are hoisted to the top of the file so

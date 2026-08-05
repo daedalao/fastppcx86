@@ -4,6 +4,8 @@
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
+#include <bit>
+
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -70,14 +72,29 @@ DEF_OP(CallbackReturn) {
 //   does NOT order load->load on Power, so the GuestCode value is fed into the
 //   HostCode load's base register.
 //
-// BLOCK LINKING (constant-target JUMP exits only, BlockLinking knob).
+// BLOCK LINKING (constant-target exits, BlockLinking knob).
 //
-// When BlockLinkingEnabled and this exit is a plain jump to a constant RIP
-// (Hint == None — calls, returns and CheckTF exits are excluded; patching a
-// call exit to `bl` would push the probe's second instruction onto POWER9's
-// link stack while the architectural return goes elsewhere, mispredicting
-// every linked call/ret pair, and that redesign is not done), the exit is
-// reordered so the WHOLE L1 probe becomes the patch target:
+// When BlockLinkingEnabled and this exit has a constant target RIP —
+// Hint == None (plain jumps) or Hint == Call (guest CALL, whose target is a
+// constant and whose x86 return address is an EntrypointOffset constant the
+// guest pushed to ITS stack, entirely independent of host control flow) —
+// the exit is reordered so the WHOLE L1 probe becomes the patch target.
+//
+// Calls were HISTORICALLY excluded by an objection about patching to `bl`:
+// that would push the probe's second instruction onto the hardware link
+// stack while the architectural return goes elsewhere, mispredicting every
+// call/ret pair. But the linker below never emits `bl` — it patches a plain
+// `b` (or `b Thunk`), creating no link-stack entry, and a 2026-08-05 storm
+// profile put the unlinked path (ExitFunctionLink->FindBlock) at 4.1% of
+// CPU in a call-dense Mono workload, so the exclusion cost real time for a
+// hazard the mechanism doesn't have. The backend consults Hint nowhere else
+// (verified by audit), and linked targets land on the callee's EntryPoint
+// prologue, whose deferred-signal drain is hint-agnostic.
+//
+// Still excluded: Return (dynamic target — nothing constant to link) and
+// CheckTF (must reach the dispatcher's trap check every time). A shadow
+// return stack for the Return side is the remaining, genuinely
+// design-heavy half.
 //
 //     InsertExitRIPMove TMP1, NewRIP      (1-5 insns; 5 fixed when
 //                                          ExitRIPFixedWidth -- see below)
@@ -169,7 +186,8 @@ DEF_OP(ExitFunction) {
   // shape keeps the exact non-linking lowering below.
   // ---------------------------------------------------------------------
   const bool Linkable =
-    ConstRIP && Op->Hint == IR::BranchHint::None && BlockLinkingEnabled;
+    ConstRIP && BlockLinkingEnabled &&
+    (Op->Hint == IR::BranchHint::None || Op->Hint == IR::BranchHint::Call);
   PPC64Emitter::Label* LinkPathLabel = nullptr;
   if (Linkable) {
     // Hoisted region: rip store + r0 re-zero, then the patch site. Both
@@ -197,9 +215,18 @@ DEF_OP(ExitFunction) {
   auto MissLabel = PPC64Emitter::Label{};
 
   ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
-  ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled)
-  sldi(TMP4, RIPReg, 4);         // log2(sizeof(LookupCacheEntry)) == 4
-  and_(TMP4, TMP4, TMP3);
+  if (!FEXCore::Config::Get_DYNAMICL1CACHE()) {
+    // Static L1: constant-mask probe, one rldic instead of L1Mask load +
+    // sldi + and_. Same derivation as the dispatcher's DispatcherLoopTop.
+    static_assert((FEXCore::LookupCache::MAX_L1_ENTRIES & (FEXCore::LookupCache::MAX_L1_ENTRIES - 1)) == 0,
+                  "rldic probe requires a power-of-two L1");
+    constexpr uint32_t L1MB = 64 - (std::countr_zero(FEXCore::LookupCache::MAX_L1_ENTRIES) + 4);
+    rldic(TMP4, RIPReg, 4, L1MB);
+  } else {
+    ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled)
+    sldi(TMP4, RIPReg, 4);         // log2(sizeof(LookupCacheEntry)) == 4
+    and_(TMP4, TMP4, TMP3);
+  }
   add(TMP2, TMP2, TMP4);         // TMP2 = &L1[hash]
 
   ld(TMP4, 8, TMP2);             // TMP4 = GuestCode (the "key"), loaded FIRST
@@ -216,9 +243,11 @@ DEF_OP(ExitFunction) {
   // Hit. Carry the GuestCode value into the HostCode load's address so the
   // hardware cannot hoist it above the GuestCode load and observe
   // {stale HostCode, new GuestCode} mid-Publish. TMP3 is 0 by construction.
+  // Same one-instruction fold as the dispatcher's match_label leg: the data
+  // dependency rides ldx's index operand (TMP3 == 0), preserving the
+  // load-load ordering the comment above requires.
   xor_(TMP3, TMP4, TMP4);
-  add(TMP2, TMP2, TMP3);
-  ld(TMP3, 0, TMP2);             // TMP3 = HostCode (loaded under address-dep)
+  ldx(TMP3, TMP2, TMP3);         // TMP3 = HostCode (loaded under address-dep)
   mtctr(TMP3);
   if (!Linkable) {
     // P5.0.1: store the destination RIP into State.rip on the hit leg too.
@@ -442,6 +471,31 @@ DEF_OP(Break) {
   bctr();
 }
 
+// Value parked in CpuStateFrame::InSyscallInfo for the duration of a
+// JIT-emitted Syscall op.
+//
+//   bits 0..15  : the SpillSRA IgnoreMask. 0xFFFF = "all 16 x64 SRA GPRs are
+//                 already spilled to the frame", exactly as before. This is
+//                 the only part any consumer outside this file looks at
+//                 (SignalDelegator.cpp:684 and SyscallsSMCTracking.cpp:151
+//                 both mask with 0xFFFF).
+//   bits 16..23 : deliberately ZERO. GdbServer.cpp:113 passes the raw
+//                 InSyscallInfo into SpillSRA's `uint32_t IgnoreMask` with no
+//                 masking, and SpillSRA tests `1U << SRAIdxMap` where
+//                 SRAIdxMap is the host register number — r16..r23 are SRA
+//                 members, so a sentinel bit in this window would silently
+//                 suppress their re-spill. Bit 24 is above every SRA register
+//                 number (max r23) and therefore inert in that path.
+//   bit  24     : the tripwire. ArchHelpers::Context::ContextBackup stores
+//                 InSyscallInfo as a *uint16_t* (MContext_ppc64le.h:77), so
+//                 this bit CANNOT survive a signal-delivery round trip:
+//                 HandleDispatcherGuestSignal zeroes the field, and
+//                 RestoreThreadState reinstates it truncated to 0xFFFF. Any
+//                 value read back with no bit above 15 set therefore means
+//                 "the guest state in the frame was republished by somebody
+//                 while we were inside the host call".
+static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
+
 DEF_OP(Syscall) {
   auto Op = IROp->C<IR::IROp_Syscall>();
 
@@ -456,10 +510,14 @@ DEF_OP(Syscall) {
   // Without this, an async signal arriving between SpillStaticRegs and
   // FillStaticRegs causes the handler to re-spill from post-bctrl volatile
   // registers, overwriting the freshly-stored gregs[RAX] with junk.
+  //
+  // Bit 24 on top of that mask is a "nobody has touched the guest state
+  // behind our back" tripwire, read back by the fill below. See
+  // kInSyscallSentinel.
   {
     const int32_t isi_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
-    LoadConstant(TMP1, 0xFFFFu);
+    LoadConstant(TMP1, kInSyscallSentinel);
     std(TMP1, static_cast<int16_t>(isi_off), STATE);
   }
 
@@ -590,7 +648,46 @@ DEF_OP(Syscall) {
 
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
   addi(r1, r1, FrameSize);
-  FillStaticRegs();
+
+  // ---- Fill elision -----------------------------------------------------
+  // SRA slots 6..15 map to r14..r23, which ELFv2 preserves across the bctrl
+  // above. Nothing between SpillStaticRegs and here touches them: the arg
+  // pack and the result move use the dynamic RA pool (r24-r26/r30-r31 in
+  // x64), the call sequence uses r3/r4/r5/r12, and TMP1..TMP4 are r3-r6. So
+  // in the common case those ten host registers still hold the live guest
+  // values and reloading them from the frame is pure overhead.
+  //
+  // The uncommon case is a signal: HandleDispatcherGuestSignal / the guest
+  // handler / RestoreThreadState can rewrite ANY greg in the frame while the
+  // host registers keep their pre-signal contents, so those ten loads are
+  // mandatory there. kInSyscallSentinel's bit 24 detects exactly that — it is
+  // erased by the uint16_t ContextBackup round trip, so "some bit above 15 is
+  // still set" is a sound proof that no signal republished the frame.
+  //
+  // NOT applied to i686 guests: their fill uses lwz for its zero-extension
+  // side effect, which a surviving host register does not provide.
+  //
+  // NOTE this only elides the *fill*. The spill must stay complete: syscalls
+  // that snapshot guest state read it straight out of the frame — e.g.
+  // Thread.cpp:103 `TM.CreateThread(0, 0, &Frame->State, ...)` hands the
+  // parent's whole CPUState to a new guest thread — and a partial spill would
+  // hand them a stale RSI/RDI/R8-R15.
+  if (CTX->Config.Is64BitMode()) {
+    const int32_t isi_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    PPC64Emitter::Label SentinelIntact;
+    ld(TMP1, isi_off, STATE);
+    // TMP1 = InSyscallInfo >> 16, recording into CR0: EQ iff nothing above
+    // bit 15 survived, i.e. iff the frame was republished behind us.
+    rldicl_(TMP1, TMP1, 48, 16);
+    // BO=4 (branch if false), BI=2 (CR0.EQ) — i.e. bne cr0.
+    bc({4, 2}, &SentinelIntact);
+    FillStaticRegs(FillMode::NonVolatileGPRsOnly);
+    Bind(&SentinelIntact);
+    FillStaticRegs(FillMode::SkipNonVolatileGPRs);
+  } else {
+    FillStaticRegs();
+  }
   // HandleSyscall is a host C function; r0 was clobbered. Restore the JIT's
   // r0=0 zero-index invariant before falling back into JIT code that uses
   // ldx/stdx.

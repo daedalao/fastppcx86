@@ -171,7 +171,7 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
 }
 
 // Fill static registers from CpuStateFrame → host regs
-void PPC64EmitterBase::FillStaticRegs() {
+void PPC64EmitterBase::FillStaticRegs(FillMode Mode) {
   // SRA[i] ↔ gregs[i]; see SpillStaticRegs comment.
   // 64-bit guest: 16 GPRs filled via ld (8 bytes each).
   // 32-bit guest:  8 GPRs filled via lwz (4 bytes, zero-extending) so the
@@ -182,7 +182,25 @@ void PPC64EmitterBase::FillStaticRegs() {
   const auto& SRA = Is64Bit ? std::span<const GPR>(x64::SRA)
                             : std::span<const GPR>(x32::SRA);
   const size_t NumGuestGPRs = Is64Bit ? 16u : 8u;
+
+  // A 32-bit guest may never elide a GPR fill. The `lwz` above is not just a
+  // value transfer: it is what re-establishes "upper 32 bits are zero" for
+  // ALU/MEM ops. A host register that merely survived a call untouched keeps
+  // whatever garbage the JIT left in its upper half (SpillStaticRegs even
+  // masks on the way out precisely because it cannot assume otherwise), so
+  // "callee-saved, therefore still correct" does not hold in i686 mode.
+  LOGMAN_THROW_A_FMT(Mode == FillMode::All || Is64Bit,
+                     "Partial SRA fill requested for a 32-bit guest; the lwz "
+                     "zero-extension invariant forbids it");
+
+  const bool WantVolatile    = Mode != FillMode::NonVolatileGPRsOnly;
+  const bool WantNonVolatile = Mode != FillMode::SkipNonVolatileGPRs;
+
   for (size_t i = 0; i < NumGuestGPRs; ++i) {
+    const bool NonVolatile = SRA[i].idx >= RegVolatility::kFirstNonVolatileGPR;
+    if (NonVolatile ? !WantNonVolatile : !WantVolatile) {
+      continue;
+    }
     int32_t off = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame,
                                                  State.gregs[i]));
     if (Is64Bit) {
@@ -202,6 +220,12 @@ void PPC64EmitterBase::FillStaticRegs() {
         lwzx(SRA[i], STATE, TMP1);
       }
     }
+  }
+
+  if (Mode == FillMode::NonVolatileGPRsOnly) {
+    // Everything below belongs to the complementary half. Returning here is
+    // what makes NonVolatileGPRsOnly + SkipNonVolatileGPRs == All.
+    return;
   }
 
   // Symmetric to SpillStaticRegs — use lwz so we don't load adjacent fields.
@@ -371,10 +395,8 @@ void PPC64EmitterBase::PopCalleeSavedRegisters() {
 // Spill GPRs at [r1+32..] and FPRs at the next 16-byte boundary above.
 size_t PPC64EmitterBase::PushDynamicRegs(GPR tmp) {
   const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
-  const auto RA    = Is64Bit ? std::span<const GPR>(x64::RA)    : std::span<const GPR>(x32::RA);
   const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
 
-  const size_t GPRStart = Is64Bit ? x64::kDynGPRStart  : x32::kDynGPRStart;
   const size_t FPRStart = Is64Bit ? x64::kDynFPRStart  : x32::kDynFPRStart;
   const size_t SaveSize = Is64Bit ? x64::kDynRegSaveSize : x32::kDynRegSaveSize;
 
@@ -382,10 +404,26 @@ size_t PPC64EmitterBase::PushDynamicRegs(GPR tmp) {
   // can step past this frame.  SaveSize fits the signed-16-bit displacement.
   stdu(r1, -static_cast<int16_t>(SaveSize), r1);
 
-  for (size_t i = 0; i < RA.size(); ++i) {
-    std(RA[i], static_cast<int16_t>(GPRStart + i * 8), r1);
-  }
+  // Save ONLY what an ELFv2 callee may clobber. RA is entirely callee-saved
+  // in both modes (x64: r24-r26/r30/r31; x32: r16-r26/r30/r31 — the
+  // static_asserts by the pool definitions in PPC64Emitter.h pin this), and
+  // of RAFPR only v0-v19 are volatile, so v20+ survive any C call. That
+  // includes host calls that RE-ENTER the JIT via a guest callback: the
+  // dispatcher's C entry runs PushCalleeSavedRegisters, which saves
+  // r14-r31/f14-f31/v20-v31 before any JIT code runs. Frame layout is
+  // deliberately UNCHANGED — the skipped registers keep their (now unwritten)
+  // slots, so kDynGPRStart/kDynFPRStart arithmetic and the DEF_OP(Thunk)
+  // linkage-area assumption stay valid, and stack cost is the only thing not
+  // reclaimed (240 bytes of dead frame, irrelevant).
+  //
+  // Previously this saved all of RA + all of RAFPR: ~50 wasted instructions
+  // per SpillForABICall/FillForABICall pair on every host C call (thunks,
+  // CPUID, atomic/crypto helpers, x87 fallbacks). DEF_OP(Syscall) already
+  // relied on exactly this reasoning for the GPR half (BranchOps.cpp).
   for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20) {
+      continue;  // v20-v31: ELFv2 callee-saved
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(tmp, static_cast<uint32_t>(off));
     stvx(RAFPR[i], r1, tmp);
@@ -395,17 +433,17 @@ size_t PPC64EmitterBase::PushDynamicRegs(GPR tmp) {
 
 void PPC64EmitterBase::PopDynamicRegs() {
   const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
-  const auto RA    = Is64Bit ? std::span<const GPR>(x64::RA)    : std::span<const GPR>(x32::RA);
   const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
 
-  const size_t GPRStart = Is64Bit ? x64::kDynGPRStart  : x32::kDynGPRStart;
   const size_t FPRStart = Is64Bit ? x64::kDynFPRStart  : x32::kDynFPRStart;
   const size_t SaveSize = Is64Bit ? x64::kDynRegSaveSize : x32::kDynRegSaveSize;
 
-  for (size_t i = 0; i < RA.size(); ++i) {
-    ld(RA[i], static_cast<int16_t>(GPRStart + i * 8), r1);
-  }
+  // Mirror of PushDynamicRegs: only the ELFv2-volatile subset was saved, so
+  // only that subset is reloaded. Everything else was preserved by the callee.
   for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20) {
+      continue;  // v20-v31: ELFv2 callee-saved, never spilled
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(TMP1, static_cast<uint32_t>(off));
     lvx(RAFPR[i], r1, TMP1);

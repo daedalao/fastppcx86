@@ -1177,8 +1177,13 @@ private:
 
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
+public:
+  // Public: the PPC64LE JIT bakes log2(MAX_L1_ENTRIES) into its constant-mask
+  // L1 probe (rldic) when DynamicL1Cache is off — the emitted MB field must
+  // track this constant.
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
+private:
 
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
   constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);

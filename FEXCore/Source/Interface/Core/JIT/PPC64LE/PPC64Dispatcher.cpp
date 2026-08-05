@@ -26,6 +26,8 @@
 #include "Utils/MemberFunctionToPointer.h"
 #include "Interface/Core/Interpreter/InterpreterOps.h"
 
+#include <bit>
+
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -274,13 +276,26 @@ void PPC64Dispatcher::EmitDispatcher() {
     int32_t l1mask_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.L1Mask));
 
     ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
-    ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled by sizeof(LookupCacheEntry)=16)
+    if (!FEXCore::Config::Get_DYNAMICL1CACHE()) {
+      // Static L1 (the port default): the mask is an emit-time constant, so
+      // the whole (RIP << 4) & L1Mask collapses into one rldic — rotate left
+      // by 4 and keep bits [4, log2(entries)+4), which is exactly
+      // (RIP & (entries-1)) * 16 with the low 4 bits clear. Replaces the
+      // L1Mask load + sldi + and_ (3 insns and a dependent load) on the
+      // hottest dispatcher leg. MB tracks LookupCache::MAX_L1_ENTRIES.
+      static_assert((FEXCore::LookupCache::MAX_L1_ENTRIES & (FEXCore::LookupCache::MAX_L1_ENTRIES - 1)) == 0,
+                    "rldic probe requires a power-of-two L1");
+      constexpr uint32_t L1MB = 64 - (std::countr_zero(FEXCore::LookupCache::MAX_L1_ENTRIES) + 4);
+      rldic(TMP4, TMP1, 4, L1MB);
+    } else {
+      ld(TMP3, l1mask_off, STATE);   // TMP3 = L1Mask (pre-scaled by sizeof(LookupCacheEntry)=16)
 
-    // Compute byte offset: (RIP << 4) & L1Mask = (RIP & L1PointerMask) * 16.
-    // L1Mask is pre-scaled (= L1PointerMask << 4), so shifting RIP left before
-    // ANDing gives the correct entry offset. Matches ARM64 dispatcher behavior.
-    sldi(TMP4, TMP1, 4);  // LookupCacheEntry = 16 bytes, log2(16) = 4
-    and_(TMP4, TMP4, TMP3);
+      // Compute byte offset: (RIP << 4) & L1Mask = (RIP & L1PointerMask) * 16.
+      // L1Mask is pre-scaled (= L1PointerMask << 4), so shifting RIP left before
+      // ANDing gives the correct entry offset. Matches ARM64 dispatcher behavior.
+      sldi(TMP4, TMP1, 4);  // LookupCacheEntry = 16 bytes, log2(16) = 4
+      and_(TMP4, TMP4, TMP3);
+    }
 
     // Address of L1 entry: L1Pointer + byte_offset
     add(TMP2, TMP2, TMP4);
@@ -363,9 +378,11 @@ void PPC64Dispatcher::EmitDispatcher() {
     // is unchanged, but the load's address now carries a data dependency on
     // TMP4 -- which is what Power's memory model actually orders on.  The
     // conditional branch above is NOT sufficient (see the ORDERING NOTE).
+    // The dependency rides the X-form index operand directly: ldx's EA is
+    // TMP2 + TMP3 with TMP3 == 0, same ordering guarantee as the old
+    // xor_/add/ld sequence, one instruction shorter on this hottest-path leg.
     xor_(TMP3, TMP4, TMP4);   // TMP3 = 0, data-dependent on the GuestCode load
-    add(TMP2, TMP2, TMP3);    // address of the HostCode load now depends on it
-    ld(TMP3, 0, TMP2);   // TMP3 = HostCode (loaded under address-dep)
+    ldx(TMP3, TMP2, TMP3);    // TMP3 = HostCode (loaded under address-dep)
     mtctr(TMP3);
     li(r(0), 0);  // JIT blocks use r0=0 as zero index for ldx/stdx
     bctr();

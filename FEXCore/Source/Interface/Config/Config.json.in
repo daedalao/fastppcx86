@@ -231,10 +231,18 @@
       },
       "DynamicL1Cache": {
         "Type": "bool",
-        "Default": "true",
+        "Default": "false",
         "Desc": [
           "Switches FEXCore's JIT L1 cache to be dynamically sized. Saving memory.",
-          "Can potentially introduce more stutters."
+          "Can potentially introduce more stutters.",
+          "Default OFF on this ppc64le port (2026-08-05): an L1 miss costs a",
+          "~62-insn spill + 2 locks + ~63-insn fill here, every resize flushes",
+          "the entire 16MiB table cold, and the 250/50-per-second thresholds",
+          "oscillate under Mono/Unity code footprints. A Ziggurat load profile",
+          "put the miss path (ExitFunctionLink->FindBlock) at 4.1% of CPU.",
+          "Static sizing also lets the JIT emit a constant-mask L1 probe",
+          "(rldic) instead of loading L1Mask per block exit. The table is",
+          "lazily faulted with THP, so full size costs virtual space only."
         ]
       },
       "DynamicL1CacheIncreaseCountHeuristic": {

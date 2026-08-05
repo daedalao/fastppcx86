@@ -74,8 +74,22 @@ host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
 }
 
 host_layout<_XDisplay*>::~host_layout() {
-  // Flush host-side event queue to make effects of the guest-side connection visible
-  if (data) x11_manager.HostXFlush(data);
+  // This used to XFlush the host connection unconditionally — a write(2) to
+  // the X socket per Display-taking GL call, defeating Xlib request batching
+  // entirely. It is not needed for rendering: glXSwapBuffers issues its own
+  // flush as part of the swap protocol, and non-swap GLX requests that a guest
+  // could observe cross-connection get pushed out by the server round trips
+  // libX11 already performs for reply-carrying requests. Kept behind a triage
+  // env: if a title's window updates lag or GLX state appears stale
+  // cross-connection, set FEX_X11_FLUSH_EVERY_CALL=1 to confirm this elision
+  // is the cause, then give the specific entry point its own flush.
+  static const bool FlushEveryCall = [] {
+    const char* e = getenv("FEX_X11_FLUSH_EVERY_CALL");
+    return e && *e == '1';
+  }();
+  if (data && FlushEveryCall) {
+    x11_manager.HostXFlush(data);
+  }
 }
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
@@ -172,6 +186,35 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glXGetVisualFromFBConfigSGIX;
   } else if (name_sv == "glXChooseVisual") {
     return (VoidFn)fexfn_impl_libGL_glXChooseVisual;
+    // The XID-taking GLX entry points MUST be listed here, not just annotated
+    // custom_host_impl.
+    //
+    // A name resolved through glXGetProcAddress does NOT reach its
+    // fexfn_impl_* wrapper. libGL_Guest.cpp:68 links the *returned host
+    // address* to the generic HostPtrInvokers entry for that name, so a later
+    // guest call lands in GuestWrapperForHostFunction<Sig>::Call (Host.h:913),
+    // which repacks the arguments and then branches straight to whatever
+    // address we returned here. Return the raw host symbol and the custom impl
+    // is bypassed entirely — the guest_layout conversions still happen (that is
+    // why this worked at all), but everything the impl adds around the call
+    // does not. Confirmed by gdb: glXMakeCurrent in libGLX.so.0 called from
+    // GuestWrapperForHostFunction<int (_XDisplay*, unsigned long,
+    // __GLXcontextRec*), ...>::Call, never from fexfn_impl_libGL_glXMakeCurrent.
+    //
+    // For these four that missing extra is GuestSyncForHostDisplay: the
+    // Window/Pixmap they name was minted on the guest connection and may still
+    // sit in the guest Xlib request buffer. Without the sync the host
+    // connection hits BadDrawable on GLXGetDrawableAttributes (Grimrock
+    // bootstrap, serials ~28/30) whenever the per-call sync in
+    // GuestToHostDisplay is not covering for it (FEX_X11_SYNC_FIRST_ONLY=1).
+  } else if (name_sv == "glXMakeCurrent") {
+    return (VoidFn)fexfn_impl_libGL_glXMakeCurrent;
+  } else if (name_sv == "glXMakeContextCurrent") {
+    return (VoidFn)fexfn_impl_libGL_glXMakeContextCurrent;
+  } else if (name_sv == "glXCreateWindow") {
+    return (VoidFn)fexfn_impl_libGL_glXCreateWindow;
+  } else if (name_sv == "glXCreatePixmap") {
+    return (VoidFn)fexfn_impl_libGL_glXCreatePixmap;
   } else if (name_sv == "glXCreateContext") {
     return (VoidFn)fexfn_impl_libGL_glXCreateContext;
   } else if (name_sv == "glXCreateGLXPixmap") {
@@ -516,6 +559,9 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 }
 
 Bool fexfn_impl_libGL_glXMakeCurrent(Display* Display, GLXDrawable Drawable, GLXContext Context) {
+  // XID args may name a guest-created drawable the host connection has not
+  // seen yet (see X11Manager::GuestSyncForHostDisplay). Rare call; cheap here.
+  x11_manager.GuestSyncForHostDisplay(Display);
   if (FexLibGLDebug()) {
     fprintf(stderr, "[fex-libGL] glXMakeCurrent: display=%p drawable=0x%lx context=%p\n",
             Display, (unsigned long)Drawable, (void*)Context);
@@ -528,6 +574,9 @@ Bool fexfn_impl_libGL_glXMakeCurrent(Display* Display, GLXDrawable Drawable, GLX
 }
 
 Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, GLXDrawable Read, GLXContext Context) {
+  // XID args may name a guest-created drawable the host connection has not
+  // seen yet (see X11Manager::GuestSyncForHostDisplay). Rare call; cheap here.
+  x11_manager.GuestSyncForHostDisplay(Display);
   if (FexLibGLDebug()) {
     fprintf(stderr, "[fex-libGL] glXMakeContextCurrent: display=%p draw=0x%lx read=0x%lx context=%p\n",
             Display, (unsigned long)Draw, (unsigned long)Read, (void*)Context);
@@ -539,7 +588,25 @@ Bool fexfn_impl_libGL_glXMakeContextCurrent(Display* Display, GLXDrawable Draw, 
   return ret;
 }
 
+GLXWindow fexfn_impl_libGL_glXCreateWindow(Display* Display, GLXFBConfig Config, Window Win, const int* AttribList) {
+  // `Win` was created on the guest connection; sync it visible to the host
+  // connection first. This is the path SDL2/GLX-1.3 titles take INSTEAD of
+  // glXMakeCurrent-first (Grimrock: BadDrawable on GLXGetDrawableAttributes,
+  // "failed to create drawable", before any MakeCurrent).
+  x11_manager.GuestSyncForHostDisplay(Display);
+  if (FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXCreateWindow: display=%p win=0x%lx\n", Display, (unsigned long)Win);
+  }
+  return fexldr_ptr_libGL_glXCreateWindow(Display, Config, Win, AttribList);
+}
+
+GLXPixmap fexfn_impl_libGL_glXCreatePixmap(Display* Display, GLXFBConfig Config, Pixmap Pixmap, const int* AttribList) {
+  x11_manager.GuestSyncForHostDisplay(Display);
+  return fexldr_ptr_libGL_glXCreatePixmap(Display, Config, Pixmap, AttribList);
+}
+
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display* Display, guest_layout<XVisualInfo*> Info, Pixmap Pixmap) {
+  x11_manager.GuestSyncForHostDisplay(Display);
   auto HostInfo = LookupHostVisualInfo(Display, Info);
   auto ret = fexldr_ptr_libGL_glXCreateGLXPixmap(Display, HostInfo, Pixmap);
   x11_manager.HostXFree(HostInfo);
@@ -547,6 +614,7 @@ GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display* Display, guest_layout<XVi
 }
 
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmapMESA(Display* Display, guest_layout<XVisualInfo*> Info, Pixmap Pixmap, Colormap Colormap) {
+  x11_manager.GuestSyncForHostDisplay(Display);
   auto HostInfo = LookupHostVisualInfo(Display, Info);
   auto ret = fexldr_ptr_libGL_glXCreateGLXPixmapMESA(Display, HostInfo, Pixmap, Colormap);
   x11_manager.HostXFree(HostInfo);

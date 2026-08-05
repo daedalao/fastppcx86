@@ -23,6 +23,22 @@ namespace PPC64Emitter {
 struct Label {
   int64_t offset = -1;  // set when bound; -1 = unbound
   bool bound = false;
+
+  // Head of this label's intrusive singly-linked list of pending forward-branch
+  // fixups: an index into Emitter::PendingBranches, or -1 for "no fixups".
+  // Each entry stores the index of the next fixup for the *same* label, so
+  // Bind() walks only its own chain instead of scanning the whole vector.
+  //
+  // COPY HAZARD: copying a Label duplicates this head index, and binding one
+  // copy patches the chain and resets only that copy's head — the other copy
+  // would then re-walk indices that have already been patched (and, after a
+  // ClearPendingBranches(), indices into a *different* compile's vector).
+  // The port never copies a live Label: every Label is a fresh stack local or
+  // an element of JITClass::JumpTargets, which is only ever grown by
+  // `resize(N, {})` from a default-constructed (head == -1) value. Keep it
+  // that way; if a Label ever needs to move, move the head index with it and
+  // clear the source.
+  int32_t pending_head = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -438,6 +454,15 @@ public:
   // extsw RA, RS (extend word sign, XO 986)
   void extsw(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 986, 0); }
 
+  // Record forms of the sign-extends (Rc=1). ISA: "extsb.", "extsh.", "extsw.".
+  // CR0 is set exactly as by a `cmpdi RA, 0` on the 64-bit sign-extended
+  // result — LT/GT/EQ from the signed comparison of the full doubleword
+  // against zero, SO copied from XER.SO — so `extsX. rT, rS` is a drop-in
+  // replacement for the two-instruction `extsX rT, rS ; cmpdi rT, 0` pair.
+  void extsb_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 954, 1); }
+  void extsh_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 922, 1); }
+  void extsw_(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 986, 1); }
+
   // cntlzw RA, RS (count leading zeros word, XO 26)
   void cntlzw(GPR ra, GPR rs) { EmitX(31, rs.idx, ra.idx, 0, 26, 0); }
 
@@ -815,6 +840,15 @@ public:
   void xxland (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 130); }
   void xxlandc(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 138); }
   void xxlnor (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 162); }
+  // xxspltw XT,XB,UIM — splat BE word UIM of XB across XT (XX2-form with the
+  // 2-bit UIM in the low bits of the RA field). Encoding verified against gas
+  // on op4k: `xxspltw vs34,vs35,2` == f0 42 1a 93 (LE), matching op=60,
+  // T=2/TX, UIM=2, B=3/BX, XO=164.
+  void xxspltw(VR t, VR b, uint32_t uim) {
+    assert(uim < 4);
+    Emit32((60u << 26) | (t.idx << 21) | ((uim & 3u) << 16) | (b.idx << 11) |
+           ((164u & 0x1FFu) << 2) | (1u << 1) /*BX*/ | 1u /*TX*/);
+  }
   // Convert (XX2-form, single operand).  TX bit at LE bit 0; AX bit unused; BX at bit 1.
   void EmitXX2(uint32_t vrt, uint32_t vrb, uint32_t xo) {
     Emit32((60u << 26) | (vrt << 21) | (vrb << 11) | ((xo & 0x1FFu) << 2) |
@@ -856,6 +890,17 @@ public:
   void xvrspic(VR t, VR b)   { EmitXX2(t.idx, b.idx, 171); }  // round using FPSCR.RN
   // Scalar DP round-to-integer using current FPSCR.RN rounding mode (banker's by default).
   void xsrdpic(VR t, VR b)   { EmitXX2(t.idx, b.idx, 107); }
+  // Scalar round-to-integral, fixed modes (gas-verified on op4k:
+  // xsrdpim/p/z vs34,vs35 = f04019e7/f04019a7/f0401967). NaN-quiet,
+  // identity for |x| >= 2^52, unlike the fctid/fcfid round trip.
+  void xsrdpim(VR t, VR b)   { EmitXX2(t.idx, b.idx, 121); }  // floor
+  void xsrdpip(VR t, VR b)   { EmitXX2(t.idx, b.idx, 105); }  // ceil
+  void xsrdpiz(VR t, VR b)   { EmitXX2(t.idx, b.idx,  89); }  // trunc
+  // Scalar single<->double converts, non-signalling (bit-preserving for NaN,
+  // ISA 2.07). Operate on dw0 / word 0. gas: xscvspdpn = f0401d2f (XO 331),
+  // xscvdpspn = f0401c2f (XO 267).
+  void xscvspdpn(VR t, VR b) { EmitXX2(t.idx, b.idx, 331); }
+  void xscvdpspn(VR t, VR b) { EmitXX2(t.idx, b.idx, 267); }
   void xvrdpi (VR t, VR b)   { EmitXX2(t.idx, b.idx, 201); }
   void xvrdpip(VR t, VR b)   { EmitXX2(t.idx, b.idx, 233); }
   void xvrdpim(VR t, VR b)   { EmitXX2(t.idx, b.idx, 249); }
@@ -1011,6 +1056,11 @@ public:
   // dword[1] = the 8-byte LE integer at EA+8 — i.e. the DOUBLEWORD-SWAPPED
   // image of what lxvx produces; follow with xxpermdi(v,v,v,2) to fix up.
   void lxvd2x(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 844, 1); }
+  // lxvdsx XT, RA, RB (ISA 2.06): load one doubleword from (RA|0)+RB and splat
+  // it into both doublewords of XT. XO 332, TX=1 for the VMX half of the VSR
+  // file -- checked against GAS: `lxvdsx 32,0,3` assembles to 0x7c001a99 and
+  // `lxvdsx 45,4,5` to 0x7da42a99, both of which this reproduces.
+  void lxvdsx(VR vrt, GPR ra, GPR rb)  { EmitX(31, vrt.idx, ra.idx, rb.idx, 332, 1); }
   // stxvd2x XS,RA,RB — ISA 2.06 (POWER7+) — p.508, XO=972. Store form: writes
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
@@ -1336,7 +1386,7 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       b(offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((18u << 26) | 0u);  // placeholder
     }
   }
@@ -1346,7 +1396,7 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       bl(offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((18u << 26) | 1u);  // placeholder with LK=1
     }
   }
@@ -1380,9 +1430,20 @@ public:
       int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
       bc(cond.BO, cond.BI, offset);
     } else {
-      PendingBranches.push_back({static_cast<int64_t>(Offset), lbl});
+      AddPendingBranch(lbl);
       Emit32((16u << 26) | (cond.BO << 21) | (cond.BI << 16) | 0u);  // placeholder
     }
+  }
+
+  // bdnz target — decrement CTR, branch if CTR != 0 afterwards.
+  // B-form bc with BO=16 ("decrement CTR, branch if CTR != 0, CR bit ignored")
+  // and BI=0 (unused, must still be encoded). Restricted to *bound* (backward)
+  // labels on purpose: every user is a bottom-of-loop back-edge, and keeping it
+  // out of the forward-fixup path means this needs no PendingBranches support.
+  void bdnz(Label* lbl) {
+    assert(lbl->bound && "bdnz requires an already-bound (backward) target");
+    int32_t offset = static_cast<int32_t>(lbl->offset) - static_cast<int32_t>(Offset);
+    bc(16u, 0u, offset);
   }
 
   // blr: branch to link register (return)
@@ -1642,23 +1703,55 @@ private:
   size_t   BufferSize = 0;
   size_t   Offset     = 0;
 
-  // Pending branch list for forward-label fixup
+  // Pending branch list for forward-label fixup.
+  //
+  // This used to be a flat vector scanned linearly by PatchPending(), with a
+  // vector::erase() per matching entry: O(pending) per Bind() and O(pending^2)
+  // per compile unit, plus an O(n) memmove for every fixup resolved. Unity/Mono
+  // app configs run MaxInst=50000 multiblock compile units, where "pending" is
+  // large enough for that quadratic term to show up as compiler CPU time.
+  //
+  // Now it is append-only storage for an intrusive singly-linked list per
+  // Label: Label::pending_head is the index of the label's first fixup and
+  // `next` chains to the rest, so Bind() touches only its own label's fixups
+  // and nothing is ever erased or shifted. Total work per compile unit is
+  // O(number of forward branches).
+  //
+  // LIFECYCLE (unchanged): the vector is append-only *within* a compile unit
+  // and dropped wholesale by ClearPendingBranches(), which CompileCode calls
+  // once at the top of every compilation (JIT.cpp) right after JumpTargets is
+  // cleared and re-resized. Indices are therefore only ever interpreted while
+  // the vector that produced them is still live. Entries for labels that are
+  // never bound are simply dropped by that reset, exactly as before.
   struct PendingBranchEntry {
     int64_t patch_offset;
-    Label*  target;
+    int32_t next;  // index of next fixup for the same label, -1 = end of chain
   };
   std::vector<PendingBranchEntry> PendingBranches;
 
+  // Record a forward-branch fixup at the current Offset against an unbound
+  // label, pushing it onto the front of that label's chain.
+  void AddPendingBranch(Label* lbl) {
+    PendingBranches.push_back({static_cast<int64_t>(Offset), lbl->pending_head});
+    lbl->pending_head = static_cast<int32_t>(PendingBranches.size() - 1);
+  }
+
   void PatchPending(Label* lbl) {
-    for (auto it = PendingBranches.begin(); it != PendingBranches.end(); ) {
-      if (it->target == lbl) {
-        PatchBranchAt(static_cast<size_t>(it->patch_offset),
-                      static_cast<size_t>(lbl->offset));
-        it = PendingBranches.erase(it);
-      } else {
-        ++it;
-      }
+    int32_t idx = lbl->pending_head;
+    while (idx >= 0) {
+      // A head index that outruns the vector means the Label survived a
+      // ClearPendingBranches() (stale label reused across compilations) or was
+      // copied. Both are bugs; catch them here rather than patching a random
+      // offset in the new buffer. Kept out of NDEBUG's reach on purpose.
+      LOGMAN_THROW_A_FMT(static_cast<size_t>(idx) < PendingBranches.size(),
+                         "PPC64 PatchPending: stale pending-branch index {} (size {}); Label reused across compiles?",
+                         idx, PendingBranches.size());
+      const auto& Entry = PendingBranches[static_cast<size_t>(idx)];
+      PatchBranchAt(static_cast<size_t>(Entry.patch_offset),
+                    static_cast<size_t>(lbl->offset));
+      idx = Entry.next;
     }
+    lbl->pending_head = -1;
   }
 
   // -------------------------------------------------------------------------
