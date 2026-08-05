@@ -133,6 +133,7 @@ enum PPC64VConstIndex : uint32_t {
   PPC64_VCONST_I64_MIN,        // splat i64 INT64_MIN
   PPC64_VCONST_PACK_DW_LO_I32, // vperm control: pack each dw's low i32 to LE-low
   PPC64_VCONST_LANE0_MASK_F32, // {~0u,0,0,0} in guest byte order: selects LE elem0 for xxsel
+  PPC64_VCONST_F64_2P31,       // splat f64(2^31)   -- f64->i32 overflow bound (CVTPD2DQ)
   PPC64_VCONST_MAX,
 };
 

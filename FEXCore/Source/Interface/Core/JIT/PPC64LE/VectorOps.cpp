@@ -4903,8 +4903,16 @@ DEF_OP(Vector_F64ToI32) {
   //      bytes of each dw — i.e. for each i64 lane, either preserve all
   //      32 bits of POWER's result word OR substitute INT_MIN.
   //   4. AFTER the substitution, do the existing vperm-pack to LE-low.
-  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P63, TMP1, TMP2);
-  xvcmpgedp(VTMP2, Src, VTMP2);               // per-i64-lane overflow mask
+  // BOUND FIX (2026-08-05): this compared against 2^63 while claiming to be
+  // 2^31 — f64 values in [2^31, 2^63) kept POWER's INT_MAX saturation
+  // instead of x86's 0x80000000 indefinite. The i32 overflow boundary is
+  // 2^31, and the compare uses the ROUNDED value (VTMP1), not Src: an input
+  // like 2^31 - 0.4 rounds up to exactly 2^31 and must also go indefinite.
+  // Negative overflow needs no mask: POWER already saturates to INT_MIN,
+  // which IS the sentinel. NaN: xvcmpgedp returns 0 (unordered), and POWER's
+  // NaN convert is already INT_MIN — correct either way.
+  EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F64_2P31, TMP1, TMP2);
+  xvcmpgedp(VTMP2, VTMP1, VTMP2);             // per-i64-lane overflow mask (rounded src)
   EmitLoadPPC64VConst(VTMP1, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
   xxsel(Dst, Dst, VTMP1, VTMP2);              // mask ? INT_MIN : Dst (per-byte == per-i32-lane here)
 
@@ -5263,6 +5271,8 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     [2 * ::FEXCore::CPU::PPC64_VCONST_I32_MIN  + 1] = 0x8000000080000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 0] = 0x43E0000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P63 + 1] = 0x43E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P31 + 0] = 0x41E0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_2P31 + 1] = 0x41E0000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 0] = 0x8000000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_I64_MIN  + 1] = 0x8000000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_PACK_DW_LO_I32 + 0] = 0x040506070C0D0E0FULL,
