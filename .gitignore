@@ -38,3 +38,4 @@ docs/local/
 
 # Local research/investigation notes — never tracked (see git log for why)
 notes/
+unittests/seccomp/seccomp_bpf_filters
