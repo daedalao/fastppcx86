@@ -276,7 +276,7 @@ void PPC64Dispatcher::EmitDispatcher() {
     int32_t l1mask_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.L1Mask));
 
     ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
-    if (!CTX->Config.DynamicL1Cache()) {
+    if (!FEXCore::Config::Get_DYNAMICL1CACHE()) {
       // Static L1 (the port default): the mask is an emit-time constant, so
       // the whole (RIP << 4) & L1Mask collapses into one rldic — rotate left
       // by 4 and keep bits [4, log2(entries)+4), which is exactly

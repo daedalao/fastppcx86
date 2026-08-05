@@ -199,7 +199,7 @@ DEF_OP(ExitFunction) {
   auto MissLabel = PPC64Emitter::Label{};
 
   ld(TMP2, l1_off, STATE);       // TMP2 = L1Pointer
-  if (!CTX->Config.DynamicL1Cache()) {
+  if (!FEXCore::Config::Get_DYNAMICL1CACHE()) {
     // Static L1: constant-mask probe, one rldic instead of L1Mask load +
     // sldi + and_. Same derivation as the dispatcher's DispatcherLoopTop.
     static_assert((FEXCore::LookupCache::MAX_L1_ENTRIES & (FEXCore::LookupCache::MAX_L1_ENTRIES - 1)) == 0,
