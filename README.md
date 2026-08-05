@@ -23,9 +23,8 @@ distributed under the same MIT license — see [`LICENSE`](LICENSE), which is un
 This is a permanent fork with no plan to merge back. The PPC64LE backend, the memory-model work
 and the SMC subsystem diverge deliberately from how upstream solves the same problems on ARM64.
 The upstream README is preserved verbatim as [`README.upstream.md`](README.upstream.md) (with its
-translation [`docs/Readme_CN.md`](docs/Readme_CN.md)) and is not maintained here; an earlier README
-of this port is kept as [`docs/README.history.md`](docs/README.history.md). Everything else in
-`docs/` describes *this* project.
+translation [`docs/Readme_CN.md`](docs/Readme_CN.md)) and is not maintained here. Everything else
+in `docs/` describes *this* project.
 
 **Binaries and environment variables keep the historical `FEX` prefix** — the programs are still
 called `FEX`, `FEXBash`, `FEXServer`, `FEXRootFSFetcher`, config keys are unchanged, and every
@@ -57,8 +56,7 @@ Notable CMake options (see top-level `CMakeLists.txt` for the full list):
 x86_64/x86 guest-side stub libraries (`libGL-guest.so`, `libvulkan-guest.so`, etc., when
 `BUILD_THUNKS`/`BUILD_THUNKS_32BIT` are enabled) are cross-compiled for the guest architecture and
 need an x86 toolchain and sysroot; see `Data/CMake/toolchain_x86_64.cmake` and
-`ThunkLibs/GuestLibs/CMakeLists.txt`. `docs/BUILD_CONFIG.md` records one project's known-good
-thunk/toolchain configuration in more detail.
+`ThunkLibs/GuestLibs/CMakeLists.txt`.
 
 ## Configuration
 
@@ -108,11 +106,10 @@ taskset -c 0-1,8-9,16-17,24-25,32-33,40-41,48-49,56-57 FEX <game>
   block linking; `strict`/`off` keep linking. Profile before assuming — a flat guest profile means
   raw throughput, not recipe overhead, is the limit.
 - `SpinLoopClampAuto=1` short-circuits recognized library spin-wait loops — no longer needed for
-  correctness anywhere (see docs/MONO_UNITY_CENSUS.md), but measurable as a perf opt-in.
+  correctness anywhere, but measurable as a perf opt-in.
 
 [`docs/GAMING.md`](docs/GAMING.md) is the full launch guide — prerequisites, launch shapes, SMC
-recipes, Steam, and where the logs actually go. Per-title verdicts live in
-[`docs/MONO_UNITY_CENSUS.md`](docs/MONO_UNITY_CENSUS.md).
+recipes, Steam, and where the logs actually go.
 
 ## Flags reference
 

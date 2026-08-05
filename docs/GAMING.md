@@ -2,8 +2,7 @@
 
 This is the practical guide: what a POWER8/POWER9 box needs before it can run an x86 game, what a
 launch command should look like, which knobs are worth setting per title, and where the output
-goes when something breaks. Flag semantics are in the [flags reference](../README.md#flags-reference);
-per-title verdicts are in [MONO_UNITY_CENSUS.md](MONO_UNITY_CENSUS.md).
+goes when something breaks. Flag semantics are in the [flags reference](../README.md#flags-reference).
 
 Binaries and environment variables keep the historical `FEX` prefix. `FEX` is the emulator,
 `FEXBash` runs a shell inside the guest rootfs, `FEXServer` is the background helper that owns the

@@ -35,3 +35,6 @@ mono_crash.*
 # Local-only: discovery, designs, adversarial reviews, raw agent output.
 # Verified conclusions get lifted into POWER9_PORT_PLAN.md, which IS tracked.
 docs/local/
+
+# Local research/investigation notes — never tracked (see git log for why)
+notes/
