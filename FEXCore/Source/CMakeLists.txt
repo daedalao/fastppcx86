@@ -34,35 +34,18 @@ set(SRCS
   Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
   Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp)
 
-if (ARCHITECTURE_ppc64le)
-  # PPC64LE JIT backend — replaces ARM64 JIT and Dispatcher
-  list(APPEND SRCS
-    Interface/Core/ArchHelpers/PPC64Emitter.cpp
-    Interface/Core/JIT/PPC64LE/JIT.cpp
-    Interface/Core/JIT/PPC64LE/ALUOps.cpp
-    Interface/Core/JIT/PPC64LE/AtomicOps.cpp
-    Interface/Core/JIT/PPC64LE/BranchOps.cpp
-    Interface/Core/JIT/PPC64LE/MemoryOps.cpp
-    Interface/Core/JIT/PPC64LE/VectorOps.cpp
-    Interface/Core/JIT/PPC64LE/X87Ops.cpp
-    Interface/Core/JIT/PPC64LE/PPC64Dispatcher.cpp)
-else()
-  # ARM64 JIT backend (default)
-  list(APPEND SRCS
-    Interface/Core/ArchHelpers/Arm64Emitter.cpp
-    Interface/Core/Dispatcher/Dispatcher.cpp
-    Interface/Core/JIT/JIT.cpp
-    Interface/Core/JIT/ALUOps.cpp
-    Interface/Core/JIT/AtomicOps.cpp
-    Interface/Core/JIT/BranchOps.cpp
-    Interface/Core/JIT/ConversionOps.cpp
-    Interface/Core/JIT/EncryptionOps.cpp
-    Interface/Core/JIT/MemoryOps.cpp
-    Interface/Core/JIT/MiscOps.cpp
-    Interface/Core/JIT/MoveOps.cpp
-    Interface/Core/JIT/VectorOps.cpp
-    Interface/Core/JIT/Arm64Relocations.cpp)
-endif()
+# PPC64LE JIT backend. This fork targets PPC64LE hosts only; the ARM64 JIT
+# and its Dispatcher have been removed.
+list(APPEND SRCS
+  Interface/Core/ArchHelpers/PPC64Emitter.cpp
+  Interface/Core/JIT/PPC64LE/JIT.cpp
+  Interface/Core/JIT/PPC64LE/ALUOps.cpp
+  Interface/Core/JIT/PPC64LE/AtomicOps.cpp
+  Interface/Core/JIT/PPC64LE/BranchOps.cpp
+  Interface/Core/JIT/PPC64LE/MemoryOps.cpp
+  Interface/Core/JIT/PPC64LE/VectorOps.cpp
+  Interface/Core/JIT/PPC64LE/X87Ops.cpp
+  Interface/Core/JIT/PPC64LE/PPC64Dispatcher.cpp)
 
 list(APPEND SRCS
   Interface/Core/X86Tables/BaseTables.cpp
@@ -89,9 +72,7 @@ list(APPEND SRCS
   Utils/Threads.cpp
   Utils/Profiler.cpp)
 
-if (ARCHITECTURE_arm64)
-  list(APPEND SRCS Utils/ArchHelpers/Arm64.cpp)
-elseif (ARCHITECTURE_ppc64le)
+if (ARCHITECTURE_ppc64le)
   # PPC64LE uses its own atomic helpers; no Arm64 stubs needed
   # (stubs would pull in ARM-specific headers).
   # PPC64.cpp provides the SIGBUS / split-lock emulation infrastructure

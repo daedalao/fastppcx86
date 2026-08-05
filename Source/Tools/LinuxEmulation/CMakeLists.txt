@@ -4,7 +4,6 @@ add_compile_options(-fno-operator-names)
 add_library(LinuxEmulation STATIC
   VDSO_Emulation.cpp
   Thunks.cpp
-  ArchHelpers/MContext.cpp
   GdbServer/Info.cpp
   LinuxSyscalls/GdbServer.cpp
   LinuxSyscalls/EmulatedFiles/EmulatedFiles.cpp

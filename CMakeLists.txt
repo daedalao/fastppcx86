@@ -505,37 +505,9 @@ if (NOT TUNE_ARCH STREQUAL "generic")
 endif()
 
 if (TUNE_CPU STREQUAL "native")
-  if(ARCHITECTURE_arm64)
-    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 999999.0)
-      # Clang 12.0 fixed the -mcpu=native bug with mixed big.little implementers
-      # Clang can not currently check for native Apple M1 type in hypervisor. Currently disabled
-      check_cxx_compiler_flag("-mcpu=native" COMPILER_SUPPORTS_CPU_TYPE)
-      if(COMPILER_SUPPORTS_CPU_TYPE)
-        list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=native")
-      endif()
-    else()
-      execute_process(COMMAND python3 "${PROJECT_SOURCE_DIR}/Scripts/aarch64_fit_native.py" "/proc/cpuinfo" "${CMAKE_CXX_COMPILER_VERSION}"
-        OUTPUT_VARIABLE AARCH64_CPU)
-
-      string(STRIP ${AARCH64_CPU} AARCH64_CPU)
-
-      execute_process(COMMAND python3 "${PROJECT_SOURCE_DIR}/Scripts/NeedDisabledSVE.py"
-        RESULT_VARIABLE NEEDS_SVE_DISABLED)
-      if (NEEDS_SVE_DISABLED)
-        message(STATUS "Platform has bugged SVE. Disabling")
-        set(AARCH64_CPU "cortex-a78")
-      endif()
-
-      check_cxx_compiler_flag("-mcpu=${AARCH64_CPU}" COMPILER_SUPPORTS_CPU_TYPE)
-      if(COMPILER_SUPPORTS_CPU_TYPE)
-        list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=${AARCH64_CPU}")
-      endif()
-    endif()
-  else()
-    check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-    if(COMPILER_SUPPORTS_MARCH_NATIVE)
-      list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=native")
-    endif()
+  check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+  if(COMPILER_SUPPORTS_MARCH_NATIVE)
+    list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=native")
   endif()
 elseif (NOT TUNE_CPU STREQUAL "none")
   check_cxx_compiler_flag("-mcpu=${TUNE_CPU}" COMPILER_SUPPORTS_CPU_TYPE)

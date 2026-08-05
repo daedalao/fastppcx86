@@ -50,9 +50,7 @@ static inline mcontext_t* GetMContext(void* ucontext) {
 // ---------------------------------------------------------------------------
 // Per-architecture implementations
 // ---------------------------------------------------------------------------
-#if defined(ARCHITECTURE_arm64)
-#  include "MContext_arm64.h"
-#elif defined(ARCHITECTURE_ppc64le)
+#if defined(ARCHITECTURE_ppc64le)
 #  include "MContext_ppc64le.h"
 #elif defined(ARCHITECTURE_x86_64)
 #  include "MContext_x86_64.h"

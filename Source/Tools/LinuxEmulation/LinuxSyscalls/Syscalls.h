@@ -47,9 +47,6 @@ $end_info$
 #include <list>
 #ifdef ARCHITECTURE_x86_64
 #define SYSCALL_ARCH_NAME x64
-#elif defined(ARCHITECTURE_arm64)
-#include "LinuxSyscalls/Arm64/SyscallsEnum.h"
-#define SYSCALL_ARCH_NAME Arm64
 #elif defined(ARCHITECTURE_ppc64le)
 #include "LinuxSyscalls/PPC64LE/SyscallsEnum.h"
 #define SYSCALL_ARCH_NAME PPC64LE
@@ -973,8 +970,6 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
 // open(2) flag remapping — implementation is per-arch, in FlagRemapping.h
 #if defined(ARCHITECTURE_x86_64)
 #  include "LinuxSyscalls/x64/FlagRemapping.h"
-#elif defined(ARCHITECTURE_arm64)
-#  include "LinuxSyscalls/Arm64/FlagRemapping.h"
 #elif defined(ARCHITECTURE_ppc64le)
 #  include "LinuxSyscalls/PPC64LE/FlagRemapping.h"
 #else
