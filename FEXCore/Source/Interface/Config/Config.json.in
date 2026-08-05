@@ -799,6 +799,14 @@
           "Default on: cleared by the 2026-08-03 real-workload regression set (probe_thread_spawn 0/30 + 0/30, ctest 7024/7024, Factorio oil-refinery ×5, FTL, stress-ng, OpenSSL 128-thread 162/162, Dex, Steam-in-Proton), all run with FEX_BLOCKLINKING=1 for the entire cycle."
         ]
       },
+      "ShadowRetStack": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "PPC64LE (EXPERIMENTAL, default OFF): maintain a per-thread shadow return-address stack. A guest CALL exit pushes {guest-return-RIP, host-trampoline} and a guest RET exit pops it, taking a direct branch to the recorded host code when the popped guest RIP matches the RET target -- skipping the inlined L1 probe on the hot call/ret path. A mismatch, an empty/overflowed stack, or any invalidation falls back to the L1 probe, which is the correctness net.",
+          "Reuses the existing frontend-owned call-ret stack allocation and CPUState.callret_sp. Every code-buffer rotation/invalidation zeroes the stack (VirtualDontNeed), so a stale host trampoline can never be reached. Forced OFF under FEX_SMCLAZYINVAL unless FEX_SMCLAZYLINK is also set (same same-thread stale-hole reasoning as BlockLinking): the RET fast path skips ExitFunctionLink's drain, and only the LAZYLINK InterruptFaultPage poke at the return block's entry re-closes that window."
+        ]
+      },
       "KernelUnalignedAtomicBackpatching": {
         "Type": "bool",
         "Default": "true",

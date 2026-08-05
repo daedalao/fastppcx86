@@ -2321,6 +2321,32 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
                       "same-thread drains ride the InterruptFaultPage poke.");
   }
 
+  // Shadow return stack (FEX_SHADOWRETSTACK). Read once here, mirroring
+  // BlockLinkingEnabled. Independent of code caching and of SMCSemanticPatch:
+  //  * Code caching: the pushed host trampoline is discovered at RUNTIME via
+  //    bcl/mflr (position-independent) and lives only in the per-thread
+  //    call-ret stack, never serialized into the code stream; a reloaded cache
+  //    zeroes the stack (CodeCache.cpp). So unlike BlockLinking's absolute-
+  //    address thunk records, nothing here is base-sensitive.
+  //  * SMCSemanticPatch rewrites a block's exit-RIP window in place; a RET has
+  //    no constant exit window to patch, and the fast path delivers control to
+  //    the return block's ENTRY, where its (possibly patched) body runs
+  //    normally -- nothing is bypassed that the patch depends on.
+  // The ONE lazy-SMC hole is identical to BlockLinking's: the RET fast path
+  // skips ExitFunctionLink's drain, so under FEX_SMCLAZYINVAL a same-thread
+  // writer's next dispatch would not drain -- UNLESS FEX_SMCLAZYLINK arms the
+  // InterruptFaultPage poke that the shadow arrival also runs at the return
+  // block entry (EmitSuspendInterruptCheck below). Force off otherwise. This
+  // also covers ScrubThreadLookupCacheForLazySMC deliberately not zeroing the
+  // call-ret stack: it only runs as part of the LAZYINVAL soundness machinery,
+  // exactly the configuration this interlock gates.
+  ShadowRetStackEnabled = CTX->Config.ShadowRetStack();
+  if (ShadowRetStackEnabled && FEXCore::Config::Get_SMCLAZYINVAL() && !LazyLinkArmed) {
+    LogMan::Msg::IFmt("ShadowRetStack disabled: incompatible with FEX_SMCLAZYINVAL without FEX_SMCLAZYLINK "
+                      "(the RET fast path skips ExitFunctionLink's same-thread drain).");
+    ShadowRetStackEnabled = false;
+  }
+
   // Resolve the exit-RIP constant width ONCE, at backend construction, from
   // the same config sources and with the same "read once" assumption as
   // BlockLinkingEnabled above.
@@ -2418,6 +2444,13 @@ void PPC64JITCore::ClearCache() {
   auto PrevCodeBuffer = CurrentCodeBuffer;
   auto lk = PrevCodeBuffer->LookupCache->AcquireWriteLock();
   GetEmptyCodeBuffer();
+  // Rotate to a fresh code buffer: any shadow-return entry whose host
+  // trampoline lived in PrevCodeBuffer is now stale (the buffer may be reused),
+  // so zero the per-thread call-ret stack alongside the mapping swap. Mirrors
+  // the CheckCodeBufferUpdate handshake in CompileCode; a no-op when the
+  // feature is off (the stack is never written). See the invalidation
+  // discussion there.
+  Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
   ThreadState->LookupCache->ChangeGuestToHostMapping(*PrevCodeBuffer, *CurrentCodeBuffer->LookupCache, lk);
 }
 
@@ -3030,13 +3063,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // (JIT/JIT.cpp:1085); it matters more here because PPC64 emits directly into
   // the shared buffer rather than staging per-thread.
   //
-  // Wipe CallRetStack alongside the code-buffer rotation. The current PPC64LE
-  // backend does not push/pop the call-return predictor stack, so this is a
-  // no-op today; landing it here now preserves the ordering invariant for
-  // when a future shadow return stack starts using it — stale entries in
-  // the per-thread callret stack must never survive a code-buffer rotation
-  // because their embedded HostPC values reference memory that is about to
-  // be reused. Mirrors JIT/JIT.cpp:1086.
+  // Wipe CallRetStack alongside the code-buffer rotation. When
+  // FEX_SHADOWRETSTACK is on, the per-thread call-ret stack holds host
+  // trampoline pointers into the OUTGOING buffer; those must never survive a
+  // rotation, because the buffer memory is about to be reused and a later RET
+  // would fast-path into recycled code. Zeroing self-heals: a zero guest-RIP
+  // slot never matches, so every pop falls back to the L1 probe. Cheap and
+  // unconditional (a no-op when the feature is off, since the stack is empty).
+  // Mirrors JIT/JIT.cpp:1086.
   if (auto Prev = CheckCodeBufferUpdate()) {
     Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
     auto CacheLock = ThreadState->LookupCache->AcquireWriteLock();
@@ -3169,6 +3203,16 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   uint32_t NumBlocks = IRView->GetHeader()->BlockCount;
   JumpTargets.clear();
   JumpTargets.resize(NumBlocks, {});
+
+  // Shadow-return entry labels: one per block, indexed by IROp_CodeBlock::ID,
+  // same as JumpTargets. Sized (once, here, before any op emits) only when the
+  // feature is on so the default path never touches this vector. Element
+  // addresses are stable for the rest of CompileCode, which the Call push's
+  // pending forward branch to CallReturnEntryLabels[id] relies on.
+  CallReturnEntryLabels.clear();
+  if (ShadowRetStackEnabled) {
+    CallReturnEntryLabels.resize(NumBlocks, {});
+  }
 
   // Belt-and-suspenders: any pending forward-branch fixups left over from a
   // prior compilation (which would also be a bug) point into a buffer that
@@ -3333,6 +3377,17 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     if (BlockIROp->EntryPoint) {
       uint64_t GuestEntry = Entry + BlockIROp->GuestEntryOffset;
       CodeData.EntryPoints[GuestEntry] = GetCursorAddress<uint8_t*>();
+      // Shadow-return fast-path entry: bind this block's CallReturnEntryLabels
+      // slot at the SAME cursor a dispatcher L1 hit lands on (this EntryPoints
+      // value), i.e. BEFORE EmitStoreBlockBeginToInlineHeader / the suspend
+      // poke / the stdu below. A shadow RET that matched then behaves exactly
+      // like an L1 hit into this block, including running the deferred-signal
+      // poke (which is what keeps the lazy-SMC interlock sound). All real
+      // call-return targets are EntryPoints, so every label a Call push
+      // referenced is bound here. Binding blocks no push referenced is a no-op.
+      if (ShadowRetStackEnabled) {
+        Bind(&CallReturnEntryLabels[BlockIROp->ID]);
+      }
       // Seed the RIP-entry table with this entry-point's guest offset. Mirrors
       // Arm64JITCore's push_back at JIT/JIT.cpp:939 — HostPCOffset here points
       // at the entry-point prologue's first byte, which is what a signal fault

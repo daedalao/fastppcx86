@@ -739,20 +739,166 @@ VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipeline
 
 #endif
 
+// Single-source list of custom_host_impl functions whose ONLY safe caller is
+// their fexfn_impl_* wrapper because the wrapper DEFUSES a guest function
+// pointer the application always supplies (a debug-callback pointer inside the
+// create-info struct).  A name resolved via vkGetInstanceProcAddr /
+// vkGetDeviceProcAddr never reaches its fexfn_impl_* wrapper unless it is
+// returned from LookupCustomVulkanFunction below: MakeGuestCallable (Guest.cpp)
+// links the returned host address to a signature-generic invoker
+// (GetCallerForHostFunction -> CallHostFunction<fexthunks_invoke_callback<Sig>>),
+// which lands on the host at GuestWrapperForHostFunction<Sig>::Call and branches
+// straight to whatever host address procaddr returned.  If that address is the
+// raw driver entry (the default LDR_PTR return), the guest's pfn*Callback is
+// passed through verbatim; native libvulkan then invokes a guest VA as host
+// code and SEGVs the first time a debug message fires.  These two entry points
+// are extension functions resolved exclusively via vkGetInstanceProcAddr, so
+// the bypass is the common path, not the exception.  Same hazard class the
+// vkCreateInstance impl already handles for the pNext-embedded callback.
+//
+// INVARIANT: every custom_host_impl that defuses or repacks a guest pointer the
+// generic GuestWrapperForHostFunction path would pass verbatim MUST be listed
+// here (or in the explicit branches below) or it is unreachable via GIPA/GDPA.
+// This cannot be asserted at compile time from this translation unit (the set
+// of custom_host_impl configs lives in libvulkan_interface.cpp / thunkgen and
+// is not visible here), so it is enforced by review against that file.
+#define FEX_VULKAN_CALLBACK_DEFUSING_IMPLS(X) \
+  X(vkCreateDebugReportCallbackEXT)           \
+  X(vkCreateDebugUtilsMessengerEXT)
+
+// Second, larger member of the same hazard class as the callback-defusing list
+// above: custom_host_impl functions whose fexfn_impl_* wrapper exists SOLELY to
+// force pAllocator = nullptr before forwarding to native libvulkan.
+//
+// VkAllocationCallbacks is an opaque_type embedding five GUEST function pointers
+// (pfnAllocation, pfnReallocation, pfnFree, pfnInternalAllocation,
+// pfnInternalFree).  If the guest supplies a custom allocator and the struct is
+// passed through verbatim, the native driver interprets those guest VAs as host
+// code and SEGVs the instant it allocates.  The wrappers below defuse that by
+// substituting nullptr (native default allocator).
+//
+// As with the callback-defusing list, a name resolved via
+// vkGetInstanceProcAddr / vkGetDeviceProcAddr NEVER reaches its fexfn_impl_*
+// wrapper unless LookupCustomVulkanFunction returns it (MakeGuestCallable links
+// the returned host address to the signature-generic
+// GuestWrapperForHostFunction<Sig>::Call, which branches straight to whatever
+// host address procaddr returned -- the raw driver entry by default).  Since
+// volk / layers / most engines resolve every entry point via GIPA/GDPA, that
+// bypass is the COMMON path.  The bug is latent only because most applications
+// pass pAllocator = nullptr, making both paths agree; any app with a custom
+// allocator crashes.  Routing every wrapper through this table closes that.
+//
+// INVARIANT: every allocator-nulling custom_host_impl MUST appear here or it is
+// unreachable via GIPA/GDPA.  This is the single source of truth for the family
+// -- the plain-name branches in LookupCustomVulkanFunction below intentionally
+// no longer duplicate any allocator-nulling entry.
+//
+// A generator-side auto-population was evaluated and rejected for the same
+// reason documented in libGL_Host.cpp (FEX_LIBGL_RELOCATING_IMPLS): the thunk
+// generator sees only the syntactic `custom_host_impl` flag, not the semantic
+// reason a wrapper exists, so it cannot distinguish an allocator-nulling /
+// pointer-defusing wrapper (which MUST be procaddr-routed) from a pure
+// array-repacking wrapper or a custom_guest_entrypoint resolver such as
+// vkGetInstanceProcAddr itself (which must NOT be).  The impl-body
+// `#ifndef IS_32BIT_THUNK` guards further live in this .cpp, invisible to the
+// generator's interface-only parse.  This X-macro coupling gives the same
+// "cannot add the impl without registering it" guarantee locally.
+//
+// NOTE: the debug-callback creators are deliberately absent here -- they null
+// pAllocator too, but are already covered by FEX_VULKAN_CALLBACK_DEFUSING_IMPLS
+// above; listing them twice would be redundant (first match wins regardless).
+
+// Wrappers defined unconditionally (both 32-bit and 64-bit thunk builds).
+#define FEX_VULKAN_ALLOCATOR_NULLING_IMPLS(X) \
+  X(vkCreateShaderModule)                     \
+  X(vkCreateInstance)                         \
+  X(vkCreateDevice)                           \
+  X(vkAllocateMemory)                         \
+  X(vkFreeMemory)                             \
+  X(vkCreateBuffer)                           \
+  X(vkDestroyBuffer)                          \
+  X(vkCreateBufferView)                       \
+  X(vkDestroyBufferView)                      \
+  X(vkCreateImage)                            \
+  X(vkDestroyImage)                           \
+  X(vkCreateImageView)                        \
+  X(vkDestroyImageView)                       \
+  X(vkCreatePipelineCache)                    \
+  X(vkDestroyPipelineCache)                   \
+  X(vkCreateGraphicsPipelines)                \
+  X(vkDestroyPipeline)                        \
+  X(vkCreatePipelineLayout)                   \
+  X(vkDestroyPipelineLayout)                  \
+  X(vkCreateSampler)                          \
+  X(vkDestroySampler)                         \
+  X(vkCreateDescriptorSetLayout)              \
+  X(vkDestroyDescriptorSetLayout)             \
+  X(vkCreateDescriptorPool)                   \
+  X(vkDestroyDescriptorPool)                  \
+  X(vkCreateSemaphore)                        \
+  X(vkDestroySemaphore)                       \
+  X(vkCreateFence)                            \
+  X(vkDestroyFence)                           \
+  X(vkCreateFramebuffer)                      \
+  X(vkDestroyFramebuffer)                     \
+  X(vkCreateRenderPass)                       \
+  X(vkDestroyRenderPass)                      \
+  X(vkCreateRenderPass2)                      \
+  X(vkCreateRenderPass2KHR)                   \
+  X(vkCreateCommandPool)                      \
+  X(vkDestroyCommandPool)                     \
+  X(vkCreateSwapchainKHR)                     \
+  X(vkDestroySwapchainKHR)                    \
+  X(vkDestroyInstance)                        \
+  X(vkDestroyDevice)                          \
+  X(vkDestroyShaderModule)                    \
+  X(vkDestroySurfaceKHR)                      \
+  X(vkCreateDescriptorUpdateTemplate)         \
+  X(vkDestroyDescriptorUpdateTemplate)        \
+  X(vkCreateDescriptorUpdateTemplateKHR)      \
+  X(vkDestroyDescriptorUpdateTemplateKHR)     \
+  X(vkDestroyDebugReportCallbackEXT)          \
+  X(vkDestroyDebugUtilsMessengerEXT)
+
+// Wrappers whose fexfn_impl_* definitions are compiled only in the 64-bit thunk
+// (their impl bodies sit inside `#ifndef IS_32BIT_THUNK` blocks in this file).
+// Referencing them from a 32-bit build would be an undefined-symbol error, so
+// they are expanded only under the same guard below.
+#define FEX_VULKAN_ALLOCATOR_NULLING_IMPLS_64BIT(X) \
+  X(vkCreateComputePipelines)                       \
+  X(vkCreateEvent)                                  \
+  X(vkDestroyEvent)                                 \
+  X(vkCreateQueryPool)                              \
+  X(vkDestroyQueryPool)                             \
+  X(vkCreateDisplayPlaneSurfaceKHR)                 \
+  X(vkCreateDisplayModeKHR)                         \
+  X(vkCreateHeadlessSurfaceEXT)                     \
+  X(vkCreatePrivateDataSlot)                        \
+  X(vkDestroyPrivateDataSlot)                       \
+  X(vkCreatePrivateDataSlotEXT)                     \
+  X(vkDestroyPrivateDataSlotEXT)                    \
+  X(vkCreateSamplerYcbcrConversion)                 \
+  X(vkDestroySamplerYcbcrConversion)                \
+  X(vkCreateSamplerYcbcrConversionKHR)              \
+  X(vkDestroySamplerYcbcrConversionKHR)             \
+  X(vkCreateValidationCacheEXT)                     \
+  X(vkDestroyValidationCacheEXT)
+
 static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   using namespace std::string_view_literals;
 
-  if (a_1 == "vkCreateShaderModule"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateShaderModule;
-  } else if (a_1 == "vkCreateInstance"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateInstance;
-  } else if (a_1 == "vkCreateDevice"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDevice;
-  } else if (a_1 == "vkAllocateMemory"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateMemory;
-  } else if (a_1 == "vkFreeMemory"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;
-  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {
+#define FEX_VULKAN_PROCADDR_CASE(name)                      \
+  if (a_1 == std::string_view {#name}) {                    \
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_##name; \
+  }
+  FEX_VULKAN_CALLBACK_DEFUSING_IMPLS(FEX_VULKAN_PROCADDR_CASE)
+  FEX_VULKAN_ALLOCATOR_NULLING_IMPLS(FEX_VULKAN_PROCADDR_CASE)
+#ifndef IS_32BIT_THUNK
+  FEX_VULKAN_ALLOCATOR_NULLING_IMPLS_64BIT(FEX_VULKAN_PROCADDR_CASE)
+#endif
+#undef FEX_VULKAN_PROCADDR_CASE
+
+  if (a_1 == "vkAcquireXlibDisplayEXT"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT;
   } else if (a_1 == "vkGetRandROutputDisplayEXT"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetRandROutputDisplayEXT;

@@ -214,6 +214,75 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
       const auto modulo_i = (i + CurrentOffset) % 8;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
     }
+  } else {
+    // ---- Handler general-purpose register writeback (RIP unchanged) --------
+    // x86-64 semantics: a signal handler may mutate the interrupted context's
+    // integer registers through uc_mcontext.gregs[], and those edits MUST
+    // persist across rt_sigreturn even when the handler leaves RIP alone (how
+    // GC/JIT/green-thread runtimes fix up a thread from a signal). The block
+    // above only republished the GPRs when RIP *also* changed, so a handler
+    // that touched only e.g. R15 had its write silently dropped: in-JIT
+    // deliveries resumed mid-block straight from the restored host SRA register
+    // file, and in-syscall deliveries let the syscall op's tail FillStaticRegs
+    // reload the *unmodified* frame. See tests/signal/greg_mutation.64.cpp.
+    //
+    // Detect any GPR edit against the pre-signal snapshot (Context->GuestState,
+    // which is exactly what SetupFrame_x64 handed the handler) and, if found,
+    // republish all 16 GPRs into guest state. Scope is deliberately the integer
+    // file only -- segment/EFLAGS/XMM/x87 handler edits on the RIP-unchanged
+    // fast path remain a pre-existing gap and are intentionally left untouched
+    // here to keep the change minimal.
+#define DIFF_REG(x) \
+  (guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_##x] != Context->GuestState.gregs[FEXCore::X86State::REG_##x])
+    const bool GregsMutated = DIFF_REG(R8) || DIFF_REG(R9) || DIFF_REG(R10) || DIFF_REG(R11) || DIFF_REG(R12) || DIFF_REG(R13) ||
+                              DIFF_REG(R14) || DIFF_REG(R15) || DIFF_REG(RDI) || DIFF_REG(RSI) || DIFF_REG(RBP) || DIFF_REG(RBX) ||
+                              DIFF_REG(RDX) || DIFF_REG(RAX) || DIFF_REG(RCX) || DIFF_REG(RSP);
+#undef DIFF_REG
+
+    if (GregsMutated) {
+#define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_##x];
+      COPY_REG(R8);
+      COPY_REG(R9);
+      COPY_REG(R10);
+      COPY_REG(R11);
+      COPY_REG(R12);
+      COPY_REG(R13);
+      COPY_REG(R14);
+      COPY_REG(R15);
+      COPY_REG(RDI);
+      COPY_REG(RSI);
+      COPY_REG(RBP);
+      COPY_REG(RBX);
+      COPY_REG(RDX);
+      COPY_REG(RAX);
+      COPY_REG(RCX);
+      COPY_REG(RSP);
+#undef COPY_REG
+
+      // Whether the State writeback above is enough depends on how execution
+      // resumes:
+      //   * outside-JIT delivery (blocked in a host syscall, or parked in the
+      //     dispatcher): a full FillStaticRegs is already pending before the
+      //     guest reads these registers -- the JIT syscall op's tail reload, or
+      //     the next block-entry fill -- so State is authoritative. No redirect.
+      //   * in-JIT delivery inside the syscall-op window (InSyscallInfo != 0):
+      //     same -- the syscall op tail runs an unconditional full FillStaticRegs
+      //     that reloads all 16 GPRs from State. No redirect (redirecting here
+      //     would re-enter the block at the syscall RIP and re-run the syscall).
+      //   * in-JIT delivery in plain compute (InSyscallInfo == 0): resume is
+      //     mid-block from the restored host SRA registers with no intervening
+      //     fill, so the State writeback alone would be invisible. Route resume
+      //     through the dispatcher's FillSRA entry instead. RIP is unchanged and
+      //     in-JIT deliveries reconstruct State.rip to the exact interrupted
+      //     instruction, so re-entry resumes precisely there with State reloaded.
+      const bool InJIT = (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) != 0;
+      if (InJIT && Context->InSyscallInfo == 0) {
+        Frame->InSyscallInfo = Context->InSyscallInfo;
+        ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+        ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
+        ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+      }
+    }
   }
 }
 
