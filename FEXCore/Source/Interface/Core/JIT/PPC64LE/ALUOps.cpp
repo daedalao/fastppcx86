@@ -1872,13 +1872,24 @@ DEF_OP(Adc) {
   auto S1  = GetReg(Op->Src1);
   auto S2  = GetReg(Op->Src2);
   // CFInverted=true: stored XER.CA = !x86_CF. PPC `adde` would inject !x86_CF
-  // as the carry-in, producing a result that is off by one. Compute manually
-  // without disturbing XER.
-  mfspr(TMP1, 1);
-  rldicl(TMP2, TMP1, 64 - 29, 63);  // TMP2 = stored_CA in LSB
-  xori(TMP2, TMP2, 1);                // TMP2 = x86_CF in LSB
+  // as the carry-in, producing a result that is off by one. Materialise the
+  // carry instead, without disturbing XER.
+  //
+  // `subfe rT, r0, r0` = ~r0 + r0 + CA. With the JIT's r0 == 0 invariant that
+  // is 0xFFFF_FFFF_FFFF_FFFF + 0 + CA, i.e.
+  //     CA = 1  ->  rT =  0
+  //     CA = 0  ->  rT = -1
+  // so rT == -(!CA) == -x86_CF for this op's CFInverted=true convention.
+  // (The identity actually holds for any r0 value: ~x + x is all-ones.)
+  // Its carry-out is 1 iff CA was 1, so XER.CA is left exactly as found;
+  // OE = 0 and Rc = 0, so OV/SO/CR0 are untouched too — which matters here
+  // because _Adc is a value-only op that must not perturb flags.
+  //
+  // Dst = S1 + S2 + x86_CF = (S1 + S2) - (-x86_CF), so the third addend
+  // folds into a subf instead of an add.
+  subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
   add(TMP3, S1, S2);
-  add(Dst, TMP3, TMP2);
+  subf(Dst, TMP2, TMP3);      // subf RT,RA,RB = RB - RA = (S1+S2) + x86_CF
 }
 
 DEF_OP(Sbb) {
@@ -1903,13 +1914,17 @@ DEF_OP(AdcWithFlags) {
 
   // i32Bit: zero-extend, do a 64-bit add with x86_CF as the third addend, take
   // bit-32 as x86_CF_out, store directly (CFInverted=false convention).
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);          // TMP4 = stored CA = x86_CF
-
+  //
+  // Because the convention here is DIRECT (stored XER.CA == x86_CF, see the
+  // i64 comment above), the carry-in needs no flip and `adde` injects exactly
+  // the right bit — no mfspr/rldicl extraction, no separate add for it.
+  // Both addends are zero-extended 32-bit values, so the sum is at most
+  // 2*(2^32 - 1) + 1 < 2^33: adde's own CA-out (the carry at bit 63) is always
+  // 0. Clobbering XER.CA here is harmless regardless — the tail below rewrites
+  // CA and OV wholesale and only reads XER for the sticky SO.
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
-  add(TMP3, TMP1, TMP2);
-  add(TMP3, TMP3, TMP4);                    // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
+  adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
   rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
 
@@ -1988,11 +2003,14 @@ DEF_OP(AdcZero) {
   auto Op  = IROp->C<IR::IROp_AdcZero>();
   auto Dst = GetReg(Node);
   auto Src = GetReg(Op->Src1);
-  // CFInverted=true: PPC `addze` would add !x86_CF. Extract x86_CF and add manually.
-  mfspr(TMP1, 1);
-  rldicl(TMP2, TMP1, 64 - 29, 63);
-  xori(TMP2, TMP2, 1);
-  add(Dst, Src, TMP2);
+  // CFInverted=true: PPC `addze` would add !x86_CF. Materialise x86_CF instead.
+  // subfe(TMP2, r0, r0) = ~r0 + r0 + CA = all-ones + CA, i.e. 0 when CA=1 and
+  // -1 when CA=0 — that is -(!CA) = -x86_CF under this op's inverted
+  // convention. Its carry-out equals its carry-in so XER.CA survives, and
+  // OE=Rc=0 leaves OV/SO/CR0 alone (this is a value-only op).
+  // Dst = Src + x86_CF = Src - (-x86_CF), so the add becomes a subf.
+  subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
+  subf(Dst, TMP2, Src);       // Dst = Src - TMP2 = Src + x86_CF
 }
 
 DEF_OP(AdcZeroWithFlags) {
@@ -2000,10 +2018,14 @@ DEF_OP(AdcZeroWithFlags) {
   auto Dst = GetReg(Node);
   auto Src = GetReg(Op->Src1);
 
-  // Extract x86_CF from CFInverted-stored XER.CA.
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);
-  xori(TMP4, TMP4, 1);                       // TMP4 = x86_CF (0 or 1)
+  // Materialise x86_CF from the CFInverted-stored XER.CA. subfe(TMP4, r0, r0)
+  // = ~r0 + r0 + CA = all-ones + CA, giving 0 for CA=1 and -1 for CA=0, i.e.
+  // -(!CA) = -x86_CF; negate to get x86_CF itself. Both instructions leave XER
+  // untouched (subfe's carry-out equals its carry-in; neg has OE=0), so the CA
+  // that addco_ below consumes-and-replaces is still the stored one, and CR0
+  // is undisturbed until addco_ writes it.
+  subfe(TMP4, r0, r0);                       // TMP4 = -x86_CF
+  neg(TMP4, TMP4);                           // TMP4 = x86_CF (0 or 1)
 
   if (IROp->Size == IR::OpSize::i64Bit) {
     // addco_(Dst, Src, TMP4): Dst = Src + x86_CF, CA = carry-out, OV = ovf, CR0 from Dst.
@@ -2063,15 +2085,19 @@ DEF_OP(AdcNZCV) {
     return;
   }
 
-  // i32Bit: extract x86_CF, manually compute, store !bit-32 as CFInverted CA.
-  mfspr(TMP1, 1);
-  rldicl(TMP4, TMP1, 64 - 29, 63);
-  xori(TMP4, TMP4, 1);                       // TMP4 = x86_CF
+  // i32Bit: materialise x86_CF, compute manually, store !bit-32 as CFInverted CA.
+  // subfe(TMP4, r0, r0) = ~r0 + r0 + CA = all-ones + CA => 0 for CA=1, -1 for
+  // CA=0, i.e. -(!CA) = -x86_CF under CFInverted=true. XER survives it (its
+  // carry-out equals its carry-in, OE=Rc=0), which matters because the stored
+  // CA must still be readable... it is not read again here, but the XER tail
+  // below reads XER for the sticky SO, and CR0 must stay clean until
+  // EmitTestNZSetCR. Adding x86_CF then becomes subtracting -x86_CF.
+  subfe(TMP4, r0, r0);                      // TMP4 = -x86_CF
 
   rldicl(TMP1, S1, 0, 32);
   rldicl(TMP2, S2, 0, 32);
   add(TMP3, TMP1, TMP2);
-  add(TMP3, TMP3, TMP4);                    // TMP3 = sum + x86_CF (33-bit)
+  subf(TMP3, TMP4, TMP3);                   // TMP3 = sum + x86_CF (33-bit)
   rldicl(TMP4, TMP3, 0, 32);                 // TMP4 = low-32 result
   EmitTestNZSetCR(TMP4, IR::OpSize::i32Bit);
 
