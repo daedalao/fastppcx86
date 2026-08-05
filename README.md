@@ -22,9 +22,9 @@ distributed under the same MIT license — see [`LICENSE`](LICENSE), which is un
 
 This is a permanent fork with no plan to merge back. The PPC64LE backend, the memory-model work
 and the SMC subsystem diverge deliberately from how upstream solves the same problems on ARM64.
-Two upstream documents are preserved verbatim for reference and are not maintained here:
-[`Readme.md`](Readme.md) (with its translation [`docs/Readme_CN.md`](docs/Readme_CN.md)) and
-[`README.upstream.md`](README.upstream.md), an earlier README of this port. Everything else in
+The upstream README is preserved verbatim as [`README.upstream.md`](README.upstream.md) (with its
+translation [`docs/Readme_CN.md`](docs/Readme_CN.md)) and is not maintained here; an earlier README
+of this port is kept as [`docs/README.history.md`](docs/README.history.md). Everything else in
 `docs/` describes *this* project.
 
 **Binaries and environment variables keep the historical `FEX` prefix** — the programs are still
