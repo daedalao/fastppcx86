@@ -67,6 +67,42 @@ struct PPC64ContextBackup {
   uint32_t VSCR;
   uint32_t VRSAVE;
 
+  // Floating-point register file and FPSCR.
+  //
+  // FPSCR is the correctness half: it is where the PPC rounding mode lives, and
+  // the JIT writes it PERSISTENTLY. DEF_OP(SetRoundingMode) (ALUOps.cpp) turns
+  // a guest LDMXCSR / FLDCW into an mtfsf that leaves the host FPSCR holding
+  // the guest's requested mode for the rest of the block and beyond -- there is
+  // no save/restore bracket around it. Without FPSCR in this backup, ANY signal
+  // taken between the SetRoundingMode and the arithmetic it was meant to govern
+  // silently reverts the guest to round-to-nearest: BackupContext copies
+  // everything except FPSCR, the handler runs (glibc/host code freely resets
+  // rounding), and RestoreContext puts back a context whose FPSCR field is
+  // whatever the handler left. The guest then computes with the wrong rounding
+  // mode and nothing anywhere reports an error. Mono's GC hammers every thread
+  // with suspend signals, so this is a real corruption source, not a theoretical
+  // one, and it is the kind that shows up as drift rather than a crash.
+  //
+  // FPRs are the same argument as the VRR block above: the JIT uses f0..f31 for
+  // scalar FP and as general scratch, so a signal landing mid-block leaves live
+  // values there; restoring them keeps resumption transparent.
+  //
+  // LAYOUT: glibc's ppc64le mcontext_t declares `fpregset_t fp_regs`, and
+  // `typedef double fpregset_t[__NFPREG]` with __NFPREG == 33 -- 32 FPRs
+  // followed by FPSCR in the 33rd slot (index 32). This matches the kernel:
+  // arch/powerpc/kernel/signal_64.c's copy_fpr_to_user()/copy_fpr_from_user()
+  // write the 32 FPRs then stash fpscr in buf[32], and rt_sigreturn feeds the
+  // whole 33-element array back through copy_fpr_from_user, so a value written
+  // into fp_regs[32] here is genuinely reloaded into FPSCR on return from the
+  // handler. Stored as raw bit patterns (uint64_t), never as `double`: FPSCR is
+  // not a float, and round-tripping FPR bits through a double would canonicalise
+  // signalling NaNs.
+  //
+  // Unconditional, unlike the VRR block -- fp_regs is an inline array in
+  // mcontext_t, not a pointer, so there is no null case to guard.
+  uint64_t FPRs[32];
+  uint64_t FPSCR;
+
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   // Sanity check trailing the GPRs (the head used to hold this cookie, but
   // ExitFunctionLinker would clobber it before any consumer could read it,
@@ -270,6 +306,13 @@ static inline void BackupContext(void* ucontext, T* Backup) {
     Backup->VRSAVE = 0;
   }
 
+  // FPRs + FPSCR. See the FPRs/FPSCR declaration for why FPSCR in particular
+  // must round-trip. fp_regs is `double[33]`; copy the bit patterns.
+  static_assert(sizeof(_mcontext->fp_regs) == 33 * sizeof(uint64_t),
+                "ppc64le mcontext fp_regs is expected to be 32 FPRs followed by FPSCR");
+  memcpy(&Backup->FPRs[0], &_mcontext->fp_regs[0], sizeof(Backup->FPRs));
+  memcpy(&Backup->FPSCR, &_mcontext->fp_regs[32], sizeof(Backup->FPSCR));
+
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   Backup->StackCookie = STACK_COOKIE_MAGIC;
 #endif
@@ -297,4 +340,11 @@ static inline void RestoreContext(void* ucontext, T* Backup) {
     _mcontext->v_regs->vscr.vscr_word = Backup->VSCR;
     _mcontext->v_regs->vrsave         = Backup->VRSAVE;
   }
+
+  // Put back the FP register file and, critically, FPSCR -- otherwise a guest
+  // that set a non-default rounding mode via LDMXCSR/FLDCW silently loses it to
+  // any signal that happens to land afterwards. rt_sigreturn reloads all 33
+  // slots, so writing fp_regs[32] here really does restore the rounding mode.
+  memcpy(&_mcontext->fp_regs[0], &Backup->FPRs[0], sizeof(Backup->FPRs));
+  memcpy(&_mcontext->fp_regs[32], &Backup->FPSCR, sizeof(Backup->FPSCR));
 }
