@@ -7,7 +7,11 @@
     "XMM5": ["0x0000000280000000", "0x00000000FFFFFFFE"],
     "XMM7": ["0xFFFFFFFD80000000", "0x0000000000000000"],
     "XMM8": ["0xFFFFFFFE80000000", "0x0000000000000000"],
-    "XMM10": ["0x80000000FFFFFFFD", "0x0000000000000000"]
+    "XMM10": ["0x80000000FFFFFFFD", "0x0000000000000000"],
+    "XMM11": ["0x8000000080000000", "0x0000000000000000"],
+    "XMM12": ["0x8000000080000000", "0x0000000000000000"],
+    "XMM13": ["0x0000000280000000", "0x0000000000000000"],
+    "XMM14": ["0x000000027FFFFFFF", "0x0000000000000000"]
   },
   "MemoryRegions": {
     "0xe0000000": "4096"
@@ -75,5 +79,32 @@ mov [rdx + 56], rax
 movaps xmm9, [rdx + 48]
 
 cvtpd2dq xmm10, xmm9
+
+; --- [2^31, 2^63) range: the bound-constant regression (fixed 2026-08-05) ---
+; The sentinel compare used 2^63 as the overflow bound, so f64 values in
+; [2^31, 2^63) kept POWER's INT_MAX saturation instead of x86's 0x80000000.
+; 5e9 sits squarely in that window; -5e9 checks the negative side (correct
+; via POWER's own INT_MIN saturation, no mask involved).
+mov rax, 0x41f2a05f20000000   ; 5e9
+mov [rdx + 64], rax
+mov rax, 0xc1f2a05f20000000   ; -5e9
+mov [rdx + 72], rax
+movaps xmm6, [rdx + 64]
+
+cvtpd2dq  xmm11, xmm6         ; both lanes -> 0x80000000
+cvttpd2dq xmm12, xmm6         ; both lanes -> 0x80000000
+
+; Rounds-up-to-2^31 edge: 2147483647.7 truncates to 0x7FFFFFFF (valid) but
+; rounds (nearest) to exactly 2^31 -> indefinite. Distinguishes comparing
+; the ROUNDED value from comparing the raw source. 2.5 -> 2 both ways
+; (banker's rounding ties to even).
+mov rax, 0x41dfffffffeccccd   ; 2147483647.7
+mov [rdx + 80], rax
+mov rax, 0x4004000000000000   ; 2.5
+mov [rdx + 88], rax
+movaps xmm6, [rdx + 80]
+
+cvtpd2dq  xmm13, xmm6         ; [0x80000000, 2]
+cvttpd2dq xmm14, xmm6         ; [0x7FFFFFFF, 2]
 
 hlt
