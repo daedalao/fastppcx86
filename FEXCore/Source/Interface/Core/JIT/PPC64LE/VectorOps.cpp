@@ -4577,20 +4577,28 @@ DEF_OP(Vector_FToZS) {
   const auto Src   = GetVReg(Op->Vector);
 
   if (ElemSz == IR::OpSize::i32Bit) {
-    vrfiz(VTMP1, Src);    // round towards zero
-    vctsxs(Dst, VTMP1, 0);
-    // INT_MIN sentinel for +overflow. This fix-up is LOAD-BEARING, not dead:
-    // hardware-measured on POWER8, vctsxs of {+2^40, NaN, -2^40, 1.5} gives
-    // {7fffffff, 00000000, 80000000, 1} — +overflow saturates to INT_MAX, so
-    // without the select the +overflow lane would be 0x7fffffff not x86's
-    // 0x80000000. KNOWN BUG (not fixed here): vctsxs maps NaN -> 0x00000000
-    // (VMX), and xvcmpgesp returns 0 for NaN, so the select leaves 0 where
-    // x86 CVTTPS2DQ(NaN) wants 0x80000000. Unlike the VSX converts, VMX vctsxs
-    // does NOT map NaN to INT_MIN. Needs a separate NaN mask to fully match.
+    // x86 CVT{T}PS2DQ maps every non-representable input to the integer-
+    // indefinite sentinel INT_MIN. The VMX vctsxs used here is x86-wrong two
+    // ways (hardware-measured on POWER8, notes/vperm-verify/fptest.out): it
+    // maps NaN → 0x00000000 and +overflow → INT_MAX. -overflow already
+    // saturates to INT_MIN (correct). Both wrong cases are folded into one
+    // select via a KEEP mask — lanes that are in-range AND not-NaN keep the
+    // converted value; everything else becomes INT_MIN. (The VSX converters in
+    // Vector_FToS/FToISized already yield INT_MIN for NaN, so they need no
+    // such mask; vctsxs is the sole deviating primitive.)
+    //
+    // The Src-dependent masks are built BEFORE the convert writes Dst: a
+    // caller may allocate Dst == Src (PF2IW: `Src = _Vector_FToZS(…, Src)`),
+    // and reading Src after vctsxs would see the converted integer
+    // reinterpreted as a float, corrupting the masks.
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_F32_2P31, TMP1, TMP2);
-    xvcmpgesp(VTMP1, Src, VTMP2);                // mask: 1 where Src >= 2^31
+    xvcmpgesp(VTMP1, Src, VTMP2);   // VTMP1 = 1 where Src >= 2^31 (0 for NaN)
+    xvcmpeqsp(VTMP2, Src, Src);     // VTMP2 = 1 where Src == Src (0 for NaN)
+    xxlandc(VTMP1, VTMP2, VTMP1);   // KEEP = notNaN AND NOT overflow
+    vrfiz(Dst, Src);                // round toward zero (safe when Dst == Src)
+    vctsxs(Dst, Dst, 0);            // Dst = converted (NaN→0, +ovf→INT_MAX)
     EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_I32_MIN, TMP1, TMP2);
-    xxsel(Dst, Dst, VTMP2, VTMP1);
+    xxsel(Dst, VTMP2, Dst, VTMP1);  // KEEP ? converted : INT_MIN
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
