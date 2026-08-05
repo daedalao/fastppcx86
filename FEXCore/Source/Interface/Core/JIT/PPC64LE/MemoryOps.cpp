@@ -431,6 +431,160 @@ DEF_OP(StoreAF) {
 // Memory load/store (guest address)
 // =========================================================================
 
+// -------------------------------------------------------------------------
+// Effective-address form selection for GPR load/store
+// -------------------------------------------------------------------------
+//
+// EA = Base + Disp (D/DS-form) or EA = Base + Index (X-form); exactly one of
+// the two is live. ComputeAddress collapses both into a single register, which
+// costs an addi/add per access and then wastes the X-form's RB operand on r0.
+// Keeping the shape lets the memory instruction absorb it.
+//
+// GetReg/IsInlineConstant are PPC64JITCore members, so the DEF_OP bodies do the
+// operand extraction and these file-local helpers only emit — the change stays
+// inside this translation unit.
+struct MemAddrForm {
+  GPR Base;
+  GPR Index;      // meaningful only when HasIndex
+  int32_t Disp;   // meaningful only when !HasIndex
+  bool HasIndex;
+};
+
+// Offset operand as the caller sees it. Valid=false means "no offset operand".
+struct MemOffsetOperand {
+  bool Valid;
+  bool IsConst;
+  uint64_t Const;
+  GPR Reg;        // meaningful only when Valid && !IsConst
+  IR::MemOffsetType Type;
+  uint8_t Scale;
+};
+
+// Scratch contract: writes TMP3 only, and only when the offset needs extension,
+// scaling, or a wide-constant materialization. Matches ComputeAddress's old
+// contract so callers' TMP assumptions are unchanged.
+static MemAddrForm MakeAddrForm(PPC64EmitterBase& E, GPR Base, const MemOffsetOperand& Off) {
+  MemAddrForm A {Base, Base, 0, false};
+  if (!Off.Valid) {
+    return A;
+  }
+  if (Off.IsConst) {
+    const int64_t sOff = static_cast<int64_t>(Off.Const) * Off.Scale;
+    if (sOff >= -32768 && sOff <= 32767) {
+      A.Disp = static_cast<int32_t>(sOff);
+      return A;
+    }
+    // Wider than any D/DS displacement: materialize and hand it to the X-form's
+    // RB rather than folding it into Base with a separate add.
+    E.LoadConstant(TMP3, static_cast<uint64_t>(sOff));
+    A.Index = TMP3;
+    A.HasIndex = true;
+    return A;
+  }
+  GPR OffReg = Off.Reg;
+  if (Off.Type == IR::MemOffsetType::UXTW) {
+    E.rldicl(TMP3, OffReg, 0, 32);
+    OffReg = TMP3;
+  } else if (Off.Type == IR::MemOffsetType::SXTW) {
+    E.extsw(TMP3, OffReg);
+    OffReg = TMP3;
+  }
+  if (Off.Scale > 1) {
+    E.sldi(TMP3, OffReg, __builtin_ctz(Off.Scale));
+    OffReg = TMP3;
+  }
+  A.Index = OffReg;
+  A.HasIndex = true;
+  return A;
+}
+
+// Collapse to a single register. FPR/vector paths and any caller that needs an
+// address register (rather than an addressing mode) go through this; it emits
+// exactly what ComputeAddress used to, including landing in TMP3.
+static GPR MaterializeAddr(PPC64EmitterBase& E, const MemAddrForm& A) {
+  if (A.HasIndex) {
+    E.add(TMP3, A.Base, A.Index);
+    return TMP3;
+  }
+  if (A.Disp == 0) {
+    return A.Base;
+  }
+  E.addi(TMP3, A.Base, static_cast<int16_t>(A.Disp));
+  return TMP3;
+}
+
+// D-form is usable when there is no register index and the displacement fits.
+// ld/std/lwa are DS-form: the low two displacement bits are the extended opcode,
+// so the displacement must be a multiple of 4. Everything else is plain D-form
+// and takes any signed 16-bit value.
+static bool CanUseDForm(const MemAddrForm& A, IR::OpSize Size) {
+  if (A.HasIndex) {
+    return false;
+  }
+  if (A.Disp < -32768 || A.Disp > 32767) {
+    return false;
+  }
+  if (Size == IR::OpSize::i64Bit && (A.Disp & 3) != 0) {
+    return false;
+  }
+  return true;
+}
+
+// rA=0 in D/DS-form encodes the literal value zero, not r0's contents, so a
+// base of r0 would silently become an absolute address. TMPs are r3-r6 and both
+// RA pools start at r7, so this cannot happen — assert rather than assume.
+static void AssertNonZeroBase(const MemAddrForm& A) {
+  LOGMAN_THROW_A_FMT(A.Base != r0, "PPC64 D-form base register must not be r0");
+}
+
+static void EmitLoadGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Dst, const MemAddrForm& A) {
+  if (CanUseDForm(A, Size)) {
+    AssertNonZeroBase(A);
+    const int16_t D = static_cast<int16_t>(A.Disp);
+    switch (Size) {
+    case IR::OpSize::i8Bit:  E.lbz(Dst, D, A.Base); break;
+    case IR::OpSize::i16Bit: E.lhz(Dst, D, A.Base); break;
+    case IR::OpSize::i32Bit: E.lwz(Dst, D, A.Base); break;
+    case IR::OpSize::i64Bit: E.ld(Dst, D, A.Base);  break;
+    default: break;
+    }
+    return;
+  }
+  // X-form base+index. When there is no index the old shape's r0 stand-in is
+  // still correct (r0 in RB reads GPR0's contents, and the backend holds r0==0).
+  const GPR Index = A.HasIndex ? A.Index : r0;
+  switch (Size) {
+  case IR::OpSize::i8Bit:  E.lbzx(Dst, A.Base, Index); break;
+  case IR::OpSize::i16Bit: E.lhzx(Dst, A.Base, Index); break;
+  case IR::OpSize::i32Bit: E.lwzx(Dst, A.Base, Index); break;
+  case IR::OpSize::i64Bit: E.ldx(Dst, A.Base, Index);  break;
+  default: break;
+  }
+}
+
+static void EmitStoreGPR(PPC64EmitterBase& E, IR::OpSize Size, GPR Src, const MemAddrForm& A) {
+  if (CanUseDForm(A, Size)) {
+    AssertNonZeroBase(A);
+    const int16_t D = static_cast<int16_t>(A.Disp);
+    switch (Size) {
+    case IR::OpSize::i8Bit:  E.stb(Src, D, A.Base); break;
+    case IR::OpSize::i16Bit: E.sth(Src, D, A.Base); break;
+    case IR::OpSize::i32Bit: E.stw(Src, D, A.Base); break;
+    case IR::OpSize::i64Bit: E.std(Src, D, A.Base); break;
+    default: break;
+    }
+    return;
+  }
+  const GPR Index = A.HasIndex ? A.Index : r0;
+  switch (Size) {
+  case IR::OpSize::i8Bit:  E.stbx(Src, A.Base, Index); break;
+  case IR::OpSize::i16Bit: E.sthx(Src, A.Base, Index); break;
+  case IR::OpSize::i32Bit: E.stwx(Src, A.Base, Index); break;
+  case IR::OpSize::i64Bit: E.stdx(Src, A.Base, Index); break;
+  default: break;
+  }
+}
+
 // Helper: compute effective address = Base + Offset (immediate or register)
 GPR PPC64JITCore::ComputeAddress(GPR Base, IR::OrderedNodeWrapper Offset,
                                   IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
@@ -445,38 +599,12 @@ GPR PPC64JITCore::ComputeAddress(GPR Base, IR::OrderedNodeWrapper Offset,
   // segment_arrays[]. Guest 32-bit pointer wrap is the dispatcher's
   // responsibility: i32-typed SSA values are already zero-extended when
   // written, so 64-bit Base+Offset arithmetic produces the correct address.
-  if (Offset.IsInvalid()) {
-    return Base;
-  }
-  uint64_t Const;
-  if (IsInlineConstant(Offset, &Const)) {
-    if (Const == 0) {
-      return Base;
-    }
-    int64_t sOff = static_cast<int64_t>(Const) * OffsetScale;
-    if (sOff >= -32768 && sOff <= 32767) {
-      addi(TMP3, Base, static_cast<int16_t>(sOff));
-    } else {
-      LoadConstant(TMP3, static_cast<uint64_t>(sOff));
-      add(TMP3, Base, TMP3);
-    }
-    return TMP3;
-  }
-  GPR OffReg = GetReg(Offset);
-  if (OffsetType == IR::MemOffsetType::UXTW) {
-    rldicl(TMP3, OffReg, 0, 32);
-    OffReg = TMP3;
-  } else if (OffsetType == IR::MemOffsetType::SXTW) {
-    extsw(TMP3, OffReg);
-    OffReg = TMP3;
-  }
-  if (OffsetScale > 1) {
-    sldi(TMP3, OffReg, __builtin_ctz(OffsetScale));
-    add(TMP3, Base, TMP3);
-  } else {
-    add(TMP3, Base, OffReg);
-  }
-  return TMP3;
+  uint64_t OffC = 0;
+  const bool OffValid = !Offset.IsInvalid();
+  const bool OffConst = OffValid && IsInlineConstant(Offset, &OffC);
+  const MemOffsetOperand Off {OffValid, OffConst, OffC, (OffValid && !OffConst) ? GetReg(Offset) : r0,
+                              OffsetType, OffsetScale};
+  return MaterializeAddr(*this, MakeAddrForm(*this, Base, Off));
 }
 
 DEF_OP(LoadMem) {
@@ -492,24 +620,27 @@ DEF_OP(LoadMem) {
   } else {
     Addr = GetReg(Op->Addr);
   }
-  GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  // Keep the addressing mode rather than collapsing it: the memory instruction
+  // absorbs either a displacement (D/DS-form) or a register index (X-form).
+  // GetReg/IsInlineConstant are core members, so the extraction is done here and
+  // MakeAddrForm only emits.
+  uint64_t OffC = 0;
+  const bool OffValid = !Op->Offset.IsInvalid();
+  const bool OffConst = OffValid && IsInlineConstant(Op->Offset, &OffC);
+  const MemOffsetOperand Off {OffValid, OffConst, OffC, (OffValid && !OffConst) ? GetReg(Op->Offset) : r0,
+                              Op->OffsetType, Op->OffsetScale};
+  const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
   if (Op->Class == IR::RegClass::FPR) {
     // Honour Op->Size so vmovd/vmovq don't read 16B and clobber upper lanes.
-    LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
+    LoadFPRSized(GetVReg(Dst), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
     return;
   }
-  auto GDst = GetReg(Dst);
-  switch (IROp->Size) {
-  case IR::OpSize::i8Bit:   lbzx(GDst, EA, r0); break;  // r0 = 0 for EA+0
-  case IR::OpSize::i16Bit:  lhzx(GDst, EA, r0); break;
-  case IR::OpSize::i32Bit:  lwzx(GDst, EA, r0); break;
-  case IR::OpSize::i64Bit:  ldx(GDst, EA, r0);  break;
-  case IR::OpSize::i128Bit:
-    LoadUnalignedV128(GetVReg(Dst), EA);
-    break;
-  default: break;
+  if (IROp->Size == IR::OpSize::i128Bit) {
+    LoadUnalignedV128(GetVReg(Dst), MaterializeAddr(*this, EAF));
+    return;
   }
+  EmitLoadGPR(*this, IROp->Size, GetReg(Dst), EAF);
 }
 
 // Materialize Addr + Offset into `scratch`, or return Addr unchanged when
@@ -569,7 +700,12 @@ DEF_OP(StoreMem) {
   } else {
     Addr = GetReg(Op->Addr);
   }
-  GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  uint64_t OffC = 0;
+  const bool OffValid = !Op->Offset.IsInvalid();
+  const bool OffConst = OffValid && IsInlineConstant(Op->Offset, &OffC);
+  const MemOffsetOperand Off {OffValid, OffConst, OffC, (OffValid && !OffConst) ? GetReg(Op->Offset) : r0,
+                              Op->OffsetType, Op->OffsetScale};
+  const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
   // Dispatch on the explicit RegisterClass field — IsFPR(Op->Value) reads the
   // *node's* class which can disagree with the store's class (e.g. an FPR-class
@@ -577,7 +713,11 @@ DEF_OP(StoreMem) {
   if (Op->Class == IR::RegClass::FPR) {
     // Honour Op->Size so vmovd m32 / vmovq m64 don't write 16B and stomp on
     // adjacent stack slots (e.g. wiping [rsp+8] in __tls_init_tp).
-    StoreFPRSized(GetVReg(Op->Value), EA, IR::OpSizeToSize(IROp->Size));
+    StoreFPRSized(GetVReg(Op->Value), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
+    return;
+  }
+  if (IROp->Size == IR::OpSize::i128Bit) {
+    StoreUnalignedV128(GetVReg(Op->Value), MaterializeAddr(*this, EAF));
     return;
   }
   // Op->Value may be an inline constant (e.g. `mov [mem], 0`). GetReg on an
@@ -594,16 +734,7 @@ DEF_OP(StoreMem) {
   } else {
     GSrc = GetReg(Op->Value);
   }
-  switch (IROp->Size) {
-  case IR::OpSize::i8Bit:   stbx(GSrc, EA, r0); break;
-  case IR::OpSize::i16Bit:  sthx(GSrc, EA, r0); break;
-  case IR::OpSize::i32Bit:  stwx(GSrc, EA, r0); break;
-  case IR::OpSize::i64Bit:  stdx(GSrc, EA, r0); break;
-  case IR::OpSize::i128Bit:
-    StoreUnalignedV128(GetVReg(Op->Value), EA);
-    break;
-  default: break;
-  }
+  EmitStoreGPR(*this, IROp->Size, GSrc, EAF);
 }
 
 DEF_OP(StoreMemPair) {
@@ -653,7 +784,12 @@ DEF_OP(LoadMemTSO) {
   // TSO loads carry the same Offset/OffsetType/OffsetScale fields as plain
   // LoadMem; without folding them in we silently drop the displacement (e.g.
   // the +0x4 in `mov %fs:0x4(%r8), …`), producing a bad effective address.
-  GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  uint64_t OffC = 0;
+  const bool OffValid = !Op->Offset.IsInvalid();
+  const bool OffConst = OffValid && IsInlineConstant(Op->Offset, &OffC);
+  const MemOffsetOperand Off {OffValid, OffConst, OffC, (OffValid && !OffConst) ? GetReg(Op->Offset) : r0,
+                              Op->OffsetType, Op->OffsetScale};
+  const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
   // Acquire barrier: `lwsync` AFTER the load.
   //
@@ -694,24 +830,20 @@ DEF_OP(LoadMemTSO) {
   //      trials cannot establish a zero, and 30 only rules out a true rate above
   //      about 10%.
   if (Op->Class == IR::RegClass::FPR) {
-    LoadFPRSized(GetVReg(Dst), EA, IR::OpSizeToSize(IROp->Size));
+    LoadFPRSized(GetVReg(Dst), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
     lwsync();
     return;
   }
 
-  auto GDst = GetReg(Dst);
-  switch (IROp->Size) {
-  // NOTE the operand order: address in RA, r0 in RB. Power's literal-zero rule
-  // covers RA only, so this reads GPR0's *contents* as the index and depends on
-  // an r0==0 invariant. Nothing in this backend writes r0, so the invariant
-  // holds — but it is an invariant, not an architectural guarantee. Contrast
-  // `PPC64.cpp:222-224`, which puts r0 in RA where the rule genuinely applies.
-  case IR::OpSize::i8Bit:  lbzx(GDst, EA, r0); break;
-  case IR::OpSize::i16Bit: lhzx(GDst, EA, r0); break;
-  case IR::OpSize::i32Bit: lwzx(GDst, EA, r0); break;
-  case IR::OpSize::i64Bit: ldx(GDst, EA, r0);  break;
-  default: break;
-  }
+  // X-form fallback puts the address in RA and r0 in RB. Power's literal-zero
+  // rule covers RA only, so that reads GPR0's *contents* as the index and
+  // depends on an r0==0 invariant. Nothing in this backend writes r0 without
+  // restoring it, so the invariant holds — but it is an invariant, not an
+  // architectural guarantee. Contrast `PPC64.cpp:222-224`, which puts r0 in RA
+  // where the rule genuinely applies. The D/DS-form selection has the mirror
+  // constraint on the *base*, checked in AssertNonZeroBase.
+  EmitLoadGPR(*this, IROp->Size, GetReg(Dst), EAF);
+  // Barrier placement unchanged: acquire is still the lwsync after the load.
   lwsync();
 }
 
@@ -729,17 +861,28 @@ DEF_OP(StoreMemTSO) {
   // before the lwsync so the displacement add is also release-ordered with
   // respect to the store; ComputeAddress only does a couple of arithmetic
   // ops on TMP3, no memory ops, so it's safe either side of the barrier.
-  GPR EA = ComputeAddress(Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
-
-  // x86 TSO stores are release stores. lwsync before the store provides
-  // StoreStore + LoadStore release ordering relative to prior memory ops.
-  lwsync();
+  uint64_t OffC = 0;
+  const bool OffValid = !Op->Offset.IsInvalid();
+  const bool OffConst = OffValid && IsInlineConstant(Op->Offset, &OffC);
+  const MemOffsetOperand Off {OffValid, OffConst, OffC, (OffValid && !OffConst) ? GetReg(Op->Offset) : r0,
+                              Op->OffsetType, Op->OffsetScale};
+  const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
   if (Op->Class == IR::RegClass::FPR) {
+    // Materialize before the barrier so the FPR path's instruction order across
+    // the lwsync is exactly what it was; the GPR path now folds the
+    // displacement into the store itself and needs no address arithmetic at all.
+    GPR EA = MaterializeAddr(*this, EAF);
+    // x86 TSO stores are release stores. lwsync before the store provides
+    // StoreStore + LoadStore release ordering relative to prior memory ops.
+    lwsync();
     // Size-aware so TSO `vmovd m32, %xmm` writes 4B not 16B.
     StoreFPRSized(GetVReg(Op->Value), EA, IR::OpSizeToSize(IROp->Size));
     return;
   }
+
+  // Release barrier before the store — placement unchanged.
+  lwsync();
 
   // Same inline-constant-Value handling as StoreMem (e.g. TSO `mov [m], 0`).
   GPR GSrc;
@@ -754,13 +897,7 @@ DEF_OP(StoreMemTSO) {
   } else {
     GSrc = GetReg(Op->Value);
   }
-  switch (IROp->Size) {
-  case IR::OpSize::i8Bit:  stbx(GSrc, EA, r0); break;
-  case IR::OpSize::i16Bit: sthx(GSrc, EA, r0); break;
-  case IR::OpSize::i32Bit: stwx(GSrc, EA, r0); break;
-  case IR::OpSize::i64Bit: stdx(GSrc, EA, r0); break;
-  default: break;
-  }
+  EmitStoreGPR(*this, IROp->Size, GSrc, EAF);
 }
 
 // =========================================================================
@@ -1158,29 +1295,135 @@ DEF_OP(MemCpy) {
   }
   GPR Step = TMP3;
 
-  // Loop state: TMP1 = current Dst, TMP2 = current Src, TMP4 = remaining count.
-  mr(TMP1, DestIn);
-  mr(TMP2, SrcIn);
-  mr(TMP4, LenIn);
+  // Fast path: REP MOVSB, forward, 64-bit guest. Guest glibc 2.44 lowers every
+  // copy >= 2KB to `rep movsb` because the port advertises ERMS, and the
+  // generic loop below costs ~8 host instructions per BYTE. Byte-copy to
+  // 8-byte DST alignment, then ld/std chunks, then byte tail.
+  //
+  // Register allocation on the fast path (same three loop registers as the
+  // generic loop, so the OutDst/OutSrc writeback below is correct on every
+  // path):
+  //   TMP1 = running dst, TMP2 = running src, TMP4 = remaining count,
+  //   TMP3 = dead after the direction test, reused as the delta/alignment
+  //          scratch, r0 = data scratch (restored to 0 at op end, both paths).
+  //
+  // OVERLAP GUARD. x86 forward `rep movsb` with dst inside (src, src+len) is a
+  // legal self-replicating pattern fill: byte-by-byte forward semantics are
+  // architecturally required there. With delta = dst - src (mod 2^64), chunked
+  // and byte-forward copies agree exactly when delta == 0 or delta >= 8
+  // unsigned. Proof sketch: byte i of a chunk reads memory that the store
+  // covering it wrote in chunk floor((i-delta)/8); that chunk index is strictly
+  // less than the current one iff delta > (i mod 8) - ((i-delta) mod 8), whose
+  // range is [-7,7], so delta >= 8 always satisfies it and 0 < delta < 8 fails
+  // it for the byte where the difference equals delta. dst < src makes the
+  // unsigned delta enormous (guest addresses are far below 2^63), so it passes.
+  // The single unsigned test `delta >= 8` therefore covers both safe cases and
+  // sends only 0 <= delta < 8 to the generic loop — delta == 0 (dst == src) is
+  // correct either way but is rare enough not to be worth a second test.
+  //
+  // FAULT GRANULARITY. The chunk stores are 8-byte aligned, so they cannot
+  // cross a page and cannot partially fault. The chunk loads may be unaligned
+  // and may fault mid-chunk, but a faulting load modifies no memory. So on any
+  // fault the destination holds a byte-exact prefix of the copy, exactly like
+  // the generic loop, and guest RCX/RSI/RDI are written back only at op end on
+  // both paths — the guest-visible state at fault time is unchanged.
+  //
+  // Gating: 32-bit guests keep the generic loop (the 4 GiB pointer wrap is
+  // per-element). Sz != 1 keeps the generic loop. The generic loop is emitted
+  // UNCONDITIONALLY whenever the fast path exists, because the runtime overlap
+  // guard branches into it even when the direction is a compile-time forward
+  // constant — a size/bitness-blind "fast path always taken" predicate is what
+  // made constant-forward REP STOSW/D/Q emit no loop at all (acbbb3405).
+  const bool ConstDir = IsInlineConstant(Op->Direction, &DirConst);
+  const bool FastEligible = Sz == 1 && CTX->Config.Is64BitMode() && !(ConstDir && static_cast<int8_t>(DirConst) != 1);
+  const bool ConstForward = FastEligible && ConstDir && static_cast<int8_t>(DirConst) == 1;
+  PPC64Emitter::Label generic_path, out;
+  if (FastEligible) {
+    if (!ConstForward) {
+      // Step (TMP3) is the sign-extended direction; +1 selects forward.
+      cmpdi(TMP3, 1);
+      bc(CC_NE, &generic_path);
+    }
+    mr(TMP1, DestIn);
+    mr(TMP2, SrcIn);
+    mr(TMP4, LenIn);
 
-  PPC64Emitter::Label loop, done;
-  Bind(&loop);
-  cmpdi(TMP4, 0);
-  bc(CC_EQ, &done);
-  // 32-bit guest: wrap pointers at 4 GiB before each iteration's load+store.
-  MaybeClrUpper32(TMP1);
-  MaybeClrUpper32(TMP2);
-  switch (Sz) {
-  case 1: lbz(r(0), 0, TMP2); stb(r(0), 0, TMP1); break;
-  case 2: lhz(r(0), 0, TMP2); sth(r(0), 0, TMP1); break;
-  case 4: lwz(r(0), 0, TMP2); stw(r(0), 0, TMP1); break;
-  case 8: ld(r(0), 0, TMP2);  std(r(0), 0, TMP1); break;
+    // delta = dst - src; subf rt,ra,rb computes rb - ra. Computed into r0, NOT
+    // TMP3: this branch can still fall through to the generic loop, which needs
+    // Step alive in TMP3. r0 is already the op's declared data scratch and is
+    // restored to 0 at op end on every path. cmpldi reads RA's contents (the
+    // "(RA|0)" literal-zero rule is a load/store + addi rule), so r0 is legal
+    // as its operand.
+    subf(r(0), TMP2, TMP1);
+    cmpldi(r(0), 8);
+    bc(CC_ULT, &generic_path);
+
+    PPC64Emitter::Label align_loop, chunk_loop, tail_loop, done;
+    Bind(&align_loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    andi_(TMP3, TMP1, 7);
+    bc(CC_EQ, &chunk_loop);
+    lbz(r(0), 0, TMP2);
+    stb(r(0), 0, TMP1);
+    addi(TMP1, TMP1, 1);
+    addi(TMP2, TMP2, 1);
+    addi(TMP4, TMP4, -1);
+    b(&align_loop);
+
+    Bind(&chunk_loop);
+    cmpldi(TMP4, 8);
+    bc(CC_ULT, &tail_loop);
+    // Source may be unaligned: POWER8 handles unaligned cacheable loads in
+    // hardware, and the DS-form displacement constraint is on the immediate
+    // (0 here), not on the address.
+    ld(r(0), 0, TMP2);
+    std(r(0), 0, TMP1);
+    addi(TMP1, TMP1, 8);
+    addi(TMP2, TMP2, 8);
+    addi(TMP4, TMP4, -8);
+    b(&chunk_loop);
+
+    Bind(&tail_loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    lbz(r(0), 0, TMP2);
+    stb(r(0), 0, TMP1);
+    addi(TMP1, TMP1, 1);
+    addi(TMP2, TMP2, 1);
+    addi(TMP4, TMP4, -1);
+    b(&tail_loop);
+    Bind(&done);
+    b(&out);
   }
-  add(TMP1, TMP1, Step);
-  add(TMP2, TMP2, Step);
-  addi(TMP4, TMP4, -1);
-  b(&loop);
-  Bind(&done);
+
+  Bind(&generic_path);
+  {
+    // Loop state: TMP1 = current Dst, TMP2 = current Src, TMP4 = remaining count.
+    mr(TMP1, DestIn);
+    mr(TMP2, SrcIn);
+    mr(TMP4, LenIn);
+
+    PPC64Emitter::Label loop, done;
+    Bind(&loop);
+    cmpdi(TMP4, 0);
+    bc(CC_EQ, &done);
+    // 32-bit guest: wrap pointers at 4 GiB before each iteration's load+store.
+    MaybeClrUpper32(TMP1);
+    MaybeClrUpper32(TMP2);
+    switch (Sz) {
+    case 1: lbz(r(0), 0, TMP2); stb(r(0), 0, TMP1); break;
+    case 2: lhz(r(0), 0, TMP2); sth(r(0), 0, TMP1); break;
+    case 4: lwz(r(0), 0, TMP2); stw(r(0), 0, TMP1); break;
+    case 8: ld(r(0), 0, TMP2);  std(r(0), 0, TMP1); break;
+    }
+    add(TMP1, TMP1, Step);
+    add(TMP2, TMP2, Step);
+    addi(TMP4, TMP4, -1);
+    b(&loop);
+    Bind(&done);
+  }
+  Bind(&out);
 
   MaybeClrUpper32(TMP1);
   MaybeClrUpper32(TMP2);
