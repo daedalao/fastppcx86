@@ -1160,30 +1160,32 @@ DEF_OP(Rev) {
   // For POWER8: combine rotate+mask to do byte swap.
   switch (IROp->Size) {
   case IR::OpSize::i16Bit: {
-    // Swap 2 bytes: rotate left 8 and mask
-    rlwinm(Dst, Src, 8, 16, 23);  // get high byte of low 16 into position
-    rlwinm(TMP1, Src, 24, 24, 31); // get low byte into high position
-    or_(Dst, Dst, TMP1);
-    rlwinm(Dst, Dst, 0, 16, 31);
+    // Swap the two bytes of the low halfword, zero-extending the result.
+    // PPC (MSB=0) bit numbering: the low halfword's high byte H is at PPC
+    // 16..23, its low byte L at PPC 24..31. ROTL32 by SH moves PPC q to
+    // (q - SH) mod 32.
+    //   L (24..31) -> 16..23 needs SH = 8;  mask MB=16, ME=23.
+    //   H (16..23) -> 24..31 needs SH = 24; mask MB=24, ME=31.
+    // rlwinm zeroes everything outside its mask (including bits 0..31 of the
+    // 64-bit register), and rlwimi then merges the second byte in, so the
+    // separate or_ and the trailing zero-extension mask both disappear.
+    rlwinm(Dst, Src, 8,  16, 23);   // L into the high byte slot
+    rlwimi(Dst, Src, 24, 24, 31);   // H into the low byte slot
     break;
   }
   case IR::OpSize::i32Bit: {
-    // 4-byte swap: use stwbrx trick via store/load, or do it with rotates
-    // Via rotates:
-    rlwinm(TMP1, Src, 8,  0, 31);   // rotate left 8
-    rlwinm(TMP2, Src, 24, 0, 31);   // rotate right 8
-    // Mask and combine bytes.
-    // TMP1 = rotl8(Src)  = 0xBBCCDDAA for Src=0xAABBCCDD
-    // TMP2 = rotl24(Src) = 0xDDAABBCC for Src=0xAABBCCDD
-    // DD lives at bits31:24 of TMP2; CC at bits23:16 of TMP1;
-    // BB at bits15:8 of TMP2;        AA at bits7:0 of TMP1.
-    rlwinm(TMP3, TMP2, 0, 0, 7);    // TMP3 = DD000000
-    rlwinm(TMP4, TMP1, 0, 8, 15);   // TMP4 = 00CC0000
-    or_(TMP3, TMP3, TMP4);           // TMP3 = DDCC0000
-    rlwinm(TMP4, TMP2, 0, 16, 23);  // TMP4 = 0000BB00
-    rlwinm(TMP1, TMP1, 0, 24, 31);  // TMP1 = 000000AA
-    or_(TMP4, TMP4, TMP1);           // TMP4 = 0000BBAA
-    or_(Dst, TMP3, TMP4);
+    // Canonical 3-instruction PPC bswap32. For Src = AABBCCDD (PPC bytes
+    // 0..7 = AA, 8..15 = BB, 16..23 = CC, 24..31 = DD) we want DDCCBBAA.
+    //   rlwinm Dst, Src, 8, 0, 31   -> Dst = ROTL32(Src, 8)  = BBCCDDAA
+    //        which already has CC in byte 1 and AA in byte 3 — correct.
+    //   ROTL32(Src, 24) = DDAABBCC has DD in byte 0 and BB in byte 2, so two
+    //   rlwimi with SH = 24 insert exactly those two byte lanes:
+    //   mask 0..7 for DD and mask 16..23 for BB.
+    // The first rlwinm zeroes bits 0..31 of the 64-bit register, and rlwimi
+    // preserves them, so the result is zero-extended as before.
+    rlwinm(Dst, Src, 8,  0,  31);
+    rlwimi(Dst, Src, 24, 0,  7);
+    rlwimi(Dst, Src, 24, 16, 23);
     break;
   }
   default: {  // 64-bit
