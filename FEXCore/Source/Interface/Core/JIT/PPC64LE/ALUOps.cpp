@@ -995,18 +995,22 @@ DEF_OP(Ror) {
       rldicl(Dst, S1, (64 - rot) & 63, 0);
     }
   } else {
+    // Rotate-right by n is rotate-left by (width - n), and both rlwnm and
+    // rldcl read only the low bits of RB — 5 bits (bits 59:63) for the 32-bit
+    // form, 6 bits (58:63) for the 64-bit form — so the count is masked by the
+    // hardware. That makes a plain `neg` sufficient: the low k bits of -count
+    // are (-count) mod 2^k = (2^k - (count mod 2^k)) mod 2^k, which is exactly
+    // the left-rotate amount wanted, including the count ≡ 0 case (neg gives
+    // 0 mod 2^k, the identity rotation). No explicit masking of the count and
+    // no `width - count` materialisation are needed.
+    //
+    // neg has OE = 0 and Rc = 0, so it touches neither XER.CA (the canonical
+    // x86 CF store under CFInverted=true, which _Ror must not disturb) nor
+    // CR0 — the same CA-safety the li/subf pair was chosen for.
+    neg(TMP4, GetReg(Op->Src2));
     if (IROp->Size <= IR::OpSize::i32Bit) {
-      // 32-bit variable rotate-right: rlwnm with sh = (32 - rot) & 31.
-      // Mask the count to 5 bits via rldicl (no Rc — andi_ would clobber CR0)
-      // then compute 32 - count without subfic (which sets XER.CA).
-      rldicl(TMP4, GetReg(Op->Src2), 0, 59);
-      li(TMP3, 32);
-      subf(TMP4, TMP4, TMP3);             // TMP4 = 32 - count, CA-safe
       rlwnm(Dst, S1, TMP4, 0, 31);
     } else {
-      // 64-bit variable rotate: negate shift amount via subf (CA-safe).
-      li(TMP3, 64);
-      subf(TMP4, GetReg(Op->Src2), TMP3); // TMP4 = 64 - count
       rldcl(Dst, S1, TMP4, 0);
     }
   }
