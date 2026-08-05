@@ -4399,16 +4399,12 @@ DEF_OP(Float_FromGPR_S) {
     }
     fcfid(f0, f0);
     frsp(f0, f0);
-    // Store f0 back as float, load into vector
+    // Store f0 back as a 4-byte float, then bring it in through a GPR: the
+    // value reaches the vector via mtvsrd below, so neither an lvx of the
+    // spill slot nor a pre-zeroed Dst is needed. vspltw overwrites all 128
+    // bits of Dst and VTMP1 is not read before mtvsrd defines it, so both of
+    // those (a dead lvx and a doubly-emitted vspltisw(Dst,0)) are dropped.
     stfs(f0, -8, r1);
-    addi(TMP1, r1, -8);
-    lvx(VTMP1, r(0), TMP1);
-    // The float is at the low 4 bytes of the 8-byte store, adjust...
-    // Actually stfs writes 4 bytes; we want those in element 0 of Dst.
-    vspltisw(Dst, 0);
-    // Load 4-byte float into element 0 (LE: phys bytes [12:15]).
-    // Use lvewx + vperm to place correctly.
-    vspltisw(Dst, 0);
     lwz(TMP1, -8, r1);
     mtvsrd(VTMP1, TMP1);        // 32-bit value in upper bits
     vsldoi(VTMP1, VTMP1, VTMP1, 8);  // move to both halves
@@ -4923,11 +4919,7 @@ DEF_OP(Vector_F64ToI32) {
   addi(TMP1, r1, -16);
   lvx(VTMP2, r(0), TMP1);                     // VTMP2 = splat f64(2^31)
   xvcmpgedp(VTMP2, Src, VTMP2);               // per-i64-lane overflow mask
-  LoadConstant(TMP1, 0x80000000ULL);          // INT_MIN as i32; broadcast via mtvsrd-splat
-  std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x80000000ULL);
-  std(TMP1, -8, r1);
-  // Actually need per-32-bit INT_MIN.  Splat 0x80000000 8 times (16 bytes):
+  // Per-32-bit INT_MIN, splatted across the whole quadword.
   LoadConstant(TMP1, 0x8000000080000000ULL);
   std(TMP1, -16, r1); std(TMP1, -8, r1);
   addi(TMP1, r1, -16);
