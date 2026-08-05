@@ -2940,7 +2940,18 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // owns it we are about to deadlock against ourselves and take every other
   // thread down with us (they all block here on the next compile).  Report the
   // re-entry with a host backtrace instead of hanging silently.
-  const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
+  // Cached per-thread: this used to be a `::syscall(SYS_gettid)` on *every*
+  // CompileCode entry — a full kernel round-trip per compiled block, paid only
+  // to feed this diagnostic and the OwnerTracker below. A thread's TID is
+  // immutable for its lifetime, so fetch it once.
+  //
+  // Fork caveat: a thread that continues in a forked child keeps the cached
+  // parent-side TID (the child's real TID differs). Nothing here depends on
+  // the TID being a *real* TID — it is only used as a per-thread identity token
+  // compared against CodeBufferWriteOwner, which lives in the same address
+  // space and is written by the same cached value. The only observable effect
+  // of staleness is the number printed in the re-entrancy log message below.
+  static thread_local const uint64_t SelfTID = static_cast<uint64_t>(::syscall(SYS_gettid));
   if (CodeBuffers.CodeBufferWriteOwner.load(std::memory_order_relaxed) == SelfTID) {
     LogMan::Msg::EFmt("PPC64 JIT: re-entrant CompileCode on tid {} for Entry {:#x} -- "
                       "CodeBufferWriteMutex is already held by this thread. Host backtrace:",
