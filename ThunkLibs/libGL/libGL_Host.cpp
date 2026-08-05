@@ -121,9 +121,47 @@ static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t GuestTarget, ui
 
 #include "thunkgen_host_libGL.inl"
 
+#ifdef IS_32BIT_THUNK
+// Single source of truth for the pointer-relocating custom_host_impl family.
+//
+// Each of these functions returns a host `.rodata` pointer (a GL/GLX driver
+// string) that the custom impl copies into guest-addressable memory via
+// RelocateStringToGuestHeap -- see the block near line ~350. The whole reason
+// they exist is that the default `to_guest` truncates a 64-bit host pointer to
+// 32 bits on an i386 guest (garbage that gldriverquery et al. read blindly).
+//
+// A procaddr-resolving i386 title (glXGetProcAddress("glGetString")) MUST land
+// on the custom impl, never the raw host symbol -- otherwise it gets the
+// truncating path the impl was written to avoid. The glXGetProcAddress table
+// below therefore *must* contain every name in this list. To make that
+// impossible to forget, the table branches are generated from this list: you
+// cannot add a relocating impl to the list without also adding its table
+// branch. (A generator-side check was considered but rejected: the generator
+// has no visibility into this hand-written table -- see gen.cpp custom_host_impl
+// handling -- so enforcing it there would mean teaching the generator to parse
+// the impl .cpp. This X-macro coupling gives the same guarantee locally.)
+#define FEX_LIBGL_RELOCATING_IMPLS(_) \
+  _(glGetString)                      \
+  _(glGetStringi)                     \
+  _(glXGetClientString)               \
+  _(glXQueryExtensionsString)         \
+  _(glXQueryServerString)
+#endif
+
 auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
   using VoidFn = void (*)();
   std::string_view name_sv {reinterpret_cast<const char*>(name)};
+#ifdef IS_32BIT_THUNK
+  // Pointer-relocating impls (see FEX_LIBGL_RELOCATING_IMPLS above). Kept as an
+  // early-return block generated from the shared list so the "needs relocation"
+  // set and the procaddr table are literally the same declaration.
+#define FEX_LIBGL_PROCADDR_BRANCH(fn) \
+  if (name_sv == #fn) {               \
+    return (VoidFn)fexfn_impl_libGL_##fn; \
+  }
+  FEX_LIBGL_RELOCATING_IMPLS(FEX_LIBGL_PROCADDR_BRANCH)
+#undef FEX_LIBGL_PROCADDR_BRANCH
+#endif
   if (name_sv == "glCompileShaderIncludeARB") {
     return (VoidFn)fexfn_impl_libGL_glCompileShaderIncludeARB;
   } else if (name_sv == "glCreateShaderProgramv") {

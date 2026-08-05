@@ -39,3 +39,10 @@ docs/local/
 # Local research/investigation notes — never tracked (see git log for why)
 notes/
 unittests/seccomp/seccomp_bpf_filters
+
+# Profiling data / captures (large, machine-specific)
+perfdata/
+*_perf.data
+*.perf.data
+perf.data
+perf.data.old
