@@ -275,6 +275,11 @@ private:
   // Resolved once at construction: BlockLinking knob AND code caching off.
   // See the resolution site in JIT.cpp for the hard-gate rationale.
   bool BlockLinkingEnabled {};
+  // Whether constant-target CALL exits may be linked. = BlockLinkingEnabled &&
+  // !LazyLinkArmed: call-dense guests flood the relink/recompile path under
+  // FEX_SMCLAZYLINK, so calls fall back to the L1 probe there. Resolved next to
+  // BlockLinkingEnabled in the constructor.
+  bool CallLinkingEnabled {};
 
   // Shadow return stack (FEX_SHADOWRETSTACK). Resolved once at construction,
   // mirroring BlockLinkingEnabled. Default OFF; the SMC interlock at the

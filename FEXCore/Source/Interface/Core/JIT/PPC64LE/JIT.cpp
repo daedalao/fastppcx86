@@ -2321,6 +2321,15 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
                       "same-thread drains ride the InterruptFaultPage poke.");
   }
 
+  // Constant-target CALL exits (BranchHint::Call) link only when block linking
+  // is on AND we are not in the lazy-link regime: under FEX_SMCLAZYLINK the SMC
+  // scrub severs links so aggressively that linking call-dense guests (32-bit
+  // Mono/Unity) turns every call into a relink-and-recompile through
+  // ExitFunctionLinkWithRecord -- a compile storm that throttles execution
+  // (observed on Dex load). Plain jumps stay linked (BlockLinkingEnabled); only
+  // the higher-volume call exits fall back to the L1 probe under lazy linking.
+  CallLinkingEnabled = BlockLinkingEnabled && !LazyLinkArmed;
+
   // Shadow return stack (FEX_SHADOWRETSTACK). Read once here, mirroring
   // BlockLinkingEnabled. Independent of code caching and of SMCSemanticPatch:
   //  * Code caching: the pushed host trampoline is discovered at RUNTIME via
