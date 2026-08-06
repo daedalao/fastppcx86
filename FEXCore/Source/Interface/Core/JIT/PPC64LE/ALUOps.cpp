@@ -1956,15 +1956,43 @@ DEF_OP(Adc) {
   //
   // Dst = S1 + S2 + x86_CF = (S1 + S2) - (-x86_CF), so the third addend
   // folds into a subf instead of an add.
-  subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
-  add(TMP3, S1, S2);
-  subf(Dst, TMP2, TMP3);      // subf RT,RA,RB = RB - RA = (S1+S2) + x86_CF
+  // CARRY POLARITY: this op consumes a DIRECT carry (XER.CA == x86_CF), not an
+  // inverted one. Its only producer is DeadFlagCalculationElimination rewriting
+  // AdcWithFlags -> Adc, and CalculateFlags_ADC (OpcodeDispatcher/Flags.cpp:276)
+  // does RectifyCarryInvert(false) + sets CFInverted=false immediately before
+  // emitting _AdcWithFlags. The ADX path likewise. So `adde` -- which computes
+  // RA + RB + XER.CA -- IS the operation, exactly.
+  //
+  // The previous sequence here (subfe TMP2,r0,r0; add; subf) assumed the
+  // INVERTED convention: subfe r0,r0 yields CA-1 == -(!CA), and subtracting it
+  // adds !CA. Under a direct carry that computes S1 + S2 + !x86_CF -- off by
+  // one in BOTH carry states. It was never caught because OP_ADC has no other
+  // producer, so this handler has never executed with the pass disabled.
+  //
+  // adde writes XER.CA (carry-out). That is safe here and not a new hazard: the
+  // Replacement rewrite only fires when the flag writes are dead, and the
+  // AdcWithFlags this replaced wrote CA itself, so nothing can observe the
+  // difference. (Sbb/AdcZero keep their subfe forms -- their producers DO
+  // rectify to inverted; see the note in each. The three deliberately differ.)
+  adde(Dst, S1, S2);          // Dst = S1 + S2 + x86_CF
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    // x86-64 zero-extends 32-bit writebacks; sources arrive AllowUpperGarbage
+    // and the dispatcher stores the raw host register. Matches Add/Sub/And/...
+    rldicl(Dst, Dst, 0, 32);
+  }
 }
 
 DEF_OP(Sbb) {
   auto Op  = IROp->C<IR::IROp_Sbb>();
   auto Dst = GetReg(Node);
+  // Carry stays as-is: SBB's producer DOES rectify to the inverted convention
+  // (CalculateFlags_SBB), so XER.CA == !x86_CF here and the bare subfe computes
+  // S1 + ~S2 + CA == S1 - S2 - x86_CF, which is exactly SBB. Deliberately the
+  // opposite polarity from DEF_OP(Adc) above -- do not "uniformize" them.
   subfe(Dst, GetReg(Op->Src2), GetReg(Op->Src1));
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    rldicl(Dst, Dst, 0, 32);  // zero-extend the 32-bit writeback (see Adc)
+  }
 }
 
 DEF_OP(AdcWithFlags) {
@@ -2090,8 +2118,17 @@ DEF_OP(AdcZero) {
   // convention. Its carry-out equals its carry-in so XER.CA survives, and
   // OE=Rc=0 leaves OV/SO/CR0 alone (this is a value-only op).
   // Dst = Src + x86_CF = Src - (-x86_CF), so the add becomes a subf.
+  // Carry stays as-is: IR.json declares AdcZero as "adds GPR with INVERTED
+  // carry-in" and the dispatcher's ADCOp literal-zero path rectifies inverted,
+  // so XER.CA == !x86_CF. subfe r0,r0 gives CA-1 == -(!CA) == -x86_CF, and
+  // subtracting it adds x86_CF. Correct -- and deliberately the opposite
+  // polarity from DEF_OP(Adc). Uniformizing these is the AdcZeroWithFlags bug
+  // class that broke BoringSSL P-256 / Steam TLS (7224def51).
   subfe(TMP2, r0, r0);        // TMP2 = -x86_CF
   subf(Dst, TMP2, Src);       // Dst = Src - TMP2 = Src + x86_CF
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    rldicl(Dst, Dst, 0, 32);  // zero-extend the 32-bit writeback (see Adc)
+  }
 }
 
 DEF_OP(AdcZeroWithFlags) {
