@@ -799,6 +799,19 @@
           "Default on: cleared by the 2026-08-03 real-workload regression set (probe_thread_spawn 0/30 + 0/30, ctest 7024/7024, Factorio oil-refinery ×5, FTL, stress-ng, OpenSSL 128-thread 162/162, Dex, Steam-in-Proton), all run with FEX_BLOCKLINKING=1 for the entire cycle."
         ]
       },
+      "DisableDFCE": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the DeadFlagCalculationElimination IR pass (FEX_DISABLEDFCE=1 turns the pass OFF).",
+          "The pass rewrites flag-producing IR ops in place (e.g. AdcWithFlags -> Adc) when their flag writes are provably dead, and folds",
+          "SubNZCV/AXFlag compares into the following CondJump. It was disabled on PPC64LE from 2026-05-11 to 2026-08-05 because of two",
+          "reproducers (32-bit ld.so _dl_sort_maps_dfs 'rpo_head == rpo'; bash setup_variables SEGV on a stale base register) that were later",
+          "traced to a missing !HasSideEffects() guard at the pass's Remove site. Because a wrong flag elimination shows up as a wrong",
+          "conditional branch -- silent and data-dependent -- this knob exists so the pass can be turned off in the field without a rebuild.",
+          "Unlike FEX_O0 this affects only this one pass; X87StackOptimization and the rest of the default pass set stay enabled."
+        ]
+      },
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",

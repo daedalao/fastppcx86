@@ -485,6 +485,18 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
   LOGMAN_THROW_A_FMT(Op->VCmpElementSize == IR::OpSize::iInvalid, "FoldBranch cannot rewrite a vector-compare CondJump's operands");
 
   // Skip past StoreRegisters at the end -- they don't touch flags.
+  //
+  // NOTE (ppc64le, measured 2026-08-05): this walk does NOT skip
+  // OP_GUESTOPCODE, and Core.cpp emits a GuestOpcode marker before EVERY guest
+  // instruction on this port (per-instruction markers are required for
+  // instruction-granular RIP reconstruction, 7a8007a1e). The marker belonging
+  // to the jcc therefore always sits immediately before the CondJump, so
+  // BOTH arms below are unreachable here -- FoldBranch is dead on ppc64le
+  // regardless of whether DFCE is enabled. Verified by IR dump: every
+  // CondJump in unittests/ASM/FEX_bugs/FoldBranch_Sub8_Sub16.asm and
+  // dfce_foldbranch_axflag.asm is preceded by `GuestOpcode`, and both files
+  // still show the unfolded AXFLAG / SUBNZCV in the after-opt IR. That also
+  // means FoldBranch_Sub8_Sub16.asm has never actually tested FoldBranch.
   auto PrevWrap = CodeNode->Header.Previous;
   while (CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREREGISTER ||
          CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREPF || CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREAF) {
@@ -493,13 +505,43 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
 
   auto Prev = CurrentIR.GetOp<IR::IROp_Header>(PrevWrap);
   if (Prev->Op == OP_AXFLAG) {
-    // Pattern match a branch fed by AXFLAG.
-    CondClass ArmCond = X86ToArmFloatCond(Op->Cond);
-    if (ArmCond == CondClass::AL) {
-      return;
-    }
-
-    Op->Cond = ArmCond;
+    // The AXFLAG arm is DISABLED. It is measurably wrong, and it is only
+    // "safe" today because the GuestOpcode marker above makes it unreachable
+    // -- exactly the kind of accidental safety that stops being safe the
+    // moment someone makes the marker skippable. So refuse it explicitly.
+    //
+    // Evidence (2026-08-05): with the predecessor walk temporarily taught to
+    // skip OP_GUESTOPCODE, so this arm fires,
+    // unittests/ASM/FEX_bugs/dfce_foldbranch_axflag.asm fails in jit_500_m:
+    //   RAX (jae) = 0xE, expected 0x6  -- branch taken on UNORDERED
+    //   RDI (jle) = 0xB, expected 0xA  -- branch taken on ordered LESS
+    // Two independent defects, both in "remap the condition against the raw
+    // Arm FCMP layout and delete the AXFLAG":
+    //
+    //  1. UGE -> FGE. The backend lowers CondClass::FGE under NZCV as
+    //     PPC CC_GE = "CR0.LT clear", and fcmpu leaves LT clear for NaN
+    //     (it sets FU/SO instead), so `jae` is taken on unordered. x86
+    //     comiss sets CF=1 for unordered, so `jae` must NOT be taken.
+    //     Arm's own GE is N==V, which excludes unordered -- CC_GE is not
+    //     that. See MapNZCVCC in JIT/PPC64LE/JIT.cpp.
+    //
+    //  2. SLE -> SLE (the identity remap) is wrong independent of the
+    //     backend. x86 `jle` after comiss is ZF || (SF!=OF); comiss forces
+    //     SF=OF=0, and AXFLAG sets Z_x86 = Z|V, so it means "equal or
+    //     unordered". Evaluated instead against the RAW fcmp flags, Arm LE
+    //     is Z || N!=V = equal || less || unordered -- it additionally
+    //     fires on ordered less. This one is a property of the shared
+    //     mapping table, not of PPC64LE.
+    //
+    // The SUBNZCV arm below is fine: with the same experiment, all three
+    // ctest configurations of FoldBranch_Sub8_Sub16.asm pass. Only the
+    // AXFLAG arm is rejected.
+    //
+    // Re-enabling requires fixing both defects and then re-running
+    // dfce_foldbranch_axflag.asm under jit_500_m, which pins the correct
+    // x86 answers for all five remappable conditions x all four comiss
+    // outcomes whether or not the fold fires.
+    return;
   } else if (Prev->Op == OP_SUBNZCV) {
     // Pattern match a branch fed by a compare. We could also handle bit tests
     // here, but tbz/tbnz has a limited offset range which we don't have a way to
@@ -580,7 +622,63 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         bool Eliminated = false;
 
         if ((FlagsRead & Info.Write()) == 0) {
-          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0) {
+          // !HasSideEffects is load-bearing, and the `&&` placement matters.
+          //
+          // EliminateDeadCode() above already refuses to drop side-effecting
+          // ops, so anything that reaches here with GetUses()==0 is
+          // side-effecting by construction. Without this guard we deleted it
+          // anyway: an op like StoreNZCV / StorePF / StoreAF /
+          // InvalidateFlags / AdcWithFlags has its *observable* effect in the
+          // flag state, not in its SSA result, so "no SSA users" does not
+          // make it dead. Removing it silently drops the flag write that a
+          // later LoadNZCV / LoadPF / LoadAF in another block still reads --
+          // a wrong conditional branch, data-dependent and silent. This was
+          // the real cause of the two 2026-05-11 PPC64LE reproducers that got
+          // the whole pass switched off (32-bit ld.so _dl_sort_maps_dfs
+          // 'rpo_head == rpo'; bash setup_variables SEGV).
+          //
+          // Keeping the test INSIDE this `if` rather than around the whole
+          // block is deliberate: a guarded-out op now falls through to the
+          // `else if (Info.Replacement())` arm and is REWRITTEN in place
+          // (AdcWithFlags -> Adc, SubWithFlags -> Sub, ...) instead of
+          // deleted. That preserves most of the win for the 6 ops that carry
+          // a Replacement (And/Add/Sub/Adc/Sbb/AdcZeroWithFlags). The
+          // remaining reachable ops are CanEliminate-only, so for them this
+          // is a genuine loss of optimization, not a reroute -- accepted,
+          // because correctness is not negotiable here.
+          //
+          // NOTE: as of today every IR op that can reach this site is
+          // HasSideEffects:true in IR.json, so the Remove arm is dead in
+          // practice. It is kept (rather than deleted) so that adding a
+          // non-side-effecting CanEliminate/Replacement op to IR.json keeps
+          // working. The ERROR_AND_DIE_FMT tripwire inside the branch is what
+          // makes deleting this conjunct fail loudly instead of silently.
+          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !IR::HasSideEffects(IROp->Op)) {
+            // Guard tripwire. Deliberately redundant with the `!HasSideEffects`
+            // conjunct above -- that is the whole point, and it is why this is
+            // ERROR_AND_DIE_FMT (release-visible) rather than a LOGMAN assert.
+            //
+            // Measured 2026-08-05: deleting `&& !IR::HasSideEffects(...)` from
+            // the condition changes NOTHING observable -- the full ASM suite
+            // (6702 tests, release and assertions), both 2026-05-11
+            // reproducers and 60 bash startups all still pass. So without this
+            // line nothing in CI notices the guard going away. A LOGMAN assert
+            // is not enough either: the harness's assert handler prints and
+            // continues, so the tests still report green (verified).
+            //
+            // With the conjunct present this is unreachable, so it costs
+            // nothing. Without it, the first StorePF of the first translated
+            // block trips it and every single test dies. Instrumenting this
+            // site showed what the guard blocks on ONE listsort run: StorePF
+            // 4847, StoreAF 2665, InvalidateFlags 2171, StoreNZCV 728,
+            // SubWithFlags 563, SubNZCV 235, ShiftFlags 32, TestNZ 26,
+            // CondSubNZCV 18, AddNZCV 8, AndWithFlags 1, AddWithFlags 1 --
+            // constantly exercised, just not observable today.
+            if (IR::HasSideEffects(IROp->Op)) {
+              ERROR_AND_DIE_FMT("DFCE: about to Remove side-effecting op {} -- the !HasSideEffects guard on this "
+                                "branch has been deleted",
+                                IR::GetName(IROp->Op));
+            }
             IREmit->Remove(CodeNode);
             Eliminated = true;
           } else if (Info.Replacement()) {
