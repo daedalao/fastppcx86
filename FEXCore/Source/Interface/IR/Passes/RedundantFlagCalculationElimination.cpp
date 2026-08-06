@@ -654,6 +654,22 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
           // working. See the DFCE_HasSideEffects_Guard unit test, which
           // fails if this conjunct is removed.
           if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !IR::HasSideEffects(IROp->Op)) {
+            // Deliberately redundant with the conjunct above -- that is the
+            // whole point. Measured 2026-08-05: deleting `&&
+            // !IR::HasSideEffects(...)` from the condition changes nothing
+            // observable (the full ASM suite, both 2026-05-11 reproducers and
+            // bash all still pass), so nothing in CI would notice the guard
+            // going away. This assert does: without the conjunct, the very
+            // first StorePF of the very first translated block trips it, so
+            // every assertions-build test fails immediately. Instrumenting
+            // this site showed what the guard actually blocks on a single
+            // listsort run -- StorePF 4847, StoreAF 2665, InvalidateFlags
+            // 2171, StoreNZCV 728, SubWithFlags 563, SubNZCV 235, ShiftFlags
+            // 32, TestNZ 26, CondSubNZCV 18, AddNZCV 8, AndWithFlags 1,
+            // AddWithFlags 1 -- i.e. it is exercised constantly, it just
+            // happens not to be observable today.
+            LOGMAN_THROW_A_FMT(!IR::HasSideEffects(IROp->Op),
+                               "DFCE: refusing to Remove a side-effecting op -- the !HasSideEffects guard on this branch is missing");
             IREmit->Remove(CodeNode);
             Eliminated = true;
           } else if (Info.Replacement()) {
