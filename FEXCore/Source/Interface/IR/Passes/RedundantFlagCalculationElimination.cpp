@@ -580,7 +580,38 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         bool Eliminated = false;
 
         if ((FlagsRead & Info.Write()) == 0) {
-          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0) {
+          // !HasSideEffects is load-bearing, and the `&&` placement matters.
+          //
+          // EliminateDeadCode() above already refuses to drop side-effecting
+          // ops, so anything that reaches here with GetUses()==0 is
+          // side-effecting by construction. Without this guard we deleted it
+          // anyway: an op like StoreNZCV / StorePF / StoreAF /
+          // InvalidateFlags / AdcWithFlags has its *observable* effect in the
+          // flag state, not in its SSA result, so "no SSA users" does not
+          // make it dead. Removing it silently drops the flag write that a
+          // later LoadNZCV / LoadPF / LoadAF in another block still reads --
+          // a wrong conditional branch, data-dependent and silent. This was
+          // the real cause of the two 2026-05-11 PPC64LE reproducers that got
+          // the whole pass switched off (32-bit ld.so _dl_sort_maps_dfs
+          // 'rpo_head == rpo'; bash setup_variables SEGV).
+          //
+          // Keeping the test INSIDE this `if` rather than around the whole
+          // block is deliberate: a guarded-out op now falls through to the
+          // `else if (Info.Replacement())` arm and is REWRITTEN in place
+          // (AdcWithFlags -> Adc, SubWithFlags -> Sub, ...) instead of
+          // deleted. That preserves most of the win for the 6 ops that carry
+          // a Replacement (And/Add/Sub/Adc/Sbb/AdcZeroWithFlags). The
+          // remaining reachable ops are CanEliminate-only, so for them this
+          // is a genuine loss of optimization, not a reroute -- accepted,
+          // because correctness is not negotiable here.
+          //
+          // NOTE: as of today every IR op that can reach this site is
+          // HasSideEffects:true in IR.json, so the Remove arm is dead in
+          // practice. It is kept (rather than deleted) so that adding a
+          // non-side-effecting CanEliminate/Replacement op to IR.json keeps
+          // working. See the DFCE_HasSideEffects_Guard unit test, which
+          // fails if this conjunct is removed.
+          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !IR::HasSideEffects(IROp->Op)) {
             IREmit->Remove(CodeNode);
             Eliminated = true;
           } else if (Info.Replacement()) {

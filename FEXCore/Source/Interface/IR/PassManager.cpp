@@ -68,30 +68,32 @@ void PassManager::Finalize() {
 
 void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
   FEX_CONFIG_OPT(DisablePasses, O0);
+  FEX_CONFIG_OPT(DisableDFCE, DISABLEDFCE);
 
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
-    // PPC64LE: DeadFlagCalculationElimination is disabled for both 32-bit and
-    // 64-bit guests. The pass's Replacement branch (e.g. SubWithFlags → Sub)
-    // mutates IROp tags in place and leaves stale operand-class metadata that
-    // the subsequent RA mis-resolves to a wrong SRA slot.
+
+    // DeadFlagCalculationElimination was disabled on PPC64LE from 2026-05-11
+    // (8774c7dda) to 2026-08-05. The diagnosis recorded at the time -- "the
+    // Replacement rewrite leaves stale operand-class metadata that RA
+    // mis-resolves" -- was wrong. The actual defect was in the pass itself:
+    // its ProcessBlock Remove site dropped nodes whose flag writes were dead
+    // WITHOUT checking IR::HasSideEffects(), so side-effecting flag writers
+    // (StoreNZCV/StorePF/StoreAF/InvalidateFlags/...) were deleted outright
+    // rather than falling through to the in-place Replacement rewrite. That
+    // is now guarded; see the comment at the Remove site in
+    // Passes/RedundantFlagCalculationElimination.cpp.
     //
-    // 32-bit symptom: ld.so trips 'rpo_head == rpo' inside _dl_sort_maps_dfs
-    //   at block sizes ≥ 9 instructions.
-    // 64-bit symptom: bash's setup_variables function entry SEGVs on a host
-    //   `lwzx r7, r24, r0` whose base register was supposed to be guest R11
-    //   but RA bound it to guest R14 (host r22), which holds an unrelated
-    //   8-byte ASCII slice from earlier in the block.
-    //
-    // The pass is purely a perf optimization; disabling costs cycles but not
-    // correctness. The ASM suites are unaffected (those don't reach dense
-    // flag-producing 9+-instruction blocks). The bash ASM patterns that
-    // trigger the 64-bit case are dense hash-table walks in glibc / bash
-    // internals.
-    //
-    // TODO: root-cause the RA/Replacement interaction and re-enable. Likely
-    // the right fix is to invalidate the post-RA-merge candidate cache when
-    // the pass rewrites an op's Op tag, or to do the rewrite after RA.
+    // The pass is a pure IR transform with no correctness mandate, and a
+    // wrong flag elimination surfaces as a wrong conditional branch --
+    // silent and data-dependent. So it gets its own persistent kill switch
+    // rather than relying on FEX_O0 (which would also drop
+    // X87StackOptimization and change x87 behaviour):
+    //     FEX_DISABLEDFCE=1
+    // turns just this pass off at runtime, no rebuild.
+    if (!DisableDFCE()) {
+      InsertPass(CreateDeadFlagCalculationEliminination());
+    }
   }
 }
 
