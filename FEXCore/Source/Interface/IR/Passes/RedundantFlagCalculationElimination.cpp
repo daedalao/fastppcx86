@@ -651,25 +651,34 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
           // HasSideEffects:true in IR.json, so the Remove arm is dead in
           // practice. It is kept (rather than deleted) so that adding a
           // non-side-effecting CanEliminate/Replacement op to IR.json keeps
-          // working. See the DFCE_HasSideEffects_Guard unit test, which
-          // fails if this conjunct is removed.
+          // working. The ERROR_AND_DIE_FMT tripwire inside the branch is what
+          // makes deleting this conjunct fail loudly instead of silently.
           if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !IR::HasSideEffects(IROp->Op)) {
-            // Deliberately redundant with the conjunct above -- that is the
-            // whole point. Measured 2026-08-05: deleting `&&
-            // !IR::HasSideEffects(...)` from the condition changes nothing
-            // observable (the full ASM suite, both 2026-05-11 reproducers and
-            // bash all still pass), so nothing in CI would notice the guard
-            // going away. This assert does: without the conjunct, the very
-            // first StorePF of the very first translated block trips it, so
-            // every assertions-build test fails immediately. Instrumenting
-            // this site showed what the guard actually blocks on a single
-            // listsort run -- StorePF 4847, StoreAF 2665, InvalidateFlags
-            // 2171, StoreNZCV 728, SubWithFlags 563, SubNZCV 235, ShiftFlags
-            // 32, TestNZ 26, CondSubNZCV 18, AddNZCV 8, AndWithFlags 1,
-            // AddWithFlags 1 -- i.e. it is exercised constantly, it just
-            // happens not to be observable today.
-            LOGMAN_THROW_A_FMT(!IR::HasSideEffects(IROp->Op),
-                               "DFCE: refusing to Remove a side-effecting op -- the !HasSideEffects guard on this branch is missing");
+            // Guard tripwire. Deliberately redundant with the `!HasSideEffects`
+            // conjunct above -- that is the whole point, and it is why this is
+            // ERROR_AND_DIE_FMT (release-visible) rather than a LOGMAN assert.
+            //
+            // Measured 2026-08-05: deleting `&& !IR::HasSideEffects(...)` from
+            // the condition changes NOTHING observable -- the full ASM suite
+            // (6702 tests, release and assertions), both 2026-05-11
+            // reproducers and 60 bash startups all still pass. So without this
+            // line nothing in CI notices the guard going away. A LOGMAN assert
+            // is not enough either: the harness's assert handler prints and
+            // continues, so the tests still report green (verified).
+            //
+            // With the conjunct present this is unreachable, so it costs
+            // nothing. Without it, the first StorePF of the first translated
+            // block trips it and every single test dies. Instrumenting this
+            // site showed what the guard blocks on ONE listsort run: StorePF
+            // 4847, StoreAF 2665, InvalidateFlags 2171, StoreNZCV 728,
+            // SubWithFlags 563, SubNZCV 235, ShiftFlags 32, TestNZ 26,
+            // CondSubNZCV 18, AddNZCV 8, AndWithFlags 1, AddWithFlags 1 --
+            // constantly exercised, just not observable today.
+            if (IR::HasSideEffects(IROp->Op)) {
+              ERROR_AND_DIE_FMT("DFCE: about to Remove side-effecting op {} -- the !HasSideEffects guard on this "
+                                "branch has been deleted",
+                                IR::GetName(IROp->Op));
+            }
             IREmit->Remove(CodeNode);
             Eliminated = true;
           } else if (Info.Replacement()) {
