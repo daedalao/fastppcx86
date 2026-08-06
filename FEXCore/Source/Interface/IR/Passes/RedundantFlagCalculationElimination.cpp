@@ -485,6 +485,18 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
   LOGMAN_THROW_A_FMT(Op->VCmpElementSize == IR::OpSize::iInvalid, "FoldBranch cannot rewrite a vector-compare CondJump's operands");
 
   // Skip past StoreRegisters at the end -- they don't touch flags.
+  //
+  // NOTE (ppc64le, measured 2026-08-05): this walk does NOT skip
+  // OP_GUESTOPCODE, and Core.cpp emits a GuestOpcode marker before EVERY guest
+  // instruction on this port (per-instruction markers are required for
+  // instruction-granular RIP reconstruction, 7a8007a1e). The marker belonging
+  // to the jcc therefore always sits immediately before the CondJump, so
+  // BOTH arms below are unreachable here -- FoldBranch is dead on ppc64le
+  // regardless of whether DFCE is enabled. Verified by IR dump: every
+  // CondJump in unittests/ASM/FEX_bugs/FoldBranch_Sub8_Sub16.asm and
+  // dfce_foldbranch_axflag.asm is preceded by `GuestOpcode`, and both files
+  // still show the unfolded AXFLAG / SUBNZCV in the after-opt IR. That also
+  // means FoldBranch_Sub8_Sub16.asm has never actually tested FoldBranch.
   auto PrevWrap = CodeNode->Header.Previous;
   while (CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREREGISTER ||
          CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREPF || CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREAF) {
@@ -493,13 +505,43 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
 
   auto Prev = CurrentIR.GetOp<IR::IROp_Header>(PrevWrap);
   if (Prev->Op == OP_AXFLAG) {
-    // Pattern match a branch fed by AXFLAG.
-    CondClass ArmCond = X86ToArmFloatCond(Op->Cond);
-    if (ArmCond == CondClass::AL) {
-      return;
-    }
-
-    Op->Cond = ArmCond;
+    // The AXFLAG arm is DISABLED. It is measurably wrong, and it is only
+    // "safe" today because the GuestOpcode marker above makes it unreachable
+    // -- exactly the kind of accidental safety that stops being safe the
+    // moment someone makes the marker skippable. So refuse it explicitly.
+    //
+    // Evidence (2026-08-05): with the predecessor walk temporarily taught to
+    // skip OP_GUESTOPCODE, so this arm fires,
+    // unittests/ASM/FEX_bugs/dfce_foldbranch_axflag.asm fails in jit_500_m:
+    //   RAX (jae) = 0xE, expected 0x6  -- branch taken on UNORDERED
+    //   RDI (jle) = 0xB, expected 0xA  -- branch taken on ordered LESS
+    // Two independent defects, both in "remap the condition against the raw
+    // Arm FCMP layout and delete the AXFLAG":
+    //
+    //  1. UGE -> FGE. The backend lowers CondClass::FGE under NZCV as
+    //     PPC CC_GE = "CR0.LT clear", and fcmpu leaves LT clear for NaN
+    //     (it sets FU/SO instead), so `jae` is taken on unordered. x86
+    //     comiss sets CF=1 for unordered, so `jae` must NOT be taken.
+    //     Arm's own GE is N==V, which excludes unordered -- CC_GE is not
+    //     that. See MapNZCVCC in JIT/PPC64LE/JIT.cpp.
+    //
+    //  2. SLE -> SLE (the identity remap) is wrong independent of the
+    //     backend. x86 `jle` after comiss is ZF || (SF!=OF); comiss forces
+    //     SF=OF=0, and AXFLAG sets Z_x86 = Z|V, so it means "equal or
+    //     unordered". Evaluated instead against the RAW fcmp flags, Arm LE
+    //     is Z || N!=V = equal || less || unordered -- it additionally
+    //     fires on ordered less. This one is a property of the shared
+    //     mapping table, not of PPC64LE.
+    //
+    // The SUBNZCV arm below is fine: with the same experiment, all three
+    // ctest configurations of FoldBranch_Sub8_Sub16.asm pass. Only the
+    // AXFLAG arm is rejected.
+    //
+    // Re-enabling requires fixing both defects and then re-running
+    // dfce_foldbranch_axflag.asm under jit_500_m, which pins the correct
+    // x86 answers for all five remappable conditions x all four comiss
+    // outcomes whether or not the fold fires.
+    return;
   } else if (Prev->Op == OP_SUBNZCV) {
     // Pattern match a branch fed by a compare. We could also handle bit tests
     // here, but tbz/tbnz has a limited offset range which we don't have a way to

@@ -22,12 +22,27 @@
 ; (N=less, Z=equal, C=!less, V=unordered) instead of the x86-mapped layout
 ; AXFLAG would have produced.
 ;
-; That fold has never run on PPC64LE: it is only reachable with DFCE enabled,
-; and DFCE was off from 2026-05-11 to 2026-08-05. It makes the backend's
-; MapNZCVCC responsible for conditions (FGE, and in principle FLU) that
-; nothing else in the tree produces, evaluated against CR0/XER as written by
-; DEF_OP(FCmp) -- which lifts CR0.SO into XER.OV and !CR0.LT into XER.CA
-; precisely so this layout holds.
+; STATUS: the AXFLAG arm of FoldBranch is explicitly DISABLED (see the comment
+; in RedundantFlagCalculationElimination.cpp). It was already unreachable on
+; ppc64le -- a GuestOpcode marker is emitted before every guest instruction, so
+; FoldBranch's predecessor walk never sees the AXFLAG -- and when that walk was
+; temporarily taught to skip the marker, this file failed under jit_500_m:
+;   RAX (jae) = 0xE, expected 0x6   branch taken on UNORDERED
+;   RDI (jle) = 0xB, expected 0xA   branch taken on ordered LESS
+; i.e. two of the five remappable conditions are wrong. This file therefore
+; documents the correct x86 answers and is the acceptance test for anyone who
+; wants to re-enable the fold; today it passes via the ordinary
+; FCmp+AXFlag+CondJump path, which is itself worth pinning.
+;
+; The fold makes the backend's MapNZCVCC responsible for conditions (FGE, and
+; in principle FLU) that nothing else in the tree produces, evaluated against
+; CR0/XER as written by DEF_OP(FCmp) -- which lifts CR0.SO into XER.OV and
+; !CR0.LT into XER.CA precisely so the Arm NZCV layout holds. MapNZCVCC maps
+; FGE to PPC CC_GE ("CR0.LT clear"), which is true for NaN; Arm GE is N==V,
+; which is not. That is defect 1. Defect 2 is in the shared mapping table:
+; X86ToArmFloatCond maps SLE to SLE unchanged, but x86 `jle` after comiss means
+; "equal or unordered" (comiss forces SF=OF=0 and AXFLAG sets Z=Z|V) while Arm
+; LE on the raw fcmp flags is "equal or less or unordered".
 ;
 ; `comiss` + jcc is the only shape that reaches it: the dispatcher emits
 ; FCmp, StorePF, StoreAF, AXFlag in that order, and FoldBranch's predecessor
