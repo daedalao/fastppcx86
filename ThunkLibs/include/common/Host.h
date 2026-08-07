@@ -43,6 +43,44 @@ __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
 #include <mutex>
 #include <sys/mman.h>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+// Address ranges of the low-4GB trampoline pools allocated by
+// MakeLow32HostTrampoline below. Kept separately from that function's own
+// cache because the interesting query at the call site is the reverse one:
+// "is this 32-bit value one of ours?" See IsLow32HostTrampoline.
+struct Low32TrampolinePools {
+  std::mutex Mutex;
+  std::vector<std::pair<uintptr_t, uintptr_t>> Ranges; // [base, end)
+};
+
+inline Low32TrampolinePools& GetLow32TrampolinePools() {
+  static Low32TrampolinePools Pools;
+  return Pools;
+}
+
+/**
+ * True if Addr points into a low-4GB host trampoline minted by
+ * MakeLow32HostTrampoline - i.e. it is a *host*-executable stub that
+ * tail-calls a real host function, not a guest function pointer.
+ *
+ * Both kinds of value are 32 bits wide and both arrive at the host wrapper
+ * edge, so width alone cannot tell them apart. Getting this wrong is not
+ * subtle: treating one of our own trampolines as a guest callback replaces a
+ * working host call with a bounce into CallbackUnpack<Sig>::CallGuestPtr,
+ * whose body the compiler emits as a trap for most signatures.
+ */
+inline bool IsLow32HostTrampoline(uintptr_t Addr) {
+  auto& Pools = GetLow32TrampolinePools();
+  std::lock_guard lk {Pools.Mutex};
+  for (const auto& [Base, End] : Pools.Ranges) {
+    if (Addr >= Base && Addr < End) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Host function pointers handed to a 32-bit guest must fit in 32 bits: the
 // value doubles as the fake guest address the thunk machinery links
@@ -76,6 +114,13 @@ inline void* MakeLow32HostTrampoline(void* Target) {
       if (P != MAP_FAILED) {
         Pool = static_cast<uint8_t*>(P);
         PoolOff = 0;
+        {
+          // Record the range so IsLow32HostTrampoline can recognise these
+          // addresses when they come back through a host wrapper.
+          auto& Pools = GetLow32TrampolinePools();
+          std::lock_guard pool_lk {Pools.Mutex};
+          Pools.Ranges.emplace_back(reinterpret_cast<uintptr_t>(P), reinterpret_cast<uintptr_t>(P) + PoolSize);
+        }
         break;
       }
     }
@@ -852,9 +897,20 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
 #endif
     };
 
+    // CBIndex is sizeof...(GuestArgs), which indexes the *trailing* uintptr_t
+    // of PackedArguments - the dispatch target, not a callback parameter. For a
+    // name resolved through glXGetProcAddress that target is the value the host
+    // handed back, and on a 32-bit guest that is a low-4GB host trampoline
+    // (MakeLow32HostTrampoline) which is already directly host-callable. Only
+    // genuine guest function pointers need bridging; wrapping our own
+    // trampoline swaps a working host call for a jump into a trap body, which
+    // is a SIGILL at the first procaddr-dispatched GL call.
+    //
+    // 64-bit guests never hit this because fallback_wrap_enabled() is opt-in
+    // there; for 32-bit it is always on, so the check has to be explicit.
     if (fallback_wrap_enabled() && cb && FEX::HLE::LookupGuestCallbackUnpacker
 #ifdef IS_32BIT_THUNK
-        && (cb >> 32) == 0
+        && (cb >> 32) == 0 && !IsLow32HostTrampoline(cb)
 #endif
     ) {
       using Sig = Result(Args...);
