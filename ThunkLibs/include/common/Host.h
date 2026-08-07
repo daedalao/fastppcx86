@@ -619,8 +619,28 @@ struct host_to_guest_convertible {
 
   operator guest_layout<T>() const requires (std::is_pointer_v<T>)
   {
-    // TODO: Assert upper 32 bits are zero
     guest_layout<T> ret;
+#ifdef IS_32BIT_THUNK
+    // guest_layout<T*>::data is uint32_t here, so a host pointer above 4 GiB
+    // narrows silently. On ppc64le host VAs live at 0x3fff'xxxx'xxxx, so the
+    // guest would receive the low half of a real host mapping and dereference
+    // an unrelated low address — corruption with no fault at the point of
+    // failure, which is undebuggable downstream.
+    //
+    // The function-pointer path (guest_layout<T*>::operator= above) already
+    // dies here rather than truncate; do the same for data pointers. Values
+    // that legitimately reach this path are guest-side already (guest heap or
+    // stack, or a token from an opaque-handle registry) and fit in 32 bits.
+    //
+    // If this fires, the fix is a custom host impl for the offending function
+    // that returns guest-visible storage — see RelocateStringToGuestHeap in
+    // libGL_Host.cpp for the established pattern.
+    if ((reinterpret_cast<uintptr_t>(from.data) >> 32) != 0) {
+      // Plain fprintf+abort because LOGMAN_THROW headers aren't in this TU.
+      fprintf(stderr, "FEX FATAL: 32-bit truncation of host pointer %p returned to guest\n", (void*)from.data);
+      std::abort();
+    }
+#endif
     ret.data = reinterpret_cast<uintptr_t>(from.data);
     return ret;
   }
