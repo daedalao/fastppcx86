@@ -1301,10 +1301,14 @@ public:
   void vminsw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 898);  }
   void vminsd(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 962);  } // POWER8+
 
-  // Abs (POWER8+)
-  void vabsdub(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 19);  }
-  void vabsduh(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 83);  }
-  void vabsduw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 147); }
+  // Abs (POWER9+ / ISA 3.0 — NOT available on POWER8)
+  // XO values verified against llvm-mc -mcpu=pwr9: vabsdub 2,3,4 = 0x10432403.
+  // The previous 19/83/147 were the VX XO values shifted right by 6 (i.e. the
+  // ISA doc's opcode column misread); XO 19 is not a valid VX op at all, so
+  // those encodings would have taken a SIGILL on first execution.
+  void vabsdub(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1027); }
+  void vabsduh(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1091); }
+  void vabsduw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1155); }
 
   // Pack/unpack
   void vpkuhum(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 14);  }
