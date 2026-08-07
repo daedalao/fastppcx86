@@ -113,6 +113,12 @@ static void OnInit() {
   // glIs*-class predicates: unsigned int(unsigned int). Mangled FjjE. Same
   // failure mode as above in Ziggurat startup.
   RegisterGuestCallbackUnpacker<unsigned int(unsigned int)>();
+  // glXChooseFBConfig-class: GLXFBConfig*(Display*, unsigned, unsigned*,
+  // unsigned*). Mangled FPP16__GLXFBConfigRecP9_XDisplayjPjS4_E. Surfaced by
+  // Dex (Unity/Mono) during GLX setup: without it the wrap returns zero, the
+  // guest reports "No matching FBConfig found" and Mono aborts via tgkill
+  // before a window is ever created.
+  RegisterGuestCallbackUnpacker<GLXFBConfig*(Display*, unsigned int, unsigned int*, unsigned int*)>();
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
