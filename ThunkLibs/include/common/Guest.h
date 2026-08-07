@@ -237,7 +237,14 @@ inline void RegisterCallbackUnpacker(const char* signature_name, uintptr_t guest
     uint64_t signature_name;
     uint64_t guest_unpacker;
   };
-  args_t args = {reinterpret_cast<uint64_t>(signature_name), guest_unpacker};
+  // Go through uintptr_t rather than casting the pointer straight to uint64_t.
+  // On i386 a direct reinterpret_cast<uint64_t> of a pointer sign-extends, so
+  // any guest address with the high bit set - which is where the guest's
+  // libraries actually live, e.g. 0xf777d020 - arrives at the host as
+  // 0xfffffffff777d020 and faults the moment the host dereferences it.
+  // uintptr_t is unsigned and exactly pointer-width on both guests, so widening
+  // from it is a plain zero-extension.
+  args_t args = {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(signature_name)), static_cast<uint64_t>(guest_unpacker)};
   fexthunks_fex_register_callback_unpacker(&args);
 }
 
