@@ -61,6 +61,19 @@ struct host_layout<__GLXFBConfigRec*> {
 };
 
 guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from);
+
+// GLXContext (__GLXcontextRec*) is the same shape of problem: an opaque host
+// pointer the guest stores and hands back. Truncated, the server rejects the
+// context with GLXBadContext on X_GLXMakeCurrent, glGetString then returns
+// NULL and a Unity title throws out of std::string construction.
+template<>
+struct host_layout<__GLXcontextRec*> {
+  __GLXcontextRec* data;
+
+  host_layout(guest_layout<__GLXcontextRec*>&);
+};
+
+guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& from);
 #endif
 
 static X11Manager x11_manager;
@@ -132,52 +145,65 @@ guest_layout<_XDisplay*> to_guest(host_layout<_XDisplay*>) = delete;
 // per-screen set (a few hundred), the guest may hold one indefinitely, and
 // reusing a token would alias two configs.
 namespace {
-constexpr uint32_t FBConfigTokenBase = 0xFBC0'0000;
-constexpr uint32_t FBConfigTokenStride = 0x10;
+// One registry per handle type, each with its own token range so a handle of
+// the wrong type is caught rather than silently reinterpreted.
+template<typename T, uint32_t TokenBase>
+struct OpaqueHandleRegistry {
+  static constexpr uint32_t Stride = 0x10;
 
-std::mutex FBConfigMutex;
-std::vector<__GLXFBConfigRec*> FBConfigByIndex;
-std::unordered_map<__GLXFBConfigRec*, uint32_t> FBConfigToToken;
+  std::mutex Mutex;
+  std::vector<T*> ByIndex;
+  std::unordered_map<T*, uint32_t> ToToken;
 
-uint32_t TokenForFBConfig(__GLXFBConfigRec* Host) {
-  if (!Host) {
-    return 0;
+  uint32_t TokenFor(T* Host) {
+    if (!Host) {
+      return 0;
+    }
+    std::lock_guard lk {Mutex};
+    if (auto It = ToToken.find(Host); It != ToToken.end()) {
+      return It->second;
+    }
+    const uint32_t Token = TokenBase + static_cast<uint32_t>(ByIndex.size()) * Stride;
+    ByIndex.push_back(Host);
+    ToToken.emplace(Host, Token);
+    return Token;
   }
-  std::lock_guard lk {FBConfigMutex};
-  if (auto It = FBConfigToToken.find(Host); It != FBConfigToToken.end()) {
-    return It->second;
-  }
-  const uint32_t Token = FBConfigTokenBase + static_cast<uint32_t>(FBConfigByIndex.size()) * FBConfigTokenStride;
-  FBConfigByIndex.push_back(Host);
-  FBConfigToToken.emplace(Host, Token);
-  return Token;
-}
 
-__GLXFBConfigRec* FBConfigForToken(uint32_t Token) {
-  if (!Token) {
-    return nullptr;
+  T* ForToken(uint32_t Token) {
+    if (!Token) {
+      return nullptr;
+    }
+    std::lock_guard lk {Mutex};
+    const uint32_t Index = (Token - TokenBase) / Stride;
+    if (Token < TokenBase || Index >= ByIndex.size()) {
+      // Not one of ours. Pass it through rather than inventing a null: a guest
+      // that obtained a handle by some path we do not model should fail in the
+      // driver with its own diagnostics, not silently here.
+      return reinterpret_cast<T*>(static_cast<uintptr_t>(Token));
+    }
+    return ByIndex[Index];
   }
-  if (Token < FBConfigTokenBase) {
-    // Not one of ours. Pass it through rather than inventing a null: a guest
-    // that obtained a handle by some path we do not model should fail in the
-    // driver with its own diagnostics, not silently here.
-    return reinterpret_cast<__GLXFBConfigRec*>(static_cast<uintptr_t>(Token));
-  }
-  const size_t Index = (Token - FBConfigTokenBase) / FBConfigTokenStride;
-  std::lock_guard lk {FBConfigMutex};
-  if (Index >= FBConfigByIndex.size()) {
-    return reinterpret_cast<__GLXFBConfigRec*>(static_cast<uintptr_t>(Token));
-  }
-  return FBConfigByIndex[Index];
-}
+};
+
+OpaqueHandleRegistry<__GLXFBConfigRec, 0xFBC0'0000> FBConfigRegistry;
+OpaqueHandleRegistry<__GLXcontextRec, 0xC0C0'0000> ContextRegistry;
 } // namespace
 
 host_layout<__GLXFBConfigRec*>::host_layout(guest_layout<__GLXFBConfigRec*>& guest)
-  : data(FBConfigForToken(static_cast<uint32_t>(guest.data))) {}
+  : data(FBConfigRegistry.ForToken(static_cast<uint32_t>(guest.data))) {}
 
 guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from) {
   guest_layout<__GLXFBConfigRec*> Result {};
-  Result.data = TokenForFBConfig(from.data);
+  Result.data = FBConfigRegistry.TokenFor(from.data);
+  return Result;
+}
+
+host_layout<__GLXcontextRec*>::host_layout(guest_layout<__GLXcontextRec*>& guest)
+  : data(ContextRegistry.ForToken(static_cast<uint32_t>(guest.data))) {}
+
+guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& from) {
+  guest_layout<__GLXcontextRec*> Result {};
+  Result.data = ContextRegistry.TokenFor(from.data);
   return Result;
 }
 #endif
