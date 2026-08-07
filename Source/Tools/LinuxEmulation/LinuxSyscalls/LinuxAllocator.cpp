@@ -304,13 +304,23 @@ int MemAllocator32Bit::Munmap(void* addr, size_t length) {
     return 0;
   }
 
-  while (PageAddr != PageEnd) {
-    // Always pass to munmap, it may be something allocated we aren't tracking
-    int Result = ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT), FEXCore::Utils::FEX_PAGE_SIZE);
-    if (Result != 0) {
-      return -errno;
-    }
+  // Unmap the whole range in a single syscall.
+  //
+  // This used to loop one page at a time, which is semantically identical -
+  // munmap succeeds on ranges containing already-unmapped holes, and spans
+  // multiple VMAs fine - but cost one syscall per page. A 32-bit guest routes
+  // every munmap here (GuestMunmap dispatches on addr < 4GiB), so a glibc
+  // free() of one mmap-threshold chunk became hundreds of syscalls, all under
+  // AllocMutex and the caller's VMATracking lock. Measured on a 32-bit Unity
+  // title: ~5000 munmap(4096) per second across 16 threads, serializing them.
+  int Result = ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT),
+                        PagesLength << FEXCore::Utils::FEX_PAGE_SHIFT);
+  if (Result != 0) {
+    return -errno;
+  }
 
+  // Bookkeeping only, no syscalls: drop the pages from the tracking bitset.
+  while (PageAddr != PageEnd) {
     if (MappedPages.test(PageAddr)) {
       MappedPages.reset(PageAddr);
     }
