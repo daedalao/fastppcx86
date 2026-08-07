@@ -108,6 +108,12 @@ inline void* MakeLow32HostTrampoline(void* Target) {
     return It->second;
   }
   if (!Pool || PoolOff + TrampSize > PoolSize) {
+    // Drop the exhausted pool before scanning. Without this, an exhausted pool
+    // whose replacement mmap fails leaves Pool non-null, the `if (!Pool)` below
+    // does not fire, and we carve trampolines past the end of the mapping into
+    // whatever follows it - forever, with PoolOff growing unbounded.
+    Pool = nullptr;
+    PoolOff = 0;
     for (uintptr_t Addr = 0x7000'0000; Addr >= 0x1000'0000; Addr -= 0x100'0000) {
       void* P = ::mmap(reinterpret_cast<void*>(Addr), PoolSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -888,13 +894,32 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
     //   1. catch the SIGSEGV class while custom impls are being written, and
     //   2. surface "no unpacker registered for signature X" to identify which
     //      APIs still need custom impls.
+    // Opt-in on every configuration, including 32-bit.
+    //
+    // This block cannot be correct at this call site: CBIndex is
+    // sizeof...(GuestArgs), which indexes the TRAILING uintptr_t of
+    // PackedArguments - the dispatch target - and never a callback parameter.
+    // GuestWrapperForHostFunction::Call is only ever emitted into the
+    // host-funcptr invoker table (Generator/gen.cpp), i.e. the
+    // glXGetProcAddress -> LinkAddressToFunction path, so that trailing value
+    // is a host function pointer by construction. On a 32-bit guest it is a
+    // low-4GB trampoline from MakeLow32HostTrampoline, which is already
+    // directly callable.
+    //
+    // It used to be unconditionally on for IS_32BIT_THUNK, which meant every
+    // condition ahead of the range check passed on every call - (cb >> 32) == 0
+    // is always true precisely because we make these targets low - so a
+    // process-global lock and a linear scan ran on every procaddr-dispatched
+    // guest->host call on every thread. A thread preempted inside that critical
+    // section stalls the rest; Unity's GC/job handshake then times out and
+    // aborts. It reproduced under a 10-CPU taskset cage and not at 80.
+    //
+    // Keep it reachable for triage only: it is still the quickest way to
+    // surface "no unpacker registered for signature X" while writing a
+    // custom_host_impl.
     auto fallback_wrap_enabled = []() -> bool {
-#ifdef IS_32BIT_THUNK
-      return true;
-#else
       static const bool enabled = (getenv("FEX_THUNK_FALLBACK_LOG_ONLY") != nullptr);
       return enabled;
-#endif
     };
 
     // CBIndex is sizeof...(GuestArgs), which indexes the *trailing* uintptr_t

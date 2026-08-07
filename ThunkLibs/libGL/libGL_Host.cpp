@@ -57,7 +57,7 @@ template<>
 struct host_layout<__GLXFBConfigRec*> {
   __GLXFBConfigRec* data;
 
-  host_layout(guest_layout<__GLXFBConfigRec*>&);
+  host_layout(const guest_layout<__GLXFBConfigRec*>&);
 };
 
 guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from);
@@ -70,7 +70,7 @@ template<>
 struct host_layout<__GLXcontextRec*> {
   __GLXcontextRec* data;
 
-  host_layout(guest_layout<__GLXcontextRec*>&);
+  host_layout(const guest_layout<__GLXcontextRec*>&);
 };
 
 guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& from);
@@ -149,10 +149,9 @@ namespace {
 // the wrong type is caught rather than silently reinterpreted.
 template<typename T, uint32_t TokenBase>
 struct OpaqueHandleRegistry {
-  static constexpr uint32_t Stride = 0x10;
-
   std::mutex Mutex;
-  std::vector<T*> ByIndex;
+  // Index 0 is never handed out so that token 0 stays reserved for null.
+  std::vector<T*> ByIndex {nullptr};
   std::unordered_map<T*, uint32_t> ToToken;
 
   uint32_t TokenFor(T* Host) {
@@ -163,7 +162,7 @@ struct OpaqueHandleRegistry {
     if (auto It = ToToken.find(Host); It != ToToken.end()) {
       return It->second;
     }
-    const uint32_t Token = TokenBase + static_cast<uint32_t>(ByIndex.size()) * Stride;
+    const uint32_t Token = TokenBase + static_cast<uint32_t>(ByIndex.size());
     ByIndex.push_back(Host);
     ToToken.emplace(Host, Token);
     return Token;
@@ -174,14 +173,41 @@ struct OpaqueHandleRegistry {
       return nullptr;
     }
     std::lock_guard lk {Mutex};
-    const uint32_t Index = (Token - TokenBase) / Stride;
+    // Token maps 1:1 onto an index. An earlier version spaced tokens 16 apart
+    // while still dividing by that stride, so 15 of every 16 values in the
+    // range resolved to a real-but-wrong handle instead of being rejected -
+    // the opposite of the intent.
+    const uint32_t Index = Token - TokenBase;
     if (Token < TokenBase || Index >= ByIndex.size()) {
       // Not one of ours. Pass it through rather than inventing a null: a guest
       // that obtained a handle by some path we do not model should fail in the
       // driver with its own diagnostics, not silently here.
       return reinterpret_cast<T*>(static_cast<uintptr_t>(Token));
     }
+    // Null here means the handle was retired (see Retire) - the guest is using
+    // it after destroying it. Returning null makes the driver reject it;
+    // returning the old pointer would dereference freed memory.
     return ByIndex[Index];
+  }
+
+  // Drop a handle whose underlying object is being destroyed. The slot is
+  // kept (so later tokens keep their meaning) but emptied, and the pointer is
+  // un-interned so that an allocator reusing the address does not resurrect
+  // the retired token for a different object.
+  void Retire(T* Host) {
+    if (!Host) {
+      return;
+    }
+    std::lock_guard lk {Mutex};
+    auto It = ToToken.find(Host);
+    if (It == ToToken.end()) {
+      return;
+    }
+    const uint32_t Index = It->second - TokenBase;
+    if (Index < ByIndex.size()) {
+      ByIndex[Index] = nullptr;
+    }
+    ToToken.erase(It);
   }
 };
 
@@ -189,7 +215,7 @@ OpaqueHandleRegistry<__GLXFBConfigRec, 0xFBC0'0000> FBConfigRegistry;
 OpaqueHandleRegistry<__GLXcontextRec, 0xC0C0'0000> ContextRegistry;
 } // namespace
 
-host_layout<__GLXFBConfigRec*>::host_layout(guest_layout<__GLXFBConfigRec*>& guest)
+host_layout<__GLXFBConfigRec*>::host_layout(const guest_layout<__GLXFBConfigRec*>& guest)
   : data(FBConfigRegistry.ForToken(static_cast<uint32_t>(guest.data))) {}
 
 guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from) {
@@ -198,7 +224,7 @@ guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& f
   return Result;
 }
 
-host_layout<__GLXcontextRec*>::host_layout(guest_layout<__GLXcontextRec*>& guest)
+host_layout<__GLXcontextRec*>::host_layout(const guest_layout<__GLXcontextRec*>& guest)
   : data(ContextRegistry.ForToken(static_cast<uint32_t>(guest.data))) {}
 
 guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& from) {
@@ -221,7 +247,12 @@ static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t 
 }
 
 static void fexfn_impl_libGL_GL_SetGuestXGetVisualInfo(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
-  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXGetVisualInfo);
+  // Build into a temporary and publish with a release store. Other threads
+  // acquire-load this (MapToGuestVisualInfo); the trampoline body and its
+  // GuestcallInfo must be visible before the pointer that reaches them is.
+  decltype(x11_manager.GuestXGetVisualInfo) Fn {};
+  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &Fn);
+  __atomic_store_n(&x11_manager.GuestXGetVisualInfo, Fn, __ATOMIC_RELEASE);
 }
 
 static void fexfn_impl_libGL_GL_SetGuestXSync(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
@@ -668,21 +699,38 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
   //
   // The result is guest-allocated, so the guest's XFree owns it - which is
   // also what the caller of glXGetVisualFromFBConfig expects.
-  if (x11_manager.GuestXGetVisualInfo && GuestMalloc) {
+  // Acquire-load the callback pointer. It is published by a different thread
+  // (whichever one ran the guest lib's OnInit) and publishing it also writes
+  // trampoline bytes and a GuestcallInfo the callee dereferences. ppc64le is
+  // weakly ordered, so without this a reader can observe a non-null pointer
+  // while the memory behind it is not yet visible, and branch into garbage.
+  auto* GuestGetVisualInfo = __atomic_load_n(&x11_manager.GuestXGetVisualInfo, __ATOMIC_ACQUIRE);
+  auto* Malloc = __atomic_load_n(&GuestMalloc, __ATOMIC_ACQUIRE);
+
+  if (GuestGetVisualInfo && Malloc) {
     auto GuestDisplay = x11_manager.HostToGuestDisplay(HostDisplay);
     if (GuestDisplay.data) {
       // Both the template and the out-count must live in guest memory: the
       // callback runs as guest code and cannot write to a host address.
+      //
+      // There is no guest free() registered here - only GuestMalloc - so a
+      // per-call allocation would leak guest heap on every call, and a 32-bit
+      // guest only has 4GiB of it. One buffer per thread, allocated once and
+      // reused, keeps this bounded. It is thread_local because the callback
+      // writes through it and concurrent callers must not share.
       constexpr size_t TemplateSize = sizeof(guest_layout<XVisualInfo>);
-      auto* Scratch = static_cast<uint8_t*>(GuestMalloc(TemplateSize + sizeof(int)));
+      static thread_local uint8_t* Scratch = nullptr;
+      if (!Scratch) {
+        Scratch = static_cast<uint8_t*>(Malloc(TemplateSize + sizeof(int)));
+      }
       if (Scratch) {
         auto* Template = reinterpret_cast<guest_layout<XVisualInfo>*>(Scratch);
         auto* NumItems = reinterpret_cast<int*>(Scratch + TemplateSize);
         *Template = to_guest(to_host_layout(*HostInfo));
         *NumItems = 0;
 
-        auto* Ret = x11_manager.GuestXGetVisualInfo(reinterpret_cast<void*>(static_cast<uintptr_t>(GuestDisplay.data)),
-                                                    static_cast<guest_long>(VisualScreenMask | VisualIDMask), Template, NumItems);
+        auto* Ret = GuestGetVisualInfo(reinterpret_cast<void*>(static_cast<uintptr_t>(GuestDisplay.data)),
+                                       static_cast<guest_long>(VisualScreenMask | VisualIDMask), Template, NumItems);
         if (Ret && *NumItems >= 1) {
           x11_manager.HostXFree(HostInfo);
           return guest_layout<XVisualInfo*> {.data = static_cast<decltype(guest_layout<XVisualInfo*>::data)>(reinterpret_cast<uintptr_t>(Ret))};
@@ -735,6 +783,20 @@ guest_layout<XVisualInfo*> fexfn_impl_libGL_glXGetVisualFromFBConfigSGIX(Display
 
 guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display* Display, int Screen, int* Attributes) {
   return MapToGuestVisualInfo(Display, fexldr_ptr_libGL_glXChooseVisual(Display, Screen, Attributes));
+}
+
+void fexfn_impl_libGL_glXDestroyContext(Display* Display, GLXContext Context) {
+#if defined(IS_32BIT_THUNK)
+  // Retire the token before the object goes away. Without this the registry
+  // keeps handing out a pointer to freed memory, which Mesa will dereference -
+  // strictly worse than the truncation this token map replaced, because a
+  // truncated context was merely rejected with GLXBadContext. Un-interning also
+  // stops an allocator that reuses the address from resurrecting the retired
+  // token for a different context. SDL2 (hence Unity) creates a probe context,
+  // destroys it and creates the real one during startup, so this path runs.
+  ContextRegistry.Retire(Context);
+#endif
+  fexldr_ptr_libGL_glXDestroyContext(Display, Context);
 }
 
 GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVisualInfo*> Info, GLXContext ShareList, Bool Direct) {

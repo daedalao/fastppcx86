@@ -240,8 +240,12 @@ template<>
 struct fex_gen_config<glXQueryVersion> {};
 template<>
 struct fex_gen_config<glXCopyContext> {};
+// custom_host_impl so the 32-bit context token registry can retire the handle.
+// A token that outlives its context resolves to freed memory, which is worse
+// than the truncation it replaced: Mesa used to reject a truncated context with
+// GLXBadContext, but a retired-yet-resolvable one it will happily dereference.
 template<>
-struct fex_gen_config<glXDestroyContext> {};
+struct fex_gen_config<glXDestroyContext> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXDestroyGLXPixmap> {};
 template<>
