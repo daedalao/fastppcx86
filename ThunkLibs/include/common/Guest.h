@@ -101,14 +101,19 @@ inline void LinkAddressToFunction(uintptr_t addr, uintptr_t target) {
 }
 
 inline bool IsLibLoaded(const char* libname) {
+  // Field widths must match the host-side struct in Thunks.cpp, which is
+  // always compiled 64-bit. A bare `const char*` here puts `rv` at offset 4
+  // on an i686 guest while the host writes it at offset 8 — the host would
+  // scribble one byte past this struct and the guest would read padding.
+  // uintptr_t zero-extends on i686, so no sign-extension hazard.
   struct {
-    const char* Name;
-    bool rv;
-  } argsrv = {libname};
+    uint64_t Name;
+    uint8_t rv;
+  } argsrv = {reinterpret_cast<uintptr_t>(libname), 0};
 
   fexthunks_fex_is_lib_loaded(&argsrv);
 
-  return argsrv.rv;
+  return argsrv.rv != 0;
 }
 
 // Helper template that packs the given arguments and invokes a thunk at the
@@ -256,11 +261,12 @@ inline void RegisterGuestCallbackUnpacker() {
 }
 
 inline bool IsHostHeapAllocation(void* ptr) {
+  // Same host/guest layout constraint as IsLibLoaded above.
   struct {
-    void* ptr;
-    bool rv;
-  } args = {ptr, {}};
+    uint64_t ptr;
+    uint8_t rv;
+  } args = {reinterpret_cast<uintptr_t>(ptr), 0};
 
   fexthunks_fex_is_host_heap_allocation(&args);
-  return args.rv;
+  return args.rv != 0;
 }
