@@ -3208,12 +3208,30 @@ template<>
 struct fex_gen_config<glMap2f> {};
 template<>
 struct fex_gen_config<glMap2xOES> {};
+#ifndef IS_32BIT_THUNK
+// TODO: 32-bit support
+//
+// These return a host pointer into the driver's mapped buffer object. The
+// generated unpacker funnels the return value through
+// host_to_guest_convertible::operator guest_layout<T*>(), which narrows it to
+// uint32_t. Host VAs live at 0x3fff'xxxx'xxxx on ppc64le, so the guest would
+// receive the low half of a real mapping and write vertex/index data into an
+// unrelated low address — silent guest-memory corruption with no fault at the
+// point of failure.
+//
+// Unlike the string-returning entry points (glGetString and friends below),
+// there is no cheap relocate-to-guest-heap fix: the buffer is written by the
+// guest and must be visible to the driver until glUnmapBuffer. Doing this
+// properly needs a custom host impl that hands back guest-visible storage and
+// copies it back on unmap. Until then, do not expose a knowingly-broken entry
+// point to 32-bit guests.
 template<>
 struct fex_gen_config<glMapBufferARB> {};
 template<>
 struct fex_gen_config<glMapBuffer> {};
 template<>
 struct fex_gen_config<glMapBufferRange> {};
+#endif
 template<>
 struct fex_gen_config<glMapControlPointsNV> {};
 template<>
@@ -3228,6 +3246,8 @@ template<>
 struct fex_gen_config<glMapGrid2f> {};
 template<>
 struct fex_gen_config<glMapGrid2xOES> {};
+#ifndef IS_32BIT_THUNK
+// TODO: 32-bit support — same truncated-host-pointer return as glMapBuffer above.
 template<>
 struct fex_gen_config<glMapNamedBufferEXT> {};
 template<>
@@ -3238,12 +3258,16 @@ template<>
 struct fex_gen_config<glMapNamedBufferRange> {};
 template<>
 struct fex_gen_config<glMapObjectBufferATI> {};
+#endif
 template<>
 struct fex_gen_config<glMapParameterfvNV> {};
 template<>
 struct fex_gen_config<glMapParameterivNV> {};
+#ifndef IS_32BIT_THUNK
+// TODO: 32-bit support — same truncated-host-pointer return as glMapBuffer above.
 template<>
 struct fex_gen_config<glMapTexture2DINTEL> {};
+#endif
 template<>
 struct fex_gen_config<glMapVertexAttrib1dAPPLE> {};
 template<>
