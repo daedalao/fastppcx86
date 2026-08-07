@@ -458,6 +458,10 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
         ERROR_AND_DIE_FMT("Failed to allocate 32-bit host trampoline page (errno {})",
                           -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
       }
+      // Tell the allocator these pages are host-owned so a guest MAP_FIXED,
+      // munmap or MREMAP_FIXED cannot replace the trampolines we are about to
+      // write here and have the host branch into guest bytes.
+      Alloc->ReserveHostRange(reinterpret_cast<uintptr_t>(Result), ThunkHandler->HostTrampolineInstanceDataAvailable);
       ThunkHandler->HostTrampolineInstanceDataPtr = static_cast<uint8_t*>(Result);
     } else {
       ThunkHandler->HostTrampolineInstanceDataPtr = (uint8_t*)mmap(0, ThunkHandler->HostTrampolineInstanceDataAvailable,
@@ -626,6 +630,25 @@ FEX_DEFAULT_VISIBILITY uintptr_t LookupGuestCallbackUnpacker(const char* signatu
   std::shared_lock lk(handler->CallbackUnpackerByNameMutex);
   auto it = handler->CallbackUnpackerByName.find(fextl::string {signature_name});
   return (it == handler->CallbackUnpackerByName.end()) ? 0 : it->second;
+}
+
+/**
+ * Register a low-4GB page range minted by a host thunk library (the
+ * MakeLow32HostTrampoline pool in ThunkLibs/include/common/Host.h) as
+ * host-owned, so the guest's 32-bit allocator refuses to replace it.
+ *
+ * That pool is raw-mmap'd from inside the host .so, which has no access to the
+ * allocator; this weak-symbol entry is how it reaches us. Without it the pages
+ * are invisible to every explicit-address guest request.
+ */
+FEX_DEFAULT_VISIBILITY void ReserveLow32HostRange(uintptr_t Base, size_t Length) {
+  if (!FEX::HLE::_SyscallHandler || FEX::HLE::_SyscallHandler->Is64BitMode()) {
+    return;
+  }
+  auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
+  if (Alloc) {
+    Alloc->ReserveHostRange(Base, Length);
+  }
 }
 
 FEX_DEFAULT_VISIBILITY void* GetGuestStack() {

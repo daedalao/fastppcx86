@@ -34,6 +34,12 @@ __attribute__((weak)) HostToGuestTrampolinePtr* FinalizeHostTrampolineForGuestFu
 // on cross-arch builds to bridge a guest VA into a host trampoline.
 __attribute__((weak)) uintptr_t LookupGuestCallbackUnpacker(const char* signature_name);
 
+// Registers a low-4GB range minted inside a host thunk library as host-owned,
+// so the guest's 32-bit allocator refuses to service a MAP_FIXED / munmap /
+// MREMAP_FIXED that would replace it (see Thunks.cpp). Weak: a host lib
+// dlopened outside FEX simply skips the registration.
+__attribute__((weak)) void ReserveLow32HostRange(uintptr_t Base, size_t Length);
+
 __attribute__((weak)) void* GetGuestStack();
 
 __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
@@ -126,6 +132,13 @@ inline void* MakeLow32HostTrampoline(void* Target) {
           auto& Pools = GetLow32TrampolinePools();
           std::lock_guard pool_lk {Pools.Mutex};
           Pools.Ranges.emplace_back(reinterpret_cast<uintptr_t>(P), reinterpret_cast<uintptr_t>(P) + PoolSize);
+        }
+        // Claim the pages in the guest's 32-bit allocator as well. MAP_FIXED_
+        // NOREPLACE above only loses races against mappings that already
+        // exist; it does nothing about a guest MAP_FIXED or munmap arriving
+        // later, which would replace host instructions we still branch to.
+        if (FEX::HLE::ReserveLow32HostRange) {
+          FEX::HLE::ReserveLow32HostRange(reinterpret_cast<uintptr_t>(P), PoolSize);
         }
         break;
       }
