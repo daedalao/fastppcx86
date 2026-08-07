@@ -446,17 +446,25 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
       auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
       auto* Result = Alloc->Mmap(nullptr, ThunkHandler->HostTrampolineInstanceDataAvailable,
                                  PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      LOGMAN_THROW_A_FMT(!FEX::HLE::HasSyscallError(reinterpret_cast<uint64_t>(Result)),
-                         "Failed to allocate 32-bit host trampoline page (errno {})",
-                         -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
-      LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(Result) >> 32) == 0,
-                         "32-bit trampoline allocator returned a >4 GiB address {:#x}",
-                         reinterpret_cast<uintptr_t>(Result));
+      // ERROR_AND_DIE_FMT, not LOGMAN_THROW_A_FMT: the latter compiles to
+      // nothing unless ASSERTIONS_ENABLED is set, which CMake only does for
+      // DEBUG builds. On failure Alloc->Mmap returns -errno, which would sail
+      // through an inert guard and be memcpy'd into below as a pointer.
+      //
+      // The allocator cannot return an address above 4 GiB (it rejects
+      // Addr+length > UINT32_MAX and its page scan is bounded), so that case
+      // needs no runtime check beyond this one.
+      if (FEX::HLE::HasSyscallError(reinterpret_cast<uint64_t>(Result))) {
+        ERROR_AND_DIE_FMT("Failed to allocate 32-bit host trampoline page (errno {})",
+                          -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
+      }
       ThunkHandler->HostTrampolineInstanceDataPtr = static_cast<uint8_t*>(Result);
     } else {
       ThunkHandler->HostTrampolineInstanceDataPtr = (uint8_t*)mmap(0, ThunkHandler->HostTrampolineInstanceDataAvailable,
                                                                    PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      LOGMAN_THROW_A_FMT(ThunkHandler->HostTrampolineInstanceDataPtr != MAP_FAILED, "Failed to mmap HostTrampolineInstanceDataPtr");
+      if (ThunkHandler->HostTrampolineInstanceDataPtr == MAP_FAILED) {
+        ERROR_AND_DIE_FMT("Failed to mmap HostTrampolineInstanceDataPtr");
+      }
     }
   }
 
