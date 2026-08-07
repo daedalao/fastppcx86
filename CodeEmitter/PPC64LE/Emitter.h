@@ -381,9 +381,16 @@ public:
   }
 
   // rlwnm RA, RS, RB, MB, ME  (rotate left word then and mask, opcode 23)
+  // MB and ME are 5-bit fields. assert() is inert in release builds, and this
+  // is the only rotate helper that splices its mask fields unmasked — an
+  // out-of-range MB would bleed into RB and silently change the source
+  // register, which is exactly the failure EmitM's guard was added to stop
+  // (see the SH=32 bug referenced there). Guard loudly *and* mask, so a
+  // release build degrades to a wrong mask rather than a wrong register.
   void rlwnm(GPR ra, GPR rs, GPR rb, uint32_t mb, uint32_t me) {
-    assert(mb < 32 && me < 32);
-    Emit32((23u << 26) | (rs.idx << 21) | (ra.idx << 16) | (rb.idx << 11) | (mb << 6) | (me << 1) | 0u);
+    LOGMAN_THROW_A_FMT(mb < 32, "rlwnm MB out of range: {}", mb);
+    LOGMAN_THROW_A_FMT(me < 32, "rlwnm ME out of range: {}", me);
+    Emit32((23u << 26) | (rs.idx << 21) | (ra.idx << 16) | (rb.idx << 11) | ((mb & 0x1F) << 6) | ((me & 0x1F) << 1) | 0u);
   }
 
   // rldicl RA, RS, SH, MB  (rotate left doubleword then clear left, opcode 30, XO=0)
