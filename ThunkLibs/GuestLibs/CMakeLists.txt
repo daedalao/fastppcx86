@@ -266,11 +266,17 @@ if (BITNESS EQUAL 64)
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
 
+  # libdrm stays 64-bit-guest only until its 32-bit host-side repacking and
+  # guest-heap relocation land. See ThunkLibs/HostLibs/CMakeLists.txt.
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
   add_guest_lib(drm "libdrm.so.2")
+endif()
 
+# libxshmfence: 32-bit support added 2026-08-07 for the guest Mesa/DRI3 stack
+# used by 32-bit Unity titles.
+if (BITNESS EQUAL 32 OR BITNESS EQUAL 64)
   generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp)
   add_guest_lib(xshmfence "libxshmfence.so.1")
 endif()

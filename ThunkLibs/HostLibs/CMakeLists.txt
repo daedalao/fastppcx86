@@ -153,13 +153,14 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # add_host_lib(SDL2 ${GUEST_BITNESS})
   # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
 
+  # libdrm stays 64-bit-guest only until the 32-bit host-side work lands: the
+  # interface carries the repacking annotations but the matching
+  # fex_custom_repack_entry/exit and the guest-heap relocation for the
+  # host-allocated drmDevice/drmVersion returns are not implemented yet.
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
-
-  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(xshmfence ${GUEST_BITNESS})
 endforeach()
 
 # These libs support both guest bitnesses. Generating the 32-bit variants requires thunkgen to parse
@@ -175,6 +176,12 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
     add_host_lib(fex_thunk_test ${GUEST_BITNESS})
   endif()
+
+  # libxshmfence: 32-bit support added 2026-08-07 for the guest Mesa/DRI3 stack
+  # used by 32-bit Unity titles. Handles are translated through an opaque-handle
+  # token registry on 32-bit; see ThunkLibs/libxshmfence/Host.cpp.
+  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp ${GUEST_BITNESS})
+  add_host_lib(xshmfence ${GUEST_BITNESS})
 
   generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
   target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
