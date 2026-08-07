@@ -652,48 +652,6 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
   // fixed afterwards (f34dbdb9d, 62ea24ce4, b21ee0205, 58973e69e), and
   // RelocateArrayToGuestHeap has been using GuestMalloc successfully since.
   // Use it here too - a single-element relocation is exactly what it does.
-  //
-  // ...but a byte-for-byte relocation is not enough, because XVisualInfo has a
-  // `Visual* visual` member that points into the *host* Xlib's connection
-  // state. Relocating the struct converts the layout and truncates that
-  // member, and the guest then hands it to its own libX11: XCreateColormap
-  // dereferences visual->visualid and segfaults. Dex died exactly there once
-  // FBConfig selection started working.
-  //
-  // A Visual belongs to the connection that produced it, so the only correct
-  // answer is one minted by the *guest's* Xlib. Re-query it there by screen +
-  // visualid, which is the mirror of what LookupHostVisualInfo already does in
-  // the other direction. GuestXGetVisualInfo has been registered for this
-  // since the X11Manager was written but had no caller until now.
-  //
-  // The result is guest-allocated, so the guest's XFree owns it - which is
-  // also what the caller of glXGetVisualFromFBConfig expects.
-  if (x11_manager.GuestXGetVisualInfo && GuestMalloc) {
-    auto GuestDisplay = x11_manager.HostToGuestDisplay(HostDisplay);
-    if (GuestDisplay.data) {
-      // Both the template and the out-count must live in guest memory: the
-      // callback runs as guest code and cannot write to a host address.
-      constexpr size_t TemplateSize = sizeof(guest_layout<XVisualInfo>);
-      auto* Scratch = static_cast<uint8_t*>(GuestMalloc(TemplateSize + sizeof(int)));
-      if (Scratch) {
-        auto* Template = reinterpret_cast<guest_layout<XVisualInfo>*>(Scratch);
-        auto* NumItems = reinterpret_cast<int*>(Scratch + TemplateSize);
-        *Template = to_guest(to_host_layout(*HostInfo));
-        *NumItems = 0;
-
-        auto* Ret = x11_manager.GuestXGetVisualInfo(reinterpret_cast<void*>(static_cast<uintptr_t>(GuestDisplay.data)),
-                                                    static_cast<guest_long>(VisualScreenMask | VisualIDMask), Template, NumItems);
-        if (Ret && *NumItems >= 1) {
-          x11_manager.HostXFree(HostInfo);
-          return guest_layout<XVisualInfo*> {.data = static_cast<decltype(guest_layout<XVisualInfo*>::data)>(reinterpret_cast<uintptr_t>(Ret))};
-        }
-        // Fall through to the relocating path on a miss rather than failing
-        // the call: a caller that only reads depth/class still works, and a
-        // hard failure here would regress titles that never touch `visual`.
-      }
-    }
-  }
-
   return RelocateArrayToGuestHeap(HostInfo, 1);
 }
 
