@@ -555,14 +555,26 @@ public:
     Emit32((19u << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (193u << 1));
   }
 
-  // crnot BT, BA = crxor BT, BA, BA
-  void crnot(uint32_t bt, uint32_t ba) { crxor(bt, ba, ba); }
+  // creqv BT, BA, BB  (XO 289)
+  void creqv(uint32_t bt, uint32_t ba, uint32_t bb) {
+    Emit32((19u << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (289u << 1));
+  }
+
+  // crnot BT, BA = crnor BT, BA, BA
+  // NOT crxor BT, BA, BA: a bit XORed with itself is always 0, which is crclr.
+  // Matches what gas emits for the `crnot` extended mnemonic.
+  void crnot(uint32_t bt, uint32_t ba) { crnor(bt, ba, ba); }
 
   // crmove BT, BA = cror BT, BA, BA
   void crmove(uint32_t bt, uint32_t ba) { cror(bt, ba, ba); }
 
-  // crset BT = cror BT, BT, BT (sets bit in CR)
-  void crset(uint32_t bt) { cror(bt, bt, bt); }
+  // crset BT = creqv BT, BT, BT (sets bit in CR)
+  // NOT cror BT, BT, BT: a bit ORed with itself is unchanged, which is a no-op.
+  // A bit XNORed with itself is always 1, which is what "set" needs.
+  void crset(uint32_t bt) { creqv(bt, bt, bt); }
+
+  // crclr BT = crxor BT, BT, BT (clears bit in CR)
+  void crclr(uint32_t bt) { crxor(bt, bt, bt); }
 
   // crnand BT, BA, BB  (XO 225)
   void crnand(uint32_t bt, uint32_t ba, uint32_t bb) {
