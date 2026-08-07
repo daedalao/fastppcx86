@@ -777,6 +777,13 @@ auto Projection(guest_layout<T>& data) {
  *    VA and either fault or read garbage. Allocate on the guest stack instead.
  */
 class GuestStackBumpAllocator final {
+  // Cap on how far below the entry stack pointer New() will bump. Packed
+  // argument frames are tens of bytes, so anything approaching this is a
+  // runaway. Without a bound New() walks off the bottom of the guest stack
+  // mapping and the placement-new below writes into whatever follows it,
+  // which on a guest thread stack is another thread's guard page or heap.
+  static constexpr uintptr_t MaxBytes = 64 * 1024;
+
   uintptr_t Top = reinterpret_cast<uintptr_t>(FEX::HLE::GetGuestStack());
   uintptr_t Next = Top;
 
@@ -789,6 +796,13 @@ public:
   T* New(Args&&... args) {
     Next -= sizeof(T);
     Next &= ~uintptr_t {alignof(T) - 1};
+    // Next > Top catches the wrap when Top is small; the second test catches
+    // the runaway. Plain fprintf+abort because LOGMAN_THROW headers aren't in
+    // this TU.
+    if (Next > Top || Top - Next > MaxBytes) {
+      fprintf(stderr, "FEX FATAL: guest stack bump allocator overran %zu bytes below guest SP %#zx\n", size_t(Top - Next), size_t(Top));
+      std::abort();
+    }
     FEX::HLE::MoveGuestStack(Next);
     return new (reinterpret_cast<void*>(Next)) T {std::forward<Args>(args)...};
   }
