@@ -13,11 +13,13 @@
 #include <FEXCore/fextl/fmt.h>
 
 #include <chrono>
+#include <limits>
 #include <cstdio>
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #if defined(__powerpc64__) || defined(ARCHITECTURE_ppc64le)
 #include <sys/platform/ppc.h>  // __ppc_get_timebase_freq
 #endif
@@ -41,9 +43,27 @@ namespace {
 // aborts with "free(): invalid pointer".
 //
 // Implementation mirrors the kernel's `exit_robust_list` walk, restricted to
-// the 32-bit list-head and list-entry layout. We're in the same address space
-// as the guest, so direct dereferences work; the thread has already exited by
-// the time DestroyThread runs so there is no concurrent guest mutation.
+// the 32-bit list-head and list-entry layout.
+//
+// Every read of this list must be fault-tolerant. It used to dereference the
+// guest pointers directly, on the reasoning that we share the address space
+// and the thread had already exited so nothing could mutate concurrently.
+// Both halves of that are wrong: the nodes live in guest memory that *other*
+// threads can unmap or recycle (a detached thread's stack is freed by the
+// guest, not by us), and the list itself is guest-controlled data that may be
+// torn or stale. The kernel walks the same list with get_user() and tolerates
+// -EFAULT for exactly this reason.
+//
+// The consequence of getting it wrong is not a guest fault: FEX owns SIGSEGV,
+// so a bad load here is taken as a *guest* fault while executing host code and
+// takes the whole process down. Observed as SIGSEGV in HandleThreadDeletion on
+// i686 titles during worker-thread teardown, with the faulting instruction
+// being the `rldicl` zero-extend of a guest address followed by its load.
+//
+// process_vm_readv against our own pid returns -EFAULT for an unmapped source
+// rather than raising a signal, which gives us the get_user() semantics the
+// kernel has. It is a syscall per read, but this runs once per thread exit
+// over a handful of nodes, not on any hot path.
 
 constexpr uint32_t FEX_FUTEX_TID_MASK = 0x3FFFFFFFu;
 constexpr uint32_t FEX_FUTEX_WAITERS = 0x80000000u;
@@ -56,7 +76,31 @@ struct robust_list_head_32 {
   uint32_t list_op_pending;
 };
 
+// Fault-tolerant read of `Len` bytes of guest memory. Returns false (leaving
+// *Out untouched) if the source is not readable, instead of raising SIGSEGV.
+bool SafeReadGuest(uint32_t GuestAddr, void* Out, size_t Len) {
+  if (!GuestAddr) {
+    return false;
+  }
+  const iovec Local {.iov_base = Out, .iov_len = Len};
+  const iovec Remote {.iov_base = reinterpret_cast<void*>(static_cast<uintptr_t>(GuestAddr)), .iov_len = Len};
+  return ::process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0) == static_cast<ssize_t>(Len);
+}
+
+bool SafeRead32(uint32_t GuestAddr, uint32_t* Out) {
+  return SafeReadGuest(GuestAddr, Out, sizeof(*Out));
+}
+
 void HandleFutexDeath(uint32_t* uaddr, uint32_t exiting_tid) {
+  // Probe first: an unreadable futex word means the guest already tore this
+  // mapping down, and there is nothing left to hand off. The CAS below still
+  // races in principle, but the window is now a mapping being unmapped between
+  // the probe and the CAS rather than the whole list being suspect.
+  uint32_t Probe;
+  if (!SafeReadGuest(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(uaddr)), &Probe, sizeof(Probe))) {
+    return;
+  }
+
   uint32_t val = __atomic_load_n(uaddr, __ATOMIC_RELAXED);
   while ((val & FEX_FUTEX_TID_MASK) == exiting_tid) {
     uint32_t new_val = (val & FEX_FUTEX_WAITERS) | FEX_FUTEX_OWNER_DIED;
@@ -72,20 +116,32 @@ void HandleFutexDeath(uint32_t* uaddr, uint32_t exiting_tid) {
 
 void WalkAndCleanupRobustList32(uint32_t head_addr, uint32_t exiting_tid) {
   if (!head_addr) return;
-  auto* head = reinterpret_cast<robust_list_head_32*>(
-    static_cast<uintptr_t>(head_addr));
 
-  uint32_t pending = head->list_op_pending;
-  int32_t  offset  = head->futex_offset;
-  uint32_t cur     = head->next;
+  // Read the head as one unit. If it is gone there is no list to walk.
+  robust_list_head_32 head {};
+  if (!SafeReadGuest(head_addr, &head, sizeof(head))) {
+    return;
+  }
+
+  uint32_t pending = head.list_op_pending;
+  int32_t  offset  = head.futex_offset;
+  uint32_t cur     = head.next;
   int iters = 0;
-  while (cur != head_addr && iters++ < ROBUST_LIST_MAX_ITERS) {
-    auto* entry = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cur));
-    uint32_t next = entry[0];
+  while (cur != head_addr && cur != 0 && iters++ < ROBUST_LIST_MAX_ITERS) {
+    // The link read is the one that faulted in the field: a node whose memory
+    // the guest has already reclaimed. Stop the walk rather than die.
+    uint32_t next;
+    if (!SafeRead32(cur, &next)) {
+      return;
+    }
     if (cur != pending) {
-      auto* futex = reinterpret_cast<uint32_t*>(
-        static_cast<uintptr_t>(cur) + static_cast<intptr_t>(offset));
-      HandleFutexDeath(futex, exiting_tid);
+      // offset is guest-controlled and signed; compute in 64-bit so a hostile
+      // or corrupt value cannot wrap the address, and require the result to
+      // still be a 32-bit guest address.
+      const int64_t FutexAddr = static_cast<int64_t>(cur) + static_cast<int64_t>(offset);
+      if (FutexAddr > 0 && FutexAddr <= std::numeric_limits<uint32_t>::max()) {
+        HandleFutexDeath(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(FutexAddr)), exiting_tid);
+      }
     }
     cur = next;
   }
@@ -93,9 +149,10 @@ void WalkAndCleanupRobustList32(uint32_t head_addr, uint32_t exiting_tid) {
   // list_op_pending captures a mutex that was being added/removed when the
   // thread died — must be handled even though it's not yet in the linked list.
   if (pending) {
-    auto* futex = reinterpret_cast<uint32_t*>(
-      static_cast<uintptr_t>(pending) + static_cast<intptr_t>(offset));
-    HandleFutexDeath(futex, exiting_tid);
+    const int64_t FutexAddr = static_cast<int64_t>(pending) + static_cast<int64_t>(offset);
+    if (FutexAddr > 0 && FutexAddr <= std::numeric_limits<uint32_t>::max()) {
+      HandleFutexDeath(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(FutexAddr)), exiting_tid);
+    }
   }
 }
 } // namespace
