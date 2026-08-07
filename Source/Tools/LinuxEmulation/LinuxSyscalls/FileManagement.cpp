@@ -101,6 +101,18 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
         for (auto Prefix : LibPrefixes) {
           PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib"));
         }
+      } else {
+        // The mirror image of the above: Arch ships 32-bit libraries in /usr/lib32
+        // (with /lib32 symlinked to it), not in the "lib" folder this branch
+        // assumes for 32-bit. Without an explicit "lib32" entry the overlay map
+        // never matches, so a 32-bit guest loads the rootfs's own libGL/libvulkan
+        // and runs the entire Mesa driver stack under emulation - correct output,
+        // but the host GPU is never reached and the frame loop is CPU-bound.
+        // Measured on a 32-bit Unity title before this fix: ~99% of cycles in
+        // translated code with the GPU at ~5%.
+        for (auto Prefix : LibPrefixes) {
+          PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib32"));
+        }
       }
     }
 
