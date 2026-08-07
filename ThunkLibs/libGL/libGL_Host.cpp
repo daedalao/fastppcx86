@@ -11,6 +11,7 @@ $end_info$
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
@@ -35,6 +36,32 @@ struct host_layout<_XDisplay*> {
 
   ~host_layout();
 };
+
+#if defined(IS_32BIT_THUNK)
+// GLXFBConfig is an opaque handle that is really a host pointer
+// (__GLXFBConfigRec* living at 0x3fff'xxxx'xxxx on ppc64le). Storing one in a
+// 32-bit guest slot truncates it, and unlike a truncated string pointer the
+// damage is silent and total: the guest hands the truncated value straight
+// back to glXGetFBConfigAttrib, every attribute reads 0, and the config it
+// then selects is rejected by the server with GLXBadFBConfig.
+//
+// Hand out a stable 32-bit token instead and translate back on the way in.
+// The guest never dereferences these - GLX defines them as opaque - so the
+// token only has to be unique, stable (applications compare handles for
+// identity), and distinguishable from a real value.
+//
+// Hooking host_layout/to_guest rather than individual entry points means
+// every generated wrapper that takes or returns a GLXFBConfig is covered,
+// including ones reached through glXGetProcAddress.
+template<>
+struct host_layout<__GLXFBConfigRec*> {
+  __GLXFBConfigRec* data;
+
+  host_layout(guest_layout<__GLXFBConfigRec*>&);
+};
+
+guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from);
+#endif
 
 static X11Manager x11_manager;
 
@@ -94,6 +121,66 @@ host_layout<_XDisplay*>::~host_layout() {
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
 guest_layout<_XDisplay*> to_guest(host_layout<_XDisplay*>) = delete;
+
+#if defined(IS_32BIT_THUNK)
+// Token registry backing the GLXFBConfig handle translation declared above.
+//
+// Tokens are drawn from a range that cannot collide with a real 32-bit guest
+// pointer value the guest might hand us: the guest's own address space is
+// populated well below this, and these values are never dereferenced by
+// either side. Entries are never retired - GLXFBConfigs are a small fixed
+// per-screen set (a few hundred), the guest may hold one indefinitely, and
+// reusing a token would alias two configs.
+namespace {
+constexpr uint32_t FBConfigTokenBase = 0xFBC0'0000;
+constexpr uint32_t FBConfigTokenStride = 0x10;
+
+std::mutex FBConfigMutex;
+std::vector<__GLXFBConfigRec*> FBConfigByIndex;
+std::unordered_map<__GLXFBConfigRec*, uint32_t> FBConfigToToken;
+
+uint32_t TokenForFBConfig(__GLXFBConfigRec* Host) {
+  if (!Host) {
+    return 0;
+  }
+  std::lock_guard lk {FBConfigMutex};
+  if (auto It = FBConfigToToken.find(Host); It != FBConfigToToken.end()) {
+    return It->second;
+  }
+  const uint32_t Token = FBConfigTokenBase + static_cast<uint32_t>(FBConfigByIndex.size()) * FBConfigTokenStride;
+  FBConfigByIndex.push_back(Host);
+  FBConfigToToken.emplace(Host, Token);
+  return Token;
+}
+
+__GLXFBConfigRec* FBConfigForToken(uint32_t Token) {
+  if (!Token) {
+    return nullptr;
+  }
+  if (Token < FBConfigTokenBase) {
+    // Not one of ours. Pass it through rather than inventing a null: a guest
+    // that obtained a handle by some path we do not model should fail in the
+    // driver with its own diagnostics, not silently here.
+    return reinterpret_cast<__GLXFBConfigRec*>(static_cast<uintptr_t>(Token));
+  }
+  const size_t Index = (Token - FBConfigTokenBase) / FBConfigTokenStride;
+  std::lock_guard lk {FBConfigMutex};
+  if (Index >= FBConfigByIndex.size()) {
+    return reinterpret_cast<__GLXFBConfigRec*>(static_cast<uintptr_t>(Token));
+  }
+  return FBConfigByIndex[Index];
+}
+} // namespace
+
+host_layout<__GLXFBConfigRec*>::host_layout(guest_layout<__GLXFBConfigRec*>& guest)
+  : data(FBConfigForToken(static_cast<uint32_t>(guest.data))) {}
+
+guest_layout<__GLXFBConfigRec*> to_guest(const host_layout<__GLXFBConfigRec*>& from) {
+  guest_layout<__GLXFBConfigRec*> Result {};
+  Result.data = TokenForFBConfig(from.data);
+  return Result;
+}
+#endif
 
 #if defined(IS_32BIT_THUNK)
 // Same tripwire discipline for the GL/GLX string-return family. Any *future*
