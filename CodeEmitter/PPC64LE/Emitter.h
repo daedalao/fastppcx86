@@ -1360,8 +1360,11 @@ public:
   void vpermxor   (VR vrt, VR vra, VR vrb, VR vrc)    { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 45); }
 
   // mfvscr / mtvscr
-  void mfvscr(VR vrt) { Emit32((4u<<26)|(vrt.idx<<21)|(0<<16)|(0<<11)|(1540u<<1)); }
-  void mtvscr(VR vrb) { Emit32((4u<<26)|(0<<21)|(0<<16)|(vrb.idx<<11)|(1604u<<1)); }
+  // VX-form XO occupies all 11 low bits and there is no Rc, so the XO value is
+  // OR'd in directly — the same trap the vpopcnt* comment above documents.
+  // Verified against llvm-mc: mfvscr 2 = 0x10400604, mtvscr 3 = 0x10001e44.
+  void mfvscr(VR vrt) { Emit32((4u<<26)|(vrt.idx<<21)|(0<<16)|(0<<11)|1540u); }
+  void mtvscr(VR vrb) { Emit32((4u<<26)|(0<<21)|(0<<16)|(vrb.idx<<11)|1604u); }
 
   // Vector VMSUMUBM etc (VA-form)
   void vmsumubm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 36); }
