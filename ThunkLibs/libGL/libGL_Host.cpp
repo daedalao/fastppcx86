@@ -560,8 +560,17 @@ guest_layout<T*> RelocateArrayToGuestHeap(T* Data, int NumItems) {
     return guest_layout<T*> {.data = 0};
   }
 
+  if (NumItems <= 0) {
+    return guest_layout<T*> {.data = 0};
+  }
+
   guest_layout<T*> GuestData;
   GuestData.data = reinterpret_cast<uintptr_t>(GuestMalloc(sizeof(guest_layout<T>) * NumItems));
+  if (!GuestData.data) {
+    // Guest heap exhausted. Without this check the loop below writes the
+    // relocated array through a null guest pointer.
+    return guest_layout<T*> {.data = 0};
+  }
   for (int Index = 0; Index < NumItems; ++Index) {
     GuestData.get_pointer()[Index] = to_guest(to_host_layout(Data[Index]));
   }
@@ -596,20 +605,36 @@ static guest_layout<const GLubyte*> RelocateStringToGuestHeap(const GLubyte* Str
   static std::mutex InternMutex;
   static std::unordered_map<const void*, uintptr_t> Interned;
 
-  std::lock_guard<std::mutex> Lock(InternMutex);
-  auto It = Interned.find(Str);
-  if (It == Interned.end()) {
-    const size_t Size = std::strlen(reinterpret_cast<const char*>(Str)) + 1;
-    void* GuestBuf = GuestMalloc(Size);
-    if (!GuestBuf) {
-      // Guest OOM. Returning null is honest -- the alternative is handing
-      // back a truncated host pointer, which is the bug we are fixing.
-      return guest_layout<const GLubyte*> {.data = 0};
-    }
-    std::memcpy(GuestBuf, Str, Size);
-    It = Interned.emplace(Str, reinterpret_cast<uintptr_t>(GuestBuf)).first;
-  }
   using GuestPtr = decltype(guest_layout<const GLubyte*>::data);
+
+  {
+    std::lock_guard<std::mutex> Lock(InternMutex);
+    if (auto It = Interned.find(Str); It != Interned.end()) {
+      return guest_layout<const GLubyte*> {.data = static_cast<GuestPtr>(It->second)};
+    }
+  }
+
+  // Allocate OUTSIDE the lock. GuestMalloc is a host->guest trampoline: it
+  // bumps the guest stack and re-enters the JIT to run the guest's malloc.
+  // Holding a host lock across that is the hazard X11Manager documents for
+  // GuestXSync - a guest allocator taking its own lock, or a signal landing on
+  // another glGetString on this thread, deadlocks against us. glGetString sits
+  // on the startup path, so this is not hypothetical.
+  const size_t Size = std::strlen(reinterpret_cast<const char*>(Str)) + 1;
+  void* GuestBuf = GuestMalloc(Size);
+  if (!GuestBuf) {
+    // Guest OOM. Returning null is honest -- the alternative is handing
+    // back a truncated host pointer, which is the bug we are fixing.
+    return guest_layout<const GLubyte*> {.data = 0};
+  }
+  std::memcpy(GuestBuf, Str, Size);
+
+  // Re-check: another thread may have interned this string while we were in
+  // the guest. Identity matters here (callers compare returned pointers), so
+  // the first writer wins and our buffer is abandoned - a handful of bytes on
+  // a rare race, against a fixed set of driver strings.
+  std::lock_guard<std::mutex> Lock(InternMutex);
+  auto [It, Inserted] = Interned.emplace(Str, reinterpret_cast<uintptr_t>(GuestBuf));
   return guest_layout<const GLubyte*> {.data = static_cast<GuestPtr>(It->second)};
 }
 
