@@ -342,6 +342,19 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glShaderSource;
   } else if (name_sv == "glShaderSourceARB") {
     return (VoidFn)fexfn_impl_libGL_glShaderSourceARB;
+    // Pointer-array widening impls. These must be listed here for the same
+    // reason as glShaderSource: a title that resolves them through
+    // glXGetProcAddress (Unity does) would otherwise miss the custom impl.
+  } else if (name_sv == "glMultiDrawElements") {
+    return (VoidFn)fexfn_impl_libGL_glMultiDrawElements;
+  } else if (name_sv == "glMultiDrawElementsEXT") {
+    return (VoidFn)fexfn_impl_libGL_glMultiDrawElementsEXT;
+  } else if (name_sv == "glMultiDrawElementsBaseVertex") {
+    return (VoidFn)fexfn_impl_libGL_glMultiDrawElementsBaseVertex;
+  } else if (name_sv == "glTransformFeedbackVaryings") {
+    return (VoidFn)fexfn_impl_libGL_glTransformFeedbackVaryings;
+  } else if (name_sv == "glTransformFeedbackVaryingsEXT") {
+    return (VoidFn)fexfn_impl_libGL_glTransformFeedbackVaryingsEXT;
 #ifdef IS_32BIT_THUNK
   } else if (name_sv == "glBindBuffersRange") {
     return (VoidFn)fexfn_impl_libGL_glBindBuffersRange;
@@ -538,6 +551,80 @@ void fexfn_impl_libGL_glShaderSource(GLuint a_0, GLsizei count, guest_layout<con
   }
 #endif
   return fexldr_ptr_libGL_glShaderSource(a_0, count, sources, a_3);
+}
+
+// glMultiDrawElements / glTransformFeedbackVaryings family.
+//
+// All of these take an array of pointers whose elements are guest-width on a
+// 32-bit guest (4 bytes) and host-width here (8 bytes), so the array has to be
+// rebuilt element by element rather than passed through. Identical in shape to
+// glShaderSource above; the 64-bit path is the same straight passthrough these
+// functions had before, so behaviour there is unchanged.
+//
+// alloca matches glShaderSource's existing approach. The counts are draw-call
+// batch sizes and varying counts (tens, not thousands), and they come from the
+// guest's own render loop rather than from untrusted input.
+void fexfn_impl_libGL_glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, guest_layout<const void* const*> a_3,
+                                          GLsizei drawcount) {
+#ifndef IS_32BIT_THUNK
+  auto indices = a_3.force_get_host_pointer();
+#else
+  auto indices = (const void**)alloca(drawcount * sizeof(const void*));
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    indices[i] = host_layout<const void* const> {a_3.get_pointer()[i]}.data;
+  }
+#endif
+  return fexldr_ptr_libGL_glMultiDrawElements(mode, count, type, indices, drawcount);
+}
+
+void fexfn_impl_libGL_glMultiDrawElementsEXT(GLenum mode, const GLsizei* count, GLenum type, guest_layout<const void* const*> a_3,
+                                             GLsizei drawcount) {
+#ifndef IS_32BIT_THUNK
+  auto indices = a_3.force_get_host_pointer();
+#else
+  auto indices = (const void**)alloca(drawcount * sizeof(const void*));
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    indices[i] = host_layout<const void* const> {a_3.get_pointer()[i]}.data;
+  }
+#endif
+  return fexldr_ptr_libGL_glMultiDrawElementsEXT(mode, count, type, indices, drawcount);
+}
+
+void fexfn_impl_libGL_glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type, guest_layout<const void* const*> a_3,
+                                                    GLsizei drawcount, const GLint* basevertex) {
+#ifndef IS_32BIT_THUNK
+  auto indices = a_3.force_get_host_pointer();
+#else
+  auto indices = (const void**)alloca(drawcount * sizeof(const void*));
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    indices[i] = host_layout<const void* const> {a_3.get_pointer()[i]}.data;
+  }
+#endif
+  return fexldr_ptr_libGL_glMultiDrawElementsBaseVertex(mode, count, type, indices, drawcount, basevertex);
+}
+
+void fexfn_impl_libGL_glTransformFeedbackVaryings(GLuint program, GLsizei count, guest_layout<const GLchar* const*> a_2, GLenum bufferMode) {
+#ifndef IS_32BIT_THUNK
+  auto varyings = a_2.force_get_host_pointer();
+#else
+  auto varyings = (const char**)alloca(count * sizeof(const char*));
+  for (GLsizei i = 0; i < count; ++i) {
+    varyings[i] = host_layout<const char* const> {a_2.get_pointer()[i]}.data;
+  }
+#endif
+  return fexldr_ptr_libGL_glTransformFeedbackVaryings(program, count, varyings, bufferMode);
+}
+
+void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei count, guest_layout<const GLchar* const*> a_2, GLenum bufferMode) {
+#ifndef IS_32BIT_THUNK
+  auto varyings = a_2.force_get_host_pointer();
+#else
+  auto varyings = (const char**)alloca(count * sizeof(const char*));
+  for (GLsizei i = 0; i < count; ++i) {
+    varyings[i] = host_layout<const char* const> {a_2.get_pointer()[i]}.data;
+  }
+#endif
+  return fexldr_ptr_libGL_glTransformFeedbackVaryingsEXT(program, count, varyings, bufferMode);
 }
 
 void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<const GLcharARB**> a_2, const GLint* a_3) {
@@ -751,7 +838,15 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
       if (Scratch) {
         auto* Template = reinterpret_cast<guest_layout<XVisualInfo>*>(Scratch);
         auto* NumItems = reinterpret_cast<int*>(Scratch + TemplateSize);
-        *Template = to_guest(to_host_layout(*HostInfo));
+        // Zero `visual` in the query template. Only screen and visualid are
+        // consulted (see the mask passed below), but to_guest converts every
+        // member — including the host Visual* at 0x3fff'xxxx'xxxx, which does
+        // not fit the guest struct's 32-bit slot. That narrowing is what the
+        // truncation guard in Host.h aborts on, and it fired here on Dex
+        // before the re-query could even run.
+        XVisualInfo Query = *HostInfo;
+        Query.visual = nullptr;
+        *Template = to_guest(to_host_layout(Query));
         *NumItems = 0;
 
         auto* Ret = GuestGetVisualInfo(reinterpret_cast<void*>(static_cast<uintptr_t>(GuestDisplay.data)),
@@ -766,6 +861,26 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
       }
     }
   }
+
+#ifdef IS_32BIT_THUNK
+  // The re-query above did not produce a guest Visual — either the guest lib's
+  // OnInit has not registered the callbacks yet, or its Xlib has no visual
+  // matching this screen+visualid. The relocating path below cannot carry
+  // `visual` across: it is a pointer into the *host* Xlib's connection state at
+  // 0x3fff'xxxx'xxxx, and to_guest would narrow it to its low 32 bits.
+  //
+  // Observed on Dex: this fallback fired during FBConfig selection and the
+  // guest received a half-pointer, which is exactly the corruption the comment
+  // above warns about. NULL is strictly better — the guest's Xlib rejects it
+  // predictably instead of dereferencing garbage — and the callers this
+  // fallback exists to serve (depth/class/visualid readers) are unaffected.
+  //
+  // HostInfo is freed by RelocateArrayToGuestHeap immediately below, so
+  // clearing the member here does not disturb anything the host still owns.
+  if (HostInfo) {
+    HostInfo->visual = nullptr;
+  }
+#endif
 
   return RelocateArrayToGuestHeap(HostInfo, 1);
 }

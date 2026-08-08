@@ -3414,22 +3414,27 @@ template<>
 struct fex_gen_config<glMultiDrawArraysIndirect> {};
 template<>
 struct fex_gen_config<glMultiDrawElementArrayAPPLE> {};
-#ifndef IS_32BIT_THUNK
-// Needs manual handling: The type of this is actually int8_t**, int16_t**, or int32_t**, depending on the "type" argument
-// TODO: Do these values get copied or do they have to stay valid past the call?
+// The "indices" parameter is an array of `drawcount` pointers. On a 32-bit guest
+// those are 4 bytes each, so the array cannot be handed to the host as-is: it has
+// to be widened element by element. These used to be excluded from the 32-bit
+// thunk entirely, which made glXGetProcAddress("glMultiDrawElements") return null
+// — observed in a 32-bit Unity title's log as "not found glMultiDrawElements".
+//
+// Same shape as glShaderSource: ptr_passthrough hands the raw guest array to a
+// custom host impl, which widens on 32-bit and is a straight passthrough on
+// 64-bit (see libGL_Host.cpp).
 template<>
-struct fex_gen_config<glMultiDrawElementsBaseVertex> {};
+struct fex_gen_config<glMultiDrawElementsBaseVertex> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElementsBaseVertex, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glMultiDrawElementsBaseVertex, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glMultiDrawElementsEXT> {};
+struct fex_gen_config<glMultiDrawElementsEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElementsEXT, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glMultiDrawElementsEXT, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glMultiDrawElements> {};
+struct fex_gen_config<glMultiDrawElements> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElements, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
-#endif
+struct fex_gen_param<glMultiDrawElements, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<glMultiDrawElementsIndirectAMD> {};
 template<>
@@ -5268,17 +5273,17 @@ template<>
 struct fex_gen_config<glTransformFeedbackBufferRange> {};
 template<>
 struct fex_gen_config<glTransformFeedbackStreamAttribsNV> {};
-#ifndef IS_32BIT_THUNK
-// TODO
+// "varyings" is an array of `count` string pointers — same 32-bit widening
+// problem as glShaderSource, and previously excluded from the 32-bit thunk for
+// that reason ("not found glTransformFeedbackVaryings" in a 32-bit Unity log).
 template<>
-struct fex_gen_config<glTransformFeedbackVaryingsEXT> {};
+struct fex_gen_config<glTransformFeedbackVaryingsEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glTransformFeedbackVaryingsEXT, 2, const char* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glTransformFeedbackVaryingsEXT, 2, const char* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glTransformFeedbackVaryings> {};
+struct fex_gen_config<glTransformFeedbackVaryings> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glTransformFeedbackVaryings, 2, const char* const*> : fexgen::assume_compatible_data_layout {};
-#endif
+struct fex_gen_param<glTransformFeedbackVaryings, 2, const char* const*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<glTransformFeedbackVaryingsNV> {};
 template<>
