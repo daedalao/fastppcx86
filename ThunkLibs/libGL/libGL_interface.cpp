@@ -610,14 +610,32 @@ template<>
 struct fex_gen_config<glTestFenceNV> {};
 template<>
 struct fex_gen_config<glTestObjectAPPLE> {};
+// On 32-bit these copy the guest's staging buffer back into the real mapping
+// before unmapping it. See the glMapBuffer block further down and the
+// implementation in libGL_Host.cpp. 64-bit keeps the plain generated thunk.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glUnmapBufferARB> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glUnmapBuffer> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<glUnmapBufferARB> {};
 template<>
 struct fex_gen_config<glUnmapBuffer> {};
+#endif
 template<>
-struct fex_gen_config<glUnmapNamedBufferEXT> {};
+struct fex_gen_config<glUnmapNamedBufferEXT>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<glUnmapNamedBuffer> {};
+struct fex_gen_config<glUnmapNamedBuffer>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<glVDPAUIsSurfaceNV> {};
 template<>
@@ -3208,23 +3226,32 @@ template<>
 struct fex_gen_config<glMap2f> {};
 template<>
 struct fex_gen_config<glMap2xOES> {};
-#ifndef IS_32BIT_THUNK
-// TODO: 32-bit support
+// Buffer mapping returns a host pointer into the driver's mapped buffer object,
+// which does not fit a 32-bit guest slot (host VAs are 0x3fff'xxxx'xxxx here).
 //
-// These return a host pointer into the driver's mapped buffer object. The
-// generated unpacker funnels the return value through
-// host_to_guest_convertible::operator guest_layout<T*>(), which narrows it to
-// uint32_t. Host VAs live at 0x3fff'xxxx'xxxx on ppc64le, so the guest would
-// receive the low half of a real mapping and write vertex/index data into an
-// unrelated low address — silent guest-memory corruption with no fault at the
-// point of failure.
+// These were briefly excluded from the 32-bit thunk on the theory that an
+// unresolved symbol beats silent corruption. That was wrong: it hard-breaks
+// titles outright. Psychonauts requires GL_ARB_vertex_buffer_object, fails to
+// resolve glMapBufferARB, and exits with "Missing required OpenGL extensions"
+// before it draws anything.
 //
-// Unlike the string-returning entry points (glGetString and friends below),
-// there is no cheap relocate-to-guest-heap fix: the buffer is written by the
-// guest and must be visible to the driver until glUnmapBuffer. Doing this
-// properly needs a custom host impl that hands back guest-visible storage and
-// copies it back on unmap. Until then, do not expose a knowingly-broken entry
-// point to 32-bit guests.
+// Instead, 32-bit gets a custom host impl that stages the mapping through
+// guest-visible memory and copies back on unmap (see libGL_Host.cpp). 64-bit
+// keeps the plain generated thunk, so its codegen is untouched.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glMapBufferARB> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBufferARB, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapBuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBuffer, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapBufferRange> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBufferRange, -1, void*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glMapBufferARB> {};
 template<>
@@ -3232,6 +3259,9 @@ struct fex_gen_config<glMapBuffer> {};
 template<>
 struct fex_gen_config<glMapBufferRange> {};
 #endif
+// The matching unmaps are declared further up (near glUnmapBufferARB); on
+// 32-bit they are custom too, since that is where the guest's writes get copied
+// back into the real mapping.
 template<>
 struct fex_gen_config<glMapControlPointsNV> {};
 template<>
@@ -3246,8 +3276,28 @@ template<>
 struct fex_gen_config<glMapGrid2f> {};
 template<>
 struct fex_gen_config<glMapGrid2xOES> {};
-#ifndef IS_32BIT_THUNK
-// TODO: 32-bit support — same truncated-host-pointer return as glMapBuffer above.
+// Direct-state-access buffer mapping (GL 4.5 core + EXT_direct_state_access).
+// Same staging treatment as glMapBuffer above, keyed by buffer name. These are
+// core GL, not a vendor curiosity — leaving them unresolved on 32-bit shows up
+// as glXGetProcAddress misses in real titles.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glMapNamedBufferEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferEXT, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBuffer, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBufferRangeEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferRangeEXT, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBufferRange> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferRange, -1, void*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glMapNamedBufferEXT> {};
 template<>
@@ -3256,6 +3306,12 @@ template<>
 struct fex_gen_config<glMapNamedBufferRangeEXT> {};
 template<>
 struct fex_gen_config<glMapNamedBufferRange> {};
+#endif
+#ifndef IS_32BIT_THUNK
+// glMapObjectBufferATI has no matching unmap that takes the same handle
+// (glUnmapObjectBufferATI exists but the ATI object-buffer model is separate
+// from GL buffer objects), so the staging scheme above does not apply. It is a
+// dead vendor extension; left 64-bit-only rather than guessed at.
 template<>
 struct fex_gen_config<glMapObjectBufferATI> {};
 #endif

@@ -356,6 +356,34 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
   } else if (name_sv == "glTransformFeedbackVaryingsEXT") {
     return (VoidFn)fexfn_impl_libGL_glTransformFeedbackVaryingsEXT;
 #ifdef IS_32BIT_THUNK
+    // Buffer mapping. Psychonauts resolves glMapBufferARB exclusively through
+    // glXGetProcAddress and aborts with "Missing required OpenGL extensions"
+    // if it comes back null, so these must be listed here and not only exported.
+    // 32-bit only: on 64-bit these are plain generated thunks with no impl.
+  } else if (name_sv == "glMapBuffer") {
+    return (VoidFn)fexfn_impl_libGL_glMapBuffer;
+  } else if (name_sv == "glMapBufferARB") {
+    return (VoidFn)fexfn_impl_libGL_glMapBufferARB;
+  } else if (name_sv == "glMapBufferRange") {
+    return (VoidFn)fexfn_impl_libGL_glMapBufferRange;
+  } else if (name_sv == "glUnmapBuffer") {
+    return (VoidFn)fexfn_impl_libGL_glUnmapBuffer;
+  } else if (name_sv == "glUnmapBufferARB") {
+    return (VoidFn)fexfn_impl_libGL_glUnmapBufferARB;
+  } else if (name_sv == "glMapNamedBuffer") {
+    return (VoidFn)fexfn_impl_libGL_glMapNamedBuffer;
+  } else if (name_sv == "glMapNamedBufferEXT") {
+    return (VoidFn)fexfn_impl_libGL_glMapNamedBufferEXT;
+  } else if (name_sv == "glMapNamedBufferRange") {
+    return (VoidFn)fexfn_impl_libGL_glMapNamedBufferRange;
+  } else if (name_sv == "glMapNamedBufferRangeEXT") {
+    return (VoidFn)fexfn_impl_libGL_glMapNamedBufferRangeEXT;
+  } else if (name_sv == "glUnmapNamedBuffer") {
+    return (VoidFn)fexfn_impl_libGL_glUnmapNamedBuffer;
+  } else if (name_sv == "glUnmapNamedBufferEXT") {
+    return (VoidFn)fexfn_impl_libGL_glUnmapNamedBufferEXT;
+#endif
+#ifdef IS_32BIT_THUNK
   } else if (name_sv == "glBindBuffersRange") {
     return (VoidFn)fexfn_impl_libGL_glBindBuffersRange;
   } else if (name_sv == "glBindVertexBuffers") {
@@ -427,7 +455,17 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glXGetSelectedEventSGIX;
 #endif
   }
-  return (VoidFn)glXGetProcAddress((const GLubyte*)name);
+  // FEX_LIBGL_DEBUG=1: report every name that resolves to null. A title whose
+  // GL init silently fails usually does so because one entry point it needs was
+  // never thunked, and it rarely says which — Psychonauts printed "Missing
+  // required OpenGL extensions" and eON prints only "failed to initialise".
+  // This turns that into a list of names to add.
+  auto Result = (VoidFn)glXGetProcAddress((const GLubyte*)name);
+  if (!Result && FexLibGLDebug()) {
+    fprintf(stderr, "[fex-libGL] glXGetProcAddress MISS: %s\n", name_sv.data());
+    fflush(stderr);
+  }
+  return Result;
 }
 
 // TODO: unsigned int *glXEnumerateVideoDevicesNV (Display *dpy, int screen, int *nelements);
@@ -626,6 +664,233 @@ void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei cou
 #endif
   return fexldr_ptr_libGL_glTransformFeedbackVaryingsEXT(program, count, varyings, bufferMode);
 }
+
+// ---------------------------------------------------------------------------
+// Buffer object mapping
+// ---------------------------------------------------------------------------
+//
+// glMapBuffer hands back a pointer into the driver's mapping. That pointer is a
+// host VA (0x3fff'xxxx'xxxx here) and cannot be represented in a 32-bit guest
+// slot, so on 32-bit the guest gets a staging buffer in guest memory instead:
+//   map:   host-map, copy host -> staging if the access allows reading
+//   unmap: copy staging -> host if the access allows writing, then host-unmap
+//
+// Excluding these instead (as this thunk briefly did) is not an option: a title
+// that needs GL_ARB_vertex_buffer_object simply refuses to start.
+//
+// Staging buffers are cached per target and grown as needed rather than freed.
+// Only GuestMalloc is registered - there is no guest free() - so allocating per
+// map would leak the guest's 4 GiB heap within minutes of gameplay. A game uses
+// a bounded set of targets, so the cache is bounded too.
+//
+// Not handled: GL_MAP_FLUSH_EXPLICIT_BIT is ignored, so the whole mapped range
+// is copied back on unmap rather than only the explicitly flushed sub-ranges.
+// That is slower than necessary but never wrong; glFlushMappedBufferRange
+// remains a passthrough and its effect is subsumed by the unmap copy.
+#ifdef IS_32BIT_THUNK
+namespace {
+struct MappedBuffer {
+  void* HostPtr = nullptr;      // driver mapping
+  uintptr_t GuestPtr = 0;       // staging buffer handed to the guest
+  size_t GuestCapacity = 0;     // allocated size of the staging buffer
+  size_t Length = 0;            // bytes actually mapped this time
+  bool CopyBackOnUnmap = false; // access included write
+};
+
+std::mutex MappedBufferMutex;
+std::unordered_map<GLenum, MappedBuffer> MappedBuffers;
+
+// Returns the guest staging pointer for this target, growing it if needed.
+// Caller must hold MappedBufferMutex; note GuestMalloc re-enters the JIT, which
+// is why this must never be called with any other host lock held.
+uintptr_t GetStagingBuffer(MappedBuffer& Entry, size_t Length) {
+  if (Entry.GuestPtr && Entry.GuestCapacity >= Length) {
+    return Entry.GuestPtr;
+  }
+  auto* Malloc = __atomic_load_n(&GuestMalloc, __ATOMIC_ACQUIRE);
+  if (!Malloc) {
+    return 0;
+  }
+  // The old buffer is abandoned rather than freed (no guest free is
+  // registered). Growth is rare: buffers settle at their working size.
+  void* Buf = Malloc(Length);
+  if (!Buf) {
+    return 0;
+  }
+  Entry.GuestPtr = reinterpret_cast<uintptr_t>(Buf);
+  Entry.GuestCapacity = Length;
+  return Entry.GuestPtr;
+}
+
+// Shared by glMapBuffer/glMapBufferARB/glMapBufferRange.
+guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length, bool WantsRead, bool WantsWrite) {
+  if (!HostPtr) {
+    return guest_layout<void*> {.data = 0};
+  }
+
+  std::lock_guard lk {MappedBufferMutex};
+  auto& Entry = MappedBuffers[target];
+  const uintptr_t Staging = GetStagingBuffer(Entry, Length);
+  if (!Staging) {
+    // Guest heap exhausted, or the guest never registered its malloc. Unmap
+    // again and report failure rather than handing back a truncated pointer.
+    fexldr_ptr_libGL_glUnmapBuffer(target);
+    return guest_layout<void*> {.data = 0};
+  }
+
+  Entry.HostPtr = HostPtr;
+  Entry.Length = Length;
+  Entry.CopyBackOnUnmap = WantsWrite;
+  if (WantsRead) {
+    std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
+  }
+  return guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
+}
+
+GLboolean UnmapBufferFromGuest(GLenum target) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedBuffers.find(target);
+  if (It != MappedBuffers.end() && It->second.HostPtr) {
+    auto& Entry = It->second;
+    if (Entry.CopyBackOnUnmap && Entry.GuestPtr) {
+      std::memcpy(Entry.HostPtr, reinterpret_cast<const void*>(Entry.GuestPtr), Entry.Length);
+    }
+    // Keep the staging allocation for reuse; only the mapping is retired.
+    Entry.HostPtr = nullptr;
+    Entry.Length = 0;
+    Entry.CopyBackOnUnmap = false;
+  }
+  return fexldr_ptr_libGL_glUnmapBuffer(target);
+}
+
+size_t BufferSizeForTarget(GLenum target) {
+  GLint Size = 0;
+  fexldr_ptr_libGL_glGetBufferParameteriv(target, GL_BUFFER_SIZE, &Size);
+  return Size > 0 ? static_cast<size_t>(Size) : 0;
+}
+
+// Direct-state-access variants (GL 4.5 core, plus the EXT_direct_state_access
+// spelling). Same staging scheme, keyed by buffer name instead of target since
+// DSA never binds. Kept in a separate map so a buffer can legitimately be
+// mapped via glMapNamedBuffer while a different one is mapped to a target.
+std::unordered_map<GLuint, MappedBuffer> MappedNamedBuffers;
+
+size_t BufferSizeForName(GLuint buffer) {
+  GLint Size = 0;
+  fexldr_ptr_libGL_glGetNamedBufferParameteriv(buffer, GL_BUFFER_SIZE, &Size);
+  return Size > 0 ? static_cast<size_t>(Size) : 0;
+}
+
+guest_layout<void*> MapNamedBufferToGuest(GLuint buffer, void* HostPtr, size_t Length, bool WantsRead, bool WantsWrite) {
+  if (!HostPtr) {
+    return guest_layout<void*> {.data = 0};
+  }
+
+  std::lock_guard lk {MappedBufferMutex};
+  auto& Entry = MappedNamedBuffers[buffer];
+  const uintptr_t Staging = GetStagingBuffer(Entry, Length);
+  if (!Staging) {
+    fexldr_ptr_libGL_glUnmapNamedBuffer(buffer);
+    return guest_layout<void*> {.data = 0};
+  }
+
+  Entry.HostPtr = HostPtr;
+  Entry.Length = Length;
+  Entry.CopyBackOnUnmap = WantsWrite;
+  if (WantsRead) {
+    std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
+  }
+  return guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
+}
+
+GLboolean UnmapNamedBufferFromGuest(GLuint buffer) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedNamedBuffers.find(buffer);
+  if (It != MappedNamedBuffers.end() && It->second.HostPtr) {
+    auto& Entry = It->second;
+    if (Entry.CopyBackOnUnmap && Entry.GuestPtr) {
+      std::memcpy(Entry.HostPtr, reinterpret_cast<const void*>(Entry.GuestPtr), Entry.Length);
+    }
+    Entry.HostPtr = nullptr;
+    Entry.Length = 0;
+    Entry.CopyBackOnUnmap = false;
+  }
+  return fexldr_ptr_libGL_glUnmapNamedBuffer(buffer);
+}
+} // namespace
+
+guest_layout<void*> fexfn_impl_libGL_glMapBuffer(GLenum target, GLenum access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapBuffer(target, access);
+  const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
+  const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
+  return MapBufferToGuest(target, HostPtr, BufferSizeForTarget(target), WantsRead, WantsWrite);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapBufferARB(GLenum target, GLenum access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapBufferARB(target, access);
+  const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
+  const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
+  return MapBufferToGuest(target, HostPtr, BufferSizeForTarget(target), WantsRead, WantsWrite);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapBufferRange(target, offset, length, access);
+  // GL_MAP_INVALIDATE_*_BIT means the previous contents are undefined, so there
+  // is nothing worth copying in even when GL_MAP_READ_BIT is also set.
+  const bool Invalidates = (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)) != 0;
+  const bool WantsRead = (access & GL_MAP_READ_BIT) != 0 && !Invalidates;
+  const bool WantsWrite = (access & GL_MAP_WRITE_BIT) != 0;
+  return MapBufferToGuest(target, HostPtr, length > 0 ? static_cast<size_t>(length) : 0, WantsRead, WantsWrite);
+}
+
+GLboolean fexfn_impl_libGL_glUnmapBuffer(GLenum target) {
+  return UnmapBufferFromGuest(target);
+}
+
+GLboolean fexfn_impl_libGL_glUnmapBufferARB(GLenum target) {
+  // Same mapping table as glUnmapBuffer: ARB and core map/unmap are
+  // interchangeable against the same buffer object, and a title may mix them.
+  return UnmapBufferFromGuest(target);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapNamedBuffer(GLuint buffer, GLenum access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapNamedBuffer(buffer, access);
+  const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
+  const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
+  return MapNamedBufferToGuest(buffer, HostPtr, BufferSizeForName(buffer), WantsRead, WantsWrite);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapNamedBufferEXT(GLuint buffer, GLenum access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapNamedBufferEXT(buffer, access);
+  const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
+  const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
+  return MapNamedBufferToGuest(buffer, HostPtr, BufferSizeForName(buffer), WantsRead, WantsWrite);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapNamedBufferRange(buffer, offset, length, access);
+  const bool Invalidates = (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)) != 0;
+  const bool WantsRead = (access & GL_MAP_READ_BIT) != 0 && !Invalidates;
+  const bool WantsWrite = (access & GL_MAP_WRITE_BIT) != 0;
+  return MapNamedBufferToGuest(buffer, HostPtr, length > 0 ? static_cast<size_t>(length) : 0, WantsRead, WantsWrite);
+}
+
+guest_layout<void*> fexfn_impl_libGL_glMapNamedBufferRangeEXT(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  auto* HostPtr = fexldr_ptr_libGL_glMapNamedBufferRangeEXT(buffer, offset, length, access);
+  const bool Invalidates = (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)) != 0;
+  const bool WantsRead = (access & GL_MAP_READ_BIT) != 0 && !Invalidates;
+  const bool WantsWrite = (access & GL_MAP_WRITE_BIT) != 0;
+  return MapNamedBufferToGuest(buffer, HostPtr, length > 0 ? static_cast<size_t>(length) : 0, WantsRead, WantsWrite);
+}
+
+GLboolean fexfn_impl_libGL_glUnmapNamedBuffer(GLuint buffer) {
+  return UnmapNamedBufferFromGuest(buffer);
+}
+
+GLboolean fexfn_impl_libGL_glUnmapNamedBufferEXT(GLuint buffer) {
+  return UnmapNamedBufferFromGuest(buffer);
+}
+#endif
 
 void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<const GLcharARB**> a_2, const GLint* a_3) {
 #ifndef IS_32BIT_THUNK
