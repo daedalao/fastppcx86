@@ -700,7 +700,8 @@ void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei cou
 // glMapBuffer hands back a pointer into the driver's mapping. That pointer is a
 // host VA (0x3fff'xxxx'xxxx here) and cannot be represented in a 32-bit guest
 // slot, so on 32-bit the guest gets a staging buffer in guest memory instead:
-//   map:   host-map, copy host -> staging if the access allows reading
+//   map:   host-map, then copy host -> staging ALWAYS (see MapBufferToGuest
+//          for why this cannot be conditional on the access flags)
 //   unmap: copy staging -> host if the access allows writing, then host-unmap
 //
 // Excluding these instead (as this thunk briefly did) is not an option: a title
@@ -711,10 +712,16 @@ void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei cou
 // map would leak the guest's 4 GiB heap within minutes of gameplay. A game uses
 // a bounded set of targets, so the cache is bounded too.
 //
-// Not handled: GL_MAP_FLUSH_EXPLICIT_BIT is ignored, so the whole mapped range
-// is copied back on unmap rather than only the explicitly flushed sub-ranges.
-// That is slower than necessary but never wrong; glFlushMappedBufferRange
-// remains a passthrough and its effect is subsumed by the unmap copy.
+// GL_MAP_FLUSH_EXPLICIT_BIT is not honoured: the whole mapped range is copied
+// back on unmap rather than only the explicitly flushed sub-ranges, and
+// glFlushMappedBufferRange stays a passthrough whose effect the unmap copy
+// subsumes. That costs bandwidth but is correct, *given* the unconditional
+// seeding above — without it, untouched bytes carry stale contents back into
+// the buffer, which is a correctness bug and not merely a slow path.
+//
+// Honouring the flag properly would mean a custom glFlushMappedBufferRange that
+// records flushed sub-ranges and copying back only those. Worth doing if buffer
+// upload ever shows up in a profile.
 #ifdef IS_32BIT_THUNK
 namespace {
 struct MappedBuffer {
@@ -769,9 +776,27 @@ guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length
   Entry.HostPtr = HostPtr;
   Entry.Length = Length;
   Entry.CopyBackOnUnmap = WantsWrite;
-  if (WantsRead) {
-    std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
-  }
+
+  // Seed the staging buffer from the real mapping unconditionally — NOT only
+  // when the access asks for reading.
+  //
+  // Unmap copies the whole range back, and the staging buffer is reused across
+  // maps. If it is not seeded, every byte the application does not write still
+  // gets copied into the buffer, carrying whatever the previous map left there.
+  // The common Unity dynamic-geometry path is exactly this shape:
+  // WRITE|INVALIDATE_RANGE|FLUSH_EXPLICIT, write a sub-range, flush only that —
+  // so most of the range is untouched and would receive stale vertices. It
+  // showed up in Dex as degenerate triangles streaking across the frame and
+  // mirrored glyphs in the HUD text, one frame's geometry bleeding into the
+  // next.
+  //
+  // Reading a mapping made with GL_MAP_INVALIDATE_* is defined-but-undefined-
+  // valued, and copying those bytes straight back is a no-op for anything the
+  // application also treats as undefined. WantsRead is therefore no longer
+  // consulted here; it stays in the signature because it documents intent at
+  // the call sites.
+  (void)WantsRead;
+  std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
   return guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
 }
 
@@ -825,9 +850,27 @@ guest_layout<void*> MapNamedBufferToGuest(GLuint buffer, void* HostPtr, size_t L
   Entry.HostPtr = HostPtr;
   Entry.Length = Length;
   Entry.CopyBackOnUnmap = WantsWrite;
-  if (WantsRead) {
-    std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
-  }
+
+  // Seed the staging buffer from the real mapping unconditionally — NOT only
+  // when the access asks for reading.
+  //
+  // Unmap copies the whole range back, and the staging buffer is reused across
+  // maps. If it is not seeded, every byte the application does not write still
+  // gets copied into the buffer, carrying whatever the previous map left there.
+  // The common Unity dynamic-geometry path is exactly this shape:
+  // WRITE|INVALIDATE_RANGE|FLUSH_EXPLICIT, write a sub-range, flush only that —
+  // so most of the range is untouched and would receive stale vertices. It
+  // showed up in Dex as degenerate triangles streaking across the frame and
+  // mirrored glyphs in the HUD text, one frame's geometry bleeding into the
+  // next.
+  //
+  // Reading a mapping made with GL_MAP_INVALIDATE_* is defined-but-undefined-
+  // valued, and copying those bytes straight back is a no-op for anything the
+  // application also treats as undefined. WantsRead is therefore no longer
+  // consulted here; it stays in the signature because it documents intent at
+  // the call sites.
+  (void)WantsRead;
+  std::memcpy(reinterpret_cast<void*>(Staging), HostPtr, Length);
   return guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
 }
 
