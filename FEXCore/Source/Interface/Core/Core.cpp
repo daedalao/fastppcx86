@@ -1234,7 +1234,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
     if (MappedSection) {
       if (Config.LibraryJITNaming()) {
-        Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CodePtr, DebugData->HostCodeSize, MappedSection->FileInfo.Filename);
+        // Register the whole block, not the entry point. CodePtr is
+        // EntryPoints[GuestRIP], which sits past the JITCodeHeader, so
+        // [CodePtr, CodePtr + HostCodeSize) would run off the end of the block
+        // and shadow the start of the next one. [BlockBegin, BlockBegin + Size)
+        // is exactly the compiled range.
+        Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CompiledCode.BlockBegin, CompiledCode.Size,
+                                    MappedSection->FileInfo.Filename);
       }
 
       if (Config.GDBSymbols()) {
