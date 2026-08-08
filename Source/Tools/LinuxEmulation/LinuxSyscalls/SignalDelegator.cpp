@@ -427,6 +427,33 @@ void SignalDelegator::HandleSignal(FEX::HLE::ThreadStateObject* Thread, int Sign
     LogMan::Msg::AFmt("Thread {} has received a signal and hasn't registered itself with the delegate! Programming error!",
                       FHU::Syscalls::gettid());
   } else {
+    // FEX_SIGFAULTWATCH=1 logs every fault signal on entry, with the guest RIP
+    // and faulting address, BEFORE any handler runs.
+    //
+    // It has to be here rather than further down: FEX's own handlers (SMC
+    // tracking) and the frontend handler both return early when they claim a
+    // signal, and the frontend is what delivers a fault to the guest — so
+    // anything logged after them misses precisely the deliveries of interest.
+    //
+    // FEX_SIGRIPWATCH cannot answer this either: it lives in SpillSRA, so it
+    // only sees signals arriving while the guest is in JIT code with static
+    // registers live. A fault taken inside a thunk, or entering/leaving one,
+    // never reaches it. Both were silent on a 32-bit Unity title (Dex) that
+    // demonstrably takes a SIGSEGV.
+    if (Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE) {
+      static const bool FaultWatch = getenv("FEX_SIGFAULTWATCH") != nullptr;
+      if (FaultWatch) {
+        const auto* SigInfo = static_cast<const siginfo_t*>(Info);
+        const auto& G = Thread->Thread->CurrentFrame->State.gregs;
+        LogMan::Msg::IFmt("SigFaultWatch: tid {} sig {} code {} fault_addr 0x{:x} guest rip 0x{:x} rsp 0x{:x} "
+                          "rax 0x{:x} rbx 0x{:x} rcx 0x{:x} rdx 0x{:x} rsi 0x{:x} rdi 0x{:x} rbp 0x{:x}",
+                          FHU::Syscalls::gettid(), Signal, SigInfo->si_code, reinterpret_cast<uint64_t>(SigInfo->si_addr),
+                          Thread->Thread->CurrentFrame->State.rip, G[FEXCore::X86State::REG_RSP], G[FEXCore::X86State::REG_RAX],
+                          G[FEXCore::X86State::REG_RBX], G[FEXCore::X86State::REG_RCX], G[FEXCore::X86State::REG_RDX],
+                          G[FEXCore::X86State::REG_RSI], G[FEXCore::X86State::REG_RDI], G[FEXCore::X86State::REG_RBP]);
+      }
+    }
+
     SignalHandler& Handler = HostHandlers[Signal];
     for (auto& HandlerFunc : Handler.Handlers) {
       if (HandlerFunc(Thread->Thread, Signal, Info, UContext)) {
