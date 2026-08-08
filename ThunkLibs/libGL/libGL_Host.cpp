@@ -851,6 +851,11 @@ static guest_layout<XVisualInfo*> MapToGuestVisualInfo(Display* HostDisplay, XVi
 
         auto* Ret = GuestGetVisualInfo(reinterpret_cast<void*>(static_cast<uintptr_t>(GuestDisplay.data)),
                                        static_cast<guest_long>(VisualScreenMask | VisualIDMask), Template, NumItems);
+        if (FexLibGLDebug()) {
+          fprintf(stderr, "[fex-libGL] MapToGuestVisualInfo: re-query %s (visualid=0x%lx screen=%d n=%d)\n", (Ret && *NumItems >= 1) ? "HIT" : "MISS",
+                  (unsigned long)HostInfo->visualid, HostInfo->screen, *NumItems);
+          fflush(stderr);
+        }
         if (Ret && *NumItems >= 1) {
           x11_manager.HostXFree(HostInfo);
           return guest_layout<XVisualInfo*> {.data = static_cast<decltype(guest_layout<XVisualInfo*>::data)>(reinterpret_cast<uintptr_t>(Ret))};
