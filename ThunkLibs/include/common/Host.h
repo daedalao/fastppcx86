@@ -11,6 +11,7 @@ $end_info$
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <optional>
 #include <typeinfo>
 
@@ -651,6 +652,15 @@ struct host_to_guest_convertible {
     if ((reinterpret_cast<uintptr_t>(from.data) >> 32) != 0) {
       // Plain fprintf+abort because LOGMAN_THROW headers aren't in this TU.
       fprintf(stderr, "FEX FATAL: 32-bit truncation of host pointer %p returned to guest\n", (void*)from.data);
+      // Name the offending thunk. This conversion is a template instantiated
+      // from every generated unpacker, so the pointer value alone does not say
+      // which API returned it; the backtrace frame will be
+      // fexfn_unpack_<lib>_<function>.
+      void* Frames[16];
+      int Count = backtrace(Frames, 16);
+      fprintf(stderr, "FEX FATAL: offending thunk backtrace:\n");
+      fflush(stderr);
+      backtrace_symbols_fd(Frames, Count, 2);
       std::abort();
     }
 #endif
