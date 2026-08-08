@@ -3585,6 +3585,15 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   CodeData.BlockBegin = CB->Ptr + BlockBufferOffset;
   CodeData.Size       = CodeSize;
 
+  // DebugData::HostCodeSize has never been populated on this port, and PPC64LE
+  // is the only backend left in the tree, so the field was dead: every consumer
+  // read a zero. That silently broke both of them - FEX_LIBRARYJITNAMING wrote
+  // perf-map entries of length 0 (perf attributes no samples to a zero-length
+  // symbol, so profiles degraded to raw addresses), and GDBJIT computed
+  // block end == block start. Code only, excluding the tail: this is the range
+  // that is actually executed.
+  DebugData->HostCodeSize = CodeSize;
+
   // Flush the freshly-emitted instructions out of the D-cache and invalidate
   // the I-cache for this range. POWER8 has split, non-coherent I/D caches: the
   // store stream that emitted these instructions hits the D-cache, but the
