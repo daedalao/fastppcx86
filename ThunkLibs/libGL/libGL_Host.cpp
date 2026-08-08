@@ -74,6 +74,23 @@ struct host_layout<__GLXcontextRec*> {
 };
 
 guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& from);
+
+// GLsync (__GLsync*) is the third of these: glFenceSync returns an opaque host
+// pointer that the guest stores and hands back to glClientWaitSync/glWaitSync/
+// glGetSynciv/glDeleteSync. Its pointee is already annotated opaque_type in the
+// interface, but without these hooks the default conversion truncates it.
+//
+// Observed on The Witcher 2, whose eON layer fences every frame: the truncation
+// guard fires inside GuestWrapperForHostFunction<__GLsync*(uint,uint)>, i.e.
+// glFenceSync, and the title takes a Breakpad crash during startup.
+template<>
+struct host_layout<__GLsync*> {
+  __GLsync* data;
+
+  host_layout(const guest_layout<__GLsync*>&);
+};
+
+guest_layout<__GLsync*> to_guest(const host_layout<__GLsync*>& from);
 #endif
 
 static X11Manager x11_manager;
@@ -213,6 +230,7 @@ struct OpaqueHandleRegistry {
 
 OpaqueHandleRegistry<__GLXFBConfigRec, 0xFBC0'0000> FBConfigRegistry;
 OpaqueHandleRegistry<__GLXcontextRec, 0xC0C0'0000> ContextRegistry;
+OpaqueHandleRegistry<__GLsync, 0x5C0'00000> SyncRegistry;
 } // namespace
 
 host_layout<__GLXFBConfigRec*>::host_layout(const guest_layout<__GLXFBConfigRec*>& guest)
@@ -232,6 +250,16 @@ guest_layout<__GLXcontextRec*> to_guest(const host_layout<__GLXcontextRec*>& fro
   Result.data = ContextRegistry.TokenFor(from.data);
   return Result;
 }
+
+host_layout<__GLsync*>::host_layout(const guest_layout<__GLsync*>& guest)
+  : data(SyncRegistry.ForToken(static_cast<uint32_t>(guest.data))) {}
+
+guest_layout<__GLsync*> to_guest(const host_layout<__GLsync*>& from) {
+  guest_layout<__GLsync*> Result {};
+  Result.data = SyncRegistry.TokenFor(from.data);
+  return Result;
+}
+
 #endif
 
 #if defined(IS_32BIT_THUNK)
@@ -818,6 +846,16 @@ GLboolean UnmapNamedBufferFromGuest(GLuint buffer) {
   return fexldr_ptr_libGL_glUnmapNamedBuffer(buffer);
 }
 } // namespace
+
+// Retire the GLsync token when the guest deletes the sync object. Unlike a GLX
+// context this genuinely matters: a title that fences once per frame creates a
+// sync object per frame, so leaving them interned grows the registry for the
+// life of the process. After retirement a stale token resolves to null, which
+// the driver rejects rather than acting on a freed pointer.
+void fexfn_impl_libGL_glDeleteSync(GLsync sync) {
+  SyncRegistry.Retire(sync);
+  fexldr_ptr_libGL_glDeleteSync(sync);
+}
 
 guest_layout<void*> fexfn_impl_libGL_glMapBuffer(GLenum target, GLenum access) {
   auto* HostPtr = fexldr_ptr_libGL_glMapBuffer(target, access);

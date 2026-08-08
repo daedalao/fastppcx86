@@ -1631,8 +1631,16 @@ template<>
 struct fex_gen_config<glDeleteShader> {};
 template<>
 struct fex_gen_config<glDeleteStatesNV> {};
+// custom_host_impl on 32-bit so the GLsync token registry can retire the handle
+// (see SyncRegistry in libGL_Host.cpp). A title that fences per frame creates a
+// sync object per frame, so without retiring, the registry grows for the life
+// of the process.
 template<>
-struct fex_gen_config<glDeleteSync> {};
+struct fex_gen_config<glDeleteSync>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<glDeleteTexturesEXT> {};
 template<>
