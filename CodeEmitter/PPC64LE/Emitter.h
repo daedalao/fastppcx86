@@ -1373,6 +1373,12 @@ public:
   void mfvscr(VR vrt) { Emit32((4u<<26)|(vrt.idx<<21)|(0<<16)|(0<<11)|1540u); }
   void mtvscr(VR vrb) { Emit32((4u<<26)|(0<<21)|(0<<16)|(vrb.idx<<11)|1604u); }
 
+  // Multiply-low and add unsigned halfword modulo (VA-form: XO=34).
+  //   VRT[i] = (VRA[i] * VRB[i] + VRC[i]) mod 2^16, per halfword.
+  // With VRC = 0 this is exactly x86 PMULLW, and being elementwise it needs no
+  // permute regardless of which physical halfword holds which guest lane.
+  void vmladduhm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 34); }
+
   // Vector VMSUMUBM etc (VA-form)
   void vmsumubm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 36); }
   void vmsummbm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 37); }

@@ -2362,30 +2362,23 @@ DEF_OP(VMul) {
     vmuluwm(Dst, V1, V2);
     break;
   case IR::OpSize::i16Bit: {
-    // vmulosh / vmulesh produce 4 32-bit BE products from phys-odd / phys-even
-    // halfwords of the inputs.  In FEX's PPC64LE convention `lvx` byte-reverses
-    // the 16-byte memory image, so phys halfword 7 of an x86 SSE register holds
-    // x86 LE-halfword 0 (and so on).  vmulesh/vmulosh therefore see each phys
-    // halfword as a BE u16, which equals the x86 LE u16 read from the original
-    // memory bytes — exactly what pmullw wants per lane.
+    // pmullw: per-lane low 16 bits of the product.
     //
-    // We then need to gather the low 16 bits of each BE product back into the
-    // output VR at the LE-halfword positions:
-    //   ctrl phys layout = [0x12,0x13,0x02,0x03, 0x16,0x17,0x06,0x07,
-    //                       0x1A,0x1B,0x0A,0x0B, 0x1E,0x1F,0x0E,0x0F]
+    // vmladduhm VRT,VRA,VRB,VRC computes (VRA[i] * VRB[i] + VRC[i]) mod 2^16
+    // for each halfword independently, so a zero addend makes it exactly
+    // pmullw. Because it is strictly elementwise, no permute and no
+    // endianness fixup is needed: whichever physical halfword holds guest
+    // lane i in V1 holds lane i in V2 as well, and the product lands in that
+    // same position. Modular low-16 arithmetic is sign-agnostic, so the one
+    // instruction serves both pmullw and its signed reading.
     //
-    // Because `lvx` byte-reverses, the std-then-lvx round-trip produces phys
-    // bytes that are the byte-reversed view of the in-memory image.  To land
-    // the desired ctrl in phys, we have to write the *byte-reversed* ctrl into
-    // memory: stack[i] := ctrl_phys[15-i].
-    //   stack[0..7]  = [0F,0E,1F,1E,0B,0A,1B,1A]   → LE u64 0x1A1B0A0B1E1F0E0F
-    //   stack[8..15] = [07,06,17,16,03,02,13,12]   → LE u64 0x1213020316170607
-    vmulosh(VTMP1, V1, V2);
-    vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1A1B0A0B1E1F0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1213020316170607ULL); std(TMP1,  -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    // Replaces vmulosh/vmulesh + two LoadConstants + std/std + addi/li/lvx +
+    // vperm — roughly fifteen instructions that materialised a permute
+    // control on the stack and then reloaded it, eating a store-hit-load on
+    // every PMULLW. Same store-to-load-forwarding pathology the
+    // StoreFPRSized and ScalarInsert paths already removed.
+    vxor(VTMP1, VTMP1, VTMP1);
+    vmladduhm(Dst, V1, V2, VTMP1);
     break;
   }
   default:
