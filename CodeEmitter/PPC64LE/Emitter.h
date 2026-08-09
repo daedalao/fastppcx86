@@ -972,6 +972,11 @@ public:
   void xvcvdpsxds(VR t, VR b) { EmitXX2(t.idx, b.idx, 472); }
   void xvcvspdp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 457); }
   void xvcvdpsp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 393); }
+  // Signed integer -> float. XO fields cross-checked against llvm-mc, using
+  // xvcvspdp (457) as the control that the extraction method is right.
+  void xvcvsxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 504); } // i64 -> f64
+  void xvcvsxdsp (VR t, VR b) { EmitXX2(t.idx, b.idx, 440); } // i64 -> f32, single rounding
+  void xvcvsxwdp (VR t, VR b) { EmitXX2(t.idx, b.idx, 248); } // i32 -> f64
   // Copy-sign (per element)
   void xvcpsgnsp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 208); }
   void xvcpsgndp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 240); }

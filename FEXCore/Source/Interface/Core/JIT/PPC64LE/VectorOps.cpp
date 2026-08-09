@@ -4040,43 +4040,43 @@ DEF_OP(VSToFVectorInsert) {
   const auto Vec2 = GetVReg(Op->Vector2);
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
   if (Op->HasTwoElements) {
-    // cvtpi2ps: convert two i32 → two f32, write to lower 64 bits of dst.
-    // Src elements 0,1 (4 bytes each) at -16, -12.
-    lwa(TMP3, -16, r1);  // sign-extend i32 elem0 → i64
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    fcfids(f0, f0);
-    stfs(f0, -32, r1);
-    lwa(TMP3, -12, r1);  // i32 elem1
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    fcfids(f0, f0);
-    stfs(f0, -28, r1);
-  } else {
-    // Single conversion: src element 0 of size SrcES → dst f-element 0 of DstES.
-    // Source path: load int as 64-bit signed in GPR, then mtfprd → fcfid(s).
-    if (SrcES == IR::OpSize::i32Bit) {
-      lwa(TMP3, -16, r1);              // sign-extend low 32 → i64
-    } else {
-      ld(TMP3, -16, r1);               // 64-bit
-    }
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    if (DstES == IR::OpSize::i32Bit) {
-      fcfids(f0, f0);
-      stfs(f0, -32, r1);
-    } else {
-      fcfid(f0, f0);
-      stfd(f0, -32, r1);
-    }
+    // cvtpi2ps: two i32 -> two f32 in the low 64 bits. xvcvsxwsp is lane-wise
+    // word->word, so both guest elements (BE words 2 and 3) convert in place
+    // with no permute at all, and one xxpermdi takes the whole low doubleword.
+    xvcvsxwsp(VTMP1, Vec2);
+    xxpermdi(Dst, Vec1, VTMP1, 1);      // {Vec1.dw0, both results}
+    return;
   }
-  lvx(Dst, r(0), TMP1);
+
+  if (SrcES == IR::OpSize::i32Bit) {
+    if (DstES == IR::OpSize::i32Bit) {
+      // i32 -> f32, lane-wise; the guest element stays in BE word 3.
+      xvcvsxwsp(VTMP1, Vec2);
+      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+      xxsel(Dst, Vec1, VTMP1, VTMP2);
+    } else {
+      // i32 -> f64. xvcvsxwdp reads BE words 0 and 2, so splat the guest
+      // element across the register first; both doublewords then match.
+      xxspltw(VTMP1, Vec2, 3);
+      xvcvsxwdp(VTMP1, VTMP1);
+      xxpermdi(Dst, Vec1, VTMP1, 1);
+    }
+    return;
+  }
+
+  // i64 source: splat dw1 so both lanes convert the guest element.
+  xxpermdi(VTMP1, Vec2, Vec2, 3);
+  if (DstES == IR::OpSize::i32Bit) {
+    // Single rounding, as in VSToFGPRInsert; results land in BE words 0 and 2.
+    xvcvsxdsp(VTMP1, VTMP1);
+    xxspltw(VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
+  } else {
+    xvcvsxddp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
+  }
 }
 
 // VSToFGPRInsert: GPR signed int → float, insert into Vec1[0].
@@ -4088,25 +4088,31 @@ DEF_OP(VSToFGPRInsert) {
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec, r(0), TMP1);
-
-  // Move signed int from GPR → FPR via memory.
+  // GPR -> VSX directly with mtvsrd (ISA 2.07) instead of bouncing the value
+  // through the red zone and the scalar FPU.
   if (SrcES == IR::OpSize::i32Bit) {
-    extsw(TMP3, Src);          // sign-extend low 32 → 64
-    std(TMP3, -48, r1);
+    extsw(TMP3, Src);                   // sign-extend low 32 -> 64
+    mtvsrd(VTMP1, TMP3);
   } else {
-    std(Src, -48, r1);         // already 64-bit
+    mtvsrd(VTMP1, Src);
   }
-  lfd(f0, -48, r1);
+  // mtvsrd writes doubleword 0 and leaves doubleword 1 undefined; splat so
+  // both lanes convert the same value and no garbage lane can raise FP flags.
+  xxpermdi(VTMP1, VTMP1, VTMP1, 0);
+
   if (DstES == IR::OpSize::i32Bit) {
-    fcfids(f0, f0);
-    stfs(f0, -32, r1);
+    // xvcvsxdsp is i64 -> f32 with a SINGLE rounding. Converting via f64 and
+    // narrowing would round twice, which cvtsi2ss with a 64-bit source would
+    // expose. Results land in BE words 0 and 2, so splat word 0 across the
+    // register to reach word 3 where the guest element lives.
+    xvcvsxdsp(VTMP1, VTMP1);
+    xxspltw(VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec, VTMP1, VTMP2);
   } else {
-    fcfid(f0, f0);
-    stfd(f0, -32, r1);
+    xvcvsxddp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec, VTMP1, 1);       // {Vec.dw0, result.dw1}
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VFToIScalarInsert: float → signed integer with explicit rounding mode.
