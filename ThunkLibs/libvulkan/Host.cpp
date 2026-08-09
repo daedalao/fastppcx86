@@ -79,11 +79,88 @@ template<>
 struct guest_layout<VkDescriptorDataEXT> {
   char union_storage[8];
 };
+
+// Dispatchable Vulkan handles are real host pointers (VkInstance is
+// VkInstance_T*, and so on), so a 32-bit guest cannot hold one. They are all
+// annotated opaque_type in the interface, but that alone only stops the thunk
+// generator from walking the pointee - the default conversion still narrows
+// the pointer, and the truncation guard then aborts the process.
+//
+// Observed on Portal 2, a 32-bit title: DXVK calls vkCreateInstance, the host
+// returns a VkInstance at 0x3fff'xxxx'xxxx, and FEX aborts with
+//   "32-bit truncation of host pointer ... returned to guest"
+// inside GuestWrapperForHostFunction<VkResult(const VkInstanceCreateInfo*...)>.
+//
+// Same treatment the GL handles got (GLXFBConfig, GLXContext, GLsync): hand the
+// guest a stable token and translate back on the way in.
+//
+// Only the six DISPATCHABLE handle types need this. Non-dispatchable handles
+// (VkImage, VkBuffer, VkDeviceMemory, ...) are already uint64_t by definition,
+// so they survive the trip on their own.
+#define FEX_VK_HANDLE_TOKEN(TYPE)                        \
+  template<>                                             \
+  struct host_layout<TYPE*> {                            \
+    TYPE* data;                                          \
+    host_layout(const guest_layout<TYPE*>&);             \
+  };                                                     \
+  guest_layout<TYPE*> to_guest(const host_layout<TYPE*>& from);
+
+FEX_VK_HANDLE_TOKEN(VkInstance_T)
+FEX_VK_HANDLE_TOKEN(VkPhysicalDevice_T)
+FEX_VK_HANDLE_TOKEN(VkDevice_T)
+FEX_VK_HANDLE_TOKEN(VkQueue_T)
+FEX_VK_HANDLE_TOKEN(VkCommandBuffer_T)
+FEX_VK_HANDLE_TOKEN(VkExternalComputeQueueNV_T)
+#undef FEX_VK_HANDLE_TOKEN
 #endif
 
 #include "thunkgen_host_libvulkan.inl"
 
 #include <common/X11Manager.h>
+
+#ifdef IS_32BIT_THUNK
+#include <common/OpaqueHandleRegistry.h>
+
+// Backing registries for the handle tokens declared above. Each type gets its
+// own token range so a handle passed where a different type is expected is
+// rejected rather than silently reinterpreted. The bases sit high in the 32-bit
+// range, clear of where a 32-bit guest's own mappings and FEX's low-4GB
+// trampolines (0x7000'0000) live, and none of these values is ever
+// dereferenced by either side.
+//
+// Handles are not retired. Instances, devices and physical devices are few and
+// long-lived; queues and command buffers are owned by their device and die with
+// it. Retiring on vkDestroy* would be tidier but risks resolving a token to
+// null while the guest still legitimately holds it, and the registries are
+// bounded in practice. glDeleteSync needed retirement because a title fences
+// once per frame - nothing here has that shape.
+namespace {
+FEX::Thunks::OpaqueHandleRegistry<VkInstance_T, 0xE100'0000> InstanceRegistry;
+FEX::Thunks::OpaqueHandleRegistry<VkPhysicalDevice_T, 0xE200'0000> PhysicalDeviceRegistry;
+FEX::Thunks::OpaqueHandleRegistry<VkDevice_T, 0xE300'0000> DeviceRegistry;
+FEX::Thunks::OpaqueHandleRegistry<VkQueue_T, 0xE400'0000> QueueRegistry;
+FEX::Thunks::OpaqueHandleRegistry<VkCommandBuffer_T, 0xE500'0000> CommandBufferRegistry;
+FEX::Thunks::OpaqueHandleRegistry<VkExternalComputeQueueNV_T, 0xE600'0000> ExternalComputeQueueRegistry;
+} // namespace
+
+#define FEX_VK_HANDLE_TOKEN_IMPL(TYPE, REGISTRY)                              \
+  host_layout<TYPE*>::host_layout(const guest_layout<TYPE*>& guest)           \
+    : data(REGISTRY.ForToken(static_cast<uint32_t>(guest.data))) {}           \
+                                                                              \
+  guest_layout<TYPE*> to_guest(const host_layout<TYPE*>& from) {              \
+    guest_layout<TYPE*> Result {};                                            \
+    Result.data = REGISTRY.TokenFor(from.data);                               \
+    return Result;                                                            \
+  }
+
+FEX_VK_HANDLE_TOKEN_IMPL(VkInstance_T, InstanceRegistry)
+FEX_VK_HANDLE_TOKEN_IMPL(VkPhysicalDevice_T, PhysicalDeviceRegistry)
+FEX_VK_HANDLE_TOKEN_IMPL(VkDevice_T, DeviceRegistry)
+FEX_VK_HANDLE_TOKEN_IMPL(VkQueue_T, QueueRegistry)
+FEX_VK_HANDLE_TOKEN_IMPL(VkCommandBuffer_T, CommandBufferRegistry)
+FEX_VK_HANDLE_TOKEN_IMPL(VkExternalComputeQueueNV_T, ExternalComputeQueueRegistry)
+#undef FEX_VK_HANDLE_TOKEN_IMPL
+#endif
 
 static bool SetupInstance {};
 static std::mutex SetupMutex {};
