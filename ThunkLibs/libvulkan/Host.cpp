@@ -117,6 +117,14 @@ FEX_VK_HANDLE_TOKEN(VkExternalComputeQueueNV_T)
 
 #include "thunkgen_host_libvulkan.inl"
 
+// FEX_VK_ARRAYTRACE=1 logs the count/array queries and the create-info repacks
+// that this file implements by hand. Cheap enough to leave in: one cached
+// lookup, no work when unset.
+static bool VkArrayTrace() {
+  static const bool Enabled = getenv("FEX_VK_ARRAYTRACE") != nullptr;
+  return Enabled;
+}
+
 #include <common/X11Manager.h>
 
 #ifdef IS_32BIT_THUNK
@@ -211,7 +219,8 @@ void fex_custom_repack_entry(host_layout<VkXcbSurfaceCreateInfoKHR>& to, const g
 
 bool fex_custom_repack_exit(guest_layout<VkXcbSurfaceCreateInfoKHR>&, const host_layout<VkXcbSurfaceCreateInfoKHR>&) {
   // TODO: xcb_sync?
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkXlibSurfaceCreateInfoKHR>& to, const guest_layout<VkXlibSurfaceCreateInfoKHR>& from) {
@@ -220,7 +229,8 @@ void fex_custom_repack_entry(host_layout<VkXlibSurfaceCreateInfoKHR>& to, const 
 
 bool fex_custom_repack_exit(guest_layout<VkXlibSurfaceCreateInfoKHR>&, const host_layout<VkXlibSurfaceCreateInfoKHR>& from) {
   x11_manager.HostXFlush(from.data.dpy);
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 static VkResult fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT(VkPhysicalDevice a_0, guest_layout<Display*> a_1, VkDisplayKHR a_2) {
@@ -265,6 +275,11 @@ DummyVkDebugReportCallback(VkDebugReportFlagsEXT, VkDebugReportObjectTypeEXT, ui
 }
 
 static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
+  if (VkArrayTrace()) {
+    fprintf(stderr, "FEXVKTRACE: vkCreateInstance impl entered info=%p out=%p ldr=%p\n", (const void*)a_0, (void*)a_2.get_pointer(),
+            (void*)LDR_PTR(vkCreateInstance));
+    fflush(stderr);
+  }
   const VkInstanceCreateInfo* vk_struct_base = a_0;
   for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
        vk_struct = vk_struct->pNext) {
@@ -298,6 +313,10 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
                                            guest_layout<VkDevice*> a_3) {
   VkDevice out;
   auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
+  if (VkArrayTrace()) {
+    fprintf(stderr, "FEXVKTRACE: vkCreateDevice ret=%d device=%p out_guest=%p\n", ret, (void*)out, (void*)a_3.get_pointer());
+    fflush(stderr);
+  }
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 
   // Reload device-specific function pointers used in custom implementations.
@@ -1143,7 +1162,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO, VkBindImagePlaneMemoryInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT, VkBufferDeviceAddressCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO, VkBufferOpaqueCaptureAddressCreateInfo>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR, VkBufferUsageFlags2CreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT, VkCommandBufferInheritanceConditionalRenderingInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO, VkCommandBufferInheritanceRenderingInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDER_PASS_TRANSFORM_INFO_QCOM, VkCommandBufferInheritanceRenderPassTransformInfoQCOM>,
@@ -1170,7 +1188,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, VkDeviceGroupSwapchainCreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD, VkDeviceMemoryOverallocationCreateInfoAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO, VkDevicePrivateDataCreateInfo>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR, VkDeviceQueueGlobalPriorityCreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_NATIVE_HDR_SURFACE_CAPABILITIES_AMD, VkDisplayNativeHdrSurfaceCapabilitiesAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_PRESENT_INFO_KHR, VkDisplayPresentInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO, VkExportFenceCreateInfo>,
@@ -1185,7 +1202,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT, VkFilterCubicImageViewImageFormatPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3, VkFormatProperties3>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, VkGraphicsPipelineLibraryCreateInfoEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT, VkHostImageCopyDevicePerformanceQueryEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT, VkImageCompressionControlEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT, VkImageCompressionPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT, VkImageDrmFormatModifierListCreateInfoEXT>,
@@ -1229,7 +1245,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_CULLING_SHADER_PROPERTIES_HUAWEI, VkPhysicalDeviceClusterCullingShaderPropertiesHUAWEI>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD, VkPhysicalDeviceCoherentMemoryFeaturesAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT, VkPhysicalDeviceColorWriteEnableFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV, VkPhysicalDeviceComputeShaderDerivativesFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT, VkPhysicalDeviceConditionalRenderingFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT, VkPhysicalDeviceConservativeRasterizationPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, VkPhysicalDeviceCooperativeMatrixFeaturesKHR>,
@@ -1237,14 +1252,12 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR, VkPhysicalDeviceCooperativeMatrixPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_NV, VkPhysicalDeviceCooperativeMatrixPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_NV, VkPhysicalDeviceCopyMemoryIndirectFeaturesNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_PROPERTIES_NV, VkPhysicalDeviceCopyMemoryIndirectPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CORNER_SAMPLED_IMAGE_FEATURES_NV, VkPhysicalDeviceCornerSampledImageFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COVERAGE_REDUCTION_MODE_FEATURES_NV, VkPhysicalDeviceCoverageReductionModeFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, VkPhysicalDeviceCustomBorderColorFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT, VkPhysicalDeviceCustomBorderColorPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEDICATED_ALLOCATION_IMAGE_ALIASING_FEATURES_NV, VkPhysicalDeviceDedicatedAllocationImageAliasingFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT, VkPhysicalDeviceDepthBiasControlFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_EXT, VkPhysicalDeviceDepthClampZeroOneFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, VkPhysicalDeviceDepthClipControlFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, VkPhysicalDeviceDepthClipEnableFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES, VkPhysicalDeviceDepthStencilResolveProperties>,
@@ -1278,8 +1291,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_2_FEATURES_EXT, VkPhysicalDeviceFragmentDensityMap2FeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_2_PROPERTIES_EXT, VkPhysicalDeviceFragmentDensityMap2PropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT, VkPhysicalDeviceFragmentDensityMapFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_QCOM, VkPhysicalDeviceFragmentDensityMapOffsetFeaturesQCOM>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_PROPERTIES_QCOM, VkPhysicalDeviceFragmentDensityMapOffsetPropertiesQCOM>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT, VkPhysicalDeviceFragmentDensityMapPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_PROPERTIES_KHR, VkPhysicalDeviceFragmentShaderBarycentricPropertiesKHR>,
@@ -1288,11 +1299,8 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_ENUMS_PROPERTIES_NV, VkPhysicalDeviceFragmentShadingRateEnumsPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR, VkPhysicalDeviceFragmentShadingRateFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR, VkPhysicalDeviceFragmentShadingRatePropertiesKHR>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GLOBAL_PRIORITY_QUERY_FEATURES_KHR, VkPhysicalDeviceGlobalPriorityQueryFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT, VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, VkPhysicalDeviceHostImageCopyFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT, VkPhysicalDeviceHostImageCopyPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, VkPhysicalDeviceHostQueryResetFeatures>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, VkPhysicalDeviceIDProperties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT, VkPhysicalDeviceImage2DViewOf3DFeaturesEXT>,
@@ -1306,23 +1314,16 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT, VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT, VkPhysicalDeviceImageViewImageFormatInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT, VkPhysicalDeviceImageViewMinLodFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, VkPhysicalDeviceIndexTypeUint8FeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INHERITED_VIEWPORT_SCISSOR_FEATURES_NV, VkPhysicalDeviceInheritedViewportScissorFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES, VkPhysicalDeviceInlineUniformBlockFeatures>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES, VkPhysicalDeviceInlineUniformBlockProperties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INVOCATION_MASK_FEATURES_HUAWEI, VkPhysicalDeviceInvocationMaskFeaturesHUAWEI>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_DITHERING_FEATURES_EXT, VkPhysicalDeviceLegacyDitheringFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINEAR_COLOR_ATTACHMENT_FEATURES_NV, VkPhysicalDeviceLinearColorAttachmentFeaturesNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT, VkPhysicalDeviceLineRasterizationFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES_EXT, VkPhysicalDeviceLineRasterizationPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, VkPhysicalDeviceMaintenance3Properties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, VkPhysicalDeviceMaintenance4Features>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES, VkPhysicalDeviceMaintenance4Properties>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, VkPhysicalDeviceMaintenance5FeaturesKHR>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR, VkPhysicalDeviceMaintenance5PropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT, VkPhysicalDeviceMemoryBudgetPropertiesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_FEATURES_NV, VkPhysicalDeviceMemoryDecompressionFeaturesNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_PROPERTIES_NV, VkPhysicalDeviceMemoryDecompressionPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT, VkPhysicalDeviceMemoryPriorityFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, VkPhysicalDeviceMeshShaderFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_NV, VkPhysicalDeviceMeshShaderFeaturesNV>,
@@ -1350,9 +1351,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT, VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_PROPERTIES_FEATURES_EXT, VkPhysicalDevicePipelinePropertiesFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_PROTECTED_ACCESS_FEATURES_EXT, VkPhysicalDevicePipelineProtectedAccessFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT, VkPhysicalDevicePipelineRobustnessFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_PROPERTIES_EXT, VkPhysicalDevicePipelineRobustnessPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES, VkPhysicalDevicePointClippingProperties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_BARRIER_FEATURES_NV, VkPhysicalDevicePresentBarrierFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, VkPhysicalDevicePresentIdFeaturesKHR>,
@@ -1364,7 +1362,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES, VkPhysicalDeviceProtectedMemoryProperties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, VkPhysicalDeviceProvokingVertexFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT, VkPhysicalDeviceProvokingVertexPropertiesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR, VkPhysicalDevicePushDescriptorPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT, VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, VkPhysicalDeviceRayQueryFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV, VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV>,
@@ -1377,8 +1374,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PROPERTIES_NV, VkPhysicalDeviceRayTracingPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_REPRESENTATIVE_FRAGMENT_TEST_FEATURES_NV, VkPhysicalDeviceRepresentativeFragmentTestFeaturesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RGBA10X6_FORMATS_FEATURES_EXT, VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, VkPhysicalDeviceRobustness2FeaturesEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT, VkPhysicalDeviceRobustness2PropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT, VkPhysicalDeviceSampleLocationsPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES, VkPhysicalDeviceSamplerFilterMinmaxProperties>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, VkPhysicalDeviceSamplerYcbcrConversionFeatures>,
@@ -1422,7 +1417,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT, VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_SHADING_FEATURES_HUAWEI, VkPhysicalDeviceSubpassShadingFeaturesHUAWEI>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_SHADING_PROPERTIES_HUAWEI, VkPhysicalDeviceSubpassShadingPropertiesHUAWEI>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT, VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, VkPhysicalDeviceSynchronization2Features>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT, VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES, VkPhysicalDeviceTexelBufferAlignmentProperties>,
@@ -1434,7 +1428,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT, VkPhysicalDeviceTransformFeedbackPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, VkPhysicalDeviceUniformBufferStandardLayoutFeatures>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES, VkPhysicalDeviceVariablePointersFeatures>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT, VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features>,
@@ -1454,25 +1447,21 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COVERAGE_MODULATION_STATE_CREATE_INFO_NV, VkPipelineCoverageModulationStateCreateInfoNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COVERAGE_REDUCTION_STATE_CREATE_INFO_NV, VkPipelineCoverageReductionStateCreateInfoNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COVERAGE_TO_COLOR_STATE_CREATE_INFO_NV, VkPipelineCoverageToColorStateCreateInfoNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR, VkPipelineCreateFlags2CreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DISCARD_RECTANGLE_STATE_CREATE_INFO_EXT, VkPipelineDiscardRectangleStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_ENUM_STATE_CREATE_INFO_NV, VkPipelineFragmentShadingRateEnumStateCreateInfoNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR, VkPipelineFragmentShadingRateStateCreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, VkPipelineLibraryCreateInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT, VkPipelineRasterizationConservativeStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT, VkPipelineRasterizationDepthClipStateCreateInfoEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT, VkPipelineRasterizationLineStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT, VkPipelineRasterizationProvokingVertexStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_RASTERIZATION_ORDER_AMD, VkPipelineRasterizationStateRasterizationOrderAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT, VkPipelineRasterizationStateStreamCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, VkPipelineRenderingCreateInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_REPRESENTATIVE_FRAGMENT_TEST_STATE_CREATE_INFO_NV, VkPipelineRepresentativeFragmentTestStateCreateInfoNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT, VkPipelineRobustnessCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT, VkPipelineSampleLocationsStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT, VkPipelineShaderStageModuleIdentifierCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO, VkPipelineTessellationDomainOriginStateCreateInfo>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, VkPipelineVertexInputDivisorStateCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, VkPipelineViewportDepthClipControlCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_EXCLUSIVE_SCISSOR_STATE_CREATE_INFO_NV, VkPipelineViewportExclusiveScissorStateCreateInfoNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_SWIZZLE_STATE_CREATE_INFO_NV, VkPipelineViewportSwizzleStateCreateInfoNV>,
@@ -1483,7 +1472,6 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_QUERY_CREATE_INFO_INTEL, VkQueryPoolPerformanceQueryCreateInfoINTEL>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_CHECKPOINT_PROPERTIES_2_NV, VkQueueFamilyCheckpointProperties2NV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_CHECKPOINT_PROPERTIES_NV, VkQueueFamilyCheckpointPropertiesNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR, VkQueueFamilyGlobalPriorityPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_QUERY_RESULT_STATUS_PROPERTIES_KHR, VkQueueFamilyQueryResultStatusPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR, VkQueueFamilyVideoPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT, VkRenderingFragmentDensityMapAttachmentInfoEXT>,
@@ -1506,22 +1494,13 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, VkShaderModuleCreateInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_VALIDATION_CACHE_CREATE_INFO_EXT, VkShaderModuleValidationCacheCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SHARED_PRESENT_SURFACE_CAPABILITIES_KHR, VkSharedPresentSurfaceCapabilitiesKHR>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_QCOM, VkSubpassFragmentDensityMapOffsetEndInfoQCOM>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT, VkSubpassResolvePerformanceQueryEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_SHADING_PIPELINE_CREATE_INFO_HUAWEI, VkSubpassShadingPipelineCreateInfoHUAWEI>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE_EXT, VkSubresourceHostMemcpySizeEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_BARRIER_NV, VkSurfaceCapabilitiesPresentBarrierNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT, VkSurfacePresentModeCompatibilityEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT, VkSurfacePresentModeEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT, VkSurfacePresentScalingCapabilitiesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR, VkSurfaceProtectedCapabilitiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_COUNTER_CREATE_INFO_EXT, VkSwapchainCounterCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_DISPLAY_NATIVE_HDR_CREATE_INFO_AMD, VkSwapchainDisplayNativeHdrCreateInfoAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_BARRIER_CREATE_INFO_NV, VkSwapchainPresentBarrierCreateInfoNV>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT, VkSwapchainPresentFenceInfoEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT, VkSwapchainPresentModeInfoEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT, VkSwapchainPresentModesCreateInfoEXT>,
-  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT, VkSwapchainPresentScalingCreateInfoEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_TEXTURE_LOD_GATHER_FORMAT_PROPERTIES_AMD, VkTextureLODGatherFormatPropertiesAMD>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, VkTimelineSemaphoreSubmitInfo>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT, VkValidationFeaturesEXT>,
@@ -1539,6 +1518,200 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR, VkVideoProfileInfoKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, VkWriteDescriptorSetAccelerationStructureKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_NV, VkWriteDescriptorSetAccelerationStructureNV>,
+
+  // Feature/property/capability structs an app or driver chains into a query.
+  // These all had a VULKAN_*_CUSTOM_REPACK registration but no entry here, so
+  // they were silently dropped from the chain and the guest read back zeroes.
+  // DXVK reads that as "device lacks the feature" and skips the adapter
+  // outright: with VkPhysicalDeviceMaintenance6Features missing it rejected
+  // every GPU on the box with "Device does not support required feature
+  // 'maintenance6'" and never created a device.
+  //
+  // Derived by matching each repack-registered struct name against the
+  // VkStructureType enumerant it canonicalises to, so a pairing is only
+  // emitted when the two agree exactly; anything irregular (VkPhysicalDevice-
+  // Vulkan14Features, whose enum spells it VULKAN_1_4) is listed by hand below
+  // rather than guessed at.
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV, VkCooperativeMatrixFlexibleDimensionsPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR, VkCooperativeMatrixPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_NV, VkCooperativeMatrixPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COOPERATIVE_VECTOR_PROPERTIES_NV, VkCooperativeVectorPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_PRESENT_CAPABILITIES_KHR, VkDeviceGroupPresentCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_MODE_PROPERTIES_2_KHR, VkDisplayModeProperties2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_MODE_STEREO_PROPERTIES_NV, VkDisplayModeStereoPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_PLANE_CAPABILITIES_2_KHR, VkDisplayPlaneCapabilities2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_PLANE_PROPERTIES_2_KHR, VkDisplayPlaneProperties2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_PROPERTIES_2_KHR, VkDisplayProperties2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES, VkExternalBufferProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES, VkExternalFenceProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES, VkExternalSemaphoreProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_TENSOR_PROPERTIES_ARM, VkExternalTensorPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, VkFormatProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT, VkImageDrmFormatModifierPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, VkImageFormatProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_ADDRESS_PROPERTIES_NVX, VkImageViewAddressPropertiesNVX>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_LATENCY_SURFACE_CAPABILITIES_NV, VkLatencySurfaceCapabilitiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR, VkMemoryFdPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, VkMemoryHostPointerPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT, VkMultisamplePropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_PROPERTIES_NV, VkOpticalFlowImageFormatPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD, VkPhysicalDeviceAntiLagFeaturesAMD>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV, VkPhysicalDeviceClusterAccelerationStructureFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV, VkPhysicalDeviceClusterAccelerationStructurePropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_CULLING_SHADER_VRS_FEATURES_HUAWEI, VkPhysicalDeviceClusterCullingShaderVrsFeaturesHUAWEI>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMMAND_BUFFER_INHERITANCE_FEATURES_NV, VkPhysicalDeviceCommandBufferInheritanceFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_OCCUPANCY_PRIORITY_FEATURES_NV, VkPhysicalDeviceComputeOccupancyPriorityFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR, VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR, VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, VkPhysicalDeviceCooperativeMatrix2FeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_PROPERTIES_NV, VkPhysicalDeviceCooperativeMatrix2PropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_FEATURES_NV, VkPhysicalDeviceCooperativeVectorFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_PROPERTIES_NV, VkPhysicalDeviceCooperativeVectorPropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR, VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_PROPERTIES_KHR, VkPhysicalDeviceCopyMemoryIndirectPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUBIC_CLAMP_FEATURES_QCOM, VkPhysicalDeviceCubicClampFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUBIC_WEIGHTS_FEATURES_QCOM, VkPhysicalDeviceCubicWeightsFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_RESOLVE_FEATURES_EXT, VkPhysicalDeviceCustomResolveFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DATA_GRAPH_FEATURES_ARM, VkPhysicalDeviceDataGraphFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DATA_GRAPH_MODEL_FEATURES_QCOM, VkPhysicalDeviceDataGraphModelFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT, VkPhysicalDeviceDepthClampControlFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_KHR, VkPhysicalDeviceDepthClampZeroOneFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_TENSOR_FEATURES_ARM, VkPhysicalDeviceDescriptorBufferTensorFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_TENSOR_PROPERTIES_ARM, VkPhysicalDeviceDescriptorBufferTensorPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_POOL_OVERALLOCATION_FEATURES_NV, VkPhysicalDeviceDescriptorPoolOverallocationFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT, VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT, VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES, VkPhysicalDeviceDynamicRenderingLocalReadFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_SPARSE_ADDRESS_SPACE_FEATURES_NV, VkPhysicalDeviceExtendedSparseAddressSpaceFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_SPARSE_ADDRESS_SPACE_PROPERTIES_NV, VkPhysicalDeviceExtendedSparseAddressSpacePropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_COMPUTE_QUEUE_PROPERTIES_NV, VkPhysicalDeviceExternalComputeQueuePropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FORMAT_PACK_FEATURES_ARM, VkPhysicalDeviceFormatPackFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_LAYERED_FEATURES_VALVE, VkPhysicalDeviceFragmentDensityMapLayeredFeaturesVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_LAYERED_PROPERTIES_VALVE, VkPhysicalDeviceFragmentDensityMapLayeredPropertiesVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_EXT, VkPhysicalDeviceFragmentDensityMapOffsetFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_PROPERTIES_EXT, VkPhysicalDeviceFragmentDensityMapOffsetPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAME_BOUNDARY_FEATURES_EXT, VkPhysicalDeviceFrameBoundaryFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GLOBAL_PRIORITY_QUERY_FEATURES, VkPhysicalDeviceGlobalPriorityQueryFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HDR_VIVID_FEATURES_HUAWEI, VkPhysicalDeviceHdrVividFeaturesHUAWEI>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES, VkPhysicalDeviceHostImageCopyFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES, VkPhysicalDeviceHostImageCopyProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ALIGNMENT_CONTROL_FEATURES_MESA, VkPhysicalDeviceImageAlignmentControlFeaturesMESA>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ALIGNMENT_CONTROL_PROPERTIES_MESA, VkPhysicalDeviceImageAlignmentControlPropertiesMESA>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM, VkPhysicalDeviceImageProcessing2FeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_PROPERTIES_QCOM, VkPhysicalDeviceImageProcessing2PropertiesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_KHR, VkPhysicalDeviceLayeredApiPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR, VkPhysicalDeviceLayeredApiVulkanPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_DRIVER_PROPERTIES_MSFT, VkPhysicalDeviceLayeredDriverPropertiesMSFT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT, VkPhysicalDeviceLegacyVertexAttributesFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_PROPERTIES_EXT, VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES, VkPhysicalDeviceLineRasterizationFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES, VkPhysicalDeviceLineRasterizationProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR, VkPhysicalDeviceMaintenance10FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_PROPERTIES_KHR, VkPhysicalDeviceMaintenance10PropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES, VkPhysicalDeviceMaintenance5Features>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES, VkPhysicalDeviceMaintenance5Properties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, VkPhysicalDeviceMaintenance6Features>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES, VkPhysicalDeviceMaintenance6Properties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR, VkPhysicalDeviceMaintenance7FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR, VkPhysicalDeviceMaintenance7PropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR, VkPhysicalDeviceMaintenance8FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_FEATURES_KHR, VkPhysicalDeviceMaintenance9FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_PROPERTIES_KHR, VkPhysicalDeviceMaintenance9PropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT, VkPhysicalDeviceMapMemoryPlacedFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT, VkPhysicalDeviceMapMemoryPlacedPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_FEATURES_EXT, VkPhysicalDeviceMemoryDecompressionFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_PROPERTIES_EXT, VkPhysicalDeviceMemoryDecompressionPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, VkPhysicalDeviceMemoryProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT, VkPhysicalDeviceNestedCommandBufferFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_PROPERTIES_EXT, VkPhysicalDeviceNestedCommandBufferPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV, VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV, VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PER_STAGE_DESCRIPTOR_SET_FEATURES_NV, VkPhysicalDevicePerStageDescriptorSetFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_COUNTERS_BY_REGION_FEATURES_ARM, VkPhysicalDevicePerformanceCountersByRegionFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_COUNTERS_BY_REGION_PROPERTIES_ARM, VkPhysicalDevicePerformanceCountersByRegionPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR, VkPhysicalDevicePipelineBinaryFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR, VkPhysicalDevicePipelineBinaryPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CACHE_INCREMENTAL_MODE_FEATURES_SEC, VkPhysicalDevicePipelineCacheIncrementalModeFeaturesSEC>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_OPACITY_MICROMAP_FEATURES_ARM, VkPhysicalDevicePipelineOpacityMicromapFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_PROTECTED_ACCESS_FEATURES, VkPhysicalDevicePipelineProtectedAccessFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES, VkPhysicalDevicePipelineRobustnessFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_PROPERTIES, VkPhysicalDevicePipelineRobustnessProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR, VkPhysicalDevicePresentId2FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR, VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT, VkPhysicalDevicePresentTimingFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR, VkPhysicalDevicePresentWait2FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, VkPhysicalDeviceProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES, VkPhysicalDevicePushDescriptorProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAW_ACCESS_CHAINS_FEATURES_NV, VkPhysicalDeviceRawAccessChainsFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT, VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT, VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV, VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_VALIDATION_FEATURES_NV, VkPhysicalDeviceRayTracingValidationFeaturesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RELAXED_LINE_RASTERIZATION_FEATURES_IMG, VkPhysicalDeviceRelaxedLineRasterizationFeaturesIMG>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RENDER_PASS_STRIPED_FEATURES_ARM, VkPhysicalDeviceRenderPassStripedFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RENDER_PASS_STRIPED_PROPERTIES_ARM, VkPhysicalDeviceRenderPassStripedPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR, VkPhysicalDeviceRobustness2FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_KHR, VkPhysicalDeviceRobustness2PropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCHEDULING_CONTROLS_FEATURES_ARM, VkPhysicalDeviceSchedulingControlsFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCHEDULING_CONTROLS_PROPERTIES_ARM, VkPhysicalDeviceSchedulingControlsPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT, VkPhysicalDeviceShader64BitIndexingFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EXPECT_ASSUME_FEATURES, VkPhysicalDeviceShaderExpectAssumeFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES, VkPhysicalDeviceShaderFloatControls2Features>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR, VkPhysicalDeviceShaderFmaFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT, VkPhysicalDeviceShaderLongVectorFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_PROPERTIES_EXT, VkPhysicalDeviceShaderLongVectorPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR, VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR, VkPhysicalDeviceShaderQuadControlFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR, VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_REPLICATED_COMPOSITES_FEATURES_EXT, VkPhysicalDeviceShaderReplicatedCompositesFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES, VkPhysicalDeviceShaderSubgroupRotateFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNIFORM_BUFFER_UNSIZED_ARRAY_FEATURES_EXT, VkPhysicalDeviceShaderUniformBufferUnsizedArrayFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR, VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_FEATURES_ARM, VkPhysicalDeviceTensorFeaturesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_PROPERTIES_ARM, VkPhysicalDeviceTensorPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_MEMORY_HEAP_FEATURES_QCOM, VkPhysicalDeviceTileMemoryHeapFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_MEMORY_HEAP_PROPERTIES_QCOM, VkPhysicalDeviceTileMemoryHeapPropertiesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM, VkPhysicalDeviceTileShadingFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_PROPERTIES_QCOM, VkPhysicalDeviceTileShadingPropertiesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES, VkPhysicalDeviceToolProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR, VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES, VkPhysicalDeviceVertexAttributeDivisorFeatures>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES, VkPhysicalDeviceVertexAttributeDivisorProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT, VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_ENCODE_INTRA_REFRESH_FEATURES_KHR, VkPhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_ENCODE_QUANTIZATION_MAP_FEATURES_KHR, VkPhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_ENCODE_RGB_CONVERSION_FEATURES_VALVE, VkPhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR, VkPhysicalDeviceVideoMaintenance1FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR, VkPhysicalDeviceVideoMaintenance2FeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_DEGAMMA_FEATURES_QCOM, VkPhysicalDeviceYcbcrDegammaFeaturesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_DEVICE_MEMORY_FEATURES_EXT, VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR, VkPipelineExecutablePropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_PROPERTIES_IDENTIFIER_EXT, VkPipelinePropertiesIdentifierEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT, VkPresentTimingSurfaceCapabilitiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_DATA_GRAPH_PROCESSING_ENGINE_PROPERTIES_ARM, VkQueueFamilyDataGraphProcessingEnginePropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_DATA_GRAPH_PROPERTIES_ARM, VkQueueFamilyDataGraphPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES, VkQueueFamilyGlobalPriorityProperties>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR, VkQueueFamilyOwnershipTransferPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2, VkQueueFamilyProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2, VkSparseImageFormatProperties2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_EXT, VkSurfaceCapabilities2EXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, VkSurfaceCapabilities2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR, VkSurfaceCapabilitiesPresentId2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR, VkSurfaceCapabilitiesPresentWait2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR, VkSurfacePresentScalingCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT, VkSwapchainTimingPropertiesEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_FORMAT_PROPERTIES_ARM, VkTensorFormatPropertiesARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TILE_PROPERTIES_QCOM, VkTilePropertiesQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, VkVideoCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR, VkVideoEncodeCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_INTRA_REFRESH_CAPABILITIES_KHR, VkVideoEncodeIntraRefreshCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUALITY_LEVEL_PROPERTIES_KHR, VkVideoEncodeQualityLevelPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUANTIZATION_MAP_CAPABILITIES_KHR, VkVideoEncodeQuantizationMapCapabilitiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_RGB_CONVERSION_CAPABILITIES_VALVE, VkVideoEncodeRgbConversionCapabilitiesVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_FORMAT_PROPERTIES_KHR, VkVideoFormatPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_FORMAT_QUANTIZATION_MAP_PROPERTIES_KHR, VkVideoFormatQuantizationMapPropertiesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES, VkPhysicalDeviceVulkan14Properties>,
 };
 
 // Walks a guest pNext chain to the first link next_handlers knows how to
@@ -2665,10 +2838,11 @@ VULKAN_NONDEFAULT_CUSTOM_REPACK(VkXlibSurfaceCreateInfoKHR)
 void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const guest_layout<VkInstanceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostApplicationInfo = new host_layout<VkApplicationInfo> {*from.data.pApplicationInfo.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostApplicationInfo, *from.data.pApplicationInfo.get_pointer());
-
-  into.data.pApplicationInfo = &HostApplicationInfo->data;
+  // pApplicationInfo is optional, and wine's own winex11 vulkan init omits it.
+  // Dereferencing it unconditionally read address 0 inside the repack, before
+  // the custom impl ran at all -- the 32-bit Dex process died there every run.
+  // RepackStructArray already returns an empty span for a null pointer.
+  into.data.pApplicationInfo = RepackStructArray(1u, from.data.pApplicationInfo).data();
 
   auto extension_count = from.data.enabledExtensionCount.data;
   into.data.ppEnabledExtensionNames = RepackStructArray<false>(extension_count, from.data.ppEnabledExtensionNames).data();
@@ -2677,11 +2851,29 @@ void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const gues
   into.data.ppEnabledLayerNames = RepackStructArray<false>(layer_count, from.data.ppEnabledLayerNames).data();
 }
 
+// Returning true suppresses the generic exit write-back in ~repack_wrapper.
+//
+// That write-back copies the *host* struct back over the guest's struct, and
+// every one of these is a const input the guest still owns and reads after the
+// call. Worse, it runs after this function has already freed the host arrays,
+// so what lands in the guest is a set of dead host pointers narrowed to 32 bits
+// -- or zero.
+//
+// ~repack_wrapper does have an `is_const_v` guard for exactly this, but the
+// generator instantiates the wrapper through get_type_name_with_nonconst_pointee
+// (Generator/gen.cpp), which strips the const, so the guard never fires and
+// every input struct with a hand-written exit was being clobbered.
+//
+// Concretely: wine passes DXVK's VkDeviceCreateInfo straight through, we
+// overwrote its pQueueCreateInfos with 0, and wine's init_device_queues then
+// dereferenced null one instruction into the queue loop -- reported as
+// "err:vulkan:vkCreateDevice Exception 0xc0000005 in Unix call", four calls
+// deep and nowhere near the actual write.
 bool fex_custom_repack_exit(guest_layout<VkInstanceCreateInfo>& into, const host_layout<VkInstanceCreateInfo>& from) {
-  delete from.data.pApplicationInfo;
+  delete[] from.data.pApplicationInfo;
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
-  return false;
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkMemoryToImageCopyEXT>& into, const guest_layout<VkMemoryToImageCopyEXT>& from) {
@@ -2690,30 +2882,44 @@ void fex_custom_repack_entry(host_layout<VkMemoryToImageCopyEXT>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkMemoryToImageCopyEXT>& into, const host_layout<VkMemoryToImageCopyEXT>& from) {
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_layout<VkDeviceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostQueueCreateInfo = new host_layout<VkDeviceQueueCreateInfo> {*from.data.pQueueCreateInfos.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostQueueCreateInfo, *from.data.pQueueCreateInfos.get_pointer());
-  into.data.pQueueCreateInfos = &HostQueueCreateInfo->data;
+  // queueCreateInfoCount is routinely >1 (DXVK asks for graphics + transfer +
+  // sparse); only element 0 was being repacked, leaving the rest as guest
+  // layout for the driver to read.
+  into.data.pQueueCreateInfos = RepackStructArray(from.data.queueCreateInfoCount.data, from.data.pQueueCreateInfos).data();
+  if (VkArrayTrace()) {
+    fprintf(stderr, "FEXVKTRACE: VkDeviceCreateInfo queueCount=%u guestQueues=%p hostQueues=%p layers=%u exts=%u\n",
+            from.data.queueCreateInfoCount.data, (void*)from.data.pQueueCreateInfos.get_pointer(), (const void*)into.data.pQueueCreateInfos,
+            from.data.enabledLayerCount.data, from.data.enabledExtensionCount.data);
+    fflush(stderr);
+  }
 
-  auto layer_count = from.data.enabledExtensionCount.data;
-  fprintf(stderr, "  Repacking %d ppEnabledLayerNames\n", layer_count);
+  // This used to read enabledExtensionCount, so a device asking for a
+  // different number of layers than extensions repacked the wrong count.
+  auto layer_count = from.data.enabledLayerCount.data;
   into.data.ppEnabledLayerNames = RepackStructArray<false>(layer_count, from.data.ppEnabledLayerNames).data();
 
   auto extension_count = from.data.enabledExtensionCount.data;
-  fprintf(stderr, "  Repacking %d ppEnabledExtensionNames\n", extension_count);
   into.data.ppEnabledExtensionNames = RepackStructArray<false>(extension_count, from.data.ppEnabledExtensionNames).data();
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceCreateInfo>& into, const host_layout<VkDeviceCreateInfo>& from) {
-  delete from.data.pQueueCreateInfos;
+  if (VkArrayTrace()) {
+    fprintf(stderr, "FEXVKTRACE: VkDeviceCreateInfo exit guestQueues=%p count=%u guestPNext=%p\n",
+            (void*)into.data.pQueueCreateInfos.get_pointer(), into.data.queueCreateInfoCount.data, (void*)into.data.pNext.get_pointer());
+    fflush(stderr);
+  }
+  delete[] from.data.pQueueCreateInfos;
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorSetLayoutCreateInfo>& into, const guest_layout<VkDescriptorSetLayoutCreateInfo>& from) {
@@ -2723,7 +2929,8 @@ void fex_custom_repack_entry(host_layout<VkDescriptorSetLayoutCreateInfo>& into,
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorSetLayoutCreateInfo>& into, const host_layout<VkDescriptorSetLayoutCreateInfo>& from) {
   delete[] from.data.pBindings;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo>& into, const guest_layout<VkRenderPassCreateInfo>& from) {
@@ -2733,7 +2940,8 @@ void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo>& into, const gu
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo>& into, const host_layout<VkRenderPassCreateInfo>& from) {
   delete[] from.data.pSubpasses;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo2>& into, const guest_layout<VkRenderPassCreateInfo2>& from) {
@@ -2747,7 +2955,8 @@ bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo2>& into, const h
   DeleteRepackedStructArray(from.data.attachmentCount, from.data.pAttachments, into.data.pAttachments);
   DeleteRepackedStructArray(from.data.subpassCount, from.data.pSubpasses, into.data.pSubpasses);
   DeleteRepackedStructArray(from.data.dependencyCount, from.data.pDependencies, into.data.pDependencies);
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkSubpassDescription2>& into, const guest_layout<VkSubpassDescription2>& from) {
@@ -2774,7 +2983,8 @@ bool fex_custom_repack_exit(guest_layout<VkSubpassDescription2>& into, const hos
     fex_apply_custom_repacking_exit(*into.data.pDepthStencilAttachment.get_pointer(), to_host_layout(*from.data.pDepthStencilAttachment));
     delete from.data.pDepthStencilAttachment;
   }
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderingInfo>& into, const guest_layout<VkRenderingInfo>& from) {
@@ -2811,7 +3021,8 @@ bool fex_custom_repack_exit(guest_layout<VkRenderingInfo>& into, const host_layo
     fex_apply_custom_repacking_exit(*into.data.pStencilAttachment.get_pointer(), to_host_layout(*from.data.pStencilAttachment));
     delete from.data.pStencilAttachment;
   }
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const guest_layout<VkDescriptorGetInfoEXT>& from) {
@@ -2876,7 +3087,8 @@ bool fex_custom_repack_exit(guest_layout<VkDescriptorGetInfoEXT>& into, const ho
     // Nothing to do for the rest
     break;
   }
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkCopyMemoryToImageInfoEXT>& into, const guest_layout<VkCopyMemoryToImageInfoEXT>& from) {
@@ -2886,7 +3098,8 @@ void fex_custom_repack_entry(host_layout<VkCopyMemoryToImageInfoEXT>& into, cons
 
 bool fex_custom_repack_exit(guest_layout<VkCopyMemoryToImageInfoEXT>& into, const host_layout<VkCopyMemoryToImageInfoEXT>& from) {
   DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkDependencyInfo>& into, const guest_layout<VkDependencyInfo>& from) {
@@ -2900,7 +3113,8 @@ bool fex_custom_repack_exit(guest_layout<VkDependencyInfo>& into, const host_lay
   DeleteRepackedStructArray(from.data.memoryBarrierCount, from.data.pMemoryBarriers, into.data.pMemoryBarriers);
   DeleteRepackedStructArray(from.data.imageMemoryBarrierCount, from.data.pImageMemoryBarriers, into.data.pImageMemoryBarriers);
   DeleteRepackedStructArray(from.data.bufferMemoryBarrierCount, from.data.pBufferMemoryBarriers, into.data.pBufferMemoryBarriers);
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorUpdateTemplateCreateInfo>& into,
@@ -2911,7 +3125,8 @@ void fex_custom_repack_entry(host_layout<VkDescriptorUpdateTemplateCreateInfo>& 
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorUpdateTemplateCreateInfo>& into, const host_layout<VkDescriptorUpdateTemplateCreateInfo>& from) {
   DeleteRepackedStructArray(from.data.descriptorUpdateEntryCount, from.data.pDescriptorUpdateEntries, into.data.pDescriptorUpdateEntries);
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into, const guest_layout<VkPipelineShaderStageCreateInfo>& from) {
@@ -2924,7 +3139,8 @@ void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into,
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into, const host_layout<VkPipelineShaderStageCreateInfo>& from) {
   // TODO
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, const guest_layout<VkGraphicsPipelineCreateInfo>& from) {
@@ -2999,7 +3215,8 @@ bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, co
   delete from.data.pDepthStencilState;
   delete from.data.pColorBlendState;
   delete from.data.pDynamicState;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkSubmitInfo>& into, const guest_layout<VkSubmitInfo>& from) {
@@ -3009,7 +3226,8 @@ void fex_custom_repack_entry(host_layout<VkSubmitInfo>& into, const guest_layout
 
 bool fex_custom_repack_exit(guest_layout<VkSubmitInfo>& into, const host_layout<VkSubmitInfo>& from) {
   delete[] from.data.pCommandBuffers;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const guest_layout<VkCommandBufferBeginInfo>& from) {
@@ -3027,7 +3245,8 @@ void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const 
 
 bool fex_custom_repack_exit(guest_layout<VkCommandBufferBeginInfo>& into, const host_layout<VkCommandBufferBeginInfo>& from) {
   delete from.data.pInheritanceInfo;
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkPipelineCacheCreateInfo>& into, const guest_layout<VkPipelineCacheCreateInfo>& from) {
@@ -3039,7 +3258,8 @@ void fex_custom_repack_entry(host_layout<VkPipelineCacheCreateInfo>& into, const
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineCacheCreateInfo>& into, const host_layout<VkPipelineCacheCreateInfo>& from) {
   // Nothing to do
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const guest_layout<VkRenderPassBeginInfo>& from) {
@@ -3051,7 +3271,8 @@ void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const gue
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const host_layout<VkRenderPassBeginInfo>& from) {
   // Nothing to do
-  return false;
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3073,7 +3294,7 @@ template<typename T, typename Fn>
 static auto RepackedArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& call) {
   using RetType = decltype(call(std::declval<T*>()));
 
-  if (getenv("FEX_VK_ARRAYTRACE")) {
+  if (VkArrayTrace()) {
     fprintf(stderr, "FEXVKTRACE: array query enter count_ptr=%p count=%u array=%p\n", (void*)count, count ? *count : 0u,
             (void*)array.get_pointer());
   }
@@ -3096,7 +3317,7 @@ static auto RepackedArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& cal
     Plain[i] = Hosts[i].data;
   }
 
-  if (getenv("FEX_VK_ARRAYTRACE")) {
+  if (VkArrayTrace()) {
     fprintf(stderr, "FEXVKTRACE: array query repacked %u elements, calling driver\n", InputCount);
   }
 

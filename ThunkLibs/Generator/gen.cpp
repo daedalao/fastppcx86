@@ -514,6 +514,37 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       }
       file << "\n";
     }
+
+    // Functions with a hand-written host implementation.
+    //
+    // Those implementations are only reached through fexfn_unpack_*, i.e. when
+    // the guest calls the packed thunk by name. A library that also hands out
+    // raw host function pointers (vkGetInstanceProcAddr and friends) sends
+    // those calls through GuestWrapperForHostFunction instead, which marshals
+    // each parameter in isolation and never consults the custom impl. Anything
+    // the custom impl exists *for* — a count/array pair, a handle that needs
+    // registry translation — is then silently wrong.
+    //
+    // Exposing the list lets such a library route these names back to its own
+    // packed thunk. Emitted for every target; it costs one unused macro where
+    // nobody expands it.
+    //
+    // custom_guest_impl entries are excluded: those have no generated alias to
+    // take the address of, and a lib that defines one can special-case it
+    // directly.
+    file << "#define FOREACH_custom_host_impl_SYMBOL(EXPAND) \\\n";
+    for (auto& thunk : thunks) {
+      if (!thunk.custom_host_impl) {
+        continue;
+      }
+      auto api_entry = std::find_if(thunked_api.begin(), thunked_api.end(),
+                                    [&](const auto& api) { return api.function_name == thunk.function_name; });
+      if (api_entry != thunked_api.end() && api_entry->custom_guest_impl) {
+        continue;
+      }
+      file << "  EXPAND(" << thunk.function_name << ") \\\n";
+    }
+    file << "\n";
   }
 
   // Files used host-side
