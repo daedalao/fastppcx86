@@ -4247,7 +4247,28 @@ DEF_OP(VFCMPScalarInsert) {
 //   fnmadd : T = -(A*C + B) → -A*C - B    ("neg mul-add" → VFNMLS)
 //   fnmsub : T = -(A*C - B) → -A*C + B    ("neg mul-sub" → VFNMLA)
 // Note: fnmadd matches FEX's VFNMLS, and fnmsub matches FEX's VFNMLA.
-#define DEF_FMA_SCALAR_INSERT(NAME, FOP_S, FOP_D)                              \
+// Vector-domain lowering. The old one spilled FOUR vectors to the red zone
+// (Upper, V1, V2, Add), reloaded three of them into the scalar FPU, ran the
+// scalar FMA and stored the result back over the spilled Upper before
+// reloading the whole thing: thirteen instructions, four store-hit-loads, a
+// VSU<->FPU crossing, and - as with the rest of this family - a SCALAR float
+// op, which on POWER8 carries the ~22.8x denormal assist penalty that xv*
+// does not.
+//
+// Splat all three inputs so every lane computes the same value: the FPSCR
+// sticky bits raised are then exactly those of the one real computation, and
+// a single rounding is preserved because the FMA stays fused.
+//
+// Register pressure is the whole difficulty: three splatted operands must be
+// live at once and this backend has only VTMP1/VTMP2 (v30/v31). Dst supplies
+// the third, which is safe as long as Dst is not Upper - Upper has to survive
+// until the merge. Sequencing also matters: Add and V1 are splatted before Dst
+// is written, so Dst aliasing V1, V2 or Add is fine (each is already consumed,
+// and xxspltw reading and writing the same register is well defined).
+//
+// XT is the accumulator here, matching the non-scalar VFMLA path a few lines
+// up (Dst <- Add, then xvmaddasp(Dst, V1, V2) == V1*V2 + Add).
+#define DEF_FMA_SCALAR_INSERT(NAME, XVOP_S, XVOP_D, FOP_S, FOP_D)              \
 DEF_OP(NAME) {                                                                 \
   const auto Op    = IROp->C<IR::IROp_##NAME>();                               \
   const auto Dst   = GetVReg(Node);                                            \
@@ -4255,17 +4276,37 @@ DEF_OP(NAME) {                                                                 \
   const auto V1    = GetVReg(Op->Vector1);                                     \
   const auto V2    = GetVReg(Op->Vector2);                                     \
   const auto Add   = GetVReg(Op->Addend);                                      \
-  /* Spill Upper at -32 (becomes result base, preserves upper lanes). */       \
+  const bool Is32  = Op->Header.ElementSize == IR::OpSize::i32Bit;             \
+                                                                               \
+  if (Dst != Upper) {                                                          \
+    if (Is32) {                                                                \
+      xxspltw(VTMP1, Add, 3);                                                  \
+      xxspltw(VTMP2, V1, 3);                                                   \
+      xxspltw(Dst, V2, 3);                                                     \
+      XVOP_S(VTMP1, VTMP2, Dst);                                               \
+      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,    \
+                          TMP1, TMP2);                                         \
+      xxsel(Dst, Upper, VTMP1, VTMP2);                                         \
+    } else {                                                                   \
+      xxpermdi(VTMP1, Add, Add, 3);                                            \
+      xxpermdi(VTMP2, V1, V1, 3);                                              \
+      xxpermdi(Dst, V2, V2, 3);                                                \
+      XVOP_D(VTMP1, VTMP2, Dst);                                               \
+      xxpermdi(Dst, Upper, VTMP1, 1);                                          \
+    }                                                                          \
+    return;                                                                    \
+  }                                                                            \
+                                                                               \
+  /* Dst == Upper: no third scratch available, keep the scalar path. */        \
   addi(TMP1, r1, -32);                                                         \
   stvx(Upper, r(0), TMP1);                                                     \
-  /* Spill V1, V2, Add at -16, -48, -64 to read element 0. */                  \
   addi(TMP2, r1, -16);                                                         \
   stvx(V1, r(0), TMP2);                                                        \
   addi(TMP3, r1, -48);                                                         \
   stvx(V2, r(0), TMP3);                                                        \
   addi(TMP4, r1, -64);                                                         \
   stvx(Add, r(0), TMP4);                                                       \
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
+  if (Is32) {                                                                  \
     lfs(f0, 0, TMP2);                                                          \
     lfs(f1, 0, TMP3);                                                          \
     lfs(f2, 0, TMP4);                                                          \
@@ -4284,12 +4325,15 @@ DEF_OP(NAME) {                                                                 \
 // PPC fmadd ISA: T = FRA*FRC + FRB → emitter call fmadd(t, a, c, b).
 // We pass: f0=V1, f1=V2, f2=Add → call fmadd(t, f0, f1, f2) emits
 //   fmadd FRT, FRA=f0, FRC=f1, FRB=f2  →  T = f0*f1 + f2 = V1*V2 + Add.  ✓
-DEF_FMA_SCALAR_INSERT(VFMLAScalarInsert,  fmadds,  fmadd)
-DEF_FMA_SCALAR_INSERT(VFMLSScalarInsert,  fmsubs,  fmsub)
+// Vector op pairing mirrors the non-scalar DEF_OP(VFMLA/VFMLS/VFNMLA/VFNMLS)
+// handlers exactly, so the FEX-vs-PPC naming inversion is inherited from a
+// path that is already proven rather than re-derived here.
+DEF_FMA_SCALAR_INSERT(VFMLAScalarInsert,  xvmaddasp,  xvmaddadp,  fmadds,  fmadd)
+DEF_FMA_SCALAR_INSERT(VFMLSScalarInsert,  xvmsubasp,  xvmsubadp,  fmsubs,  fmsub)
 // VFNMLA: -(V1*V2) + Add → fnmsub: -A*C + B = -V1*V2 + Add  ✓
-DEF_FMA_SCALAR_INSERT(VFNMLAScalarInsert, fnmsubs, fnmsub)
+DEF_FMA_SCALAR_INSERT(VFNMLAScalarInsert, xvnmsubasp, xvnmsubadp, fnmsubs, fnmsub)
 // VFNMLS: -(V1*V2) - Add → fnmadd: -(A*C+B) = -V1*V2 - Add  ✓
-DEF_FMA_SCALAR_INSERT(VFNMLSScalarInsert, fnmadds, fnmadd)
+DEF_FMA_SCALAR_INSERT(VFNMLSScalarInsert, xvnmaddasp, xvnmaddadp, fnmadds, fnmadd)
 #undef DEF_FMA_SCALAR_INSERT
 // VFCopySign — magnitude from V1, sign from V2.
 DEF_OP(VFCopySign) {
