@@ -4148,57 +4148,80 @@ DEF_OP(VFCMPScalarInsert) {
   const auto ESize = Op->Header.ElementSize;
   const auto Pred = Op->Op;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
-  if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
-    lfs(f1, -16, r1);
-  } else {
-    lfd(f0, -32, r1);
-    lfd(f1, -16, r1);
-  }
-  // cr(1) throughout: guest CMPSS/CMPSD writes NO EFLAGS, and CR0 holds the
-  // packed NZCV — clobbering it here corrupts a pending cmp/test's flags
-  // (Hard West wedged forever in a cmp → cmpltss → jne normalize loop).
-  fcmpu(cr(1), f0, f1);
-  // CR1: bit 4=LT (a<b), bit 5=GT (a>b), bit 6=EQ (a==b), bit 7=SO (NaN).
-  // Normalize predicate result into CR1.EQ (bit 6) so we can branch on it.
+  // Branchless, in the vector domain. The old lowering spilled both operands
+  // to the red zone, reloaded them into the scalar FPU, compared with fcmpu,
+  // normalised the predicate through CR1 bit twiddling, then took a
+  // conditional BRANCH to pick 0 vs -1, stored that into lane 0 of the
+  // spilled Vec1 and reloaded the whole vector: ~14 instructions, two
+  // store-hit-loads, a scalar-FPU domain crossing and an unpredictable branch
+  // on what is usually a data-dependent comparison.
+  //
+  // The vector float compares already produce exactly the all-ones/all-zeros
+  // per-lane mask x86 CMPSS/CMPSD wants, and they are elementwise, so lane 0
+  // of the result is computed from lane 0 of the inputs with no splat needed.
+  //
+  // As a bonus this no longer writes ANY condition register: the cr(1) dance
+  // existed to avoid clobbering CR0's packed NZCV (the Hard West
+  // cmp -> cmpltss -> jne wedge). That hazard is now structurally absent
+  // rather than merely relocated.
+  //
+  // Unordered predicates: a NaN operand fails every ordered compare, so
+  // ORD = (V1 == V1) && (V2 == V2), and UNO/NEQ are its complement / the
+  // complement of EQ.
+  const bool Is32 = ESize == IR::OpSize::i32Bit;
   switch (Pred) {
   case IR::FloatCompareOp::EQ:
-    /* CR1.EQ already correct */
+    if (Is32) { vcmpeqfp(VTMP1, Vec1, Vec2); } else { xvcmpeqdp(VTMP1, Vec1, Vec2); }
     break;
   case IR::FloatCompareOp::LT:
-    cror(6, 4, 4);   // EQ = LT
+    if (Is32) { vcmpgtfp(VTMP1, Vec2, Vec1); } else { xvcmpgtdp(VTMP1, Vec2, Vec1); }
     break;
   case IR::FloatCompareOp::LE:
-    cror(6, 4, 6);   // EQ = LT || EQ
-    break;
-  case IR::FloatCompareOp::UNO:
-    cror(6, 7, 7);   // EQ = SO
+    if (Is32) { vcmpgefp(VTMP1, Vec2, Vec1); } else { xvcmpgedp(VTMP1, Vec2, Vec1); }
     break;
   case IR::FloatCompareOp::NEQ:
-    crnor(6, 6, 6);  // EQ = !EQ
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec2);
+      vnor    (VTMP1, VTMP1, VTMP1);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec2);
+      xxlnor   (VTMP1, VTMP1, VTMP1);
+    }
     break;
   case IR::FloatCompareOp::ORD:
-    crnor(6, 7, 7);  // EQ = !SO
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec1);
+      vcmpeqfp(VTMP2, Vec2, Vec2);
+      vand    (VTMP1, VTMP1, VTMP2);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec1);
+      xvcmpeqdp(VTMP2, Vec2, Vec2);
+      xxland   (VTMP1, VTMP1, VTMP2);
+    }
+    break;
+  case IR::FloatCompareOp::UNO:
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec1);
+      vcmpeqfp(VTMP2, Vec2, Vec2);
+      vand    (VTMP1, VTMP1, VTMP2);
+      vnor    (VTMP1, VTMP1, VTMP1);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec1);
+      xvcmpeqdp(VTMP2, Vec2, Vec2);
+      xxland   (VTMP1, VTMP1, VTMP2);
+      xxlnor   (VTMP1, VTMP1, VTMP1);
+    }
     break;
   }
 
-  PPC64Emitter::Label done{};
-  li(TMP3, 0);
-  bc({4, 6}, &done);             // bne on CR1.EQ: skip if predicate false
-  li(TMP3, -1);                  // mask = all-ones
-  Bind(&done);
-
-  if (ESize == IR::OpSize::i32Bit) {
-    stw(TMP3, 0, TMP1);
+  // Merge the mask into element 0, upper elements from Vec1 - same lane-0
+  // merge as the arithmetic ScalarInsert path.
+  if (Is32) {
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
   } else {
-    std(TMP3, 0, TMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
   }
-  lvx(Dst, r(0), TMP1);
 }
 // FMA scalar inserts.  Semantics match VFMLA et al but only on element 0;
 // upper elements are copied from `Upper`.  Stack roundtrip per the
