@@ -1145,6 +1145,24 @@ void fexfn_impl_libvulkan_vkUnmapMemory(VkDevice device, VkDeviceMemory memory) 
   ReleasePlacedRange(Base);
 }
 
+// Allocate a host copy of a single nested struct *and* run its custom repacking.
+//
+// The plain `new host_layout<T>{*guest}` form only converts T's own fields, so
+// anything T owns -- its arrays, its pNext chain -- is left pointing at guest
+// memory for the driver to read. That is invisible whenever the element layouts
+// happen to match on both sides, which is why it survived: wrong, but not yet
+// fatal. Use this instead of hand-rolling the allocation.
+template<typename HostT, typename GuestPtrT>
+static const HostT* RepackNested(const GuestPtrT& Guest) {
+  auto Ptr = Guest.get_pointer();
+  if (!Ptr) {
+    return nullptr;
+  }
+  auto Host = new host_layout<HostT> {*Ptr};
+  fex_apply_custom_repacking_entry(*Host, *Ptr);
+  return &Host->data;
+}
+
 // Allocates storage on the heap that must be de-allocated using delete[] or DeleteRepackedStructArray
 template<bool NeedsRepack = true, typename T>
 std::span<std::remove_cv_t<T>> RepackStructArray(uint32_t Count, const guest_layout<T*> GuestData) {
@@ -3941,61 +3959,23 @@ void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, co
   default_fex_custom_repack_entry(into, from);
   into.data.pStages = RepackStructArray(from.data.stageCount.data, from.data.pStages).data();
 
-  if (!from.data.pVertexInputState.get_pointer()) {
-    into.data.pVertexInputState = nullptr;
-  } else {
-    into.data.pVertexInputState = &(new host_layout<VkPipelineVertexInputStateCreateInfo> {*from.data.pVertexInputState.get_pointer()})->data;
-  }
+  into.data.pVertexInputState = RepackNested<VkPipelineVertexInputStateCreateInfo>(from.data.pVertexInputState);
 
-  if (!from.data.pInputAssemblyState.get_pointer()) {
-    into.data.pInputAssemblyState = nullptr;
-  } else {
-    into.data.pInputAssemblyState =
-      &(new host_layout<VkPipelineInputAssemblyStateCreateInfo> {*from.data.pInputAssemblyState.get_pointer()})->data;
-  }
+  into.data.pInputAssemblyState = RepackNested<VkPipelineInputAssemblyStateCreateInfo>(from.data.pInputAssemblyState);
 
-  if (!from.data.pTessellationState.get_pointer()) {
-    into.data.pTessellationState = nullptr;
-  } else {
-    into.data.pTessellationState = &(new host_layout<VkPipelineTessellationStateCreateInfo> {*from.data.pTessellationState.get_pointer()})->data;
-  }
+  into.data.pTessellationState = RepackNested<VkPipelineTessellationStateCreateInfo>(from.data.pTessellationState);
 
-  if (!from.data.pViewportState.get_pointer()) {
-    into.data.pViewportState = nullptr;
-  } else {
-    into.data.pViewportState = &(new host_layout<VkPipelineViewportStateCreateInfo> {*from.data.pViewportState.get_pointer()})->data;
-  }
+  into.data.pViewportState = RepackNested<VkPipelineViewportStateCreateInfo>(from.data.pViewportState);
 
-  if (!from.data.pRasterizationState.get_pointer()) {
-    into.data.pRasterizationState = nullptr;
-  } else {
-    into.data.pRasterizationState =
-      &(new host_layout<VkPipelineRasterizationStateCreateInfo> {*from.data.pRasterizationState.get_pointer()})->data;
-  }
+  into.data.pRasterizationState = RepackNested<VkPipelineRasterizationStateCreateInfo>(from.data.pRasterizationState);
 
-  if (!from.data.pMultisampleState.get_pointer()) {
-    into.data.pMultisampleState = nullptr;
-  } else {
-    into.data.pMultisampleState = &(new host_layout<VkPipelineMultisampleStateCreateInfo> {*from.data.pMultisampleState.get_pointer()})->data;
-  }
+  into.data.pMultisampleState = RepackNested<VkPipelineMultisampleStateCreateInfo>(from.data.pMultisampleState);
 
-  if (!from.data.pDepthStencilState.get_pointer()) {
-    into.data.pDepthStencilState = nullptr;
-  } else {
-    into.data.pDepthStencilState = &(new host_layout<VkPipelineDepthStencilStateCreateInfo> {*from.data.pDepthStencilState.get_pointer()})->data;
-  }
+  into.data.pDepthStencilState = RepackNested<VkPipelineDepthStencilStateCreateInfo>(from.data.pDepthStencilState);
 
-  if (!from.data.pColorBlendState.get_pointer()) {
-    into.data.pColorBlendState = nullptr;
-  } else {
-    into.data.pColorBlendState = &(new host_layout<VkPipelineColorBlendStateCreateInfo> {*from.data.pColorBlendState.get_pointer()})->data;
-  }
+  into.data.pColorBlendState = RepackNested<VkPipelineColorBlendStateCreateInfo>(from.data.pColorBlendState);
 
-  if (!from.data.pDynamicState.get_pointer()) {
-    into.data.pDynamicState = nullptr;
-  } else {
-    into.data.pDynamicState = &(new host_layout<VkPipelineDynamicStateCreateInfo> {*from.data.pDynamicState.get_pointer()})->data;
-  }
+  into.data.pDynamicState = RepackNested<VkPipelineDynamicStateCreateInfo>(from.data.pDynamicState);
 }
 
 bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, const host_layout<VkGraphicsPipelineCreateInfo>& from) {

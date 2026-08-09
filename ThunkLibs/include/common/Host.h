@@ -545,7 +545,15 @@ inline guest_layout<T*> to_guest(const host_layout<T*>& from) {
 // needed for repacked data itself.
 // This also implicitly converts to a pointer of the wrapped host type, since
 // this conversion is required at all call sites anyway
-template<typename T, typename GuestT>
+// IsConstPointee records whether the *API* declared the pointee const. It has to
+// be carried separately because T cannot: host_layout is only specialised for
+// non-const types, so the generator instantiates this with the const stripped
+// (Generator/gen.cpp, get_type_name_with_nonconst_pointee). Without the flag the
+// std::is_const_v test below is dead, and the exit write-back silently copies
+// the host struct back over an input the guest still owns and reads -- which is
+// exactly what zeroed DXVK's VkDeviceCreateInfo::pQueueCreateInfos and left wine
+// dereferencing null inside init_device_queues.
+template<typename T, typename GuestT, bool IsConstPointee = false>
 struct repack_wrapper {
   static_assert(std::is_pointer_v<T>);
 
@@ -583,7 +591,7 @@ struct repack_wrapper {
         //       might have unrelated side effects (such as deallocation of
         //       memory reserved on entry)
         if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {
-          if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
+          if constexpr (!IsConstPointee && !std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
             if constexpr (!(has_compatible_data_layout<T> && std::is_same_v<T, GuestT>)) {
               *orig_arg.get_pointer() = to_guest(*data); // TODO: Only if annotated as out-parameter
             }
@@ -600,8 +608,8 @@ struct repack_wrapper {
   }
 };
 
-template<typename T, typename GuestT>
-static repack_wrapper<T, GuestT> make_repack_wrapper(guest_layout<GuestT>& orig_arg) {
+template<typename T, bool IsConstPointee = false, typename GuestT>
+static repack_wrapper<T, GuestT, IsConstPointee> make_repack_wrapper(guest_layout<GuestT>& orig_arg) {
   return {orig_arg};
 }
 
@@ -610,8 +618,8 @@ T& unwrap_host(host_layout<T>& val) {
   return val.data;
 }
 
-template<typename T, typename T2>
-T* unwrap_host(repack_wrapper<T*, T2>& val) {
+template<typename T, typename T2, bool IsConstPointee>
+T* unwrap_host(repack_wrapper<T*, T2, IsConstPointee>& val) {
   return val;
 }
 

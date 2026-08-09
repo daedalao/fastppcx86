@@ -704,8 +704,11 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           fmt::print(file, "  host_layout<{}> a_{} {{ args->a_{} }};\n", get_type_name(context, param_type.getTypePtr()), param_idx, param_idx);
         } else if (pointee_compat == TypeCompatibility::Repackable) {
           // TODO: Require opt-in for this to be emitted since it's single-element only; otherwise, pointers-to-arrays arguments will cause stack trampling
-          fmt::print(file, "  auto a_{} = make_repack_wrapper<{}>(args->a_{});\n", param_idx,
-                     get_type_name_with_nonconst_pointee(param_type), param_idx);
+          // Pass the pointee's constness alongside the stripped type, so
+          // repack_wrapper can honour "do not write back to a const input".
+          const bool is_const_pointee = param_type->isPointerType() && param_type->getPointeeType().isConstQualified();
+          fmt::print(file, "  auto a_{} = make_repack_wrapper<{}, {}>(args->a_{});\n", param_idx,
+                     get_type_name_with_nonconst_pointee(param_type), is_const_pointee ? "true" : "false", param_idx);
         } else {
           throw report_error(thunk.decl->getLocation(), "Cannot generate unpacking function for function %0 with unannotated pointer "
                                                         "parameter %1")
