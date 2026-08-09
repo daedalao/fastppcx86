@@ -3045,9 +3045,20 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
-    // VkDescriptorAddressInfoEXT*. Repacking required
+    // VkDescriptorAddressInfoEXT*. Repacking required.
+    //
+    // The pointer is allowed to be null: with VK_EXT_robustness2's
+    // nullDescriptor feature -- which DXVK enables, and radv supports -- a null
+    // here means "write a null descriptor". Dereferencing it unconditionally
+    // faulted inside the thunk, and wine turned that into
+    // "nested exception on signal stack" while dispatching it, taking the crash
+    // report with it.
     guest_layout<VkDescriptorAddressInfoEXT*> guest_ptr;
     memcpy(&guest_ptr, from.data.data.union_storage, sizeof(guest_ptr));
+    if (!guest_ptr.get_pointer()) {
+      into.data.data.pUniformBuffer = nullptr;
+      break;
+    }
     auto child_mem = (char*)aligned_alloc(alignof(host_layout<VkDescriptorAddressInfoEXT>), sizeof(host_layout<VkDescriptorAddressInfoEXT>));
     auto child = new (child_mem) host_layout<VkDescriptorAddressInfoEXT> {*guest_ptr.get_pointer()};
 
@@ -3070,7 +3081,30 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
-  default: fprintf(stderr, "ERROR: Invalid descriptor type used in VkDescriptorGetInfoEXT"); std::abort();
+  default:
+    // This used to abort(). Two things were wrong with that. The message had no
+    // newline and no flush, so it never reached the log and the abort looked
+    // like a bare EXCEPTION_WINE_ASSERTION from inside libvulkan.so.1 -- which
+    // wine then compounded into "nested exception on signal stack" while
+    // dispatching it, losing the crash report entirely.
+    //
+    // And aborting is the wrong response: with VK_EXT_robustness2's
+    // nullDescriptor enabled (DXVK does enable it), a zeroed descriptor is a
+    // well-defined null descriptor. Degrade to that and name the type once, so
+    // an unhandled case shows up as a rendering artifact plus a log line rather
+    // than a dead process.
+    {
+      static std::mutex ReportedMutex;
+      static std::unordered_set<uint32_t> Reported;
+      std::lock_guard lk {ReportedMutex};
+      if (Reported.insert(static_cast<uint32_t>(into.data.type)).second) {
+        fprintf(stderr, "WARNING: Unhandled descriptor type %u in VkDescriptorGetInfoEXT; writing a null descriptor\n",
+                static_cast<uint32_t>(into.data.type));
+        fflush(stderr);
+      }
+    }
+    memset(&into.data.data, 0, sizeof(into.data.data));
+    break;
   }
 }
 
