@@ -4278,48 +4278,23 @@ DEF_OP(NAME) {                                                                 \
   const auto Add   = GetVReg(Op->Addend);                                      \
   const bool Is32  = Op->Header.ElementSize == IR::OpSize::i32Bit;             \
                                                                                \
-  if (Dst != Upper) {                                                          \
-    if (Is32) {                                                                \
-      xxspltw(VTMP1, Add, 3);                                                  \
-      xxspltw(VTMP2, V1, 3);                                                   \
-      xxspltw(Dst, V2, 3);                                                     \
-      XVOP_S(VTMP1, VTMP2, Dst);                                               \
-      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,    \
-                          TMP1, TMP2);                                         \
-      xxsel(Dst, Upper, VTMP1, VTMP2);                                         \
-    } else {                                                                   \
-      xxpermdi(VTMP1, Add, Add, 3);                                            \
-      xxpermdi(VTMP2, V1, V1, 3);                                              \
-      xxpermdi(Dst, V2, V2, 3);                                                \
-      XVOP_D(VTMP1, VTMP2, Dst);                                               \
-      xxpermdi(Dst, Upper, VTMP1, 1);                                          \
-    }                                                                          \
-    return;                                                                    \
-  }                                                                            \
-                                                                               \
-  /* Dst == Upper: no third scratch available, keep the scalar path. */        \
-  addi(TMP1, r1, -32);                                                         \
-  stvx(Upper, r(0), TMP1);                                                     \
-  addi(TMP2, r1, -16);                                                         \
-  stvx(V1, r(0), TMP2);                                                        \
-  addi(TMP3, r1, -48);                                                         \
-  stvx(V2, r(0), TMP3);                                                        \
-  addi(TMP4, r1, -64);                                                         \
-  stvx(Add, r(0), TMP4);                                                       \
+  /* VTMP3_VSX supplies the third splat slot, so this is unconditional now -   \
+   * no Dst == Upper fallback and no red-zone traffic in any case. */          \
   if (Is32) {                                                                  \
-    lfs(f0, 0, TMP2);                                                          \
-    lfs(f1, 0, TMP3);                                                          \
-    lfs(f2, 0, TMP4);                                                          \
-    FOP_S(f0, f0, f1, f2);                                                     \
-    stfs(f0, 0, TMP1);                                                         \
+    xxspltw(toVSX(VTMP1), toVSX(Add), 3);                                      \
+    xxspltw(toVSX(VTMP2), toVSX(V1), 3);                                       \
+    xxspltw(VTMP3_VSX, toVSX(V2), 3);                                          \
+    XVOP_S(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
+                        TMP1, TMP2);                                           \
+    xxsel(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), toVSX(VTMP2));               \
   } else {                                                                     \
-    lfd(f0, 0, TMP2);                                                          \
-    lfd(f1, 0, TMP3);                                                          \
-    lfd(f2, 0, TMP4);                                                          \
-    FOP_D(f0, f0, f1, f2);                                                     \
-    stfd(f0, 0, TMP1);                                                         \
+    xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                         \
+    xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                           \
+    xxpermdi(VTMP3_VSX, toVSX(V2), toVSX(V2), 3);                              \
+    XVOP_D(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
+    xxpermdi(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), 1);                       \
   }                                                                            \
-  lvx(Dst, r(0), TMP1);                                                        \
 }
 // fmadd(t,a,b,c)/fmsub etc per emitter signature: (t, fra, frc, frb).
 // PPC fmadd ISA: T = FRA*FRC + FRB → emitter call fmadd(t, a, c, b).

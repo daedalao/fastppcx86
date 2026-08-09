@@ -787,9 +787,18 @@ public:
   //   bits 25:21= VRT low 5 bits
   //   bits 31:26= primary opcode = 60
   // VR registers map to VSX 32..63, so AX/BX/TX are always 1 when targeting VRs.
+  // Full 6-bit VSX form: the AX/BX/TX extension bits are DERIVED from bit 5 of
+  // each register number instead of being hardcoded, which is what makes
+  // vs0-vs31 (the FPR-aliased half) reachable at all.
+  void EmitXX3VSX(uint32_t t, uint32_t a, uint32_t b, uint32_t xo) {
+    Emit32((60u << 26) | ((t & 31u) << 21) | ((a & 31u) << 16) | ((b & 31u) << 11) | ((xo & 0xFFu) << 3) |
+           (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/ | ((t >> 5) & 1u) /*TX*/);
+  }
+
+  // VR n is vs(32+n), so every extension bit comes out 1 and this is
+  // bit-identical to the previous hardcoded 0x7.
   void EmitXX3(uint32_t vrt, uint32_t vra, uint32_t vrb, uint32_t xo) {
-    Emit32((60u << 26) | (vrt << 21) | (vra << 16) | (vrb << 11) |
-           ((xo & 0xFFu) << 3) | 0x7u /* AX|BX|TX = all 1 for VR targets */);
+    EmitXX3VSX(32u + vrt, 32u + vra, 32u + vrb, xo);
   }
 
   // xxpermdi VRT, VRA, VRB, DM (POWER7+).  XO=10; DM goes in the XO field's bits 5:6.
@@ -843,6 +852,38 @@ public:
   void xvmsubadp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 113); }
   void xvnmaddadp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 225); }
   void xvnmsubadp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 241); }
+
+  // ---- VSX-form overloads reaching the full vs0-vs63 file --------------------
+  // Only the ops the scalar-insert lowerings need. Anything taking a VSXR is
+  // usable with a low-bank (FPR-aliased) register; anything taking a VR is not.
+  // Deliberately NOT provided for VMX-form ops - they cannot encode vs0-vs31,
+  // so the absence of an overload is the compile-time guard against misuse.
+  void xvmaddasp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  65); }
+  void xvmsubasp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  81); }
+  void xvnmaddasp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 193); }
+  void xvnmsubasp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 209); }
+  void xvmaddadp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  97); }
+  void xvmsubadp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 113); }
+  void xvnmaddadp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 225); }
+  void xvnmsubadp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 241); }
+
+  void xxpermdi(VSXR t, VSXR a, VSXR b, uint32_t dm) {
+    assert(dm < 4);
+    EmitXX3VSX(t.idx, a.idx, b.idx, 10u | ((dm & 3u) << 5));
+  }
+
+  void xxspltw(VSXR t, VSXR b, uint32_t uim) {
+    assert(uim < 4);
+    Emit32((60u << 26) | ((t.idx & 31u) << 21) | ((uim & 3u) << 16) | ((b.idx & 31u) << 11) |
+           ((164u & 0x1FFu) << 2) | (((b.idx >> 5) & 1u) << 1) /*BX*/ | ((t.idx >> 5) & 1u) /*TX*/);
+  }
+
+  // XX4-form: VRC sits at bits 10:6 with its extension bit CX at bit 3.
+  void xxsel(VSXR t, VSXR a, VSXR b, VSXR c) {
+    Emit32((60u << 26) | ((t.idx & 31u) << 21) | ((a.idx & 31u) << 16) | ((b.idx & 31u) << 11) | ((c.idx & 31u) << 6) |
+           (3u << 4) /*XO=3*/ | (((c.idx >> 5) & 1u) << 3) /*CX*/ | (((a.idx >> 5) & 1u) << 2) /*AX*/ |
+           (((b.idx >> 5) & 1u) << 1) /*BX*/ | ((t.idx >> 5) & 1u) /*TX*/);
+  }
   // m-form: T = ±(T*B) ± A (T is multiplicand, A is addend)
   void xvmaddmsp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx,  73); }
   void xvmsubmsp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx,  89); }
