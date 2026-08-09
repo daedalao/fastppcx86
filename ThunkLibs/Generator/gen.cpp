@@ -627,6 +627,37 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
               type_compat.at(context.getCanonicalType(type.getTypePtr())) == TypeCompatibility::None) {
             // TODO: Factor in "assume_compatible_layout" annotations here
             //       That annotation should cause the type to be treated as TypeCompatibility::Full
+            // Name the member that made the struct incompatible. Reporting only
+            // the outermost type turns every one of these into a bisect: the
+            // struct is usually fine and one field several levels down is not,
+            // and the message as written gives no way to tell which.
+            std::string Detail;
+            if (auto* AsStruct = type->getAsStructureType()) {
+              for (auto* Field : AsStruct->getDecl()->fields()) {
+                auto FieldType = Field->getType();
+                auto Canonical = context.getCanonicalType(FieldType.getTypePtr());
+                auto Compat = type_compat.find(Canonical);
+                const char* Why = nullptr;
+                if (FieldType->isPointerType()) {
+                  auto Pointee = context.getCanonicalType(FieldType->getPointeeType().getTypePtr());
+                  auto PointeeCompat = type_compat.find(Pointee);
+                  if (PointeeCompat != type_compat.end() && PointeeCompat->second == TypeCompatibility::None) {
+                    Why = "pointer to a type with no compatible layout";
+                  }
+                } else if (Compat != type_compat.end() && Compat->second != TypeCompatibility::Full) {
+                  Why = "embedded by value and not layout-compatible";
+                }
+                if (Why) {
+                  Detail += "\n  note: member '" + Field->getNameAsString() + "' (" + FieldType.getAsString() + ") is " + Why;
+                }
+              }
+            }
+            if (Detail.empty()) {
+              Detail = "\n  note: no single member identified; the struct itself has no compatible layout";
+            }
+            // report_error only takes string literals, so the per-member detail
+            // goes to stderr alongside it rather than into the diagnostic.
+            std::cerr << "Unsupported parameter type " << param_type.getAsString() << " in " << thunk.function_name << Detail << "\n";
             throw report_error(thunk.decl->getLocation(), "Unsupported parameter type %0").AddTaggedVal(param_type);
           }
         }

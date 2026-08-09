@@ -2639,7 +2639,7 @@ VULKAN_DEFAULT_CUSTOM_REPACK(VkCommandBufferInheritanceViewportScissorInfoNV)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkCommandBufferSubmitInfo)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkCommandPoolCreateInfo)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkComputeOccupancyPriorityParametersNV)
-VULKAN_DEFAULT_CUSTOM_REPACK(VkComputePipelineCreateInfo)
+VULKAN_NONDEFAULT_CUSTOM_REPACK(VkComputePipelineCreateInfo) // hand-written above: repacks the embedded stage
 VULKAN_DEFAULT_CUSTOM_REPACK(VkComputePipelineIndirectBufferInfoNV)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkConditionalRenderingBeginInfoEXT)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkCooperativeMatrixFlexibleDimensionsPropertiesNV)
@@ -3955,6 +3955,28 @@ bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into,
   return true;
 }
 
+// VkComputePipelineCreateInfo embeds a VkPipelineShaderStageCreateInfo *by
+// value*, so it inherits that struct's incompatibility on 32-bit: the stage
+// carries a pSpecializationInfo pointer, and specialization info needs real
+// repacking (size_t on both itself and its map entries). The graphics variant
+// gets this for free because its stages arrive as an array behind a pointer;
+// the compute one has to convert the embedded copy explicitly.
+void fex_custom_repack_entry(host_layout<VkComputePipelineCreateInfo>& into, const guest_layout<VkComputePipelineCreateInfo>& from) {
+  default_fex_custom_repack_entry(into, from);
+  auto Stage = host_layout<VkPipelineShaderStageCreateInfo> {from.data.stage};
+  fex_apply_custom_repacking_entry(Stage, from.data.stage);
+  into.data.stage = Stage.data;
+}
+
+bool fex_custom_repack_exit(guest_layout<VkComputePipelineCreateInfo>& into, const host_layout<VkComputePipelineCreateInfo>& from) {
+  if (from.data.stage.pSpecializationInfo) {
+    delete[] from.data.stage.pSpecializationInfo->pMapEntries;
+    delete reinterpret_cast<const host_layout<VkSpecializationInfo>*>(from.data.stage.pSpecializationInfo);
+  }
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
+  return true;
+}
+
 void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, const guest_layout<VkGraphicsPipelineCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
   into.data.pStages = RepackStructArray(from.data.stageCount.data, from.data.pStages).data();
@@ -4218,6 +4240,280 @@ static auto RepackedArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& cal
     Finish();
     return Ret;
   }
+}
+
+// Two-call array queries over *plain* structs -- no sType, no pNext, so there is
+// no custom repacking to run, only a per-element layout conversion. The
+// sType-bearing equivalent is RepackedArrayQuery above.
+template<typename T, typename Fn>
+static auto PlainArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& call) {
+  using RetType = decltype(call(std::declval<T*>()));
+
+  if (!array.get_pointer()) {
+    return call(nullptr);
+  }
+
+  const uint32_t InputCount = *count;
+  std::vector<T> Host(InputCount);
+  auto* Guest = array.get_pointer();
+
+  auto WriteBack = [&]() {
+    for (uint32_t i = 0; i < std::min(InputCount, *count); ++i) {
+      Guest[i] = to_guest(to_host_layout(Host[i]));
+    }
+  };
+
+  if constexpr (std::is_void_v<RetType>) {
+    call(Host.data());
+    WriteBack();
+  } else {
+    auto Ret = call(Host.data());
+    WriteBack();
+    return Ret;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// maintenance5/6: entry points that fold their old argument lists into structs.
+//
+// These are hand-repacked rather than declared with custom_repack members. The
+// declarative route works for the struct itself but reclassifies what it points
+// at: registering VkPushDescriptorSetInfo::pDescriptorWrites moves
+// VkWriteDescriptorSet out of "layout wrappers only", and vkCreateComputePipelines
+// stops generating. Doing the array by hand -- exactly as vkUpdateDescriptorSets
+// already does for the same element type -- leaves the type graph alone.
+// ---------------------------------------------------------------------------
+void fexfn_impl_libvulkan_vkCmdPushConstants2KHR(VkCommandBuffer a_0, guest_layout<const VkPushConstantsInfo*> a_1) {
+  auto* Guest = a_1.get_pointer();
+  auto Host = host_layout<VkPushConstantsInfo> {*Guest};
+  default_fex_custom_repack_entry(Host, *Guest);
+  // Opaque constant bytes: same on both sides.
+  Host.data.pValues = Guest->data.pValues.get_pointer();
+  LDR_PTR(vkCmdPushConstants2KHR)(a_0, &Host.data);
+}
+
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSet2KHR(VkCommandBuffer a_0, guest_layout<const VkPushDescriptorSetInfo*> a_1) {
+  auto* Guest = a_1.get_pointer();
+  auto Host = host_layout<VkPushDescriptorSetInfo> {*Guest};
+  default_fex_custom_repack_entry(Host, *Guest);
+  auto Writes = RepackStructArray(Guest->data.descriptorWriteCount.data, Guest->data.pDescriptorWrites);
+  Host.data.pDescriptorWrites = Writes.data();
+  LDR_PTR(vkCmdPushDescriptorSet2KHR)(a_0, &Host.data);
+  delete[] Writes.data();
+}
+
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSetWithTemplate2KHR(VkCommandBuffer a_0,
+                                                                 guest_layout<const VkPushDescriptorSetWithTemplateInfo*> a_1) {
+  auto* Guest = a_1.get_pointer();
+  auto Host = host_layout<VkPushDescriptorSetWithTemplateInfo> {*Guest};
+  default_fex_custom_repack_entry(Host, *Guest);
+  // Laid out by the descriptor update template the guest created through us.
+  Host.data.pData = Guest->data.pData.get_pointer();
+  LDR_PTR(vkCmdPushDescriptorSetWithTemplate2KHR)(a_0, &Host.data);
+}
+
+void fexfn_impl_libvulkan_vkGetDeviceImageSubresourceLayoutKHR(VkDevice a_0, guest_layout<const VkDeviceImageSubresourceInfo*> a_1,
+                                                               VkSubresourceLayout2* a_2) {
+  auto* Guest = a_1.get_pointer();
+  auto Host = host_layout<VkDeviceImageSubresourceInfo> {*Guest};
+  default_fex_custom_repack_entry(Host, *Guest);
+  auto CreateInfo = RepackStructArray(1u, Guest->data.pCreateInfo);
+  auto Subresource = RepackStructArray(1u, Guest->data.pSubresource);
+  Host.data.pCreateInfo = CreateInfo.data();
+  Host.data.pSubresource = Subresource.data();
+  (void*&)LDR_PTR(vkGetDeviceImageSubresourceLayoutKHR) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetDeviceImageSubresourceLayoutKHR");
+  LDR_PTR(vkGetDeviceImageSubresourceLayoutKHR)(a_0, &Host.data, a_2);
+  delete[] CreateInfo.data();
+  delete[] Subresource.data();
+}
+
+// Vulkan 1.4 core spellings; same structs, same implementation as the KHR ones.
+void fexfn_impl_libvulkan_vkCmdPushConstants2(VkCommandBuffer a_0, guest_layout<const VkPushConstantsInfo*> a_1) {
+  fexfn_impl_libvulkan_vkCmdPushConstants2KHR(a_0, a_1);
+}
+
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSet2(VkCommandBuffer a_0, guest_layout<const VkPushDescriptorSetInfo*> a_1) {
+  fexfn_impl_libvulkan_vkCmdPushDescriptorSet2KHR(a_0, a_1);
+}
+
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSetWithTemplate2(VkCommandBuffer a_0,
+                                                              guest_layout<const VkPushDescriptorSetWithTemplateInfo*> a_1) {
+  fexfn_impl_libvulkan_vkCmdPushDescriptorSetWithTemplate2KHR(a_0, a_1);
+}
+
+// Vulkan 1.4 core spelling of the same call; shares the KHR implementation.
+void fexfn_impl_libvulkan_vkGetDeviceImageSubresourceLayout(VkDevice a_0, guest_layout<const VkDeviceImageSubresourceInfo*> a_1,
+                                                            VkSubresourceLayout2* a_2) {
+  fexfn_impl_libvulkan_vkGetDeviceImageSubresourceLayoutKHR(a_0, a_1, a_2);
+}
+
+// ---------------------------------------------------------------------------
+// vkQueueBindSparse.
+//
+// The outer array the generator cannot see, and each element carries five more
+// count/array pairs of its own. The leaf types (VkSparseMemoryBind,
+// VkSparseImageMemoryBind, and the non-dispatchable VkSemaphore) are
+// layout-identical on both sides, so only the pointers need converting -- but
+// they need converting at every level, which is why this is written out rather
+// than declared.
+// ---------------------------------------------------------------------------
+namespace {
+struct BindSparseScratch {
+  std::vector<VkBindSparseInfo> Infos;
+  // Kept alive for the duration of the call; freed on destruction.
+  std::vector<std::vector<VkSemaphore>> Semaphores;
+  std::vector<std::vector<VkSparseBufferMemoryBindInfo>> BufferBinds;
+  std::vector<std::vector<VkSparseImageOpaqueMemoryBindInfo>> ImageOpaqueBinds;
+  std::vector<std::vector<VkSparseImageMemoryBindInfo>> ImageBinds;
+  std::vector<std::vector<VkSparseMemoryBind>> MemoryBinds;
+  std::vector<std::vector<VkSparseImageMemoryBind>> ImageMemoryBinds;
+};
+} // namespace
+
+VkResult fexfn_impl_libvulkan_vkQueueBindSparse(VkQueue a_0, uint32_t a_1, guest_layout<const VkBindSparseInfo*> a_2, VkFence a_3) {
+  if (!a_2.get_pointer() || !a_1) {
+    return LDR_PTR(vkQueueBindSparse)(a_0, a_1, nullptr, a_3);
+  }
+
+  BindSparseScratch Scratch;
+  Scratch.Infos.resize(a_1);
+  Scratch.Semaphores.resize(2 * a_1);
+  Scratch.BufferBinds.resize(a_1);
+  Scratch.ImageOpaqueBinds.resize(a_1);
+  Scratch.ImageBinds.resize(a_1);
+  Scratch.MemoryBinds.reserve(2 * a_1);
+  Scratch.ImageMemoryBinds.reserve(a_1);
+
+  auto* Guest = a_2.get_pointer();
+  for (uint32_t i = 0; i < a_1; ++i) {
+    auto& G = Guest[i];
+    auto Host = host_layout<VkBindSparseInfo> {G};
+    default_fex_custom_repack_entry(Host, G);
+
+    auto CopyHandles = [](std::vector<VkSemaphore>& Out, uint32_t Count, auto& GuestArray) {
+      Out.resize(Count);
+      for (uint32_t j = 0; j < Count; ++j) {
+        // Non-dispatchable handles are 64-bit on both sides.
+        Out[j] = host_layout<VkSemaphore> {GuestArray.get_pointer()[j]}.data;
+      }
+    };
+    CopyHandles(Scratch.Semaphores[2 * i], G.data.waitSemaphoreCount.data, G.data.pWaitSemaphores);
+    CopyHandles(Scratch.Semaphores[2 * i + 1], G.data.signalSemaphoreCount.data, G.data.pSignalSemaphores);
+    Host.data.pWaitSemaphores = Scratch.Semaphores[2 * i].data();
+    Host.data.pSignalSemaphores = Scratch.Semaphores[2 * i + 1].data();
+
+    const uint32_t BufferCount = G.data.bufferBindCount.data;
+    Scratch.BufferBinds[i].resize(BufferCount);
+    for (uint32_t j = 0; j < BufferCount; ++j) {
+      auto& GB = G.data.pBufferBinds.get_pointer()[j];
+      auto HB = host_layout<VkSparseBufferMemoryBindInfo> {GB};
+      Scratch.MemoryBinds.emplace_back();
+      auto& Binds = Scratch.MemoryBinds.back();
+      const uint32_t BindCount = GB.data.bindCount.data;
+      Binds.resize(BindCount);
+      for (uint32_t k = 0; k < BindCount; ++k) {
+        Binds[k] = host_layout<VkSparseMemoryBind> {GB.data.pBinds.get_pointer()[k]}.data;
+      }
+      HB.data.pBinds = Binds.data();
+      Scratch.BufferBinds[i][j] = HB.data;
+    }
+    Host.data.pBufferBinds = Scratch.BufferBinds[i].data();
+
+    const uint32_t OpaqueCount = G.data.imageOpaqueBindCount.data;
+    Scratch.ImageOpaqueBinds[i].resize(OpaqueCount);
+    for (uint32_t j = 0; j < OpaqueCount; ++j) {
+      auto& GB = G.data.pImageOpaqueBinds.get_pointer()[j];
+      auto HB = host_layout<VkSparseImageOpaqueMemoryBindInfo> {GB};
+      Scratch.MemoryBinds.emplace_back();
+      auto& Binds = Scratch.MemoryBinds.back();
+      const uint32_t BindCount = GB.data.bindCount.data;
+      Binds.resize(BindCount);
+      for (uint32_t k = 0; k < BindCount; ++k) {
+        Binds[k] = host_layout<VkSparseMemoryBind> {GB.data.pBinds.get_pointer()[k]}.data;
+      }
+      HB.data.pBinds = Binds.data();
+      Scratch.ImageOpaqueBinds[i][j] = HB.data;
+    }
+    Host.data.pImageOpaqueBinds = Scratch.ImageOpaqueBinds[i].data();
+
+    const uint32_t ImageCount = G.data.imageBindCount.data;
+    Scratch.ImageBinds[i].resize(ImageCount);
+    for (uint32_t j = 0; j < ImageCount; ++j) {
+      auto& GB = G.data.pImageBinds.get_pointer()[j];
+      auto HB = host_layout<VkSparseImageMemoryBindInfo> {GB};
+      Scratch.ImageMemoryBinds.emplace_back();
+      auto& Binds = Scratch.ImageMemoryBinds.back();
+      const uint32_t BindCount = GB.data.bindCount.data;
+      Binds.resize(BindCount);
+      for (uint32_t k = 0; k < BindCount; ++k) {
+        Binds[k] = host_layout<VkSparseImageMemoryBind> {GB.data.pBinds.get_pointer()[k]}.data;
+      }
+      HB.data.pBinds = Binds.data();
+      Scratch.ImageBinds[i][j] = HB.data;
+    }
+    Host.data.pImageBinds = Scratch.ImageBinds[i].data();
+
+    Scratch.Infos[i] = Host.data;
+  }
+
+  return LDR_PTR(vkQueueBindSparse)(a_0, a_1, Scratch.Infos.data(), a_3);
+}
+
+// ---------------------------------------------------------------------------
+// Count/array parameters the generator cannot see as arrays.
+//
+// It emits a single-element repack wrapper for any struct pointer, because the
+// length lives in a sibling parameter it never looks at. Every one of these was
+// therefore repacking element 0 and handing the driver guest-layout memory for
+// the rest -- silent whenever the layouts happen to coincide, corruption when
+// they do not.
+// ---------------------------------------------------------------------------
+void fexfn_impl_libvulkan_vkGetImageSparseMemoryRequirements(VkDevice a_0, VkImage a_1, uint32_t* a_2,
+                                                             guest_layout<VkSparseImageMemoryRequirements*> a_3) {
+  PlainArrayQuery(a_2, a_3, [&](VkSparseImageMemoryRequirements* out) {
+    (void*&)LDR_PTR(vkGetImageSparseMemoryRequirements) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageSparseMemoryRequirements");
+    LDR_PTR(vkGetImageSparseMemoryRequirements)(a_0, a_1, a_2, out);
+  });
+}
+
+void fexfn_impl_libvulkan_vkGetImageSparseMemoryRequirements2(VkDevice a_0, const VkImageSparseMemoryRequirementsInfo2* a_1, uint32_t* a_2,
+                                                              guest_layout<VkSparseImageMemoryRequirements2*> a_3) {
+  RepackedArrayQuery(a_2, a_3, [&](VkSparseImageMemoryRequirements2* out) {
+    (void*&)LDR_PTR(vkGetImageSparseMemoryRequirements2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageSparseMemoryRequirements2");
+    LDR_PTR(vkGetImageSparseMemoryRequirements2)(a_0, a_1, a_2, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                                guest_layout<VkCooperativeMatrixPropertiesKHR*> a_2) {
+  return RepackedArrayQuery(a_1, a_2, [&](VkCooperativeMatrixPropertiesKHR* out) {
+    return LDR_PTR(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)(a_0, a_1, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice a_0,
+                                                                          const VkPhysicalDeviceVideoFormatInfoKHR* a_1, uint32_t* a_2,
+                                                                          guest_layout<VkVideoFormatPropertiesKHR*> a_3) {
+  return RepackedArrayQuery(a_2, a_3, [&](VkVideoFormatPropertiesKHR* out) {
+    return LDR_PTR(vkGetPhysicalDeviceVideoFormatPropertiesKHR)(a_0, a_1, a_2, out);
+  });
+}
+
+// Dispatchable handles cross as tokens (the OpaqueHandleRegistry above), so an
+// array of them has to be translated element by element -- passing the guest's
+// array straight through would hand the driver 0xE5xx'xxxx tokens where it
+// expects VkCommandBuffer pointers.
+void fexfn_impl_libvulkan_vkCmdExecuteCommands(VkCommandBuffer a_0, uint32_t a_1, guest_layout<const VkCommandBuffer*> a_2) {
+  std::vector<VkCommandBuffer> Host(a_1);
+  auto* Guest = a_2.get_pointer();
+  for (uint32_t i = 0; i < a_1; ++i) {
+    // Straight through the registry rather than host_layout's converting
+    // constructor: the array elements are const-qualified guest_layouts and the
+    // token is what we actually need.
+    Host[i] = CommandBufferRegistry.ForToken(static_cast<uint32_t>(Guest[i].data));
+  }
+  LDR_PTR(vkCmdExecuteCommands)(a_0, a_1, Host.data());
 }
 
 void fexfn_impl_libvulkan_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice a_0, uint32_t* a_1,
