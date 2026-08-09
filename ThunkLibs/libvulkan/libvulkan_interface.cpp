@@ -2895,8 +2895,13 @@ struct fex_gen_config<vkCmdSetPrimitiveRestartEnable> {};
 template<>
 struct fex_gen_config<vkMapMemory2> {};
 #endif
+#ifndef IS_32BIT_THUNK
+// vkMapMemory2 is 64-bit only, so a 32-bit guest unmapping through vkUnmapMemory2
+// could only be unwinding a mapping made by vkMapMemory - bypassing the placed-map
+// pool that owns the reservation. Keep both halves on the same side.
 template<>
 struct fex_gen_config<vkUnmapMemory2> {};
+#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetDeviceImageSubresourceLayout> {};
