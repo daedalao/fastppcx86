@@ -651,6 +651,35 @@ FEX_DEFAULT_VISIBILITY void ReserveLow32HostRange(uintptr_t Base, size_t Length)
   }
 }
 
+/**
+ * Allocate a low-4GB range through the guest's own 32-bit allocator.
+ *
+ * ReserveLow32HostRange above exists to tell the allocator about pages a thunk
+ * already took by raw mmap. That works for the trampoline pool, which is 64 KiB
+ * and can be squeezed in anywhere, and fails badly for anything large: the
+ * allocator has already reserved the free parts of the guest address space, so
+ * from outside there are no gaps left to take, and MAP_FIXED_NOREPLACE loses
+ * everywhere. A 16 MiB Vulkan mapping placed for a 32-bit guest hit exactly
+ * that.
+ *
+ * Asking the allocator instead means it picks somewhere genuinely free and
+ * accounts for it, with no probing and no race.
+ */
+FEX_DEFAULT_VISIBILITY void* AllocateLow32HostRange(size_t Length) {
+  if (!FEX::HLE::_SyscallHandler || FEX::HLE::_SyscallHandler->Is64BitMode()) {
+    return nullptr;
+  }
+  auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
+  if (!Alloc) {
+    return nullptr;
+  }
+  void* Result = Alloc->Mmap(nullptr, Length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (FEX::HLE::HasSyscallError(Result)) {
+    return nullptr;
+  }
+  return Result;
+}
+
 FEX_DEFAULT_VISIBILITY void* GetGuestStack() {
   if (!ThreadObject) {
     ERROR_AND_DIE_FMT("Thunked library attempted to query guest stack pointer asynchronously");

@@ -326,15 +326,27 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
 #ifdef IS_32BIT_THUNK
   VkDeviceCreateInfo PatchedInfo = *a_1;
   std::vector<const char*> PatchedExtensions;
+  // Ask the driver what it actually supports and enable exactly that. Setting a
+  // feature bit the implementation does not advertise is invalid usage on its
+  // own, never mind what it does to the mappings afterwards.
+  VkPhysicalDeviceMapMemoryPlacedFeaturesEXT SupportedPlaced {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
+  };
+  VkPhysicalDeviceFeatures2 SupportedFeatures2 {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    .pNext = &SupportedPlaced,
+  };
+  LDR_PTR(vkGetPhysicalDeviceFeatures2)(a_0, &SupportedFeatures2);
+
   VkPhysicalDeviceMapMemoryPlacedFeaturesEXT PlacedFeatures {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
     .pNext = const_cast<void*>(a_1->pNext),
-    .memoryMapPlaced = VK_TRUE,
-    .memoryMapRangePlaced = VK_FALSE,
-    .memoryUnmapReserve = VK_TRUE,
+    .memoryMapPlaced = SupportedPlaced.memoryMapPlaced,
+    .memoryMapRangePlaced = SupportedPlaced.memoryMapRangePlaced,
+    .memoryUnmapReserve = SupportedPlaced.memoryUnmapReserve,
   };
 
-  const bool WantPlaced = DeviceSupportsPlacedMaps(a_0);
+  const bool WantPlaced = DeviceSupportsPlacedMaps(a_0) && SupportedPlaced.memoryMapPlaced == VK_TRUE;
   if (WantPlaced) {
     PatchedExtensions.assign(a_1->ppEnabledExtensionNames, a_1->ppEnabledExtensionNames + a_1->enabledExtensionCount);
     for (const char* Name : {VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME}) {
@@ -878,26 +890,81 @@ static std::mutex PlacedPoolMutex;
 static std::multimap<size_t, uintptr_t> PlacedFreeRanges;    // size -> base
 static std::unordered_map<uintptr_t, size_t> PlacedRangeSize; // base -> size
 
-// Scans downward the same way MakeLow32HostTrampoline does, for the same
-// reason: MAP_FIXED_NOREPLACE only loses to mappings that already exist, and
-// ReserveLow32HostRange is what stops the guest allocator handing the range out
-// later.
+// Find a real gap rather than probing blindly.
+//
+// The first version stepped downward by the allocation size and tried
+// MAP_FIXED_NOREPLACE at each stop, which is fine for the 64 KiB trampoline pool
+// MakeLow32HostTrampoline uses and useless for a 16 MiB Vulkan heap: a couple of
+// hundred guesses against a fragmented guest address space, most of them landing
+// on something already mapped. Reading /proc/self/maps and picking a gap that
+// actually fits turns that into one attempt.
+//
+// MAP_FIXED_NOREPLACE still guards the race between reading the map and taking
+// the range, and ReserveLow32HostRange is what stops the guest allocator handing
+// it out afterwards.
 static uintptr_t ReserveGuestVisibleRange(size_t Size) {
   constexpr uintptr_t ScanTop = 0x7000'0000;
-  constexpr uintptr_t ScanBottom = 0x1000'0000;
-  const size_t Step = std::max<size_t>(Size, 0x10'0000);
+  constexpr uintptr_t ScanBottom = 0x0800'0000;
+  constexpr size_t PageSize = 0x1000;
 
-  for (uintptr_t Addr = ScanTop - Size; Addr >= ScanBottom; Addr -= Step) {
+  auto TryTake = [&](uintptr_t Addr) -> uintptr_t {
     void* P = ::mmap(reinterpret_cast<void*>(Addr), Size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (P == MAP_FAILED) {
-      continue;
+      return 0;
     }
     if (FEX::HLE::ReserveLow32HostRange) {
       FEX::HLE::ReserveLow32HostRange(reinterpret_cast<uintptr_t>(P), Size);
     }
     return reinterpret_cast<uintptr_t>(P);
+  };
+
+  // Preferred route: the guest's own allocator knows what is free and will
+  // account for the range. The map-scanning fallback below only matters if this
+  // entry point is missing (older FEX, or a 64-bit guest).
+  if (FEX::HLE::AllocateLow32HostRange) {
+    if (void* P = FEX::HLE::AllocateLow32HostRange(Size)) {
+      return reinterpret_cast<uintptr_t>(P);
+    }
   }
-  return 0;
+
+  FILE* Maps = fopen("/proc/self/maps", "r");
+  if (!Maps) {
+    return 0;
+  }
+
+  // Walk the mappings in order, remembering the end of the previous one; the
+  // space between that and the start of the next is a gap.
+  uintptr_t PrevEnd = ScanBottom;
+  uintptr_t Found = 0;
+  char Line[512];
+  while (fgets(Line, sizeof(Line), Maps)) {
+    uintptr_t Start = 0, End = 0;
+    if (sscanf(Line, "%lx-%lx", &Start, &End) != 2) {
+      continue;
+    }
+    if (End <= ScanBottom) {
+      continue;
+    }
+    if (Start >= ScanTop) {
+      break;
+    }
+    if (Start > PrevEnd) {
+      const uintptr_t GapStart = (PrevEnd + PageSize - 1) & ~(PageSize - 1);
+      const uintptr_t GapEnd = std::min<uintptr_t>(Start, ScanTop);
+      if (GapEnd > GapStart && GapEnd - GapStart >= Size) {
+        Found = GapStart;
+        break;
+      }
+    }
+    PrevEnd = std::max(PrevEnd, End);
+  }
+  // Nothing between mappings; the tail of the window may still be free.
+  if (!Found && PrevEnd < ScanTop && ScanTop - PrevEnd >= Size) {
+    Found = (PrevEnd + PageSize - 1) & ~(PageSize - 1);
+  }
+  fclose(Maps);
+
+  return Found ? TryTake(Found) : 0;
 }
 
 static uintptr_t AcquirePlacedRange(size_t Size, size_t Alignment) {
@@ -912,11 +979,31 @@ static uintptr_t AcquirePlacedRange(size_t Size, size_t Alignment) {
     return Base;
   }
 
-  auto Base = ReserveGuestVisibleRange(Rounded);
-  if (Base) {
+  if (auto Base = ReserveGuestVisibleRange(Rounded)) {
     PlacedRangeSize[Base] = Rounded;
+    return Base;
   }
-  return Base;
+
+  // Out of low address space. Reservations are whole-allocation sized now, so
+  // hoarding freed ones costs real room -- give them back to the OS and try
+  // again before failing the map. A failed vkMapMemory is not something callers
+  // handle gracefully.
+  size_t Reclaimed = 0;
+  for (auto& [FreeSize, FreeBase] : PlacedFreeRanges) {
+    ::munmap(reinterpret_cast<void*>(FreeBase), FreeSize);
+    PlacedRangeSize.erase(FreeBase);
+    Reclaimed += FreeSize;
+  }
+  PlacedFreeRanges.clear();
+  if (!Reclaimed) {
+    return 0;
+  }
+
+  if (auto Base = ReserveGuestVisibleRange(Rounded)) {
+    PlacedRangeSize[Base] = Rounded;
+    return Base;
+  }
+  return 0;
 }
 
 static void ReleasePlacedRange(uintptr_t Base) {
@@ -935,6 +1022,7 @@ struct PlacedDeviceInfo {
   PFN_vkUnmapMemory2KHR UnmapMemory2 {};
   size_t Alignment {4096};
   bool UnmapReserve {};
+  bool RangePlaced {};
 };
 
 static std::mutex PlacedDeviceMutex;
@@ -993,12 +1081,14 @@ static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice 
   };
   LDR_PTR(vkGetPhysicalDeviceFeatures2)(PhysicalDevice, &Features2);
   Info.UnmapReserve = PlacedFeatures.memoryUnmapReserve == VK_TRUE;
+  Info.RangePlaced = PlacedFeatures.memoryMapRangePlaced == VK_TRUE;
 
   {
     std::lock_guard lk {PlacedDeviceMutex};
     PlacedDevices[Device] = Info;
   }
-  fprintf(stderr, "Placed Vulkan memory maps enabled (alignment %zu, unmapReserve %d)\n", Info.Alignment, (int)Info.UnmapReserve);
+  fprintf(stderr, "Placed Vulkan memory maps enabled (alignment %zu, unmapReserve %d, rangePlaced %d)\n", Info.Alignment,
+          (int)Info.UnmapReserve, (int)Info.RangePlaced);
   fflush(stderr);
 }
 
@@ -1046,21 +1136,45 @@ VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory
     return VK_ERROR_MEMORY_MAP_FAILED;
   }
 
-  // A VK_WHOLE_SIZE map still needs a reservation covering the whole
-  // allocation, so use the size recorded at vkAllocateMemory time.
-  VkDeviceSize MapSize = size;
-  if (MapSize == VK_WHOLE_SIZE) {
+  // Always place the WHOLE allocation, never the caller's subrange.
+  //
+  // VK_EXT_map_memory_placed only permits a placed map of a range when
+  // memoryMapRangePlaced is enabled; without it, offset must be 0 and size must
+  // be VK_WHOLE_SIZE. DXVK maps subranges constantly, so passing the caller's
+  // offset/size through was invalid usage on nearly every map -- the driver was
+  // free to place the mapping anywhere, and what the guest then wrote landed
+  // somewhere the GPU did not expect. That is what put the card into a reset
+  // loop.
+  //
+  // Mapping the whole allocation and returning base + offset is what the guest
+  // observes anyway, costs nothing, and is valid whether or not the range
+  // feature exists.
+  VkDeviceSize AllocationSize = 0;
+  {
     std::lock_guard lk {PlacedDeviceMutex};
     auto It = PlacedAllocationSizes.find(memory);
-    MapSize = It != PlacedAllocationSizes.end() ? It->second - offset : 0;
+    AllocationSize = It != PlacedAllocationSizes.end() ? It->second : 0;
   }
-  if (!MapSize) {
+  if (!AllocationSize || offset >= AllocationSize) {
+    // Without the allocation size there is no way to size the reservation, and
+    // guessing is how the previous version went wrong.
     return VK_ERROR_MEMORY_MAP_FAILED;
   }
 
-  auto Base = AcquirePlacedRange(MapSize, Placed.Alignment);
+  // Placing only the requested range needs memoryMapRangePlaced; without it the
+  // extension requires offset 0 and VK_WHOLE_SIZE. Reserving the whole
+  // allocation when a subrange would do is not free -- a 32-bit guest deep into
+  // wine + DXVK has no 16 MiB contiguous window left -- so take the cheaper
+  // option whenever the driver allows it.
+  const bool PlaceRange = Placed.RangePlaced && size != VK_WHOLE_SIZE;
+  const VkDeviceSize ReserveSize = PlaceRange ? size : AllocationSize;
+  const VkDeviceSize MapOffset = PlaceRange ? offset : 0;
+  const VkDeviceSize MapLength = PlaceRange ? size : VK_WHOLE_SIZE;
+  const VkDeviceSize PointerBias = PlaceRange ? 0 : offset;
+
+  auto Base = AcquirePlacedRange(ReserveSize, Placed.Alignment);
   if (!Base) {
-    fprintf(stderr, "ERROR: no free guest-visible address space for a %zu byte Vulkan mapping\n", (size_t)MapSize);
+    fprintf(stderr, "ERROR: no free guest-visible address space for a %zu byte Vulkan mapping\n", (size_t)ReserveSize);
     fflush(stderr);
     return VK_ERROR_MEMORY_MAP_FAILED;
   }
@@ -1075,8 +1189,8 @@ VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory
     .pNext = &PlacedInfo,
     .flags = flags | VK_MEMORY_MAP_PLACED_BIT_EXT,
     .memory = memory,
-    .offset = offset,
-    .size = size,
+    .offset = MapOffset,
+    .size = MapLength,
   };
 
   void* mapped {};
@@ -1091,8 +1205,9 @@ VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory
     PlacedMappings[memory] = Base;
   }
 
+  // The guest asked for a pointer to its subrange, not to the allocation.
   host_layout<void*> host_data {};
-  host_data.data = mapped;
+  host_data.data = static_cast<char*>(mapped) + PointerBias;
   *data.get_pointer() = to_guest(host_data);
   return ret;
 }

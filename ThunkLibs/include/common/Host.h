@@ -40,6 +40,9 @@ __attribute__((weak)) uintptr_t LookupGuestCallbackUnpacker(const char* signatur
 // MREMAP_FIXED that would replace it (see Thunks.cpp). Weak: a host lib
 // dlopened outside FEX simply skips the registration.
 __attribute__((weak)) void ReserveLow32HostRange(uintptr_t Base, size_t Length);
+// Allocate from the guest's 32-bit allocator rather than taking pages behind
+// its back; the only way to get a large low-4GB range reliably.
+__attribute__((weak)) void* AllocateLow32HostRange(size_t Length);
 
 __attribute__((weak)) void* GetGuestStack();
 
