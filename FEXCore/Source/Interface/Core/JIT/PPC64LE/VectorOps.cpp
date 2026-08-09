@@ -3858,25 +3858,22 @@ DEF_OP(VFMinScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // Lane 0 is merged by permute/select, not through the stack. The old path
+  // spent nine instructions (addi/stvx/addi/stvx/lwz/stw/lvx) and took two
+  // store-hit-loads to move one element; xxpermdi/xxsel do it in one or two.
+  // These are bitwise ops, so they also sidestep the SNaN canonicalisation
+  // that motivated the integer lwz/stw copy in the first place - a bit-exact
+  // merge, which is what MINSS/MINSD require.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec2, Vec1);          // mask = Vec2 > Vec1
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);    // guest f32 elem0 = BE word 3
   } else {
     xvcmpgtdp(VTMP1, Vec2, Vec1);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
+    xxpermdi (Dst, Vec1, VTMP1, 1);       // {Vec1.dw0, result.dw1}
   }
-  addi(TMP1, r1, -32);
-  stvx(Vec1,  r(0), TMP1);                 // [-32..-17] = Vec1
-  addi(TMP2, r1, -16);
-  stvx(VTMP1, r(0), TMP2);                 // [-16..-1]  = computed min
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lwz(TMP3, -16, r1);
-    stw(TMP3, -32, r1);
-  } else {
-    ld (TMP3, -16, r1);
-    std(TMP3, -32, r1);
-  }
-  lvx(Dst, r(0), TMP1);
 }
 
 DEF_OP(VFMaxScalarInsert) {
@@ -3884,25 +3881,18 @@ DEF_OP(VFMaxScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // Same lane-0 merge as VFMinScalarInsert: permute/select instead of a
+  // nine-instruction stack round trip with two store-hit-loads.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec1, Vec2);          // mask = Vec1 > Vec2
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
     xvcmpgtdp(VTMP1, Vec1, Vec2);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
+    xxpermdi (Dst, Vec1, VTMP1, 1);
   }
-  addi(TMP1, r1, -32);
-  stvx(Vec1,  r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(VTMP1, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lwz(TMP3, -16, r1);
-    stw(TMP3, -32, r1);
-  } else {
-    ld (TMP3, -16, r1);
-    std(TMP3, -32, r1);
-  }
-  lvx(Dst, r(0), TMP1);
 }
 DEF_OP(VFSqrtScalarInsert) {
   const auto Op   = IROp->C<IR::IROp_VFSqrtScalarInsert>();
