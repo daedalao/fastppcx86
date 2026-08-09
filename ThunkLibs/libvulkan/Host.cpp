@@ -967,12 +967,100 @@ static uintptr_t ReserveGuestVisibleRange(size_t Size) {
   return Found ? TryTake(Found) : 0;
 }
 
+// Report what the guest address space actually looks like when a reservation
+// fails. Sampling it from outside kept missing the window -- the process is
+// gone in under a minute -- and the answer only matters at this instant.
+static void ReportGuestAddressSpace(size_t Wanted) {
+  FILE* Maps = fopen("/proc/self/maps", "r");
+  if (!Maps) {
+    return;
+  }
+  constexpr uintptr_t Limit = 0x1'0000'0000;
+  uintptr_t Prev = 0;
+  uintptr_t Mapped = 0;
+  uintptr_t BestStart = 0, BestSize = 0;
+  char Line[512];
+  while (fgets(Line, sizeof(Line), Maps)) {
+    uintptr_t Start = 0, End = 0;
+    if (sscanf(Line, "%lx-%lx", &Start, &End) != 2 || Start >= Limit) {
+      continue;
+    }
+    End = std::min(End, Limit);
+    if (Start > Prev && Start - Prev > BestSize) {
+      BestSize = Start - Prev;
+      BestStart = Prev;
+    }
+    Mapped += End - Start;
+    Prev = std::max(Prev, End);
+  }
+  if (Limit - Prev > BestSize) {
+    BestSize = Limit - Prev;
+    BestStart = Prev;
+  }
+  fclose(Maps);
+  fprintf(stderr,
+          "FEXVK: guest address space: %zu MiB mapped below 4GiB, largest free gap %zu MiB at %#zx (this request %zu MiB)\n",
+          (size_t)(Mapped >> 20), (size_t)(BestSize >> 20), (size_t)BestStart, (size_t)(Wanted >> 20));
+  fflush(stderr);
+}
+
+// A single arena, taken at device creation while the guest address space is
+// still mostly empty, and sub-allocated from thereafter.
+//
+// Per-mapping reservation loses a race it cannot win: radv does not support
+// memoryMapRangePlaced, so every map has to place the *whole* allocation, and by
+// the time DXVK is asking for a 16 MiB heap the guest's 4 GiB is fragmented
+// enough that neither our scan nor FEX's own allocator can find a contiguous
+// window. Reserving one large region up front and carving it up removes the
+// dependence on what the address space looks like later.
+static uintptr_t ArenaBase = 0;
+static size_t ArenaSize = 0;
+static size_t ArenaUsed = 0;
+
+static void EnsurePlacedArena() {
+  if (ArenaBase || !FEX::HLE::AllocateLow32HostRange) {
+    return;
+  }
+  // Start ambitious and back off; a smaller arena still beats per-mapping.
+  for (size_t Try : {size_t(512) << 20, size_t(256) << 20, size_t(128) << 20, size_t(64) << 20}) {
+    if (void* P = FEX::HLE::AllocateLow32HostRange(Try)) {
+      ArenaBase = reinterpret_cast<uintptr_t>(P);
+      ArenaSize = Try;
+      ArenaUsed = 0;
+      fprintf(stderr, "Placed Vulkan map arena: %zu MiB at %#zx\n", Try >> 20, ArenaBase);
+      fflush(stderr);
+      return;
+    }
+  }
+  fprintf(stderr, "WARNING: could not reserve a placed-map arena; falling back to per-mapping reservation\n");
+  fflush(stderr);
+}
+
+static uintptr_t AcquireFromArena(size_t Size, size_t Alignment) {
+  if (!ArenaBase) {
+    return 0;
+  }
+  const uintptr_t Cursor = (ArenaBase + ArenaUsed + Alignment - 1) & ~(uintptr_t)(Alignment - 1);
+  const size_t Offset = Cursor - ArenaBase;
+  if (Offset + Size > ArenaSize) {
+    return 0;
+  }
+  ArenaUsed = Offset + Size;
+  return Cursor;
+}
+
 static uintptr_t AcquirePlacedRange(size_t Size, size_t Alignment) {
   const size_t Rounded = (Size + Alignment - 1) & ~(Alignment - 1);
   std::lock_guard lk {PlacedPoolMutex};
 
   // Smallest recycled range that fits.
   auto It = PlacedFreeRanges.lower_bound(Rounded);
+  if (It == PlacedFreeRanges.end()) {
+    if (auto FromArena = AcquireFromArena(Rounded, Alignment)) {
+      PlacedRangeSize[FromArena] = Rounded;
+      return FromArena;
+    }
+  }
   if (It != PlacedFreeRanges.end()) {
     auto Base = It->second;
     PlacedFreeRanges.erase(It);
@@ -1084,6 +1172,10 @@ static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice 
   Info.RangePlaced = PlacedFeatures.memoryMapRangePlaced == VK_TRUE;
 
   {
+    std::lock_guard lk {PlacedPoolMutex};
+    EnsurePlacedArena();
+  }
+  {
     std::lock_guard lk {PlacedDeviceMutex};
     PlacedDevices[Device] = Info;
   }
@@ -1172,10 +1264,20 @@ VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory
   const VkDeviceSize MapLength = PlaceRange ? size : VK_WHOLE_SIZE;
   const VkDeviceSize PointerBias = PlaceRange ? 0 : offset;
 
+  {
+    // Report once per process regardless of outcome: a failure-only report
+    // cannot distinguish "never ran" from "ran and found nothing", and a stale
+    // copy of this library in a long-lived wine service prints the same error
+    // text as a current one.
+    static std::once_flag Once;
+    std::call_once(Once, [&] { ReportGuestAddressSpace(ReserveSize); });
+  }
+
   auto Base = AcquirePlacedRange(ReserveSize, Placed.Alignment);
   if (!Base) {
     fprintf(stderr, "ERROR: no free guest-visible address space for a %zu byte Vulkan mapping\n", (size_t)ReserveSize);
     fflush(stderr);
+    ReportGuestAddressSpace(ReserveSize);
     return VK_ERROR_MEMORY_MAP_FAILED;
   }
 
