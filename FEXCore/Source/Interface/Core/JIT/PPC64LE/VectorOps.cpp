@@ -3994,27 +3994,41 @@ DEF_OP(VFToFScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
+
+  // Vector domain throughout: no red-zone traffic and no scalar-FPU crossing.
+  // Lane bookkeeping is the whole difficulty, because the VSX converts do not
+  // read or write the lane the guest keeps its scalar element in:
+  //   xvcvspdp reads single-precision from BE words 0 and 2
+  //   xvcvdpsp writes single-precision to  BE words 0 and 2
+  // while guest f32 element 0 is BE word 3 and guest f64 element 0 is BE dw1.
+  // A splat before (and after, for the narrowing case) reconciles the two.
   if (SrcES == IR::OpSize::i32Bit && DstES == IR::OpSize::i64Bit) {
-    // f32 → f64: lfs already promotes, stfd writes f64.
-    lfs(f0, -16, r1);
-    stfd(f0, -32, r1);
+    // f32 -> f64 (cvtss2sd). Splatting the guest element across all four words
+    // puts it in both lanes xvcvspdp reads, so both doublewords come out equal
+    // and dw1 is the value the merge wants.
+    xxspltw (VTMP1, Vec2, 3);
+    xvcvspdp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
   } else if (SrcES == IR::OpSize::i64Bit && DstES == IR::OpSize::i32Bit) {
-    // f64 → f32: lfd, frsp narrows, stfs writes 4 bytes (preserves elem 1+).
-    lfd(f0, -16, r1);
-    frsp(f0, f0);
-    stfs(f0, -32, r1);
+    // f64 -> f32 (cvtsd2ss). Splat dw1 into both doublewords, convert, then
+    // splat BE word 0 back across the register so the result also sits in
+    // word 3 where the merge reads it.
+    xxpermdi(VTMP1, Vec2, Vec2, 3);
+    xvcvdpsp(VTMP1, VTMP1);
+    xxspltw (VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
-    // Same size — degenerate copy.
-    if (DstES == IR::OpSize::i32Bit) { lfs(f0, -16, r1); stfs(f0, -32, r1); }
-    else                              { lfd(f0, -16, r1); stfd(f0, -32, r1); }
+    // Same size: a lane copy, no conversion at all.
+    if (DstES == IR::OpSize::i32Bit) {
+      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+      xxsel(Dst, Vec1, Vec2, VTMP2);
+    } else {
+      xxpermdi(Dst, Vec1, Vec2, 1);
+    }
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VSToFVectorInsert: signed-int → float, source from FPR vector.
