@@ -3900,23 +3900,28 @@ DEF_OP(VFSqrtScalarInsert) {
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
+  // Vector domain, same shape as DEF_SCALAR_INSERT: splat the source element,
+  // one xv* sqrt, merge lane 0 back over Vec1.
+  //
+  // The old lowering was two stvx, then lfs/fsqrts/stfs in the SCALAR FPU
+  // domain, then lvx: eight instructions, two store-hit-loads, a VSU<->FPU
+  // domain crossing on the critical path, and - the expensive part - a scalar
+  // float op, which on POWER8 takes the ~22.8x denormal assist penalty that
+  // the xv* ops do not (measured op4k 2026-08-05, notes/denormal_bench.c).
+  //
+  // All lanes compute the same value, so the FPSCR sticky bits raised are
+  // exactly those of the one real computation, and rounding follows FPSCR.RN
+  // as the scalar op did.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    fsqrts(f0, f0);
-    stfs(f0, -32, r1);
+    xxspltw (VTMP1, Vec2, 3);             // guest f32 elem0 = BE word 3
+    xvsqrtsp(VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
-    lfd(f0, -16, r1);
-    fsqrt(f0, f0);
-    stfd(f0, -32, r1);
+    xxpermdi(VTMP1, Vec2, Vec2, 3);       // guest f64 elem0 = BE dw1
+    xvsqrtdp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);        // {Vec1.dw0, result.dw1}
   }
-
-  // (Was previously `lvx(VTMP1, ...)` — bug: result never made it to Dst.)
-  lvx(Dst, r(0), TMP1);
 }
 // VFRSqrt / VFRecp scalar inserts.  x86 RSQRTSS / RCPSS produce ~12-bit
 // approximations; PPC frsqrtes/fres give similar-precision estimates.  For
