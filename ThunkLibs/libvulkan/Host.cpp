@@ -22,6 +22,7 @@ $end_info$
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -1409,6 +1410,7 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV, VkPhysicalDeviceShaderSMBuiltinsPropertiesNV>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR, VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR, VkPhysicalDeviceShaderUntypedPointersFeaturesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES, VkPhysicalDeviceShaderTerminateInvocationFeatures>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TILE_IMAGE_FEATURES_EXT, VkPhysicalDeviceShaderTileImageFeaturesEXT>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TILE_IMAGE_PROPERTIES_EXT, VkPhysicalDeviceShaderTileImagePropertiesEXT>,
@@ -1539,19 +1541,54 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_NV, VkWriteDescriptorSetAccelerationStructureNV>,
 };
 
+// Walks a guest pNext chain to the first link next_handlers knows how to
+// repack, skipping (and reporting, once per sType) any link it does not.
+//
+// Aborting here instead — which is what this used to do — turns every Vulkan
+// extension newer than this table into a hard guest crash. That is not
+// hypothetical: DXVK 3.0.2 on Mesa chains
+// VkPhysicalDeviceShaderUntypedPointersFeaturesKHR into its
+// vkGetPhysicalDeviceFeatures2 query, the abort fired inside the guest thunk,
+// and wine turned it into an unwind through a smashed 32-bit stack frame —
+// which is how Dex-Windows ended up branching to 0x0D000000 (2026-08-08).
+//
+// Dropping the link is the same thing a driver without that extension does:
+// the host never sees the struct, so it never writes it, and the guest reads
+// back whatever it initialized (zeroes, for a features query) and concludes
+// the feature is unsupported. For an input chain we do lose the request, hence
+// the warning naming the sType so it can be given a real converter.
+//
+// Both directions must skip by the same rule or the guest and host chains stop
+// corresponding, so entry and reverse share this function.
+static const guest_layout<VkBaseOutStructure>* find_repackable_link(const guest_layout<VkBaseOutStructure>* link) {
+  static std::mutex ReportedMutex;
+  static std::unordered_set<uint32_t> Reported;
+
+  while (link) {
+    const auto sType = static_cast<VkStructureType>(link->data.sType.data);
+    if (next_handlers.contains(sType)) {
+      return link;
+    }
+    {
+      std::lock_guard lk {ReportedMutex};
+      if (Reported.insert(link->data.sType.data).second) {
+        fprintf(stderr, "WARNING: Unrecognized VkStructureType %u in a pNext chain; dropping it. Add it to next_handlers to repack it.\n",
+                link->data.sType.data);
+      }
+    }
+    link = reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(link->data.pNext.get_pointer());
+  }
+  return nullptr;
+}
+
 static void default_fex_custom_repack_entry(VkBaseOutStructure& into, const guest_layout<VkBaseOutStructure>* from) {
-  if (!from->data.pNext.get_pointer()) {
+  auto typed_source = find_repackable_link(reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(from->data.pNext.get_pointer()));
+  if (!typed_source) {
     into.pNext = nullptr;
     return;
   }
-  auto typed_source = reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(from->data.pNext.get_pointer());
 
   auto next_handler = next_handlers.find(static_cast<VkStructureType>(typed_source->data.sType.data));
-  if (next_handler == next_handlers.end()) {
-    fprintf(stderr, "ERROR: Unrecognized VkStructureType %u referenced by pNext\n", typed_source->data.sType.data);
-    std::abort();
-  }
-
   into.pNext = next_handler->second.first(typed_source);
 }
 
@@ -1566,12 +1603,16 @@ static void default_fex_custom_repack_reverse(guest_layout<VkBaseOutStructure>& 
     return;
   }
 
-  auto next_handler = next_handlers.find(static_cast<VkStructureType>(into.data.pNext.get_pointer()->data.sType.data));
-  if (next_handler == next_handlers.end()) {
-    fprintf(stderr, "ERROR: Unrecognized VkStructureType %u referenced by pNext when converting to guest\n", from->sType);
-    std::abort();
+  // Same skip rule as the entry path, so this pairs with whichever guest link
+  // actually got repacked into pNextHost.
+  auto guest_link = find_repackable_link(reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(into.data.pNext.get_pointer()));
+  if (!guest_link) {
+    free(pNextHost);
+    return;
   }
-  next_handler->second.second((void*)into.data.pNext.get_pointer(), from->pNext);
+
+  auto next_handler = next_handlers.find(static_cast<VkStructureType>(guest_link->data.sType.data));
+  next_handler->second.second((void*)const_cast<guest_layout<VkBaseOutStructure>*>(guest_link), from->pNext);
 
   free(pNextHost);
 }
@@ -3011,6 +3052,128 @@ void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const gue
 bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const host_layout<VkRenderPassBeginInfo>& from) {
   // Nothing to do
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Two-call array queries over extensible (sType/pNext) structs.
+//
+// The generator wraps an out-array parameter with make_repack_wrapper, which
+// repacks exactly one element. For a count/array pair that is wrong twice over:
+// elements past the first are never repacked, and on the counting call (array
+// == nullptr) the wrapper still walks a struct that is not there. DXVK's first
+// vkGetPhysicalDeviceQueueFamilyProperties2 call took the second path and
+// faulted reading 0xFFFFFFFF inside the thunk.
+//
+// So these get a hand-written host impl, following the shape vkEnumerate-
+// PhysicalDevices already uses: pass the count-probe straight through, and
+// otherwise repack every element in and back out, carrying each element's own
+// pNext chain across in both directions.
+// ---------------------------------------------------------------------------
+template<typename T, typename Fn>
+static auto RepackedArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& call) {
+  using RetType = decltype(call(std::declval<T*>()));
+
+  if (getenv("FEX_VK_ARRAYTRACE")) {
+    fprintf(stderr, "FEXVKTRACE: array query enter count_ptr=%p count=%u array=%p\n", (void*)count, count ? *count : 0u,
+            (void*)array.get_pointer());
+  }
+  if (!array.get_pointer()) {
+    // Count probe: nothing to repack, and the guest may not have sized *count yet.
+    return call(nullptr);
+  }
+
+  const uint32_t InputCount = *count;
+  auto* Guest = array.get_pointer();
+
+  // Hosts owns each element's repacked pNext chain until the exit pass frees it;
+  // Plain is the contiguous T[] the driver actually writes through.
+  std::vector<host_layout<T>> Hosts;
+  Hosts.reserve(InputCount);
+  std::vector<T> Plain(InputCount);
+  for (uint32_t i = 0; i < InputCount; ++i) {
+    Hosts.emplace_back(Guest[i]);
+    fex_custom_repack_entry(Hosts[i], Guest[i]);
+    Plain[i] = Hosts[i].data;
+  }
+
+  if (getenv("FEX_VK_ARRAYTRACE")) {
+    fprintf(stderr, "FEXVKTRACE: array query repacked %u elements, calling driver\n", InputCount);
+  }
+
+  auto Finish = [&]() {
+    // *count is what the driver actually filled, which may be below InputCount.
+    for (uint32_t i = 0; i < std::min(InputCount, *count); ++i) {
+      fex_custom_repack_exit(Guest[i], to_host_layout(Plain[i]));
+    }
+  };
+
+  if constexpr (std::is_void_v<RetType>) {
+    call(Plain.data());
+    Finish();
+  } else {
+    auto Ret = call(Plain.data());
+    Finish();
+    return Ret;
+  }
+}
+
+void fexfn_impl_libvulkan_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                    guest_layout<VkQueueFamilyProperties2*> a_2) {
+  RepackedArrayQuery(a_1, a_2, [&](VkQueueFamilyProperties2* out) {
+    fexldr_ptr_libvulkan_vkGetPhysicalDeviceQueueFamilyProperties2(a_0, a_1, out);
+  });
+}
+
+void fexfn_impl_libvulkan_vkGetPhysicalDeviceQueueFamilyProperties2KHR(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                       guest_layout<VkQueueFamilyProperties2*> a_2) {
+  RepackedArrayQuery(a_1, a_2, [&](VkQueueFamilyProperties2* out) {
+    fexldr_ptr_libvulkan_vkGetPhysicalDeviceQueueFamilyProperties2KHR(a_0, a_1, out);
+  });
+}
+
+void fexfn_impl_libvulkan_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice a_0,
+                                                                          const VkPhysicalDeviceSparseImageFormatInfo2* a_1, uint32_t* a_2,
+                                                                          guest_layout<VkSparseImageFormatProperties2*> a_3) {
+  RepackedArrayQuery(a_2, a_3, [&](VkSparseImageFormatProperties2* out) {
+    fexldr_ptr_libvulkan_vkGetPhysicalDeviceSparseImageFormatProperties2(a_0, a_1, a_2, out);
+  });
+}
+
+void fexfn_impl_libvulkan_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(VkPhysicalDevice a_0,
+                                                                             const VkPhysicalDeviceSparseImageFormatInfo2* a_1,
+                                                                             uint32_t* a_2,
+                                                                             guest_layout<VkSparseImageFormatProperties2*> a_3) {
+  RepackedArrayQuery(a_2, a_3, [&](VkSparseImageFormatProperties2* out) {
+    fexldr_ptr_libvulkan_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(a_0, a_1, a_2, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice a_0, const VkPhysicalDeviceSurfaceInfo2KHR* a_1,
+                                                                    uint32_t* a_2, guest_layout<VkSurfaceFormat2KHR*> a_3) {
+  return RepackedArrayQuery(a_2, a_3, [&](VkSurfaceFormat2KHR* out) {
+    return fexldr_ptr_libvulkan_vkGetPhysicalDeviceSurfaceFormats2KHR(a_0, a_1, a_2, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceToolProperties(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                 guest_layout<VkPhysicalDeviceToolProperties*> a_2) {
+  return RepackedArrayQuery(a_1, a_2, [&](VkPhysicalDeviceToolProperties* out) {
+    return fexldr_ptr_libvulkan_vkGetPhysicalDeviceToolProperties(a_0, a_1, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceToolPropertiesEXT(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                    guest_layout<VkPhysicalDeviceToolProperties*> a_2) {
+  return RepackedArrayQuery(a_1, a_2, [&](VkPhysicalDeviceToolProperties* out) {
+    return fexldr_ptr_libvulkan_vkGetPhysicalDeviceToolPropertiesEXT(a_0, a_1, out);
+  });
+}
+
+VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice a_0, uint32_t* a_1,
+                                                                         guest_layout<VkPhysicalDeviceFragmentShadingRateKHR*> a_2) {
+  return RepackedArrayQuery(a_1, a_2, [&](VkPhysicalDeviceFragmentShadingRateKHR* out) {
+    return fexldr_ptr_libvulkan_vkGetPhysicalDeviceFragmentShadingRatesKHR(a_0, a_1, out);
+  });
 }
 #endif
 

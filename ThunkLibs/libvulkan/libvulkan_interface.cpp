@@ -4028,7 +4028,9 @@ struct fex_gen_config<vkGetPhysicalDeviceFeatures2KHR> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceFormatProperties2KHR> {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceFragmentShadingRatesKHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceFragmentShadingRatesKHR> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkGetPhysicalDeviceFragmentShadingRatesKHR, 2, VkPhysicalDeviceFragmentShadingRateKHR*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceImageFormatProperties2KHR> {};
 template<>
@@ -4041,22 +4043,38 @@ template<>
 struct fex_gen_config<vkGetPhysicalDevicePresentRectanglesKHR> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceProperties2KHR> {};
+// Count/array pairs need the hand-written host impls in Host.cpp: the
+// generated wrapper only ever repacks element 0.
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2> {};
+struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2KHR> {};
+struct fex_gen_param<vkGetPhysicalDeviceQueueFamilyProperties2, 2, VkQueueFamilyProperties2*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2> {};
+struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2KHR> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2KHR> {};
+struct fex_gen_param<vkGetPhysicalDeviceQueueFamilyProperties2KHR, 2, VkQueueFamilyProperties2*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkGetPhysicalDeviceSparseImageFormatProperties2, 3, VkSparseImageFormatProperties2*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2KHR> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkGetPhysicalDeviceSparseImageFormatProperties2KHR, 3, VkSparseImageFormatProperties2*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilities2KHR> {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceToolProperties> {};
+struct fex_gen_param<vkGetPhysicalDeviceSurfaceFormats2KHR, 3, VkSurfaceFormat2KHR*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceToolPropertiesEXT> {};
+struct fex_gen_config<vkGetPhysicalDeviceToolProperties> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkGetPhysicalDeviceToolProperties, 2, VkPhysicalDeviceToolProperties*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceToolPropertiesEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkGetPhysicalDeviceToolPropertiesEXT, 2, VkPhysicalDeviceToolProperties*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkReleaseSwapchainImagesEXT> {};
 #endif
