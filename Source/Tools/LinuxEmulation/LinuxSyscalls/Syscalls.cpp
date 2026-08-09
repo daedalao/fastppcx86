@@ -1675,12 +1675,27 @@ bool SyscallHandler::IsMonoRuntimeLibraryPath(std::string_view pathname) {
     pathname.remove_prefix(Slash + 1);
   }
   // Match known Mono runtime library prefixes.  Cheap prefix match, no regex.
+  //
+  // The Windows names matter as much as the Linux ones. A Unity title run under
+  // wine loads its runtime as a PE, and the only Windows name here used to be
+  // Unity 2017+'s mono-2.0-bdwgc: Unity 4 and 5 ship a plain "mono.dll", which
+  // matched nothing, so MonoDetected never fired and every MonoHacks path --
+  // the hook-based SMC scheme, the smaller JIT blocks, the spin-loop clamp --
+  // stayed off for the entire Windows-Unity catalogue. Native Dex opens
+  // libmono.so and reaches gameplay; the same game's Windows build opens
+  // mono.dll and dies in MonoManager ReloadAssembly.
+  //
+  // Prefix-matching a basename is deliberately narrow: "mono.dll" does not
+  // match MonoPosixHelper.dll or Mono.Security.dll, which are managed
+  // assemblies rather than the runtime.
   return pathname.starts_with("libmonosgen-")   || // mainline mono runtime (sgen GC)
          pathname.starts_with("libmono-2.0")    || // older mono runtime
          pathname.starts_with("libmonoboehm-")  || // Boehm-GC mono variant
          pathname.starts_with("libmonobdwgc-")  || // Unity 2017+ / modern Unity runtime
          pathname.starts_with("libmono.so")     || // generic libmono (Unity 4/5)
-         pathname.starts_with("mono-2.0-bdwgc") || // matches Windows-side name too
+         pathname.starts_with("mono-2.0-bdwgc") || // Unity 2017+ Windows-side name
+         pathname.starts_with("mono-2.0-sgen")  || // mono's own Windows build
+         pathname.starts_with("mono.dll")       || // Unity 4/5 Windows player (Dex_Data/Mono/mono.dll)
          pathname.starts_with("mono.so");
 }
 
