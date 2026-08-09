@@ -201,8 +201,8 @@ template<>
 struct fex_gen_config<&VkBindVideoSessionMemoryInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkBlitImageCubicWeightsInfoQCOM::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkBlitImageInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkBlitImageInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkBufferCaptureDescriptorDataInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -285,18 +285,18 @@ template<>
 struct fex_gen_config<&VkCopyAccelerationStructureInfoKHR::pNext> : fexgen::custom_repack {};
 // template<>
 // struct fex_gen_config<&VkCopyAccelerationStructureToMemoryInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyBufferInfo2::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyBufferToImageInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyBufferInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyBufferToImageInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyCommandTransformInfoQCOM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyDescriptorSet::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyImageInfo2::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyImageToBufferInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageToBufferInfo2::pNext> : fexgen::custom_repack {};
 // template<>
 // struct fex_gen_config<&VkCopyImageToImageInfo::pNext> : fexgen::custom_repack {};
 // template<>
@@ -427,8 +427,8 @@ template<>
 struct fex_gen_config<&VkDescriptorUpdateTemplateCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceAddressBindingCallbackDataEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceCreateInfo::pNext> : fexgen::custom_repack {};
 // template<>
@@ -457,8 +457,8 @@ template<>
 struct fex_gen_config<&VkDeviceGroupSubmitInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceGroupSwapchainCreateInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceImageMemoryRequirements::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceImageMemoryRequirements::pNext> : fexgen::custom_repack {};
 // template<>
 // struct fex_gen_config<&VkDeviceImageSubresourceInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1801,8 +1801,8 @@ template<>
 struct fex_gen_config<&VkRenderPassTileShadingCreateInfoQCOM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkRenderPassTransformBeginInfoQCOM::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkResolveImageInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkResolveImageInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkResolveImageModeInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1863,8 +1863,8 @@ template<>
 struct fex_gen_config<&VkSparseImageMemoryRequirements2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSubmitInfo::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkSubmitInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSubmitInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSubpassBeginInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -3198,8 +3198,6 @@ struct fex_gen_config<vkCmdBindIndexBuffer2KHR> {};
 template<>
 struct fex_gen_config<vkGetRenderingAreaGranularityKHR> {};
 template<>
-struct fex_gen_config<vkGetDeviceImageSubresourceLayoutKHR> {};
-template<>
 struct fex_gen_config<vkGetImageSubresourceLayout2KHR> {};
 template<>
 struct fex_gen_config<vkWaitForPresent2KHR> {};
@@ -4077,6 +4075,293 @@ template<>
 struct fex_gen_param<vkGetPhysicalDeviceToolPropertiesEXT, 2, VkPhysicalDeviceToolProperties*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkReleaseSwapchainImagesEXT> {};
+#endif
+
+// ---------------------------------------------------------------------------
+// Device and command-buffer entry points DXVK calls, restored for 32-bit.
+//
+// The same IS_32BIT_THUNK gates that hid the physical-device queries also hide
+// most of the device API, so vkGetDeviceProcAddr handed DXVK nullptr for ~150
+// names. Unity's D3D11 device creation called one and died with EIP=0
+// ("Dex.exe caused an Access Violation ... in module Dex.exe at 0030:00000000",
+// 2026-08-09).
+//
+// This is exactly the set a 32-bit guest was observed asking for and not
+// getting, minus vendor extensions nothing here calls and minus the ones the
+// generator cannot marshal yet (listed at the end).
+// ---------------------------------------------------------------------------
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<vkAcquireNextImage2KHR> {};
+template<>
+struct fex_gen_config<vkBindBufferMemory2> {};
+template<>
+struct fex_gen_config<vkBindImageMemory2> {};
+template<>
+struct fex_gen_config<vkCmdBeginQuery> {};
+template<>
+struct fex_gen_config<vkCmdBeginQueryIndexedEXT> {};
+template<>
+struct fex_gen_config<vkCmdBeginRenderPass2> {};
+template<>
+struct fex_gen_config<vkCmdBeginTransformFeedbackEXT> {};
+template<>
+struct fex_gen_config<vkCmdBindDescriptorBufferEmbeddedSamplers2EXT> {};
+template<>
+struct fex_gen_config<vkCmdBindDescriptorBufferEmbeddedSamplersEXT> {};
+template<>
+struct fex_gen_config<vkCmdBindDescriptorSets2KHR> {};
+template<>
+struct fex_gen_config<vkCmdBindIndexBuffer2KHR> {};
+template<>
+struct fex_gen_config<vkCmdBindTransformFeedbackBuffersEXT> {};
+template<>
+struct fex_gen_config<vkCmdBlitImage> {};
+template<>
+struct fex_gen_config<vkCmdClearColorImage> {};
+template<>
+struct fex_gen_config<vkCmdClearDepthStencilImage> {};
+template<>
+struct fex_gen_config<vkCmdCopyBuffer> {};
+template<>
+struct fex_gen_config<vkCmdCopyImage> {};
+template<>
+struct fex_gen_config<vkCmdCopyImageToBuffer> {};
+template<>
+struct fex_gen_config<vkCmdCopyQueryPoolResults> {};
+template<>
+struct fex_gen_config<vkCmdDispatch> {};
+template<>
+struct fex_gen_config<vkCmdDispatchBase> {};
+template<>
+struct fex_gen_config<vkCmdDispatchIndirect> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndexed> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndexedIndirect> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndexedIndirectCount> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndirect> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndirectByteCountEXT> {};
+template<>
+struct fex_gen_config<vkCmdDrawIndirectCount> {};
+template<>
+struct fex_gen_config<vkCmdEndQuery> {};
+template<>
+struct fex_gen_config<vkCmdEndQueryIndexedEXT> {};
+template<>
+struct fex_gen_config<vkCmdEndRenderPass2> {};
+template<>
+struct fex_gen_config<vkCmdEndRendering2KHR> {};
+template<>
+struct fex_gen_config<vkCmdEndTransformFeedbackEXT> {};
+template<>
+struct fex_gen_config<vkCmdFillBuffer> {};
+template<>
+struct fex_gen_config<vkCmdNextSubpass> {};
+template<>
+struct fex_gen_config<vkCmdNextSubpass2> {};
+template<>
+struct fex_gen_config<vkCmdPushConstants> {};
+template<>
+struct fex_gen_param<vkCmdPushConstants, 5, const void*> : fexgen::assume_compatible_data_layout {};
+template<>
+struct fex_gen_config<vkCmdResetEvent> {};
+template<>
+struct fex_gen_config<vkCmdResetEvent2> {};
+template<>
+struct fex_gen_config<vkCmdResetQueryPool> {};
+template<>
+struct fex_gen_config<vkCmdResolveImage> {};
+template<>
+struct fex_gen_config<vkCmdSetDepthBias2EXT> {};
+template<>
+struct fex_gen_config<vkCmdSetDescriptorBufferOffsets2EXT> {};
+template<>
+struct fex_gen_config<vkCmdSetDeviceMask> {};
+template<>
+struct fex_gen_config<vkCmdSetEvent> {};
+template<>
+struct fex_gen_config<vkCmdSetEvent2> {};
+template<>
+struct fex_gen_config<vkCmdSetRenderingAttachmentLocationsKHR> {};
+template<>
+struct fex_gen_config<vkCmdSetRenderingInputAttachmentIndicesKHR> {};
+template<>
+struct fex_gen_config<vkCmdSetSampleLocationsEXT> {};
+template<>
+struct fex_gen_config<vkCmdUpdateBuffer> {};
+template<>
+struct fex_gen_param<vkCmdUpdateBuffer, 4, const void*> : fexgen::assume_compatible_data_layout {};
+template<>
+struct fex_gen_config<vkCmdWaitEvents> {};
+template<>
+struct fex_gen_config<vkCmdWaitEvents2> {};
+template<>
+struct fex_gen_config<vkCmdWriteTimestamp> {};
+template<>
+struct fex_gen_config<vkCmdWriteTimestamp2> {};
+template<>
+struct fex_gen_config<vkCreateComputePipelines> {};
+template<>
+struct fex_gen_config<vkCreateEvent> {};
+template<>
+struct fex_gen_config<vkCreatePrivateDataSlot> {};
+template<>
+struct fex_gen_config<vkCreateQueryPool> {};
+template<>
+struct fex_gen_config<vkCreateSamplerYcbcrConversion> {};
+template<>
+struct fex_gen_config<vkDestroyEvent> {};
+template<>
+struct fex_gen_config<vkDestroyPrivateDataSlot> {};
+template<>
+struct fex_gen_config<vkDestroyQueryPool> {};
+template<>
+struct fex_gen_config<vkDestroySamplerYcbcrConversion> {};
+template<>
+struct fex_gen_config<vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR> {};
+template<>
+struct fex_gen_config<vkFlushMappedMemoryRanges> {};
+template<>
+struct fex_gen_config<vkGetBufferMemoryRequirements2> {};
+template<>
+struct fex_gen_config<vkGetBufferOpaqueCaptureAddress> {};
+template<>
+struct fex_gen_config<vkGetDeviceGroupPeerMemoryFeatures> {};
+template<>
+struct fex_gen_config<vkGetDeviceGroupPresentCapabilitiesKHR> {};
+template<>
+struct fex_gen_config<vkGetDeviceGroupSurfacePresentModesKHR> {};
+template<>
+struct fex_gen_config<vkGetDeviceMemoryCommitment> {};
+template<>
+struct fex_gen_config<vkGetDeviceMemoryOpaqueCaptureAddress> {};
+template<>
+struct fex_gen_config<vkGetDeviceQueue2> {};
+template<>
+struct fex_gen_config<vkGetEventStatus> {};
+template<>
+struct fex_gen_config<vkGetFenceStatus> {};
+template<>
+struct fex_gen_config<vkGetImageSparseMemoryRequirements> {};
+template<>
+struct fex_gen_config<vkGetImageSparseMemoryRequirements2> {};
+template<>
+struct fex_gen_config<vkGetImageSubresourceLayout2KHR> {};
+template<>
+struct fex_gen_config<vkGetMemoryFdKHR> {};
+template<>
+struct fex_gen_config<vkGetMemoryFdPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceExternalBufferPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceVideoCapabilitiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceVideoFormatPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPrivateData> {};
+template<>
+struct fex_gen_config<vkGetQueryPoolResults> {};
+template<>
+struct fex_gen_param<vkGetQueryPoolResults, 5, void*> : fexgen::assume_compatible_data_layout {};
+template<>
+struct fex_gen_config<vkGetRenderingAreaGranularityKHR> {};
+template<>
+struct fex_gen_config<vkGetSemaphoreCounterValue> {};
+template<>
+struct fex_gen_config<vkGetSemaphoreCounterValueKHR> {};
+template<>
+struct fex_gen_config<vkGetSemaphoreFdKHR> {};
+template<>
+struct fex_gen_config<vkGetShaderModuleCreateInfoIdentifierEXT> {};
+template<>
+struct fex_gen_config<vkGetShaderModuleIdentifierEXT> {};
+template<>
+struct fex_gen_config<vkImportSemaphoreFdKHR> {};
+template<>
+struct fex_gen_config<vkInvalidateMappedMemoryRanges> {};
+template<>
+struct fex_gen_config<vkMergePipelineCaches> {};
+template<>
+struct fex_gen_config<vkReleaseSwapchainImagesKHR> {};
+template<>
+struct fex_gen_config<vkResetEvent> {};
+template<>
+struct fex_gen_config<vkResetQueryPool> {};
+template<>
+struct fex_gen_config<vkSetEvent> {};
+template<>
+struct fex_gen_config<vkSetPrivateData> {};
+template<>
+struct fex_gen_config<vkSignalSemaphore> {};
+template<>
+struct fex_gen_config<vkSignalSemaphoreKHR> {};
+template<>
+struct fex_gen_config<vkTrimCommandPool> {};
+template<>
+struct fex_gen_config<vkWaitForPresentKHR> {};
+template<>
+struct fex_gen_config<vkWaitSemaphoresKHR> {};
+
+
+// Members the repacks above need; without these the generator will not accept
+// the enclosing parameter at all.
+template<>
+struct fex_gen_config<&VkBlitImageInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyBufferInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyBufferToImageInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageToBufferInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkResolveImageInfo2::pRegions> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSubmitInfo2::pWaitSemaphoreInfos> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSubmitInfo2::pCommandBufferInfos> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSubmitInfo2::pSignalSemaphoreInfos> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pCreateInfo> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceImageMemoryRequirements::pCreateInfo> : fexgen::custom_repack {};
+
+template<>
+struct fex_gen_config<vkCmdCopyBuffer2> {};template<>
+struct fex_gen_config<vkCmdBlitImage2> {};
+template<>
+struct fex_gen_config<vkCmdCopyBufferToImage2> {};
+template<>
+struct fex_gen_config<vkCmdCopyImage2> {};
+template<>
+struct fex_gen_config<vkCmdCopyImageToBuffer2> {};
+template<>
+struct fex_gen_config<vkCmdResolveImage2> {};
+template<>
+struct fex_gen_config<vkQueueSubmit2> {};
+template<>
+struct fex_gen_config<vkGetDeviceBufferMemoryRequirements> {};
+template<>
+struct fex_gen_config<vkGetDeviceImageMemoryRequirements> {};
+
+// Not restored, and why:
+//   vkGetDeviceImageSubresourceLayoutKHR: VkDeviceImageSubresourceInfo has no
+//     generated layout, so its repack cannot be written yet.
+//   vkCmdExecuteCommands takes an array of dispatchable VkCommandBuffer handles,
+//     which needs the token map and so a custom host impl.
+//   vkGet*OpaqueCaptureDescriptorDataEXT write through an unannotated void*.
+// Both are descriptor-buffer/secondary-command-buffer paths DXVK loads but does
+// not use on this driver; they stay null until something actually calls them.
 #endif
 
 } // namespace internal

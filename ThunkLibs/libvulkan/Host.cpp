@@ -3275,6 +3275,114 @@ bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const hos
   return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Vulkan 1.3 info structs DXVK needs on 32-bit.
+//
+// Each wraps what used to be a flat argument list into a struct holding either
+// a count/array pair or a pointer to another info struct, so the generator
+// refuses the parameter outright ("Unsupported parameter type") until the
+// member has a repack rule. Without them vkGetInstanceProcAddr returned null
+// for vkQueueSubmit2, the copy_commands2 family and the maintenance4 memory
+// queries, and Unity died with EIP=0 in "GfxDevice: creating device client".
+//
+// All are const inputs, so the exits return true: see the note on
+// fex_custom_repack_exit(VkInstanceCreateInfo).
+// ---------------------------------------------------------------------------
+void fex_custom_repack_entry(host_layout<VkBlitImageInfo2>& into, const guest_layout<VkBlitImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkBlitImageInfo2>& into, const host_layout<VkBlitImageInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkCopyBufferInfo2>& into, const guest_layout<VkCopyBufferInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkCopyBufferInfo2>& into, const host_layout<VkCopyBufferInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkCopyImageInfo2>& into, const guest_layout<VkCopyImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkCopyImageInfo2>& into, const host_layout<VkCopyImageInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkCopyBufferToImageInfo2>& into, const guest_layout<VkCopyBufferToImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkCopyBufferToImageInfo2>& into, const host_layout<VkCopyBufferToImageInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkCopyImageToBufferInfo2>& into, const guest_layout<VkCopyImageToBufferInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkCopyImageToBufferInfo2>& into, const host_layout<VkCopyImageToBufferInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkResolveImageInfo2>& into, const guest_layout<VkResolveImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkResolveImageInfo2>& into, const host_layout<VkResolveImageInfo2>& from) {
+  delete[] from.data.pRegions;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkSubmitInfo2>& into, const guest_layout<VkSubmitInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pWaitSemaphoreInfos = RepackStructArray(from.data.waitSemaphoreInfoCount.data, from.data.pWaitSemaphoreInfos).data();
+  into.data.pCommandBufferInfos = RepackStructArray(from.data.commandBufferInfoCount.data, from.data.pCommandBufferInfos).data();
+  into.data.pSignalSemaphoreInfos = RepackStructArray(from.data.signalSemaphoreInfoCount.data, from.data.pSignalSemaphoreInfos).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkSubmitInfo2>& into, const host_layout<VkSubmitInfo2>& from) {
+  delete[] from.data.pWaitSemaphoreInfos;
+  delete[] from.data.pCommandBufferInfos;
+  delete[] from.data.pSignalSemaphoreInfos;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkDeviceBufferMemoryRequirements>& into, const guest_layout<VkDeviceBufferMemoryRequirements>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pCreateInfo = RepackStructArray(1u, from.data.pCreateInfo).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkDeviceBufferMemoryRequirements>& into, const host_layout<VkDeviceBufferMemoryRequirements>& from) {
+  delete[] from.data.pCreateInfo;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkDeviceImageMemoryRequirements>& into, const guest_layout<VkDeviceImageMemoryRequirements>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pCreateInfo = RepackStructArray(1u, from.data.pCreateInfo).data();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkDeviceImageMemoryRequirements>& into, const host_layout<VkDeviceImageMemoryRequirements>& from) {
+  delete[] from.data.pCreateInfo;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Two-call array queries over extensible (sType/pNext) structs.
 //
