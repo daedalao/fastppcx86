@@ -3991,4 +3991,74 @@ struct fex_gen_config<vkGetPhysicalDeviceXlibPresentationSupportKHR> : fexgen::c
 template<>
 struct fex_gen_param<vkGetPhysicalDeviceXlibPresentationSupportKHR, 2, Display*> : fexgen::ptr_passthrough {};
 
+// ---------------------------------------------------------------------------
+// Physical-device queries DXVK requires, restored for the 32-bit thunk.
+//
+// Upstream's IS_32BIT_THUNK gates above exclude these (the Vulkan 1.1 "2"
+// queries live inside the #ifndef at :2739 and nearly every KHR alias inside
+// the one at :2953). Excluded means absent from FOREACH_internal_SYMBOL, so
+// Guest.cpp's MakeGuestCallable finds no host invoker and vkGetInstanceProcAddr
+// hands the guest a nullptr.
+//
+// DXVK does not treat these as optional: it calls what the loader returns. The
+// null then gets called, and FEX reports "NoExec instruction in entry block: 0"
+// and the 32-bit process dies without a wine-level exception — which is how
+// Dex-Windows died a few hundred ms after winevulkan.dll loaded (2026-08-08).
+//
+// This list is exactly the set observed coming back unknown from a 32-bit
+// guest (address 0x700000xx, the low-4GB trampoline range), minus the NV/ARM
+// vendor entry points nothing here calls.
+// ---------------------------------------------------------------------------
+// Not restored: vkEnumeratePhysicalDeviceGroups. Its out-parameter
+// VkPhysicalDeviceGroupProperties embeds an array of dispatchable
+// VkPhysicalDevice handles, which the generator refuses to repack without a
+// custom_repack rule ("Unsupported parameter type"). Device groups are
+// optional for DXVK, so this stays absent rather than half-done.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceExternalBufferProperties> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceExternalFenceProperties> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceExternalSemaphoreProperties> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceExternalSemaphorePropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceFeatures2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceFormatProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceFragmentShadingRatesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceImageFormatProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceMemoryProperties2> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceMemoryProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceMultisamplePropertiesEXT> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDevicePresentRectanglesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSparseImageFormatProperties2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilities2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceToolProperties> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceToolPropertiesEXT> {};
+template<>
+struct fex_gen_config<vkReleaseSwapchainImagesEXT> {};
+#endif
+
 } // namespace internal
