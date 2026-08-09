@@ -17,6 +17,8 @@ $end_info$
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <unistd.h>
+#include <cstdarg>
 #include <cstring>
 #include <map>
 #include <sys/mman.h>
@@ -119,6 +121,8 @@ FEX_VK_HANDLE_TOKEN(VkExternalComputeQueueNV_T)
 #endif
 
 #include "thunkgen_host_libvulkan.inl"
+
+static void ThunkLog(const char* Fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // FEX_VK_ARRAYTRACE=1 logs the count/array queries and the create-info repacks
 // that this file implements by hand. Cheap enough to leave in: one cached
@@ -903,7 +907,19 @@ static std::unordered_map<uintptr_t, size_t> PlacedRangeSize; // base -> size
 // the range, and ReserveLow32HostRange is what stops the guest allocator handing
 // it out afterwards.
 static uintptr_t ReserveGuestVisibleRange(size_t Size) {
-  constexpr uintptr_t ScanTop = 0x7000'0000;
+  // The whole low 4 GiB is fair game, not just the bottom 1.75 GiB.
+  //
+  // This window was copied from MakeLow32HostTrampoline, which stops at
+  // 0x7000'0000 to stay clear of the wine DLLs that sit from 0x7A00'0000 up.
+  // That constraint belongs to an executable trampoline pool, not to data
+  // mappings -- and it meant the search never looked at the one region that is
+  // actually free: with wine, mono and DXVK loaded there is 1.4 GiB of
+  // contiguous space at 0x8000'0000, while everything below 0x7000'0000 is
+  // fragmented. A 16 MiB request was failing with well over a gigabyte free.
+  //
+  // The gap finder below reads the real mappings, so widening the window costs
+  // nothing and simply lets it see the space.
+  constexpr uintptr_t ScanTop = 0xF000'0000;
   constexpr uintptr_t ScanBottom = 0x0800'0000;
   constexpr size_t PageSize = 0x1000;
 
@@ -967,6 +983,22 @@ static uintptr_t ReserveGuestVisibleRange(size_t Size) {
   return Found ? TryTake(Found) : 0;
 }
 
+// Diagnostics from here go out through write(2) rather than stdio. Several
+// fprintf calls in this file reach the proton log and several others -- in the
+// same functions, a few lines apart -- do not, which cost hours of chasing
+// phantom "this code never ran" conclusions. A raw write cannot be buffered
+// away.
+static void ThunkLog(const char* Fmt, ...) {
+  char Buf[512];
+  va_list Args;
+  va_start(Args, Fmt);
+  int Len = vsnprintf(Buf, sizeof(Buf), Fmt, Args);
+  va_end(Args);
+  if (Len > 0) {
+    [[maybe_unused]] auto Ignored = write(2, Buf, std::min<size_t>(Len, sizeof(Buf) - 1));
+  }
+}
+
 // Report what the guest address space actually looks like when a reservation
 // fails. Sampling it from outside kept missing the window -- the process is
 // gone in under a minute -- and the answer only matters at this instant.
@@ -998,11 +1030,11 @@ static void ReportGuestAddressSpace(size_t Wanted) {
     BestStart = Prev;
   }
   fclose(Maps);
-  fprintf(stderr,
-          "FEXVK: guest address space: %zu MiB mapped below 4GiB, largest free gap %zu MiB at %#zx (this request %zu MiB)\n",
-          (size_t)(Mapped >> 20), (size_t)(BestSize >> 20), (size_t)BestStart, (size_t)(Wanted >> 20));
-  fflush(stderr);
+  ThunkLog("FEXVK: guest address space: %zu MiB mapped below 4GiB, largest free gap %zu MiB at %#zx (this request %zu MiB)\n",
+           (size_t)(Mapped >> 20), (size_t)(BestSize >> 20), (size_t)BestStart, (size_t)(Wanted >> 20));
 }
+
+static uintptr_t ReserveGuestVisibleRange(size_t Size);
 
 // A single arena, taken at device creation while the guest address space is
 // still mostly empty, and sub-allocated from thereafter.
@@ -1018,22 +1050,37 @@ static size_t ArenaSize = 0;
 static size_t ArenaUsed = 0;
 
 static void EnsurePlacedArena() {
-  if (ArenaBase || !FEX::HLE::AllocateLow32HostRange) {
+  if (ArenaBase) {
     return;
   }
+  // Do NOT gate this on FEX::HLE::AllocateLow32HostRange being present. That is
+  // a weak symbol, it resolves to null in this library at runtime, and the
+  // previous version returned immediately when it did -- silently, without even
+  // reaching its own warning. ReserveLow32HostRange is declared the same way, so
+  // the low-4GB trampoline pool has probably never been registering with the
+  // guest allocator either.
+  const bool HaveAllocator = FEX::HLE::AllocateLow32HostRange != nullptr;
+  ThunkLog("FEXVK: placed-map arena: guest allocator %s\n", HaveAllocator ? "available" : "MISSING (weak symbol unresolved)");
+
   // Start ambitious and back off; a smaller arena still beats per-mapping.
-  for (size_t Try : {size_t(512) << 20, size_t(256) << 20, size_t(128) << 20, size_t(64) << 20}) {
-    if (void* P = FEX::HLE::AllocateLow32HostRange(Try)) {
-      ArenaBase = reinterpret_cast<uintptr_t>(P);
+  for (size_t Try : {size_t(512) << 20, size_t(256) << 20, size_t(128) << 20, size_t(64) << 20, size_t(32) << 20}) {
+    uintptr_t Base = 0;
+    if (HaveAllocator) {
+      Base = reinterpret_cast<uintptr_t>(FEX::HLE::AllocateLow32HostRange(Try));
+    }
+    if (!Base) {
+      // Same route the trampoline pool uses, which demonstrably works.
+      Base = ReserveGuestVisibleRange(Try);
+    }
+    if (Base) {
+      ArenaBase = Base;
       ArenaSize = Try;
       ArenaUsed = 0;
-      fprintf(stderr, "Placed Vulkan map arena: %zu MiB at %#zx\n", Try >> 20, ArenaBase);
-      fflush(stderr);
+      ThunkLog("FEXVK: placed-map arena: %zu MiB at %#zx\n", Try >> 20, ArenaBase);
       return;
     }
   }
-  fprintf(stderr, "WARNING: could not reserve a placed-map arena; falling back to per-mapping reservation\n");
-  fflush(stderr);
+  ThunkLog("FEXVK: placed-map arena: could not reserve any arena; falling back to per-mapping\n");
 }
 
 static uintptr_t AcquireFromArena(size_t Size, size_t Alignment) {
@@ -2707,16 +2754,57 @@ static const guest_layout<VkBaseOutStructure>* find_repackable_link(const guest_
   static std::mutex ReportedMutex;
   static std::unordered_set<uint32_t> Reported;
 
+  // FEX_VK_DROP_PNEXT=1 reverts to the old behaviour of dropping every chained
+  // struct. 359 types went from "dropped" to "repacked and handed to the driver"
+  // in one change; if any of those conversions is wrong the driver acts on
+  // malformed state, which is exactly how a shader ends up reading an address it
+  // should not. This is the A/B that says whether that surface is implicated,
+  // and it should have existed before the surface was enabled.
+  // FEX_VK_PNEXT_SKIP=<comma-separated sTypes> drops just those, for bisecting
+  // which conversion is the one handing the driver bad state. A real workload
+  // chains around 55 distinct types, so this converges in a handful of runs.
+  static const auto SkipList = [] {
+    std::unordered_set<uint32_t> Set;
+    if (const char* Env = getenv("FEX_VK_PNEXT_SKIP")) {
+      const char* P = Env;
+      while (*P) {
+        char* End = nullptr;
+        unsigned long V = strtoul(P, &End, 10);
+        if (End == P) {
+          break;
+        }
+        Set.insert(static_cast<uint32_t>(V));
+        P = (*End == ',') ? End + 1 : End;
+      }
+    }
+    return Set;
+  }();
+
+  static const bool DropAll = getenv("FEX_VK_DROP_PNEXT") != nullptr;
+  if (DropAll) {
+    // Log what a real workload actually chains. Repacking everything we *can*
+    // was the mistake -- the working set is far smaller than the 900-odd types
+    // with layout wrappers, and each one we convert is a chance to hand the
+    // driver something malformed.
+    for (auto* Walk = link; Walk;
+         Walk = reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(Walk->data.pNext.get_pointer())) {
+      std::lock_guard lk {ReportedMutex};
+      if (Reported.insert(Walk->data.sType.data).second) {
+        ThunkLog("FEXVK-CHAINED: %u\n", Walk->data.sType.data);
+      }
+    }
+    return nullptr;
+  }
+
   while (link) {
     const auto sType = static_cast<VkStructureType>(link->data.sType.data);
-    if (next_handlers.contains(sType)) {
+    if (next_handlers.contains(sType) && !SkipList.contains(link->data.sType.data)) {
       return link;
     }
     {
       std::lock_guard lk {ReportedMutex};
       if (Reported.insert(link->data.sType.data).second) {
-        fprintf(stderr, "WARNING: Unrecognized VkStructureType %u in a pNext chain; dropping it. Add it to next_handlers to repack it.\n",
-                link->data.sType.data);
+        ThunkLog("FEXVK: unrecognized VkStructureType %u in a pNext chain; dropping it\n", link->data.sType.data);
       }
     }
     link = reinterpret_cast<const guest_layout<VkBaseOutStructure>*>(link->data.pNext.get_pointer());
@@ -4068,9 +4156,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
       static std::unordered_set<uint32_t> Reported;
       std::lock_guard lk {ReportedMutex};
       if (Reported.insert(static_cast<uint32_t>(into.data.type)).second) {
-        fprintf(stderr, "WARNING: Unhandled descriptor type %u in VkDescriptorGetInfoEXT; writing a null descriptor\n",
-                static_cast<uint32_t>(into.data.type));
-        fflush(stderr);
+        ThunkLog("FEXVK: unhandled descriptor type %u in VkDescriptorGetInfoEXT; zeroing it\n", static_cast<uint32_t>(into.data.type));
       }
     }
     memset(&into.data.data, 0, sizeof(into.data.data));
