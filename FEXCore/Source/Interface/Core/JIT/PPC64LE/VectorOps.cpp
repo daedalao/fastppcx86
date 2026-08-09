@@ -3931,19 +3931,26 @@ DEF_OP(VFRSqrtScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // f32 is the only size x86 can reach here (RSQRTSS); vrsqrtefp is the
+  // vector-domain analogue of frsqrtes with the same estimate precision
+  // class, so the stack round trip and the scalar-FPU crossing both go.
+  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
+    xxspltw  (VTMP1, Vec2, 3);            // guest f32 elem0 = BE word 3
+    vrsqrtefp(VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel    (Dst, Vec1, VTMP1, VTMP2);
+    return;
+  }
+
+  // f64 has no x86 equivalent and no VSX double rsqrt-estimate encoder in
+  // this tree, so it keeps the scalar path.
   addi(TMP1, r1, -32);
   stvx(Vec1, r(0), TMP1);
   addi(TMP2, r1, -16);
   stvx(Vec2, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    frsqrtes(f0, f0);
-    stfs(f0, -32, r1);
-  } else {
-    lfd(f0, -16, r1);
-    frsqrte(f0, f0);
-    stfd(f0, -32, r1);
-  }
+  lfd(f0, -16, r1);
+  frsqrte(f0, f0);
+  stfd(f0, -32, r1);
   lvx(Dst, r(0), TMP1);
 }
 
@@ -3952,23 +3959,30 @@ DEF_OP(VFRecpScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // f32 is the only size x86 can reach here (RCPSS); vrefp is the
+  // vector-domain analogue of fres with the same estimate precision class.
+  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
+    xxspltw(VTMP1, Vec2, 3);              // guest f32 elem0 = BE word 3
+    vrefp  (VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel  (Dst, Vec1, VTMP1, VTMP2);
+    return;
+  }
+
+  // f64 has no x86 equivalent. It also is NOT an estimate here: PPC has no
+  // scalar f64 fre, so this computes an exact 1.0/x via fdiv. Keeping the
+  // scalar path preserves that precision - swapping in a double estimate
+  // would quietly downgrade it.
   addi(TMP1, r1, -32);
   stvx(Vec1, r(0), TMP1);
   addi(TMP2, r1, -16);
   stvx(Vec2, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    fres(f0, f0);
-    stfs(f0, -32, r1);
-  } else {
-    lfd(f0, -16, r1);
-    // PPC has no scalar f64 fre; use 1.0/x via fdiv.
-    LoadConstant(TMP3, 0x3FF0000000000000ULL); // 1.0 as f64
-    std(TMP3, -48, r1);
-    lfd(f1, -48, r1);
-    fdiv(f0, f1, f0);
-    stfd(f0, -32, r1);
-  }
+  lfd(f0, -16, r1);
+  LoadConstant(TMP3, 0x3FF0000000000000ULL); // 1.0 as f64
+  std(TMP3, -48, r1);
+  lfd(f1, -48, r1);
+  fdiv(f0, f1, f0);
+  stfd(f0, -32, r1);
   lvx(Dst, r(0), TMP1);
 }
 
