@@ -14,9 +14,12 @@ $end_info$
 
 #include "common/Host.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <sys/mman.h>
 #include <mutex>
 #include <span>
 #include <string>
@@ -309,10 +312,52 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   return ret;
 }
 
+#ifdef IS_32BIT_THUNK
+static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice Device);
+static bool DeviceSupportsPlacedMaps(VkPhysicalDevice PhysicalDevice);
+#endif
+
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                            guest_layout<VkDevice*> a_3) {
+  // Add VK_EXT_map_memory_placed (and the VK_KHR_map_memory2 it builds on) to
+  // whatever the guest asked for. The guest will not request them - DXVK has no
+  // reason to - but without them vkMapMemory cannot return an address a 32-bit
+  // guest can hold. Same injection wine performs for wow64.
+#ifdef IS_32BIT_THUNK
+  VkDeviceCreateInfo PatchedInfo = *a_1;
+  std::vector<const char*> PatchedExtensions;
+  VkPhysicalDeviceMapMemoryPlacedFeaturesEXT PlacedFeatures {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
+    .pNext = const_cast<void*>(a_1->pNext),
+    .memoryMapPlaced = VK_TRUE,
+    .memoryMapRangePlaced = VK_FALSE,
+    .memoryUnmapReserve = VK_TRUE,
+  };
+
+  const bool WantPlaced = DeviceSupportsPlacedMaps(a_0);
+  if (WantPlaced) {
+    PatchedExtensions.assign(a_1->ppEnabledExtensionNames, a_1->ppEnabledExtensionNames + a_1->enabledExtensionCount);
+    for (const char* Name : {VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME}) {
+      auto Already = std::any_of(PatchedExtensions.begin(), PatchedExtensions.end(),
+                                 [&](const char* E) { return std::string_view {E} == Name; });
+      if (!Already) {
+        PatchedExtensions.push_back(Name);
+      }
+    }
+    PatchedInfo.enabledExtensionCount = PatchedExtensions.size();
+    PatchedInfo.ppEnabledExtensionNames = PatchedExtensions.data();
+    PatchedInfo.pNext = &PlacedFeatures;
+    a_1 = &PatchedInfo;
+  }
+#endif
+
   VkDevice out;
   auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
+#ifdef IS_32BIT_THUNK
+  if (ret == VK_SUCCESS && WantPlaced) {
+    EnablePlacedMapsForDevice(a_0, out);
+  }
+#endif
   if (VkArrayTrace()) {
     fprintf(stderr, "FEXVKTRACE: vkCreateDevice ret=%d device=%p out_guest=%p\n", ret, (void*)out, (void*)a_3.get_pointer());
     fflush(stderr);
@@ -336,12 +381,28 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   return ret;
 }
 
+#ifdef IS_32BIT_THUNK
+static void RecordPlacedAllocationSize(VkDeviceMemory Memory, VkDeviceSize Size);
+static void ForgetPlacedAllocation(VkDeviceMemory Memory);
+#endif
+
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
   (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
-  return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+  auto Ret = LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+#ifdef IS_32BIT_THUNK
+  if (Ret == VK_SUCCESS) {
+    // A VK_WHOLE_SIZE vkMapMemory has to be given a placed reservation covering
+    // the whole allocation, and the size is not recoverable at map time.
+    RecordPlacedAllocationSize(*a_3, a_1->allocationSize);
+  }
+#endif
+  return Ret;
 }
 
 static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkAllocationCallbacks* a_2) {
+#ifdef IS_32BIT_THUNK
+  ForgetPlacedAllocation(a_1);
+#endif
   (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
   LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);
 }
@@ -429,6 +490,18 @@ static void FEXFN_IMPL(vkDestroyPipelineCache)(VkDevice a_0, VkPipelineCache a_1
 
 static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice a_0, VkPipelineCache a_1, uint32_t a_2, const VkGraphicsPipelineCreateInfo* a_3,
                                                      const VkAllocationCallbacks* a_4, VkPipeline* a_5) {
+  if (VkArrayTrace()) {
+    fprintf(stderr, "FEXVKTRACE: vkCreateGraphicsPipelines count=%u info=%p", a_2, (const void*)a_3);
+    if (a_3) {
+      fprintf(stderr, " stages=%u pStages=%p vi=%p ia=%p vp=%p rs=%p ms=%p ds=%p cb=%p dyn=%p layout=%p pNext=%p flags=%x",
+              a_3->stageCount, (const void*)a_3->pStages, (const void*)a_3->pVertexInputState, (const void*)a_3->pInputAssemblyState,
+              (const void*)a_3->pViewportState, (const void*)a_3->pRasterizationState, (const void*)a_3->pMultisampleState,
+              (const void*)a_3->pDepthStencilState, (const void*)a_3->pColorBlendState, (const void*)a_3->pDynamicState,
+              (const void*)a_3->layout, (const void*)a_3->pNext, a_3->flags);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+  }
   (void*&)LDR_PTR(vkCreateGraphicsPipelines) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateGraphicsPipelines");
   return LDR_PTR(vkCreateGraphicsPipelines)(a_0, a_1, a_2, a_3, nullptr, a_5);
 }
@@ -771,17 +844,305 @@ VkResult fexfn_impl_libvulkan_vkAllocateCommandBuffers(VkDevice device, const Vk
   return ret;
 }
 
+// ---------------------------------------------------------------------------
+// Placed memory maps for 32-bit guests (VK_EXT_map_memory_placed).
+//
+// vkMapMemory hands back whatever address the driver picked, and on this host
+// that is a 0x3fff'xxxx'xxxx mapping which cannot be represented in a 32-bit
+// guest pointer at all. The old implementation narrowed it, which the guard in
+// host_to_guest_convertible correctly turned into
+//   FEX FATAL: 32-bit truncation of host pointer ... returned to guest
+// and an abort, right as DXVK mapped its descriptor heap. No amount of
+// repacking fixes that: the address itself has to be one the guest can hold.
+//
+// VK_EXT_map_memory_placed exists for exactly this problem (wine's wow64
+// winevulkan uses it): vkMapMemory2 takes a VkMemoryMapPlacedInfoEXT naming the
+// address the mapping must land on. So reserve a range down in the guest's own
+// 4 GiB - where guest VA and host VA coincide - and place the mapping there.
+//
+// The device has to have the extension enabled for that to work, and DXVK will
+// never ask for it, so vkCreateDevice below injects it.
+// ---------------------------------------------------------------------------
+
+// A reservation is a PROT_NONE mapping in the low 4 GiB, claimed in the guest's
+// allocator so a later guest mmap cannot land on top of it. Reservations are
+// kept and recycled rather than returned to the OS: with memoryUnmapReserve the
+// driver leaves the address space intact on unmap, which is precisely so a
+// caller can reuse it.
+struct PlacedReservation {
+  uintptr_t Base;
+  size_t Size;
+};
+
+static std::mutex PlacedPoolMutex;
+static std::multimap<size_t, uintptr_t> PlacedFreeRanges;    // size -> base
+static std::unordered_map<uintptr_t, size_t> PlacedRangeSize; // base -> size
+
+// Scans downward the same way MakeLow32HostTrampoline does, for the same
+// reason: MAP_FIXED_NOREPLACE only loses to mappings that already exist, and
+// ReserveLow32HostRange is what stops the guest allocator handing the range out
+// later.
+static uintptr_t ReserveGuestVisibleRange(size_t Size) {
+  constexpr uintptr_t ScanTop = 0x7000'0000;
+  constexpr uintptr_t ScanBottom = 0x1000'0000;
+  const size_t Step = std::max<size_t>(Size, 0x10'0000);
+
+  for (uintptr_t Addr = ScanTop - Size; Addr >= ScanBottom; Addr -= Step) {
+    void* P = ::mmap(reinterpret_cast<void*>(Addr), Size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (P == MAP_FAILED) {
+      continue;
+    }
+    if (FEX::HLE::ReserveLow32HostRange) {
+      FEX::HLE::ReserveLow32HostRange(reinterpret_cast<uintptr_t>(P), Size);
+    }
+    return reinterpret_cast<uintptr_t>(P);
+  }
+  return 0;
+}
+
+static uintptr_t AcquirePlacedRange(size_t Size, size_t Alignment) {
+  const size_t Rounded = (Size + Alignment - 1) & ~(Alignment - 1);
+  std::lock_guard lk {PlacedPoolMutex};
+
+  // Smallest recycled range that fits.
+  auto It = PlacedFreeRanges.lower_bound(Rounded);
+  if (It != PlacedFreeRanges.end()) {
+    auto Base = It->second;
+    PlacedFreeRanges.erase(It);
+    return Base;
+  }
+
+  auto Base = ReserveGuestVisibleRange(Rounded);
+  if (Base) {
+    PlacedRangeSize[Base] = Rounded;
+  }
+  return Base;
+}
+
+static void ReleasePlacedRange(uintptr_t Base) {
+  std::lock_guard lk {PlacedPoolMutex};
+  auto It = PlacedRangeSize.find(Base);
+  if (It == PlacedRangeSize.end()) {
+    return;
+  }
+  PlacedFreeRanges.emplace(It->second, Base);
+}
+
+// Per-device placed-mapping state. Empty means the device does not have the
+// extension and vkMapMemory has nothing it can do.
+struct PlacedDeviceInfo {
+  PFN_vkMapMemory2KHR MapMemory2 {};
+  PFN_vkUnmapMemory2KHR UnmapMemory2 {};
+  size_t Alignment {4096};
+  bool UnmapReserve {};
+};
+
+static std::mutex PlacedDeviceMutex;
+static std::unordered_map<VkDevice, PlacedDeviceInfo> PlacedDevices;
+// Allocation sizes, needed because a VK_WHOLE_SIZE map still has to be given a
+// reservation big enough for the whole allocation.
+static std::unordered_map<VkDeviceMemory, VkDeviceSize> PlacedAllocationSizes;
+// Live placed mappings, so unmap can hand the reservation back.
+static std::unordered_map<VkDeviceMemory, uintptr_t> PlacedMappings;
+
+static void RecordPlacedAllocationSize(VkDeviceMemory Memory, VkDeviceSize Size) {
+  std::lock_guard lk {PlacedDeviceMutex};
+  PlacedAllocationSizes[Memory] = Size;
+}
+
+static void ForgetPlacedAllocation(VkDeviceMemory Memory) {
+  std::lock_guard lk {PlacedDeviceMutex};
+  PlacedAllocationSizes.erase(Memory);
+  PlacedMappings.erase(Memory);
+}
+
+// Resolve the map/unmap entry points and the placement alignment once, at
+// device creation, so vkMapMemory is a table lookup.
+static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice Device) {
+  PlacedDeviceInfo Info {};
+  Info.MapMemory2 = (PFN_vkMapMemory2KHR)LDR_PTR(vkGetDeviceProcAddr)(Device, "vkMapMemory2KHR");
+  Info.UnmapMemory2 = (PFN_vkUnmapMemory2KHR)LDR_PTR(vkGetDeviceProcAddr)(Device, "vkUnmapMemory2KHR");
+  if (!Info.MapMemory2) {
+    Info.MapMemory2 = (PFN_vkMapMemory2KHR)LDR_PTR(vkGetDeviceProcAddr)(Device, "vkMapMemory2");
+    Info.UnmapMemory2 = (PFN_vkUnmapMemory2KHR)LDR_PTR(vkGetDeviceProcAddr)(Device, "vkUnmapMemory2");
+  }
+  if (!Info.MapMemory2 || !Info.UnmapMemory2) {
+    fprintf(stderr, "ERROR: VK_EXT_map_memory_placed enabled but vkMapMemory2 is missing\n");
+    fflush(stderr);
+    return;
+  }
+
+  VkPhysicalDeviceMapMemoryPlacedPropertiesEXT PlacedProps {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT,
+  };
+  VkPhysicalDeviceProperties2 Props2 {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+    .pNext = &PlacedProps,
+  };
+  LDR_PTR(vkGetPhysicalDeviceProperties2)(PhysicalDevice, &Props2);
+  // The placed address has to satisfy the driver's alignment, and the
+  // reservation is an mmap, so never go below a page either.
+  Info.Alignment = std::max<size_t>(PlacedProps.minPlacedMemoryMapAlignment, 4096);
+
+  VkPhysicalDeviceMapMemoryPlacedFeaturesEXT PlacedFeatures {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
+  };
+  VkPhysicalDeviceFeatures2 Features2 {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    .pNext = &PlacedFeatures,
+  };
+  LDR_PTR(vkGetPhysicalDeviceFeatures2)(PhysicalDevice, &Features2);
+  Info.UnmapReserve = PlacedFeatures.memoryUnmapReserve == VK_TRUE;
+
+  {
+    std::lock_guard lk {PlacedDeviceMutex};
+    PlacedDevices[Device] = Info;
+  }
+  fprintf(stderr, "Placed Vulkan memory maps enabled (alignment %zu, unmapReserve %d)\n", Info.Alignment, (int)Info.UnmapReserve);
+  fflush(stderr);
+}
+
+static bool DeviceSupportsPlacedMaps(VkPhysicalDevice PhysicalDevice) {
+  uint32_t Count = 0;
+  if (LDR_PTR(vkEnumerateDeviceExtensionProperties)(PhysicalDevice, nullptr, &Count, nullptr) != VK_SUCCESS || !Count) {
+    return false;
+  }
+  std::vector<VkExtensionProperties> Props(Count);
+  if (LDR_PTR(vkEnumerateDeviceExtensionProperties)(PhysicalDevice, nullptr, &Count, Props.data()) != VK_SUCCESS) {
+    return false;
+  }
+  bool HasPlaced = false;
+  bool HasMapMemory2 = false;
+  for (auto& P : Props) {
+    std::string_view Name {P.extensionName};
+    HasPlaced |= Name == VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+    HasMapMemory2 |= Name == VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+  }
+  return HasPlaced && HasMapMemory2;
+}
+
 VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size,
                                           VkMemoryMapFlags flags, guest_layout<void**> data) {
-  host_layout<void*> host_data {};
-  void* mapped;
-  (void*&)fexldr_ptr_libvulkan_vkMapMemory = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkMapMemory");
-  auto ret = fexldr_ptr_libvulkan_vkMapMemory(device, memory, offset, size, flags, &mapped);
-  if (ret == VK_SUCCESS) {
-    host_data.data = mapped;
-    *data.get_pointer() = to_guest(host_data);
+  PlacedDeviceInfo Placed;
+  {
+    std::lock_guard lk {PlacedDeviceMutex};
+    auto It = PlacedDevices.find(device);
+    if (It != PlacedDevices.end()) {
+      Placed = It->second;
+    }
   }
+
+  if (!Placed.MapMemory2) {
+    // No placed mapping on this device. Refusing is the only honest answer: the
+    // driver would hand back an address the guest cannot hold, and narrowing it
+    // silently corrupts. VK_ERROR_MEMORY_MAP_FAILED is a documented result that
+    // callers already handle.
+    static std::once_flag Warned;
+    std::call_once(Warned, [] {
+      fprintf(stderr, "ERROR: vkMapMemory on a device without VK_EXT_map_memory_placed; a 32-bit guest cannot hold the "
+                      "host mapping address. Failing the map.\n");
+      fflush(stderr);
+    });
+    return VK_ERROR_MEMORY_MAP_FAILED;
+  }
+
+  // A VK_WHOLE_SIZE map still needs a reservation covering the whole
+  // allocation, so use the size recorded at vkAllocateMemory time.
+  VkDeviceSize MapSize = size;
+  if (MapSize == VK_WHOLE_SIZE) {
+    std::lock_guard lk {PlacedDeviceMutex};
+    auto It = PlacedAllocationSizes.find(memory);
+    MapSize = It != PlacedAllocationSizes.end() ? It->second - offset : 0;
+  }
+  if (!MapSize) {
+    return VK_ERROR_MEMORY_MAP_FAILED;
+  }
+
+  auto Base = AcquirePlacedRange(MapSize, Placed.Alignment);
+  if (!Base) {
+    fprintf(stderr, "ERROR: no free guest-visible address space for a %zu byte Vulkan mapping\n", (size_t)MapSize);
+    fflush(stderr);
+    return VK_ERROR_MEMORY_MAP_FAILED;
+  }
+
+  VkMemoryMapPlacedInfoEXT PlacedInfo {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,
+    .pNext = nullptr,
+    .pPlacedAddress = reinterpret_cast<void*>(Base),
+  };
+  VkMemoryMapInfo MapInfo {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO,
+    .pNext = &PlacedInfo,
+    .flags = flags | VK_MEMORY_MAP_PLACED_BIT_EXT,
+    .memory = memory,
+    .offset = offset,
+    .size = size,
+  };
+
+  void* mapped {};
+  auto ret = Placed.MapMemory2(device, &MapInfo, &mapped);
+  if (ret != VK_SUCCESS) {
+    ReleasePlacedRange(Base);
+    return ret;
+  }
+
+  {
+    std::lock_guard lk {PlacedDeviceMutex};
+    PlacedMappings[memory] = Base;
+  }
+
+  host_layout<void*> host_data {};
+  host_data.data = mapped;
+  *data.get_pointer() = to_guest(host_data);
   return ret;
+}
+
+void fexfn_impl_libvulkan_vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+  PlacedDeviceInfo Placed;
+  uintptr_t Base = 0;
+  {
+    std::lock_guard lk {PlacedDeviceMutex};
+    auto It = PlacedDevices.find(device);
+    if (It != PlacedDevices.end()) {
+      Placed = It->second;
+    }
+    auto MapIt = PlacedMappings.find(memory);
+    if (MapIt != PlacedMappings.end()) {
+      Base = MapIt->second;
+      PlacedMappings.erase(MapIt);
+    }
+  }
+
+  if (!Base || !Placed.UnmapMemory2) {
+    (void*&)LDR_PTR(vkUnmapMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkUnmapMemory");
+    LDR_PTR(vkUnmapMemory)(device, memory);
+    return;
+  }
+
+  // With memoryUnmapReserve the driver leaves the address space mapped
+  // PROT_NONE instead of releasing it, which is what lets the range go back on
+  // the free list. Without the feature the VA is gone, so put an equivalent
+  // reservation back ourselves before recycling it.
+  VkMemoryUnmapInfo UnmapInfo {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO,
+    .pNext = nullptr,
+    .flags = Placed.UnmapReserve ? (VkMemoryUnmapFlags)VK_MEMORY_UNMAP_RESERVE_BIT_EXT : (VkMemoryUnmapFlags)0,
+    .memory = memory,
+  };
+  Placed.UnmapMemory2(device, &UnmapInfo);
+
+  if (!Placed.UnmapReserve) {
+    size_t Size = 0;
+    {
+      std::lock_guard lk {PlacedPoolMutex};
+      auto It = PlacedRangeSize.find(Base);
+      Size = It != PlacedRangeSize.end() ? It->second : 0;
+    }
+    if (Size) {
+      ::mmap(reinterpret_cast<void*>(Base), Size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    }
+  }
+  ReleasePlacedRange(Base);
 }
 
 // Allocates storage on the heap that must be de-allocated using delete[] or DeleteRepackedStructArray
@@ -1712,6 +2073,329 @@ static std::unordered_map<VkStructureType, std::pair<VkBaseOutStructure* (*)(con
   converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_FORMAT_QUANTIZATION_MAP_PROPERTIES_KHR, VkVideoFormatQuantizationMapPropertiesKHR>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features>,
   converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES, VkPhysicalDeviceVulkan14Properties>,
+
+  // Everything else repack-registered that a driver or app can legally chain.
+  // The earlier pass only added feature/property structs, which left the ones
+  // that carry *behaviour* still being dropped -- and dropping those is worse
+  // than dropping a query, because the call still happens, just without what
+  // the app asked for. VkPipelineCreateFlags2CreateInfo is the case that bit:
+  // DXVK puts VK_PIPELINE_CREATE_LIBRARY_BIT_KHR there under maintenance5, we
+  // dropped it, and the driver then read a pipeline library as a complete
+  // pipeline and dereferenced the state pointers it was entitled to assume
+  // non-null.
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR, VkAccelerationStructureBuildSizesInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CAPTURE_DESCRIPTOR_DATA_INFO_EXT, VkAccelerationStructureCaptureDescriptorDataInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR, VkAccelerationStructureCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, VkAccelerationStructureDeviceAddressInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_INFO_NV, VkAccelerationStructureMemoryRequirementsInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR, VkAccelerationStructureVersionInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR, VkAcquireNextImageInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ACQUIRE_PROFILING_LOCK_INFO_KHR, VkAcquireProfilingLockInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD, VkAntiLagPresentationInfoAMD>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_APPLICATION_INFO, VkApplicationInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, VkAttachmentDescription2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT, VkAttachmentFeedbackLoopInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, VkAttachmentReference2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BEGIN_CUSTOM_RESOLVE_INFO_EXT, VkBeginCustomResolveInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_ACCELERATION_STRUCTURE_MEMORY_INFO_NV, VkBindAccelerationStructureMemoryInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO, VkBindBufferMemoryInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_DATA_GRAPH_PIPELINE_SESSION_MEMORY_INFO_ARM, VkBindDataGraphPipelineSessionMemoryInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_INFO_EXT, VkBindDescriptorBufferEmbeddedSamplersInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO, VkBindDescriptorSetsInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, VkBindImageMemoryInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS, VkBindMemoryStatus>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_TENSOR_MEMORY_INFO_ARM, VkBindTensorMemoryInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BIND_VIDEO_SESSION_MEMORY_INFO_KHR, VkBindVideoSessionMemoryInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BLIT_IMAGE_CUBIC_WEIGHTS_INFO_QCOM, VkBlitImageCubicWeightsInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2, VkBlitImageInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CAPTURE_DESCRIPTOR_DATA_INFO_EXT, VkBufferCaptureDescriptorDataInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_COPY_2, VkBufferCopy2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, VkBufferCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, VkBufferDeviceAddressInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2, VkBufferImageCopy2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, VkBufferMemoryBarrier>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, VkBufferMemoryBarrier2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, VkBufferMemoryRequirementsInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO, VkBufferUsageFlags2CreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, VkBufferViewCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_BUILD_PARTITIONED_ACCELERATION_STRUCTURE_INFO_NV, VkBuildPartitionedAccelerationStructureInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, VkCalibratedTimestampInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_CLUSTERS_BOTTOM_LEVEL_INPUT_NV, VkClusterAccelerationStructureClustersBottomLevelInputNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_MOVE_OBJECTS_INPUT_NV, VkClusterAccelerationStructureMoveObjectsInputNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_TRIANGLE_CLUSTER_INPUT_NV, VkClusterAccelerationStructureTriangleClusterInputNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, VkCommandBufferAllocateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, VkCommandBufferBeginInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, VkCommandBufferInheritanceInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, VkCommandBufferSubmitInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, VkCommandPoolCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMPUTE_OCCUPANCY_PRIORITY_PARAMETERS_NV, VkComputeOccupancyPriorityParametersNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, VkComputePipelineCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_INDIRECT_BUFFER_INFO_NV, VkComputePipelineIndirectBufferInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, VkConditionalRenderingBeginInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR, VkCopyAccelerationStructureInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2, VkCopyBufferInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2, VkCopyBufferToImageInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET, VkCopyDescriptorSet>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2, VkCopyImageInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2, VkCopyImageToBufferInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR, VkCopyMemoryIndirectInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INDIRECT_INFO_KHR, VkCopyMemoryToImageIndirectInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_COPY_MICROMAP_INFO_EXT, VkCopyMicromapInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CU_FUNCTION_CREATE_INFO_NVX, VkCuFunctionCreateInfoNVX>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CU_MODULE_TEXTURING_MODE_CREATE_INFO_NVX, VkCuModuleTexturingModeCreateInfoNVX>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_CUSTOM_RESOLVE_CREATE_INFO_EXT, VkCustomResolveCreateInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_BUILTIN_MODEL_CREATE_INFO_QCOM, VkDataGraphPipelineBuiltinModelCreateInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_COMPILER_CONTROL_CREATE_INFO_ARM, VkDataGraphPipelineCompilerControlCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_CONSTANT_TENSOR_SEMI_STRUCTURED_SPARSITY_INFO_ARM, VkDataGraphPipelineConstantTensorSemiStructuredSparsityInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_DISPATCH_INFO_ARM, VkDataGraphPipelineDispatchInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_IDENTIFIER_CREATE_INFO_ARM, VkDataGraphPipelineIdentifierCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_INFO_ARM, VkDataGraphPipelineInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_RESOURCE_INFO_ARM, VkDataGraphPipelineResourceInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_SESSION_BIND_POINT_REQUIREMENT_ARM, VkDataGraphPipelineSessionBindPointRequirementARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_SESSION_BIND_POINT_REQUIREMENTS_INFO_ARM, VkDataGraphPipelineSessionBindPointRequirementsInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_SESSION_CREATE_INFO_ARM, VkDataGraphPipelineSessionCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PIPELINE_SESSION_MEMORY_REQUIREMENTS_INFO_ARM, VkDataGraphPipelineSessionMemoryRequirementsInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DATA_GRAPH_PROCESSING_ENGINE_CREATE_INFO_ARM, VkDataGraphProcessingEngineCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEBUG_MARKER_MARKER_INFO_EXT, VkDebugMarkerMarkerInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT, VkDebugMarkerObjectNameInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, VkDebugUtilsLabelEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEPENDENCY_INFO, VkDependencyInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, VkDepthBiasInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT, VkDescriptorAddressInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, VkDescriptorBufferBindingInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT, VkDescriptorGetInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_GET_TENSOR_INFO_ARM, VkDescriptorGetTensorInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, VkDescriptorPoolCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, VkDescriptorSetAllocateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_BINDING_REFERENCE_VALVE, VkDescriptorSetBindingReferenceVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, VkDescriptorSetLayoutCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_HOST_MAPPING_INFO_VALVE, VkDescriptorSetLayoutHostMappingInfoVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT, VkDescriptorSetLayoutSupport>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, VkDescriptorUpdateTemplateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS, VkDeviceBufferMemoryRequirements>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, VkDeviceCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_EVENT_INFO_EXT, VkDeviceEventInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT, VkDeviceFaultCountsEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, VkDeviceImageMemoryRequirements>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO, VkDeviceMemoryOpaqueCaptureAddressInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_MEMORY_REPORT_CALLBACK_DATA_EXT, VkDeviceMemoryReportCallbackDataEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_PIPELINE_BINARY_INTERNAL_CACHE_CONTROL_KHR, VkDevicePipelineBinaryInternalCacheControlKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, VkDeviceQueueCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO, VkDeviceQueueGlobalPriorityCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2, VkDeviceQueueInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_SHADER_CORE_CONTROL_CREATE_INFO_ARM, VkDeviceQueueShaderCoreControlCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPATCH_TILE_INFO_QCOM, VkDispatchTileInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_EVENT_INFO_EXT, VkDisplayEventInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_MODE_CREATE_INFO_KHR, VkDisplayModeCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_PLANE_INFO_2_KHR, VkDisplayPlaneInfo2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_POWER_INFO_EXT, VkDisplayPowerInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR, VkDisplaySurfaceCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_DISPLAY_SURFACE_STEREO_CREATE_INFO_NV, VkDisplaySurfaceStereoCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EVENT_CREATE_INFO, VkEventCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_COMPUTE_QUEUE_CREATE_INFO_NV, VkExternalComputeQueueCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_COMPUTE_QUEUE_DATA_PARAMS_NV, VkExternalComputeQueueDataParamsNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_COMPUTE_QUEUE_DEVICE_CREATE_INFO_NV, VkExternalComputeQueueDeviceCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_TENSOR_CREATE_INFO_ARM, VkExternalMemoryTensorCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, VkFenceCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, VkFenceGetFdInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FRAME_BOUNDARY_TENSORS_ARM, VkFrameBoundaryTensorsARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO, VkFramebufferAttachmentImageInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, VkFramebufferCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_MIXED_SAMPLES_COMBINATION_NV, VkFramebufferMixedSamplesCombinationNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT, VkGeneratedCommandsInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT, VkGeneratedCommandsMemoryRequirementsInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_NV, VkGeneratedCommandsMemoryRequirementsInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT, VkGeneratedCommandsPipelineInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT, VkGeneratedCommandsShaderInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GEOMETRY_NV, VkGeometryNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GEOMETRY_TRIANGLES_NV, VkGeometryTrianglesNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, VkGraphicsPipelineCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT, VkHeadlessSurfaceCreateInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY, VkHostImageCopyDevicePerformanceQuery>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO, VkHostImageLayoutTransitionInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_ALIGNMENT_CONTROL_CREATE_INFO_MESA, VkImageAlignmentControlCreateInfoMESA>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_BLIT_2, VkImageBlit2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CAPTURE_DESCRIPTOR_DATA_INFO_EXT, VkImageCaptureDescriptorDataInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_COPY_2, VkImageCopy2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, VkImageCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, VkImageMemoryBarrier>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, VkImageMemoryBarrier2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, VkImageMemoryRequirementsInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2, VkImageResolve2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2, VkImageSparseMemoryRequirementsInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2, VkImageSubresource2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CAPTURE_DESCRIPTOR_DATA_INFO_EXT, VkImageViewCaptureDescriptorDataInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, VkImageViewCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX, VkImageViewHandleInfoNVX>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR, VkImportFenceFdInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, VkImportSemaphoreFdInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_NV, VkIndirectCommandsLayoutTokenNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT, VkIndirectExecutionSetPipelineInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_SHADER_LAYOUT_INFO_EXT, VkIndirectExecutionSetShaderLayoutInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, VkInstanceCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV, VkLatencySleepInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV, VkLatencySleepModeInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV, VkLatencySubmissionPresentIdNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV, VkLatencyTimingsFrameReportNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, VkMappedMemoryRange>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, VkMemoryAllocateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER, VkMemoryBarrier>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR, VkMemoryBarrierAccessFlags3KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_TENSOR_ARM, VkMemoryDedicatedAllocateInfoTensorARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, VkMemoryGetFdInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_GET_REMOTE_ADDRESS_INFO_NV, VkMemoryGetRemoteAddressInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_MAP_INFO, VkMemoryMapInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, VkMemoryRequirements2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY, VkMemoryToImageCopy>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO, VkMemoryUnmapInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT, VkMicromapBuildSizesInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MICROMAP_CREATE_INFO_EXT, VkMicromapCreateInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_MICROMAP_VERSION_INFO_EXT, VkMicromapVersionInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_OPTICAL_FLOW_EXECUTE_INFO_NV, VkOpticalFlowExecuteInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV, VkOpticalFlowSessionCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_OUT_OF_BAND_QUEUE_TYPE_INFO_NV, VkOutOfBandQueueTypeInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_FLAGS_NV, VkPartitionedAccelerationStructureFlagsNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCES_INPUT_NV, VkPartitionedAccelerationStructureInstancesInputNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT, VkPastPresentationTimingInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PER_TILE_BEGIN_INFO_QCOM, VkPerTileBeginInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PER_TILE_END_INFO_QCOM, VkPerTileEndInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_CONFIGURATION_ACQUIRE_INFO_INTEL, VkPerformanceConfigurationAcquireInfoINTEL>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_ARM, VkPerformanceCounterARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_ARM, VkPerformanceCounterDescriptionARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR, VkPerformanceCounterDescriptionKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR, VkPerformanceCounterKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_MARKER_INFO_INTEL, VkPerformanceMarkerInfoINTEL>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_OVERRIDE_INFO_INTEL, VkPerformanceOverrideInfoINTEL>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PERFORMANCE_STREAM_MARKER_INFO_INTEL, VkPerformanceStreamMarkerInfoINTEL>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO, VkPhysicalDeviceExternalBufferInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO, VkPhysicalDeviceExternalFenceInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO, VkPhysicalDeviceExternalSemaphoreInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR, VkPhysicalDeviceFragmentShadingRateKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, VkPhysicalDeviceImageFormatInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_QUEUE_FAMILY_DATA_GRAPH_PROCESSING_ENGINE_INFO_ARM, VkPhysicalDeviceQueueFamilyDataGraphProcessingEngineInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2, VkPhysicalDeviceSparseImageFormatInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, VkPhysicalDeviceSurfaceInfo2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_FORMAT_INFO_KHR, VkPhysicalDeviceVideoFormatInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR, VkPipelineBinaryDataInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR, VkPipelineBinaryInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR, VkPipelineBinaryKeyKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, VkPipelineCacheCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, VkPipelineColorBlendStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, VkPipelineCreateFlags2CreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, VkPipelineCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, VkPipelineDepthStencilStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, VkPipelineDynamicStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, VkPipelineExecutableInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR, VkPipelineExecutableStatisticKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_DENSITY_MAP_LAYERED_CREATE_INFO_VALVE, VkPipelineFragmentDensityMapLayeredCreateInfoVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_INDIRECT_DEVICE_ADDRESS_INFO_NV, VkPipelineIndirectDeviceAddressInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, VkPipelineInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, VkPipelineInputAssemblyStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, VkPipelineLayoutCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, VkPipelineMultisampleStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO, VkPipelineRasterizationLineStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, VkPipelineRasterizationStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO, VkPipelineRobustnessCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, VkPipelineShaderStageCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, VkPipelineTessellationStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, VkPipelineVertexInputStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLAMP_CONTROL_CREATE_INFO_EXT, VkPipelineViewportDepthClampControlCreateInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, VkPipelineViewportStateCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR, VkPresentId2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, VkPresentInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT, VkPresentTimingInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR, VkPresentWait2InfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO, VkPrivateDataSlotCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, VkQueryPoolCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_QUERY_POOL_VIDEO_ENCODE_FEEDBACK_CREATE_INFO_KHR, VkQueryPoolVideoEncodeFeedbackCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CLUSTER_ACCELERATION_STRUCTURE_CREATE_INFO_NV, VkRayTracingPipelineClusterAccelerationStructureCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR, VkRayTracingPipelineInterfaceCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_NV, VkRayTracingShaderGroupCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR, VkReleaseCapturedPipelineDataInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR, VkReleaseSwapchainImagesInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, VkRenderPassBeginInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, VkRenderPassCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2, VkRenderPassCreateInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT, VkRenderPassFragmentDensityMapOffsetEndInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_PERFORMANCE_COUNTERS_BY_REGION_BEGIN_INFO_ARM, VkRenderPassPerformanceCountersByRegionBeginInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_STRIPE_INFO_ARM, VkRenderPassStripeInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM, VkRenderPassTileShadingCreateInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_AREA_INFO, VkRenderingAreaInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR, VkRenderingAttachmentFlagsInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, VkRenderingAttachmentInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO, VkRenderingAttachmentLocationInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR, VkRenderingEndInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_INFO, VkRenderingInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO, VkRenderingInputAttachmentIndexInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2, VkResolveImageInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_RESOLVE_IMAGE_MODE_INFO_KHR, VkResolveImageModeInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_BLOCK_MATCH_WINDOW_CREATE_INFO_QCOM, VkSamplerBlockMatchWindowCreateInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CAPTURE_DESCRIPTOR_DATA_INFO_EXT, VkSamplerCaptureDescriptorDataInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, VkSamplerCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM, VkSamplerCubicWeightsCreateInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO, VkSamplerYcbcrConversionCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_YCBCR_DEGAMMA_CREATE_INFO_QCOM, VkSamplerYcbcrConversionYcbcrDegammaCreateInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, VkSemaphoreCreateInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, VkSemaphoreGetFdInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, VkSemaphoreSignalInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, VkSemaphoreSubmitInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, VkSemaphoreWaitInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SET_DESCRIPTOR_BUFFER_OFFSETS_INFO_EXT, VkSetDescriptorBufferOffsetsInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV, VkSetLatencyMarkerInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT, VkShaderModuleIdentifierEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2, VkSparseImageMemoryRequirements2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO, VkSubmitInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO_2, VkSubmitInfo2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO, VkSubpassBeginInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, VkSubpassDependency2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, VkSubpassDescription2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_END_INFO, VkSubpassEndInfo>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE, VkSubresourceHostMemcpySize>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2, VkSubresourceLayout2>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR, VkSurfaceFormat2KHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR, VkSurfacePresentModeCompatibilityKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR, VkSurfacePresentModeKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT, VkSwapchainCalibratedTimestampInfoEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, VkSwapchainCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV, VkSwapchainLatencyCreateInfoNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR, VkSwapchainPresentFenceInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR, VkSwapchainPresentModeInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR, VkSwapchainPresentModesCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_KHR, VkSwapchainPresentScalingCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_CAPTURE_DESCRIPTOR_DATA_INFO_ARM, VkTensorCaptureDescriptorDataInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_MEMORY_BARRIER_ARM, VkTensorMemoryBarrierARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_MEMORY_REQUIREMENTS_INFO_ARM, VkTensorMemoryRequirementsInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_VIEW_CAPTURE_DESCRIPTOR_DATA_INFO_ARM, VkTensorViewCaptureDescriptorDataInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TENSOR_VIEW_CREATE_INFO_ARM, VkTensorViewCreateInfoARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TILE_MEMORY_BIND_INFO_QCOM, VkTileMemoryBindInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TILE_MEMORY_REQUIREMENTS_QCOM, VkTileMemoryRequirementsQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_TILE_MEMORY_SIZE_INFO_QCOM, VkTileMemorySizeInfoQCOM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, VkVertexInputAttributeDescription2EXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, VkVertexInputBindingDescription2EXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR, VkVideoCodingControlInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_INTRA_REFRESH_INFO_KHR, VkVideoEncodeIntraRefreshInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_PROFILE_RGB_CONVERSION_INFO_VALVE, VkVideoEncodeProfileRgbConversionInfoVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUALITY_LEVEL_INFO_KHR, VkVideoEncodeQualityLevelInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUANTIZATION_MAP_INFO_KHR, VkVideoEncodeQuantizationMapInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUANTIZATION_MAP_SESSION_PARAMETERS_CREATE_INFO_KHR, VkVideoEncodeQuantizationMapSessionParametersCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_RATE_CONTROL_LAYER_INFO_KHR, VkVideoEncodeRateControlLayerInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_INTRA_REFRESH_CREATE_INFO_KHR, VkVideoEncodeSessionIntraRefreshCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_FEEDBACK_INFO_KHR, VkVideoEncodeSessionParametersFeedbackInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_GET_INFO_KHR, VkVideoEncodeSessionParametersGetInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_RGB_CONVERSION_CREATE_INFO_VALVE, VkVideoEncodeSessionRgbConversionCreateInfoVALVE>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_ENCODE_USAGE_INFO_KHR, VkVideoEncodeUsageInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR, VkVideoEndCodingInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_INLINE_QUERY_INFO_KHR, VkVideoInlineQueryInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR, VkVideoPictureResourceInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_REFERENCE_INTRA_REFRESH_INFO_KHR, VkVideoReferenceIntraRefreshInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_SESSION_MEMORY_REQUIREMENTS_KHR, VkVideoSessionMemoryRequirementsKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR, VkVideoSessionParametersCreateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_UPDATE_INFO_KHR, VkVideoSessionParametersUpdateInfoKHR>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, VkWriteDescriptorSet>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_PARTITIONED_ACCELERATION_STRUCTURE_NV, VkWriteDescriptorSetPartitionedAccelerationStructureNV>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_TENSOR_ARM, VkWriteDescriptorSetTensorARM>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT, VkWriteIndirectExecutionSetPipelineEXT>,
+  converters<VkStructureType::VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_SHADER_EXT, VkWriteIndirectExecutionSetShaderEXT>,
 };
 
 // Walks a guest pNext chain to the first link next_handlers knows how to
@@ -3163,15 +3847,40 @@ bool fex_custom_repack_exit(guest_layout<VkDescriptorUpdateTemplateCreateInfo>& 
   return true;
 }
 
+// VkSpecializationInfo and VkSpecializationMapEntry both carry a size_t, so
+// neither survives a straight copy from a 32-bit guest. This used to abort --
+// with an fprintf that had no newline and no flush, so the message never even
+// reached the log. DXVK attaches specialization constants to nearly every
+// pipeline stage, so that abort was a wall.
+void fex_custom_repack_entry(host_layout<VkSpecializationInfo>& into, const guest_layout<VkSpecializationInfo>& from) {
+  into.data.pMapEntries = RepackStructArray(from.data.mapEntryCount.data, from.data.pMapEntries).data();
+  // pData is an opaque blob of constant values; same bytes either side.
+  into.data.pData = from.data.pData.get_pointer();
+}
+
+bool fex_custom_repack_exit(guest_layout<VkSpecializationInfo>& into, const host_layout<VkSpecializationInfo>& from) {
+  delete[] from.data.pMapEntries;
+  return true;
+}
+
 void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into, const guest_layout<VkPipelineShaderStageCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
-  if (from.data.pSpecializationInfo.get_pointer()) {
-    fprintf(stderr, "ERROR: Cannot repack non-null VkPipelineShaderStageCreateInfo::pSpecializationInfo yet");
-    std::abort();
+
+  auto GuestSpec = from.data.pSpecializationInfo.get_pointer();
+  if (!GuestSpec) {
+    into.data.pSpecializationInfo = nullptr;
+    return;
   }
+  auto HostSpec = new host_layout<VkSpecializationInfo> {*GuestSpec};
+  fex_custom_repack_entry(*HostSpec, *GuestSpec);
+  into.data.pSpecializationInfo = &HostSpec->data;
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into, const host_layout<VkPipelineShaderStageCreateInfo>& from) {
+  if (from.data.pSpecializationInfo) {
+    delete[] from.data.pSpecializationInfo->pMapEntries;
+    delete reinterpret_cast<const host_layout<VkSpecializationInfo>*>(from.data.pSpecializationInfo);
+  }
   // TODO
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;

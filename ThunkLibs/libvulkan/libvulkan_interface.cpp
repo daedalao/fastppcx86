@@ -100,6 +100,14 @@ struct fex_gen_type<VkSubpassDescription> {};
 // TODO: Use custom repacking for these instead
 template<>
 struct fex_gen_type<VkDebugReportCallbackCreateInfoEXT> : fexgen::emit_layout_wrappers {};
+
+// Nothing else references these by value, so the generator does not emit
+// layouts for them unless asked.
+template<>
+struct fex_gen_type<VkSpecializationMapEntry> : fexgen::emit_layout_wrappers {};
+template<>
+struct fex_gen_type<VkSpecializationInfo> : fexgen::emit_layout_wrappers {};
+
 template<>
 struct fex_gen_type<VkDebugUtilsMessengerCreateInfoEXT> : fexgen::emit_layout_wrappers {};
 
@@ -2266,8 +2274,6 @@ struct fex_gen_config<&VkRenderPassCreateInfo2::pDependencies> : fexgen::custom_
 
 template<>
 struct fex_gen_config<&VkPipelineShaderStageCreateInfo::pSpecializationInfo> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkSpecializationInfo::pMapEntries> : fexgen::custom_repack {};
 
 // TODO: Support annotating as assume_compatible_data_layout instead
 template<>
@@ -2412,8 +2418,15 @@ struct fex_gen_config<vkMapMemory> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkMapMemory, 5, void**> : fexgen::ptr_passthrough {};
 #endif
+#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkUnmapMemory> {};
+#else
+// Paired with the placed-map implementation of vkMapMemory: unmapping has to
+// hand the guest-visible reservation back to the pool.
+template<>
+struct fex_gen_config<vkUnmapMemory> : fexgen::custom_host_impl {};
+#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkFlushMappedMemoryRanges> {};
@@ -4353,6 +4366,14 @@ template<>
 struct fex_gen_config<vkGetDeviceBufferMemoryRequirements> {};
 template<>
 struct fex_gen_config<vkGetDeviceImageMemoryRequirements> {};
+
+// VkSpecializationInfo needs real repacking on 32-bit: both it and
+// VkSpecializationMapEntry carry a size_t, and DXVK puts specialization
+// constants on nearly every pipeline stage.
+template<>
+struct fex_gen_config<&VkSpecializationInfo::pMapEntries> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSpecializationInfo::pData> : fexgen::custom_repack {};
 
 // Not restored, and why:
 //   vkGetDeviceImageSubresourceLayoutKHR: VkDeviceImageSubresourceInfo has no
