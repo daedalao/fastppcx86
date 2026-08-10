@@ -15,8 +15,11 @@ $end_info$
 #include "common/Guest.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 
@@ -37,21 +40,88 @@ const std::unordered_map<std::string_view, uintptr_t /* guest function address *
 // This variable controls the behavior of vkGetDevice/InstanceProcAddr for functions we don't know the signature of:
 // - if false (default), we return a nullptr (since the application might have a fallback code path)
 // - if true, we return a stub function that fatally errors upon being called
-constexpr bool stub_unknown_functions = false;
+//
+// FEX_VK_TRAP_UNKNOWN=1 turns this on as a DIAGNOSTIC. The thunk covers only
+// part of the API on 32-bit, so a client like DXVK gets null for hundreds of
+// entry points. Most of those it merely probes and never calls - it has
+// fallbacks - but the few it genuinely requires turn into a silent hang far
+// from the cause (observed with Portal 2: every thread parked in futex_wait,
+// no window, no further output).
+//
+// With this set, the first such call traps and names the function, which is
+// what tells you which entry points actually need implementing rather than
+// guessing among everything that came back null.
+static const bool stub_unknown_functions = getenv("FEX_VK_TRAP_UNKNOWN") != nullptr;
+
+// Names of the functions we handed back a trapping stub for, so the trap can
+// report which one was called rather than a bare address.
+static std::unordered_map<uintptr_t, std::string>& StubbedFunctionNames() {
+  static std::unordered_map<uintptr_t, std::string> Map;
+  return Map;
+}
+static std::mutex StubbedFunctionNamesMutex;
 
 // Fatally erroring function with a thunk-like interface. This is used as a placeholder for unknown Vulkan functions
 [[noreturn]]
 static void FatalError(void* raw_args) {
   auto called_function = reinterpret_cast<PackedArguments<void, uintptr_t>*>(raw_args)->a0;
-  fprintf(stderr, "FATAL: Called unknown Vulkan function at address %p\n", reinterpret_cast<void*>(called_function));
+  const char* Name = "<unknown>";
+  {
+    std::lock_guard lk {StubbedFunctionNamesMutex};
+    auto& Map = StubbedFunctionNames();
+    if (auto It = Map.find(called_function); It != Map.end()) {
+      Name = It->second.c_str();
+    }
+  }
+  fprintf(stderr, "FATAL: Called unimplemented Vulkan function %s (address %p)\n", Name, reinterpret_cast<void*>(called_function));
   __builtin_trap();
 }
+
+#ifdef IS_32BIT_THUNK
+// Entry points that must dispatch through our own packed thunk rather than the
+// generic host-function-pointer path.
+//
+// MakeGuestCallable normally links the pointer the loader handed back to
+// GetCallerForHostFunction(name), so the call lands in
+// GuestWrapperForHostFunction::Call on the host side. That wrapper marshals
+// each parameter in isolation and never reaches fexfn_impl_*, so every
+// hand-written host implementation is silently bypassed for any function DXVK
+// obtained through vkGetInstanceProcAddr -- which is how DXVK obtains all of
+// them.
+//
+// Two ways that showed up here (2026-08-08):
+//   - vkGetPhysicalDeviceQueueFamilyProperties2: a count/array pair, whose
+//     length lives in a parameter the wrapper never looks at. It repacked
+//     element 0 and, on the count probe, walked a struct that was not there,
+//     faulting on a read of 0xFFFFFFFF.
+//   - vkCreateInstance: faulted on a null read at the same kind of edge.
+// Both were reported by wine at the thunk's 0F 3F marker, because the guest PC
+// parks there for the whole host call. That reads exactly like a failed thunk
+// dispatch and is not one.
+//
+// The list comes from the generator (custom_host_impl functions), so adding a
+// custom impl later does not silently reintroduce this.
+static PFN_vkVoidFunction GuestThunkForCustomHostImpl(std::string_view name) {
+#define CUSTOM_HOST_IMPL(fn)              \
+  if (name == std::string_view {#fn}) {   \
+    return (PFN_vkVoidFunction)fn;        \
+  }
+  FOREACH_custom_host_impl_SYMBOL(CUSTOM_HOST_IMPL)
+#undef CUSTOM_HOST_IMPL
+  return nullptr;
+}
+#endif
 
 static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {
   auto It = HostPtrInvokers.find(name);
   if (It == HostPtrInvokers.end()) {
     fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\n", origin, func, name);
     if (stub_unknown_functions) {
+      {
+        // Remember the name so the trap can report which function was called.
+        std::lock_guard lk {StubbedFunctionNamesMutex};
+        StubbedFunctionNames().emplace(reinterpret_cast<uintptr_t>(func), name);
+      }
       const auto StubHostPtrInvoker = CallHostFunction<FatalError, void>;
       LinkAddressToFunction((uintptr_t)func, reinterpret_cast<uintptr_t>(StubHostPtrInvoker));
       return func;
@@ -78,6 +148,14 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
   if (!Ret) {
     return nullptr;
   }
+#ifdef IS_32BIT_THUNK
+  // Ask the host first: a nullptr here still means "driver does not have it",
+  // and only then do we substitute our own thunk for the ones the generic
+  // path cannot marshal.
+  if (auto Direct = GuestThunkForCustomHostImpl(a_1)) {
+    return Direct;
+  }
+#endif
   return MakeGuestCallable(__FUNCTION__, Ret, a_1);
 }
 
@@ -103,6 +181,14 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
   if (!Ret) {
     return nullptr;
   }
+#ifdef IS_32BIT_THUNK
+  // Ask the host first: a nullptr here still means "driver does not have it",
+  // and only then do we substitute our own thunk for the ones the generic
+  // path cannot marshal.
+  if (auto Direct = GuestThunkForCustomHostImpl(a_1)) {
+    return Direct;
+  }
+#endif
   return MakeGuestCallable(__FUNCTION__, Ret, a_1);
 }
 }

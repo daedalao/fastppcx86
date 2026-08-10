@@ -11,8 +11,12 @@ $end_info$
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <limits>
+#include <new>
 #include <optional>
 #include <typeinfo>
+#include <utility>
 
 #include "PackedArguments.h"
 
@@ -34,6 +38,15 @@ __attribute__((weak)) HostToGuestTrampolinePtr* FinalizeHostTrampolineForGuestFu
 // on cross-arch builds to bridge a guest VA into a host trampoline.
 __attribute__((weak)) uintptr_t LookupGuestCallbackUnpacker(const char* signature_name);
 
+// Registers a low-4GB range minted inside a host thunk library as host-owned,
+// so the guest's 32-bit allocator refuses to service a MAP_FIXED / munmap /
+// MREMAP_FIXED that would replace it (see Thunks.cpp). Weak: a host lib
+// dlopened outside FEX simply skips the registration.
+__attribute__((weak)) void ReserveLow32HostRange(uintptr_t Base, size_t Length);
+// Allocate from the guest's 32-bit allocator rather than taking pages behind
+// its back; the only way to get a large low-4GB range reliably.
+__attribute__((weak)) void* AllocateLow32HostRange(size_t Length);
+
 __attribute__((weak)) void* GetGuestStack();
 
 __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
@@ -43,6 +56,44 @@ __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
 #include <mutex>
 #include <sys/mman.h>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+// Address ranges of the low-4GB trampoline pools allocated by
+// MakeLow32HostTrampoline below. Kept separately from that function's own
+// cache because the interesting query at the call site is the reverse one:
+// "is this 32-bit value one of ours?" See IsLow32HostTrampoline.
+struct Low32TrampolinePools {
+  std::mutex Mutex;
+  std::vector<std::pair<uintptr_t, uintptr_t>> Ranges; // [base, end)
+};
+
+inline Low32TrampolinePools& GetLow32TrampolinePools() {
+  static Low32TrampolinePools Pools;
+  return Pools;
+}
+
+/**
+ * True if Addr points into a low-4GB host trampoline minted by
+ * MakeLow32HostTrampoline - i.e. it is a *host*-executable stub that
+ * tail-calls a real host function, not a guest function pointer.
+ *
+ * Both kinds of value are 32 bits wide and both arrive at the host wrapper
+ * edge, so width alone cannot tell them apart. Getting this wrong is not
+ * subtle: treating one of our own trampolines as a guest callback replaces a
+ * working host call with a bounce into CallbackUnpack<Sig>::CallGuestPtr,
+ * whose body the compiler emits as a trap for most signatures.
+ */
+inline bool IsLow32HostTrampoline(uintptr_t Addr) {
+  auto& Pools = GetLow32TrampolinePools();
+  std::lock_guard lk {Pools.Mutex};
+  for (const auto& [Base, End] : Pools.Ranges) {
+    if (Addr >= Base && Addr < End) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Host function pointers handed to a 32-bit guest must fit in 32 bits: the
 // value doubles as the fake guest address the thunk machinery links
@@ -70,12 +121,32 @@ inline void* MakeLow32HostTrampoline(void* Target) {
     return It->second;
   }
   if (!Pool || PoolOff + TrampSize > PoolSize) {
+    // Drop the exhausted pool before scanning. Without this, an exhausted pool
+    // whose replacement mmap fails leaves Pool non-null, the `if (!Pool)` below
+    // does not fire, and we carve trampolines past the end of the mapping into
+    // whatever follows it - forever, with PoolOff growing unbounded.
+    Pool = nullptr;
+    PoolOff = 0;
     for (uintptr_t Addr = 0x7000'0000; Addr >= 0x1000'0000; Addr -= 0x100'0000) {
       void* P = ::mmap(reinterpret_cast<void*>(Addr), PoolSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
       if (P != MAP_FAILED) {
         Pool = static_cast<uint8_t*>(P);
         PoolOff = 0;
+        {
+          // Record the range so IsLow32HostTrampoline can recognise these
+          // addresses when they come back through a host wrapper.
+          auto& Pools = GetLow32TrampolinePools();
+          std::lock_guard pool_lk {Pools.Mutex};
+          Pools.Ranges.emplace_back(reinterpret_cast<uintptr_t>(P), reinterpret_cast<uintptr_t>(P) + PoolSize);
+        }
+        // Claim the pages in the guest's 32-bit allocator as well. MAP_FIXED_
+        // NOREPLACE above only loses races against mappings that already
+        // exist; it does nothing about a guest MAP_FIXED or munmap arriving
+        // later, which would replace host instructions we still branch to.
+        if (FEX::HLE::ReserveLow32HostRange) {
+          FEX::HLE::ReserveLow32HostRange(reinterpret_cast<uintptr_t>(P), PoolSize);
+        }
         break;
       }
     }
@@ -480,7 +551,15 @@ inline guest_layout<T*> to_guest(const host_layout<T*>& from) {
 // needed for repacked data itself.
 // This also implicitly converts to a pointer of the wrapped host type, since
 // this conversion is required at all call sites anyway
-template<typename T, typename GuestT>
+// IsConstPointee records whether the *API* declared the pointee const. It has to
+// be carried separately because T cannot: host_layout is only specialised for
+// non-const types, so the generator instantiates this with the const stripped
+// (Generator/gen.cpp, get_type_name_with_nonconst_pointee). Without the flag the
+// std::is_const_v test below is dead, and the exit write-back silently copies
+// the host struct back over an input the guest still owns and reads -- which is
+// exactly what zeroed DXVK's VkDeviceCreateInfo::pQueueCreateInfos and left wine
+// dereferencing null inside init_device_queues.
+template<typename T, typename GuestT, bool IsConstPointee = false>
 struct repack_wrapper {
   static_assert(std::is_pointer_v<T>);
 
@@ -518,7 +597,7 @@ struct repack_wrapper {
         //       might have unrelated side effects (such as deallocation of
         //       memory reserved on entry)
         if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {
-          if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
+          if constexpr (!IsConstPointee && !std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
             if constexpr (!(has_compatible_data_layout<T> && std::is_same_v<T, GuestT>)) {
               *orig_arg.get_pointer() = to_guest(*data); // TODO: Only if annotated as out-parameter
             }
@@ -535,8 +614,64 @@ struct repack_wrapper {
   }
 };
 
-template<typename T, typename GuestT>
-static repack_wrapper<T, GuestT> make_repack_wrapper(guest_layout<GuestT>& orig_arg) {
+template<typename T, bool IsConstPointee = false, typename GuestT>
+static repack_wrapper<T, GuestT, IsConstPointee> make_repack_wrapper(guest_layout<GuestT>& orig_arg) {
+  return {orig_arg};
+}
+
+// Repacking for a pointer to a builtin integer whose width differs between
+// guest and host. `size_t*` is the case that matters: 4 bytes in a 32-bit
+// guest, 8 here.
+//
+// The generator used to route every pointer-to-builtin through the
+// "fully compatible" path, which reinterprets the pointer and leaves the
+// pointee alone. That is wrong whenever the pointee has a different size, and
+// it did not even compile once the affected entry points were enabled -- it
+// tried to build a host_layout<unsigned long*> out of a guest_layout<uint32_t*>
+// (vkGetEncodedVideoSessionParametersKHR, vkGetPipelineBinaryDataKHR and
+// friends, all of which take a size_t* in/out length).
+//
+// So the value is widened into host-side storage on entry and narrowed back on
+// exit, the same entry/exit shape repack_wrapper uses for structs.
+template<typename HostT, typename GuestT, bool IsConstPointee = false>
+struct int_repack_wrapper {
+  static_assert(std::is_pointer_v<HostT>);
+  using HostPointee = std::remove_cv_t<std::remove_pointer_t<HostT>>;
+  using GuestPointee = std::remove_cv_t<std::remove_pointer_t<GuestT>>;
+  static_assert(std::is_integral_v<HostPointee> && std::is_integral_v<GuestPointee>);
+
+  std::optional<HostPointee> storage;
+  guest_layout<GuestT>& orig_arg;
+
+  int_repack_wrapper(guest_layout<GuestT>& orig_arg_)
+    : orig_arg(orig_arg_) {
+    if (orig_arg_.get_pointer()) {
+      storage = static_cast<HostPointee>(orig_arg_.get_pointer()->data);
+    }
+  }
+
+  ~int_repack_wrapper() {
+    // Skip write-back for const pointees, matching repack_wrapper.
+    if constexpr (!IsConstPointee && !std::is_const_v<std::remove_pointer_t<HostT>>) {
+      if (storage) {
+        // A host value too large for the guest type cannot be represented at
+        // all. Saturating is still a lie, but a silent wrap would hand the
+        // guest a small length for a large buffer and turn an unsupported case
+        // into a heap overflow in guest code.
+        constexpr auto GuestMax = std::numeric_limits<GuestPointee>::max();
+        orig_arg.get_pointer()->data =
+          std::cmp_greater(*storage, GuestMax) ? GuestMax : static_cast<GuestPointee>(*storage);
+      }
+    }
+  }
+
+  operator HostT() {
+    return storage ? &*storage : nullptr;
+  }
+};
+
+template<typename HostT, bool IsConstPointee = false, typename GuestT>
+static int_repack_wrapper<HostT, GuestT, IsConstPointee> make_int_repack_wrapper(guest_layout<GuestT>& orig_arg) {
   return {orig_arg};
 }
 
@@ -545,8 +680,13 @@ T& unwrap_host(host_layout<T>& val) {
   return val.data;
 }
 
-template<typename T, typename T2>
-T* unwrap_host(repack_wrapper<T*, T2>& val) {
+template<typename T, typename T2, bool IsConstPointee>
+T* unwrap_host(repack_wrapper<T*, T2, IsConstPointee>& val) {
+  return val;
+}
+
+template<typename T, typename T2, bool IsConstPointee>
+T* unwrap_host(int_repack_wrapper<T*, T2, IsConstPointee>& val) {
   return val;
 }
 
@@ -568,8 +708,37 @@ struct host_to_guest_convertible {
 
   operator guest_layout<T>() const requires (std::is_pointer_v<T>)
   {
-    // TODO: Assert upper 32 bits are zero
     guest_layout<T> ret;
+#ifdef IS_32BIT_THUNK
+    // guest_layout<T*>::data is uint32_t here, so a host pointer above 4 GiB
+    // narrows silently. On ppc64le host VAs live at 0x3fff'xxxx'xxxx, so the
+    // guest would receive the low half of a real host mapping and dereference
+    // an unrelated low address — corruption with no fault at the point of
+    // failure, which is undebuggable downstream.
+    //
+    // The function-pointer path (guest_layout<T*>::operator= above) already
+    // dies here rather than truncate; do the same for data pointers. Values
+    // that legitimately reach this path are guest-side already (guest heap or
+    // stack, or a token from an opaque-handle registry) and fit in 32 bits.
+    //
+    // If this fires, the fix is a custom host impl for the offending function
+    // that returns guest-visible storage — see RelocateStringToGuestHeap in
+    // libGL_Host.cpp for the established pattern.
+    if ((reinterpret_cast<uintptr_t>(from.data) >> 32) != 0) {
+      // Plain fprintf+abort because LOGMAN_THROW headers aren't in this TU.
+      fprintf(stderr, "FEX FATAL: 32-bit truncation of host pointer %p returned to guest\n", (void*)from.data);
+      // Name the offending thunk. This conversion is a template instantiated
+      // from every generated unpacker, so the pointer value alone does not say
+      // which API returned it; the backtrace frame will be
+      // fexfn_unpack_<lib>_<function>.
+      void* Frames[16];
+      int Count = backtrace(Frames, 16);
+      fprintf(stderr, "FEX FATAL: offending thunk backtrace:\n");
+      fflush(stderr);
+      backtrace_symbols_fd(Frames, Count, 2);
+      std::abort();
+    }
+#endif
     ret.data = reinterpret_cast<uintptr_t>(from.data);
     return ret;
   }
@@ -682,6 +851,21 @@ auto Projection(guest_layout<T>& data) {
     // Instead of using host_layout<HostT> { data }.data, return a wrapper object.
     // This ensures that temporary lifetime extension can kick in at call-site.
     return decaying_host_layout<HostT> {.data {data}};
+  } else if constexpr (std::is_void_v<std::remove_cv_t<std::remove_pointer_t<T>>>) {
+    // void* has no pointee to repack, so widening the pointer is all there is
+    // to do -- exactly what the fexfn_unpack_* path does with
+    // host_layout<void*>. Falling through to repack_wrapper instead tried to
+    // instantiate host_layout<void> and tripped its "Missing annotation for
+    // void pointer?" static_assert, which is what stopped this dispatch path
+    // compiling once entry points taking a void* payload were enabled.
+    return decaying_host_layout<HostT> {.data {data}};
+  } else if constexpr (std::is_pointer_v<HostT> && std::is_integral_v<std::remove_cv_t<std::remove_pointer_t<T>>> &&
+                       std::is_integral_v<std::remove_cv_t<std::remove_pointer_t<HostT>>> &&
+                       sizeof(std::remove_pointer_t<T>) != sizeof(std::remove_pointer_t<HostT>)) {
+    // Pointer to an integer that is a different width on each side (size_t).
+    // See int_repack_wrapper: the pointer cannot simply be widened, the pointee
+    // has to be converted in both directions.
+    return make_int_repack_wrapper<HostT>(data);
   } else {
     // This argument requires temporary storage for repacked data
     // *and* it needs to call custom repack functions (if any)
@@ -706,6 +890,13 @@ auto Projection(guest_layout<T>& data) {
  *    VA and either fault or read garbage. Allocate on the guest stack instead.
  */
 class GuestStackBumpAllocator final {
+  // Cap on how far below the entry stack pointer New() will bump. Packed
+  // argument frames are tens of bytes, so anything approaching this is a
+  // runaway. Without a bound New() walks off the bottom of the guest stack
+  // mapping and the placement-new below writes into whatever follows it,
+  // which on a guest thread stack is another thread's guard page or heap.
+  static constexpr uintptr_t MaxBytes = 64 * 1024;
+
   uintptr_t Top = reinterpret_cast<uintptr_t>(FEX::HLE::GetGuestStack());
   uintptr_t Next = Top;
 
@@ -718,6 +909,13 @@ public:
   T* New(Args&&... args) {
     Next -= sizeof(T);
     Next &= ~uintptr_t {alignof(T) - 1};
+    // Next > Top catches the wrap when Top is small; the second test catches
+    // the runaway. Plain fprintf+abort because LOGMAN_THROW headers aren't in
+    // this TU.
+    if (Next > Top || Top - Next > MaxBytes) {
+      fprintf(stderr, "FEX FATAL: guest stack bump allocator overran %zu bytes below guest SP %#zx\n", size_t(Top - Next), size_t(Top));
+      std::abort();
+    }
     FEX::HLE::MoveGuestStack(Next);
     return new (reinterpret_cast<void*>(Next)) T {std::forward<Args>(args)...};
   }
@@ -843,18 +1041,48 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
     //   1. catch the SIGSEGV class while custom impls are being written, and
     //   2. surface "no unpacker registered for signature X" to identify which
     //      APIs still need custom impls.
+    // Opt-in on every configuration, including 32-bit.
+    //
+    // This block cannot be correct at this call site: CBIndex is
+    // sizeof...(GuestArgs), which indexes the TRAILING uintptr_t of
+    // PackedArguments - the dispatch target - and never a callback parameter.
+    // GuestWrapperForHostFunction::Call is only ever emitted into the
+    // host-funcptr invoker table (Generator/gen.cpp), i.e. the
+    // glXGetProcAddress -> LinkAddressToFunction path, so that trailing value
+    // is a host function pointer by construction. On a 32-bit guest it is a
+    // low-4GB trampoline from MakeLow32HostTrampoline, which is already
+    // directly callable.
+    //
+    // It used to be unconditionally on for IS_32BIT_THUNK, which meant every
+    // condition ahead of the range check passed on every call - (cb >> 32) == 0
+    // is always true precisely because we make these targets low - so a
+    // process-global lock and a linear scan ran on every procaddr-dispatched
+    // guest->host call on every thread. A thread preempted inside that critical
+    // section stalls the rest; Unity's GC/job handshake then times out and
+    // aborts. It reproduced under a 10-CPU taskset cage and not at 80.
+    //
+    // Keep it reachable for triage only: it is still the quickest way to
+    // surface "no unpacker registered for signature X" while writing a
+    // custom_host_impl.
     auto fallback_wrap_enabled = []() -> bool {
-#ifdef IS_32BIT_THUNK
-      return true;
-#else
       static const bool enabled = (getenv("FEX_THUNK_FALLBACK_LOG_ONLY") != nullptr);
       return enabled;
-#endif
     };
 
+    // CBIndex is sizeof...(GuestArgs), which indexes the *trailing* uintptr_t
+    // of PackedArguments - the dispatch target, not a callback parameter. For a
+    // name resolved through glXGetProcAddress that target is the value the host
+    // handed back, and on a 32-bit guest that is a low-4GB host trampoline
+    // (MakeLow32HostTrampoline) which is already directly host-callable. Only
+    // genuine guest function pointers need bridging; wrapping our own
+    // trampoline swaps a working host call for a jump into a trap body, which
+    // is a SIGILL at the first procaddr-dispatched GL call.
+    //
+    // 64-bit guests never hit this because fallback_wrap_enabled() is opt-in
+    // there; for 32-bit it is always on, so the check has to be explicit.
     if (fallback_wrap_enabled() && cb && FEX::HLE::LookupGuestCallbackUnpacker
 #ifdef IS_32BIT_THUNK
-        && (cb >> 32) == 0
+        && (cb >> 32) == 0 && !IsLow32HostTrampoline(cb)
 #endif
     ) {
       using Sig = Result(Args...);

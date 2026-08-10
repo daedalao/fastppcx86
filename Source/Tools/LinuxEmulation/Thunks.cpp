@@ -446,17 +446,29 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
       auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
       auto* Result = Alloc->Mmap(nullptr, ThunkHandler->HostTrampolineInstanceDataAvailable,
                                  PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      LOGMAN_THROW_A_FMT(!FEX::HLE::HasSyscallError(reinterpret_cast<uint64_t>(Result)),
-                         "Failed to allocate 32-bit host trampoline page (errno {})",
-                         -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
-      LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(Result) >> 32) == 0,
-                         "32-bit trampoline allocator returned a >4 GiB address {:#x}",
-                         reinterpret_cast<uintptr_t>(Result));
+      // ERROR_AND_DIE_FMT, not LOGMAN_THROW_A_FMT: the latter compiles to
+      // nothing unless ASSERTIONS_ENABLED is set, which CMake only does for
+      // DEBUG builds. On failure Alloc->Mmap returns -errno, which would sail
+      // through an inert guard and be memcpy'd into below as a pointer.
+      //
+      // The allocator cannot return an address above 4 GiB (it rejects
+      // Addr+length > UINT32_MAX and its page scan is bounded), so that case
+      // needs no runtime check beyond this one.
+      if (FEX::HLE::HasSyscallError(reinterpret_cast<uint64_t>(Result))) {
+        ERROR_AND_DIE_FMT("Failed to allocate 32-bit host trampoline page (errno {})",
+                          -static_cast<int64_t>(reinterpret_cast<intptr_t>(Result)));
+      }
+      // Tell the allocator these pages are host-owned so a guest MAP_FIXED,
+      // munmap or MREMAP_FIXED cannot replace the trampolines we are about to
+      // write here and have the host branch into guest bytes.
+      Alloc->ReserveHostRange(reinterpret_cast<uintptr_t>(Result), ThunkHandler->HostTrampolineInstanceDataAvailable);
       ThunkHandler->HostTrampolineInstanceDataPtr = static_cast<uint8_t*>(Result);
     } else {
       ThunkHandler->HostTrampolineInstanceDataPtr = (uint8_t*)mmap(0, ThunkHandler->HostTrampolineInstanceDataAvailable,
                                                                    PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      LOGMAN_THROW_A_FMT(ThunkHandler->HostTrampolineInstanceDataPtr != MAP_FAILED, "Failed to mmap HostTrampolineInstanceDataPtr");
+      if (ThunkHandler->HostTrampolineInstanceDataPtr == MAP_FAILED) {
+        ERROR_AND_DIE_FMT("Failed to mmap HostTrampolineInstanceDataPtr");
+      }
     }
   }
 
@@ -618,6 +630,54 @@ FEX_DEFAULT_VISIBILITY uintptr_t LookupGuestCallbackUnpacker(const char* signatu
   std::shared_lock lk(handler->CallbackUnpackerByNameMutex);
   auto it = handler->CallbackUnpackerByName.find(fextl::string {signature_name});
   return (it == handler->CallbackUnpackerByName.end()) ? 0 : it->second;
+}
+
+/**
+ * Register a low-4GB page range minted by a host thunk library (the
+ * MakeLow32HostTrampoline pool in ThunkLibs/include/common/Host.h) as
+ * host-owned, so the guest's 32-bit allocator refuses to replace it.
+ *
+ * That pool is raw-mmap'd from inside the host .so, which has no access to the
+ * allocator; this weak-symbol entry is how it reaches us. Without it the pages
+ * are invisible to every explicit-address guest request.
+ */
+FEX_DEFAULT_VISIBILITY void ReserveLow32HostRange(uintptr_t Base, size_t Length) {
+  if (!FEX::HLE::_SyscallHandler || FEX::HLE::_SyscallHandler->Is64BitMode()) {
+    return;
+  }
+  auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
+  if (Alloc) {
+    Alloc->ReserveHostRange(Base, Length);
+  }
+}
+
+/**
+ * Allocate a low-4GB range through the guest's own 32-bit allocator.
+ *
+ * ReserveLow32HostRange above exists to tell the allocator about pages a thunk
+ * already took by raw mmap. That works for the trampoline pool, which is 64 KiB
+ * and can be squeezed in anywhere, and fails badly for anything large: the
+ * allocator has already reserved the free parts of the guest address space, so
+ * from outside there are no gaps left to take, and MAP_FIXED_NOREPLACE loses
+ * everywhere. A 16 MiB Vulkan mapping placed for a 32-bit guest hit exactly
+ * that.
+ *
+ * Asking the allocator instead means it picks somewhere genuinely free and
+ * accounts for it, with no probing and no race.
+ */
+FEX_DEFAULT_VISIBILITY void* AllocateLow32HostRange(size_t Length) {
+  if (!FEX::HLE::_SyscallHandler || FEX::HLE::_SyscallHandler->Is64BitMode()) {
+    return nullptr;
+  }
+  auto* Alloc = FEX::HLE::_SyscallHandler->Get32BitAllocator();
+  if (!Alloc) {
+    return nullptr;
+  }
+  void* Result = Alloc->Mmap(nullptr, Length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (FEX::HLE::HasSyscallError(Result)) {
+    return nullptr;
+  }
+  return Result;
 }
 
 FEX_DEFAULT_VISIBILITY void* GetGuestStack() {

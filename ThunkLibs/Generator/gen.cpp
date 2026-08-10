@@ -87,13 +87,14 @@ void BubbleSort(It begin, It end, std::relation<std::iter_value_t<It>, std::iter
 // This applies recursively to structs contained by B.
 struct compare_by_struct_dependency {
   clang::ASTContext& context;
+  const std::unordered_map<const clang::Type*, GenerateThunkLibsAction::RepackedType>& types;
 
   bool operator()(const std::pair<const clang::Type*, GenerateThunkLibsAction::RepackedType>& a,
                   const std::pair<const clang::Type*, GenerateThunkLibsAction::RepackedType>& b) const {
     return (*this)(a.first, b.first);
   }
 
-  bool operator()(const clang::Type* a, const clang::Type* b) const {
+  bool operator()(const clang::Type* a, const clang::Type* b, int depth = 0) const {
     if (llvm::isa<clang::ConstantArrayType>(b)) {
       throw std::runtime_error("Cannot have \"b\" be an array");
     }
@@ -112,7 +113,21 @@ struct compare_by_struct_dependency {
       auto child_type = child->getType().getTypePtr();
 
       if (child_type->isPointerType()) {
-        // Pointers don't need the definition to be available
+        // Pointers don't need the definition to be available -- except for
+        // array_length_from members, whose generated repacking instantiates
+        // host_layout<Element> and so requires the element type to have been
+        // emitted first. Without this the element's specialization landed after
+        // its first use ("explicit specialization after instantiation").
+        auto parent = types.find(context.getCanonicalType(b));
+        const bool is_repacked_array =
+          parent != types.end() && parent->second.ArrayLengthFor(child->getNameAsString()) != nullptr;
+        if (!is_repacked_array || depth > 8) {
+          continue;
+        }
+        auto pointee = child_type->getPointeeType().getTypePtr();
+        if (context.hasSameType(a, pointee) || (*this)(a, pointee, depth + 1)) {
+          return true;
+        }
         continue;
       }
 
@@ -125,7 +140,7 @@ struct compare_by_struct_dependency {
         return true;
       }
 
-      if ((*this)(a, child_type)) {
+      if ((*this)(a, child_type, depth + 1)) {
         // Child depends on A => transitive dependency
         return true;
       }
@@ -140,7 +155,7 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
                                                  std::unordered_map<const clang::Type*, TypeCompatibility>& type_compat) {
   // Sort struct types by dependency so that repacking code is emitted in an order that compiles fine
   std::vector<std::pair<const clang::Type*, RepackedType>> types {this->types.begin(), this->types.end()};
-  BubbleSort(types.begin(), types.end(), compare_by_struct_dependency {context});
+  BubbleSort(types.begin(), types.end(), compare_by_struct_dependency {context, this->types});
 
   for (const auto& [type, type_repack_info] : types) {
     auto struct_name = get_type_name(context, type);
@@ -217,6 +232,20 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
       fmt::print(file, "    data {{ from.data }} {{\n");
     } else {
       // Conversion needs struct repacking.
+      //
+      // The member-wise code below indexes arrays as if they were
+      // one-dimensional. That is fine for the memcpy path above, where a
+      // multi-dimensional array is just contiguous bytes, but here it would
+      // silently convert only the first row. Layout computation flattens such
+      // members, so catch the case explicitly rather than emit wrong code.
+      for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
+        if (auto* arr = llvm::dyn_cast<clang::ConstantArrayType>(member->getType())) {
+          if (llvm::isa<clang::ConstantArrayType>(arr->getElementType())) {
+            throw std::runtime_error("Multi-dimensional array member \"" + member->getNameAsString() + "\" in type \"" + struct_name +
+                                     "\" requires repacking, which is not implemented");
+          }
+        }
+      }
       // Wrapping each member in `host_layout<>` ensures this is done recursively.
       fmt::print(file, "    data {{\n");
       auto map_field = [&file](clang::FieldDecl* member, bool skip_arrays) {
@@ -305,23 +334,161 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
     fmt::print(file, "  return ret;\n");
     fmt::print(file, "}}\n\n");
 
+    // Generated repacking for members annotated array_length_from. The element
+    // count lives in a sibling member, so each array is converted element-wise
+    // into host-side storage on entry and released on exit. Elements are run
+    // through their own repacking hooks so nested annotated arrays work.
+    auto emit_array_repack_entry = [&](std::string_view indent) {
+      // Unions and other non-struct types reach here too, and have no fields to
+      // walk -- getAsStructureType() returns null for them.
+      // Only meaningful on the repacking path: when the struct is fully
+      // compatible, guest_layout<T>::type is the real struct, so its members
+      // are raw fields with no get_pointer() and nothing needs converting.
+      if (type_repack_info.array_length_members.empty() || !type->getAsStructureType() ||
+          type_compat.at(type) == TypeCompatibility::Full) {
+        return;
+      }
+      for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
+        auto member_name = member->getNameAsString();
+        auto* count_name = type_repack_info.ArrayLengthFor(member_name);
+        if (!count_name) {
+          continue;
+        }
+        auto element_type = member->getType()->getPointeeType();
+        auto element_name = element_type.getUnqualifiedType().getAsString();
+        fmt::print(file, "{}{{\n", indent);
+        fmt::print(file, "{}  const size_t count = from.data.{}.data;\n", indent, *count_name);
+        fmt::print(file, "{}  auto* guest_elements = from.data.{}.get_pointer();\n", indent, member_name);
+        fmt::print(file, "{}  if (guest_elements && count) {{\n", indent);
+        // host_layout<T> has no default constructor (it only converts from
+        // guest_layout<T>), so the array cannot be new[]'d -- allocate raw
+        // storage and construct in place instead.
+        // count comes from guest memory, so sizeof * count can wrap and the
+        // loop below would then write count elements into a short allocation.
+        fmt::print(file, "{}    if (count > SIZE_MAX / sizeof(host_layout<{}>)) {{\n", indent, element_name);
+        fmt::print(file, "{}      fprintf(stderr, \"FATAL: implausible array length %zu for {}::{}\\n\", count);\n", indent, struct_name,
+                   member_name);
+        fmt::print(file, "{}      __builtin_trap();\n", indent);
+        fmt::print(file, "{}    }}\n", indent);
+        fmt::print(file, "{}    auto* host_elements = static_cast<host_layout<{}>*>(::operator new[](sizeof(host_layout<{}>) * count));\n",
+                   indent, element_name, element_name);
+        fmt::print(file, "{}    for (size_t i = 0; i < count; ++i) {{\n", indent);
+        fmt::print(file, "{}      new (&host_elements[i]) host_layout<{}> {{ guest_elements[i] }};\n", indent, element_name);
+        fmt::print(file, "{}      fex_apply_custom_repacking_entry(host_elements[i], guest_elements[i]);\n", indent);
+        fmt::print(file, "{}    }}\n", indent);
+        // host_layout<T> is layout-identical to T (a single `type data;` member),
+        // so the array of wrappers doubles as an array of the host type.
+        fmt::print(file, "{}    static_assert(sizeof(host_layout<{}>) == sizeof({}));\n", indent, element_name, element_name);
+        fmt::print(file, "{}    static_assert(alignof(host_layout<{}>) == alignof({}));\n", indent, element_name, element_name);
+        fmt::print(file, "{}    source.data.{} = &host_elements[0].data;\n", indent, member_name);
+        fmt::print(file, "{}  }} else {{\n", indent);
+        fmt::print(file, "{}    source.data.{} = nullptr;\n", indent, member_name);
+        fmt::print(file, "{}  }}\n", indent);
+        fmt::print(file, "{}}}\n", indent);
+      }
+    };
+    // The guest's array pointers must be captured before any hand-written exit
+    // hook runs. VULKAN_DEFAULT_CUSTOM_REPACK rewrites the whole guest struct
+    // through to_guest(), whose designated initializer omits members the
+    // automatic conversion skips -- these arrays among them -- so they come back
+    // as null. Reading them afterwards handed the loop below a null base and
+    // dereferenced it.
+    auto emit_array_guest_saves = [&](std::string_view indent) {
+      if (type_repack_info.array_length_members.empty() || !type->getAsStructureType() ||
+          type_compat.at(type) == TypeCompatibility::Full) {
+        return;
+      }
+      for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
+        auto member_name = member->getNameAsString();
+        if (!type_repack_info.ArrayLengthFor(member_name)) {
+          continue;
+        }
+        fmt::print(file, "{}auto fex_saved_{} = into.data.{};\n", indent, member_name, member_name);
+      }
+    };
+
+    auto emit_array_repack_exit = [&](std::string_view indent) {
+      // Only meaningful on the repacking path: when the struct is fully
+      // compatible, guest_layout<T>::type is the real struct, so its members
+      // are raw fields with no get_pointer() and nothing needs converting.
+      if (type_repack_info.array_length_members.empty() || !type->getAsStructureType() ||
+          type_compat.at(type) == TypeCompatibility::Full) {
+        return;
+      }
+      for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
+        auto member_name = member->getNameAsString();
+        auto* count_name = type_repack_info.ArrayLengthFor(member_name);
+        if (!count_name) {
+          continue;
+        }
+        auto element_type = member->getType()->getPointeeType();
+        auto element_name = element_type.getUnqualifiedType().getAsString();
+        fmt::print(file, "{}{{\n", indent);
+        // The count comes from the host struct, which captured it during entry
+        // conversion. Re-reading into.data (guest memory) would take a second
+        // look at a guest-writable field across the driver call, and a count
+        // that grew in between would walk off the end of the scratch array.
+        fmt::print(file, "{}  const size_t count = from.data.{};\n", indent, *count_name);
+        fmt::print(file, "{}  auto* host_elements = reinterpret_cast<host_layout<{}>*>(const_cast<{}*>(from.data.{}));\n", indent, element_name,
+                   element_name, member_name);
+        fmt::print(file, "{}  if (host_elements) {{\n", indent);
+        fmt::print(file, "{}    auto* guest_elements = fex_saved_{}.get_pointer();\n", indent, member_name);
+        fmt::print(file, "{}    for (size_t i = 0; guest_elements && i < count; ++i) {{\n", indent);
+        fmt::print(file, "{}      fex_apply_custom_repacking_exit(guest_elements[i], host_elements[i]);\n", indent);
+        fmt::print(file, "{}    }}\n", indent);
+        // Matches ::operator new[] above; host_layout<T> is trivially
+        // destructible (a single `type data;` member), so no destructor calls.
+        fmt::print(file, "{}    ::operator delete[](static_cast<void*>(host_elements));\n", indent);
+        fmt::print(file, "{}  }}\n", indent);
+        // Leave the guest's struct as the guest handed it to us; the hook above
+        // may have zeroed this member.
+        fmt::print(file, "{}  into.data.{} = fex_saved_{};\n", indent, member_name, member_name);
+        fmt::print(file, "{}}}\n", indent);
+      }
+    };
+    const bool has_array_members = !type_repack_info.array_length_members.empty() && type->getAsStructureType() &&
+                                   type_compat.at(type) != TypeCompatibility::Full;
+
     // Forward-declare user-provided repacking functions
     if (type_repack_info.custom_repacked_members.empty()) {
       fmt::print(file, "void fex_apply_custom_repacking_entry(host_layout<{}>& source, const guest_layout<{}>& from) {{\n", struct_name, struct_name);
+      emit_array_repack_entry("  ");
       fmt::print(file, "}}\n");
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
-      fmt::print(file, "  return false;\n");
+      emit_array_guest_saves("  ");
+      emit_array_repack_exit("  ");
+      // Returning true means "fully handled": the annotated members hold host
+      // pointers that must not be written back into guest memory, and the
+      // automatic path would do exactly that. Same contract custom_repack
+      // structs already rely on.
+      fmt::print(file, "  return {};\n", has_array_members ? "true" : "false");
       fmt::print(file, "}}\n");
     } else {
       fmt::print(file, "void fex_custom_repack_entry(host_layout<{}>& into, const guest_layout<{}>& from);\n", struct_name, struct_name);
       fmt::print(file, "bool fex_custom_repack_exit(guest_layout<{}>& into, const host_layout<{}>& from);\n\n", struct_name, struct_name);
 
       fmt::print(file, "void fex_apply_custom_repacking_entry(host_layout<{}>& source, const guest_layout<{}>& from) {{\n", struct_name, struct_name);
+      // Generated array repacking runs first so the hand-written hook sees the
+      // arrays already converted.
+      emit_array_repack_entry("  ");
       fmt::print(file, "  fex_custom_repack_entry(source, from);\n");
       fmt::print(file, "}}\n");
 
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
-      fmt::print(file, "  return fex_custom_repack_exit(into, from);\n");
+      emit_array_guest_saves("  ");
+      fmt::print(file, "  const bool handled = fex_custom_repack_exit(into, from);\n");
+      emit_array_repack_exit("  ");
+      if (has_array_members) {
+        // Annotated members hold host pointers that the automatic exit path
+        // would write straight back into guest memory, so exit is always fully
+        // handled for these structs and the hook cannot downgrade that. Said
+        // explicitly rather than as "handled || true", which read as if the
+        // hook's answer mattered.
+        fmt::print(file, "  static_cast<void>(handled);\n");
+        fmt::print(file, "  return true;\n");
+      } else {
+        fmt::print(file, "  return handled;\n");
+      }
       fmt::print(file, "}}\n");
     }
 
@@ -514,6 +681,37 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       }
       file << "\n";
     }
+
+    // Functions with a hand-written host implementation.
+    //
+    // Those implementations are only reached through fexfn_unpack_*, i.e. when
+    // the guest calls the packed thunk by name. A library that also hands out
+    // raw host function pointers (vkGetInstanceProcAddr and friends) sends
+    // those calls through GuestWrapperForHostFunction instead, which marshals
+    // each parameter in isolation and never consults the custom impl. Anything
+    // the custom impl exists *for* — a count/array pair, a handle that needs
+    // registry translation — is then silently wrong.
+    //
+    // Exposing the list lets such a library route these names back to its own
+    // packed thunk. Emitted for every target; it costs one unused macro where
+    // nobody expands it.
+    //
+    // custom_guest_impl entries are excluded: those have no generated alias to
+    // take the address of, and a lib that defines one can special-case it
+    // directly.
+    file << "#define FOREACH_custom_host_impl_SYMBOL(EXPAND) \\\n";
+    for (auto& thunk : thunks) {
+      if (!thunk.custom_host_impl) {
+        continue;
+      }
+      auto api_entry = std::find_if(thunked_api.begin(), thunked_api.end(),
+                                    [&](const auto& api) { return api.function_name == thunk.function_name; });
+      if (api_entry != thunked_api.end() && api_entry->custom_guest_impl) {
+        continue;
+      }
+      file << "  EXPAND(" << thunk.function_name << ") \\\n";
+    }
+    file << "\n";
   }
 
   // Files used host-side
@@ -596,6 +794,37 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
               type_compat.at(context.getCanonicalType(type.getTypePtr())) == TypeCompatibility::None) {
             // TODO: Factor in "assume_compatible_layout" annotations here
             //       That annotation should cause the type to be treated as TypeCompatibility::Full
+            // Name the member that made the struct incompatible. Reporting only
+            // the outermost type turns every one of these into a bisect: the
+            // struct is usually fine and one field several levels down is not,
+            // and the message as written gives no way to tell which.
+            std::string Detail;
+            if (auto* AsStruct = type->getAsStructureType()) {
+              for (auto* Field : AsStruct->getDecl()->fields()) {
+                auto FieldType = Field->getType();
+                auto Canonical = context.getCanonicalType(FieldType.getTypePtr());
+                auto Compat = type_compat.find(Canonical);
+                const char* Why = nullptr;
+                if (FieldType->isPointerType()) {
+                  auto Pointee = context.getCanonicalType(FieldType->getPointeeType().getTypePtr());
+                  auto PointeeCompat = type_compat.find(Pointee);
+                  if (PointeeCompat != type_compat.end() && PointeeCompat->second == TypeCompatibility::None) {
+                    Why = "pointer to a type with no compatible layout";
+                  }
+                } else if (Compat != type_compat.end() && Compat->second != TypeCompatibility::Full) {
+                  Why = "embedded by value and not layout-compatible";
+                }
+                if (Why) {
+                  Detail += "\n  note: member '" + Field->getNameAsString() + "' (" + FieldType.getAsString() + ") is " + Why;
+                }
+              }
+            }
+            if (Detail.empty()) {
+              Detail = "\n  note: no single member identified; the struct itself has no compatible layout";
+            }
+            // report_error only takes string literals, so the per-member detail
+            // goes to stderr alongside it rather than into the diagnostic.
+            std::cerr << "Unsupported parameter type " << param_type.getAsString() << " in " << thunk.function_name << Detail << "\n";
             throw report_error(thunk.decl->getLocation(), "Unsupported parameter type %0").AddTaggedVal(param_type);
           }
         }
@@ -666,15 +895,41 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           continue;
         }
 
+        // A pointer to a builtin integer is only reinterpretable if the pointee
+        // is the same width on both sides. size_t is not: 4 bytes in a 32-bit
+        // guest, 8 on the host. Reinterpreting there hands the library a
+        // pointer to a half-initialised value, and the generated code did not
+        // even compile (no conversion from guest_layout<uint32_t*> to
+        // host_layout<unsigned long*>), which is why every entry point taking a
+        // size_t* used to be dropped from the 32-bit thunk.
+        const bool pointee_width_differs = [&] {
+          if (!param_type->isPointerType()) {
+            return false;
+          }
+          auto pointee = param_type->getPointeeType();
+          if (!pointee->isBuiltinType() || !pointee->isIntegerType() || pointee->isVoidType()) {
+            return false;
+          }
+          auto* guest_info = guest_abi.at(pointee.getUnqualifiedType().getAsString()).get_if_simple_or_struct();
+          return guest_info && guest_info->size_bits != context.getTypeSize(pointee);
+        }();
+
         // Layout repacking happens here
-        if (!param_type->isPointerType() || (is_assumed_compatible || pointee_compat == TypeCompatibility::Full) ||
-            param_type->getPointeeType()->isBuiltinType() /* TODO: handle size_t. Actually, properly check for data layout compatibility */) {
+        if (pointee_width_differs) {
+          const bool is_const_pointee = param_type->getPointeeType().isConstQualified();
+          fmt::print(file, "  auto a_{} = make_int_repack_wrapper<{}, {}>(args->a_{});\n", param_idx,
+                     get_type_name_with_nonconst_pointee(param_type), is_const_pointee ? "true" : "false", param_idx);
+        } else if (!param_type->isPointerType() || (is_assumed_compatible || pointee_compat == TypeCompatibility::Full) ||
+                   param_type->getPointeeType()->isBuiltinType()) {
           // Fully compatible
           fmt::print(file, "  host_layout<{}> a_{} {{ args->a_{} }};\n", get_type_name(context, param_type.getTypePtr()), param_idx, param_idx);
         } else if (pointee_compat == TypeCompatibility::Repackable) {
           // TODO: Require opt-in for this to be emitted since it's single-element only; otherwise, pointers-to-arrays arguments will cause stack trampling
-          fmt::print(file, "  auto a_{} = make_repack_wrapper<{}>(args->a_{});\n", param_idx,
-                     get_type_name_with_nonconst_pointee(param_type), param_idx);
+          // Pass the pointee's constness alongside the stripped type, so
+          // repack_wrapper can honour "do not write back to a const input".
+          const bool is_const_pointee = param_type->isPointerType() && param_type->getPointeeType().isConstQualified();
+          fmt::print(file, "  auto a_{} = make_repack_wrapper<{}, {}>(args->a_{});\n", param_idx,
+                     get_type_name_with_nonconst_pointee(param_type), is_const_pointee ? "true" : "false", param_idx);
         } else {
           throw report_error(thunk.decl->getLocation(), "Cannot generate unpacking function for function %0 with unannotated pointer "
                                                         "parameter %1")

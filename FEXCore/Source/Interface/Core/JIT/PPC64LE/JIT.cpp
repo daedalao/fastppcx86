@@ -2321,6 +2321,15 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
                       "same-thread drains ride the InterruptFaultPage poke.");
   }
 
+  // Constant-target CALL exits (BranchHint::Call) link only when block linking
+  // is on AND we are not in the lazy-link regime: under FEX_SMCLAZYLINK the SMC
+  // scrub severs links so aggressively that linking call-dense guests (32-bit
+  // Mono/Unity) turns every call into a relink-and-recompile through
+  // ExitFunctionLinkWithRecord -- a compile storm that throttles execution
+  // (observed on Dex load). Plain jumps stay linked (BlockLinkingEnabled); only
+  // the higher-volume call exits fall back to the L1 probe under lazy linking.
+  CallLinkingEnabled = BlockLinkingEnabled && !LazyLinkArmed;
+
   // Shadow return stack (FEX_SHADOWRETSTACK). Read once here, mirroring
   // BlockLinkingEnabled. Independent of code caching and of SMCSemanticPatch:
   //  * Code caching: the pushed host trampoline is discovered at RUNTIME via
@@ -3575,6 +3584,15 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // change above.
   CodeData.BlockBegin = CB->Ptr + BlockBufferOffset;
   CodeData.Size       = CodeSize;
+
+  // DebugData::HostCodeSize has never been populated on this port, and PPC64LE
+  // is the only backend left in the tree, so the field was dead: every consumer
+  // read a zero. That silently broke both of them - FEX_LIBRARYJITNAMING wrote
+  // perf-map entries of length 0 (perf attributes no samples to a zero-length
+  // symbol, so profiles degraded to raw addresses), and GDBJIT computed
+  // block end == block start. Code only, excluding the tail: this is the range
+  // that is actually executed.
+  DebugData->HostCodeSize = CodeSize;
 
   // Flush the freshly-emitted instructions out of the D-cache and invalidate
   // the I-cache for this range. POWER8 has split, non-coherent I/D caches: the

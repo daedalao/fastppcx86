@@ -381,9 +381,16 @@ public:
   }
 
   // rlwnm RA, RS, RB, MB, ME  (rotate left word then and mask, opcode 23)
+  // MB and ME are 5-bit fields. assert() is inert in release builds, and this
+  // is the only rotate helper that splices its mask fields unmasked — an
+  // out-of-range MB would bleed into RB and silently change the source
+  // register, which is exactly the failure EmitM's guard was added to stop
+  // (see the SH=32 bug referenced there). Guard loudly *and* mask, so a
+  // release build degrades to a wrong mask rather than a wrong register.
   void rlwnm(GPR ra, GPR rs, GPR rb, uint32_t mb, uint32_t me) {
-    assert(mb < 32 && me < 32);
-    Emit32((23u << 26) | (rs.idx << 21) | (ra.idx << 16) | (rb.idx << 11) | (mb << 6) | (me << 1) | 0u);
+    LOGMAN_THROW_A_FMT(mb < 32, "rlwnm MB out of range: {}", mb);
+    LOGMAN_THROW_A_FMT(me < 32, "rlwnm ME out of range: {}", me);
+    Emit32((23u << 26) | (rs.idx << 21) | (ra.idx << 16) | (rb.idx << 11) | ((mb & 0x1F) << 6) | ((me & 0x1F) << 1) | 0u);
   }
 
   // rldicl RA, RS, SH, MB  (rotate left doubleword then clear left, opcode 30, XO=0)
@@ -555,14 +562,26 @@ public:
     Emit32((19u << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (193u << 1));
   }
 
-  // crnot BT, BA = crxor BT, BA, BA
-  void crnot(uint32_t bt, uint32_t ba) { crxor(bt, ba, ba); }
+  // creqv BT, BA, BB  (XO 289)
+  void creqv(uint32_t bt, uint32_t ba, uint32_t bb) {
+    Emit32((19u << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (289u << 1));
+  }
+
+  // crnot BT, BA = crnor BT, BA, BA
+  // NOT crxor BT, BA, BA: a bit XORed with itself is always 0, which is crclr.
+  // Matches what gas emits for the `crnot` extended mnemonic.
+  void crnot(uint32_t bt, uint32_t ba) { crnor(bt, ba, ba); }
 
   // crmove BT, BA = cror BT, BA, BA
   void crmove(uint32_t bt, uint32_t ba) { cror(bt, ba, ba); }
 
-  // crset BT = cror BT, BT, BT (sets bit in CR)
-  void crset(uint32_t bt) { cror(bt, bt, bt); }
+  // crset BT = creqv BT, BT, BT (sets bit in CR)
+  // NOT cror BT, BT, BT: a bit ORed with itself is unchanged, which is a no-op.
+  // A bit XNORed with itself is always 1, which is what "set" needs.
+  void crset(uint32_t bt) { creqv(bt, bt, bt); }
+
+  // crclr BT = crxor BT, BT, BT (clears bit in CR)
+  void crclr(uint32_t bt) { crxor(bt, bt, bt); }
 
   // crnand BT, BA, BB  (XO 225)
   void crnand(uint32_t bt, uint32_t ba, uint32_t bb) {
@@ -768,9 +787,18 @@ public:
   //   bits 25:21= VRT low 5 bits
   //   bits 31:26= primary opcode = 60
   // VR registers map to VSX 32..63, so AX/BX/TX are always 1 when targeting VRs.
+  // Full 6-bit VSX form: the AX/BX/TX extension bits are DERIVED from bit 5 of
+  // each register number instead of being hardcoded, which is what makes
+  // vs0-vs31 (the FPR-aliased half) reachable at all.
+  void EmitXX3VSX(uint32_t t, uint32_t a, uint32_t b, uint32_t xo) {
+    Emit32((60u << 26) | ((t & 31u) << 21) | ((a & 31u) << 16) | ((b & 31u) << 11) | ((xo & 0xFFu) << 3) |
+           (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/ | ((t >> 5) & 1u) /*TX*/);
+  }
+
+  // VR n is vs(32+n), so every extension bit comes out 1 and this is
+  // bit-identical to the previous hardcoded 0x7.
   void EmitXX3(uint32_t vrt, uint32_t vra, uint32_t vrb, uint32_t xo) {
-    Emit32((60u << 26) | (vrt << 21) | (vra << 16) | (vrb << 11) |
-           ((xo & 0xFFu) << 3) | 0x7u /* AX|BX|TX = all 1 for VR targets */);
+    EmitXX3VSX(32u + vrt, 32u + vra, 32u + vrb, xo);
   }
 
   // xxpermdi VRT, VRA, VRB, DM (POWER7+).  XO=10; DM goes in the XO field's bits 5:6.
@@ -824,6 +852,38 @@ public:
   void xvmsubadp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 113); }
   void xvnmaddadp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 225); }
   void xvnmsubadp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 241); }
+
+  // ---- VSX-form overloads reaching the full vs0-vs63 file --------------------
+  // Only the ops the scalar-insert lowerings need. Anything taking a VSXR is
+  // usable with a low-bank (FPR-aliased) register; anything taking a VR is not.
+  // Deliberately NOT provided for VMX-form ops - they cannot encode vs0-vs31,
+  // so the absence of an overload is the compile-time guard against misuse.
+  void xvmaddasp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  65); }
+  void xvmsubasp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  81); }
+  void xvnmaddasp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 193); }
+  void xvnmsubasp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 209); }
+  void xvmaddadp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx,  97); }
+  void xvmsubadp (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 113); }
+  void xvnmaddadp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 225); }
+  void xvnmsubadp(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 241); }
+
+  void xxpermdi(VSXR t, VSXR a, VSXR b, uint32_t dm) {
+    assert(dm < 4);
+    EmitXX3VSX(t.idx, a.idx, b.idx, 10u | ((dm & 3u) << 5));
+  }
+
+  void xxspltw(VSXR t, VSXR b, uint32_t uim) {
+    assert(uim < 4);
+    Emit32((60u << 26) | ((t.idx & 31u) << 21) | ((uim & 3u) << 16) | ((b.idx & 31u) << 11) |
+           ((164u & 0x1FFu) << 2) | (((b.idx >> 5) & 1u) << 1) /*BX*/ | ((t.idx >> 5) & 1u) /*TX*/);
+  }
+
+  // XX4-form: VRC sits at bits 10:6 with its extension bit CX at bit 3.
+  void xxsel(VSXR t, VSXR a, VSXR b, VSXR c) {
+    Emit32((60u << 26) | ((t.idx & 31u) << 21) | ((a.idx & 31u) << 16) | ((b.idx & 31u) << 11) | ((c.idx & 31u) << 6) |
+           (3u << 4) /*XO=3*/ | (((c.idx >> 5) & 1u) << 3) /*CX*/ | (((a.idx >> 5) & 1u) << 2) /*AX*/ |
+           (((b.idx >> 5) & 1u) << 1) /*BX*/ | ((t.idx >> 5) & 1u) /*TX*/);
+  }
   // m-form: T = ±(T*B) ± A (T is multiplicand, A is addend)
   void xvmaddmsp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx,  73); }
   void xvmsubmsp (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx,  89); }
@@ -912,6 +972,11 @@ public:
   void xvcvdpsxds(VR t, VR b) { EmitXX2(t.idx, b.idx, 472); }
   void xvcvspdp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 457); }
   void xvcvdpsp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 393); }
+  // Signed integer -> float. XO fields cross-checked against llvm-mc, using
+  // xvcvspdp (457) as the control that the extraction method is right.
+  void xvcvsxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 504); } // i64 -> f64
+  void xvcvsxdsp (VR t, VR b) { EmitXX2(t.idx, b.idx, 440); } // i64 -> f32, single rounding
+  void xvcvsxwdp (VR t, VR b) { EmitXX2(t.idx, b.idx, 248); } // i32 -> f64
   // Copy-sign (per element)
   void xvcpsgnsp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 208); }
   void xvcpsgndp(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 240); }
@@ -1289,10 +1354,14 @@ public:
   void vminsw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 898);  }
   void vminsd(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 962);  } // POWER8+
 
-  // Abs (POWER8+)
-  void vabsdub(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 19);  }
-  void vabsduh(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 83);  }
-  void vabsduw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 147); }
+  // Abs (POWER9+ / ISA 3.0 — NOT available on POWER8)
+  // XO values verified against llvm-mc -mcpu=pwr9: vabsdub 2,3,4 = 0x10432403.
+  // The previous 19/83/147 were the VX XO values shifted right by 6 (i.e. the
+  // ISA doc's opcode column misread); XO 19 is not a valid VX op at all, so
+  // those encodings would have taken a SIGILL on first execution.
+  void vabsdub(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1027); }
+  void vabsduh(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1091); }
+  void vabsduw(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 1155); }
 
   // Pack/unpack
   void vpkuhum(VR vrt, VR vra, VR vrb) { EmitVX(vrt.idx, vra.idx, vrb.idx, 14);  }
@@ -1344,8 +1413,17 @@ public:
   void vpermxor   (VR vrt, VR vra, VR vrb, VR vrc)    { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 45); }
 
   // mfvscr / mtvscr
-  void mfvscr(VR vrt) { Emit32((4u<<26)|(vrt.idx<<21)|(0<<16)|(0<<11)|(1540u<<1)); }
-  void mtvscr(VR vrb) { Emit32((4u<<26)|(0<<21)|(0<<16)|(vrb.idx<<11)|(1604u<<1)); }
+  // VX-form XO occupies all 11 low bits and there is no Rc, so the XO value is
+  // OR'd in directly — the same trap the vpopcnt* comment above documents.
+  // Verified against llvm-mc: mfvscr 2 = 0x10400604, mtvscr 3 = 0x10001e44.
+  void mfvscr(VR vrt) { Emit32((4u<<26)|(vrt.idx<<21)|(0<<16)|(0<<11)|1540u); }
+  void mtvscr(VR vrb) { Emit32((4u<<26)|(0<<21)|(0<<16)|(vrb.idx<<11)|1604u); }
+
+  // Multiply-low and add unsigned halfword modulo (VA-form: XO=34).
+  //   VRT[i] = (VRA[i] * VRB[i] + VRC[i]) mod 2^16, per halfword.
+  // With VRC = 0 this is exactly x86 PMULLW, and being elementwise it needs no
+  // permute regardless of which physical halfword holds which guest lane.
+  void vmladduhm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 34); }
 
   // Vector VMSUMUBM etc (VA-form)
   void vmsumubm(VR vrt, VR vra, VR vrb, VR vrc) { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 36); }

@@ -1669,19 +1669,52 @@ DoGenerate:
 // Linux Mono runtime detection — flip MonoDetected when the guest opens a
 // libmono / libmonosgen / libmonoboehm / mono-2.0-bdwgc shared library.
 // Cheap atomic gate after first detection so the openat hot path stays fast.
+static bool StartsWithNoCase(std::string_view Haystack, std::string_view Prefix) {
+  if (Haystack.size() < Prefix.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < Prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(Haystack[i])) != std::tolower(static_cast<unsigned char>(Prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SyscallHandler::IsMonoRuntimeLibraryPath(std::string_view pathname) {
   // Take the basename — everything after the last '/'.
   if (auto Slash = pathname.find_last_of('/'); Slash != std::string_view::npos) {
     pathname.remove_prefix(Slash + 1);
   }
   // Match known Mono runtime library prefixes.  Cheap prefix match, no regex.
+  //
+  // The Windows names matter as much as the Linux ones. A Unity title run under
+  // wine loads its runtime as a PE, and the only Windows name here used to be
+  // Unity 2017+'s mono-2.0-bdwgc: Unity 4 and 5 ship a plain "mono.dll", which
+  // matched nothing, so MonoDetected never fired and every MonoHacks path --
+  // the hook-based SMC scheme, the smaller JIT blocks, the spin-loop clamp --
+  // stayed off for the entire Windows-Unity catalogue. Native Dex opens
+  // libmono.so and reaches gameplay; the same game's Windows build opens
+  // mono.dll and dies in MonoManager ReloadAssembly.
+  //
+  // Prefix-matching a basename is deliberately narrow: "mono.dll" does not
+  // match MonoPosixHelper.dll or Mono.Security.dll, which are managed
+  // assemblies rather than the runtime.
   return pathname.starts_with("libmonosgen-")   || // mainline mono runtime (sgen GC)
          pathname.starts_with("libmono-2.0")    || // older mono runtime
          pathname.starts_with("libmonoboehm-")  || // Boehm-GC mono variant
          pathname.starts_with("libmonobdwgc-")  || // Unity 2017+ / modern Unity runtime
          pathname.starts_with("libmono.so")     || // generic libmono (Unity 4/5)
-         pathname.starts_with("mono-2.0-bdwgc") || // matches Windows-side name too
-         pathname.starts_with("mono.so");
+         pathname.starts_with("mono.so") ||
+         // Windows names are matched case-insensitively: these arrive through
+         // wine from a case-insensitive filesystem view, so a title shipping
+         // Mono.dll rather than mono.dll would otherwise go undetected. The
+         // prefixes stay narrow enough that Mono.Security.dll and
+         // MonoPosixHelper.dll -- managed assemblies, not the runtime -- do not
+         // match.
+         StartsWithNoCase(pathname, "mono-2.0-bdwgc") || // Unity 2017+ Windows-side name
+         StartsWithNoCase(pathname, "mono-2.0-sgen") ||  // mono's own Windows build
+         StartsWithNoCase(pathname, "mono.dll");         // Unity 4/5 Windows player
 }
 
 void SyscallHandler::MaybeDetectMonoFromPath(std::string_view pathname) {

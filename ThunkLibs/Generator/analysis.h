@@ -126,11 +126,27 @@ public:
     // Set of members (identified by their field name) with custom repacking
     std::unordered_set<std::string> custom_repacked_members;
 
+    // Members annotated array_length_from, mapping the array member's field
+    // name to the field name holding its element count.
+    std::unordered_map<std::string, std::string> array_length_members;
+
+    // Both kinds are filled in by hand-written or generated repacking code, so
+    // the automatic member-wise conversion must skip them.
     bool UsesCustomRepackFor(const clang::FieldDecl* member) const {
-      return custom_repacked_members.contains(member->getNameAsString());
+      return UsesCustomRepackFor(member->getNameAsString());
     }
     bool UsesCustomRepackFor(const std::string& member_name) const {
+      return custom_repacked_members.contains(member_name) || array_length_members.contains(member_name);
+    }
+
+    // True only for members the *user* repacks; array members are generated.
+    bool UsesHandWrittenRepackFor(const std::string& member_name) const {
       return custom_repacked_members.contains(member_name);
+    }
+
+    const std::string* ArrayLengthFor(const std::string& member_name) const {
+      auto it = array_length_members.find(member_name);
+      return it == array_length_members.end() ? nullptr : &it->second;
     }
   };
 

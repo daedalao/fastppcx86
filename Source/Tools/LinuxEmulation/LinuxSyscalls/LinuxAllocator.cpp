@@ -62,6 +62,40 @@ public:
     }
   }
 
+  void ReserveHostRange(uintptr_t Base, size_t Length) override {
+    std::scoped_lock<std::mutex> lk {AllocMutex};
+    const uint64_t PageAddr = Base >> FEXCore::Utils::FEX_PAGE_SHIFT;
+    const size_t PagesLength = FEXCore::AlignUp(Length, FEXCore::Utils::FEX_PAGE_SIZE) >> FEXCore::Utils::FEX_PAGE_SHIFT;
+    for (size_t i = 0; i < PagesLength; ++i) {
+      const uint64_t Page = PageAddr + i;
+      if (Page >= HostReservedPages.size()) {
+        break;
+      }
+      HostReservedPages.set(Page);
+      // Also mark them used so the no-hint scan never proposes them.
+      MappedPages.set(Page);
+    }
+  }
+
+  // Caller must hold AllocMutex. PageAddr is a page index, PagesLength a count.
+  //
+  // Bounds-checked internally rather than at the call sites: Mremap validates
+  // neither of its addresses before reaching here, and std::bitset::test
+  // throws on an out-of-range index. A range outside the 32-bit space can
+  // never overlap a reservation anyway.
+  bool OverlapsHostReservation(uint64_t PageAddr, size_t PagesLength) const {
+    for (size_t i = 0; i < PagesLength; ++i) {
+      const uint64_t Page = PageAddr + i;
+      if (Page >= HostReservedPages.size()) {
+        break;
+      }
+      if (HostReservedPages.test(Page)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // PageAddr is a page already shifted to page index
   // PagesLength is the number of pages
   void SetFreePages(uint64_t PageAddr, size_t PagesLength) {
@@ -75,6 +109,9 @@ private:
   // Set that contains 4k mapped pages
   // This is the full 32bit memory range
   std::bitset<0x10'0000> MappedPages;
+  // Subset of the above holding host-owned pages (thunk trampoline pools).
+  // See MemAllocator::ReserveHostRange for why these need separate tracking.
+  std::bitset<0x10'0000> HostReservedPages;
   fextl::map<uint32_t, int> PageToShm {};
   uint64_t LastScanLocation {};
   uint64_t LastKeyLocation {};
@@ -260,6 +297,13 @@ restart: {
   if (Addr == 0) {
     return AllocateNoHint();
   } else {
+    // The guest asked for a specific address and we are about to honour it
+    // verbatim. If that would replace a host-owned trampoline pool, the host
+    // would subsequently branch into guest-supplied bytes. Refuse instead.
+    if (OverlapsHostReservation(PageAddr, PagesLength)) {
+      return reinterpret_cast<void*>(-ENOMEM);
+    }
+
     void* MappedPtr = ::mmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT),
                              PagesLength << FEXCore::Utils::FEX_PAGE_SHIFT, prot, flags, fd, offset);
 
@@ -304,13 +348,31 @@ int MemAllocator32Bit::Munmap(void* addr, size_t length) {
     return 0;
   }
 
-  while (PageAddr != PageEnd) {
-    // Always pass to munmap, it may be something allocated we aren't tracking
-    int Result = ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT), FEXCore::Utils::FEX_PAGE_SIZE);
-    if (Result != 0) {
-      return -errno;
-    }
+  // Never let the guest unmap a host trampoline pool out from under the host.
+  // Report success without doing anything: the guest believes it owns this
+  // range only because it was never told otherwise, and failing the unmap
+  // would be more disruptive than leaking a page it was not using.
+  if (OverlapsHostReservation(PageAddr, PagesLength)) {
+    return 0;
+  }
 
+  // Unmap the whole range in a single syscall.
+  //
+  // This used to loop one page at a time, which is semantically identical -
+  // munmap succeeds on ranges containing already-unmapped holes, and spans
+  // multiple VMAs fine - but cost one syscall per page. A 32-bit guest routes
+  // every munmap here (GuestMunmap dispatches on addr < 4GiB), so a glibc
+  // free() of one mmap-threshold chunk became hundreds of syscalls, all under
+  // AllocMutex and the caller's VMATracking lock. Measured on a 32-bit Unity
+  // title: ~5000 munmap(4096) per second across 16 threads, serializing them.
+  int Result = ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT),
+                        PagesLength << FEXCore::Utils::FEX_PAGE_SHIFT);
+  if (Result != 0) {
+    return -errno;
+  }
+
+  // Bookkeeping only, no syscalls: drop the pages from the tracking bitset.
+  while (PageAddr != PageEnd) {
     if (MappedPages.test(PageAddr)) {
       MappedPages.reset(PageAddr);
     }
@@ -327,6 +389,14 @@ void* MemAllocator32Bit::Mremap(void* old_address, size_t old_size, size_t new_s
 
   {
     std::scoped_lock<std::mutex> lk {AllocMutex};
+    // Both ends matter: the source range would be moved (and unmapped) out
+    // from under the host, and the destination range would be replaced.
+    if (OverlapsHostReservation(reinterpret_cast<uintptr_t>(old_address) >> FEXCore::Utils::FEX_PAGE_SHIFT, OldPagesLength) ||
+        ((flags & MREMAP_FIXED) &&
+         OverlapsHostReservation(reinterpret_cast<uintptr_t>(new_address) >> FEXCore::Utils::FEX_PAGE_SHIFT, NewPagesLength))) {
+      return reinterpret_cast<void*>(-ENOMEM);
+    }
+
     if (flags & MREMAP_FIXED) {
       void* MappedPtr = ::mremap(old_address, old_size, new_size, flags, new_address);
 

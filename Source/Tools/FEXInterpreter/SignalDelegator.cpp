@@ -133,7 +133,17 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
     Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmGPRs(ucontext)[SRAIdxMap];
   }
 
-  if (SupportsAVX) {
+  // Destination view depends on host register convergence — see the detailed
+  // note on the matching branch in LinuxEmulation's SignalDelegator::SpillSRA.
+  // PPC64LE advertises AVX but has no converged 256-bit registers, so its SRA
+  // XMMs live in the 16-byte sse.data view; the 32-byte avx.data stride would
+  // scatter xmm[k] into sse.data[2k].
+#ifdef ARCHITECTURE_ppc64le
+  constexpr bool UseConvergedAVXStorage = false;
+#else
+  const bool UseConvergedAVXStorage = SupportsAVX;
+#endif
+  if (UseConvergedAVXStorage) {
     // TODO: This doesn't save the upper 128-bits of the 256-bit registers.
     // This needs to be implemented still.
     for (size_t i = 0; i < Config.SRAFPRCount; i++) {

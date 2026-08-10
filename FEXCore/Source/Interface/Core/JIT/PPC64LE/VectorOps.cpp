@@ -2362,30 +2362,23 @@ DEF_OP(VMul) {
     vmuluwm(Dst, V1, V2);
     break;
   case IR::OpSize::i16Bit: {
-    // vmulosh / vmulesh produce 4 32-bit BE products from phys-odd / phys-even
-    // halfwords of the inputs.  In FEX's PPC64LE convention `lvx` byte-reverses
-    // the 16-byte memory image, so phys halfword 7 of an x86 SSE register holds
-    // x86 LE-halfword 0 (and so on).  vmulesh/vmulosh therefore see each phys
-    // halfword as a BE u16, which equals the x86 LE u16 read from the original
-    // memory bytes — exactly what pmullw wants per lane.
+    // pmullw: per-lane low 16 bits of the product.
     //
-    // We then need to gather the low 16 bits of each BE product back into the
-    // output VR at the LE-halfword positions:
-    //   ctrl phys layout = [0x12,0x13,0x02,0x03, 0x16,0x17,0x06,0x07,
-    //                       0x1A,0x1B,0x0A,0x0B, 0x1E,0x1F,0x0E,0x0F]
+    // vmladduhm VRT,VRA,VRB,VRC computes (VRA[i] * VRB[i] + VRC[i]) mod 2^16
+    // for each halfword independently, so a zero addend makes it exactly
+    // pmullw. Because it is strictly elementwise, no permute and no
+    // endianness fixup is needed: whichever physical halfword holds guest
+    // lane i in V1 holds lane i in V2 as well, and the product lands in that
+    // same position. Modular low-16 arithmetic is sign-agnostic, so the one
+    // instruction serves both pmullw and its signed reading.
     //
-    // Because `lvx` byte-reverses, the std-then-lvx round-trip produces phys
-    // bytes that are the byte-reversed view of the in-memory image.  To land
-    // the desired ctrl in phys, we have to write the *byte-reversed* ctrl into
-    // memory: stack[i] := ctrl_phys[15-i].
-    //   stack[0..7]  = [0F,0E,1F,1E,0B,0A,1B,1A]   → LE u64 0x1A1B0A0B1E1F0E0F
-    //   stack[8..15] = [07,06,17,16,03,02,13,12]   → LE u64 0x1213020316170607
-    vmulosh(VTMP1, V1, V2);
-    vmulesh(VTMP2, V1, V2);
-    LoadConstant(TMP1, 0x1A1B0A0B1E1F0E0FULL); std(TMP1, -16, r1);
-    LoadConstant(TMP1, 0x1213020316170607ULL); std(TMP1,  -8, r1);
-    addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
-    vperm(Dst, VTMP1, VTMP2, Dst);
+    // Replaces vmulosh/vmulesh + two LoadConstants + std/std + addi/li/lvx +
+    // vperm — roughly fifteen instructions that materialised a permute
+    // control on the stack and then reloaded it, eating a store-hit-load on
+    // every PMULLW. Same store-to-load-forwarding pathology the
+    // StoreFPRSized and ScalarInsert paths already removed.
+    vxor(VTMP1, VTMP1, VTMP1);
+    vmladduhm(Dst, V1, V2, VTMP1);
     break;
   }
   default:
@@ -3865,25 +3858,22 @@ DEF_OP(VFMinScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // Lane 0 is merged by permute/select, not through the stack. The old path
+  // spent nine instructions (addi/stvx/addi/stvx/lwz/stw/lvx) and took two
+  // store-hit-loads to move one element; xxpermdi/xxsel do it in one or two.
+  // These are bitwise ops, so they also sidestep the SNaN canonicalisation
+  // that motivated the integer lwz/stw copy in the first place - a bit-exact
+  // merge, which is what MINSS/MINSD require.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec2, Vec1);          // mask = Vec2 > Vec1
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);    // guest f32 elem0 = BE word 3
   } else {
     xvcmpgtdp(VTMP1, Vec2, Vec1);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
+    xxpermdi (Dst, Vec1, VTMP1, 1);       // {Vec1.dw0, result.dw1}
   }
-  addi(TMP1, r1, -32);
-  stvx(Vec1,  r(0), TMP1);                 // [-32..-17] = Vec1
-  addi(TMP2, r1, -16);
-  stvx(VTMP1, r(0), TMP2);                 // [-16..-1]  = computed min
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lwz(TMP3, -16, r1);
-    stw(TMP3, -32, r1);
-  } else {
-    ld (TMP3, -16, r1);
-    std(TMP3, -32, r1);
-  }
-  lvx(Dst, r(0), TMP1);
 }
 
 DEF_OP(VFMaxScalarInsert) {
@@ -3891,25 +3881,18 @@ DEF_OP(VFMaxScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // Same lane-0 merge as VFMinScalarInsert: permute/select instead of a
+  // nine-instruction stack round trip with two store-hit-loads.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec1, Vec2);          // mask = Vec1 > Vec2
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
     xvcmpgtdp(VTMP1, Vec1, Vec2);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
+    xxpermdi (Dst, Vec1, VTMP1, 1);
   }
-  addi(TMP1, r1, -32);
-  stvx(Vec1,  r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(VTMP1, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lwz(TMP3, -16, r1);
-    stw(TMP3, -32, r1);
-  } else {
-    ld (TMP3, -16, r1);
-    std(TMP3, -32, r1);
-  }
-  lvx(Dst, r(0), TMP1);
 }
 DEF_OP(VFSqrtScalarInsert) {
   const auto Op   = IROp->C<IR::IROp_VFSqrtScalarInsert>();
@@ -3917,23 +3900,28 @@ DEF_OP(VFSqrtScalarInsert) {
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
+  // Vector domain, same shape as DEF_SCALAR_INSERT: splat the source element,
+  // one xv* sqrt, merge lane 0 back over Vec1.
+  //
+  // The old lowering was two stvx, then lfs/fsqrts/stfs in the SCALAR FPU
+  // domain, then lvx: eight instructions, two store-hit-loads, a VSU<->FPU
+  // domain crossing on the critical path, and - the expensive part - a scalar
+  // float op, which on POWER8 takes the ~22.8x denormal assist penalty that
+  // the xv* ops do not (measured op4k 2026-08-05, notes/denormal_bench.c).
+  //
+  // All lanes compute the same value, so the FPSCR sticky bits raised are
+  // exactly those of the one real computation, and rounding follows FPSCR.RN
+  // as the scalar op did.
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    fsqrts(f0, f0);
-    stfs(f0, -32, r1);
+    xxspltw (VTMP1, Vec2, 3);             // guest f32 elem0 = BE word 3
+    xvsqrtsp(VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
-    lfd(f0, -16, r1);
-    fsqrt(f0, f0);
-    stfd(f0, -32, r1);
+    xxpermdi(VTMP1, Vec2, Vec2, 3);       // guest f64 elem0 = BE dw1
+    xvsqrtdp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);        // {Vec1.dw0, result.dw1}
   }
-
-  // (Was previously `lvx(VTMP1, ...)` — bug: result never made it to Dst.)
-  lvx(Dst, r(0), TMP1);
 }
 // VFRSqrt / VFRecp scalar inserts.  x86 RSQRTSS / RCPSS produce ~12-bit
 // approximations; PPC frsqrtes/fres give similar-precision estimates.  For
@@ -3943,19 +3931,26 @@ DEF_OP(VFRSqrtScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // f32 is the only size x86 can reach here (RSQRTSS); vrsqrtefp is the
+  // vector-domain analogue of frsqrtes with the same estimate precision
+  // class, so the stack round trip and the scalar-FPU crossing both go.
+  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
+    xxspltw  (VTMP1, Vec2, 3);            // guest f32 elem0 = BE word 3
+    vrsqrtefp(VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel    (Dst, Vec1, VTMP1, VTMP2);
+    return;
+  }
+
+  // f64 has no x86 equivalent and no VSX double rsqrt-estimate encoder in
+  // this tree, so it keeps the scalar path.
   addi(TMP1, r1, -32);
   stvx(Vec1, r(0), TMP1);
   addi(TMP2, r1, -16);
   stvx(Vec2, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    frsqrtes(f0, f0);
-    stfs(f0, -32, r1);
-  } else {
-    lfd(f0, -16, r1);
-    frsqrte(f0, f0);
-    stfd(f0, -32, r1);
-  }
+  lfd(f0, -16, r1);
+  frsqrte(f0, f0);
+  stfd(f0, -32, r1);
   lvx(Dst, r(0), TMP1);
 }
 
@@ -3964,23 +3959,30 @@ DEF_OP(VFRecpScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
+  // f32 is the only size x86 can reach here (RCPSS); vrefp is the
+  // vector-domain analogue of fres with the same estimate precision class.
+  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
+    xxspltw(VTMP1, Vec2, 3);              // guest f32 elem0 = BE word 3
+    vrefp  (VTMP1, VTMP1);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel  (Dst, Vec1, VTMP1, VTMP2);
+    return;
+  }
+
+  // f64 has no x86 equivalent. It also is NOT an estimate here: PPC has no
+  // scalar f64 fre, so this computes an exact 1.0/x via fdiv. Keeping the
+  // scalar path preserves that precision - swapping in a double estimate
+  // would quietly downgrade it.
   addi(TMP1, r1, -32);
   stvx(Vec1, r(0), TMP1);
   addi(TMP2, r1, -16);
   stvx(Vec2, r(0), TMP2);
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    lfs(f0, -16, r1);
-    fres(f0, f0);
-    stfs(f0, -32, r1);
-  } else {
-    lfd(f0, -16, r1);
-    // PPC has no scalar f64 fre; use 1.0/x via fdiv.
-    LoadConstant(TMP3, 0x3FF0000000000000ULL); // 1.0 as f64
-    std(TMP3, -48, r1);
-    lfd(f1, -48, r1);
-    fdiv(f0, f1, f0);
-    stfd(f0, -32, r1);
-  }
+  lfd(f0, -16, r1);
+  LoadConstant(TMP3, 0x3FF0000000000000ULL); // 1.0 as f64
+  std(TMP3, -48, r1);
+  lfd(f1, -48, r1);
+  fdiv(f0, f1, f0);
+  stfd(f0, -32, r1);
   lvx(Dst, r(0), TMP1);
 }
 
@@ -3992,27 +3994,41 @@ DEF_OP(VFToFScalarInsert) {
   const auto Dst  = GetVReg(Node);
   const auto Vec1 = GetVReg(Op->Vector1);
   const auto Vec2 = GetVReg(Op->Vector2);
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
+
+  // Vector domain throughout: no red-zone traffic and no scalar-FPU crossing.
+  // Lane bookkeeping is the whole difficulty, because the VSX converts do not
+  // read or write the lane the guest keeps its scalar element in:
+  //   xvcvspdp reads single-precision from BE words 0 and 2
+  //   xvcvdpsp writes single-precision to  BE words 0 and 2
+  // while guest f32 element 0 is BE word 3 and guest f64 element 0 is BE dw1.
+  // A splat before (and after, for the narrowing case) reconciles the two.
   if (SrcES == IR::OpSize::i32Bit && DstES == IR::OpSize::i64Bit) {
-    // f32 → f64: lfs already promotes, stfd writes f64.
-    lfs(f0, -16, r1);
-    stfd(f0, -32, r1);
+    // f32 -> f64 (cvtss2sd). Splatting the guest element across all four words
+    // puts it in both lanes xvcvspdp reads, so both doublewords come out equal
+    // and dw1 is the value the merge wants.
+    xxspltw (VTMP1, Vec2, 3);
+    xvcvspdp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
   } else if (SrcES == IR::OpSize::i64Bit && DstES == IR::OpSize::i32Bit) {
-    // f64 → f32: lfd, frsp narrows, stfs writes 4 bytes (preserves elem 1+).
-    lfd(f0, -16, r1);
-    frsp(f0, f0);
-    stfs(f0, -32, r1);
+    // f64 -> f32 (cvtsd2ss). Splat dw1 into both doublewords, convert, then
+    // splat BE word 0 back across the register so the result also sits in
+    // word 3 where the merge reads it.
+    xxpermdi(VTMP1, Vec2, Vec2, 3);
+    xvcvdpsp(VTMP1, VTMP1);
+    xxspltw (VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel   (Dst, Vec1, VTMP1, VTMP2);
   } else {
-    // Same size — degenerate copy.
-    if (DstES == IR::OpSize::i32Bit) { lfs(f0, -16, r1); stfs(f0, -32, r1); }
-    else                              { lfd(f0, -16, r1); stfd(f0, -32, r1); }
+    // Same size: a lane copy, no conversion at all.
+    if (DstES == IR::OpSize::i32Bit) {
+      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+      xxsel(Dst, Vec1, Vec2, VTMP2);
+    } else {
+      xxpermdi(Dst, Vec1, Vec2, 1);
+    }
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VSToFVectorInsert: signed-int → float, source from FPR vector.
@@ -4024,43 +4040,43 @@ DEF_OP(VSToFVectorInsert) {
   const auto Vec2 = GetVReg(Op->Vector2);
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
   if (Op->HasTwoElements) {
-    // cvtpi2ps: convert two i32 → two f32, write to lower 64 bits of dst.
-    // Src elements 0,1 (4 bytes each) at -16, -12.
-    lwa(TMP3, -16, r1);  // sign-extend i32 elem0 → i64
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    fcfids(f0, f0);
-    stfs(f0, -32, r1);
-    lwa(TMP3, -12, r1);  // i32 elem1
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    fcfids(f0, f0);
-    stfs(f0, -28, r1);
-  } else {
-    // Single conversion: src element 0 of size SrcES → dst f-element 0 of DstES.
-    // Source path: load int as 64-bit signed in GPR, then mtfprd → fcfid(s).
-    if (SrcES == IR::OpSize::i32Bit) {
-      lwa(TMP3, -16, r1);              // sign-extend low 32 → i64
-    } else {
-      ld(TMP3, -16, r1);               // 64-bit
-    }
-    std(TMP3, -48, r1);
-    lfd(f0, -48, r1);
-    if (DstES == IR::OpSize::i32Bit) {
-      fcfids(f0, f0);
-      stfs(f0, -32, r1);
-    } else {
-      fcfid(f0, f0);
-      stfd(f0, -32, r1);
-    }
+    // cvtpi2ps: two i32 -> two f32 in the low 64 bits. xvcvsxwsp is lane-wise
+    // word->word, so both guest elements (BE words 2 and 3) convert in place
+    // with no permute at all, and one xxpermdi takes the whole low doubleword.
+    xvcvsxwsp(VTMP1, Vec2);
+    xxpermdi(Dst, Vec1, VTMP1, 1);      // {Vec1.dw0, both results}
+    return;
   }
-  lvx(Dst, r(0), TMP1);
+
+  if (SrcES == IR::OpSize::i32Bit) {
+    if (DstES == IR::OpSize::i32Bit) {
+      // i32 -> f32, lane-wise; the guest element stays in BE word 3.
+      xvcvsxwsp(VTMP1, Vec2);
+      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+      xxsel(Dst, Vec1, VTMP1, VTMP2);
+    } else {
+      // i32 -> f64. xvcvsxwdp reads BE words 0 and 2, so splat the guest
+      // element across the register first; both doublewords then match.
+      xxspltw(VTMP1, Vec2, 3);
+      xvcvsxwdp(VTMP1, VTMP1);
+      xxpermdi(Dst, Vec1, VTMP1, 1);
+    }
+    return;
+  }
+
+  // i64 source: splat dw1 so both lanes convert the guest element.
+  xxpermdi(VTMP1, Vec2, Vec2, 3);
+  if (DstES == IR::OpSize::i32Bit) {
+    // Single rounding, as in VSToFGPRInsert; results land in BE words 0 and 2.
+    xvcvsxdsp(VTMP1, VTMP1);
+    xxspltw(VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
+  } else {
+    xvcvsxddp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
+  }
 }
 
 // VSToFGPRInsert: GPR signed int → float, insert into Vec1[0].
@@ -4072,25 +4088,31 @@ DEF_OP(VSToFGPRInsert) {
   const auto DstES = Op->Header.ElementSize;
   const auto SrcES = Op->SrcElementSize;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec, r(0), TMP1);
-
-  // Move signed int from GPR → FPR via memory.
+  // GPR -> VSX directly with mtvsrd (ISA 2.07) instead of bouncing the value
+  // through the red zone and the scalar FPU.
   if (SrcES == IR::OpSize::i32Bit) {
-    extsw(TMP3, Src);          // sign-extend low 32 → 64
-    std(TMP3, -48, r1);
+    extsw(TMP3, Src);                   // sign-extend low 32 -> 64
+    mtvsrd(VTMP1, TMP3);
   } else {
-    std(Src, -48, r1);         // already 64-bit
+    mtvsrd(VTMP1, Src);
   }
-  lfd(f0, -48, r1);
+  // mtvsrd writes doubleword 0 and leaves doubleword 1 undefined; splat so
+  // both lanes convert the same value and no garbage lane can raise FP flags.
+  xxpermdi(VTMP1, VTMP1, VTMP1, 0);
+
   if (DstES == IR::OpSize::i32Bit) {
-    fcfids(f0, f0);
-    stfs(f0, -32, r1);
+    // xvcvsxdsp is i64 -> f32 with a SINGLE rounding. Converting via f64 and
+    // narrowing would round twice, which cvtsi2ss with a 64-bit source would
+    // expose. Results land in BE words 0 and 2, so splat word 0 across the
+    // register to reach word 3 where the guest element lives.
+    xvcvsxdsp(VTMP1, VTMP1);
+    xxspltw(VTMP1, VTMP1, 0);
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec, VTMP1, VTMP2);
   } else {
-    fcfid(f0, f0);
-    stfd(f0, -32, r1);
+    xvcvsxddp(VTMP1, VTMP1);
+    xxpermdi(Dst, Vec, VTMP1, 1);       // {Vec.dw0, result.dw1}
   }
-  lvx(Dst, r(0), TMP1);
 }
 
 // VFToIScalarInsert: float → signed integer with explicit rounding mode.
@@ -4160,57 +4182,80 @@ DEF_OP(VFCMPScalarInsert) {
   const auto ESize = Op->Header.ElementSize;
   const auto Pred = Op->Op;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(Vec2, r(0), TMP2);
-
-  if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
-    lfs(f1, -16, r1);
-  } else {
-    lfd(f0, -32, r1);
-    lfd(f1, -16, r1);
-  }
-  // cr(1) throughout: guest CMPSS/CMPSD writes NO EFLAGS, and CR0 holds the
-  // packed NZCV — clobbering it here corrupts a pending cmp/test's flags
-  // (Hard West wedged forever in a cmp → cmpltss → jne normalize loop).
-  fcmpu(cr(1), f0, f1);
-  // CR1: bit 4=LT (a<b), bit 5=GT (a>b), bit 6=EQ (a==b), bit 7=SO (NaN).
-  // Normalize predicate result into CR1.EQ (bit 6) so we can branch on it.
+  // Branchless, in the vector domain. The old lowering spilled both operands
+  // to the red zone, reloaded them into the scalar FPU, compared with fcmpu,
+  // normalised the predicate through CR1 bit twiddling, then took a
+  // conditional BRANCH to pick 0 vs -1, stored that into lane 0 of the
+  // spilled Vec1 and reloaded the whole vector: ~14 instructions, two
+  // store-hit-loads, a scalar-FPU domain crossing and an unpredictable branch
+  // on what is usually a data-dependent comparison.
+  //
+  // The vector float compares already produce exactly the all-ones/all-zeros
+  // per-lane mask x86 CMPSS/CMPSD wants, and they are elementwise, so lane 0
+  // of the result is computed from lane 0 of the inputs with no splat needed.
+  //
+  // As a bonus this no longer writes ANY condition register: the cr(1) dance
+  // existed to avoid clobbering CR0's packed NZCV (the Hard West
+  // cmp -> cmpltss -> jne wedge). That hazard is now structurally absent
+  // rather than merely relocated.
+  //
+  // Unordered predicates: a NaN operand fails every ordered compare, so
+  // ORD = (V1 == V1) && (V2 == V2), and UNO/NEQ are its complement / the
+  // complement of EQ.
+  const bool Is32 = ESize == IR::OpSize::i32Bit;
   switch (Pred) {
   case IR::FloatCompareOp::EQ:
-    /* CR1.EQ already correct */
+    if (Is32) { vcmpeqfp(VTMP1, Vec1, Vec2); } else { xvcmpeqdp(VTMP1, Vec1, Vec2); }
     break;
   case IR::FloatCompareOp::LT:
-    cror(6, 4, 4);   // EQ = LT
+    if (Is32) { vcmpgtfp(VTMP1, Vec2, Vec1); } else { xvcmpgtdp(VTMP1, Vec2, Vec1); }
     break;
   case IR::FloatCompareOp::LE:
-    cror(6, 4, 6);   // EQ = LT || EQ
-    break;
-  case IR::FloatCompareOp::UNO:
-    cror(6, 7, 7);   // EQ = SO
+    if (Is32) { vcmpgefp(VTMP1, Vec2, Vec1); } else { xvcmpgedp(VTMP1, Vec2, Vec1); }
     break;
   case IR::FloatCompareOp::NEQ:
-    crnor(6, 6, 6);  // EQ = !EQ
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec2);
+      vnor    (VTMP1, VTMP1, VTMP1);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec2);
+      xxlnor   (VTMP1, VTMP1, VTMP1);
+    }
     break;
   case IR::FloatCompareOp::ORD:
-    crnor(6, 7, 7);  // EQ = !SO
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec1);
+      vcmpeqfp(VTMP2, Vec2, Vec2);
+      vand    (VTMP1, VTMP1, VTMP2);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec1);
+      xvcmpeqdp(VTMP2, Vec2, Vec2);
+      xxland   (VTMP1, VTMP1, VTMP2);
+    }
+    break;
+  case IR::FloatCompareOp::UNO:
+    if (Is32) {
+      vcmpeqfp(VTMP1, Vec1, Vec1);
+      vcmpeqfp(VTMP2, Vec2, Vec2);
+      vand    (VTMP1, VTMP1, VTMP2);
+      vnor    (VTMP1, VTMP1, VTMP1);
+    } else {
+      xvcmpeqdp(VTMP1, Vec1, Vec1);
+      xvcmpeqdp(VTMP2, Vec2, Vec2);
+      xxland   (VTMP1, VTMP1, VTMP2);
+      xxlnor   (VTMP1, VTMP1, VTMP1);
+    }
     break;
   }
 
-  PPC64Emitter::Label done{};
-  li(TMP3, 0);
-  bc({4, 6}, &done);             // bne on CR1.EQ: skip if predicate false
-  li(TMP3, -1);                  // mask = all-ones
-  Bind(&done);
-
-  if (ESize == IR::OpSize::i32Bit) {
-    stw(TMP3, 0, TMP1);
+  // Merge the mask into element 0, upper elements from Vec1 - same lane-0
+  // merge as the arithmetic ScalarInsert path.
+  if (Is32) {
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+    xxsel(Dst, Vec1, VTMP1, VTMP2);
   } else {
-    std(TMP3, 0, TMP1);
+    xxpermdi(Dst, Vec1, VTMP1, 1);
   }
-  lvx(Dst, r(0), TMP1);
 }
 // FMA scalar inserts.  Semantics match VFMLA et al but only on element 0;
 // upper elements are copied from `Upper`.  Stack roundtrip per the
@@ -4222,7 +4267,28 @@ DEF_OP(VFCMPScalarInsert) {
 //   fnmadd : T = -(A*C + B) → -A*C - B    ("neg mul-add" → VFNMLS)
 //   fnmsub : T = -(A*C - B) → -A*C + B    ("neg mul-sub" → VFNMLA)
 // Note: fnmadd matches FEX's VFNMLS, and fnmsub matches FEX's VFNMLA.
-#define DEF_FMA_SCALAR_INSERT(NAME, FOP_S, FOP_D)                              \
+// Vector-domain lowering. The old one spilled FOUR vectors to the red zone
+// (Upper, V1, V2, Add), reloaded three of them into the scalar FPU, ran the
+// scalar FMA and stored the result back over the spilled Upper before
+// reloading the whole thing: thirteen instructions, four store-hit-loads, a
+// VSU<->FPU crossing, and - as with the rest of this family - a SCALAR float
+// op, which on POWER8 carries the ~22.8x denormal assist penalty that xv*
+// does not.
+//
+// Splat all three inputs so every lane computes the same value: the FPSCR
+// sticky bits raised are then exactly those of the one real computation, and
+// a single rounding is preserved because the FMA stays fused.
+//
+// Register pressure is the whole difficulty: three splatted operands must be
+// live at once and this backend has only VTMP1/VTMP2 (v30/v31). Dst supplies
+// the third, which is safe as long as Dst is not Upper - Upper has to survive
+// until the merge. Sequencing also matters: Add and V1 are splatted before Dst
+// is written, so Dst aliasing V1, V2 or Add is fine (each is already consumed,
+// and xxspltw reading and writing the same register is well defined).
+//
+// XT is the accumulator here, matching the non-scalar VFMLA path a few lines
+// up (Dst <- Add, then xvmaddasp(Dst, V1, V2) == V1*V2 + Add).
+#define DEF_FMA_SCALAR_INSERT(NAME, XVOP_S, XVOP_D, FOP_S, FOP_D)              \
 DEF_OP(NAME) {                                                                 \
   const auto Op    = IROp->C<IR::IROp_##NAME>();                               \
   const auto Dst   = GetVReg(Node);                                            \
@@ -4230,41 +4296,39 @@ DEF_OP(NAME) {                                                                 \
   const auto V1    = GetVReg(Op->Vector1);                                     \
   const auto V2    = GetVReg(Op->Vector2);                                     \
   const auto Add   = GetVReg(Op->Addend);                                      \
-  /* Spill Upper at -32 (becomes result base, preserves upper lanes). */       \
-  addi(TMP1, r1, -32);                                                         \
-  stvx(Upper, r(0), TMP1);                                                     \
-  /* Spill V1, V2, Add at -16, -48, -64 to read element 0. */                  \
-  addi(TMP2, r1, -16);                                                         \
-  stvx(V1, r(0), TMP2);                                                        \
-  addi(TMP3, r1, -48);                                                         \
-  stvx(V2, r(0), TMP3);                                                        \
-  addi(TMP4, r1, -64);                                                         \
-  stvx(Add, r(0), TMP4);                                                       \
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
-    lfs(f0, 0, TMP2);                                                          \
-    lfs(f1, 0, TMP3);                                                          \
-    lfs(f2, 0, TMP4);                                                          \
-    FOP_S(f0, f0, f1, f2);                                                     \
-    stfs(f0, 0, TMP1);                                                         \
+  const bool Is32  = Op->Header.ElementSize == IR::OpSize::i32Bit;             \
+                                                                               \
+  /* VTMP3_VSX supplies the third splat slot, so this is unconditional now -   \
+   * no Dst == Upper fallback and no red-zone traffic in any case. */          \
+  if (Is32) {                                                                  \
+    xxspltw(toVSX(VTMP1), toVSX(Add), 3);                                      \
+    xxspltw(toVSX(VTMP2), toVSX(V1), 3);                                       \
+    xxspltw(VTMP3_VSX, toVSX(V2), 3);                                          \
+    XVOP_S(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
+    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
+                        TMP1, TMP2);                                           \
+    xxsel(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), toVSX(VTMP2));               \
   } else {                                                                     \
-    lfd(f0, 0, TMP2);                                                          \
-    lfd(f1, 0, TMP3);                                                          \
-    lfd(f2, 0, TMP4);                                                          \
-    FOP_D(f0, f0, f1, f2);                                                     \
-    stfd(f0, 0, TMP1);                                                         \
+    xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                         \
+    xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                           \
+    xxpermdi(VTMP3_VSX, toVSX(V2), toVSX(V2), 3);                              \
+    XVOP_D(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
+    xxpermdi(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), 1);                       \
   }                                                                            \
-  lvx(Dst, r(0), TMP1);                                                        \
 }
 // fmadd(t,a,b,c)/fmsub etc per emitter signature: (t, fra, frc, frb).
 // PPC fmadd ISA: T = FRA*FRC + FRB → emitter call fmadd(t, a, c, b).
 // We pass: f0=V1, f1=V2, f2=Add → call fmadd(t, f0, f1, f2) emits
 //   fmadd FRT, FRA=f0, FRC=f1, FRB=f2  →  T = f0*f1 + f2 = V1*V2 + Add.  ✓
-DEF_FMA_SCALAR_INSERT(VFMLAScalarInsert,  fmadds,  fmadd)
-DEF_FMA_SCALAR_INSERT(VFMLSScalarInsert,  fmsubs,  fmsub)
+// Vector op pairing mirrors the non-scalar DEF_OP(VFMLA/VFMLS/VFNMLA/VFNMLS)
+// handlers exactly, so the FEX-vs-PPC naming inversion is inherited from a
+// path that is already proven rather than re-derived here.
+DEF_FMA_SCALAR_INSERT(VFMLAScalarInsert,  xvmaddasp,  xvmaddadp,  fmadds,  fmadd)
+DEF_FMA_SCALAR_INSERT(VFMLSScalarInsert,  xvmsubasp,  xvmsubadp,  fmsubs,  fmsub)
 // VFNMLA: -(V1*V2) + Add → fnmsub: -A*C + B = -V1*V2 + Add  ✓
-DEF_FMA_SCALAR_INSERT(VFNMLAScalarInsert, fnmsubs, fnmsub)
+DEF_FMA_SCALAR_INSERT(VFNMLAScalarInsert, xvnmsubasp, xvnmsubadp, fnmsubs, fnmsub)
 // VFNMLS: -(V1*V2) - Add → fnmadd: -(A*C+B) = -V1*V2 - Add  ✓
-DEF_FMA_SCALAR_INSERT(VFNMLSScalarInsert, fnmadds, fnmadd)
+DEF_FMA_SCALAR_INSERT(VFNMLSScalarInsert, xvnmaddasp, xvnmaddadp, fnmadds, fnmadd)
 #undef DEF_FMA_SCALAR_INSERT
 // VFCopySign — magnitude from V1, sign from V2.
 DEF_OP(VFCopySign) {

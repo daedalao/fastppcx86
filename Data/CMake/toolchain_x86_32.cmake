@@ -25,6 +25,16 @@ if (ENABLE_CLANG_THUNKS)
   # rootfs ships lib32-glibc / lib32-gcc-libs by default and provides both.
   if (X86_DEV_ROOTFS AND NOT X86_DEV_ROOTFS STREQUAL "/")
     set(CLANG_FLAGS "${CLANG_FLAGS} --sysroot=${X86_DEV_ROOTFS}")
+
+    # Arch (and other multilib distros) keep the 32-bit libc/libgcc under
+    # usr/lib32, which is not on clang's i686 search path — it looks in
+    # <sysroot>/usr/lib, where a multilib rootfs has the 64-bit ones. Without
+    # this the link fails with "unable to find library -lc" even though the
+    # rootfs does have them. Debian-style rootfs layouts are unaffected: the
+    # directory simply does not exist and nothing is added.
+    if (EXISTS "${X86_DEV_ROOTFS}/usr/lib32")
+      set(CLANG_FLAGS "${CLANG_FLAGS} -L${X86_DEV_ROOTFS}/usr/lib32 -B${X86_DEV_ROOTFS}/usr/lib32")
+    endif()
   endif()
 
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CLANG_FLAGS}")

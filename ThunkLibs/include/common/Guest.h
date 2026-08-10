@@ -101,14 +101,19 @@ inline void LinkAddressToFunction(uintptr_t addr, uintptr_t target) {
 }
 
 inline bool IsLibLoaded(const char* libname) {
+  // Field widths must match the host-side struct in Thunks.cpp, which is
+  // always compiled 64-bit. A bare `const char*` here puts `rv` at offset 4
+  // on an i686 guest while the host writes it at offset 8 — the host would
+  // scribble one byte past this struct and the guest would read padding.
+  // uintptr_t zero-extends on i686, so no sign-extension hazard.
   struct {
-    const char* Name;
-    bool rv;
-  } argsrv = {libname};
+    uint64_t Name;
+    uint8_t rv;
+  } argsrv = {reinterpret_cast<uintptr_t>(libname), 0};
 
   fexthunks_fex_is_lib_loaded(&argsrv);
 
-  return argsrv.rv;
+  return argsrv.rv != 0;
 }
 
 // Helper template that packs the given arguments and invokes a thunk at the
@@ -237,7 +242,14 @@ inline void RegisterCallbackUnpacker(const char* signature_name, uintptr_t guest
     uint64_t signature_name;
     uint64_t guest_unpacker;
   };
-  args_t args = {reinterpret_cast<uint64_t>(signature_name), guest_unpacker};
+  // Go through uintptr_t rather than casting the pointer straight to uint64_t.
+  // On i386 a direct reinterpret_cast<uint64_t> of a pointer sign-extends, so
+  // any guest address with the high bit set - which is where the guest's
+  // libraries actually live, e.g. 0xf777d020 - arrives at the host as
+  // 0xfffffffff777d020 and faults the moment the host dereferences it.
+  // uintptr_t is unsigned and exactly pointer-width on both guests, so widening
+  // from it is a plain zero-extension.
+  args_t args = {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(signature_name)), static_cast<uint64_t>(guest_unpacker)};
   fexthunks_fex_register_callback_unpacker(&args);
 }
 
@@ -249,11 +261,12 @@ inline void RegisterGuestCallbackUnpacker() {
 }
 
 inline bool IsHostHeapAllocation(void* ptr) {
+  // Same host/guest layout constraint as IsLibLoaded above.
   struct {
-    void* ptr;
-    bool rv;
-  } args = {ptr, {}};
+    uint64_t ptr;
+    uint8_t rv;
+  } args = {reinterpret_cast<uintptr_t>(ptr), 0};
 
   fexthunks_fex_is_host_heap_allocation(&args);
-  return args.rv;
+  return args.rv != 0;
 }

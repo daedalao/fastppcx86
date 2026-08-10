@@ -43,6 +43,25 @@ constexpr auto TMP4 = r6;
 constexpr auto VTMP1 = VR{30};
 constexpr auto VTMP2 = VR{31};
 
+// Third vector temporary, taken from the FPR-aliased half of the VSX file
+// (vs0-vs31) instead of the VMX pool, so it costs the register allocator
+// nothing. vs12 == f12, which this backend never names (only f0, f1, f2, f13
+// and f16 appear anywhere in the JIT).
+//
+// TWO RULES, both different from VTMP1/VTMP2:
+//
+//  1. VSX-form instructions ONLY (xx*, xv*, lxv, stxv). VMX-form ops - vperm,
+//     vsel, vcmp*, vmladduhm, lvx/stvx - have no bit to encode vs0-vs31 and
+//     physically cannot address it. This is enforced by type: the VSXR
+//     overloads exist only for VSX-form ops, so a wrong use fails to compile
+//     rather than silently encoding the wrong register.
+//
+//  2. NOT live across a host call. f12 is volatile under ELFv2 §2.2, unlike
+//     v30/v31 which are non-volatile and therefore survive calls. Signals are
+//     fine either way - delivery goes through the kernel, which saves and
+//     restores the whole register file, and resume is via sigreturn.
+constexpr auto VTMP3_VSX = VSXR{12};
+
 // -------------------------------------------------------------------------
 // ELFv2 volatility boundaries, plus the compile-time checks that keep each
 // mode's "which pool registers survive a host call" answer honest.

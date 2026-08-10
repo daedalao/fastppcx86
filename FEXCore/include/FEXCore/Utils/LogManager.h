@@ -7,6 +7,15 @@
 
 #include <fmt/format.h>
 #include <fmt/color.h>
+// fmt moved formatter<std::byte> out of format.h into std.h between 12.1.0 and
+// 12.2.0. FEX formats std::span<std::byte> (CodeCache's cache-validation
+// message uses fmt::join over one), so without this include the tree stops
+// compiling against any system fmt >= 12.2 with an unformattable-type error.
+// CMake's find_package(fmt QUIET) prefers the system copy over the bundled
+// submodule, so which one you get depends on the host -- hence a build that
+// works here and fails on a newer distro. fmt/std.h has existed for years, so
+// including it unconditionally is safe against both.
+#include <fmt/std.h>
 
 namespace LogMan {
 enum DebugLevels : uint32_t {

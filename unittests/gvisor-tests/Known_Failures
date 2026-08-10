@@ -238,11 +238,10 @@ poll_test
 # subtest fails.
 unlink_test
 
-# AbsAndRelTarget/ParamSymlinkTest.{CreatLinkCreatesTarget,OpenLinkCreatesTarget}/1
-# (relative-target variant) creates a symlink whose content is a relative
-# name, follows it via creat()/open() — which the kernel resolves relative
-# to the symlink's parent dir — then stat()s the relative name expecting
-# to find the just-created file. That only works if cwd happens to equal
-# the symlink's parent dir, which our test environment does not arrange.
-# /0 (absolute-target) variants pass; only the /1 variants fail.
-symlink_test
+# symlink_test used to fail on the relative-target variants
+# (AbsAndRelTarget/ParamSymlinkTest.{CreatLinkCreatesTarget,OpenLinkCreatesTarget}/1),
+# blamed on cwd not matching the symlink's parent dir. That diagnosis was
+# wrong: the real cause was /tmp resolving into the RootFS for lookups while
+# creation used the literal host path, so the symlink and the file it created
+# landed in different trees. With /tmp excluded from the overlay all 30
+# subtests pass, so the entry is removed rather than re-explained.

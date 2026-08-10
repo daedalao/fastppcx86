@@ -19,6 +19,17 @@ struct GPR  : Reg {};
 struct FPR  : Reg {};  // FPR0-FPR31 (also VSR0-VSR31 low 64 bits)
 struct VR   : Reg {};  // VMX v0-v31 (VSR32-VSR63)
 
+// Full VSX register file, vs0-vs63.
+//
+// vs32-vs63 alias the VMX registers v0-v31 (what VR names); vs0-vs31 alias the
+// FPRs f0-f31. Only VSX-form instructions (xx*, xv*, lxv, stxv) can reach the
+// low half - VMX-form ops (vperm, vsel, vcmp*, vmladduhm, lvx/stvx) have no
+// bit to encode it and are restricted to v0-v31 forever.
+//
+// This exists so the backend can use the otherwise-idle low bank for scratch
+// without taking a register away from the allocator's VMX pool.
+struct VSXR { uint32_t idx; };
+
 // Condition register fields CR0-CR7
 struct CRField { uint32_t idx; };
 
@@ -34,6 +45,9 @@ static constexpr GPR r(uint32_t n) { return GPR{{n}}; }
 static constexpr FPR f(uint32_t n) { return FPR{{n}}; }
 static constexpr VR  v(uint32_t n) { return VR {{n}}; }
 static constexpr CRField cr(uint32_t n) { return CRField{n}; }
+// vs0-vs63 by raw number, and the VMX-to-VSX mapping (v_n == vs_{32+n}).
+static constexpr VSXR vsx(uint32_t n) { return VSXR {n}; }
+static constexpr VSXR toVSX(VR r) { return VSXR {32u + r.idx}; }
 
 // Named GPRs
 namespace GPRegs {

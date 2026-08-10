@@ -75,11 +75,16 @@ ComputeDataLayout(const clang::ASTContext& context, const std::unordered_map<con
       auto field_type = field->getType().getTypePtr();
       std::optional<uint64_t> array_size;
       if (auto array_type = llvm::dyn_cast<clang::ConstantArrayType>(field->getType())) {
+        // A multi-dimensional array is contiguous elements of the innermost
+        // type, so for layout purposes it is a flat array of their product.
+        // Video codec structs use these (StdVideoVP9Segmentation::FeatureData
+        // is uint8_t[8][4]), and refusing them outright kept every video entry
+        // point off 32-bit.
         array_size = array_type->getSize().getZExtValue();
         field_type = array_type->getElementType().getTypePtr();
-        if (llvm::isa<clang::ConstantArrayType>(field_type)) {
-          throw std::runtime_error("Unsupported multi-dimensional array member \"" + field->getNameAsString() + "\" in type \"" +
-                                   clang::QualType {type, 0}.getAsString() + "\"");
+        while (auto inner = llvm::dyn_cast<clang::ConstantArrayType>(field_type)) {
+          array_size = *array_size * inner->getSize().getZExtValue();
+          field_type = inner->getElementType().getTypePtr();
         }
       }
 
@@ -309,7 +314,14 @@ TypeCompatibility DataLayoutCompareAction::GetTypeCompatibility(const clang::AST
         host_member_type = context.getCanonicalType(array_type->getElementType().getTypePtr());
       }
 
-      if (types.at(type).UsesCustomRepackFor(host_member_field)) {
+      // Hand-written repacking always implies the member needs repacking.
+      // An array_length_from member does not: where the pointee is fully
+      // compatible and pointers are the same width (64-bit), it needs no
+      // conversion at all, and forcing Repackable here degraded structs that
+      // were previously Full -- which broke 64-bit generation for types the
+      // annotation was only meant to help on 32-bit. Let those fall through to
+      // the pointer logic below, which decides based on the pointee.
+      if (types.at(type).UsesHandWrittenRepackFor(host_member_field->getNameAsString())) {
         member_compat.push_back(TypeCompatibility::Repackable);
         continue;
       } else if (host_member_type->isPointerType()) {
@@ -356,6 +368,13 @@ TypeCompatibility DataLayoutCompareAction::GetTypeCompatibility(const clang::AST
           if (pointee_compat == TypeCompatibility::Full) {
             // Pointee is fully compatible, so automatic repacking only requires converting the pointers themselves
             member_compat.push_back(is_32bit ? TypeCompatibility::Repackable : TypeCompatibility::Full);
+          } else if (pointee_compat == TypeCompatibility::Repackable && types.contains(type) &&
+                     types.at(type).ArrayLengthFor(guest_struct_info->members.at(member_idx).member_name)) {
+            // A repackable pointee is fine once the element count is known:
+            // the array is converted element-wise by generated code. Without
+            // the count this used to fall through to None, which is what made
+            // every function taking such a struct unrepresentable.
+            member_compat.push_back(TypeCompatibility::Repackable);
           } else {
             // If the pointee is incompatible (even if repackable), automatic repacking isn't possible
             member_compat.push_back(TypeCompatibility::None);

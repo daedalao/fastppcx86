@@ -240,8 +240,12 @@ template<>
 struct fex_gen_config<glXQueryVersion> {};
 template<>
 struct fex_gen_config<glXCopyContext> {};
+// custom_host_impl so the 32-bit context token registry can retire the handle.
+// A token that outlives its context resolves to freed memory, which is worse
+// than the truncation it replaced: Mesa used to reject a truncated context with
+// GLXBadContext, but a retired-yet-resolvable one it will happily dereference.
 template<>
-struct fex_gen_config<glXDestroyContext> {};
+struct fex_gen_config<glXDestroyContext> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXDestroyGLXPixmap> {};
 template<>
@@ -606,14 +610,32 @@ template<>
 struct fex_gen_config<glTestFenceNV> {};
 template<>
 struct fex_gen_config<glTestObjectAPPLE> {};
+// On 32-bit these copy the guest's staging buffer back into the real mapping
+// before unmapping it. See the glMapBuffer block further down and the
+// implementation in libGL_Host.cpp. 64-bit keeps the plain generated thunk.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glUnmapBufferARB> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glUnmapBuffer> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<glUnmapBufferARB> {};
 template<>
 struct fex_gen_config<glUnmapBuffer> {};
+#endif
 template<>
-struct fex_gen_config<glUnmapNamedBufferEXT> {};
+struct fex_gen_config<glUnmapNamedBufferEXT>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<glUnmapNamedBuffer> {};
+struct fex_gen_config<glUnmapNamedBuffer>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<glVDPAUIsSurfaceNV> {};
 template<>
@@ -1609,8 +1631,16 @@ template<>
 struct fex_gen_config<glDeleteShader> {};
 template<>
 struct fex_gen_config<glDeleteStatesNV> {};
+// custom_host_impl on 32-bit so the GLsync token registry can retire the handle
+// (see SyncRegistry in libGL_Host.cpp). A title that fences per frame creates a
+// sync object per frame, so without retiring, the registry grows for the life
+// of the process.
 template<>
-struct fex_gen_config<glDeleteSync> {};
+struct fex_gen_config<glDeleteSync>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<glDeleteTexturesEXT> {};
 template<>
@@ -3204,12 +3234,42 @@ template<>
 struct fex_gen_config<glMap2f> {};
 template<>
 struct fex_gen_config<glMap2xOES> {};
+// Buffer mapping returns a host pointer into the driver's mapped buffer object,
+// which does not fit a 32-bit guest slot (host VAs are 0x3fff'xxxx'xxxx here).
+//
+// These were briefly excluded from the 32-bit thunk on the theory that an
+// unresolved symbol beats silent corruption. That was wrong: it hard-breaks
+// titles outright. Psychonauts requires GL_ARB_vertex_buffer_object, fails to
+// resolve glMapBufferARB, and exits with "Missing required OpenGL extensions"
+// before it draws anything.
+//
+// Instead, 32-bit gets a custom host impl that stages the mapping through
+// guest-visible memory and copies back on unmap (see libGL_Host.cpp). 64-bit
+// keeps the plain generated thunk, so its codegen is untouched.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glMapBufferARB> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBufferARB, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapBuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBuffer, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapBufferRange> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapBufferRange, -1, void*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glMapBufferARB> {};
 template<>
 struct fex_gen_config<glMapBuffer> {};
 template<>
 struct fex_gen_config<glMapBufferRange> {};
+#endif
+// The matching unmaps are declared further up (near glUnmapBufferARB); on
+// 32-bit they are custom too, since that is where the guest's writes get copied
+// back into the real mapping.
 template<>
 struct fex_gen_config<glMapControlPointsNV> {};
 template<>
@@ -3224,6 +3284,28 @@ template<>
 struct fex_gen_config<glMapGrid2f> {};
 template<>
 struct fex_gen_config<glMapGrid2xOES> {};
+// Direct-state-access buffer mapping (GL 4.5 core + EXT_direct_state_access).
+// Same staging treatment as glMapBuffer above, keyed by buffer name. These are
+// core GL, not a vendor curiosity — leaving them unresolved on 32-bit shows up
+// as glXGetProcAddress misses in real titles.
+#ifdef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<glMapNamedBufferEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferEXT, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBuffer, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBufferRangeEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferRangeEXT, -1, void*> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_config<glMapNamedBufferRange> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<glMapNamedBufferRange, -1, void*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<glMapNamedBufferEXT> {};
 template<>
@@ -3232,14 +3314,24 @@ template<>
 struct fex_gen_config<glMapNamedBufferRangeEXT> {};
 template<>
 struct fex_gen_config<glMapNamedBufferRange> {};
+#endif
+#ifndef IS_32BIT_THUNK
+// glMapObjectBufferATI has no matching unmap that takes the same handle
+// (glUnmapObjectBufferATI exists but the ATI object-buffer model is separate
+// from GL buffer objects), so the staging scheme above does not apply. It is a
+// dead vendor extension; left 64-bit-only rather than guessed at.
 template<>
 struct fex_gen_config<glMapObjectBufferATI> {};
+#endif
 template<>
 struct fex_gen_config<glMapParameterfvNV> {};
 template<>
 struct fex_gen_config<glMapParameterivNV> {};
+#ifndef IS_32BIT_THUNK
+// TODO: 32-bit support — same truncated-host-pointer return as glMapBuffer above.
 template<>
 struct fex_gen_config<glMapTexture2DINTEL> {};
+#endif
 template<>
 struct fex_gen_config<glMapVertexAttrib1dAPPLE> {};
 template<>
@@ -3386,22 +3478,27 @@ template<>
 struct fex_gen_config<glMultiDrawArraysIndirect> {};
 template<>
 struct fex_gen_config<glMultiDrawElementArrayAPPLE> {};
-#ifndef IS_32BIT_THUNK
-// Needs manual handling: The type of this is actually int8_t**, int16_t**, or int32_t**, depending on the "type" argument
-// TODO: Do these values get copied or do they have to stay valid past the call?
+// The "indices" parameter is an array of `drawcount` pointers. On a 32-bit guest
+// those are 4 bytes each, so the array cannot be handed to the host as-is: it has
+// to be widened element by element. These used to be excluded from the 32-bit
+// thunk entirely, which made glXGetProcAddress("glMultiDrawElements") return null
+// — observed in a 32-bit Unity title's log as "not found glMultiDrawElements".
+//
+// Same shape as glShaderSource: ptr_passthrough hands the raw guest array to a
+// custom host impl, which widens on 32-bit and is a straight passthrough on
+// 64-bit (see libGL_Host.cpp).
 template<>
-struct fex_gen_config<glMultiDrawElementsBaseVertex> {};
+struct fex_gen_config<glMultiDrawElementsBaseVertex> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElementsBaseVertex, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glMultiDrawElementsBaseVertex, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glMultiDrawElementsEXT> {};
+struct fex_gen_config<glMultiDrawElementsEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElementsEXT, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glMultiDrawElementsEXT, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glMultiDrawElements> {};
+struct fex_gen_config<glMultiDrawElements> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glMultiDrawElements, 3, const void* const*> : fexgen::assume_compatible_data_layout {};
-#endif
+struct fex_gen_param<glMultiDrawElements, 3, const void* const*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<glMultiDrawElementsIndirectAMD> {};
 template<>
@@ -5240,17 +5337,17 @@ template<>
 struct fex_gen_config<glTransformFeedbackBufferRange> {};
 template<>
 struct fex_gen_config<glTransformFeedbackStreamAttribsNV> {};
-#ifndef IS_32BIT_THUNK
-// TODO
+// "varyings" is an array of `count` string pointers — same 32-bit widening
+// problem as glShaderSource, and previously excluded from the 32-bit thunk for
+// that reason ("not found glTransformFeedbackVaryings" in a 32-bit Unity log).
 template<>
-struct fex_gen_config<glTransformFeedbackVaryingsEXT> {};
+struct fex_gen_config<glTransformFeedbackVaryingsEXT> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glTransformFeedbackVaryingsEXT, 2, const char* const*> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_param<glTransformFeedbackVaryingsEXT, 2, const char* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glTransformFeedbackVaryings> {};
+struct fex_gen_config<glTransformFeedbackVaryings> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_param<glTransformFeedbackVaryings, 2, const char* const*> : fexgen::assume_compatible_data_layout {};
-#endif
+struct fex_gen_param<glTransformFeedbackVaryings, 2, const char* const*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<glTransformFeedbackVaryingsNV> {};
 template<>

@@ -5,6 +5,17 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 set(CMAKE_CXX_STANDARD 20)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
+# Pre-generated thunkgen output. The generated .inl encodes GUEST data
+# layouts, which thunkgen derives by parsing the interface with x86 targets
+# against real x86 glibc/libstdc++ headers. Without those headers the parse is
+# unsound -- against ppc64le glibc it produced silently different repack code
+# for libwayland-client and refused valid Vulkan structs -- so builds on hosts
+# without an x86 sysroot (i.e. end users) consume maintainer-generated .inl
+# files instead of running the generator. Expects
+# ${THUNKGEN_PREGEN_DIR}/gen_{32,64}/thunkgen_host_<name>.inl.
+set(THUNKGEN_PREGEN_DIR "" CACHE PATH
+    "Directory of pre-generated thunkgen host .inl files; skips the x86 interface parse")
+
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
@@ -76,6 +87,18 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(BITNESS_FLAGS "-for-32bit-guest")
   endif()
 
+  # Without an X86_DEV_ROOTFS the x86-target interface parses run against the
+  # host's glibc headers, and ppc64le glibc's <gnu/stubs.h> includes
+  # <gnu/stubs-32.h> for ANY target that does not define __powerpc64__ -- so
+  # both the x86_64 and the i686 parse die on a header only multilib glibc
+  # ships. The parse never links, so an empty stand-in is sufficient;
+  # -idirafter keeps it behind every real header, so a provided sysroot still
+  # wins.
+  set(THUNKGEN_COMPAT_DIR "${CMAKE_BINARY_DIR}/thunkgen-compat")
+  file(WRITE "${THUNKGEN_COMPAT_DIR}/gnu/stubs-32.h"
+    "/* Empty parse-only stand-in for the x86 multilib stubs header. */\n")
+  set(BITNESS_COMPAT_FLAGS "-idirafter${THUNKGEN_COMPAT_DIR}")
+
   # Only pass X86_DEV_GCC_TOOLCHAIN for 64-bit guest thunks. For 32-bit the
   # ct-ng x86_64 crosstool has no i686 libstdc++, and pointing thunkgen's
   # clang at it forces the header search there and skips the perfectly good
@@ -85,6 +108,17 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(THUNKGEN_GCC_TOOLCHAIN_ENV "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}")
   endif()
 
+  if (THUNKGEN_PREGEN_DIR)
+    set(PREGEN_FILE "${THUNKGEN_PREGEN_DIR}/gen_${GUEST_BITNESS}/thunkgen_host_${NAME}.inl")
+    if (NOT EXISTS "${PREGEN_FILE}")
+      message(FATAL_ERROR "THUNKGEN_PREGEN_DIR is set but ${PREGEN_FILE} is missing")
+    endif()
+    add_custom_command(
+      OUTPUT "${OUTFILE}"
+      DEPENDS "${PREGEN_FILE}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PREGEN_FILE}" "${OUTFILE}"
+      VERBATIM)
+  else()
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
@@ -96,8 +130,10 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
       # Expand include directories to space-separated list of -isystem parameters
       "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
       ${PPC_THUNKGEN_EXTRA_FLAGS}
+      ${BITNESS_COMPAT_FLAGS}
     VERBATIM
     COMMAND_EXPAND_LISTS)
+  endif()
 
   list(APPEND OUTPUTS "${OUTFILE}")
   set(GEN_${NAME} ${OUTPUTS} PARENT_SCOPE)
@@ -153,13 +189,14 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # add_host_lib(SDL2 ${GUEST_BITNESS})
   # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
 
+  # libdrm stays 64-bit-guest only until the 32-bit host-side work lands: the
+  # interface carries the repacking annotations but the matching
+  # fex_custom_repack_entry/exit and the guest-heap relocation for the
+  # host-allocated drmDevice/drmVersion returns are not implemented yet.
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
-
-  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(xshmfence ${GUEST_BITNESS})
 endforeach()
 
 # These libs support both guest bitnesses. Generating the 32-bit variants requires thunkgen to parse
@@ -175,6 +212,12 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
     add_host_lib(fex_thunk_test ${GUEST_BITNESS})
   endif()
+
+  # libxshmfence: 32-bit support added 2026-08-07 for the guest Mesa/DRI3 stack
+  # used by 32-bit Unity titles. Handles are translated through an opaque-handle
+  # token registry on 32-bit; see ThunkLibs/libxshmfence/Host.cpp.
+  generate(libxshmfence ${CMAKE_CURRENT_SOURCE_DIR}/../libxshmfence/libxshmfence_interface.cpp ${GUEST_BITNESS})
+  add_host_lib(xshmfence ${GUEST_BITNESS})
 
   generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
   target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)

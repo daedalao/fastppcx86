@@ -101,6 +101,18 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
         for (auto Prefix : LibPrefixes) {
           PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib"));
         }
+      } else {
+        // The mirror image of the above: Arch ships 32-bit libraries in /usr/lib32
+        // (with /lib32 symlinked to it), not in the "lib" folder this branch
+        // assumes for 32-bit. Without an explicit "lib32" entry the overlay map
+        // never matches, so a 32-bit guest loads the rootfs's own libGL/libvulkan
+        // and runs the entire Mesa driver stack under emulation - correct output,
+        // but the host GPU is never reached and the frame loop is CPU-bound.
+        // Measured on a 32-bit Unity title before this fix: ~99% of cycles in
+        // translated code with the GPU at ~5%.
+        for (auto Prefix : LibPrefixes) {
+          PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib32"));
+        }
       }
     }
 
@@ -463,6 +475,43 @@ fextl::string FileManager::GetHostPath(fextl::string& Path, bool AliasedOnly) co
   return ret;
 }
 
+// Volatile runtime directories that must never resolve into the RootFS.
+//
+// The RootFS is an overlay whose job is to supply guest binaries and libraries
+// the host cannot provide. These directories supply none of that - they hold
+// state created by the running process - and a RootFS image that happens to
+// ship them is actively harmful, because lookup and creation then disagree:
+//
+//   openat2(<rootfs>, "tmp", RESOLVE_IN_ROOT) = fd     lookup -> rootfs
+//   chmod("/tmp/foo", ...)                    = 0      creation -> host
+//   fchmodat(fd, "foo", ...)                  = ENOENT  and never meet
+//
+// The dirfd from the first line poisons every later relative *at() call on it,
+// and mkdirat through it creates INSIDE the rootfs - which is how a leaked
+// <rootfs>/tmp grows (541 entries on op4k). wineserver hits exactly this: it
+// stats /tmp/.wine-1000, finds the rootfs copy, then cannot mkdir its socket
+// directory at the literal path. <rootfs>/home had to be quarantined by hand
+// for the same reason - pressure-vessel bind-mounted it over the real /home
+// and hid the Steam install.
+//
+// Keeping these host-only makes lookup and creation agree by construction.
+static bool IsHostOnlyPath(const char* pathname) {
+  using namespace std::string_view_literals;
+  // Exact match, or a prefix followed by '/', so "/tmpfoo" is not caught.
+  constexpr std::string_view HostOnlyPrefixes[] = {
+    "/tmp"sv, "/var/tmp"sv, "/dev/shm"sv, "/run"sv, "/home"sv,
+  };
+
+  const std::string_view Path {pathname};
+  for (const auto Prefix : HostOnlyPrefixes) {
+    if (Path.size() >= Prefix.size() && Path.compare(0, Prefix.size(), Prefix) == 0 &&
+        (Path.size() == Prefix.size() || Path[Prefix.size()] == '/')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSymlink) const {
   if (!pathname ||                  // If no pathname
       pathname[0] != '/' ||         // If relative
@@ -473,6 +522,10 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
   auto thunkOverlay = ThunkOverlays.find(pathname);
   if (thunkOverlay != ThunkOverlays.end()) {
     return thunkOverlay->second;
+  }
+
+  if (IsHostOnlyPath(pathname)) {
+    return {};
   }
 
   const auto& RootFSPath = LDPath();
@@ -519,6 +572,12 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
   auto thunkOverlay = ThunkOverlays.find(pathname);
   if (thunkOverlay != ThunkOverlays.end()) {
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
+  }
+
+  // See IsHostOnlyPath: returning a rootfs dirfd for these is what breaks
+  // every subsequent relative *at() call made against it.
+  if (IsHostOnlyPath(pathname)) {
+    return NoEntry;
   }
 
   if (RootFSFD == AT_FDCWD) {

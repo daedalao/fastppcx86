@@ -298,9 +298,17 @@ DEF_OP(ExitFunction) {
   // Only for constant-target plain jumps with the knob on; every other exit
   // shape keeps the exact non-linking lowering below.
   // ---------------------------------------------------------------------
-  const bool Linkable =
-    ConstRIP && BlockLinkingEnabled &&
-    (Op->Hint == IR::BranchHint::None || Op->Hint == IR::BranchHint::Call);
+  // Plain jumps link whenever BlockLinkingEnabled. CALL exits additionally
+  // require CallLinkingEnabled (= BlockLinkingEnabled && !LazyLinkArmed):
+  // under FEX_SMCLAZYLINK the SMC scrub severs links constantly, and call-
+  // dense guests (32-bit Mono/Unity — Dex) then flood ExitFunctionLinkWith
+  // Record with relink-and-recompile on every call, a compile storm that
+  // throttles guest execution (measured on Dex load 2026-08-05). Under lazy
+  // linking, calls take the fast rldic L1 probe instead; the call-linking win
+  // is retained only where links actually stick (non-lazy configs).
+  const bool Linkable = ConstRIP &&
+    ((Op->Hint == IR::BranchHint::None && BlockLinkingEnabled) ||
+     (Op->Hint == IR::BranchHint::Call && CallLinkingEnabled));
   PPC64Emitter::Label* LinkPathLabel = nullptr;
   if (Linkable) {
     // Hoisted region: rip store + r0 re-zero, then the patch site. Both
