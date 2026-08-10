@@ -1279,8 +1279,70 @@ static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice 
 
 // Extensions we enable for our own use and must not report to the guest,
 // because the entry points they bring are not thunked for a 32-bit guest.
+// FEX_VK_HIDE_EXTENSIONS=<comma-separated names> removes extensions from what
+// the guest is allowed to see, on top of the ones we enable internally.
+//
+// This exists as a bisection tool. When a title faults inside the driver there
+// is no way to tell from the outside which extension's data we are marshalling
+// wrongly, and rebuilding the thunk per hypothesis is far too slow. Hiding one
+// makes the client take its fallback path, so a fault that disappears names the
+// culprit.
+static const std::vector<std::string>& ExtraHiddenExtensions() {
+  static const std::vector<std::string> List = [] {
+    std::vector<std::string> Ret;
+    const char* Env = getenv("FEX_VK_HIDE_EXTENSIONS");
+    if (!Env) {
+      return Ret;
+    }
+    std::string_view Rest {Env};
+    while (!Rest.empty()) {
+      auto Comma = Rest.find(',');
+      auto Name = Rest.substr(0, Comma);
+      if (!Name.empty()) {
+        Ret.emplace_back(Name);
+      }
+      if (Comma == std::string_view::npos) {
+        break;
+      }
+      Rest.remove_prefix(Comma + 1);
+    }
+    return Ret;
+  }();
+  return List;
+}
+
 static bool IsInternalOnlyExtension(std::string_view Name) {
-  return Name == VK_KHR_MAP_MEMORY_2_EXTENSION_NAME || Name == VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+  if (Name == VK_KHR_MAP_MEMORY_2_EXTENSION_NAME || Name == VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) {
+    return true;
+  }
+
+#ifdef IS_32BIT_THUNK
+  // VK_EXT_descriptor_buffer is not marshalled correctly for a 32-bit guest.
+  // VkDescriptorDataEXT is a union whose arms are pointers, and which arm is
+  // live is decided by VkDescriptorGetInfoEXT::type, so the descriptor the
+  // driver ends up reading is assembled from guest pointers that were never
+  // widened for the ones we do not special-case.
+  //
+  // Measured with Dex (32-bit D3D11 via DXVK): with the extension advertised
+  // the GPU takes an SQC (data) read fault at an unmapped address ~40s in and
+  // the gfx ring is reset; with it hidden, none across repeated runs. DXVK
+  // gates on the extension being present, so hiding it makes it take the
+  // descriptor-set path, which is marshalled correctly.
+  //
+  // Advertising support we cannot honour is the bug; this is not a per-title
+  // workaround. FEX_VK_ENABLE_DESCRIPTOR_BUFFER=1 re-enables it for whoever
+  // fixes the union repacking.
+  if (Name == VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME && !getenv("FEX_VK_ENABLE_DESCRIPTOR_BUFFER")) {
+    return true;
+  }
+#endif
+
+  for (const auto& Hidden : ExtraHiddenExtensions()) {
+    if (Name == Hidden) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static bool DeviceSupportsPlacedMaps(VkPhysicalDevice PhysicalDevice) {
