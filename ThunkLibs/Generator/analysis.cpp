@@ -366,15 +366,32 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
           }
           // Add member to its list of members
           if (length_member) {
-            // Only struct elements need element-wise conversion. An array of
-            // enums, handles or builtins has the same layout on both sides, so
-            // the ordinary pointer handling already covers it -- and emitting
-            // element-wise code for those would reference layout wrappers that
-            // are never generated for non-struct types. Recording nothing here
-            // leaves such a member on exactly the path it used before.
-            if (annotated_member->getType()->getPointeeType()->isStructureType()) {
-              repack_info_it->second.array_length_members.emplace(annotated_member->getNameAsString(), length_member->getNameAsString());
+            auto pointee = annotated_member->getType()->getPointeeType();
+
+            // Elements are converted into scratch storage that is released on
+            // exit, and the generated exit path deliberately does not write
+            // pointer members back into guest memory. For an array the driver
+            // fills in, that silently discards the result: the guest keeps its
+            // own untouched buffer and never learns anything went wrong.
+            // Refuse rather than generate that.
+            if (!pointee.isConstQualified()) {
+              throw report_error(template_arg_loc, "array_length_from requires a const pointee: a driver-filled output array needs "
+                                                   "custom_repack, which can write elements back to the guest");
             }
+
+            // Only struct elements need element-wise conversion. Arrays of
+            // enums, handles or builtins have the same layout on both sides,
+            // so the annotation would do nothing -- and emitting element-wise
+            // code for them would reference layout wrappers that are never
+            // generated for non-struct types. Silently ignoring these made the
+            // interface file read as if those members were handled; say so
+            // instead.
+            if (!pointee->isStructureType()) {
+              throw report_error(template_arg_loc, "array_length_from is only meaningful for arrays of struct elements; arrays of "
+                                                   "builtins, enums or handles need no element-wise conversion");
+            }
+
+            repack_info_it->second.array_length_members.emplace(annotated_member->getNameAsString(), length_member->getNameAsString());
           } else {
             repack_info_it->second.custom_repacked_members.insert(annotated_member->getNameAsString());
           }

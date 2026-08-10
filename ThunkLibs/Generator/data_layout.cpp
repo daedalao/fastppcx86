@@ -368,7 +368,8 @@ TypeCompatibility DataLayoutCompareAction::GetTypeCompatibility(const clang::AST
           if (pointee_compat == TypeCompatibility::Full) {
             // Pointee is fully compatible, so automatic repacking only requires converting the pointers themselves
             member_compat.push_back(is_32bit ? TypeCompatibility::Repackable : TypeCompatibility::Full);
-          } else if (pointee_compat == TypeCompatibility::Repackable && types.at(type).ArrayLengthFor(guest_struct_info->members.at(member_idx).member_name)) {
+          } else if (pointee_compat == TypeCompatibility::Repackable && types.contains(type) &&
+                     types.at(type).ArrayLengthFor(guest_struct_info->members.at(member_idx).member_name)) {
             // A repackable pointee is fine once the element count is known:
             // the array is converted element-wise by generated code. Without
             // the count this used to fall through to None, which is what made

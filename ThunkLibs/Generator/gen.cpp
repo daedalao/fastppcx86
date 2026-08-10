@@ -363,6 +363,13 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
         // host_layout<T> has no default constructor (it only converts from
         // guest_layout<T>), so the array cannot be new[]'d -- allocate raw
         // storage and construct in place instead.
+        // count comes from guest memory, so sizeof * count can wrap and the
+        // loop below would then write count elements into a short allocation.
+        fmt::print(file, "{}    if (count > SIZE_MAX / sizeof(host_layout<{}>)) {{\n", indent, element_name);
+        fmt::print(file, "{}      fprintf(stderr, \"FATAL: implausible array length %zu for {}::{}\\n\", count);\n", indent, struct_name,
+                   member_name);
+        fmt::print(file, "{}      __builtin_trap();\n", indent);
+        fmt::print(file, "{}    }}\n", indent);
         fmt::print(file, "{}    auto* host_elements = static_cast<host_layout<{}>*>(::operator new[](sizeof(host_layout<{}>) * count));\n",
                    indent, element_name, element_name);
         fmt::print(file, "{}    for (size_t i = 0; i < count; ++i) {{\n", indent);
@@ -397,7 +404,11 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
         auto element_type = member->getType()->getPointeeType();
         auto element_name = element_type.getUnqualifiedType().getAsString();
         fmt::print(file, "{}{{\n", indent);
-        fmt::print(file, "{}  const size_t count = into.data.{}.data;\n", indent, *count_name);
+        // The count comes from the host struct, which captured it during entry
+        // conversion. Re-reading into.data (guest memory) would take a second
+        // look at a guest-writable field across the driver call, and a count
+        // that grew in between would walk off the end of the scratch array.
+        fmt::print(file, "{}  const size_t count = from.data.{};\n", indent, *count_name);
         fmt::print(file, "{}  auto* host_elements = reinterpret_cast<host_layout<{}>*>(const_cast<{}*>(from.data.{}));\n", indent, element_name,
                    element_name, member_name);
         fmt::print(file, "{}  if (host_elements) {{\n", indent);
@@ -442,7 +453,17 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
       fmt::print(file, "  const bool handled = fex_custom_repack_exit(into, from);\n");
       emit_array_repack_exit("  ");
-      fmt::print(file, "  return handled{};\n", has_array_members ? " || true" : "");
+      if (has_array_members) {
+        // Annotated members hold host pointers that the automatic exit path
+        // would write straight back into guest memory, so exit is always fully
+        // handled for these structs and the hook cannot downgrade that. Said
+        // explicitly rather than as "handled || true", which read as if the
+        // hook's answer mattered.
+        fmt::print(file, "  static_cast<void>(handled);\n");
+        fmt::print(file, "  return true;\n");
+      } else {
+        fmt::print(file, "  return handled;\n");
+      }
       fmt::print(file, "}}\n");
     }
 

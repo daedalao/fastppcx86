@@ -727,8 +727,12 @@ template<>
 struct fex_gen_config<&VkGeometryNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGeometryTrianglesNV::pNext> : fexgen::custom_repack {};
-template<>
-struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
+// template<>
+// struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGraphicsPipelineCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -981,12 +985,20 @@ template<>
 struct fex_gen_config<&VkPartitionedAccelerationStructureFlagsNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPartitionedAccelerationStructureInstancesInputNV::pNext> : fexgen::custom_repack {};
-template<>
-struct fex_gen_config<&VkPastPresentationTimingEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
+// template<>
+// struct fex_gen_config<&VkPastPresentationTimingEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPastPresentationTimingInfoEXT::pNext> : fexgen::custom_repack {};
-template<>
-struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
+// template<>
+// struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPerformanceConfigurationAcquireInfoINTEL::pNext> : fexgen::custom_repack {};
 template<>
@@ -2731,10 +2743,6 @@ struct fex_gen_type<wl_surface> : fexgen::opaque_type {};
 
 // --- array_length_from annotations (generated from vk.xml) ---
 template<>
-struct fex_gen_config<&VkSwapchainTimeDomainPropertiesEXT::pTimeDomains> : fexgen::array_length_from<&VkSwapchainTimeDomainPropertiesEXT::timeDomainCount> {};
-template<>
-struct fex_gen_config<&VkSwapchainTimeDomainPropertiesEXT::pTimeDomainIds> : fexgen::array_length_from<&VkSwapchainTimeDomainPropertiesEXT::timeDomainCount> {};
-template<>
 struct fex_gen_config<&VkRayTracingPipelineCreateInfoKHR::pStages> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoKHR::stageCount> {};
 template<>
 struct fex_gen_config<&VkRayTracingPipelineCreateInfoKHR::pGroups> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoKHR::groupCount> {};
@@ -2745,43 +2753,17 @@ struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoEXT::pTokens> : fexgen:
 template<>
 struct fex_gen_config<&VkDecompressMemoryInfoEXT::pRegions> : fexgen::array_length_from<&VkDecompressMemoryInfoEXT::regionCount> {};
 template<>
-struct fex_gen_config<&VkDataGraphPipelinePropertyQueryResultARM::pData> : fexgen::array_length_from<&VkDataGraphPipelinePropertyQueryResultARM::dataSize> {};
-template<>
 struct fex_gen_config<&VkDataGraphPipelineCreateInfoARM::pResourceInfos> : fexgen::array_length_from<&VkDataGraphPipelineCreateInfoARM::resourceInfoCount> {};
-template<>
-struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pTimings> : fexgen::array_length_from<&VkGetLatencyMarkerInfoNV::timingCount> {};
-template<>
-struct fex_gen_config<&VkShaderCreateInfoEXT::pCode> : fexgen::array_length_from<&VkShaderCreateInfoEXT::codeSize> {};
-template<>
-struct fex_gen_config<&VkShaderCreateInfoEXT::pSetLayouts> : fexgen::array_length_from<&VkShaderCreateInfoEXT::setLayoutCount> {};
 template<>
 struct fex_gen_config<&VkShaderCreateInfoEXT::pPushConstantRanges> : fexgen::array_length_from<&VkShaderCreateInfoEXT::pushConstantRangeCount> {};
 template<>
 struct fex_gen_config<&VkCopyTensorInfoARM::pRegions> : fexgen::array_length_from<&VkCopyTensorInfoARM::regionCount> {};
 template<>
-struct fex_gen_config<&VkTensorCopyARM::pSrcOffset> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
-template<>
-struct fex_gen_config<&VkTensorCopyARM::pDstOffset> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
-template<>
-struct fex_gen_config<&VkTensorCopyARM::pExtent> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
-template<>
-struct fex_gen_config<&VkTensorCreateInfoARM::pQueueFamilyIndices> : fexgen::array_length_from<&VkTensorCreateInfoARM::queueFamilyIndexCount> {};
-template<>
 struct fex_gen_config<&VkMicromapBuildInfoEXT::pUsageCounts> : fexgen::array_length_from<&VkMicromapBuildInfoEXT::usageCountsCount> {};
 template<>
 struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pTokens> : fexgen::array_length_from<&VkIndirectCommandsLayoutCreateInfoNV::tokenCount> {};
 template<>
-struct fex_gen_config<&VkIndirectCommandsLayoutTokenNV::pIndexTypes> : fexgen::array_length_from<&VkIndirectCommandsLayoutTokenNV::indexTypeCount> {};
-template<>
-struct fex_gen_config<&VkIndirectCommandsLayoutTokenNV::pIndexTypeValues> : fexgen::array_length_from<&VkIndirectCommandsLayoutTokenNV::indexTypeCount> {};
-template<>
-struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pStreamStrides> : fexgen::array_length_from<&VkIndirectCommandsLayoutCreateInfoNV::streamCount> {};
-template<>
 struct fex_gen_config<&VkGeneratedCommandsInfoNV::pStreams> : fexgen::array_length_from<&VkGeneratedCommandsInfoNV::streamCount> {};
-template<>
-struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pPresentationTimings> : fexgen::array_length_from<&VkPastPresentationTimingPropertiesEXT::presentationTimingCount> {};
-template<>
-struct fex_gen_config<&VkPastPresentationTimingEXT::pPresentStages> : fexgen::array_length_from<&VkPastPresentationTimingEXT::presentStageCount> {};
 template<>
 struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pStages> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoNV::stageCount> {};
 template<>
@@ -2789,27 +2771,13 @@ struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pGroups> : fexgen::arra
 template<>
 struct fex_gen_config<&VkAccelerationStructureInfoNV::pGeometries> : fexgen::array_length_from<&VkAccelerationStructureInfoNV::geometryCount> {};
 template<>
-struct fex_gen_config<&VkValidationCacheCreateInfoEXT::pInitialData> : fexgen::array_length_from<&VkValidationCacheCreateInfoEXT::initialDataSize> {};
-template<>
 struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pQueueLabels> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::queueLabelCount> {};
 template<>
 struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pCmdBufLabels> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::cmdBufLabelCount> {};
 template<>
 struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pObjects> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::objectCount> {};
 template<>
-struct fex_gen_config<&VkDebugUtilsObjectTagInfoEXT::pTag> : fexgen::array_length_from<&VkDebugUtilsObjectTagInfoEXT::tagSize> {};
-template<>
-struct fex_gen_config<&VkCuLaunchInfoNVX::pParams> : fexgen::array_length_from<&VkCuLaunchInfoNVX::paramCount> {};
-template<>
-struct fex_gen_config<&VkCuLaunchInfoNVX::pExtras> : fexgen::array_length_from<&VkCuLaunchInfoNVX::extraCount> {};
-template<>
-struct fex_gen_config<&VkCuModuleCreateInfoNVX::pData> : fexgen::array_length_from<&VkCuModuleCreateInfoNVX::dataSize> {};
-template<>
-struct fex_gen_config<&VkDebugMarkerObjectTagInfoEXT::pTag> : fexgen::array_length_from<&VkDebugMarkerObjectTagInfoEXT::tagSize> {};
-template<>
 struct fex_gen_config<&VkVideoEncodeInfoKHR::pReferenceSlots> : fexgen::array_length_from<&VkVideoEncodeInfoKHR::referenceSlotCount> {};
-template<>
-struct fex_gen_config<&VkPipelineExecutableInternalRepresentationKHR::pData> : fexgen::array_length_from<&VkPipelineExecutableInternalRepresentationKHR::dataSize> {};
 template<>
 struct fex_gen_config<&VkVideoDecodeInfoKHR::pReferenceSlots> : fexgen::array_length_from<&VkVideoDecodeInfoKHR::referenceSlotCount> {};
 template<>
@@ -4240,8 +4208,10 @@ struct fex_gen_config<vkGetSwapchainTimingPropertiesEXT> {};
 template<>
 struct fex_gen_config<vkGetSwapchainTimeDomainPropertiesEXT> {};
 #endif
+#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetPastPresentationTimingEXT> {};
+#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkInitializePerformanceApiINTEL> {};
@@ -4641,8 +4611,10 @@ template<>
 struct fex_gen_config<vkLatencySleepNV> {};
 template<>
 struct fex_gen_config<vkSetLatencyMarkerNV> {};
+#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetLatencyTimingsNV> {};
+#endif
 template<>
 struct fex_gen_config<vkQueueNotifyOutOfBandNV> {};
 template<>
