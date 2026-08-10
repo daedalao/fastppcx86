@@ -604,7 +604,19 @@ endif()
 
 if (BUILD_THUNKS)
   set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
-  add_subdirectory(ThunkLibs/Generator)
+
+  # Declared here (rather than at first use below) so the Generator decision
+  # can see them.
+  option(BUILD_GUEST_THUNKS "Build x86_64 guest stub libraries via ExternalProject" ON)
+  option(BUILD_GUEST_THUNKS_32 "Build 32-bit guest stub libraries via ExternalProject" ON)
+
+  # With pre-generated host .inl files and no guest-side builds, nothing runs
+  # the generator, so don't require libclang for it.
+  set(THUNKGEN_PREGEN_DIR "" CACHE PATH
+      "Directory of pre-generated thunkgen host .inl files; skips the x86 interface parse")
+  if (NOT THUNKGEN_PREGEN_DIR OR BUILD_GUEST_THUNKS OR BUILD_GUEST_THUNKS_32)
+    add_subdirectory(ThunkLibs/Generator)
+  endif()
 
   # Thunk targets for both host libraries and IDE integration
   add_subdirectory(ThunkLibs/HostLibs)
@@ -623,15 +635,13 @@ if (BUILD_THUNKS)
     message(STATUS "Skipping guest-thunk IDE targets: host ${CMAKE_HOST_SYSTEM_PROCESSOR} cannot assemble x86 thunk trampolines")
   endif()
 
-  # Optionally cross-build the actual guest-side stub libraries. Disable on
-  # hosts without an x86_64 cross-compile chain and ship in pre-built guest
-  # stubs separately.
-  option(BUILD_GUEST_THUNKS "Build x86_64 guest stub libraries via ExternalProject" ON)
-  # The 32-bit stubs need a separate i686 cross chain, which is far less widely
-  # packaged than the x86_64 one (e.g. Arch on POWER8 ships x86_64-pc-linux-gnu
-  # but no i686-linux-gnu). Keep it independently switchable so a missing i686
-  # chain doesn't take the 64-bit thunks down with it.
-  option(BUILD_GUEST_THUNKS_32 "Build 32-bit guest stub libraries via ExternalProject" ON)
+  # The guest-side stub libraries are optionally cross-built here. Disable on
+  # hosts without an x86_64 cross-compile chain and ship pre-built guest stubs
+  # separately. The 32-bit stubs need a separate i686 cross chain, which is
+  # far less widely packaged than the x86_64 one (e.g. Arch on POWER8 ships
+  # x86_64-pc-linux-gnu but no i686-linux-gnu), so it is independently
+  # switchable: a missing i686 chain doesn't take the 64-bit thunks down with
+  # it. Both option() declarations moved up next to the Generator decision.
 
   # The guest stubs are built with gcc even when the host thunks use clang.
   #

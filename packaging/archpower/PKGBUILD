@@ -27,13 +27,17 @@ arch=('powerpc64le')
 url='https://github.com/daedalao/fastppcx86'
 license=('MIT')
 
-# The guest-thunk artifact is regenerated (and this pin bumped) whenever a
-# ThunkLibs interface changes; guest and host halves are generated from the
-# same interface description and must move together. Release recipe:
-#   Scripts/make-guest-thunks-release.sh  (or: tar the build's Guest{,_32}
-#   dirs as GuestThunks{,_32} and `gh release create guest-thunks-<sha>`)
+# The guest-thunk artifact carries the guest .so stubs (GuestThunks{,_32}/)
+# AND the pre-generated host .inl files (HostGen/gen_{32,64}/) -- thunkgen
+# needs real x86 headers to derive guest layouts, which end-user build boxes
+# lack. Regenerate the artifact (and bump this pin) whenever a ThunkLibs
+# interface changes; guest and host halves are generated from the same
+# interface description and must move together. Release recipe: from a full
+# thunk build, tar Guest/ and Guest_32/ as GuestThunks{,_32}/ plus
+# ThunkLibs/HostLibs/gen_{32,64}/ as HostGen/, then
+# `gh release create guest-thunks-<sha> <tarball>`.
 _guest_thunks_ver=27218fa
-_guest_thunks_sha256=02930ff58ee34661f4c0a062b9a39ca2724ad7b6523d1c51ceed6108895b9146
+_guest_thunks_sha256=e49ebad90db6df7f0a68f98f285d448adbc9f4b82b8210a256cc726e5c7c9f98
 
 # Runtime: fmt is linked as a shared library (the build prefers the system copy
 # over External/fmt); the Qt6 bits are only needed by the FEXConfig GUI.
@@ -162,6 +166,7 @@ build() {
     -DBUILD_THUNKS=ON \
     -DBUILD_GUEST_THUNKS=OFF \
     -DBUILD_GUEST_THUNKS_32=OFF \
+    -DTHUNKGEN_PREGEN_DIR="$srcdir/fastppcx86-guest-thunks-${_guest_thunks_ver}/HostGen" \
     -DBUILD_FEXCONFIG=ON \
     -DENABLE_LTO=OFF \
     -DENABLE_CCACHE=OFF \

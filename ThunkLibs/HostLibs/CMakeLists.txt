@@ -5,6 +5,17 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 set(CMAKE_CXX_STANDARD 20)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
+# Pre-generated thunkgen output. The generated .inl encodes GUEST data
+# layouts, which thunkgen derives by parsing the interface with x86 targets
+# against real x86 glibc/libstdc++ headers. Without those headers the parse is
+# unsound -- against ppc64le glibc it produced silently different repack code
+# for libwayland-client and refused valid Vulkan structs -- so builds on hosts
+# without an x86 sysroot (i.e. end users) consume maintainer-generated .inl
+# files instead of running the generator. Expects
+# ${THUNKGEN_PREGEN_DIR}/gen_{32,64}/thunkgen_host_<name>.inl.
+set(THUNKGEN_PREGEN_DIR "" CACHE PATH
+    "Directory of pre-generated thunkgen host .inl files; skips the x86 interface parse")
+
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
@@ -97,6 +108,17 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(THUNKGEN_GCC_TOOLCHAIN_ENV "FEX_THUNKGEN_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}")
   endif()
 
+  if (THUNKGEN_PREGEN_DIR)
+    set(PREGEN_FILE "${THUNKGEN_PREGEN_DIR}/gen_${GUEST_BITNESS}/thunkgen_host_${NAME}.inl")
+    if (NOT EXISTS "${PREGEN_FILE}")
+      message(FATAL_ERROR "THUNKGEN_PREGEN_DIR is set but ${PREGEN_FILE} is missing")
+    endif()
+    add_custom_command(
+      OUTPUT "${OUTFILE}"
+      DEPENDS "${PREGEN_FILE}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PREGEN_FILE}" "${OUTFILE}"
+      VERBATIM)
+  else()
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
@@ -111,6 +133,7 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
       ${BITNESS_COMPAT_FLAGS}
     VERBATIM
     COMMAND_EXPAND_LISTS)
+  endif()
 
   list(APPEND OUTPUTS "${OUTFILE}")
   set(GEN_${NAME} ${OUTPUTS} PARENT_SCOPE)
