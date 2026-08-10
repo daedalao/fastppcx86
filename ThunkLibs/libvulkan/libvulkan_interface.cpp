@@ -103,10 +103,16 @@ struct fex_gen_type<VkDebugReportCallbackCreateInfoEXT> : fexgen::emit_layout_wr
 
 // Nothing else references these by value, so the generator does not emit
 // layouts for them unless asked.
+#ifdef IS_32BIT_THUNK
+// 32-bit only: these exist to bridge a layout difference that does not exist on
+// 64-bit, and forcing wrappers there makes VkPipelineShaderStageCreateInfo
+// non-compatible, which cascades into VkComputePipelineCreateInfo (it embeds a
+// stage by value) and stops the 64-bit thunk generating at all.
 template<>
 struct fex_gen_type<VkSpecializationMapEntry> : fexgen::emit_layout_wrappers {};
 template<>
 struct fex_gen_type<VkSpecializationInfo> : fexgen::emit_layout_wrappers {};
+#endif
 #ifdef IS_32BIT_THUNK
 template<>
 struct fex_gen_type<VkBindSparseInfo> : fexgen::emit_layout_wrappers {};
@@ -4472,13 +4478,7 @@ template<>
 struct fex_gen_param<vkQueueBindSparse, 2, const VkBindSparseInfo*> : fexgen::ptr_passthrough {};
 #endif
 
-#ifdef IS_32BIT_THUNK
-// Filters the extensions we enable internally out of what the guest sees.
-template<>
-struct fex_gen_config<vkEnumerateDeviceExtensionProperties> : fexgen::custom_host_impl {};
-template<>
-struct fex_gen_param<vkEnumerateDeviceExtensionProperties, 3, VkExtensionProperties*> : fexgen::ptr_passthrough {};
-#endif
+
 
 // Not restored, and why:
 //   vkGetDeviceImageSubresourceLayoutKHR: VkDeviceImageSubresourceInfo has no
@@ -4486,6 +4486,26 @@ struct fex_gen_param<vkEnumerateDeviceExtensionProperties, 3, VkExtensionPropert
 //   vkGet*OpaqueCaptureDescriptorDataEXT write through an unannotated void*.
 // Both are descriptor-buffer/secondary-command-buffer paths DXVK loads but does
 // not use on this driver; they stay null until something actually calls them.
+#endif
+
+// vkEnumerateDeviceExtensionProperties.
+//
+// At namespace scope deliberately: an earlier version put this pair inside the
+// 32-bit block above, so the #else branch required IS_32BIT_THUNK to be both
+// defined and undefined and never compiled. The 64-bit guest thunk lost the
+// symbol entirely, and Proton's guest-side Python resolves it out of
+// libvulkan.so.1 before launching anything -- so every 64-bit title died at
+// startup with "undefined symbol: vkEnumerateDeviceExtensionProperties".
+#ifdef IS_32BIT_THUNK
+// Filters the extensions we enable behind the guest's back out of what it sees.
+template<>
+struct fex_gen_config<vkEnumerateDeviceExtensionProperties> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkEnumerateDeviceExtensionProperties, 3, VkExtensionProperties*> : fexgen::ptr_passthrough {};
+#else
+// 64-bit enables no extensions of its own, so it needs the plain thunk.
+template<>
+struct fex_gen_config<vkEnumerateDeviceExtensionProperties> {};
 #endif
 
 } // namespace internal
