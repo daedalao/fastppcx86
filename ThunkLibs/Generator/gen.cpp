@@ -15,12 +15,6 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
-// Paired with ranges.h deliberately: fmt::join is what pulls a container into a
-// format string, and formatter<std::byte> lives in fmt/std.h from fmt 12.2
-// onward. Any TU that joins a std::span<std::byte> needs both, and relying on
-// one of them arriving transitively through some other header is how this breaks
-// again on the next distro bump.
-#include <fmt/std.h>
 
 #include <openssl/sha.h>
 

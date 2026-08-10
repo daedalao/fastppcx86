@@ -1669,6 +1669,18 @@ DoGenerate:
 // Linux Mono runtime detection — flip MonoDetected when the guest opens a
 // libmono / libmonosgen / libmonoboehm / mono-2.0-bdwgc shared library.
 // Cheap atomic gate after first detection so the openat hot path stays fast.
+static bool StartsWithNoCase(std::string_view Haystack, std::string_view Prefix) {
+  if (Haystack.size() < Prefix.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < Prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(Haystack[i])) != std::tolower(static_cast<unsigned char>(Prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SyscallHandler::IsMonoRuntimeLibraryPath(std::string_view pathname) {
   // Take the basename — everything after the last '/'.
   if (auto Slash = pathname.find_last_of('/'); Slash != std::string_view::npos) {
@@ -1693,10 +1705,16 @@ bool SyscallHandler::IsMonoRuntimeLibraryPath(std::string_view pathname) {
          pathname.starts_with("libmonoboehm-")  || // Boehm-GC mono variant
          pathname.starts_with("libmonobdwgc-")  || // Unity 2017+ / modern Unity runtime
          pathname.starts_with("libmono.so")     || // generic libmono (Unity 4/5)
-         pathname.starts_with("mono-2.0-bdwgc") || // Unity 2017+ Windows-side name
-         pathname.starts_with("mono-2.0-sgen")  || // mono's own Windows build
-         pathname.starts_with("mono.dll")       || // Unity 4/5 Windows player (Dex_Data/Mono/mono.dll)
-         pathname.starts_with("mono.so");
+         pathname.starts_with("mono.so") ||
+         // Windows names are matched case-insensitively: these arrive through
+         // wine from a case-insensitive filesystem view, so a title shipping
+         // Mono.dll rather than mono.dll would otherwise go undetected. The
+         // prefixes stay narrow enough that Mono.Security.dll and
+         // MonoPosixHelper.dll -- managed assemblies, not the runtime -- do not
+         // match.
+         StartsWithNoCase(pathname, "mono-2.0-bdwgc") || // Unity 2017+ Windows-side name
+         StartsWithNoCase(pathname, "mono-2.0-sgen") ||  // mono's own Windows build
+         StartsWithNoCase(pathname, "mono.dll");         // Unity 4/5 Windows player
 }
 
 void SyscallHandler::MaybeDetectMonoFromPath(std::string_view pathname) {

@@ -123,6 +123,7 @@ FEX_VK_HANDLE_TOKEN(VkExternalComputeQueueNV_T)
 #include "thunkgen_host_libvulkan.inl"
 
 static void ThunkLog(const char* Fmt, ...) __attribute__((format(printf, 1, 2)));
+static void FreePNextChain(const void* Struct);
 
 // FEX_VK_ARRAYTRACE=1 logs the count/array queries and the create-info repacks
 // that this file implements by hand. Cheap enough to leave in: one cached
@@ -350,7 +351,18 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
     .memoryUnmapReserve = SupportedPlaced.memoryUnmapReserve,
   };
 
-  const bool WantPlaced = DeviceSupportsPlacedMaps(a_0) && SupportedPlaced.memoryMapPlaced == VK_TRUE;
+  // Chaining a second struct of an sType the app already provided is invalid
+  // usage, so look before adding ours.
+  bool AppAlreadyChainedPlacedFeatures = false;
+  for (auto* Link = reinterpret_cast<const VkBaseInStructure*>(a_1->pNext); Link; Link = Link->pNext) {
+    if (Link->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) {
+      AppAlreadyChainedPlacedFeatures = true;
+      break;
+    }
+  }
+
+  const bool WantPlaced =
+    DeviceSupportsPlacedMaps(a_0) && SupportedPlaced.memoryMapPlaced == VK_TRUE && !AppAlreadyChainedPlacedFeatures;
 
   // We enable VK_KHR_map_memory2 and VK_EXT_map_memory_placed for our own use,
   // but neither vkMapMemory2 nor vkUnmapMemory2 is thunked for a 32-bit guest.
@@ -1042,8 +1054,6 @@ static void ReportGuestAddressSpace(size_t Wanted) {
            (size_t)(Mapped >> 20), (size_t)(BestSize >> 20), (size_t)BestStart, (size_t)(Wanted >> 20));
 }
 
-static uintptr_t ReserveGuestVisibleRange(size_t Size);
-
 // A single arena, taken at device creation while the guest address space is
 // still mostly empty, and sub-allocated from thereafter.
 //
@@ -1061,12 +1071,13 @@ static void EnsurePlacedArena() {
   if (ArenaBase) {
     return;
   }
-  // Do NOT gate this on FEX::HLE::AllocateLow32HostRange being present. That is
-  // a weak symbol, it resolves to null in this library at runtime, and the
-  // previous version returned immediately when it did -- silently, without even
-  // reaching its own warning. ReserveLow32HostRange is declared the same way, so
-  // the low-4GB trampoline pool has probably never been registering with the
-  // guest allocator either.
+  // Do not gate this on FEX::HLE::AllocateLow32HostRange being present: an
+  // early return there is silent, and that silence was previously misread as
+  // the weak symbol failing to bind. It binds -- the arena log below reports
+  // "guest allocator available" and takes 512 MiB -- so ReserveLow32HostRange
+  // works too and the reservations really are registered with the guest
+  // allocator. The fallback path exists only for a 64-bit guest or a build
+  // without the export.
   const bool HaveAllocator = FEX::HLE::AllocateLow32HostRange != nullptr;
   ThunkLog("FEXVK: placed-map arena: guest allocator %s\n", HaveAllocator ? "available" : "MISSING (weak symbol unresolved)");
 
@@ -3966,6 +3977,7 @@ void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const gues
 // "err:vulkan:vkCreateDevice Exception 0xc0000005 in Unix call", four calls
 // deep and nowhere near the actual write.
 bool fex_custom_repack_exit(guest_layout<VkInstanceCreateInfo>& into, const host_layout<VkInstanceCreateInfo>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pApplicationInfo;
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
@@ -3978,6 +3990,7 @@ void fex_custom_repack_entry(host_layout<VkMemoryToImageCopyEXT>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkMemoryToImageCopyEXT>& into, const host_layout<VkMemoryToImageCopyEXT>& from) {
+  FreePNextChain(&from.data);
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
 }
@@ -4006,6 +4019,7 @@ void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceCreateInfo>& into, const host_layout<VkDeviceCreateInfo>& from) {
+  FreePNextChain(&from.data);
   if (VkArrayTrace()) {
     fprintf(stderr, "FEXVKTRACE: VkDeviceCreateInfo exit guestQueues=%p count=%u guestPNext=%p\n",
             (void*)into.data.pQueueCreateInfos.get_pointer(), into.data.queueCreateInfoCount.data, (void*)into.data.pNext.get_pointer());
@@ -4024,6 +4038,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorSetLayoutCreateInfo>& into,
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorSetLayoutCreateInfo>& into, const host_layout<VkDescriptorSetLayoutCreateInfo>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pBindings;
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4035,6 +4050,7 @@ void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo>& into, const host_layout<VkRenderPassCreateInfo>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pSubpasses;
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4048,6 +4064,7 @@ void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo2>& into, const g
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo2>& into, const host_layout<VkRenderPassCreateInfo2>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.attachmentCount, from.data.pAttachments, into.data.pAttachments);
   DeleteRepackedStructArray(from.data.subpassCount, from.data.pSubpasses, into.data.pSubpasses);
   DeleteRepackedStructArray(from.data.dependencyCount, from.data.pDependencies, into.data.pDependencies);
@@ -4072,6 +4089,7 @@ void fex_custom_repack_entry(host_layout<VkSubpassDescription2>& into, const gue
 }
 
 bool fex_custom_repack_exit(guest_layout<VkSubpassDescription2>& into, const host_layout<VkSubpassDescription2>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.inputAttachmentCount, from.data.pInputAttachments, into.data.pInputAttachments);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments, into.data.pColorAttachments);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pResolveAttachments, into.data.pResolveAttachments);
@@ -4108,6 +4126,7 @@ void fex_custom_repack_entry(host_layout<VkRenderingInfo>& into, const guest_lay
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderingInfo>& into, const host_layout<VkRenderingInfo>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments, into.data.pColorAttachments);
   if (from.data.pDepthAttachment) {
     fex_apply_custom_repacking_exit(*into.data.pDepthAttachment.get_pointer(), to_host_layout(*from.data.pDepthAttachment));
@@ -4203,6 +4222,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorGetInfoEXT>& into, const host_layout<VkDescriptorGetInfoEXT>& from) {
+  FreePNextChain(&from.data);
   switch (from.data.type) {
   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
@@ -4225,6 +4245,7 @@ void fex_custom_repack_entry(host_layout<VkCopyMemoryToImageInfoEXT>& into, cons
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyMemoryToImageInfoEXT>& into, const host_layout<VkCopyMemoryToImageInfoEXT>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4238,6 +4259,7 @@ void fex_custom_repack_entry(host_layout<VkDependencyInfo>& into, const guest_la
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDependencyInfo>& into, const host_layout<VkDependencyInfo>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.memoryBarrierCount, from.data.pMemoryBarriers, into.data.pMemoryBarriers);
   DeleteRepackedStructArray(from.data.imageMemoryBarrierCount, from.data.pImageMemoryBarriers, into.data.pImageMemoryBarriers);
   DeleteRepackedStructArray(from.data.bufferMemoryBarrierCount, from.data.pBufferMemoryBarriers, into.data.pBufferMemoryBarriers);
@@ -4252,6 +4274,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorUpdateTemplateCreateInfo>& 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorUpdateTemplateCreateInfo>& into, const host_layout<VkDescriptorUpdateTemplateCreateInfo>& from) {
+  FreePNextChain(&from.data);
   DeleteRepackedStructArray(from.data.descriptorUpdateEntryCount, from.data.pDescriptorUpdateEntries, into.data.pDescriptorUpdateEntries);
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4287,6 +4310,7 @@ void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into,
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into, const host_layout<VkPipelineShaderStageCreateInfo>& from) {
+  FreePNextChain(&from.data);
   if (from.data.pSpecializationInfo) {
     delete[] from.data.pSpecializationInfo->pMapEntries;
     delete reinterpret_cast<const host_layout<VkSpecializationInfo>*>(from.data.pSpecializationInfo);
@@ -4310,6 +4334,7 @@ void fex_custom_repack_entry(host_layout<VkComputePipelineCreateInfo>& into, con
 }
 
 bool fex_custom_repack_exit(guest_layout<VkComputePipelineCreateInfo>& into, const host_layout<VkComputePipelineCreateInfo>& from) {
+  FreePNextChain(&from.data);
   if (from.data.stage.pSpecializationInfo) {
     delete[] from.data.stage.pSpecializationInfo->pMapEntries;
     delete reinterpret_cast<const host_layout<VkSpecializationInfo>*>(from.data.stage.pSpecializationInfo);
@@ -4344,21 +4369,38 @@ void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, co
 // Release a chain RepackNested built. convert() allocates each link with
 // aligned_alloc, and only default_fex_custom_repack_reverse frees them -- which
 // an exit that returns true never reaches.
-template<typename T>
-static void FreeNestedChain(const T* Nested) {
-  if (!Nested) {
+// Free a repacked pNext chain. convert() allocates each link with
+// aligned_alloc, and only default_fex_custom_repack_reverse frees them -- which
+// a hand-written exit returning true never reaches. Every such exit was leaking
+// its whole chain, and several sit on per-frame paths.
+//
+// Only ever call this on a struct that really begins with sType/pNext.
+// VkSpecializationInfo does not: its second member is pMapEntries, so treating
+// it as a VkBaseOutStructure would free() an array that the same exit also
+// delete[]s.
+static void FreePNextChain(const void* Struct) {
+  if (!Struct) {
     return;
   }
-  auto* Base = reinterpret_cast<const VkBaseOutStructure*>(Nested);
+  auto* Base = reinterpret_cast<const VkBaseOutStructure*>(Struct);
   for (auto* Link = Base->pNext; Link;) {
     auto* Next = Link->pNext;
     free(Link);
     Link = Next;
   }
+}
+
+template<typename T>
+static void FreeNestedChain(const T* Nested) {
+  if (!Nested) {
+    return;
+  }
+  FreePNextChain(Nested);
   delete reinterpret_cast<const host_layout<T>*>(Nested);
 }
 
 bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, const host_layout<VkGraphicsPipelineCreateInfo>& from) {
+  FreePNextChain(&from.data);
   FreeNestedChain(from.data.pVertexInputState);
   FreeNestedChain(from.data.pInputAssemblyState);
   FreeNestedChain(from.data.pTessellationState);
@@ -4379,6 +4421,7 @@ void fex_custom_repack_entry(host_layout<VkSubmitInfo>& into, const guest_layout
 }
 
 bool fex_custom_repack_exit(guest_layout<VkSubmitInfo>& into, const host_layout<VkSubmitInfo>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pCommandBuffers;
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4398,6 +4441,7 @@ void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCommandBufferBeginInfo>& into, const host_layout<VkCommandBufferBeginInfo>& from) {
+  FreePNextChain(&from.data);
   delete from.data.pInheritanceInfo;
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4411,6 +4455,7 @@ void fex_custom_repack_entry(host_layout<VkPipelineCacheCreateInfo>& into, const
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineCacheCreateInfo>& into, const host_layout<VkPipelineCacheCreateInfo>& from) {
+  FreePNextChain(&from.data);
   // Nothing to do
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4424,6 +4469,7 @@ void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const gue
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const host_layout<VkRenderPassBeginInfo>& from) {
+  FreePNextChain(&from.data);
   // Nothing to do
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
@@ -4449,6 +4495,7 @@ void fex_custom_repack_entry(host_layout<VkBlitImageInfo2>& into, const guest_la
 }
 
 bool fex_custom_repack_exit(guest_layout<VkBlitImageInfo2>& into, const host_layout<VkBlitImageInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4459,6 +4506,7 @@ void fex_custom_repack_entry(host_layout<VkCopyBufferInfo2>& into, const guest_l
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyBufferInfo2>& into, const host_layout<VkCopyBufferInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4469,6 +4517,7 @@ void fex_custom_repack_entry(host_layout<VkCopyImageInfo2>& into, const guest_la
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyImageInfo2>& into, const host_layout<VkCopyImageInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4479,6 +4528,7 @@ void fex_custom_repack_entry(host_layout<VkCopyBufferToImageInfo2>& into, const 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyBufferToImageInfo2>& into, const host_layout<VkCopyBufferToImageInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4489,6 +4539,7 @@ void fex_custom_repack_entry(host_layout<VkCopyImageToBufferInfo2>& into, const 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyImageToBufferInfo2>& into, const host_layout<VkCopyImageToBufferInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4499,6 +4550,7 @@ void fex_custom_repack_entry(host_layout<VkResolveImageInfo2>& into, const guest
 }
 
 bool fex_custom_repack_exit(guest_layout<VkResolveImageInfo2>& into, const host_layout<VkResolveImageInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pRegions;
   return true;
 }
@@ -4511,6 +4563,7 @@ void fex_custom_repack_entry(host_layout<VkSubmitInfo2>& into, const guest_layou
 }
 
 bool fex_custom_repack_exit(guest_layout<VkSubmitInfo2>& into, const host_layout<VkSubmitInfo2>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pWaitSemaphoreInfos;
   delete[] from.data.pCommandBufferInfos;
   delete[] from.data.pSignalSemaphoreInfos;
@@ -4523,6 +4576,7 @@ void fex_custom_repack_entry(host_layout<VkDeviceBufferMemoryRequirements>& into
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceBufferMemoryRequirements>& into, const host_layout<VkDeviceBufferMemoryRequirements>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pCreateInfo;
   return true;
 }
@@ -4533,6 +4587,7 @@ void fex_custom_repack_entry(host_layout<VkDeviceImageMemoryRequirements>& into,
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceImageMemoryRequirements>& into, const host_layout<VkDeviceImageMemoryRequirements>& from) {
+  FreePNextChain(&from.data);
   delete[] from.data.pCreateInfo;
   return true;
 }
@@ -4585,8 +4640,14 @@ static auto RepackedArrayQuery(uint32_t* count, guest_layout<T*> array, Fn&& cal
 
   auto Finish = [&]() {
     // *count is what the driver actually filled, which may be below InputCount.
-    for (uint32_t i = 0; i < std::min(InputCount, *count); ++i) {
+    const uint32_t Written = std::min(InputCount, *count);
+    for (uint32_t i = 0; i < Written; ++i) {
       fex_custom_repack_exit(Guest[i], to_host_layout(Plain[i]));
+    }
+    // Elements past what the driver wrote still had chains repacked on the way
+    // in, and nothing else will free them.
+    for (uint32_t i = Written; i < InputCount; ++i) {
+      FreePNextChain(&Plain[i]);
     }
   };
 
@@ -4734,16 +4795,26 @@ VkResult fexfn_impl_libvulkan_vkQueueBindSparse(VkQueue a_0, uint32_t a_1, guest
     return LDR_PTR(vkQueueBindSparse)(a_0, a_1, nullptr, a_3);
   }
 
+  auto* Guest = a_2.get_pointer();
+
   BindSparseScratch Scratch;
   Scratch.Infos.resize(a_1);
   Scratch.Semaphores.resize(2 * a_1);
   Scratch.BufferBinds.resize(a_1);
   Scratch.ImageOpaqueBinds.resize(a_1);
   Scratch.ImageBinds.resize(a_1);
-  Scratch.MemoryBinds.reserve(2 * a_1);
-  Scratch.ImageMemoryBinds.reserve(a_1);
+  // One inner vector per bind-info element across both opaque and buffer binds,
+  // and one per image bind. The old 2 * a_1 / a_1 guess was far short; it
+  // happened to be safe only because reallocating the outer vector
+  // move-constructs the inner ones and preserves their data() pointers.
+  size_t BufferBindTotal = 0, ImageBindTotal = 0;
+  for (uint32_t i = 0; i < a_1; ++i) {
+    BufferBindTotal += Guest[i].data.bufferBindCount.data + Guest[i].data.imageOpaqueBindCount.data;
+    ImageBindTotal += Guest[i].data.imageBindCount.data;
+  }
+  Scratch.MemoryBinds.reserve(BufferBindTotal);
+  Scratch.ImageMemoryBinds.reserve(ImageBindTotal);
 
-  auto* Guest = a_2.get_pointer();
   for (uint32_t i = 0; i < a_1; ++i) {
     auto& G = Guest[i];
     auto Host = host_layout<VkBindSparseInfo> {G};
