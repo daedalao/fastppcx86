@@ -712,6 +712,15 @@ if (BUILD_THUNKS)
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
         "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
         "-DTHUNKGEN_X86_CROSS_CXX_DIR=${THUNKGEN_X86_CROSS_CXX_DIR}"
+        # The inner configure runs during the outer build and would otherwise
+        # absorb HOST toolchain flags from the environment (makepkg exports
+        # CFLAGS=-mcpu=power8..., which the x86 cross gcc rejects). Guest code
+        # gets its flags from the toolchain file and the build type only.
+        "-DCMAKE_C_FLAGS="
+        "-DCMAKE_CXX_FLAGS="
+        "-DCMAKE_EXE_LINKER_FLAGS="
+        "-DCMAKE_SHARED_LINKER_FLAGS="
+        "-DCMAKE_MODULE_LINKER_FLAGS="
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
@@ -732,6 +741,12 @@ if (BUILD_THUNKS)
         "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS_32}"
         "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+        # Same environment isolation as guest-libs above.
+        "-DCMAKE_C_FLAGS="
+        "-DCMAKE_CXX_FLAGS="
+        "-DCMAKE_EXE_LINKER_FLAGS="
+        "-DCMAKE_SHARED_LINKER_FLAGS="
+        "-DCMAKE_MODULE_LINKER_FLAGS="
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
