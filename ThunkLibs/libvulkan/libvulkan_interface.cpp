@@ -5211,36 +5211,24 @@ template<>
 struct fex_gen_config<vkCmdPushConstants2KHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCmdPushConstants2KHR, 1, const VkPushConstantsInfo*> : fexgen::ptr_passthrough {};
-#else
-template<>
-struct fex_gen_config<vkCmdPushConstants2KHR> {};
 #endif
 #ifdef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdPushDescriptorSet2KHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCmdPushDescriptorSet2KHR, 1, const VkPushDescriptorSetInfo*> : fexgen::ptr_passthrough {};
-#else
-template<>
-struct fex_gen_config<vkCmdPushDescriptorSet2KHR> {};
 #endif
 #ifdef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdPushDescriptorSetWithTemplate2KHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCmdPushDescriptorSetWithTemplate2KHR, 1, const VkPushDescriptorSetWithTemplateInfo*> : fexgen::ptr_passthrough {};
-#else
-template<>
-struct fex_gen_config<vkCmdPushDescriptorSetWithTemplate2KHR> {};
 #endif
 #ifdef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetDeviceImageSubresourceLayoutKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkGetDeviceImageSubresourceLayoutKHR, 1, const VkDeviceImageSubresourceInfo*> : fexgen::ptr_passthrough {};
-#else
-template<>
-struct fex_gen_config<vkGetDeviceImageSubresourceLayoutKHR> {};
 #endif
 
 #ifdef IS_32BIT_THUNK
@@ -5253,11 +5241,36 @@ struct fex_gen_param<vkQueueBindSparse, 2, const VkBindSparseInfo*> : fexgen::pt
 
 
 // Not restored, and why:
-//   vkGetDeviceImageSubresourceLayoutKHR: VkDeviceImageSubresourceInfo has no
-//     generated layout, so its repack cannot be written yet.
 //   vkGet*OpaqueCaptureDescriptorDataEXT write through an unannotated void*.
-// Both are descriptor-buffer/secondary-command-buffer paths DXVK loads but does
-// not use on this driver; they stay null until something actually calls them.
+// Descriptor-buffer paths DXVK loads but does not use on this driver; they
+// stay null until something actually calls them.
+#endif
+
+// 64-bit spellings of the entry points the 32-bit block above hand-repacks.
+// At namespace scope deliberately, for the same reason as
+// vkEnumerateDeviceExtensionProperties below: an #else nested inside that
+// block requires IS_32BIT_THUNK to be both defined and undefined and never
+// compiles. When these declarations lived inside it, all eight vanished from
+// the 64-bit guest thunk, vkGetDeviceProcAddr handed DXVK nulls for functions
+// whose feature bits it had already verified, and every 64-bit DXVK title
+// crashed jumping to address zero (witcher3.exe, 2026-08-10).
+#ifndef IS_32BIT_THUNK
+template<>
+struct fex_gen_config<vkGetImageSparseMemoryRequirements> {};
+template<>
+struct fex_gen_config<vkGetImageSparseMemoryRequirements2> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceVideoFormatPropertiesKHR> {};
+template<>
+struct fex_gen_config<vkCmdExecuteCommands> {};
+template<>
+struct fex_gen_config<vkCmdPushConstants2KHR> {};
+template<>
+struct fex_gen_config<vkCmdPushDescriptorSetWithTemplate2KHR> {};
+template<>
+struct fex_gen_config<vkGetDeviceImageSubresourceLayoutKHR> {};
 #endif
 
 // vkEnumerateDeviceExtensionProperties.

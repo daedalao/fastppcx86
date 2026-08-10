@@ -201,6 +201,14 @@ static void DoSetupWithInstance(VkInstance instance) {
   // Query pointers for non-EXT functions customized below
   (void*&)LDR_PTR(vkCreateDevice) = (void*)LDR_PTR(vkGetInstanceProcAddr)(instance, "vkCreateDevice");
 
+  // Physical-device queries from device extensions: the loader does not export
+  // these, so their dlsym pointers are null and the custom impls below would
+  // call through zero.
+  (void*&)LDR_PTR(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) =
+    (void*)LDR_PTR(vkGetInstanceProcAddr)(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+  (void*&)LDR_PTR(vkGetPhysicalDeviceVideoFormatPropertiesKHR) =
+    (void*)LDR_PTR(vkGetInstanceProcAddr)(instance, "vkGetPhysicalDeviceVideoFormatPropertiesKHR");
+
   // Only do this lookup once.
   // NOTE: If vkGetInstanceProcAddr was called with a null instance, only a few function pointers will be filled with non-null values, so we do repeat the lookup in that case
   if (instance) {
@@ -414,6 +422,16 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   fexldr_ptr_libvulkan_vkCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)fexldr_ptr_libvulkan_vkGetDeviceProcAddr(out, "vkCmdSetVertexIn"
                                                                                                                           "putEXT");
   fexldr_ptr_libvulkan_vkQueueSubmit = (PFN_vkQueueSubmit)fexldr_ptr_libvulkan_vkGetDeviceProcAddr(out, "vkQueueSubmit");
+  // The loader exports only core spellings, so the dlsym-populated pointers
+  // for these KHR names are null -- and DXVK resolves maintenance6 entry
+  // points by their KHR names. Their impls take a VkCommandBuffer, not a
+  // VkDevice, so they cannot re-resolve on demand like the others; a null
+  // slot here meant every push-constant update faulted on the host while the
+  // game kept running with nothing rendered (Dex, 2026-08-10).
+  (void*&)LDR_PTR(vkCmdPushConstants2KHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(out, "vkCmdPushConstants2KHR");
+  (void*&)LDR_PTR(vkCmdPushDescriptorSet2KHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(out, "vkCmdPushDescriptorSet2KHR");
+  (void*&)LDR_PTR(vkCmdPushDescriptorSetWithTemplate2KHR) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(out, "vkCmdPushDescriptorSetWithTemplate2KHR");
 #else
   // No functions affected on 64-bit
 #endif
