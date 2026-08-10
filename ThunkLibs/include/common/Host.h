@@ -12,8 +12,10 @@ $end_info$
 #include <cstring>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <limits>
 #include <optional>
 #include <typeinfo>
+#include <utility>
 
 #include "PackedArguments.h"
 
@@ -616,6 +618,62 @@ static repack_wrapper<T, GuestT, IsConstPointee> make_repack_wrapper(guest_layou
   return {orig_arg};
 }
 
+// Repacking for a pointer to a builtin integer whose width differs between
+// guest and host. `size_t*` is the case that matters: 4 bytes in a 32-bit
+// guest, 8 here.
+//
+// The generator used to route every pointer-to-builtin through the
+// "fully compatible" path, which reinterprets the pointer and leaves the
+// pointee alone. That is wrong whenever the pointee has a different size, and
+// it did not even compile once the affected entry points were enabled -- it
+// tried to build a host_layout<unsigned long*> out of a guest_layout<uint32_t*>
+// (vkGetEncodedVideoSessionParametersKHR, vkGetPipelineBinaryDataKHR and
+// friends, all of which take a size_t* in/out length).
+//
+// So the value is widened into host-side storage on entry and narrowed back on
+// exit, the same entry/exit shape repack_wrapper uses for structs.
+template<typename HostT, typename GuestT, bool IsConstPointee = false>
+struct int_repack_wrapper {
+  static_assert(std::is_pointer_v<HostT>);
+  using HostPointee = std::remove_cv_t<std::remove_pointer_t<HostT>>;
+  using GuestPointee = std::remove_cv_t<std::remove_pointer_t<GuestT>>;
+  static_assert(std::is_integral_v<HostPointee> && std::is_integral_v<GuestPointee>);
+
+  std::optional<HostPointee> storage;
+  guest_layout<GuestT>& orig_arg;
+
+  int_repack_wrapper(guest_layout<GuestT>& orig_arg_)
+    : orig_arg(orig_arg_) {
+    if (orig_arg_.get_pointer()) {
+      storage = static_cast<HostPointee>(orig_arg_.get_pointer()->data);
+    }
+  }
+
+  ~int_repack_wrapper() {
+    // Skip write-back for const pointees, matching repack_wrapper.
+    if constexpr (!IsConstPointee && !std::is_const_v<std::remove_pointer_t<HostT>>) {
+      if (storage) {
+        // A host value too large for the guest type cannot be represented at
+        // all. Saturating is still a lie, but a silent wrap would hand the
+        // guest a small length for a large buffer and turn an unsupported case
+        // into a heap overflow in guest code.
+        constexpr auto GuestMax = std::numeric_limits<GuestPointee>::max();
+        orig_arg.get_pointer()->data =
+          std::cmp_greater(*storage, GuestMax) ? GuestMax : static_cast<GuestPointee>(*storage);
+      }
+    }
+  }
+
+  operator HostT() {
+    return storage ? &*storage : nullptr;
+  }
+};
+
+template<typename HostT, bool IsConstPointee = false, typename GuestT>
+static int_repack_wrapper<HostT, GuestT, IsConstPointee> make_int_repack_wrapper(guest_layout<GuestT>& orig_arg) {
+  return {orig_arg};
+}
+
 template<typename T>
 T& unwrap_host(host_layout<T>& val) {
   return val.data;
@@ -623,6 +681,11 @@ T& unwrap_host(host_layout<T>& val) {
 
 template<typename T, typename T2, bool IsConstPointee>
 T* unwrap_host(repack_wrapper<T*, T2, IsConstPointee>& val) {
+  return val;
+}
+
+template<typename T, typename T2, bool IsConstPointee>
+T* unwrap_host(int_repack_wrapper<T*, T2, IsConstPointee>& val) {
   return val;
 }
 
@@ -787,6 +850,21 @@ auto Projection(guest_layout<T>& data) {
     // Instead of using host_layout<HostT> { data }.data, return a wrapper object.
     // This ensures that temporary lifetime extension can kick in at call-site.
     return decaying_host_layout<HostT> {.data {data}};
+  } else if constexpr (std::is_void_v<std::remove_cv_t<std::remove_pointer_t<T>>>) {
+    // void* has no pointee to repack, so widening the pointer is all there is
+    // to do -- exactly what the fexfn_unpack_* path does with
+    // host_layout<void*>. Falling through to repack_wrapper instead tried to
+    // instantiate host_layout<void> and tripped its "Missing annotation for
+    // void pointer?" static_assert, which is what stopped this dispatch path
+    // compiling once entry points taking a void* payload were enabled.
+    return decaying_host_layout<HostT> {.data {data}};
+  } else if constexpr (std::is_pointer_v<HostT> && std::is_integral_v<std::remove_cv_t<std::remove_pointer_t<T>>> &&
+                       std::is_integral_v<std::remove_cv_t<std::remove_pointer_t<HostT>>> &&
+                       sizeof(std::remove_pointer_t<T>) != sizeof(std::remove_pointer_t<HostT>)) {
+    // Pointer to an integer that is a different width on each side (size_t).
+    // See int_repack_wrapper: the pointer cannot simply be widened, the pointee
+    // has to be converted in both directions.
+    return make_int_repack_wrapper<HostT>(data);
   } else {
     // This argument requires temporary storage for repacked data
     // *and* it needs to call custom repack functions (if any)

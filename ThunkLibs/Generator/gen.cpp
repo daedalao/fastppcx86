@@ -728,9 +728,32 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           continue;
         }
 
+        // A pointer to a builtin integer is only reinterpretable if the pointee
+        // is the same width on both sides. size_t is not: 4 bytes in a 32-bit
+        // guest, 8 on the host. Reinterpreting there hands the library a
+        // pointer to a half-initialised value, and the generated code did not
+        // even compile (no conversion from guest_layout<uint32_t*> to
+        // host_layout<unsigned long*>), which is why every entry point taking a
+        // size_t* used to be dropped from the 32-bit thunk.
+        const bool pointee_width_differs = [&] {
+          if (!param_type->isPointerType()) {
+            return false;
+          }
+          auto pointee = param_type->getPointeeType();
+          if (!pointee->isBuiltinType() || !pointee->isIntegerType() || pointee->isVoidType()) {
+            return false;
+          }
+          auto* guest_info = guest_abi.at(pointee.getUnqualifiedType().getAsString()).get_if_simple_or_struct();
+          return guest_info && guest_info->size_bits != context.getTypeSize(pointee);
+        }();
+
         // Layout repacking happens here
-        if (!param_type->isPointerType() || (is_assumed_compatible || pointee_compat == TypeCompatibility::Full) ||
-            param_type->getPointeeType()->isBuiltinType() /* TODO: handle size_t. Actually, properly check for data layout compatibility */) {
+        if (pointee_width_differs) {
+          const bool is_const_pointee = param_type->getPointeeType().isConstQualified();
+          fmt::print(file, "  auto a_{} = make_int_repack_wrapper<{}, {}>(args->a_{});\n", param_idx,
+                     get_type_name_with_nonconst_pointee(param_type), is_const_pointee ? "true" : "false", param_idx);
+        } else if (!param_type->isPointerType() || (is_assumed_compatible || pointee_compat == TypeCompatibility::Full) ||
+                   param_type->getPointeeType()->isBuiltinType()) {
           // Fully compatible
           fmt::print(file, "  host_layout<{}> a_{} {{ args->a_{} }};\n", get_type_name(context, param_type.getTypePtr()), param_idx, param_idx);
         } else if (pointee_compat == TypeCompatibility::Repackable) {

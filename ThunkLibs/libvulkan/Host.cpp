@@ -80,11 +80,15 @@ __attribute__((constructor)) void SanitizeHostVulkanEnvironment() {
 } // namespace
 
 #ifdef IS_32BIT_THUNK
-// Union type embedded in VkDescriptorGetInfoEXT
-template<>
-struct guest_layout<VkDescriptorDataEXT> {
-  char union_storage[8];
-};
+// NOTE: guest_layout<VkDescriptorDataEXT> used to be hand-written here as an
+// opaque 8-byte blob. The interface annotates the union
+// assume_compatible_data_layout, so the generator now emits an equivalent
+// specialization itself and the hand-written one is a redefinition.
+//
+// Residual gap either way: the union's pSampler/pCombinedImageSampler arms are
+// guest pointers (4 bytes) reinterpreted as host pointers (8), so
+// VK_EXT_descriptor_buffer is not actually correct on 32-bit. Nothing consumes
+// it yet; it needs a real per-arm repack driven by VkDescriptorGetInfoEXT::type.
 
 // Dispatchable Vulkan handles are real host pointers (VkInstance is
 // VkInstance_T*, and so on), so a 32-bit guest cannot hold one. They are all
@@ -774,25 +778,52 @@ static void FEXFN_IMPL(vkDestroyDebugUtilsMessengerEXT)(VkInstance a_0, VkDebugU
   LDR_PTR(vkDestroyDebugUtilsMessengerEXT)(a_0, a_1, nullptr);
 }
 
-#ifndef IS_32BIT_THUNK
-static VkResult FEXFN_IMPL(vkCreateDisplayPlaneSurfaceKHR)(VkInstance a_0, const VkDisplaySurfaceCreateInfoKHR* a_1,
-                                                           const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateDisplayPlaneSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDisplayPlaneSurfaceKHR");
-  return LDR_PTR(vkCreateDisplayPlaneSurfaceKHR)(a_0, a_1, nullptr, a_3);
-}
-
+// Architecture-independent: these only drop the allocation callbacks (FEX does
+// not forward guest allocators) and refresh the proc address. They sat inside
+// the 64-bit-only block below purely because their registrations did; the
+// 32-bit thunk now registers them, so the definitions have to be visible too.
 // vkCreateDisplayModeKHR takes VkPhysicalDevice; no owning VkInstance is in
 // scope to refresh the proc-addr from, so reuse the pre-loaded dlsym pointer.
 static VkResult FEXFN_IMPL(vkCreateDisplayModeKHR)(VkPhysicalDevice a_0, VkDisplayKHR a_1, const VkDisplayModeCreateInfoKHR* a_2,
                                                    const VkAllocationCallbacks* a_3, VkDisplayModeKHR* a_4) {
   return LDR_PTR(vkCreateDisplayModeKHR)(a_0, a_1, a_2, nullptr, a_4);
 }
-
+static VkResult FEXFN_IMPL(vkCreateDisplayPlaneSurfaceKHR)(VkInstance a_0, const VkDisplaySurfaceCreateInfoKHR* a_1,
+                                                           const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
+  (void*&)LDR_PTR(vkCreateDisplayPlaneSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDisplayPlaneSurfaceKHR");
+  return LDR_PTR(vkCreateDisplayPlaneSurfaceKHR)(a_0, a_1, nullptr, a_3);
+}
 static VkResult FEXFN_IMPL(vkCreateHeadlessSurfaceEXT)(VkInstance a_0, const VkHeadlessSurfaceCreateInfoEXT* a_1,
                                                        const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
   (void*&)LDR_PTR(vkCreateHeadlessSurfaceEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateHeadlessSurfaceEXT");
   return LDR_PTR(vkCreateHeadlessSurfaceEXT)(a_0, a_1, nullptr, a_3);
 }
+static VkResult FEXFN_IMPL(vkCreatePrivateDataSlotEXT)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1,
+                                                       const VkAllocationCallbacks* a_2, VkPrivateDataSlot* a_3) {
+  (void*&)LDR_PTR(vkCreatePrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlotEXT");
+  return LDR_PTR(vkCreatePrivateDataSlotEXT)(a_0, a_1, nullptr, a_3);
+}
+static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversionKHR)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
+                                                              const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
+  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversionKHR");
+  return LDR_PTR(vkCreateSamplerYcbcrConversionKHR)(a_0, a_1, nullptr, a_3);
+}
+static void FEXFN_IMPL(vkDestroyPrivateDataSlotEXT)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyPrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlotEXT");
+  LDR_PTR(vkDestroyPrivateDataSlotEXT)(a_0, a_1, nullptr);
+}
+static void FEXFN_IMPL(vkDestroySamplerYcbcrConversionKHR)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversionKHR");
+  LDR_PTR(vkDestroySamplerYcbcrConversionKHR)(a_0, a_1, nullptr);
+}
+static void FEXFN_IMPL(vkDestroyValidationCacheEXT)(VkDevice a_0, VkValidationCacheEXT a_1, const VkAllocationCallbacks* a_2) {
+  (void*&)LDR_PTR(vkDestroyValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyValidationCacheEXT");
+  LDR_PTR(vkDestroyValidationCacheEXT)(a_0, a_1, nullptr);
+}
+
+#ifndef IS_32BIT_THUNK
+
+
 
 static VkResult FEXFN_IMPL(vkCreatePrivateDataSlot)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                     VkPrivateDataSlot* a_3) {
@@ -804,15 +835,6 @@ static void FEXFN_IMPL(vkDestroyPrivateDataSlot)(VkDevice a_0, VkPrivateDataSlot
   LDR_PTR(vkDestroyPrivateDataSlot)(a_0, a_1, nullptr);
 }
 
-static VkResult FEXFN_IMPL(vkCreatePrivateDataSlotEXT)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1,
-                                                       const VkAllocationCallbacks* a_2, VkPrivateDataSlot* a_3) {
-  (void*&)LDR_PTR(vkCreatePrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlotEXT");
-  return LDR_PTR(vkCreatePrivateDataSlotEXT)(a_0, a_1, nullptr, a_3);
-}
-static void FEXFN_IMPL(vkDestroyPrivateDataSlotEXT)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlotEXT");
-  LDR_PTR(vkDestroyPrivateDataSlotEXT)(a_0, a_1, nullptr);
-}
 
 static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversion)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
                                                            const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
@@ -824,24 +846,11 @@ static void FEXFN_IMPL(vkDestroySamplerYcbcrConversion)(VkDevice a_0, VkSamplerY
   LDR_PTR(vkDestroySamplerYcbcrConversion)(a_0, a_1, nullptr);
 }
 
-static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversionKHR)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
-                                                              const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
-  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversionKHR");
-  return LDR_PTR(vkCreateSamplerYcbcrConversionKHR)(a_0, a_1, nullptr, a_3);
-}
-static void FEXFN_IMPL(vkDestroySamplerYcbcrConversionKHR)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversionKHR");
-  LDR_PTR(vkDestroySamplerYcbcrConversionKHR)(a_0, a_1, nullptr);
-}
 
 static VkResult FEXFN_IMPL(vkCreateValidationCacheEXT)(VkDevice a_0, const VkValidationCacheCreateInfoEXT* a_1,
                                                        const VkAllocationCallbacks* a_2, VkValidationCacheEXT* a_3) {
   (void*&)LDR_PTR(vkCreateValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateValidationCacheEXT");
   return LDR_PTR(vkCreateValidationCacheEXT)(a_0, a_1, nullptr, a_3);
-}
-static void FEXFN_IMPL(vkDestroyValidationCacheEXT)(VkDevice a_0, VkValidationCacheEXT a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyValidationCacheEXT");
-  LDR_PTR(vkDestroyValidationCacheEXT)(a_0, a_1, nullptr);
 }
 #endif
 
@@ -1549,6 +1558,28 @@ void fexfn_impl_libvulkan_vkFreeCommandBuffers(VkDevice device, VkCommandPool po
   (void*&)fexldr_ptr_libvulkan_vkFreeCommandBuffers = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkFreeCommandBuffers");
   fexldr_ptr_libvulkan_vkFreeCommandBuffers(device, pool, num_buffers, HostBuffers.data());
   delete[] HostBuffers.data();
+}
+
+// Push descriptors take the same counted VkWriteDescriptorSet array as
+// vkUpdateDescriptorSets, so they repack the same way. Without these the
+// generator refuses the entry points outright (the array member is a pointer to
+// a merely-repackable struct), and DXVK gates push-descriptor use on the
+// extension bit rather than on the function pointer -- so a null here is not a
+// fallback, it is a call through null.
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                                                    VkPipelineLayout layout, uint32_t set, uint32_t descriptorWriteCount,
+                                                    guest_layout<const VkWriteDescriptorSet*> pDescriptorWrites) {
+  auto HostWrites = RepackStructArray(descriptorWriteCount, pDescriptorWrites);
+  fexldr_ptr_libvulkan_vkCmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set, descriptorWriteCount, HostWrites.data());
+  delete[] HostWrites.data();
+}
+
+void fexfn_impl_libvulkan_vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
+                                                 uint32_t set, uint32_t descriptorWriteCount,
+                                                 guest_layout<const VkWriteDescriptorSet*> pDescriptorWrites) {
+  auto HostWrites = RepackStructArray(descriptorWriteCount, pDescriptorWrites);
+  fexldr_ptr_libvulkan_vkCmdPushDescriptorSet(commandBuffer, pipelineBindPoint, layout, set, descriptorWriteCount, HostWrites.data());
+  delete[] HostWrites.data();
 }
 
 VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipelineCache cache, guest_layout<uint32_t*> guest_data_size, void* data) {
@@ -4151,7 +4182,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
     // VkSampler* or VkDescriptorImageInfo*. Handle by zero-extending
     guest_layout<VkSampler*> guest_data;
-    memcpy(&guest_data, from.data.data.union_storage, sizeof(guest_data));
+    memcpy(&guest_data, &from.data.data.data, sizeof(guest_data));
     into.data.data.pSampler = host_layout<VkSampler*> {guest_data}.data;
     break;
   }
@@ -4169,7 +4200,7 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
     // "nested exception on signal stack" while dispatching it, taking the crash
     // report with it.
     guest_layout<VkDescriptorAddressInfoEXT*> guest_ptr;
-    memcpy(&guest_ptr, from.data.data.union_storage, sizeof(guest_ptr));
+    memcpy(&guest_ptr, &from.data.data.data, sizeof(guest_ptr));
     if (!guest_ptr.get_pointer()) {
       into.data.data.pUniformBuffer = nullptr;
       break;
