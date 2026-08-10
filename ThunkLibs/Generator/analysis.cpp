@@ -308,7 +308,49 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
         if (llvm::isa<clang::FunctionDecl>(template_args[0].getAsDecl())) {
           // Process later
         } else if (auto annotated_member = llvm::dyn_cast<clang::FieldDecl>(template_args[0].getAsDecl())) {
-          if (decl->getNumBases() != 1 || decl->bases_begin()->getType().getAsString() != "fexgen::custom_repack") {
+          // array_length_from<&Parent::count> names the sibling member holding
+          // the element count, so it arrives as a template specialization
+          // rather than as a plain base name.
+          const clang::FieldDecl* length_member = nullptr;
+          bool is_custom_repack = false;
+          if (decl->getNumBases() == 1) {
+            auto base_type = decl->bases_begin()->getType();
+            if (base_type.getAsString() == "fexgen::custom_repack") {
+              is_custom_repack = true;
+            } else if (auto* base_decl = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(base_type->getAsCXXRecordDecl())) {
+              if (base_decl->getName() == "array_length_from" && base_decl->getTemplateArgs().size() == 1) {
+                auto& arg = base_decl->getTemplateArgs()[0];
+                // Pointer-to-member non-type template arguments appear as a
+                // Declaration, or as a StructuralValue wrapping one depending
+                // on the clang version.
+                const clang::ValueDecl* referenced = nullptr;
+                if (arg.getKind() == clang::TemplateArgument::Declaration) {
+                  referenced = arg.getAsDecl();
+                }
+#if CLANG_VERSION_MAJOR >= 17
+                else if (arg.getKind() == clang::TemplateArgument::StructuralValue) {
+                  if (auto* member_ptr = arg.getAsStructuralValue().getMemberPointerDecl()) {
+                    referenced = member_ptr;
+                  }
+                }
+#endif
+                length_member = llvm::dyn_cast_or_null<clang::FieldDecl>(referenced);
+                if (!length_member) {
+                  throw report_error(template_arg_loc, "array_length_from must name a data member of the same struct");
+                }
+                if (length_member->getParent() != annotated_member->getParent()) {
+                  throw report_error(template_arg_loc, "array_length_from must name a member of the same struct");
+                }
+                if (!length_member->getType()->isIntegerType()) {
+                  throw report_error(template_arg_loc, "array_length_from must name an integer member");
+                }
+                if (!annotated_member->getType()->isPointerType()) {
+                  throw report_error(template_arg_loc, "array_length_from may only annotate pointer members");
+                }
+              }
+            }
+          }
+          if (!is_custom_repack && !length_member) {
             throw report_error(template_arg_loc, "Unsupported member annotation(s)");
           }
 
@@ -323,7 +365,19 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
             throw report_error(template_arg_loc, "May not annotate members of opaque types");
           }
           // Add member to its list of members
-          repack_info_it->second.custom_repacked_members.insert(annotated_member->getNameAsString());
+          if (length_member) {
+            // Only struct elements need element-wise conversion. An array of
+            // enums, handles or builtins has the same layout on both sides, so
+            // the ordinary pointer handling already covers it -- and emitting
+            // element-wise code for those would reference layout wrappers that
+            // are never generated for non-struct types. Recording nothing here
+            // leaves such a member on exactly the path it used before.
+            if (annotated_member->getType()->getPointeeType()->isStructureType()) {
+              repack_info_it->second.array_length_members.emplace(annotated_member->getNameAsString(), length_member->getNameAsString());
+            }
+          } else {
+            repack_info_it->second.custom_repacked_members.insert(annotated_member->getNameAsString());
+          }
         } else {
           throw report_error(template_arg_loc, "Cannot annotate this kind of symbol");
         }
@@ -555,7 +609,11 @@ void AnalysisAction::CoverReferencedTypes(clang::ASTContext& context) {
 
       for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
         auto member_type = member->getType().getTypePtr();
-        if (type_repack_info.UsesCustomRepackFor(member) && member_type->isPointerType() && member_type->getPointeeType()->isStructureType()) {
+        // Hand-written repacking means the pointee never needs layout info.
+        // Generated array repacking does: it emits host_layout<Element>, so the
+        // element type must be covered like any other referenced type.
+        if (type_repack_info.UsesHandWrittenRepackFor(member->getNameAsString()) && member_type->isPointerType() &&
+            member_type->getPointeeType()->isStructureType()) {
           continue;
         }
 

@@ -13,6 +13,7 @@ $end_info$
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <limits>
+#include <new>
 #include <optional>
 #include <typeinfo>
 #include <utility>

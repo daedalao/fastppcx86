@@ -145,6 +145,10 @@ struct fex_gen_type<VkBaseOutStructure> : fexgen::emit_layout_wrappers {};
 // do
 //   grep $i vulkan_{core,wayland,xcb,xlib,xlib_xrandr}.h >& /dev/null && echo $i
 // done | awk '{ print "template<> struct fex_gen_config<&"$1"::pNext> : fexgen::custom_repack {};" }'
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkAccelerationStructureBuildGeometryInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -153,26 +157,30 @@ template<>
 struct fex_gen_config<&VkAccelerationStructureCaptureDescriptorDataInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAccelerationStructureCreateInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureCreateInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureCreateInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAccelerationStructureDeviceAddressInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureGeometryAabbsDataKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureGeometryInstancesDataKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureGeometryKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureGeometryMotionTrianglesDataNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureGeometryTrianglesDataKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkAccelerationStructureInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureGeometryAabbsDataKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureGeometryInstancesDataKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureGeometryKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureGeometryMotionTrianglesDataNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureGeometryTrianglesDataKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAccelerationStructureMemoryRequirementsInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAccelerationStructureMotionInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkAccelerationStructureTrianglesOpacityMicromapEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -183,6 +191,10 @@ template<>
 struct fex_gen_config<&VkAcquireProfilingLockInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAmigoProfilingSubmitInfoSEC::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkAntiLagDataAMD::pNext> : fexgen::custom_repack {};
 template<>
@@ -225,8 +237,8 @@ template<>
 struct fex_gen_config<&VkBindImagePlaneMemoryInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkBindMemoryStatus::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkBindSparseInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkBindSparseInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkBindTensorMemoryInfoARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -263,16 +275,24 @@ template<>
 struct fex_gen_config<&VkBuildPartitionedAccelerationStructureInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCalibratedTimestampInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkCheckpointData2NV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkCheckpointDataNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkClusterAccelerationStructureClustersBottomLevelInputNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkClusterAccelerationStructureCommandsInfoNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkClusterAccelerationStructureInputInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkClusterAccelerationStructureCommandsInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkClusterAccelerationStructureInputInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkClusterAccelerationStructureMoveObjectsInputNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -303,6 +323,10 @@ template<>
 struct fex_gen_config<&VkComputePipelineIndirectBufferInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkConditionalRenderingBeginInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer to a type of different width on each side (size_t*,
+// or a handle array written back on exit). Repacking that needs out-array
+// support the generator does not have; keeping the struct out of the type
+// set leaves its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkConvertCooperativeVectorMatrixInfoNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -315,8 +339,8 @@ template<>
 struct fex_gen_config<&VkCooperativeVectorPropertiesNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyAccelerationStructureInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyAccelerationStructureToMemoryInfoKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyAccelerationStructureToMemoryInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyBufferInfo2::pNext> : fexgen::custom_repack {};
 template<>
@@ -329,32 +353,44 @@ template<>
 struct fex_gen_config<&VkCopyImageInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyImageToBufferInfo2::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyImageToImageInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageToImageInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkCopyImageToMemoryInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMemoryIndirectInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyMemoryToAccelerationStructureInfoKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyMemoryToAccelerationStructureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMemoryToImageIndirectInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMemoryToImageInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMemoryToImageInfo::pRegions> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyMemoryToMicromapInfoEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyMemoryToMicromapInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMicromapInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyMicromapToMemoryInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkCopyTensorInfoARM::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyMicromapToMemoryInfoEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyTensorInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCuFunctionCreateInfoNVX::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkCuLaunchInfoNVX::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkCuModuleCreateInfoNVX::pNext> : fexgen::custom_repack {};
 template<>
@@ -365,18 +401,26 @@ template<>
 struct fex_gen_config<&VkDataGraphPipelineBuiltinModelCreateInfoQCOM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineCompilerControlCreateInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDataGraphPipelineConstantARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineConstantTensorSemiStructuredSparsityInfoARM::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDataGraphPipelineCreateInfoARM::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDataGraphPipelineCreateInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineDispatchInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineIdentifierCreateInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDataGraphPipelinePropertyQueryResultARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -389,6 +433,10 @@ template<>
 struct fex_gen_config<&VkDataGraphPipelineSessionCreateInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDataGraphPipelineSessionMemoryRequirementsInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDataGraphPipelineShaderModuleCreateInfoARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -397,22 +445,30 @@ template<>
 struct fex_gen_config<&VkDebugMarkerMarkerInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDebugMarkerObjectNameInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDebugMarkerObjectTagInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDebugReportCallbackCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDebugUtilsLabelEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDebugUtilsMessengerCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDebugUtilsObjectNameInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDebugUtilsObjectTagInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDecompressMemoryInfoEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDecompressMemoryInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDedicatedAllocationBufferCreateInfoNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -463,6 +519,10 @@ template<>
 struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceCreateInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDeviceDeviceMemoryReportCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -471,12 +531,20 @@ template<>
 struct fex_gen_config<&VkDeviceEventInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceFaultCountsEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDeviceFaultInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceGroupBindSparseInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceGroupBindSparseInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceGroupCommandBufferBeginInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDeviceGroupDeviceCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -491,8 +559,8 @@ template<>
 struct fex_gen_config<&VkDeviceGroupSwapchainCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceImageMemoryRequirements::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceImageSubresourceInfoKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceImageSubresourceInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceMemoryOpaqueCaptureAddressInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -511,10 +579,22 @@ template<>
 struct fex_gen_config<&VkDeviceQueueInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceQueueShaderCoreControlCreateInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDeviceTensorMemoryRequirementsARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDirectDriverLoadingInfoLUNARG::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDirectDriverLoadingListLUNARG::pNext> : fexgen::custom_repack {};
 template<>
@@ -545,8 +625,16 @@ template<>
 struct fex_gen_config<&VkDisplaySurfaceCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDisplaySurfaceStereoCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDrmFormatModifierPropertiesList2EXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkDrmFormatModifierPropertiesListEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -595,14 +683,26 @@ template<>
 struct fex_gen_config<&VkFormatProperties2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkFormatProperties3::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkFragmentShadingRateAttachmentInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkFrameBoundaryEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkFrameBoundaryTensorsARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkFramebufferAttachmentImageInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkFramebufferAttachmentsCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -611,8 +711,8 @@ template<>
 struct fex_gen_config<&VkFramebufferMixedSamplesCombinationNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGeneratedCommandsInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkGeneratedCommandsInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkGeneratedCommandsInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGeneratedCommandsMemoryRequirementsInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -627,16 +727,28 @@ template<>
 struct fex_gen_config<&VkGeometryNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGeometryTrianglesNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGraphicsPipelineCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkGraphicsPipelineLibraryCreateInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkGraphicsPipelineShaderGroupsCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkGraphicsShaderGroupCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkHdrVividDynamicMetadataHUAWEI::pNext> : fexgen::custom_repack {};
 template<>
@@ -659,6 +771,10 @@ template<>
 struct fex_gen_config<&VkImageCopy2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkImageCreateInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkImageDrmFormatModifierExplicitCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -687,6 +803,10 @@ template<>
 struct fex_gen_config<&VkImageSubresource2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkImageSwapchainCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkImageToMemoryCopy::pNext> : fexgen::custom_repack {};
 template<>
@@ -711,26 +831,38 @@ template<>
 struct fex_gen_config<&VkImportFenceFdInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkImportMemoryFdInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkImportMemoryHostPointerInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkImportSemaphoreFdInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkIndirectCommandsLayoutTokenEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutTokenEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkIndirectCommandsLayoutTokenNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkIndirectExecutionSetCreateInfoEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkIndirectExecutionSetCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkIndirectExecutionSetPipelineInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkIndirectExecutionSetShaderInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkIndirectExecutionSetShaderLayoutInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkInitializePerformanceApiInfoINTEL::pNext> : fexgen::custom_repack {};
 template<>
@@ -745,6 +877,10 @@ template<>
 struct fex_gen_config<&VkLatencySurfaceCapabilitiesNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkLatencyTimingsFrameReportNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkLayerSettingsCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -775,6 +911,10 @@ template<>
 struct fex_gen_config<&VkMemoryHostPointerPropertiesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkMemoryMapInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkMemoryMapPlacedInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -789,6 +929,10 @@ template<>
 struct fex_gen_config<&VkMemoryToImageCopy::pHostPointer> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkMemoryUnmapInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkMicromapBuildInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -805,8 +949,16 @@ template<>
 struct fex_gen_config<&VkMultiviewPerViewAttributesInfoNVX::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkMultiviewPerViewRenderAreasRenderPassBeginInfoQCOM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkMutableDescriptorTypeCreateInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkOpaqueCaptureDescriptorDataCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -817,6 +969,10 @@ template<>
 struct fex_gen_config<&VkOpticalFlowImageFormatPropertiesNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkOpticalFlowSessionCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkOpticalFlowSessionCreatePrivateDataInfoNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -825,12 +981,12 @@ template<>
 struct fex_gen_config<&VkPartitionedAccelerationStructureFlagsNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPartitionedAccelerationStructureInstancesInputNV::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkPastPresentationTimingEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkPastPresentationTimingEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPastPresentationTimingInfoEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPerformanceConfigurationAcquireInfoINTEL::pNext> : fexgen::custom_repack {};
 template<>
@@ -1037,6 +1193,10 @@ template<>
 struct fex_gen_config<&VkPhysicalDeviceExternalMemoryRDMAFeaturesNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPhysicalDeviceExternalSemaphoreInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPhysicalDeviceExternalTensorInfoARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -1087,6 +1247,10 @@ template<>
 struct fex_gen_config<&VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPhysicalDeviceGroupProperties::pNext> : fexgen::custom_repack {};
 template<>
@@ -1143,6 +1307,10 @@ template<>
 struct fex_gen_config<&VkPhysicalDeviceInvocationMaskFeaturesHUAWEI::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPhysicalDeviceLayeredApiPropertiesKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPhysicalDeviceLayeredApiPropertiesListKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1547,6 +1715,10 @@ template<>
 struct fex_gen_config<&VkPhysicalDeviceVideoEncodeAV1FeaturesKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1589,10 +1761,18 @@ template<>
 struct fex_gen_config<&VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineBinaryCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPipelineBinaryDataInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer to a type of different width on each side (size_t*,
+// or a handle array written back on exit). Repacking that needs out-array
+// support the generator does not have; keeping the struct out of the type
+// set leaves its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineBinaryHandlesInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1619,6 +1799,10 @@ template<>
 struct fex_gen_config<&VkPipelineCreateFlags2CreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPipelineCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineCreationFeedbackCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -1629,6 +1813,10 @@ template<>
 struct fex_gen_config<&VkPipelineDynamicStateCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPipelineExecutableInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineExecutableInternalRepresentationKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1691,6 +1879,10 @@ template<>
 struct fex_gen_config<&VkPipelineVertexInputDivisorStateCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPipelineVertexInputStateCreateInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineViewportCoarseSampleOrderStateCreateInfoNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -1699,6 +1891,10 @@ template<>
 struct fex_gen_config<&VkPipelineViewportDepthClipControlCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPipelineViewportExclusiveScissorStateCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPipelineViewportShadingRateImageStateCreateInfoNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -1713,12 +1909,24 @@ template<>
 struct fex_gen_config<&VkPresentIdKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPresentInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPresentRegionsKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPresentTimesInfoGOOGLE::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkPresentTimingInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkPresentTimingsInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -1729,12 +1937,16 @@ template<>
 struct fex_gen_config<&VkPrivateDataSlotCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkProtectedSubmitInfo::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkPushConstantsInfo::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkPushDescriptorSetInfo::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkPushDescriptorSetWithTemplateInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkPushConstantsInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkPushDescriptorSetInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkPushDescriptorSetWithTemplateInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkQueryLowLatencySupportNV::pNext> : fexgen::custom_repack {};
 template<>
@@ -1765,12 +1977,20 @@ template<>
 struct fex_gen_config<&VkQueueFamilyVideoPropertiesKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkRayTracingPipelineClusterAccelerationStructureCreateInfoNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkRayTracingPipelineCreateInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkRayTracingPipelineInterfaceCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkRayTracingShaderGroupCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -1819,12 +2039,24 @@ template<>
 struct fex_gen_config<&VkRenderPassMultiviewCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkRenderPassPerformanceCountersByRegionBeginInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkRenderPassSampleLocationsBeginInfoEXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkRenderPassStripeBeginInfoARM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkRenderPassStripeInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkRenderPassStripeSubmitInfoARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -1879,6 +2111,10 @@ template<>
 struct fex_gen_config<&VkSetLatencyMarkerInfoNV::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSetPresentConfigNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkShaderCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -1903,6 +2139,10 @@ template<>
 struct fex_gen_config<&VkSubpassDependency2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSubpassDescription2::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkSubpassDescriptionDepthStencilResolve::pNext> : fexgen::custom_repack {};
 template<>
@@ -1955,18 +2195,34 @@ template<>
 struct fex_gen_config<&VkSwapchainPresentModesCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSwapchainPresentScalingCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer to a type of different width on each side (size_t*,
+// or a handle array written back on exit). Repacking that needs out-array
+// support the generator does not have; keeping the struct out of the type
+// set leaves its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkSwapchainTimeDomainPropertiesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSwapchainTimingPropertiesEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkTensorCaptureDescriptorDataInfoARM::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkTensorCopyARM::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkTensorCopyARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkTensorCreateInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkTensorDependencyInfoARM::pNext> : fexgen::custom_repack {};
+// Contains a pointer to a type of different width on each side (size_t*,
+// or a handle array written back on exit). Repacking that needs out-array
+// support the generator does not have; keeping the struct out of the type
+// set leaves its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkTensorDescriptionARM::pNext> : fexgen::custom_repack {};
 template<>
@@ -1991,6 +2247,10 @@ template<>
 struct fex_gen_config<&VkTilePropertiesQCOM::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkTimelineSemaphoreSubmitInfo::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkValidationCacheCreateInfoEXT::pNext> : fexgen::custom_repack {};
 template<>
@@ -2001,6 +2261,10 @@ template<>
 struct fex_gen_config<&VkVertexInputAttributeDescription2EXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVertexInputBindingDescription2EXT::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoBeginCodingInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2009,14 +2273,26 @@ template<>
 struct fex_gen_config<&VkVideoCodingControlInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeAV1CapabilitiesKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkVideoDecodeAV1DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkVideoDecodeAV1DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeAV1InlineSessionParametersInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeAV1PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeAV1ProfileInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeAV1SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2025,46 +2301,86 @@ template<>
 struct fex_gen_config<&VkVideoDecodeH264CapabilitiesKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH264DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH264InlineSessionParametersInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH264PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH264ProfileInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH264SessionParametersAddInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH264SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH265CapabilitiesKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH265DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH265InlineSessionParametersInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH265PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeH265ProfileInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH265SessionParametersAddInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeH265SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeUsageInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeVP9CapabilitiesKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoDecodeVP9PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoDecodeVP9ProfileInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeAV1CapabilitiesKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeAV1DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeAV1GopRemainingFrameInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeAV1PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2079,6 +2395,10 @@ template<>
 struct fex_gen_config<&VkVideoEncodeAV1RateControlLayerInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeAV1SessionCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeAV1SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2089,8 +2409,16 @@ template<>
 struct fex_gen_config<&VkVideoEncodeH264DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH264GopRemainingFrameInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH264NaluSliceInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH264PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2105,8 +2433,16 @@ template<>
 struct fex_gen_config<&VkVideoEncodeH264RateControlLayerInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH264SessionCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH264SessionParametersAddInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH264SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2119,8 +2455,16 @@ template<>
 struct fex_gen_config<&VkVideoEncodeH265DpbSlotInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH265GopRemainingFrameInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH265NaluSliceSegmentInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH265PictureInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2135,14 +2479,26 @@ template<>
 struct fex_gen_config<&VkVideoEncodeH265RateControlLayerInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH265SessionCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH265SessionParametersAddInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeH265SessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH265SessionParametersFeedbackInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeH265SessionParametersGetInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2161,6 +2517,10 @@ template<>
 struct fex_gen_config<&VkVideoEncodeQuantizationMapInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoEncodeQuantizationMapSessionParametersCreateInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoEncodeRateControlInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2193,12 +2553,24 @@ template<>
 struct fex_gen_config<&VkVideoPictureResourceInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoProfileInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoProfileListInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkVideoReferenceIntraRefreshInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoReferenceSlotInfoKHR::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkVideoSessionCreateInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2215,6 +2587,10 @@ template<>
 struct fex_gen_config<&VkWriteDescriptorSetAccelerationStructureKHR::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkWriteDescriptorSetAccelerationStructureNV::pNext> : fexgen::custom_repack {};
+// Contains a pointer whose pointee differs in width between guest and host
+// (size_t*, or a handle array written back on exit). Converting that needs
+// out-array support the generator does not have, so keep the struct out of
+// the type set and leave its entry points 64-bit-only.
 // template<>
 // struct fex_gen_config<&VkWriteDescriptorSetInlineUniformBlock::pNext> : fexgen::custom_repack {};
 template<>
@@ -2352,6 +2728,96 @@ template<>
 struct fex_gen_type<wl_display> : fexgen::opaque_type {};
 template<>
 struct fex_gen_type<wl_surface> : fexgen::opaque_type {};
+
+// --- array_length_from annotations (generated from vk.xml) ---
+template<>
+struct fex_gen_config<&VkSwapchainTimeDomainPropertiesEXT::pTimeDomains> : fexgen::array_length_from<&VkSwapchainTimeDomainPropertiesEXT::timeDomainCount> {};
+template<>
+struct fex_gen_config<&VkSwapchainTimeDomainPropertiesEXT::pTimeDomainIds> : fexgen::array_length_from<&VkSwapchainTimeDomainPropertiesEXT::timeDomainCount> {};
+template<>
+struct fex_gen_config<&VkRayTracingPipelineCreateInfoKHR::pStages> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoKHR::stageCount> {};
+template<>
+struct fex_gen_config<&VkRayTracingPipelineCreateInfoKHR::pGroups> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoKHR::groupCount> {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureBuildGeometryInfoKHR::pGeometries> : fexgen::array_length_from<&VkAccelerationStructureBuildGeometryInfoKHR::geometryCount> {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoEXT::pTokens> : fexgen::array_length_from<&VkIndirectCommandsLayoutCreateInfoEXT::tokenCount> {};
+template<>
+struct fex_gen_config<&VkDecompressMemoryInfoEXT::pRegions> : fexgen::array_length_from<&VkDecompressMemoryInfoEXT::regionCount> {};
+template<>
+struct fex_gen_config<&VkDataGraphPipelinePropertyQueryResultARM::pData> : fexgen::array_length_from<&VkDataGraphPipelinePropertyQueryResultARM::dataSize> {};
+template<>
+struct fex_gen_config<&VkDataGraphPipelineCreateInfoARM::pResourceInfos> : fexgen::array_length_from<&VkDataGraphPipelineCreateInfoARM::resourceInfoCount> {};
+template<>
+struct fex_gen_config<&VkGetLatencyMarkerInfoNV::pTimings> : fexgen::array_length_from<&VkGetLatencyMarkerInfoNV::timingCount> {};
+template<>
+struct fex_gen_config<&VkShaderCreateInfoEXT::pCode> : fexgen::array_length_from<&VkShaderCreateInfoEXT::codeSize> {};
+template<>
+struct fex_gen_config<&VkShaderCreateInfoEXT::pSetLayouts> : fexgen::array_length_from<&VkShaderCreateInfoEXT::setLayoutCount> {};
+template<>
+struct fex_gen_config<&VkShaderCreateInfoEXT::pPushConstantRanges> : fexgen::array_length_from<&VkShaderCreateInfoEXT::pushConstantRangeCount> {};
+template<>
+struct fex_gen_config<&VkCopyTensorInfoARM::pRegions> : fexgen::array_length_from<&VkCopyTensorInfoARM::regionCount> {};
+template<>
+struct fex_gen_config<&VkTensorCopyARM::pSrcOffset> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
+template<>
+struct fex_gen_config<&VkTensorCopyARM::pDstOffset> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
+template<>
+struct fex_gen_config<&VkTensorCopyARM::pExtent> : fexgen::array_length_from<&VkTensorCopyARM::dimensionCount> {};
+template<>
+struct fex_gen_config<&VkTensorCreateInfoARM::pQueueFamilyIndices> : fexgen::array_length_from<&VkTensorCreateInfoARM::queueFamilyIndexCount> {};
+template<>
+struct fex_gen_config<&VkMicromapBuildInfoEXT::pUsageCounts> : fexgen::array_length_from<&VkMicromapBuildInfoEXT::usageCountsCount> {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pTokens> : fexgen::array_length_from<&VkIndirectCommandsLayoutCreateInfoNV::tokenCount> {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutTokenNV::pIndexTypes> : fexgen::array_length_from<&VkIndirectCommandsLayoutTokenNV::indexTypeCount> {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutTokenNV::pIndexTypeValues> : fexgen::array_length_from<&VkIndirectCommandsLayoutTokenNV::indexTypeCount> {};
+template<>
+struct fex_gen_config<&VkIndirectCommandsLayoutCreateInfoNV::pStreamStrides> : fexgen::array_length_from<&VkIndirectCommandsLayoutCreateInfoNV::streamCount> {};
+template<>
+struct fex_gen_config<&VkGeneratedCommandsInfoNV::pStreams> : fexgen::array_length_from<&VkGeneratedCommandsInfoNV::streamCount> {};
+template<>
+struct fex_gen_config<&VkPastPresentationTimingPropertiesEXT::pPresentationTimings> : fexgen::array_length_from<&VkPastPresentationTimingPropertiesEXT::presentationTimingCount> {};
+template<>
+struct fex_gen_config<&VkPastPresentationTimingEXT::pPresentStages> : fexgen::array_length_from<&VkPastPresentationTimingEXT::presentStageCount> {};
+template<>
+struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pStages> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoNV::stageCount> {};
+template<>
+struct fex_gen_config<&VkRayTracingPipelineCreateInfoNV::pGroups> : fexgen::array_length_from<&VkRayTracingPipelineCreateInfoNV::groupCount> {};
+template<>
+struct fex_gen_config<&VkAccelerationStructureInfoNV::pGeometries> : fexgen::array_length_from<&VkAccelerationStructureInfoNV::geometryCount> {};
+template<>
+struct fex_gen_config<&VkValidationCacheCreateInfoEXT::pInitialData> : fexgen::array_length_from<&VkValidationCacheCreateInfoEXT::initialDataSize> {};
+template<>
+struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pQueueLabels> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::queueLabelCount> {};
+template<>
+struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pCmdBufLabels> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::cmdBufLabelCount> {};
+template<>
+struct fex_gen_config<&VkDebugUtilsMessengerCallbackDataEXT::pObjects> : fexgen::array_length_from<&VkDebugUtilsMessengerCallbackDataEXT::objectCount> {};
+template<>
+struct fex_gen_config<&VkDebugUtilsObjectTagInfoEXT::pTag> : fexgen::array_length_from<&VkDebugUtilsObjectTagInfoEXT::tagSize> {};
+template<>
+struct fex_gen_config<&VkCuLaunchInfoNVX::pParams> : fexgen::array_length_from<&VkCuLaunchInfoNVX::paramCount> {};
+template<>
+struct fex_gen_config<&VkCuLaunchInfoNVX::pExtras> : fexgen::array_length_from<&VkCuLaunchInfoNVX::extraCount> {};
+template<>
+struct fex_gen_config<&VkCuModuleCreateInfoNVX::pData> : fexgen::array_length_from<&VkCuModuleCreateInfoNVX::dataSize> {};
+template<>
+struct fex_gen_config<&VkDebugMarkerObjectTagInfoEXT::pTag> : fexgen::array_length_from<&VkDebugMarkerObjectTagInfoEXT::tagSize> {};
+template<>
+struct fex_gen_config<&VkVideoEncodeInfoKHR::pReferenceSlots> : fexgen::array_length_from<&VkVideoEncodeInfoKHR::referenceSlotCount> {};
+template<>
+struct fex_gen_config<&VkPipelineExecutableInternalRepresentationKHR::pData> : fexgen::array_length_from<&VkPipelineExecutableInternalRepresentationKHR::dataSize> {};
+template<>
+struct fex_gen_config<&VkVideoDecodeInfoKHR::pReferenceSlots> : fexgen::array_length_from<&VkVideoDecodeInfoKHR::referenceSlotCount> {};
+template<>
+struct fex_gen_config<&VkVideoBeginCodingInfoKHR::pReferenceSlots> : fexgen::array_length_from<&VkVideoBeginCodingInfoKHR::referenceSlotCount> {};
+template<>
+struct fex_gen_config<&VkCopyImageToImageInfo::pRegions> : fexgen::array_length_from<&VkCopyImageToImageInfo::regionCount> {};
+template<>
+struct fex_gen_config<&VkCopyImageToMemoryInfo::pRegions> : fexgen::array_length_from<&VkCopyImageToMemoryInfo::regionCount> {};
 
 namespace internal {
 
@@ -3070,10 +3536,8 @@ struct fex_gen_config<vkCopyMemoryToImage> {};
 template<>
 struct fex_gen_config<vkCopyImageToMemory> {};
 #endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyImageToImage> {};
-#endif
 template<>
 struct fex_gen_config<vkTransitionImageLayout> {};
 template<>
@@ -3670,10 +4134,8 @@ template<>
 struct fex_gen_param<vkCreateDebugUtilsMessengerEXT, 1, const VkDebugUtilsMessengerCreateInfoEXT*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkDestroyDebugUtilsMessengerEXT> : fexgen::custom_host_impl {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkSubmitDebugUtilsMessageEXT> {};
-#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdSetSampleLocationsEXT> {};
@@ -3712,18 +4174,14 @@ template<>
 struct fex_gen_config<vkGetAccelerationStructureMemoryRequirementsNV> {};
 template<>
 struct fex_gen_config<vkBindAccelerationStructureMemoryNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBuildAccelerationStructureNV> {};
-#endif
 template<>
 struct fex_gen_config<vkCmdCopyAccelerationStructureNV> {};
 template<>
 struct fex_gen_config<vkCmdTraceRaysNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateRayTracingPipelinesNV> {};
-#endif
 template<>
 struct fex_gen_config<vkGetRayTracingShaderGroupHandlesKHR> {};
 template<>
@@ -3782,10 +4240,8 @@ struct fex_gen_config<vkGetSwapchainTimingPropertiesEXT> {};
 template<>
 struct fex_gen_config<vkGetSwapchainTimeDomainPropertiesEXT> {};
 #endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetPastPresentationTimingEXT> {};
-#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkInitializePerformanceApiINTEL> {};
@@ -3854,10 +4310,8 @@ struct fex_gen_config<vkCopyMemoryToImageEXT> {};
 template<>
 struct fex_gen_config<vkCopyImageToMemoryEXT> {};
 #endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyImageToImageEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkTransitionImageLayoutEXT> {};
 template<>
@@ -3868,20 +4322,14 @@ struct fex_gen_config<vkReleaseSwapchainImagesEXT> {};
 #endif
 template<>
 struct fex_gen_config<vkGetGeneratedCommandsMemoryRequirementsNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdPreprocessGeneratedCommandsNV> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdExecuteGeneratedCommandsNV> {};
-#endif
 template<>
 struct fex_gen_config<vkCmdBindPipelineShaderGroupNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateIndirectCommandsLayoutNV> {};
-#endif
 template<>
 struct fex_gen_config<vkDestroyIndirectCommandsLayoutNV> {};
 #ifndef IS_32BIT_THUNK
@@ -3996,28 +4444,20 @@ struct fex_gen_config<vkBuildMicromapsEXT> {};
 #endif
 template<>
 struct fex_gen_config<vkCopyMicromapEXT> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyMicromapToMemoryEXT> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyMemoryToMicromapEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkWriteMicromapsPropertiesEXT> {};
 template<>
 struct fex_gen_param<vkWriteMicromapsPropertiesEXT, 5, void*> : fexgen::assume_compatible_data_layout {};
 template<>
 struct fex_gen_config<vkCmdCopyMicromapEXT> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdCopyMicromapToMemoryEXT> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdCopyMemoryToMicromapEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkCmdWriteMicromapsPropertiesEXT> {};
 template<>
@@ -4137,10 +4577,8 @@ struct fex_gen_config<vkBindTensorMemoryARM> {};
 template<>
 struct fex_gen_config<vkGetDeviceTensorMemoryRequirementsARM> {};
 #endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdCopyTensorARM> {};
-#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceExternalTensorPropertiesARM> {};
@@ -4203,16 +4641,12 @@ template<>
 struct fex_gen_config<vkLatencySleepNV> {};
 template<>
 struct fex_gen_config<vkSetLatencyMarkerNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetLatencyTimingsNV> {};
-#endif
 template<>
 struct fex_gen_config<vkQueueNotifyOutOfBandNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateDataGraphPipelinesARM> {};
-#endif
 template<>
 struct fex_gen_config<vkCreateDataGraphPipelineSessionARM> {};
 template<>
@@ -4239,10 +4673,8 @@ template<>
 struct fex_gen_config<vkCmdSetAttachmentFeedbackLoopEnableEXT> {};
 template<>
 struct fex_gen_config<vkCmdBindTileMemoryQCOM> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdDecompressMemoryEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkCmdDecompressMemoryIndirectCountEXT> {};
 template<>
@@ -4251,14 +4683,10 @@ template<>
 struct fex_gen_config<vkDestroyExternalComputeQueueNV> {};
 template<>
 struct fex_gen_config<vkGetExternalComputeQueueDataNV> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetClusterAccelerationStructureBuildSizesNV> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBuildClusterAccelerationStructureIndirectNV> {};
-#endif
 template<>
 struct fex_gen_config<vkGetPartitionedAccelerationStructuresBuildSizesNV> {};
 template<>
@@ -4269,16 +4697,12 @@ template<>
 struct fex_gen_config<vkCmdPreprocessGeneratedCommandsEXT> {};
 template<>
 struct fex_gen_config<vkCmdExecuteGeneratedCommandsEXT> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateIndirectCommandsLayoutEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkDestroyIndirectCommandsLayoutEXT> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateIndirectExecutionSetEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkDestroyIndirectExecutionSetEXT> {};
 template<>
@@ -4313,28 +4737,20 @@ struct fex_gen_config<vkBuildAccelerationStructuresKHR> {};
 #endif
 template<>
 struct fex_gen_config<vkCopyAccelerationStructureKHR> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyAccelerationStructureToMemoryKHR> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyMemoryToAccelerationStructureKHR> {};
-#endif
 template<>
 struct fex_gen_config<vkWriteAccelerationStructuresPropertiesKHR> {};
 template<>
 struct fex_gen_param<vkWriteAccelerationStructuresPropertiesKHR, 5, void*> : fexgen::assume_compatible_data_layout {};
 template<>
 struct fex_gen_config<vkCmdCopyAccelerationStructureKHR> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdCopyAccelerationStructureToMemoryKHR> {};
-#endif
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdCopyMemoryToAccelerationStructureKHR> {};
-#endif
 template<>
 struct fex_gen_config<vkGetAccelerationStructureDeviceAddressKHR> {};
 template<>
