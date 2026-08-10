@@ -2397,8 +2397,6 @@ struct fex_gen_config<vkDestroyDevice> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkEnumerateInstanceExtensionProperties> {};
 template<>
-struct fex_gen_config<vkEnumerateDeviceExtensionProperties> {};
-template<>
 struct fex_gen_config<vkEnumerateInstanceLayerProperties> {};
 template<>
 struct fex_gen_config<vkEnumerateDeviceLayerProperties> {};
@@ -4472,6 +4470,14 @@ template<>
 struct fex_gen_config<vkQueueBindSparse> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkQueueBindSparse, 2, const VkBindSparseInfo*> : fexgen::ptr_passthrough {};
+#endif
+
+#ifdef IS_32BIT_THUNK
+// Filters the extensions we enable internally out of what the guest sees.
+template<>
+struct fex_gen_config<vkEnumerateDeviceExtensionProperties> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkEnumerateDeviceExtensionProperties, 3, VkExtensionProperties*> : fexgen::ptr_passthrough {};
 #endif
 
 // Not restored, and why:

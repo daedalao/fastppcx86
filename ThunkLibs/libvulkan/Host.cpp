@@ -351,6 +351,14 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   };
 
   const bool WantPlaced = DeviceSupportsPlacedMaps(a_0) && SupportedPlaced.memoryMapPlaced == VK_TRUE;
+
+  // We enable VK_KHR_map_memory2 and VK_EXT_map_memory_placed for our own use,
+  // but neither vkMapMemory2 nor vkUnmapMemory2 is thunked for a 32-bit guest.
+  // If the guest sees the extensions it may call them, get nullptr back from
+  // vkGetDeviceProcAddr and call through it -- the "NoExec instruction in entry
+  // block: 0" crash this thunk already had once. Hide them: the guest keeps
+  // using vkMapMemory/vkUnmapMemory, which route through the placed path.
+
   if (WantPlaced) {
     PatchedExtensions.assign(a_1->ppEnabledExtensionNames, a_1->ppEnabledExtensionNames + a_1->enabledExtensionCount);
     for (const char* Name : {VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME}) {
@@ -1173,10 +1181,28 @@ static void RecordPlacedAllocationSize(VkDeviceMemory Memory, VkDeviceSize Size)
   PlacedAllocationSizes[Memory] = Size;
 }
 
+static void ReleasePlacedRange(uintptr_t Base);
+
 static void ForgetPlacedAllocation(VkDeviceMemory Memory) {
-  std::lock_guard lk {PlacedDeviceMutex};
-  PlacedAllocationSizes.erase(Memory);
-  PlacedMappings.erase(Memory);
+  // Vulkan implicitly unmaps on vkFreeMemory, and DXVK keeps its chunks
+  // persistently mapped and frees them on chunk destruction -- so this is a
+  // routine path, not an edge case. Dropping the VkDeviceMemory -> Base entry
+  // without releasing the range permanently burned an allocation-sized slice of
+  // low-4GB per freed chunk: a leak of the exact resource the placed-map work
+  // exists to conserve, and almost certainly why the address space looked
+  // exhausted while over a gigabyte sat free.
+  uintptr_t Base = 0;
+  {
+    std::lock_guard lk {PlacedDeviceMutex};
+    PlacedAllocationSizes.erase(Memory);
+    if (auto It = PlacedMappings.find(Memory); It != PlacedMappings.end()) {
+      Base = It->second;
+      PlacedMappings.erase(It);
+    }
+  }
+  if (Base) {
+    ReleasePlacedRange(Base);
+  }
 }
 
 // Resolve the map/unmap entry points and the placement alignment once, at
@@ -1229,6 +1255,12 @@ static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice 
   fprintf(stderr, "Placed Vulkan memory maps enabled (alignment %zu, unmapReserve %d, rangePlaced %d)\n", Info.Alignment,
           (int)Info.UnmapReserve, (int)Info.RangePlaced);
   fflush(stderr);
+}
+
+// Extensions we enable for our own use and must not report to the guest,
+// because the entry points they bring are not thunked for a 32-bit guest.
+static bool IsInternalOnlyExtension(std::string_view Name) {
+  return Name == VK_KHR_MAP_MEMORY_2_EXTENSION_NAME || Name == VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
 }
 
 static bool DeviceSupportsPlacedMaps(VkPhysicalDevice PhysicalDevice) {
@@ -1409,13 +1441,19 @@ void fexfn_impl_libvulkan_vkUnmapMemory(VkDevice device, VkDeviceMemory memory) 
   ReleasePlacedRange(Base);
 }
 
-// Allocate a host copy of a single nested struct *and* run its custom repacking.
+// Allocate a host copy of a single nested struct and run its custom repacking.
 //
-// The plain `new host_layout<T>{*guest}` form only converts T's own fields, so
-// anything T owns -- its arrays, its pNext chain -- is left pointing at guest
-// memory for the driver to read. That is invisible whenever the element layouts
-// happen to match on both sides, which is why it survived: wrong, but not yet
-// fatal. Use this instead of hand-rolling the allocation.
+// Scope correction: the commit that introduced this claimed it fixed nested
+// *arrays* left pointing at guest memory. It does not. The nine
+// VkGraphicsPipelineCreateInfo state structs it replaced all use
+// VULKAN_DEFAULT_CUSTOM_REPACK, which only walks pNext -- none of them has a
+// hand-written entry that would repack an array. So for those callers this is
+// equivalent to the `new host_layout<T>{*guest}` it replaced, plus a pNext walk
+// that was previously skipped.
+//
+// It is still the right shape (recursion by default rather than per-site), but
+// anything it allocates has to be freed by the caller's exit -- see
+// FreeNestedChain below.
 template<typename HostT, typename GuestPtrT>
 static const HostT* RepackNested(const GuestPtrT& Guest) {
   auto Ptr = Guest.get_pointer();
@@ -4303,17 +4341,34 @@ void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, co
   into.data.pDynamicState = RepackNested<VkPipelineDynamicStateCreateInfo>(from.data.pDynamicState);
 }
 
+// Release a chain RepackNested built. convert() allocates each link with
+// aligned_alloc, and only default_fex_custom_repack_reverse frees them -- which
+// an exit that returns true never reaches.
+template<typename T>
+static void FreeNestedChain(const T* Nested) {
+  if (!Nested) {
+    return;
+  }
+  auto* Base = reinterpret_cast<const VkBaseOutStructure*>(Nested);
+  for (auto* Link = Base->pNext; Link;) {
+    auto* Next = Link->pNext;
+    free(Link);
+    Link = Next;
+  }
+  delete reinterpret_cast<const host_layout<T>*>(Nested);
+}
+
 bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, const host_layout<VkGraphicsPipelineCreateInfo>& from) {
+  FreeNestedChain(from.data.pVertexInputState);
+  FreeNestedChain(from.data.pInputAssemblyState);
+  FreeNestedChain(from.data.pTessellationState);
+  FreeNestedChain(from.data.pViewportState);
+  FreeNestedChain(from.data.pRasterizationState);
+  FreeNestedChain(from.data.pMultisampleState);
+  FreeNestedChain(from.data.pDepthStencilState);
+  FreeNestedChain(from.data.pColorBlendState);
+  FreeNestedChain(from.data.pDynamicState);
   delete[] from.data.pStages;
-  delete from.data.pVertexInputState;
-  delete from.data.pInputAssemblyState;
-  delete from.data.pTessellationState;
-  delete from.data.pViewportState;
-  delete from.data.pRasterizationState;
-  delete from.data.pMultisampleState;
-  delete from.data.pDepthStencilState;
-  delete from.data.pColorBlendState;
-  delete from.data.pDynamicState;
   // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
 }
@@ -4761,6 +4816,49 @@ VkResult fexfn_impl_libvulkan_vkQueueBindSparse(VkQueue a_0, uint32_t a_1, guest
   }
 
   return LDR_PTR(vkQueueBindSparse)(a_0, a_1, Scratch.Infos.data(), a_3);
+}
+
+// Hide the extensions we enable for our own use. Reported unconditionally
+// rather than only after vkCreateDevice, because DXVK queries the list before
+// creating the device and decides then what it will call.
+VkResult fexfn_impl_libvulkan_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice a_0, const char* a_1, uint32_t* a_2,
+                                                                   guest_layout<VkExtensionProperties*> a_3) {
+  uint32_t HostCount = 0;
+  auto Ret = LDR_PTR(vkEnumerateDeviceExtensionProperties)(a_0, a_1, &HostCount, nullptr);
+  if (Ret != VK_SUCCESS || !HostCount) {
+    if (a_2) {
+      *a_2 = 0;
+    }
+    return Ret;
+  }
+
+  std::vector<VkExtensionProperties> All(HostCount);
+  Ret = LDR_PTR(vkEnumerateDeviceExtensionProperties)(a_0, a_1, &HostCount, All.data());
+  if (Ret != VK_SUCCESS) {
+    return Ret;
+  }
+
+  std::vector<VkExtensionProperties> Visible;
+  Visible.reserve(HostCount);
+  for (uint32_t i = 0; i < HostCount; ++i) {
+    if (!IsInternalOnlyExtension(All[i].extensionName)) {
+      Visible.push_back(All[i]);
+    }
+  }
+
+  if (!a_3.get_pointer()) {
+    *a_2 = static_cast<uint32_t>(Visible.size());
+    return VK_SUCCESS;
+  }
+
+  const uint32_t Room = *a_2;
+  const uint32_t Written = std::min<uint32_t>(Room, static_cast<uint32_t>(Visible.size()));
+  auto* Guest = a_3.get_pointer();
+  for (uint32_t i = 0; i < Written; ++i) {
+    Guest[i] = to_guest(to_host_layout(Visible[i]));
+  }
+  *a_2 = Written;
+  return Written < Visible.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
