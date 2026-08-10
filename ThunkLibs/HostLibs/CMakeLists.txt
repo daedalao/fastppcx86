@@ -21,12 +21,26 @@ if (ENABLE_CLANG_THUNKS)
   add_link_options(${LD_OVERRIDE})
 endif()
 
+set(PPC_THUNKGEN_EXTRA_FLAGS "")
+
+# x86 cross toolchain detected at top level: its cross gcc supplies the
+# libstdc++ headers for the x86-target parses (the cross-glibc sysroot in
+# X86_DEV_ROOTFS has none of its own). The i686 parse additionally needs the
+# stubs-32.h stand-in below: the cross glibc is 64-bit-only.
+if (THUNKGEN_X86_CROSS_CXX_DIR)
+  list(APPEND PPC_THUNKGEN_EXTRA_FLAGS
+       "-isystem${THUNKGEN_X86_CROSS_CXX_DIR}"
+       "-isystem${THUNKGEN_X86_CROSS_CXX_DIR}/x86_64-pc-linux-gnu")
+endif()
+
 # On PPC64LE (Arch) clang picks the Debian-style triple powerpc64le-linux-gnu
 # for the GCC toolchain, but the platform-specific c++ headers live under
 # powerpc64le-unknown-linux-gnu. The mismatch hides <bits/c++config.h>.
 # Discover the real path once and add it to every thunkgen invocation.
-set(PPC_THUNKGEN_EXTRA_FLAGS "")
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|powerpc64)")
+# Skipped when the x86 cross toolchain supplies the c++ headers instead: two
+# competing bits/c++config.h in the search path is how layouts go subtly
+# wrong.
+if (NOT THUNKGEN_X86_CROSS_CXX_DIR AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|powerpc64)")
   set(_PPC_CXX_PLATFORM_INC "")
   file(GLOB _PPC_CXX_DIRS /usr/include/c++/*/powerpc64le-*linux-gnu)
   foreach(_d ${_PPC_CXX_DIRS})

@@ -19,6 +19,9 @@ FastPPCx86 installed.
   Library thunks (native host GL/Vulkan/wayland passthrough) are installed
   and enabled system-wide via /usr/share/fex-emu/Config.json. Disable or
   tune them per user (~/.config/fex-emu/Config.json) or per app (FEXConfig).
+  If this package was built without an x86 RootFS (the default), 32-bit
+  titles fall back to emulated libraries; rebuild with FASTPPCX86_X86_ROOTFS
+  set to add the 32-bit thunk stubs (see the PKGBUILD header).
 
   Note: the SMC (self-modifying code) mtrack path needs a 4K-page kernel.
   On a 64K-page kernel FEX falls back to a slower software path.

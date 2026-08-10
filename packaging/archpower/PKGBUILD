@@ -8,16 +8,20 @@
 # Point it at a local checkout or a fork with FASTPPCX86_GIT_URL:
 #   FASTPPCX86_GIT_URL='file:///home/you/src/fastppcx86' makepkg -s
 #
-# Library thunks (native host GL/Vulkan/wayland passthrough) are ON. The host
-# halves build natively here. The guest halves are x86/i686 ELF objects --
-# identical for every ppc64le machine -- and cross-compiling them needs an
-# x86_64 cross gcc plus two x86 sysroots that end-user build boxes do not
-# have, so they install from a pinned release artifact instead. Maintainers
-# regenerate that artifact from a full thunk build (ENABLE_CLANG_GUEST_THUNKS
-# =OFF for the 64-bit stubs -- clang-built ones export ~2400 extra symbols and
-# break titles, see CMakeLists -- ENABLE_CLANG_GUEST_THUNKS_32=ON against a
-# multilib RootFS), then tar Guest/ and Guest_32/ as GuestThunks{,_32} and
-# upload: gh release create guest-thunks-<sha> <tarball>
+# Library thunks (native host GL/Vulkan/wayland passthrough) are ON,
+# everything built from source. ArchPOWER packages a full x86_64 cross
+# toolchain (x86_64-pc-linux-gnu-{gcc,glibc}); the build uses it for the
+# x86-target interface parses and the 64-bit guest stub libraries, all from
+# repo packages. Generated output is byte-identical to the maintainer ct-ng
+# sysroot reference (validated 2026-08-10).
+#
+# The 32-bit guest stubs are the one exception: they need an i686/multilib
+# x86 sysroot the repos do not carry. Point FASTPPCX86_X86_ROOTFS at an
+# extracted multilib x86-64 RootFS (e.g. from FEXRootFSFetcher) to build and
+# ship them too:
+#   FASTPPCX86_X86_ROOTFS=$HOME/.local/share/fex-emu/RootFS/ArchLinux makepkg -s
+# Without it, 64-bit titles get thunks and 32-bit titles transparently fall
+# back to emulated libraries.
 
 pkgname=fastppcx86
 pkgver=r0.0000000
@@ -26,18 +30,6 @@ pkgdesc='Fast x86 and x86-64 emulation for 64-bit POWER'
 arch=('powerpc64le')
 url='https://github.com/daedalao/fastppcx86'
 license=('MIT')
-
-# The guest-thunk artifact carries the guest .so stubs (GuestThunks{,_32}/)
-# AND the pre-generated host .inl files (HostGen/gen_{32,64}/) -- thunkgen
-# needs real x86 headers to derive guest layouts, which end-user build boxes
-# lack. Regenerate the artifact (and bump this pin) whenever a ThunkLibs
-# interface changes; guest and host halves are generated from the same
-# interface description and must move together. Release recipe: from a full
-# thunk build, tar Guest/ and Guest_32/ as GuestThunks{,_32}/ plus
-# ThunkLibs/HostLibs/gen_{32,64}/ as HostGen/, then
-# `gh release create guest-thunks-<sha> <tarball>`.
-_guest_thunks_ver=27218fa
-_guest_thunks_sha256=e49ebad90db6df7f0a68f98f285d448adbc9f4b82b8210a256cc726e5c7c9f98
 
 # Runtime: fmt is linked as a shared library (the build prefers the system copy
 # over External/fmt); the Qt6 bits are only needed by the FEXConfig GUI.
@@ -69,6 +61,10 @@ makedepends=(
   'libxcb'         # xcb presentation-support query in the Vulkan host thunk
   'libxshmfence'   # xshmfence host thunk
   'wayland'        # wayland-client host thunk
+  # x86 cross toolchain: thunkgen's x86-target interface parses and the
+  # 64-bit guest stub libraries.
+  'x86_64-pc-linux-gnu-gcc'
+  'x86_64-pc-linux-gnu-glibc'
 )
 optdepends=(
   'squashfuse: mount squashfs x86-64 RootFS images'
@@ -85,6 +81,7 @@ options=('!lto')
 install="$pkgname.install"
 
 _repourl="${FASTPPCX86_GIT_URL:-https://github.com/daedalao/fastppcx86.git}"
+_x86rootfs="${FASTPPCX86_X86_ROOTFS:-}"
 
 # The bundled third-party trees are git submodules. They are listed here as
 # real makepkg sources (rather than fetched inside prepare()) so that the
@@ -104,10 +101,8 @@ source=(
   'rpmalloc::git+https://github.com/FEX-Emu/rpmalloc.git'
   'cpp-optparse::git+https://github.com/Sonicadvance1/cpp-optparse.git'
   'vulkan-headers::git+https://github.com/KhronosGroup/Vulkan-Headers.git'
-  "fastppcx86-guest-thunks-${_guest_thunks_ver}.tar.zst::${url}/releases/download/guest-thunks-${_guest_thunks_ver}/fastppcx86-guest-thunks-${_guest_thunks_ver}.tar.zst"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
-            "$_guest_thunks_sha256")
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 # Submodule name -> source directory name. Note that the submodule *name* is
 # not always its path (cpp-optparse lives in Source/Common/).
@@ -150,6 +145,20 @@ build() {
   local _hash
   _hash="$(git -C "$srcdir/$pkgname" rev-parse HEAD)"
 
+  # 32-bit guest stubs only when a multilib x86 RootFS was provided (see the
+  # header comment). They build with clang against the RootFS sysroot; the
+  # 64-bit stubs always build, with the repo cross gcc (gcc deliberately:
+  # clang-built 64-bit stubs export ~2400 extra symbols and break titles, see
+  # the note in CMakeLists.txt).
+  local _guest32_args=(-DBUILD_GUEST_THUNKS_32=OFF)
+  if [[ -n $_x86rootfs ]]; then
+    _guest32_args=(
+      -DBUILD_GUEST_THUNKS_32=ON
+      -DENABLE_CLANG_GUEST_THUNKS_32=ON
+      -DX86_DEV_ROOTFS_32="$_x86rootfs"
+    )
+  fi
+
   # Mirrors the known-good POWER9 configuration (build-smc): clang, Ninja,
   # RelWithDebInfo, jemalloc-glibc + FEX allocator on, LTO off, tests off.
   # TUNE_CPU is forced to 'none' -- the upstream default of 'native' bakes
@@ -164,9 +173,8 @@ build() {
     -DBUILD_TESTING=OFF \
     -DBUILD_FEX_LINUX_TESTS=OFF \
     -DBUILD_THUNKS=ON \
-    -DBUILD_GUEST_THUNKS=OFF \
-    -DBUILD_GUEST_THUNKS_32=OFF \
-    -DTHUNKGEN_PREGEN_DIR="$srcdir/fastppcx86-guest-thunks-${_guest_thunks_ver}/HostGen" \
+    -DBUILD_GUEST_THUNKS=ON \
+    "${_guest32_args[@]}" \
     -DBUILD_FEXCONFIG=ON \
     -DENABLE_LTO=OFF \
     -DENABLE_CCACHE=OFF \
@@ -193,13 +201,15 @@ package() {
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
-  # Guest thunk libraries from the pinned artifact, into the config-default
-  # location ($prefix/share/fex-emu/GuestThunks{,_32}).
-  local _gt="$srcdir/fastppcx86-guest-thunks-${_guest_thunks_ver}"
-  install -dm755 "$pkgdir/usr/share/fex-emu"
-  cp -r "$_gt/GuestThunks" "$_gt/GuestThunks_32" "$pkgdir/usr/share/fex-emu/"
-  chmod -R u=rwX,go=rX "$pkgdir/usr/share/fex-emu/GuestThunks" \
-                       "$pkgdir/usr/share/fex-emu/GuestThunks_32"
+  # Guest thunk libraries (built by the guest-libs ExternalProjects; their
+  # INSTALL_COMMAND is empty) into the config-default location
+  # ($prefix/share/fex-emu/GuestThunks{,_32}).
+  install -dm755 "$pkgdir/usr/share/fex-emu/GuestThunks"
+  install -m755 "$srcdir"/build/Guest/*.so "$pkgdir/usr/share/fex-emu/GuestThunks/"
+  if [[ -n $_x86rootfs ]]; then
+    install -dm755 "$pkgdir/usr/share/fex-emu/GuestThunks_32"
+    install -m755 "$srcdir"/build/Guest_32/*.so "$pkgdir/usr/share/fex-emu/GuestThunks_32/"
+  fi
 
   # System-wide default configuration: thunks enabled for the libraries whose
   # thunk is production quality. Users override per-app or per-user via
