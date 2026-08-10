@@ -612,7 +612,8 @@ if (BUILD_THUNKS)
   # against it validated byte-identical to a full ct-ng x86 sysroot for every
   # interface at both bitnesses (2026-08-10).
   set(THUNKGEN_X86_CROSS_CXX_DIR "")
-  if (NOT X86_DEV_ROOTFS AND EXISTS "/usr/x86_64-pc-linux-gnu/usr/include/gnu/stubs.h")
+  # "/" is the cache default, meaning "nothing configured".
+  if ((NOT X86_DEV_ROOTFS OR X86_DEV_ROOTFS STREQUAL "/") AND EXISTS "/usr/x86_64-pc-linux-gnu/usr/include/gnu/stubs.h")
     file(GLOB _X86_CROSS_CXX_DIRS /usr/x86_64-pc-linux-gnu/include/c++/*)
     foreach(_d ${_X86_CROSS_CXX_DIRS})
       if (EXISTS "${_d}/x86_64-pc-linux-gnu/bits/c++config.h")
