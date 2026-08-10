@@ -56,10 +56,13 @@ makedepends=(
   'ninja'
   'python'
   'range-v3'       # optional: avoids compiling the bundled copy
-  # Host-thunk halves link against these:
+  # Host-thunk halves compile and link against these:
   'alsa-lib'       # asound host thunk
+  'libdrm'         # drm host thunk (xf86drm.h)
   'libglvnd'       # GL/EGL host thunks
   'libx11'         # X11 surface plumbing in the GL and Vulkan host thunks
+  'libxcb'         # xcb presentation-support query in the Vulkan host thunk
+  'libxshmfence'   # xshmfence host thunk
   'wayland'        # wayland-client host thunk
 )
 optdepends=(
@@ -69,6 +72,7 @@ optdepends=(
   'xz: RootFS extraction'
   'vulkan-driver: native Vulkan passthrough via the thunk'
   'libglvnd: native GL passthrough via the thunk'
+  'pipewire-pulse: PulseAudio server for guest audio (guests speak the PA protocol; pulseaudio works too)'
 )
 # nasm is deliberately absent: it is only needed by the ASM unit tests, and
 # BUILD_TESTING is off here.

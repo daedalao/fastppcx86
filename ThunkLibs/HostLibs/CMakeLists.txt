@@ -76,6 +76,18 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(BITNESS_FLAGS "-for-32bit-guest")
   endif()
 
+  # Without an X86_DEV_ROOTFS the x86-target interface parses run against the
+  # host's glibc headers, and ppc64le glibc's <gnu/stubs.h> includes
+  # <gnu/stubs-32.h> for ANY target that does not define __powerpc64__ -- so
+  # both the x86_64 and the i686 parse die on a header only multilib glibc
+  # ships. The parse never links, so an empty stand-in is sufficient;
+  # -idirafter keeps it behind every real header, so a provided sysroot still
+  # wins.
+  set(THUNKGEN_COMPAT_DIR "${CMAKE_BINARY_DIR}/thunkgen-compat")
+  file(WRITE "${THUNKGEN_COMPAT_DIR}/gnu/stubs-32.h"
+    "/* Empty parse-only stand-in for the x86 multilib stubs header. */\n")
+  set(BITNESS_COMPAT_FLAGS "-idirafter${THUNKGEN_COMPAT_DIR}")
+
   # Only pass X86_DEV_GCC_TOOLCHAIN for 64-bit guest thunks. For 32-bit the
   # ct-ng x86_64 crosstool has no i686 libstdc++, and pointing thunkgen's
   # clang at it forces the header search there and skips the perfectly good
@@ -96,6 +108,7 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
       # Expand include directories to space-separated list of -isystem parameters
       "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
       ${PPC_THUNKGEN_EXTRA_FLAGS}
+      ${BITNESS_COMPAT_FLAGS}
     VERBATIM
     COMMAND_EXPAND_LISTS)
 
