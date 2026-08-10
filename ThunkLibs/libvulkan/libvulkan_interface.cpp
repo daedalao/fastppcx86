@@ -71,6 +71,16 @@ template<>
 struct fex_gen_type<VkAccelerationStructureGeometryDataKHR> : fexgen::assume_compatible_data_layout {};
 template<>
 struct fex_gen_type<VkDescriptorDataEXT> : fexgen::assume_compatible_data_layout {};
+
+#ifdef IS_32BIT_THUNK
+// VkPhysicalDeviceGroupProperties embeds VkPhysicalDevice physicalDevices[32].
+// Dispatchable handles are host pointers, so an array of them has no guest
+// layout the generator can emit -- guest_layout<VkPhysicalDevice_T*[32]> is
+// exactly what it fails on. Pass the pointer through untouched and translate
+// the contents by hand, the same shape vkEnumeratePhysicalDevices already uses.
+template<>
+struct fex_gen_type<VkPhysicalDeviceGroupProperties> : fexgen::opaque_type {};
+#endif
 template<>
 struct fex_gen_type<VkDeviceOrHostAddressKHR> : fexgen::assume_compatible_data_layout {};
 template<>
@@ -359,8 +369,8 @@ struct fex_gen_config<&VkCopyImageToImageInfo::pNext> : fexgen::custom_repack {}
 // (size_t*, or a handle array written back on exit). Converting that needs
 // out-array support the generator does not have, so keep the struct out of
 // the type set and leave its entry points 64-bit-only.
-// template<>
-// struct fex_gen_config<&VkCopyImageToMemoryInfo::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkCopyImageToMemoryInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkCopyMemoryIndirectInfoKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -811,8 +821,14 @@ struct fex_gen_config<&VkImageSwapchainCreateInfoKHR::pNext> : fexgen::custom_re
 // (size_t*, or a handle array written back on exit). Converting that needs
 // out-array support the generator does not have, so keep the struct out of
 // the type set and leave its entry points 64-bit-only.
-// template<>
-// struct fex_gen_config<&VkImageToMemoryCopy::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkImageToMemoryCopy::pNext> : fexgen::custom_repack {};
+// pHostPointer is the guest buffer the driver copies the image into; it needs
+// the same widening the memory->image direction already does.
+template<>
+struct fex_gen_config<&VkImageToMemoryCopy::pHostPointer> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkHdrMetadataEXT::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkImageViewAddressPropertiesNVX::pNext> : fexgen::custom_repack {};
 template<>
@@ -3245,7 +3261,12 @@ struct fex_gen_config<vkGetDeviceGroupPeerMemoryFeatures> {};
 template<>
 struct fex_gen_config<vkCmdSetDeviceMask> {};
 #endif
-#ifndef IS_32BIT_THUNK
+#ifdef IS_32BIT_THUNK
+// VkPhysicalDeviceGroupProperties holds a fixed array of dispatchable
+// handles, which have no guest layout; translated by hand below.
+template<>
+struct fex_gen_config<vkEnumeratePhysicalDeviceGroups> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkEnumeratePhysicalDeviceGroups> {};
 #endif
@@ -3500,10 +3521,8 @@ template<>
 struct fex_gen_config<vkGetImageSubresourceLayout2> {};
 template<>
 struct fex_gen_config<vkCopyMemoryToImage> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyImageToMemory> {};
-#endif
 template<>
 struct fex_gen_config<vkCopyImageToImage> {};
 template<>
@@ -3688,7 +3707,12 @@ template<>
 struct fex_gen_config<vkCmdDispatchBaseKHR> {};
 template<>
 struct fex_gen_config<vkTrimCommandPoolKHR> {};
-#ifndef IS_32BIT_THUNK
+#ifdef IS_32BIT_THUNK
+// VkPhysicalDeviceGroupProperties holds a fixed array of dispatchable
+// handles, which have no guest layout; translated by hand below.
+template<>
+struct fex_gen_config<vkEnumeratePhysicalDeviceGroupsKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkEnumeratePhysicalDeviceGroupsKHR> {};
 #endif
@@ -4074,7 +4098,14 @@ template<>
 struct fex_gen_config<vkCmdSetDiscardRectangleEnableEXT> {};
 template<>
 struct fex_gen_config<vkCmdSetDiscardRectangleModeEXT> {};
-#ifndef IS_32BIT_THUNK
+#ifdef IS_32BIT_THUNK
+// pMetadata is an array of swapchainCount elements; automatic parameter
+// repacking only ever converts element 0.
+template<>
+struct fex_gen_config<vkSetHdrMetadataEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_param<vkSetHdrMetadataEXT, 3, const VkHdrMetadataEXT*> : fexgen::ptr_passthrough {};
+#else
 template<>
 struct fex_gen_config<vkSetHdrMetadataEXT> {};
 #endif
@@ -4276,10 +4307,8 @@ template<>
 struct fex_gen_config<vkCmdSetStencilOpEXT> {};
 template<>
 struct fex_gen_config<vkCopyMemoryToImageEXT> {};
-#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCopyImageToMemoryEXT> {};
-#endif
 template<>
 struct fex_gen_config<vkCopyImageToImageEXT> {};
 template<>

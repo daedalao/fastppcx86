@@ -387,6 +387,26 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
         fmt::print(file, "{}}}\n", indent);
       }
     };
+    // The guest's array pointers must be captured before any hand-written exit
+    // hook runs. VULKAN_DEFAULT_CUSTOM_REPACK rewrites the whole guest struct
+    // through to_guest(), whose designated initializer omits members the
+    // automatic conversion skips -- these arrays among them -- so they come back
+    // as null. Reading them afterwards handed the loop below a null base and
+    // dereferenced it.
+    auto emit_array_guest_saves = [&](std::string_view indent) {
+      if (type_repack_info.array_length_members.empty() || !type->getAsStructureType() ||
+          type_compat.at(type) == TypeCompatibility::Full) {
+        return;
+      }
+      for (auto* member : type->getAsStructureType()->getDecl()->fields()) {
+        auto member_name = member->getNameAsString();
+        if (!type_repack_info.ArrayLengthFor(member_name)) {
+          continue;
+        }
+        fmt::print(file, "{}auto fex_saved_{} = into.data.{};\n", indent, member_name, member_name);
+      }
+    };
+
     auto emit_array_repack_exit = [&](std::string_view indent) {
       // Only meaningful on the repacking path: when the struct is fully
       // compatible, guest_layout<T>::type is the real struct, so its members
@@ -412,14 +432,17 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
         fmt::print(file, "{}  auto* host_elements = reinterpret_cast<host_layout<{}>*>(const_cast<{}*>(from.data.{}));\n", indent, element_name,
                    element_name, member_name);
         fmt::print(file, "{}  if (host_elements) {{\n", indent);
-        fmt::print(file, "{}    for (size_t i = 0; i < count; ++i) {{\n", indent);
-        fmt::print(file, "{}      auto* guest_elements = into.data.{}.get_pointer();\n", indent, member_name);
+        fmt::print(file, "{}    auto* guest_elements = fex_saved_{}.get_pointer();\n", indent, member_name);
+        fmt::print(file, "{}    for (size_t i = 0; guest_elements && i < count; ++i) {{\n", indent);
         fmt::print(file, "{}      fex_apply_custom_repacking_exit(guest_elements[i], host_elements[i]);\n", indent);
         fmt::print(file, "{}    }}\n", indent);
         // Matches ::operator new[] above; host_layout<T> is trivially
         // destructible (a single `type data;` member), so no destructor calls.
         fmt::print(file, "{}    ::operator delete[](static_cast<void*>(host_elements));\n", indent);
         fmt::print(file, "{}  }}\n", indent);
+        // Leave the guest's struct as the guest handed it to us; the hook above
+        // may have zeroed this member.
+        fmt::print(file, "{}  into.data.{} = fex_saved_{};\n", indent, member_name, member_name);
         fmt::print(file, "{}}}\n", indent);
       }
     };
@@ -432,6 +455,7 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
       emit_array_repack_entry("  ");
       fmt::print(file, "}}\n");
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
+      emit_array_guest_saves("  ");
       emit_array_repack_exit("  ");
       // Returning true means "fully handled": the annotated members hold host
       // pointers that must not be written back into guest memory, and the
@@ -451,6 +475,7 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
       fmt::print(file, "}}\n");
 
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
+      emit_array_guest_saves("  ");
       fmt::print(file, "  const bool handled = fex_custom_repack_exit(into, from);\n");
       emit_array_repack_exit("  ");
       if (has_array_members) {

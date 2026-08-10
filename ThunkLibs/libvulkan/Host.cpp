@@ -1582,6 +1582,68 @@ void fexfn_impl_libvulkan_vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer, 
   delete[] HostWrites.data();
 }
 
+// pMetadata is an array of swapchainCount elements. Automatic parameter
+// repacking converts element 0 only, which would hand the driver one converted
+// entry and garbage for the rest as soon as a title drives more than one
+// swapchain.
+void fexfn_impl_libvulkan_vkSetHdrMetadataEXT(VkDevice device, uint32_t swapchainCount, const VkSwapchainKHR* pSwapchains,
+                                              guest_layout<const VkHdrMetadataEXT*> pMetadata) {
+  auto HostMetadata = RepackStructArray(swapchainCount, pMetadata);
+  (void*&)fexldr_ptr_libvulkan_vkSetHdrMetadataEXT = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkSetHdrMetadataEXT");
+  fexldr_ptr_libvulkan_vkSetHdrMetadataEXT(device, swapchainCount, pSwapchains, HostMetadata.data());
+  delete[] HostMetadata.data();
+}
+
+// 32-bit guest layout of VkPhysicalDeviceGroupProperties. The struct is opaque
+// to the generator (see the note in the interface file), so the pointer arrives
+// pointing at guest memory and the conversion is done here.
+struct GuestPhysicalDeviceGroupProperties {
+  uint32_t sType;
+  uint32_t pNext;
+  uint32_t physicalDeviceCount;
+  uint32_t physicalDevices[VK_MAX_DEVICE_GROUP_SIZE];
+  uint32_t subsetAllocation;
+};
+static_assert(sizeof(GuestPhysicalDeviceGroupProperties) == 4 * (3 + VK_MAX_DEVICE_GROUP_SIZE + 1));
+
+static VkResult EnumeratePhysicalDeviceGroupsImpl(VkInstance instance, uint32_t* count, VkPhysicalDeviceGroupProperties* guest_props,
+                                                  decltype(fexldr_ptr_libvulkan_vkEnumeratePhysicalDeviceGroups) host_fn) {
+  if (!guest_props) {
+    return host_fn(instance, count, nullptr);
+  }
+
+  auto input_count = *count;
+  std::vector<VkPhysicalDeviceGroupProperties> out(input_count);
+  for (auto& Entry : out) {
+    Entry.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+    Entry.pNext = nullptr;
+  }
+  auto ret = host_fn(instance, count, out.data());
+
+  auto* guest = reinterpret_cast<GuestPhysicalDeviceGroupProperties*>(guest_props);
+  for (uint32_t i = 0; i < std::min(input_count, *count); ++i) {
+    guest[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+    guest[i].physicalDeviceCount = out[i].physicalDeviceCount;
+    guest[i].subsetAllocation = out[i].subsetAllocation;
+    for (uint32_t j = 0; j < VK_MAX_DEVICE_GROUP_SIZE; ++j) {
+      // Each handle goes through the token map, same as vkEnumeratePhysicalDevices.
+      guest[i].physicalDevices[j] =
+        j < out[i].physicalDeviceCount ? to_guest(to_host_layout(out[i].physicalDevices[j])).data : 0;
+    }
+  }
+  return ret;
+}
+
+VkResult fexfn_impl_libvulkan_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* count,
+                                                              VkPhysicalDeviceGroupProperties* guest_props) {
+  return EnumeratePhysicalDeviceGroupsImpl(instance, count, guest_props, fexldr_ptr_libvulkan_vkEnumeratePhysicalDeviceGroups);
+}
+
+VkResult fexfn_impl_libvulkan_vkEnumeratePhysicalDeviceGroupsKHR(VkInstance instance, uint32_t* count,
+                                                                 VkPhysicalDeviceGroupProperties* guest_props) {
+  return EnumeratePhysicalDeviceGroupsImpl(instance, count, guest_props, fexldr_ptr_libvulkan_vkEnumeratePhysicalDeviceGroupsKHR);
+}
+
 VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipelineCache cache, guest_layout<uint32_t*> guest_data_size, void* data) {
   size_t data_size = guest_data_size.get_pointer()->data;
   (void*&)fexldr_ptr_libvulkan_vkGetPipelineCacheData = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkGetPipelineCacheData");
@@ -3221,6 +3283,9 @@ VULKAN_DEFAULT_CUSTOM_REPACK(VkMemoryMapInfo)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkMemoryPriorityAllocateInfoEXT)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkMemoryRequirements2)
 VULKAN_NONDEFAULT_CUSTOM_REPACK(VkMemoryToImageCopy)
+VULKAN_NONDEFAULT_CUSTOM_REPACK(VkImageToMemoryCopy)
+VULKAN_DEFAULT_CUSTOM_REPACK(VkCopyImageToMemoryInfo)
+VULKAN_DEFAULT_CUSTOM_REPACK(VkHdrMetadataEXT)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkMemoryUnmapInfo)
 // VULKAN_DEFAULT_CUSTOM_REPACK(VkMicromapBuildSizesInfoEXT)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkMicromapCreateInfoEXT)
@@ -4006,6 +4071,23 @@ bool fex_custom_repack_exit(guest_layout<VkInstanceCreateInfo>& into, const host
   delete[] from.data.pApplicationInfo;
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
+  return true;
+}
+
+void fex_custom_repack_entry(host_layout<VkImageToMemoryCopy>& into, const guest_layout<VkImageToMemoryCopy>& from) {
+  default_fex_custom_repack_entry(into, from);
+  // The destination lives in guest memory, which the host can address directly,
+  // so widening the pointer is all that is needed -- the driver writes straight
+  // into the guest's buffer. Mirror of VkMemoryToImageCopyEXT below.
+  // Unlike the memory->image direction this member is a non-const destination,
+  // and get_pointer() is const only because the hook takes `from` by const
+  // reference -- the guest buffer itself is writable.
+  into.data.pHostPointer = const_cast<void*>(reinterpret_cast<const void*>(from.data.pHostPointer.get_pointer()));
+}
+
+bool fex_custom_repack_exit(guest_layout<VkImageToMemoryCopy>& into, const host_layout<VkImageToMemoryCopy>& from) {
+  FreePNextChain(&from.data);
+  // Input-only struct; see the note on fex_custom_repack_exit(VkInstanceCreateInfo).
   return true;
 }
 
