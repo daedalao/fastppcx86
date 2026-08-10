@@ -124,6 +124,15 @@ function(generate NAME SOURCE_FILE)
     list(APPEND BITNESS_FLAGS2 "-isystem" "${_FALLBACK_ISYSTEM}")
   endif()
 
+  # Distro x86 cross toolchain (see the detection in the top-level
+  # CMakeLists): its glibc sysroot carries no libstdc++ headers, the cross
+  # gcc does. Same validated header pair as the host-side generation.
+  if (THUNKGEN_X86_CROSS_CXX_DIR)
+    list(APPEND BITNESS_FLAGS2
+         "-isystem" "${THUNKGEN_X86_CROSS_CXX_DIR}"
+         "-isystem" "${THUNKGEN_X86_CROSS_CXX_DIR}/x86_64-pc-linux-gnu")
+  endif()
+
   # --gcc-toolchain wins over --sysroot for C++ header search. Only pass it
   # when it can genuinely serve the target: for 32-bit the ct-ng x86_64
   # crosstool at X86_DEV_GCC_TOOLCHAIN has no i686 libstdc++ headers (no

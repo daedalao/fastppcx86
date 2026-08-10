@@ -605,6 +605,25 @@ endif()
 if (BUILD_THUNKS)
   set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
 
+  # ArchPOWER packages a full x86_64 cross toolchain
+  # (x86_64-pc-linux-gnu-{gcc,glibc}). When no explicit X86_DEV_ROOTFS was
+  # given, use its sysroot everywhere one is needed: thunkgen's x86 interface
+  # parses (host and guest side) and the guest-libs builds. Thunkgen output
+  # against it validated byte-identical to a full ct-ng x86 sysroot for every
+  # interface at both bitnesses (2026-08-10).
+  set(THUNKGEN_X86_CROSS_CXX_DIR "")
+  if (NOT X86_DEV_ROOTFS AND EXISTS "/usr/x86_64-pc-linux-gnu/usr/include/gnu/stubs.h")
+    file(GLOB _X86_CROSS_CXX_DIRS /usr/x86_64-pc-linux-gnu/include/c++/*)
+    foreach(_d ${_X86_CROSS_CXX_DIRS})
+      if (EXISTS "${_d}/x86_64-pc-linux-gnu/bits/c++config.h")
+        set(X86_DEV_ROOTFS "/usr/x86_64-pc-linux-gnu")
+        set(THUNKGEN_X86_CROSS_CXX_DIR "${_d}")
+        message(STATUS "Thunks: using the x86_64-pc-linux-gnu cross toolchain (sysroot + ${_d})")
+        break()
+      endif()
+    endforeach()
+  endif()
+
   # Declared here (rather than at first use below) so the Generator decision
   # can see them.
   option(BUILD_GUEST_THUNKS "Build x86_64 guest stub libraries via ExternalProject" ON)
@@ -692,6 +711,7 @@ if (BUILD_THUNKS)
         "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
         "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
+        "-DTHUNKGEN_X86_CROSS_CXX_DIR=${THUNKGEN_X86_CROSS_CXX_DIR}"
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS thunkgen)
