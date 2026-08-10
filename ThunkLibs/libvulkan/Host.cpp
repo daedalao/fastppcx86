@@ -253,7 +253,15 @@ bool fex_custom_repack_exit(guest_layout<VkXlibSurfaceCreateInfoKHR>&, const hos
   return true;
 }
 
+// Both display impls guard against a null fexldr pointer: the loader does not
+// export these instance-extension entry points, so the pointer is only filled
+// by the requery in vkGetInstanceProcAddr. An application that fetches them
+// through vkGetDeviceProcAddr instead reaches the impl with the slot still
+// null, and should get an error, not a call through zero.
 static VkResult fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT(VkPhysicalDevice a_0, guest_layout<Display*> a_1, VkDisplayKHR a_2) {
+  if (!fexldr_ptr_libvulkan_vkAcquireXlibDisplayEXT) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
   auto host_display = x11_manager.GuestToHostDisplay(a_1.force_get_host_pointer());
   auto ret = fexldr_ptr_libvulkan_vkAcquireXlibDisplayEXT(a_0, host_display, a_2);
   x11_manager.HostXFlush(host_display);
@@ -261,6 +269,9 @@ static VkResult fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT(VkPhysicalDevice a_
 }
 
 static VkResult fexfn_impl_libvulkan_vkGetRandROutputDisplayEXT(VkPhysicalDevice a_0, guest_layout<Display*> a_1, RROutput a_2, VkDisplayKHR* a_3) {
+  if (!fexldr_ptr_libvulkan_vkGetRandROutputDisplayEXT) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
   auto host_display = x11_manager.GuestToHostDisplay(a_1.force_get_host_pointer());
   auto ret = fexldr_ptr_libvulkan_vkGetRandROutputDisplayEXT(a_0, host_display, a_2, a_3);
   x11_manager.HostXFlush(host_display);
