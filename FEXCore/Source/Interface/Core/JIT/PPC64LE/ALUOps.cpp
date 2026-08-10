@@ -1423,6 +1423,21 @@ DEF_OP(Bfi) {
   auto Src  = GetReg(Op->Src);
   uint32_t width = Op->Width;
   uint32_t lsb   = Op->lsb;
+  // Same last-use aliasing hazard Bfxil below already guards against, and it was
+  // never applied here. If RA picked Dst == Src (normal when Src dies at this
+  // op) while Dst != S1, the mr(Dst, S1) overwrites Src before the insert reads
+  // it, and the field inserted is whatever Dest happened to hold.
+  //
+  // `xchg %ah, %al` is the case that exposed it: the AL store is
+  // Bfi(Dest=RAX, Src=RAX>>8, lsb=0, width=8) with the shifted value at last
+  // use, so the mr clobbered it and the insert put RAX's own low byte back --
+  // giving (AL << 8) | AL. That instruction is what GCC emits for a runtime
+  // 16-bit byteswap, so every htons/ntohs/__builtin_bswap16 in every guest was
+  // silently returning the wrong value, with no fault to notice.
+  if (Dst == Src && Dst != S1) {
+    mr(TMP3, Src);
+    Src = TMP3;
+  }
   if (Dst != S1) mr(Dst, S1);  // copy Dest into result first
   if (IROp->Size <= IR::OpSize::i32Bit) {
     // rlwimi inserts field
