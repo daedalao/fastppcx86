@@ -45,6 +45,7 @@ depends=(
   'gcc-libs'
   'glibc'
   'fmt'
+  'libglvnd'       # DT_NEEDED of the GL host thunk, which ships enabled
   'xxhash'
   'qt6-base'
   'qt6-declarative'
@@ -75,7 +76,6 @@ optdepends=(
   'wget: used by FEXRootFSFetcher to download a RootFS'
   'xz: RootFS extraction'
   'vulkan-driver: native Vulkan passthrough via the thunk'
-  'libglvnd: native GL passthrough via the thunk'
   'pipewire-pulse: PulseAudio server for guest audio (guests speak the PA protocol; pulseaudio works too)'
 )
 # nasm is deliberately absent: it is only needed by the ASM unit tests, and
