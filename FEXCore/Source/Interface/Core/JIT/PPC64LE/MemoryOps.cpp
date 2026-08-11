@@ -1495,7 +1495,17 @@ DEF_OP(MemCpy) {
     cmpldi(r(0), 8);
     bc(CC_ULT, &generic_path);
 
-    PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
+    // 16B-tier overlap gate: stage `delta >= 16` into CR6 NOW, while delta is
+    // still live in r0 — the alignment loop below reuses r0 as its data
+    // scratch. Every other compare in this op targets CR0, and the guest's
+    // packed-NZCV CR0 snapshot/restore brackets the whole op, so parking a
+    // predicate in CR6 across the alignment loop is free. Same proof shape as
+    // the delta >= 8 argument above with chunk size 16: byte-forward and
+    // 16B-chunked copies agree exactly when delta == 0 or delta >= 16, so
+    // deltas in [8, 16) must stay on the 8B tier.
+    cmpldi(cr(6), r(0), 16);
+
+    PPC64Emitter::Label align_loop, chunk_setup, chunk8_setup, chunk16_setup, chunk16_loop, chunk_loop, tail_loop, done;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
@@ -1522,6 +1532,56 @@ DEF_OP(MemCpy) {
     // granularity argument above is unchanged; a faulting update-form access
     // also leaves RA architecturally unmodified.
     Bind(&chunk_setup);
+    // 16-byte VSX tier. Gates, in order:
+    //   - CR6.LT set (delta < 16, staged before the alignment loop): a
+    //     forward delta in [8, 16) is a legal self-replicating pattern for
+    //     16B chunks to break, but the 8B tier below is still exact there.
+    //   - remaining length < 32: not worth the 16-alignment step plus loop
+    //     setup; the 8B tier handles short copies fine.
+    bc(Cond {12, 24}, &chunk8_setup); // CR6.LT (BI = 6*4 + 0)
+    cmpdi(TMP4, 32);
+    bc(CC_LT, &chunk8_setup);
+
+    // Destination is 8-aligned here (align_loop above); one 8-byte unit
+    // reaches 16-alignment when bit 3 is set. The 16B *stores* below are then
+    // 16-aligned, so they can never cross a page and never partially fault —
+    // the fault-granularity argument above carries over to this tier
+    // unchanged (the unaligned loads may still fault; they modify no memory).
+    andi_(TMP3, TMP1, 8);
+    bc(CC_EQ, &chunk16_setup);
+    ld(r(0), 0, TMP2);
+    std(r(0), 0, TMP1);
+    addi(TMP1, TMP1, 8);
+    addi(TMP2, TMP2, 8);
+    addi(TMP4, TMP4, -8);
+
+    Bind(&chunk16_setup);
+    // Delta (r0) is dead once CR6 is staged; restore the JIT's r0=0
+    // zero-index invariant early so lxvd2x/stxvd2x can use r0 as their RB
+    // index. len >= 24 here (>= 32 gated, minus at most one 8B alignment
+    // step), so the CTR count is >= 1 and mtctr 0 is impossible.
+    li(r(0), 0);
+    srdi(TMP3, TMP4, 4);      // 16B chunk count = len >> 4
+    mtctr(TMP3);
+    andi_(TMP4, TMP4, 15);    // remainder for the 8B tier + byte tail
+    // lxvd2x/stxvd2x pair on the SAME VSR: both perform the LE doubleword
+    // swap, so the swaps cancel and the 16 bytes are copied verbatim — no
+    // xxpermdi needed, unlike LoadUnalignedV128 (whose TMP1-TMP3 clobber
+    // contract would also collide with the loop registers here). VTMP1 is
+    // per-op scratch, dead across ops, same as its other DEF_OP uses. No
+    // update forms exist for these, so the pointers step by explicit addi;
+    // both end exactly at the end of the chunked region.
+    Bind(&chunk16_loop);
+    lxvd2x(VTMP1, TMP2, r(0));
+    stxvd2x(VTMP1, TMP1, r(0));
+    addi(TMP1, TMP1, 16);
+    addi(TMP2, TMP2, 16);
+    bdnz(&chunk16_loop);
+    // Fall into the 8B tier for the 8..15-byte remainder: dst is still
+    // 16-aligned (hence 8-aligned) and TMP4 < 16, so it runs 0 or 1 chunks
+    // plus the byte tail.
+
+    Bind(&chunk8_setup);
     srdi(TMP3, TMP4, 3);      // chunk count = len >> 3
     cmpdi(TMP3, 0);
     bc(CC_EQ, &tail_loop);
