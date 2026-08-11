@@ -428,10 +428,12 @@ private:
   [[nodiscard]]
   bool IsInlineEntrypointOffset(const IR::OrderedNodeWrapper& WNode, uint64_t* Value) const;
 
-  // Is this operand produced by a VF*ScalarInsert that the ScalarSplatChain IR
-  // pass granted the SplatResult permission? Such a value holds element 0's
-  // bits replicated across every element, so a consumer that only needs element
-  // 0 may read any element and skip its own splat.
+  // Does this operand hold element 0's bits replicated across every element, so
+  // that a consumer needing only element 0 may read any element and skip its
+  // own splat? True for a VF*ScalarInsert the ScalarSplatChain IR pass granted
+  // SplatResult, and for a LoadRegister it stamped with SplatElementSize -- the
+  // latter matters because the frontend's per-instruction register-cache flush
+  // routes almost every chain edge through the guest XMM's static register.
   //
   // Answering from the defining op is what makes this safe in both directions:
   // the producer's DEF_OP tests the exact same bit when it decides to leave the

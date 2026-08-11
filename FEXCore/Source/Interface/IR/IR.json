@@ -370,9 +370,13 @@
       }
     },
     "StaticRA": {
-      "SSA = LoadRegister u32:$Reg, RegisterClass:$Class, OpSize:#Size": {
+      "SSA = LoadRegister u32:$Reg, RegisterClass:$Class, OpSize:#Size, OpSize:$SplatElementSize{OpSize::iInvalid}": {
         "Desc": ["Loads a value from the given register",
-                 "Size must match the execution mode."],
+                 "Size must match the execution mode.",
+                 "SplatElementSize is a PERMISSION set by the ScalarSplatChain pass on FPR loads only: when it is not",
+                 "iInvalid, the value in this static register is known to hold element 0 replicated across every element",
+                 "at that element size, so a consumer needing only element 0 may read any element. A backend that",
+                 "ignores it stays correct."],
         "DestSize": "Size"
       },
 

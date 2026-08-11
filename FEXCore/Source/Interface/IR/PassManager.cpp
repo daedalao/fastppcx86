@@ -112,15 +112,18 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
       InsertPass(CreateDeadFlagCalculationEliminination());
     }
 
-    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult, and
-    // the analysis reads OrderedNode::GetUses() plus the frontend's explicit
-    // StoreRegister writebacks -- both of which RA rewrites. It is otherwise
-    // order-independent (it neither reads nor writes flags, and adds/removes no
-    // operand uses), so it sits last among the optimisation passes.
+    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult and
+    // LoadRegister nodes with SplatElementSize, and the analysis reads
+    // OrderedNode::GetUses() plus the frontend's explicit LoadRegister/
+    // StoreRegister register-cache traffic -- all of which RA rewrites. It is
+    // otherwise order-independent (it neither reads nor writes flags, and
+    // adds/removes no operand uses), so it sits last among the optimisation
+    // passes.
     //
-    // Own kill switch for the same reason as the two above: a wrongly marked
-    // node lets the backend leave junk in a guest XMM's upper elements, which
-    // is silent and data-dependent:
+    // Own kill switch for the same reason as the two above, plus one more: the
+    // pass deliberately trades exactness of a guest XMM's UPPER elements
+    // mid-block for shorter scalar-float chains, so turning it off is also how
+    // you restore exact upper elements in a signal frame:
     //     FEX_DISABLESCALARSPLATCHAIN=1
     if (!DisableScalarSplatChain()) {
       InsertPass(CreateScalarSplatChain());

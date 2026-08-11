@@ -859,10 +859,15 @@
           "backend lowers as splat(Vector1) + splat(Vector2) + one xv*sp + a two-instruction lane-0 merge -- and the next link then splats the",
           "merged value straight back apart. Since xv*sp over two splatted operands yields an already-splatted result, both the merge and the",
           "consumer's re-splat are dead work whenever nothing observes the upper elements. The pass proves that (every use is another",
-          "ScalarInsert of the same element size, or a narrow FPR store) and sets the SplatResult permission bit the backend then honours,",
-          "taking a chain-internal scalar op down to a single instruction.",
-          "The flag is a permission, so mis-marking does not crash -- it silently leaves the splat value in a guest XMM's upper elements, which",
-          "is exactly the kind of data-dependent corruption that wants a field kill switch of its own."
+          "ScalarInsert of the same element size, a narrow FPR store, or a guest-XMM writeback that a later one in the block supersedes) and",
+          "sets the SplatResult / SplatElementSize permission bits the backend then honours, taking a chain-internal scalar op down to one or",
+          "two instructions. It has to model the frontend's per-instruction register-cache flush to see the chains at all, since every guest",
+          "XMM def is written back and re-read rather than forwarded along an SSA edge.",
+          "ACCEPTED IMPRECISION: a splat may be live in a guest XMM's static register between two guest instructions inside a block, so a",
+          "signal taken there delivers a frame whose XMM UPPER elements read as the replicated element 0. Element 0 itself, every GPR, and",
+          "all state at block boundaries and across syscalls/thunks stay exact. Setting this to 1 restores exact upper elements everywhere.",
+          "The bits are permissions, so mis-marking does not crash -- it silently leaves the splat where architectural upper elements belong,",
+          "which is exactly the kind of data-dependent corruption that wants a field kill switch of its own."
         ]
       },
       "ShadowRetStack": {

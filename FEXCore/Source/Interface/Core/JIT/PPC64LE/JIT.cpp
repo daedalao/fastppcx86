@@ -1230,6 +1230,14 @@ bool PPC64JITCore::IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpS
 
   auto IROp = IR->GetOp<IR::IROp_Header>(WNode);
   switch (IROp->Op) {
+  case IR::IROps::OP_LOADREGISTER:
+    // The frontend's per-instruction register-cache flush (Core.cpp:851) means
+    // a chain's consumers read their operands back out of the guest XMM's
+    // static register rather than off an SSA edge. The pass stamps the element
+    // size onto those loads when the value in that register is known splatted;
+    // SRAFPR (v0..v15) is disjoint from RAFPR (v16..v29), so nothing but the
+    // tracked StoreRegister can have written it.
+    return IROp->C<IR::IROp_LoadRegister>()->SplatElementSize == ElementSize;
   case IR::IROps::OP_VFADDSCALARINSERT:
   case IR::IROps::OP_VFSUBSCALARINSERT:
   case IR::IROps::OP_VFMULSCALARINSERT:
