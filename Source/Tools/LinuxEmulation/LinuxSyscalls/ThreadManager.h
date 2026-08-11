@@ -121,6 +121,21 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   uint32_t SeccompMode {SECCOMP_MODE_DISABLED};
   fextl::vector<FEX::HLE::SeccompFilterInfo*> Filters {};
 
+  // Per-thread seccomp verdict cache (owned and touched only by this thread;
+  // see SeccompEmulator::ExecuteFilter). When no installed filter reads the
+  // instruction pointer or the syscall arguments, a verdict depends only on
+  // the syscall number, so an ALLOW verdict can be replayed without running
+  // the BPF interpreter. Only ALLOW is cached: it is the only action with no
+  // side effects (no logging, no signal, no errno).
+  struct SeccompVerdictCache {
+    constexpr static uint32_t MAX_CACHED_NR = 512;
+    // Compared against SeccompEmulator::FilterGeneration; mismatch clears.
+    uint64_t Generation {};
+    bool Cacheable {}; // No filter reads ip/args; AllowedNrs is usable.
+    bool NeedsRIP {};  // Some filter reads ip; reconstruct RIP up front.
+    uint64_t AllowedNrs[MAX_CACHED_NR / 64] {};
+  } SeccompCache {};
+
   // personality emulation.
   uint32_t persona {};
 

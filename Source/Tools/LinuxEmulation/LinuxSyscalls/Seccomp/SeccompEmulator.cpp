@@ -18,6 +18,7 @@ $end_info$
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <cstring>
 #include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/bpf_common.h>
@@ -327,6 +328,7 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
     }
 
     auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, SFilter.FilterInstructions, SFilter.ShouldLog});
+    AnalyzeFilterLoads(it);
     TotalFilterInstructions += SFilter.FilterInstructions;
 
     // Append the filter to the thread.
@@ -334,7 +336,38 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
   }
 
   Thread->SeccompMode = Header.SeccompMode;
+  FilterGeneration.fetch_add(1, std::memory_order_relaxed);
   close(FD);
+}
+
+void SeccompEmulator::AnalyzeFilterLoads(SeccompFilterInfo& Filter) {
+  // seccomp cBPF may only read seccomp_data through 32-bit BPF_ABS loads (the
+  // validator enforces alignment and bounds); BPF_MEM touches scratch memory
+  // and BPF_IMM/BPF_LEN don't read the data at all. Anything else shouldn't
+  // pass validation -- treat it as reading everything so the caches stay off.
+  bool ReadsIP {};
+  bool ReadsArgs {};
+  for (const auto& Inst : Filter.Program) {
+    const uint16_t Class = BPF_CLASS(Inst.code);
+    if (Class != BPF_LD && Class != BPF_LDX) {
+      continue;
+    }
+    const uint16_t Mode = BPF_MODE(Inst.code);
+    if (Mode == BPF_IMM || Mode == BPF_MEM || Mode == BPF_LEN) {
+      continue;
+    }
+    if (Mode != BPF_ABS) {
+      ReadsIP = ReadsArgs = true;
+      break;
+    }
+    if (Inst.k >= offsetof(seccomp_data, args)) {
+      ReadsArgs = true;
+    } else if (Inst.k >= offsetof(seccomp_data, instruction_pointer)) {
+      ReadsIP = true;
+    }
+  }
+  Filter.ReadsIP = ReadsIP;
+  Filter.ReadsArgs = ReadsArgs;
 }
 
 SeccompEmulator::ExecuteFilterResult
@@ -346,8 +379,45 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     return {false, 0};
   }
 
-  // Reconstruct the RIP from the JITPC.
-  const uint64_t RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+  // Revalidate the per-thread verdict cache against the filter-set generation.
+  auto& Cache = Thread->SeccompCache;
+  const uint64_t CurrentGen = FilterGeneration.load(std::memory_order_relaxed);
+  if (Cache.Generation != CurrentGen) {
+    bool Cacheable = true;
+    bool NeedsRIP = false;
+    for (const auto* Filter : Thread->Filters) {
+      Cacheable &= !(Filter->ReadsIP || Filter->ReadsArgs);
+      NeedsRIP |= Filter->ReadsIP;
+    }
+    Cache.Cacheable = Cacheable;
+    Cache.NeedsRIP = NeedsRIP;
+    memset(Cache.AllowedNrs, 0, sizeof(Cache.AllowedNrs));
+    Cache.Generation = CurrentGen;
+  }
+
+  // Fast path: this syscall number already produced ALLOW under the current
+  // filter set and no filter can see args/ip, so the verdict replays as-is.
+  // ALLOW has no side effects (never logs, never signals), so skipping the
+  // interpreter and the RIP reconstruction is invisible to the guest.
+  const uint64_t Nr = Args->Argument[0];
+  const bool NrCacheable = Cache.Cacheable && Nr < decltype(Thread->SeccompCache)::MAX_CACHED_NR;
+  if (NrCacheable && (Cache.AllowedNrs[Nr / 64] & (1ULL << (Nr % 64)))) {
+    return {false, 0};
+  }
+
+  // Reconstructing the RIP from the JITPC takes a lock and a binary search;
+  // only pay for it when a filter actually loads instruction_pointer. The
+  // rare non-ALLOW verdicts that need a RIP for audit logs or SIGSYS info
+  // reconstruct it on demand below.
+  uint64_t RIP = Cache.NeedsRIP ? Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC) : 0;
+  bool RIPValid = Cache.NeedsRIP;
+  auto GetRIP = [&]() {
+    if (!RIPValid) {
+      RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+      RIPValid = true;
+    }
+    return RIP;
+  };
 
   const auto Arch = Is64BitMode() ? AUDIT_ARCH_X86_64 : AUDIT_ARCH_I386;
   bool ShouldLog {};
@@ -410,6 +480,10 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   const auto ActionMasked = SeccompResult & SECCOMP_RET_ACTION_FULL;
   const auto DataMasked = SeccompResult & SECCOMP_RET_DATA;
 
+  if (NrCacheable && ActionMasked == SECCOMP_RET_ALLOW) {
+    Cache.AllowedNrs[Nr / 64] |= 1ULL << (Nr % 64);
+  }
+
   // Logging rules
   // - Log if explicitly returning SECCOMP_RET_LOG
   // - Log if the filter enabled the logging flag and the action is something other than SECCOMP_RET_ALLOW.
@@ -429,7 +503,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     clock_gettime(CLOCK_MONOTONIC, &tp);
     LogMan::Msg::IFmt("audit: type={} audit({}.{:03}:{}): uid={} gid={} pid={} comm={} sig={} arch={:x} syscall={} ip=0x{:x} code=0x{:x}",
                       AUDIT_SECCOMP, tp.tv_sec, tp.tv_nsec / 1'000'000, AuditSerialIncrement(), ::getuid(), ::getgid(), ::getpid(),
-                      Filename(), Signal, Arch, Args->Argument[0], RIP, SeccompResult);
+                      Filename(), Signal, Arch, Args->Argument[0], GetRIP(), SeccompResult);
   }
 
   switch (ActionMasked) {
@@ -462,7 +536,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
       .si_code = 1, // SYS_SECCOMP
     };
 
-    Info.si_call_addr = reinterpret_cast<void*>(RIP);
+    Info.si_call_addr = reinterpret_cast<void*>(GetRIP());
     Info.si_syscall = Args->Argument[0];
     Info.si_arch = Arch;
 
@@ -695,6 +769,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     // Copy the program out of guest memory: the guest may reuse or unmap its buffer the moment this returns.
     fextl::vector<sock_filter> Program(prog->filter, prog->filter + prog->len);
     auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, prog->len, LoggingEnabled});
+    AnalyzeFilterLoads(it);
     TotalFilterInstructions += prog->len;
 
     // Append the filter to the thread.
@@ -703,6 +778,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
       TSyncFilters(Frame);
     }
+    FilterGeneration.fetch_add(1, std::memory_order_relaxed);
   }
 
   return Result;
