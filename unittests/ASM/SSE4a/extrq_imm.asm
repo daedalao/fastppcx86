@@ -10,7 +10,7 @@
     "XMM6": ["0x00000000432298df", "0", "0x88b0bd28710f2147", "0xc4e95e887fb5ac38"],
     "XMM7": ["0x0000b0bd28710f21", "0", "0xa7df8c2ad03e5be4", "0x6c70d1eec2d395ea"]
   },
-  "HostFeatures": ["SSE4A"]
+  "HostFeatures": ["SSE4A", "AVX"]
 }
 %endif
 
