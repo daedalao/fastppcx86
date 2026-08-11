@@ -627,6 +627,27 @@ public:
     Emit32((31u << 26) | (rs.idx << 21) | (1u << 20) | (fxm << 12) | (144u << 1));
   }
 
+  // mcrxrx BF  (move XER overflow/carry state into a CR field — X-form,
+  // opcode 31, XO 576; Power ISA 3.0, i.e. POWER9 and later ONLY. A POWER8
+  // takes an illegal-instruction interrupt, so every emitter of this must be
+  // gated on HostFeatures.SupportsISA30.)
+  //   CR[BF].LT = XER.OV     CR[BF].GT = XER.OV32
+  //   CR[BF].EQ = XER.CA     CR[BF].SO = XER.CA32
+  // XER itself is left unchanged (unlike the obsolete `mcrxr`, which cleared
+  // the bits it moved).
+  // CAUTION: this is NOT the bit layout of the mfxer/rotlwi/mtocrf idiom it
+  // replaces (LT=SO, GT=OV, EQ=CA). CA stays in EQ, but OV moves from GT to
+  // LT and SO is not projected at all — a consumer that keeps reading GT for
+  // "overflow" silently gets OV32, which is wrong for every 64-bit op.
+  // CAUTION: gas assembles `mcrxrx` at -mcpu=power8 with no diagnostic, so the
+  // assembler accepting it is not evidence about ISA level.
+  // Verified against powerpc64le-linux-gnu-as: mcrxrx 1 = 0x7C800480,
+  // mcrxrx 0 = 0x7C000480, mcrxrx 7 = 0x7F800480.
+  void mcrxrx(uint32_t bf) {
+    assert(bf < 8 && "mcrxrx BF is a 3-bit CR field index");
+    Emit32((31u << 26) | (bf << 23) | (576u << 1));
+  }
+
   // mtcr RS = mtcrf 0xFF, RS
   void mtcr(GPR rs) { mtcrf(0xFF, rs); }
 

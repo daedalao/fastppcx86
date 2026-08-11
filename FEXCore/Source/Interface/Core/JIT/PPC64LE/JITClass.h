@@ -505,8 +505,23 @@ private:
                    IR::OrderedNodeWrapper Src1, IR::OrderedNodeWrapper Src2,
                    uint8_t CRField = 0);
 
-  // Project XER.SO/OV/CA -> CR1.LT/GT/EQ non-destructively. Used to make
-  // C/V flags branch-testable after an x86 *WithFlags op. Clobbers TMP1, TMP2.
+  // True when ProjectXERToCR1() emits the ISA 3.0 single-instruction `mcrxrx`
+  // form (POWER9+) rather than the POWER8 mfxer/rotlwi/mtocrf fallback. The
+  // two produce DIFFERENT CR1 layouts, so this one predicate must drive both
+  // the emitted sequence and every bit index read back out of CR1 — otherwise
+  // the sequence and the index can drift apart silently.
+  [[nodiscard]] bool ProjectXERUsesMcrxrx() const;
+
+  // PPC CR-bit index holding XER.OV after ProjectXERToCR1(): 4 (CR1.LT) on the
+  // mcrxrx layout, 5 (CR1.GT) on the pre-3.0 layout. XER.CA is CR1.EQ (bit 6)
+  // in both, so C-consuming conditions need no equivalent accessor.
+  [[nodiscard]] uint32_t XEROVBitIndex() const;
+
+  // Project XER's carry/overflow state into CR1 non-destructively (XER itself
+  // is unchanged). Used to make C/V flags branch-testable after an x86
+  // *WithFlags op. Read the OV bit index from XEROVBitIndex(), never a
+  // literal. Clobbers TMP1/TMP2 on the pre-3.0 path; the ISA 3.0 path clobbers
+  // no GPRs, but callers may assume the larger clobber set unconditionally.
   void ProjectXERToCR1();
 
   // Write a 4-bit NZCV literal (bit3=N, bit2=Z, bit1=C, bit0=V) into our
