@@ -1150,6 +1150,7 @@ fextl::string ReadPEExportName(uint64_t Base) {
 const char* SyscallHandler::LookupAnonymousExecImageName(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) {
   uint64_t VMABase = 0;
   uint64_t ImageBase = 0;
+  fextl::string NameHint {};
   {
     auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
 
@@ -1169,25 +1170,47 @@ const char* SyscallHandler::LookupAnonymousExecImageName(FEXCore::Core::Internal
       }
     }
 
-    // Find the image base: walk backward over contiguous anonymous VMAs
-    // (wine's per-section mprotects split one image into several entries) and
-    // probe each entry's start for the DOS magic. Closest hit below the query
-    // wins. The walk is bounded: a manually-loaded image is split into at most
-    // a few dozen section-protection ranges, and Mono/JIT arenas — the other
-    // thing living in anon exec memory — fail every probe and fall out at the
-    // contiguity break.
+    // Find the image base: walk backward over contiguous VMAs (wine's
+    // per-section mprotects split one image into several entries) and probe
+    // entry starts for the DOS magic. Closest hit below the query wins.
+    //
+    // The header page needs special handling: wine maps the PE HEADERS
+    // file-backed (a single r--p page at file offset 0, which is where the
+    // magic lives) and only the copied-in sections above it anonymously —
+    // observed layout for Dex.exe:
+    //   7afc0000-7afc1000 r--p 00000000 .../Dex.exe   <- headers, MZ here
+    //   7afc1000-7bbf2000 r-xp 00000000 00:00 0       <- .text, anonymous
+    // So a file-backed predecessor is probed too, but only when its mapping
+    // starts at file offset 0 (a section mapping of some unrelated library
+    // never does), and the walk stops at it either way — walking past a
+    // foreign file mapping could only misattribute. When the magic is found
+    // in such an entry, the module name comes from its filename, which beats
+    // the export-directory parse (EXEs commonly export nothing).
+    //
+    // The walk is bounded: a manually-loaded image is split into at most a
+    // few dozen section-protection ranges, and Mono/JIT arenas — the other
+    // thing living in anon exec memory — fail every probe and fall out at
+    // the contiguity break.
     auto It = EntryIt;
     for (int Steps = 0; Steps < 128; ++Steps) {
-      uint16_t Magic {};
-      if (SafeReadGuest(Magic, It->first) && Magic == 0x5A4D /* "MZ" */) {
-        ImageBase = It->first;
-        break;
+      const bool FileBacked = It->second.Resource != nullptr;
+      if (!FileBacked || It->second.Offset == 0) {
+        uint16_t Magic {};
+        if (SafeReadGuest(Magic, It->first) && Magic == 0x5A4D /* "MZ" */) {
+          ImageBase = It->first;
+          if (FileBacked && It->second.Resource->MappedFile) {
+            const auto& Path = It->second.Resource->MappedFile->Filename;
+            auto Slash = Path.rfind('/');
+            NameHint = Slash == Path.npos ? Path : Path.substr(Slash + 1);
+          }
+          break;
+        }
       }
-      if (It == VMATracking.VMAs.begin()) {
+      if (FileBacked || It == VMATracking.VMAs.begin()) {
         break;
       }
       auto Prev = std::prev(It);
-      if (Prev->second.Resource || Prev->first + Prev->second.Length != It->first) {
+      if (Prev->first + Prev->second.Length != It->first) {
         break;
       }
       It = Prev;
@@ -1201,8 +1224,10 @@ const char* SyscallHandler::LookupAnonymousExecImageName(FEXCore::Core::Internal
     if (Existing != AnonImageNames.end()) {
       Result = Existing->second->c_str();
     } else {
-      auto ExportName = ReadPEExportName(ImageBase);
-      auto Label = fextl::fmt::format("PE:{}@0x{:x}", ExportName.empty() ? "image" : ExportName.c_str(), ImageBase);
+      if (NameHint.empty()) {
+        NameHint = ReadPEExportName(ImageBase);
+      }
+      auto Label = fextl::fmt::format("PE:{}@0x{:x}", NameHint.empty() ? "image" : NameHint.c_str(), ImageBase);
       Result = AnonImageNames.emplace(ImageBase, fextl::make_unique<fextl::string>(std::move(Label))).first->second->c_str();
     }
   }
