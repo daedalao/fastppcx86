@@ -69,9 +69,23 @@ void PassManager::Finalize() {
 void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
   FEX_CONFIG_OPT(DisablePasses, O0);
   FEX_CONFIG_OPT(DisableDFCE, DISABLEDFCE);
+  FEX_CONFIG_OPT(DisableCmpBranchFusion, DISABLECMPBRANCHFUSION);
 
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
+
+    // Must precede DFCE: fusion turns a FromNZCV CondJump into a direct
+    // register compare, and it is DFCE that then observes the branch no longer
+    // reads NZCV and demotes/removes the SubWithFlags feeding it. Running it
+    // the other way round would leave the flag computation emitted. It must
+    // also precede RA, since it adds two operand uses to the branch.
+    //
+    // Same kill-switch reasoning as DFCE below -- a mis-fused branch is a
+    // wrong-direction conditional jump, silent and data-dependent:
+    //     FEX_DISABLECMPBRANCHFUSION=1
+    if (!DisableCmpBranchFusion()) {
+      InsertPass(CreateCompareBranchFusion());
+    }
 
     // DeadFlagCalculationElimination was disabled on PPC64LE from 2026-05-11
     // (8774c7dda) to 2026-08-05. The diagnosis recorded at the time -- "the

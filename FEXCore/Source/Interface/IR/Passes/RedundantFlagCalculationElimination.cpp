@@ -8,6 +8,7 @@ $end_info$
 #include "Interface/IR/IR.h"
 #include "Interface/IR/IREmitter.h"
 #include "Interface/IR/PassManager.h"
+#include "Interface/IR/Passes.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -154,8 +155,13 @@ public:
 
 private:
   FEX_CONFIG_OPT(DisableDFCEStoreElim, DISABLEDFCESTOREELIM);
-  FlagInfo Classify(IROp_Header* Node);
-  unsigned FlagsForCondClassType(CondClass Cond);
+
+public:
+  // Stateless, and shared with CompareBranchFusion via IROpWritesNZCV below.
+  static FlagInfo Classify(IROp_Header* Node);
+  static unsigned FlagsForCondClassType(CondClass Cond);
+
+private:
   bool EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
@@ -442,6 +448,15 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
   }
 
   FEX_UNREACHABLE;
+}
+
+// Exported for CompareBranchFusion, which must walk backwards past everything
+// that is NOT a flag writer to find the compare feeding a branch. An op missing
+// from a private copy of that set would let it walk past a real NZCV write and
+// fuse the wrong compare -- silent and data-dependent -- so the answer is
+// derived from the table above rather than restated.
+bool IROpWritesNZCV(IROp_Header* IROp) {
+  return (DeadFlagCalculationEliminination::Classify(IROp).Write() & FLAG_NZCV) != 0;
 }
 
 // General purpose dead code elimination. Returns whether flag handling should

@@ -836,6 +836,20 @@
           "A wrong elimination surfaces as a wrong conditional branch -- silent and data-dependent -- hence a field kill switch of its own."
         ]
       },
+      "DisableCmpBranchFusion": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the CompareBranchFusion IR pass (FEX_DISABLECMPBRANCHFUSION=1 turns the pass OFF).",
+          "x86 'cmp a,b; jcc' arrives as SubWithFlags + a FromNZCV CondJump, and the PPC64LE lowering of that branch has to rebuild C/V out of",
+          "XER (mfxer + rlwinm + mtocrf + a cr-logical composite before the bc); mfxer serialises on POWER8 and this sits on every hot loop",
+          "backedge. The pass rewrites the branch into the backend's existing direct-compare form (cmp into cr7 + bc) when the NZCV it reads",
+          "provably comes from a SubWithFlags earlier in the same block, letting DeadFlagCalculationElimination then drop the flag computation.",
+          "Only the ten register-comparable conditions are fused (EQ/NEQ/UGE/ULT/UGT/ULE/SGE/SLT/SGT/SLE); MI/PL and VS/VC are excluded because",
+          "the compare form cannot reproduce N-alone or V. A mis-fused branch is a wrong-direction conditional jump -- silent and",
+          "data-dependent -- hence a field kill switch of its own."
+        ]
+      },
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",
