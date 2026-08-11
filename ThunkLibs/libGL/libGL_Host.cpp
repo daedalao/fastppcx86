@@ -5,6 +5,7 @@ desc: Uses glXGetProcAddress instead of dlsym
 $end_info$
 */
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -410,6 +411,27 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glUnmapNamedBuffer;
   } else if (name_sv == "glUnmapNamedBufferEXT") {
     return (VoidFn)fexfn_impl_libGL_glUnmapNamedBufferEXT;
+    // Explicit flush. Same reason as the map/unmap entries above, and it is the
+    // one that matters most for Unity: it resolves the whole buffer-mapping
+    // family through glXGetProcAddress, and a flush that reaches the driver
+    // without going through the staging copy uploads the range as it was at map
+    // time.
+    //
+    // Each is gated on the host actually exporting it. glXGetProcAddress is
+    // spec'd to return non-null for unsupported functions, but titles use it as
+    // a support probe (see the Psychonauts note above), and unlike the map
+    // family these are not universally present -- APPLE_flush_buffer_range is
+    // not a Mesa extension and the DSA spellings need GL 4.5 / EXT_DSA. Handing
+    // back an impl that forwards into a null loader pointer would turn "not
+    // supported" into a crash.
+  } else if (name_sv == "glFlushMappedBufferRange") {
+    return fexldr_ptr_libGL_glFlushMappedBufferRange ? (VoidFn)fexfn_impl_libGL_glFlushMappedBufferRange : nullptr;
+  } else if (name_sv == "glFlushMappedBufferRangeAPPLE") {
+    return fexldr_ptr_libGL_glFlushMappedBufferRangeAPPLE ? (VoidFn)fexfn_impl_libGL_glFlushMappedBufferRangeAPPLE : nullptr;
+  } else if (name_sv == "glFlushMappedNamedBufferRange") {
+    return fexldr_ptr_libGL_glFlushMappedNamedBufferRange ? (VoidFn)fexfn_impl_libGL_glFlushMappedNamedBufferRange : nullptr;
+  } else if (name_sv == "glFlushMappedNamedBufferRangeEXT") {
+    return fexldr_ptr_libGL_glFlushMappedNamedBufferRangeEXT ? (VoidFn)fexfn_impl_libGL_glFlushMappedNamedBufferRangeEXT : nullptr;
 #endif
 #ifdef IS_32BIT_THUNK
   } else if (name_sv == "glBindBuffersRange") {
@@ -712,16 +734,26 @@ void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei cou
 // map would leak the guest's 4 GiB heap within minutes of gameplay. A game uses
 // a bounded set of targets, so the cache is bounded too.
 //
-// GL_MAP_FLUSH_EXPLICIT_BIT is not honoured: the whole mapped range is copied
-// back on unmap rather than only the explicitly flushed sub-ranges, and
-// glFlushMappedBufferRange stays a passthrough whose effect the unmap copy
-// subsumes. That costs bandwidth but is correct, *given* the unconditional
-// seeding above — without it, untouched bytes carry stale contents back into
-// the buffer, which is a correctness bug and not merely a slow path.
+// GL_MAP_FLUSH_EXPLICIT_BIT needs the flush itself to be intercepted, and this
+// is why: glFlushMappedBufferRange is the point at which the driver takes the
+// mapped range's current contents. Under the staging scheme the guest's writes
+// are in the staging buffer, and nothing has copied them into the driver's
+// mapping yet — the copy used to happen only at unmap, strictly *after* every
+// flush. So the driver latched the range as it stood at map time, i.e. the
+// seeded (previous) contents, and for a FLUSH_EXPLICIT mapping the unmap copy
+// that followed was not required to be uploaded at all: GL only promises to
+// upload sub-ranges that were explicitly flushed.
 //
-// Honouring the flag properly would mean a custom glFlushMappedBufferRange that
-// records flushed sub-ranges and copying back only those. Worth doing if buffer
-// upload ever shows up in a profile.
+// That is one frame's geometry surviving into the next — the same visible
+// failure the unconditional seeding above was written for, which seeding could
+// only change from "random garbage" into "last frame's contents".
+//
+// So the four flush entry points get custom impls on 32-bit that copy the
+// flushed sub-range staging -> host mapping before forwarding. The full
+// copy-back at unmap stays: it is what serves mappings *without*
+// FLUSH_EXPLICIT, and for a flushed mapping it rewrites bytes that already
+// match. Copying back only the flushed sub-ranges is a bandwidth optimisation
+// that can come later; unlike this, it is not a correctness matter.
 #ifdef IS_32BIT_THUNK
 namespace {
 struct MappedBuffer {
@@ -888,7 +920,62 @@ GLboolean UnmapNamedBufferFromGuest(GLuint buffer) {
   }
   return fexldr_ptr_libGL_glUnmapNamedBuffer(buffer);
 }
+
+// Push a flushed sub-range from the staging buffer into the driver's mapping,
+// so that the flush the guest is about to perform sees the bytes it wrote.
+//
+// `offset` is relative to the start of the mapped range (GL spec), which is
+// also how the staging buffer is laid out, so the same offset indexes both.
+// Ranges are clamped against the recorded mapped length: a guest may pass an
+// out-of-range flush (the driver will raise GL_INVALID_VALUE for it), and this
+// runs before that validation, so it must not read or write past either buffer.
+// A target/name with no live mapping copies nothing and just forwards.
+void FlushStagingSubRange(MappedBuffer* Entry, GLintptr offset, GLsizeiptr length) {
+  if (!Entry || !Entry->HostPtr || !Entry->GuestPtr || offset < 0 || length <= 0) {
+    return;
+  }
+  const size_t Offset = static_cast<size_t>(offset);
+  if (Offset >= Entry->Length) {
+    return;
+  }
+  const size_t Length = std::min(static_cast<size_t>(length), Entry->Length - Offset);
+  std::memcpy(reinterpret_cast<char*>(Entry->HostPtr) + Offset, reinterpret_cast<const char*>(Entry->GuestPtr) + Offset, Length);
+}
+
+void FlushMappedTargetRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedBuffers.find(target);
+  FlushStagingSubRange(It != MappedBuffers.end() ? &It->second : nullptr, offset, length);
+}
+
+void FlushMappedNameRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedNamedBuffers.find(buffer);
+  FlushStagingSubRange(It != MappedNamedBuffers.end() ? &It->second : nullptr, offset, length);
+}
 } // namespace
+
+void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  FlushMappedTargetRange(target, offset, length);
+  fexldr_ptr_libGL_glFlushMappedBufferRange(target, offset, length);
+}
+
+// APPLE_flush_buffer_range spells the same operation with a `size` parameter;
+// the staging handling is identical.
+void fexfn_impl_libGL_glFlushMappedBufferRangeAPPLE(GLenum target, GLintptr offset, GLsizeiptr size) {
+  FlushMappedTargetRange(target, offset, size);
+  fexldr_ptr_libGL_glFlushMappedBufferRangeAPPLE(target, offset, size);
+}
+
+void fexfn_impl_libGL_glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  FlushMappedNameRange(buffer, offset, length);
+  fexldr_ptr_libGL_glFlushMappedNamedBufferRange(buffer, offset, length);
+}
+
+void fexfn_impl_libGL_glFlushMappedNamedBufferRangeEXT(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  FlushMappedNameRange(buffer, offset, length);
+  fexldr_ptr_libGL_glFlushMappedNamedBufferRangeEXT(buffer, offset, length);
+}
 
 // Retire the GLsync token when the guest deletes the sync object. Unlike a GLX
 // context this genuinely matters: a title that fences once per frame creates a
