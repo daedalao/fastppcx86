@@ -212,10 +212,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // If the write spans two pages, they will be flushed one at a time (generating two faults)
     auto Entry = VMATracking->FindVMAEntry(FaultAddress);
 
-    // If an untracked address, or the mapping wasn't writable, it can't be handled here.
-    // The "UNHANDLED untracked" audit tag below therefore means "this fault is not ours":
-    // the address has no VMA entry, so mtrack never write-protected it and returning false
-    // (letting the fault reach the guest's own handler) is the correct outcome, not a miss.
+    // If an untracked address, or the mapping wasn't writable, it can't be handled here
     if (Entry == VMATracking->VMAs.end() || !Entry->second.Prot.Writable) {
       SMC_AUDIT("[%d] fault addr=%lx UNHANDLED %s\n", FHU::Syscalls::gettid(), FaultAddress,
                 Entry == VMATracking->VMAs.end() ? "untracked" : "vma-not-writable");
@@ -617,34 +614,12 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   const auto Base = Start & FEXCore::Utils::FEX_PAGE_MASK;
   const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_PAGE_SIZE);
 
-  if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
-    return;
-  }
-
-  // Sample the VMA map version *before* looking at anything else. Used both to
-  // validate a memo hit below and to stamp the memo we may publish at the end.
-  // Sampling it before the lock is deliberate and safe -- see the invariant
-  // argument at the memo's definition in SyscallsVMATracking.h.
-  const auto Generation = VMATracking.LoadGeneration();
-
-  // Only single-page ranges are memoised. That is what the compile path asks
-  // for (Core.cpp and CodeCache.cpp both call with FEX_PAGE_SIZE), and it keeps
-  // the memo one lookup rather than a loop.
-  const bool Memoisable = (Top - Base) == FEXCore::Utils::FEX_PAGE_SIZE;
-
-  if (Memoisable && VMATracking.IsMarkNoOp(Base, Generation)) {
-    // Known to be a private, non-writable mapping (or no mapping at all) as of
-    // Generation, so the walk below would find nothing to protect.
-    SMC_AUDIT("[%d] mark FASTSKIP base=%lx\n", FHU::Syscalls::gettid(), Base);
-    return;
-  }
-
   {
-    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+    if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
+      return;
+    }
 
-    // Cleared as soon as the walk finds anything actionable for this range;
-    // only a walk that stays true may be memoised.
-    bool NoActionNeeded = true;
+    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
 
     // Find the first mapping at or after the range ends, or ::end().
     // Top points to the address after the end of the range
@@ -674,11 +649,6 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
         const auto ProtectSize = std::min(MapTop, Top) - ProtectBase;
 
         if (Mapping->second.Flags.Shared) {
-          // Whether a shared mapping needs work depends on the protections of
-          // every mirror of its resource, so don't memoise it -- the mirror
-          // list is walked below anyway.
-          NoActionNeeded = false;
-
           LOGMAN_THROW_A_FMT(Mapping->second.Resource, "VMA tracking error");
 
           const auto OffsetBase = ProtectBase - Mapping->first + Mapping->second.Offset;
@@ -725,12 +695,6 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           } while ((VMA = VMA->ResourceNextVMA));
 
         } else if (Mapping->second.Prot.Writable) {
-          // Writable-private: either we protect it now, or SMC detection is
-          // disabled for it. The latter is a no-op today, but it depends on
-          // SMCDetectionDisabled rather than on the VMA map, so it is not
-          // covered by the generation counter -- don't memoise either case.
-          NoActionNeeded = false;
-
           // Once the mono backpatcher hook is installed, writable+executable
           // mappings (mono's JIT arenas) are covered by MonoBackpatcherWrite and
           // per-instruction validation on tailcall sites instead of by faulting,
@@ -788,14 +752,6 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
                     Mapping->second.Flags.Shared ? 1 : 0, Mapping->second.Prot.Writable ? 1 : 0);
         }
       }
-    }
-
-    // Nothing to protect for this page: every overlapping mapping was private
-    // and non-writable (or there was no mapping at all). Record that against
-    // the generation sampled before the walk, so the next compile that touches
-    // this page answers without the lock. Any VMA change retires this.
-    if (Memoisable && NoActionNeeded) {
-      VMATracking.RecordMarkNoOp(Base, Generation);
     }
   }
 }
@@ -1066,16 +1022,6 @@ void SyscallHandler::DisableSMCDetectionLocked(FEXCore::Core::InternalThreadStat
   if (SMCDetectionDisabled.exchange(true, std::memory_order_release)) {
     return;
   }
-
-  // Defence in depth for the MarkGuestExecutableRange memo. It only ever
-  // records private, non-writable mappings, which this sweep never touches, so
-  // no entry can go stale here -- but this is the one place outside the VMA
-  // mutators that changes what a mark would do, and it is a one-shot, so pay
-  // the bump rather than leave the reasoning load-bearing. Note the caller only
-  // holds the mutex shared: that is fine, a bump is sound from any context
-  // because a memo entry is only trusted while its stamp is the live
-  // generation (see SyscallsVMATracking.h).
-  VMATracking.BumpGeneration();
 
   // One-time sweep: anything we already write-protected that the guest asked to
   // be both writable and executable goes back to its requested protection.
