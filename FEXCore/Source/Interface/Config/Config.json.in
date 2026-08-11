@@ -812,6 +812,17 @@
           "Unlike FEX_O0 this affects only this one pass; X87StackOptimization and the rest of the default pass set stay enabled."
         ]
       },
+      "SMCMarkMemo": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "Memoise the no-op case of MarkGuestExecutableRange (FEX_SMCMARKMEMO=0 disables).",
+          "A 16.5-minute Witcher 3 SMC audit measured 114K of 120K mark calls as pure no-ops that still took the VMA mutex on the compile path.",
+          "The memo answers those lock-free, invalidated wholesale by a VMA-map generation counter bumped in every mutating funnel.",
+          "Throughput effect is small (0.4% hit rate on W3); the knob exists because the mark path contends the VMA mutex with the syscall side,",
+          "so the memo's real effect is on hitch/latency tails -- A/B it with stutterwatch (audio zero-runs, hitch stats), not with perf means."
+        ]
+      },
       "DisableDFCEStoreElim": {
         "Type": "bool",
         "Default": "false",
