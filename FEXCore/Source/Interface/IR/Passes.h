@@ -24,6 +24,7 @@ bool IROpWritesNZCV(IROp_Header* IROp);
 
 fextl::unique_ptr<FEXCore::IR::Pass> CreateCompareBranchFusion();
 fextl::unique_ptr<FEXCore::IR::Pass> CreateDeadFlagCalculationEliminination();
+fextl::unique_ptr<FEXCore::IR::Pass> CreateScalarSplatChain();
 fextl::unique_ptr<FEXCore::IR::RegisterAllocationPass> CreateRegisterAllocationPass(const FEXCore::CPUIDEmu* CPUID);
 fextl::unique_ptr<FEXCore::IR::Pass> CreateX87StackOptimizationPass(const FEXCore::HostFeatures&, OpSize GPROpSize);
 

@@ -428,6 +428,22 @@ private:
   [[nodiscard]]
   bool IsInlineEntrypointOffset(const IR::OrderedNodeWrapper& WNode, uint64_t* Value) const;
 
+  // Is this operand produced by a VF*ScalarInsert that the ScalarSplatChain IR
+  // pass granted the SplatResult permission? Such a value holds element 0's
+  // bits replicated across every element, so a consumer that only needs element
+  // 0 may read any element and skip its own splat.
+  //
+  // Answering from the defining op is what makes this safe in both directions:
+  // the producer's DEF_OP tests the exact same bit when it decides to leave the
+  // result splatted, and anything that stands between def and use -- an
+  // RA-inserted fill or copy -- changes the defining op to one that is not a
+  // marked ScalarInsert, so the test degrades to "assume architectural" and the
+  // splat gets emitted. (A fill is a full-width lvx of a full-width stvx, so
+  // the value really is still splatted there; re-splatting it is merely
+  // redundant, never wrong.)
+  [[nodiscard]]
+  bool IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpSize ElementSize) const;
+
   // Get a register that may be zero-register if the node is constant 0
   [[nodiscard]]
   GPR GetZeroableReg(IR::OrderedNodeWrapper Src) const {

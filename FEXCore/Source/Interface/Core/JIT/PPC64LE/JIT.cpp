@@ -1223,6 +1223,27 @@ bool PPC64JITCore::IsInlineEntrypointOffset(const IR::OrderedNodeWrapper& WNode,
   return false;
 }
 
+bool PPC64JITCore::IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpSize ElementSize) const {
+  if (WNode.IsInvalid() || WNode.IsImmediate()) {
+    return false;
+  }
+
+  auto IROp = IR->GetOp<IR::IROp_Header>(WNode);
+  switch (IROp->Op) {
+  case IR::IROps::OP_VFADDSCALARINSERT:
+  case IR::IROps::OP_VFSUBSCALARINSERT:
+  case IR::IROps::OP_VFMULSCALARINSERT:
+  case IR::IROps::OP_VFDIVSCALARINSERT:
+    // The element size has to agree: an f32 splat replicates a word, so its
+    // doubleword 1 is {value, value} rather than the architectural
+    // {Vector1.word2, value} an f64 reader would expect (and vice versa). The
+    // IR pass enforces the same match when it marks, this is the backend half
+    // of that contract.
+    return IROp->ElementSize == ElementSize && IROp->C<IR::IROp_VFAddScalarInsert>()->SplatResult;
+  default: return false;
+  }
+}
+
 // -------------------------------------------------------------------------
 // Named thunk relocation
 // -------------------------------------------------------------------------

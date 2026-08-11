@@ -762,7 +762,33 @@ DEF_OP(StoreMem) {
   if (Op->Class == IR::RegClass::FPR) {
     // Honour Op->Size so vmovd m32 / vmovq m64 don't write 16B and stomp on
     // adjacent stack slots (e.g. wiping [rsp+8] in __tls_init_tp).
-    StoreFPRSized(GetVReg(Op->Value), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
+    const auto Size = IR::OpSizeToSize(IROp->Size);
+
+    // Splat-form values (see Passes/ScalarSplatChain.cpp) hold element 0's bits
+    // replicated across the register, so doubleword 0 already equals doubleword
+    // 1 and StoreFPRSized's xxpermdi(DM=2) staging permute is a no-op. Drop it
+    // and issue the scalar-VSX store directly -- the movss store that ends a
+    // guest scalar chain becomes one instruction.
+    //
+    // The accepted element sizes differ per store width and are checked here
+    // rather than inherited from the pass: stxsiwx reads word 1 of doubleword
+    // 0, which is element 0's word under an f32 splat and the low word of
+    // element 0 under an f64 splat; stxsdx reads all of doubleword 0, which is
+    // only element 0 under an f64 splat.
+    const bool SplatSrc = (Size == 4 && (IsSplatFormValue(Op->Value, IR::OpSize::i32Bit) || IsSplatFormValue(Op->Value, IR::OpSize::i64Bit))) ||
+                          (Size == 8 && IsSplatFormValue(Op->Value, IR::OpSize::i64Bit));
+    if (SplatSrc) {
+      const auto VSrc = GetVReg(Op->Value);
+      const auto Ea = MaterializeAddr(*this, EAF);
+      if (Size == 4) {
+        stxsiwx(VSrc, Ea, r0);
+      } else {
+        stxsdx(VSrc, Ea, r0);
+      }
+      return;
+    }
+
+    StoreFPRSized(GetVReg(Op->Value), MaterializeAddr(*this, EAF), Size);
     return;
   }
   if (IROp->Size == IR::OpSize::i128Bit) {

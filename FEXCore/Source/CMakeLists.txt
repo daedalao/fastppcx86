@@ -67,6 +67,7 @@ list(APPEND SRCS
   Interface/IR/Passes/IRValidation.cpp
   Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
   Interface/IR/Passes/RegisterAllocationPass.cpp
+  Interface/IR/Passes/ScalarSplatChain.cpp
   Interface/IR/Passes/x87StackOptimizationPass.cpp
   Utils/LongJump.cpp
   Utils/Telemetry.cpp

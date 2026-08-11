@@ -3820,23 +3820,62 @@ DEF_OP(VFNMLS) {
 // the two GPR-store->vector-load forwarding stalls of the old lowering.
 //   old: 9 instructions + 2 store-hit-load stalls + denormal cliff
 //   new: f64 = 4 instructions, f32 = 5, no stalls, no memory traffic
+//
+// SPLAT CHAINS (see Interface/IR/Passes/ScalarSplatChain.cpp).
+//
+// Step 2 above is the whole trick: with both operands splatted, the xv* result
+// is ALREADY splatted in every element. So for a scalar op sitting inside a
+// guest chain (movss; subss; mulss; movss) the step-3 merge only exists to
+// rebuild upper elements that the next link immediately throws away again.
+//
+// The IR pass proves per node that nothing observes the upper elements and sets
+// SplatResult. Two independent savings follow, both keyed off that one bit:
+//   * Op->SplatResult      -> skip the merge, write the xv* straight to Dst.
+//   * operand is splat-form -> skip that operand's splat, feed it in directly.
+// A chain-internal op with both a marked producer and a marked self is then a
+// single xv* instruction, down from five.
+//
+// The backend keeps no value state and does not need any: the splat-form test
+// reads the SplatResult bit off the operand's DEFINING op, which is the same
+// bit that op's own lowering consulted when it decided not to merge. The pass
+// guarantees a marked value never leaves its block, never reaches a
+// StoreRegister/StoreContext, never reaches a 16-byte store, and never reaches
+// a consumer that reads anything above element 0.
+//
+// Denormals are unaffected: every lane still computes the same value with the
+// same xv* op, exactly as the splat-both-operands lowering already did. Do not
+// be tempted to "simplify" a splat chain into xs*/f* scalar ops -- that is the
+// 22.8x POWER8 denormal assist this lowering exists to avoid.
 #define DEF_SCALAR_INSERT(NAME, XVOP_S, XVOP_D)                                \
 DEF_OP(NAME) {                                                                 \
   const auto Op   = IROp->C<IR::IROp_##NAME>();                                \
+  const auto ElemSz = Op->Header.ElementSize;                                  \
   const auto Dst  = GetVReg(Node);                                             \
   const auto Vec1 = GetVReg(Op->Vector1);                                      \
   const auto Vec2 = GetVReg(Op->Vector2);                                      \
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
-    xxspltw(VTMP1, Vec1, 3);                                                   \
-    xxspltw(VTMP2, Vec2, 3);                                                   \
-    XVOP_S(VTMP1, VTMP1, VTMP2);                                               \
-    xxsldwi(VTMP2, VTMP1, Vec1, 3);                                            \
-    xxsldwi(Dst, VTMP2, VTMP2, 1);                                             \
+  const bool Splat1 = IsSplatFormValue(Op->Vector1, ElemSz);                   \
+  const bool Splat2 = IsSplatFormValue(Op->Vector2, ElemSz);                   \
+  VR A = Vec1, B = Vec2;                                                       \
+  if (ElemSz == IR::OpSize::i32Bit) {                                          \
+    if (!Splat1) { xxspltw(VTMP1, Vec1, 3); A = VTMP1; }                       \
+    if (!Splat2) { xxspltw(VTMP2, Vec2, 3); B = VTMP2; }                       \
+    if (Op->SplatResult) {                                                     \
+      XVOP_S(Dst, A, B);                                                       \
+    } else {                                                                   \
+      /* Vec1 is read again below, so the xv* must land in a scratch. */       \
+      XVOP_S(VTMP1, A, B);                                                     \
+      xxsldwi(VTMP2, VTMP1, Vec1, 3);                                          \
+      xxsldwi(Dst, VTMP2, VTMP2, 1);                                           \
+    }                                                                          \
   } else {                                                                     \
-    xxpermdi(VTMP1, Vec1, Vec1, 3);                                            \
-    xxpermdi(VTMP2, Vec2, Vec2, 3);                                            \
-    XVOP_D(VTMP1, VTMP1, VTMP2);                                               \
-    xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */                \
+    if (!Splat1) { xxpermdi(VTMP1, Vec1, Vec1, 3); A = VTMP1; }                \
+    if (!Splat2) { xxpermdi(VTMP2, Vec2, Vec2, 3); B = VTMP2; }                \
+    if (Op->SplatResult) {                                                     \
+      XVOP_D(Dst, A, B);                                                       \
+    } else {                                                                   \
+      XVOP_D(VTMP1, A, B);                                                     \
+      xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */              \
+    }                                                                          \
   }                                                                            \
 }
 DEF_SCALAR_INSERT(VFAddScalarInsert, xvaddsp, xvadddp)

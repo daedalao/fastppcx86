@@ -70,6 +70,7 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
   FEX_CONFIG_OPT(DisablePasses, O0);
   FEX_CONFIG_OPT(DisableDFCE, DISABLEDFCE);
   FEX_CONFIG_OPT(DisableCmpBranchFusion, DISABLECMPBRANCHFUSION);
+  FEX_CONFIG_OPT(DisableScalarSplatChain, DISABLESCALARSPLATCHAIN);
 
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
@@ -109,6 +110,20 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
     // turns just this pass off at runtime, no rebuild.
     if (!DisableDFCE()) {
       InsertPass(CreateDeadFlagCalculationEliminination());
+    }
+
+    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult, and
+    // the analysis reads OrderedNode::GetUses() plus the frontend's explicit
+    // StoreRegister writebacks -- both of which RA rewrites. It is otherwise
+    // order-independent (it neither reads nor writes flags, and adds/removes no
+    // operand uses), so it sits last among the optimisation passes.
+    //
+    // Own kill switch for the same reason as the two above: a wrongly marked
+    // node lets the backend leave junk in a guest XMM's upper elements, which
+    // is silent and data-dependent:
+    //     FEX_DISABLESCALARSPLATCHAIN=1
+    if (!DisableScalarSplatChain()) {
+      InsertPass(CreateScalarSplatChain());
     }
   }
 }
