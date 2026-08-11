@@ -15,6 +15,8 @@ $end_info$
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <optional>
+
 namespace FEXCore::IR {
 
 // ---------------------------------------------------------------------------
@@ -170,6 +172,28 @@ static bool IsFusableProducer(IRListView& IR, IROp_Header* Producer) {
   return IsRegisterOperand(IR, Producer->Args[0]) && IsUsableOperand(IR, Producer->Args[1]);
 }
 
+// Resolve the condition this consumer would need after fusing against
+// Producer, or nullopt if the pair is not an identity. MI/PL read N alone,
+// which a compare cannot reproduce in general (its LT is N^V) -- EXCEPT when
+// the subtrahend is a literal zero: a-0 can never overflow signed, so V==0
+// and MI == SLT-vs-0, PL == SGE-vs-0 exactly. The frontend lowers x86
+// `test r,r` (guest js/jns/sets loops) to SubWithFlags(a, #0), so this case
+// is common. Everything else routes through IsFusableCond unchanged.
+static std::optional<CondClass> ResolveFusedCond(IRListView& IR, IROp_Header* Producer, CondClass Cond) {
+  if (Cond == CondClass::MI || Cond == CondClass::PL) {
+    auto Hdr = IR.GetOp<IROp_Header>(Producer->Args[1]);
+    if (Hdr->Op == OP_INLINECONSTANT && Hdr->C<IROp_InlineConstant>()->Constant == 0) {
+      return Cond == CondClass::MI ? CondClass::SLT : CondClass::SGE;
+    }
+    return std::nullopt;
+  }
+
+  if (IsFusableCond(Cond)) {
+    return Cond;
+  }
+  return std::nullopt;
+}
+
 void CompareBranchFusion::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::CmpBranchFusion");
 
@@ -180,6 +204,7 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
   struct SelectRewrite {
     Ref Node;
     IROp_Header* Producer;
+    CondClass Cond;
   };
   fextl::vector<SelectRewrite> SelectRewrites;
 
@@ -229,7 +254,11 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
 
       if (IROp->Op == OP_NZCVSELECT) {
         auto SelOp = IROp->CW<IROp_NZCVSelect>();
-        if (IsFusableCond(SelOp->Cond) && (CarryValid || !ReadsCarry(SelOp->Cond)) && IsFusableProducer(CurrentIR, Producer)) {
+        std::optional<CondClass> Fused;
+        if (IsFusableProducer(CurrentIR, Producer)) {
+          Fused = ResolveFusedCond(CurrentIR, Producer, SelOp->Cond);
+        }
+        if (Fused && (CarryValid || !ReadsCarry(*Fused))) {
           // DEF_OP(Select) materialises inline-constant True/False values via
           // a bare 16-bit `li`; anything wider would silently truncate, so
           // only fuse when both fit (covers the 0/1/-1 flag-materialisation
@@ -249,13 +278,16 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
             return true;
           };
           if (FitsLi(SelOp->TrueVal) && FitsLi(SelOp->FalseVal)) {
-            SelectRewrites.push_back({CodeNode, Producer});
+            SelectRewrites.push_back({CodeNode, Producer, *Fused});
           }
         }
       } else if (IROp->Op == OP_CONDJUMP) {
         auto CondOp = IROp->CW<IROp_CondJump>();
-        if (CondOp->FromNZCV && IsFusableCond(CondOp->Cond) && (CarryValid || !ReadsCarry(CondOp->Cond)) &&
-            IsFusableProducer(CurrentIR, Producer)) {
+        std::optional<CondClass> Fused;
+        if (CondOp->FromNZCV && IsFusableProducer(CurrentIR, Producer)) {
+          Fused = ResolveFusedCond(CurrentIR, Producer, CondOp->Cond);
+        }
+        if (Fused && (CarryValid || !ReadsCarry(*Fused))) {
           // FromNZCV and the vector-compare mode are mutually exclusive today,
           // and the rewrite would reinterpret FPR-class Cmp1/Cmp2 as GPRs.
           LOGMAN_THROW_A_FMT(CondOp->VCmpElementSize == OpSize::iInvalid, "FromNZCV CondJump cannot also be a vector-compare CondJump");
@@ -264,6 +296,7 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
           IREmit->ReplaceNodeArgument(CodeNode, 0, CurrentIR.GetNode(Producer->Args[0]));
           IREmit->ReplaceNodeArgument(CodeNode, 1, CurrentIR.GetNode(Producer->Args[1]));
           CondOp->CompareSize = Producer->Size;
+          CondOp->Cond = *Fused;
           CondOp->FromNZCV = false;
         }
       }
@@ -285,7 +318,7 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
     auto SelOp = IROp->CW<IROp_NZCVSelect>();
 
     IREmit->SetWriteCursorBefore(RW.Node);
-    Ref NewSelect = IREmit->_Select(IROp->Size, RW.Producer->Size, SelOp->Cond,
+    Ref NewSelect = IREmit->_Select(IROp->Size, RW.Producer->Size, RW.Cond,
                                     CurrentIR.GetNode(RW.Producer->Args[0]),
                                     CurrentIR.GetNode(RW.Producer->Args[1]),
                                     CurrentIR.GetNode(SelOp->TrueVal),
