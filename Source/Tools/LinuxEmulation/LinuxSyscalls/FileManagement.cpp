@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "Common/Config.h"
+#include "Common/CPUInfo.h"
 #include "Common/FDUtils.h"
 #include "Common/JSONPool.h"
 
@@ -202,6 +203,17 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
 
 FileManager::FileManager(FEXCore::Context::Context* ctx)
   : EmuFD {ctx} {
+  {
+    // Cache the identity of the host sysfs CPU directory and the CPU count
+    // reported to the guest, for IsHiddenDentry.
+    struct stat Buffer {};
+    if (stat("/sys/devices/system/cpu", &Buffer) == 0) {
+      SysfsCPUDirDev = Buffer.st_dev;
+      SysfsCPUDirInode = Buffer.st_ino;
+      ReportedCPUCount = FEX::CPUInfo::CalculateNumberOfCPUs();
+    }
+  }
+
   const auto& ThunkConfigFile = ThunkConfig();
 
   // We try to load ThunksDB from:
@@ -2180,6 +2192,29 @@ void FileManager::UpdatePID(uint32_t PID) {
     ProcFDInode = 0;
     return;
   }
+}
+
+bool FileManager::IsHiddenDentry(int ParentDirFD, uint64_t inode, const char* Name) const {
+  if (IsProtectedFile(ParentDirFD, inode)) {
+    return true;
+  }
+  // Hide /sys/devices/system/cpu/cpu<N> for N >= the reported CPU count.
+  // The emulated online/present files already clamp what the guest is told,
+  // but guests that COUNT cpu<N> directory entries (glibc __get_nprocs_conf,
+  // Unity's SystemInfo.processorCount) would still see every configured host
+  // CPU — 160 on an SMT-off POWER8 — and oversubscribe their thread pools.
+  if (ReportedCPUCount != 0 && Name[0] == 'c' && Name[1] == 'p' && Name[2] == 'u' && Name[3] >= '0' && Name[3] <= '9') {
+    char* End = nullptr;
+    const unsigned long N = std::strtoul(Name + 3, &End, 10);
+    if (End && *End == '\0' && N >= ReportedCPUCount) {
+      struct stat Buffer;
+      if (fstat(ParentDirFD, &Buffer) >= 0 && Buffer.st_dev == SysfsCPUDirDev &&
+          Buffer.st_ino == static_cast<decltype(Buffer.st_ino)>(SysfsCPUDirInode)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 bool FileManager::IsProtectedFile(int ParentDirFD, uint64_t inode) const {

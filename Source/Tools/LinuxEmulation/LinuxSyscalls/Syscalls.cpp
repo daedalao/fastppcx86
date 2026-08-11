@@ -174,7 +174,7 @@ uint64_t GetDentsEmulation(int fd, T* dirp, uint32_t count) {
 
       TmpOffset += Tmp->d_reclen;
 
-      if (FEX::HLE::_SyscallHandler->FM.IsProtectedFile(fd, Outgoing->d_ino)) {
+      if (FEX::HLE::_SyscallHandler->FM.IsHiddenDentry(fd, Outgoing->d_ino, Outgoing->d_name)) {
         continue;
       }
 

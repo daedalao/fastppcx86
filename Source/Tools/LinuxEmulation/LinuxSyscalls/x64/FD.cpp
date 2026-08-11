@@ -116,7 +116,7 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
       // Check for and hide the RootFS FD
       for (size_t i = 0; i < Result;) {
         linux_dirent_64* Incoming = (linux_dirent_64*)(reinterpret_cast<uint64_t>(dirp) + i);
-        if (FEX::HLE::_SyscallHandler->FM.IsProtectedFile(fd, Incoming->d_ino)) {
+        if (FEX::HLE::_SyscallHandler->FM.IsHiddenDentry(fd, Incoming->d_ino, Incoming->d_name)) {
           Result -= Incoming->d_reclen;
           memmove(Incoming, (linux_dirent_64*)(reinterpret_cast<uint64_t>(Incoming) + Incoming->d_reclen), Result - i);
           continue;

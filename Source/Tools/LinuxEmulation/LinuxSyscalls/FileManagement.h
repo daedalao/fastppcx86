@@ -118,6 +118,11 @@ public:
   // Helper to detect FEX-internal files from their inode and parent directory FD.
   // This is useful to deal with Chromium/CEF, which closes any FDs reported in /proc/self/fd/.
   bool IsProtectedFile(int ParentDirFD, uint64_t inode) const;
+  // Full dentry filter for getdents emulation: protected FEX-internal files
+  // plus /sys/devices/system/cpu/cpu<N> entries beyond the reported CPU
+  // count, so guests that size thread pools by counting sysfs entries
+  // (glibc __get_nprocs_conf, Unity) agree with the emulated online/present.
+  bool IsHiddenDentry(int ParentDirFD, uint64_t inode, const char* Name) const;
   void SetProtectedCodeMapFD(int FD);
 
   fextl::string GetEmulatedPath(const char* pathname, bool FollowSymlink = false) const;
@@ -223,5 +228,10 @@ private:
   int64_t ProcFDInode = 0;
   int64_t CodeMapInode = 0;
   dev_t ProcFSDev;
+  // Identity of the host /sys/devices/system/cpu directory plus the CPU
+  // count reported to the guest, for hiding excess cpu<N> dentries.
+  dev_t SysfsCPUDirDev = 0;
+  int64_t SysfsCPUDirInode = 0;
+  uint32_t ReportedCPUCount = 0;
 };
 } // namespace FEX::HLE
