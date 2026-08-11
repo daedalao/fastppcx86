@@ -103,6 +103,16 @@ namespace FEXCore::IR {
 // ---------------------------------------------------------------------------
 
 namespace {
+  bool ReadsCarry(CondClass Cond) {
+    switch (Cond) {
+    case CondClass::UGE:
+    case CondClass::ULT:
+    case CondClass::UGT:
+    case CondClass::ULE: return true;
+    default: return false;
+    }
+  }
+
   bool IsFusableCond(CondClass Cond) {
     switch (Cond) {
     case CondClass::EQ:
@@ -177,12 +187,49 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
     // Forward walk, tracking the most recent NZCV writer. Readers (setcc,
     // NZCVSelect) are walked over: they keep the SubWithFlags' flag write
     // alive but do not change it, and DFCE sees each reader independently.
+    //
+    // CarryValid handles the x86 dec/inc idiom, which preserves CF: the
+    // frontend saves it (NZCVSelect on the OLD flags), lets Sub/AddWithFlags
+    // clobber NZCV, then splices it back with
+    //     %l = LoadNZCV ; %b = Bfi #1, #29, %l, %saved ; StoreNZCV %b
+    // That StoreNZCV rewrites ONLY bit 29 (ARM C) on top of the arithmetic
+    // op's own NZCV, so N/Z/V still belong to that op and every non-carry
+    // condition may fuse straight through it. Recognising the splice needs to
+    // know whose flags the LoadNZCV read, so each LoadNZCV is recorded with
+    // the producer current at its position (list order after other passes is
+    // not program order; visit-time recording is).
     IROp_Header* Producer {};
+    bool CarryValid = true;
+    IROp_Header* LastLoadNZCV {};
+    IROp_Header* LastLoadNZCVProducer {};
 
     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+      if (IROp->Op == OP_LOADNZCV) {
+        LastLoadNZCV = IROp;
+        LastLoadNZCVProducer = Producer;
+        continue;
+      }
+
+      if (IROp->Op == OP_STORENZCV) {
+        // Carry-splice StoreNZCV? Source must be Bfi(width 1, lsb 29) over
+        // the LoadNZCV that read the CURRENT producer's flags.
+        auto Src = CurrentIR.GetOp<IROp_Header>(IROp->Args[0]);
+        if (Src->Op == OP_BFI) {
+          auto Bfi = Src->C<IROp_Bfi>();
+          if (Bfi->Width == 1 && Bfi->lsb == 29 && CurrentIR.GetOp<IROp_Header>(Bfi->Dest) == LastLoadNZCV &&
+              LastLoadNZCV && LastLoadNZCVProducer == Producer && Producer) {
+            CarryValid = false;
+            continue;
+          }
+        }
+        Producer = IROp;
+        CarryValid = true;
+        continue;
+      }
+
       if (IROp->Op == OP_NZCVSELECT) {
         auto SelOp = IROp->CW<IROp_NZCVSelect>();
-        if (IsFusableCond(SelOp->Cond) && IsFusableProducer(CurrentIR, Producer)) {
+        if (IsFusableCond(SelOp->Cond) && (CarryValid || !ReadsCarry(SelOp->Cond)) && IsFusableProducer(CurrentIR, Producer)) {
           // DEF_OP(Select) materialises inline-constant True/False values via
           // a bare 16-bit `li`; anything wider would silently truncate, so
           // only fuse when both fit (covers the 0/1/-1 flag-materialisation
@@ -207,7 +254,8 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
         }
       } else if (IROp->Op == OP_CONDJUMP) {
         auto CondOp = IROp->CW<IROp_CondJump>();
-        if (CondOp->FromNZCV && IsFusableCond(CondOp->Cond) && IsFusableProducer(CurrentIR, Producer)) {
+        if (CondOp->FromNZCV && IsFusableCond(CondOp->Cond) && (CarryValid || !ReadsCarry(CondOp->Cond)) &&
+            IsFusableProducer(CurrentIR, Producer)) {
           // FromNZCV and the vector-compare mode are mutually exclusive today,
           // and the rewrite would reinterpret FPR-class Cmp1/Cmp2 as GPRs.
           LOGMAN_THROW_A_FMT(CondOp->VCmpElementSize == OpSize::iInvalid, "FromNZCV CondJump cannot also be a vector-compare CondJump");
@@ -222,6 +270,7 @@ void CompareBranchFusion::Run(IREmitter* IREmit) {
 
       if (IROpWritesNZCV(IROp)) {
         Producer = IROp;
+        CarryValid = true;
       }
     }
   }
