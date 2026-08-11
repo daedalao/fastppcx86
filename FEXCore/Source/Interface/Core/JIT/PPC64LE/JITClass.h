@@ -760,6 +760,12 @@ private:
   DEF_OP(SyncStackToSlow);
   DEF_OP(StackForceSlow);
 
+  // Native f64→f80 conversion (X87Ops.cpp). IR.json marks F80CVTTO
+  // JITDispatch:false (every other size/backend uses the FABI softfloat
+  // bridge); we override the i64 source case with a branchy bit-manipulation
+  // lowering because FXSAVE in ReducedPrecisionMode hammers it.
+  DEF_OP(F80CVTTo);
+
   // Bucket C: stack-form arithmetic ops that survive the optimisation pass.
   // Each is a thin wrapper that loads operands from x87 stack slots, calls
   // the corresponding F80 fallback handler via the existing FABI bridge,

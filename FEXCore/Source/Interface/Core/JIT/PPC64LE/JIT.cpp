@@ -3387,6 +3387,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     REGISTER_OP(F80STACKCHANGESIGN, F80StackChangeSign);
     REGISTER_OP(F80STACKABS,       F80StackAbs);
 
+    // Native f64→f80 conversion. Unlike the ops above this one IS hot on the
+    // normal (passes-enabled) path: ReducedPrecisionMode FXSAVE/FST-m80
+    // convert through it, and the FABI softfloat bridge (f64_to_extF80) was
+    // ~4.5% of Cyberpunk 2077's game thread. The DEF_OP delegates non-i64
+    // sources back to Op_Unhandled's FABI call.
+    REGISTER_OP(F80CVTTO,          F80CVTTo);
+
 #undef REGISTER_OP
     return t;
   }();
