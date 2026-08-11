@@ -2669,6 +2669,13 @@ void PPC64JITCore::EmitSuspendInterruptCheck() {
 // for small blocks anyway; the bump keeps the aggregate honest for
 // exit-dense blocks (a block that is a single guest Jcc is ~10 SSA ops for
 // two exits: 10*160 = 1600 >= 2*(inline ~420 + thunk 80)).
+//
+// Since the shared-spill-stub change, exits no longer inline SpillStaticRegs
+// (miss legs are a single b), and CompileCode's tail instead carries at most
+// TWO ~400-byte shared stubs per compile unit. The single-Jcc worst case is
+// now 2*(inline ~60 + thunk 80) + 800 ≈ 1080 <= 1600, and every additional
+// exit makes the aggregate cheaper than the pre-stub layout, so 160 stays a
+// valid (now conservative) claim.
 constexpr size_t kMaxHostBytesPerIROp = 160;
 constexpr size_t kMaxRIPEntryBytesPerIROp = 16;
 
@@ -3230,8 +3237,13 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   // Same for pending block-link jump thunks: their LinkPath labels are the
   // targets of miss-leg branches recorded in PendingBranches, so the two
-  // lists must be reset together.
+  // lists must be reset together. Ditto the shared spill stub labels, whose
+  // fixup chains also live in PendingBranches.
   PendingJumpThunks.clear();
+  SharedSpillExitLabel = {};
+  SharedSpillLinkLabel = {};
+  SharedSpillExitUsed = false;
+  SharedSpillLinkUsed = false;
 
   // -------------------------------------------------------------------------
   // Emit entry point
@@ -3539,13 +3551,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     bcl(20, 31, 4);
     mflr(TMP2);                                                     // +0x18
     addi(TMP2, TMP2, static_cast<int16_t>(PPC64LinkRecordFromThunkStart - 0x18)); // +0x1c
-    // TMP2 now holds &record. Load the dispatcher stub address from
-    // record.StubAddr (populated below with the constant fetched above).
-    ld(TMP1,                                                        // +0x20
-       static_cast<int16_t>(offsetof(PPC64BlockLinkRecord, StubAddr)),
-       TMP2);
-    mtctr(TMP1);                                                    // +0x24
-    bctr();                                                         // +0x28
+    // TMP2 now holds &record. Tail-branch to the shared spill stub, which
+    // runs SpillStaticRegs (TMP2 survives it via the f0 stash) and then
+    // dispatches through record.StubAddr. The miss leg no longer spills
+    // inline, so the spill happens exactly once, here, per compile unit.
+    SharedSpillLinkUsed = true;
+    b(&SharedSpillLinkLabel);                                       // +0x20
+    nop();                                                          // +0x24
+    nop();                                                          // +0x28
     nop();                                                          // +0x2c
     // Release-visible layout check (LOGMAN_* compiles to nothing in Release
     // and the failure mode of a drifted record offset is silent wrong-code:
@@ -3568,6 +3581,35 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
          (static_cast<uint64_t>(OrigThunkWord) << 32));               // Orig{Caller,Thunk}Word
     dc64(StubAddr);                                                   // StubAddr — dispatcher
                                                                       // stub cached per record
+  }
+
+  // -------------------------------------------------------------------------
+  // Shared miss-leg spill stubs (see SharedSpill*Label in JITClass.h). Cold
+  // by construction — an exit reaches these only on an L1 miss / unlinked
+  // path. Both live inside the code buffer, which is what the signal
+  // delegator's IsAddressInCodeBuffer "SRA may be live" proxy requires of the
+  // spill; the guest CR0/XER arrive here unclobbered (miss-leg compares use
+  // cr7, the thunk leg touches only LR/TMP1/TMP2) so SpillStaticRegs's NZCV
+  // pack still observes the block's final flags.
+  // -------------------------------------------------------------------------
+  if (SharedSpillExitUsed) {
+    Bind(&SharedSpillExitLabel);
+    SpillStaticRegs(TMP1);
+    const int32_t exit_off = static_cast<int32_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
+    ld(TMP1, exit_off, STATE);
+    mtctr(TMP1);
+    bctr();
+  }
+  if (SharedSpillLinkUsed) {
+    // Entered from a jump thunk's LinkPath leg with TMP2 = &record;
+    // SpillStaticRegs preserves TMP2 (f0 stash) precisely for contracts like
+    // this one, so the WithRecord dispatcher stub still receives r4 = &record.
+    Bind(&SharedSpillLinkLabel);
+    SpillStaticRegs(TMP1);
+    ld(TMP1, static_cast<int16_t>(offsetof(PPC64BlockLinkRecord, StubAddr)), TMP2);
+    mtctr(TMP1);
+    bctr();
   }
 
   // -------------------------------------------------------------------------

@@ -426,26 +426,25 @@ DEF_OP(ExitFunction) {
   // dispatcher's own L1 miss branches to a second, SRA-spilling entry.
   // ---------------------------------------------------------------------
   Bind(&MissLabel);
-  if (!Linkable) {
-    std(RIPReg, rip_off, STATE); // BEFORE the spill clobbers TMP1-TMP4
-  }
-  SpillStaticRegs(TMP1);
-
   if (Linkable) {
     // Linkable miss leg: State.rip was already stored by the hoisted region.
     // Branch to this exit's jump thunk LinkPath (emitted at the tail of
-    // CompileCode), which PC-discovers the adjacent PPC64BlockLinkRecord and
-    // enters the dispatcher's ExitFunctionLinkerWithRecord stub with
-    // r4 = &record. That path compiles/looks up the target AND backpatches
-    // the probe above; it dispatches exactly like ExitFunctionLinker
-    // otherwise (deferred-signal guard, FillStaticRegs, bctr).
+    // CompileCode), which PC-discovers the adjacent PPC64BlockLinkRecord into
+    // TMP2 and tail-branches to the shared SpillStaticRegs stub
+    // (SharedSpillLinkLabel — SpillStaticRegs preserves TMP2 through f0, so
+    // &record survives it), which then enters the dispatcher's
+    // ExitFunctionLinkerWithRecord stub with r4 = &record and SRA spilled.
+    // That path compiles/looks up the target AND backpatches the probe above;
+    // it dispatches exactly like ExitFunctionLinker otherwise (deferred-signal
+    // guard, FillStaticRegs, bctr).
     b(LinkPathLabel);
   } else {
-    const int32_t exit_off = static_cast<int32_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
-    ld(TMP1, exit_off, STATE);
-    mtctr(TMP1);
-    bctr();
+    std(RIPReg, rip_off, STATE); // BEFORE the shared stub's spill clobbers TMP1-TMP4
+    // Shared per-compile-unit spill stub (CompileCode tail): SpillStaticRegs +
+    // dispatch to Pointers.ExitFunctionLinker. Replaces ~90 inline cold
+    // instructions per exit with this one branch; see SharedSpillExitLabel.
+    SharedSpillExitUsed = true;
+    b(&SharedSpillExitLabel);
   }
 }
 
