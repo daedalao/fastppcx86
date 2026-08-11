@@ -18,7 +18,8 @@ split-lock handling) and the self-modifying-code subsystem are written for POWER
 ## Provenance
 
 FastPPCx86 is derived from the FEX-Emu project (<https://github.com/FEX-Emu/FEX>) and is
-distributed under the same MIT license. See [`LICENSE`](LICENSE), which is unmodified.
+distributed under the same MIT license. See [`LICENSE`](LICENSE), which is unmodified. This
+project was forked and heavily uses LLM generated code.
 
 This is a permanent fork with no plan to merge back. The PPC64LE backend, the memory-model work
 and the SMC subsystem diverge deliberately from how upstream solves the same problems on ARM64.
