@@ -2314,24 +2314,34 @@ DEF_OP(Select) {
                      Op->Cond == IR::CondClass::FU || Op->Cond == IR::CondClass::FNU);
   const bool IsBitTest = (Op->Cond == IR::CondClass::TSTZ || Op->Cond == IR::CondClass::TSTNZ);
 
+  // Every arm compares into cr7 and touches neither CR0 nor XER, so this op
+  // clobbers NO architectural flag state on ppc64le. CompareBranchFusion
+  // relies on that: it rewrites NZCVSelect (a pure NZCV *reader*) into Select
+  // mid-block, between an NZCV def and other live uses of it — legal only
+  // while every path through here leaves CR0/XER untouched. (The IR-level
+  // ImplicitFlagClobber on Select stays true for the frontend's sake; DFCE
+  // does not consult it.)
   PPC64Emitter::Cond CC;
   if (IsFP) {
     // FP compare path: operands are FPRs; defer entirely to EmitCompare.
-    EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
+    EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2, /*CRField=*/7);
     CC = MapCC(Op->Cond);
+    CC = {CC.BO, static_cast<uint8_t>(CC.BI + 28)};
   } else if (IsBitTest) {
     // Bit-test select: Cmp2 is an inline constant bit POSITION (mirrors the
     // CondJumpBit lowering, see DEF_OP(CondJump) in BranchOps.cpp). MapCC has
     // no TSTZ/TSTNZ entry — without this branch it would fall to its default
     // and silently return CC_EQ, miscompiling the Select. Extract the target
-    // bit via rldicl_, then pick CC_NE (TSTNZ) / CC_EQ (TSTZ).
+    // bit via rldicl (no Rc — CR0 must stay untouched, see above), compare
+    // via cr7, then pick NE (TSTNZ) / EQ (TSTZ) on cr7's EQ bit (BI 30).
     uint64_t Bit;
     LOGMAN_THROW_A_FMT(IsInlineConstant(Op->Cmp2, &Bit) && Bit < 64,
                        "Select TSTZ/TSTNZ: expected inline-constant bit < 64");
     auto Reg = GetReg(Op->Cmp1);
     uint32_t sh = (64u - static_cast<uint32_t>(Bit)) & 63u;
-    rldicl_(TMP1, Reg, sh, 63);
-    CC = (Op->Cond == IR::CondClass::TSTNZ) ? CC_NE : CC_EQ;
+    rldicl(TMP1, Reg, sh, 63);
+    cmpldi(cr(7), TMP1, 0);
+    CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
   } else {
     auto S1 = GetReg(Op->Cmp1);
     uint64_t Const;
@@ -2341,9 +2351,9 @@ DEF_OP(Select) {
                          Op->Cond == IR::CondClass::UGT || Op->Cond == IR::CondClass::ULE);
       if (!isUnsigned && sc >= -32768 && sc <= 32767) {
         if (Op->CompareSize <= IR::OpSize::i32Bit)
-          cmpwi(S1, static_cast<int16_t>(sc));
+          cmpwi(cr(7), S1, static_cast<int16_t>(sc));
         else
-          cmpdi(S1, static_cast<int16_t>(sc));
+          cmpdi(cr(7), S1, static_cast<int16_t>(sc));
       } else {
         // No LoadConstant here: EmitCompare (JIT.cpp) re-materialises the
         // inline constant itself on every path it can take for this operand
@@ -2351,18 +2361,19 @@ DEF_OP(Select) {
         // TMP2 (pre-shifted by Const << Sh) for the 8/16-bit case — and it
         // reads Op->Cmp2 rather than any register we could have primed. A
         // LoadConstant here was therefore pure dead weight.
-        EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
+        EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2, /*CRField=*/7);
       }
     } else {
-      EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2);
+      EmitCompare(Op->Cond, Op->CompareSize, Op->Cmp1, Op->Cmp2, /*CRField=*/7);
     }
     CC = MapCC(Op->Cond);
+    CC = {CC.BO, static_cast<uint8_t>(CC.BI + 28)};
   }
   // Branch-free select via isel (ISA 2.03). isel reads both sources before
   // writing RT, so the old Dst-aliases-True stash and the mr/bc/mr dance are
-  // both unnecessary. The compare/bit-test above has already set the CR bit
-  // that CC names (CC.BI is an absolute CR bit index — CR0-relative 0..3
-  // for every path through this op).
+  // both unnecessary. The compare/bit-test above has already set the cr7 bit
+  // that CC names (CC.BI is an absolute CR bit index — 28..31 on every path
+  // through this op; isel's 5-bit BC field encodes it directly).
   //
   // SETTLED — keep isel here too, and do not make the constant form branchy.
   // This op was flagged as a candidate for a branchy constant form on the same reasoning that

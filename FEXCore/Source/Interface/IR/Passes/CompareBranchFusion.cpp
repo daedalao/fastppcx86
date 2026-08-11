@@ -13,6 +13,7 @@ $end_info$
 
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/fextl/vector.h>
 
 namespace FEXCore::IR {
 
@@ -145,66 +146,103 @@ public:
   void Run(IREmitter* IREmit) override;
 };
 
+// Is Producer a SubWithFlags whose operands the direct-compare arms can take?
+static bool IsFusableProducer(IRListView& IR, IROp_Header* Producer) {
+  if (!Producer || Producer->Op != OP_SUBWITHFLAGS) {
+    return false;
+  }
+
+  if (Producer->Size != OpSize::i32Bit && Producer->Size != OpSize::i64Bit) {
+    LOGMAN_MSG_A_FMT("SubWithFlags with an unexpected size {}", static_cast<uint32_t>(Producer->Size));
+    return false;
+  }
+
+  return IsRegisterOperand(IR, Producer->Args[0]) && IsUsableOperand(IR, Producer->Args[1]);
+}
+
 void CompareBranchFusion::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::CmpBranchFusion");
 
   auto CurrentIR = IREmit->ViewIR();
 
-  for (auto [_, BlockHeader] : CurrentIR.GetBlocks()) {
-    auto BlockIROp = BlockHeader->C<IROp_CodeBlock>();
+  // NZCVSelect rewrites recorded during the scan and applied afterwards, so
+  // the forward iteration never walks over nodes the pass itself inserted.
+  struct SelectRewrite {
+    Ref Node;
+    IROp_Header* Producer;
+  };
+  fextl::vector<SelectRewrite> SelectRewrites;
 
-    auto Begin = CurrentIR.at(BlockIROp->Begin);
-    auto It = CurrentIR.at(BlockIROp->Last);
-    // Last is the EndBlock marker; the terminator sits just before it.
-    --It;
-
-    auto Exit = It();
-    if (Exit.Header->Op != OP_CONDJUMP) {
-      continue;
-    }
-
-    auto CondOp = Exit.Header->CW<IROp_CondJump>();
-    if (!CondOp->FromNZCV || !IsFusableCond(CondOp->Cond)) {
-      continue;
-    }
-
-    // FromNZCV and the vector-compare mode are mutually exclusive today, and
-    // the rewrite below would reinterpret FPR-class Cmp1/Cmp2 as GPRs.
-    LOGMAN_THROW_A_FMT(CondOp->VCmpElementSize == OpSize::iInvalid, "FromNZCV CondJump cannot also be a vector-compare CondJump");
-
-    // Walk backwards to the op that produced the NZCV this branch reads. Only
-    // writers matter: an intervening reader (a setcc, an NZCVSelect) keeps the
-    // SubWithFlags' flag write alive but does not change it, and DFCE sees that
-    // reader independently.
+  for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
+    // Forward walk, tracking the most recent NZCV writer. Readers (setcc,
+    // NZCVSelect) are walked over: they keep the SubWithFlags' flag write
+    // alive but do not change it, and DFCE sees each reader independently.
     IROp_Header* Producer {};
-    while (It != Begin) {
-      --It;
-      auto Cur = It();
-      if (IROpWritesNZCV(Cur.Header)) {
-        Producer = Cur.Header;
-        break;
+
+    for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+      if (IROp->Op == OP_NZCVSELECT) {
+        auto SelOp = IROp->CW<IROp_NZCVSelect>();
+        if (IsFusableCond(SelOp->Cond) && IsFusableProducer(CurrentIR, Producer)) {
+          // DEF_OP(Select) materialises inline-constant True/False values via
+          // a bare 16-bit `li`; anything wider would silently truncate, so
+          // only fuse when both fit (covers the 0/1/-1 flag-materialisation
+          // selects, which are the bulk).
+          auto FitsLi = [&](OrderedNodeWrapper Arg) {
+            if (Arg.IsInvalid()) {
+              return false;
+            }
+            auto Hdr = CurrentIR.GetOp<IROp_Header>(Arg);
+            if (Hdr->Op == OP_INLINEENTRYPOINTOFFSET) {
+              return false;
+            }
+            if (Hdr->Op == OP_INLINECONSTANT) {
+              int64_t V = static_cast<int64_t>(Hdr->C<IROp_InlineConstant>()->Constant);
+              return V >= -32768 && V <= 32767;
+            }
+            return true;
+          };
+          if (FitsLi(SelOp->TrueVal) && FitsLi(SelOp->FalseVal)) {
+            SelectRewrites.push_back({CodeNode, Producer});
+          }
+        }
+      } else if (IROp->Op == OP_CONDJUMP) {
+        auto CondOp = IROp->CW<IROp_CondJump>();
+        if (CondOp->FromNZCV && IsFusableCond(CondOp->Cond) && IsFusableProducer(CurrentIR, Producer)) {
+          // FromNZCV and the vector-compare mode are mutually exclusive today,
+          // and the rewrite would reinterpret FPR-class Cmp1/Cmp2 as GPRs.
+          LOGMAN_THROW_A_FMT(CondOp->VCmpElementSize == OpSize::iInvalid, "FromNZCV CondJump cannot also be a vector-compare CondJump");
+          // In-place rewrite; the SubWithFlags is left alone -- DFCE decides
+          // whether its flag write (and its result) are still needed.
+          IREmit->ReplaceNodeArgument(CodeNode, 0, CurrentIR.GetNode(Producer->Args[0]));
+          IREmit->ReplaceNodeArgument(CodeNode, 1, CurrentIR.GetNode(Producer->Args[1]));
+          CondOp->CompareSize = Producer->Size;
+          CondOp->FromNZCV = false;
+        }
+      }
+
+      if (IROpWritesNZCV(IROp)) {
+        Producer = IROp;
       }
     }
+  }
 
-    if (!Producer || Producer->Op != OP_SUBWITHFLAGS) {
-      continue;
-    }
+  // NZCVSelect -> Select. Legal mid-flag-region ONLY because ppc64le's
+  // DEF_OP(Select) compares into cr7 on every arm and thus clobbers neither
+  // CR0 nor XER (see the comment there, which points back here); the declared
+  // IR-level ImplicitFlagClobber is a frontend-emission concern that DFCE
+  // never consults. The producing SubWithFlags again stays for DFCE to judge.
+  for (const auto& RW : SelectRewrites) {
+    auto IROp = CurrentIR.GetOp<IROp_Header>(RW.Node);
+    auto SelOp = IROp->CW<IROp_NZCVSelect>();
 
-    if (Producer->Size != OpSize::i32Bit && Producer->Size != OpSize::i64Bit) {
-      LOGMAN_MSG_A_FMT("SubWithFlags with an unexpected size {}", static_cast<uint32_t>(Producer->Size));
-      continue;
-    }
-
-    if (!IsRegisterOperand(CurrentIR, Producer->Args[0]) || !IsUsableOperand(CurrentIR, Producer->Args[1])) {
-      continue;
-    }
-
-    // Matched. The SubWithFlags is left alone -- DFCE decides whether its flag
-    // write (and its result) are still needed.
-    IREmit->ReplaceNodeArgument(Exit.Node, 0, CurrentIR.GetNode(Producer->Args[0]));
-    IREmit->ReplaceNodeArgument(Exit.Node, 1, CurrentIR.GetNode(Producer->Args[1]));
-    CondOp->CompareSize = Producer->Size;
-    CondOp->FromNZCV = false;
+    IREmit->SetWriteCursorBefore(RW.Node);
+    Ref NewSelect = IREmit->_Select(IROp->Size, RW.Producer->Size, SelOp->Cond,
+                                    CurrentIR.GetNode(RW.Producer->Args[0]),
+                                    CurrentIR.GetNode(RW.Producer->Args[1]),
+                                    CurrentIR.GetNode(SelOp->TrueVal),
+                                    CurrentIR.GetNode(SelOp->FalseVal));
+    IREmit->ReplaceUsesWithAfter(RW.Node, NewSelect, RW.Node);
+    IREmit->Remove(RW.Node);
   }
 }
 
