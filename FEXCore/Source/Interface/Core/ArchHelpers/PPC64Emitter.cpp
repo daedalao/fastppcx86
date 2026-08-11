@@ -599,13 +599,11 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
   //     dword[1] <- 0 for these loads, so the DM=2 swap (T.dw0 = A.dw1 = 0,
   //     T.dw1 = B.dw0 = value) finishes the job in 2 instructions.
   //   * pre-3.0 (sizes 4/8): lxsiwzx/lxsdx leave dword[1] UNDEFINED on
-  //     2.06/2.07 hardware, so build an explicit zero and use DM=0
-  //     (T.dw0 = VZero.dw0 = 0, T.dw1 = B.dw0 = value) — never reading the
-  //     undefined half.  3 instructions.  Sizes 1/2 have no pre-3.0 scalar
-  //     load; they keep the JITScratch bounce below.
-  // These paths clobber no TMP GPR; the pre-3.0 path clobbers one vector
-  // temp (VTMP2, or VTMP1 if dst==VTMP2 — GetVReg never hands out VTMPs, but
-  // stay safe for emitter-internal callers).
+  //     2.06/2.07 hardware, so merge against the pinned zero with DM=0
+  //     (T.dw0 = VZERO_VSX.dw0 = 0, T.dw1 = B.dw0 = value) — never reading
+  //     the undefined half.  2 instructions.  Sizes 1/2 have no pre-3.0
+  //     scalar load; they keep the JITScratch bounce below.
+  // These paths clobber no TMP GPR and no vector temp.
   const bool ISA30 = EmitterCTX->HostFeatures.SupportsISA30;
   if (ISA30 && (size == 1 || size == 2 || size == 4 || size == 8)) {
     switch (size) {
@@ -618,14 +616,16 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
     return;
   }
   if (!ISA30 && (size == 4 || size == 8)) {
-    const VR VZero = (dst == VTMP2) ? VTMP1 : VTMP2;
-    xxlxor(VZero, VZero, VZero);
     if (size == 4) {
       lxsiwzx(dst, ea, GPRegs::r0);
     } else {
       lxsdx(dst, ea, GPRegs::r0);
     }
-    xxpermdi(dst, VZero, dst, 0);
+    // DM=0: T.dw0 = VZERO_VSX.dw0 = 0, T.dw1 = B.dw0 = value — the undefined
+    // dword[1] of the scalar load is never read. The pinned zero replaces a
+    // per-load xxlxor + vector temp (one per guest movss/movsd in DSP-heavy
+    // blocks); the dispatcher maintains vs14 == 0 (see VZERO_VSX).
+    xxpermdi(toVSX(dst), VZERO_VSX, toVSX(dst), 0);
     return;
   }
 
