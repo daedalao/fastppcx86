@@ -1504,8 +1504,12 @@ DEF_OP(MemCpy) {
     // 16B-chunked copies agree exactly when delta == 0 or delta >= 16, so
     // deltas in [8, 16) must stay on the 8B tier.
     cmpldi(cr(6), r(0), 16);
+    // 32B-tier overlap gate, same staging trick one CR field up: byte-forward
+    // and 32B-chunked copies agree exactly when delta == 0 or delta >= 32, so
+    // deltas in [16, 32) must stay on the 16B tier.
+    cmpldi(cr(7), r(0), 32);
 
-    PPC64Emitter::Label align_loop, chunk_setup, chunk8_setup, chunk16_setup, chunk16_loop, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label align_loop, chunk_setup, chunk8_setup, chunk16_setup, chunk16_go, chunk16_loop, chunk32_loop, chunk_loop, tail_loop, done;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
@@ -1556,20 +1560,59 @@ DEF_OP(MemCpy) {
     addi(TMP4, TMP4, -8);
 
     Bind(&chunk16_setup);
-    // Delta (r0) is dead once CR6 is staged; restore the JIT's r0=0
+    // Delta (r0) is dead once CR6/CR7 are staged; restore the JIT's r0=0
     // zero-index invariant early so lxvd2x/stxvd2x can use r0 as their RB
     // index. len >= 24 here (>= 32 gated, minus at most one 8B alignment
-    // step), so the CTR count is >= 1 and mtctr 0 is impossible.
+    // step), so the 16B CTR count is >= 1 and mtctr 0 is impossible.
     li(r(0), 0);
+    // 32B tier: 2x-unrolled lxvd2x/stxvd2x. Gates mirror the 16B tier's:
+    //   - CR7.LT set (delta < 32): a forward delta in [16, 32) is a legal
+    //     self-replicating pattern for 32B chunks to break; the 16B tier is
+    //     still exact there.
+    //   - remaining length < 64: not worth the extra setup; and it keeps the
+    //     32B CTR count >= 2, so mtctr 0 is impossible here too.
+    // Both 16B stores stay 16-aligned, so neither can cross a page: on any
+    // fault the destination holds a byte-exact 16B-granular prefix and the
+    // fault-granularity argument above carries over unchanged. Both loads of
+    // a chunk issue before either store, so each 32B chunk reads strictly
+    // before it writes, matching the delta >= 32 exactness proof.
+    bc(Cond {12, 28}, &chunk16_go); // CR7.LT (BI = 7*4 + 0)
+    cmpdi(TMP4, 64);
+    bc(CC_LT, &chunk16_go);
+    srdi(TMP3, TMP4, 5);      // 32B chunk count = len >> 5
+    mtctr(TMP3);
+    andi_(TMP4, TMP4, 31);    // remainder: one optional 16B step + 8B tier + tail
+    li(TMP3, 16);             // second-lane RB index; TMP3 is dead here (see 8B tier note)
+    Bind(&chunk32_loop);
+    lxvd2x(VTMP1, TMP2, r(0));
+    lxvd2x(VTMP2, TMP2, TMP3);
+    stxvd2x(VTMP1, TMP1, r(0));
+    stxvd2x(VTMP2, TMP1, TMP3);
+    addi(TMP1, TMP1, 32);
+    addi(TMP2, TMP2, 32);
+    bdnz(&chunk32_loop);
+    // The remainder is < 32 with dst still 16-aligned: peel at most one 16B
+    // chunk here rather than falling into chunk16_setup, whose mtctr would
+    // spin 2^64 times on a zero count.
+    andi_(TMP3, TMP4, 16);
+    bc(CC_EQ, &chunk8_setup);
+    lxvd2x(VTMP1, TMP2, r(0));
+    stxvd2x(VTMP1, TMP1, r(0));
+    addi(TMP1, TMP1, 16);
+    addi(TMP2, TMP2, 16);
+    addi(TMP4, TMP4, -16);
+    b(&chunk8_setup);
+
+    Bind(&chunk16_go);
     srdi(TMP3, TMP4, 4);      // 16B chunk count = len >> 4
     mtctr(TMP3);
     andi_(TMP4, TMP4, 15);    // remainder for the 8B tier + byte tail
     // lxvd2x/stxvd2x pair on the SAME VSR: both perform the LE doubleword
     // swap, so the swaps cancel and the 16 bytes are copied verbatim — no
     // xxpermdi needed, unlike LoadUnalignedV128 (whose TMP1-TMP3 clobber
-    // contract would also collide with the loop registers here). VTMP1 is
-    // per-op scratch, dead across ops, same as its other DEF_OP uses. No
-    // update forms exist for these, so the pointers step by explicit addi;
+    // contract would also collide with the loop registers here). VTMP1/VTMP2
+    // are per-op scratch, dead across ops, same as their other DEF_OP uses.
+    // No update forms exist for these, so the pointers step by explicit addi;
     // both end exactly at the end of the chunked region.
     Bind(&chunk16_loop);
     lxvd2x(VTMP1, TMP2, r(0));
