@@ -852,9 +852,14 @@
       },
       "DisableScalarSplatChain": {
         "Type": "bool",
-        "Default": "false",
+        "Default": "true",
         "Desc": [
-          "Kill switch for the ScalarSplatChain IR pass (FEX_DISABLESCALARSPLATCHAIN=1 turns the pass OFF).",
+          "Kill switch for the ScalarSplatChain IR pass (FEX_DISABLESCALARSPLATCHAIN=0 opts IN; the pass is OFF by default).",
+          "DEFAULT OFF 2026-08-11: the superseded-store rule is unsound under mid-block fault resume. A guest fault inside a marked",
+          "chain (Witcher 3 save-load = SMC fault storm) spills the splat-form register, resumes at the fault RIP in a fresh block,",
+          "and the superseding store of the ORIGINAL block never runs -- the splatted upper elements become architectural state and",
+          "propagate (two reproducible save-load crashes; clean with the pass off). Sound rescue paths are documented in the pass",
+          "header; do not re-enable by default without solving mid-block re-entry.",
           "A guest scalar-SSE float chain (movss; subss; mulss; movss) becomes a chain of VF*ScalarInsert ops, each of which the PPC64LE",
           "backend lowers as splat(Vector1) + splat(Vector2) + one xv*sp + a two-instruction lane-0 merge -- and the next link then splats the",
           "merged value straight back apart. Since xv*sp over two splatted operands yields an already-splatted result, both the merge and the",
