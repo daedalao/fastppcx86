@@ -66,6 +66,20 @@ public:
   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
   virtual std::optional<ExecutableFileSectionInfo> LookupExecutableFileSection(Core::InternalThreadState* Thread, uint64_t GuestAddr) = 0;
 
+  // Fallback naming for executable code in mappings LookupExecutableFileSection
+  // cannot attribute: anonymous memory holding a manually-loaded image. Wine
+  // loads the MAIN PE image this way (anonymous reserve + copy-in), so without
+  // this every sample in a Windows game's own engine code profiles as
+  // [unknown] — ~90% of a Witcher 3 in-world capture. Returns a stable,
+  // interned, human-readable label (e.g. "PE:witcher3.exe@0x140000000") or
+  // nullptr when the address isn't in a recognizable image. The pointer stays
+  // valid for the process lifetime; the label may go stale if the guest unmaps
+  // the image and loads something else at the same base — acceptable for its
+  // only consumer, profile symbol naming.
+  virtual const char* LookupAnonymousExecImageName(Core::InternalThreadState* Thread, uint64_t GuestAddr) {
+    return nullptr;
+  }
+
   virtual void PreCompile() {}
 
   // FEX_SMCLAZYINVAL: with lazy SMC invalidation the SMC fault handler only

@@ -646,6 +646,8 @@ public:
   std::optional<FEXCore::ExecutableFileSectionInfo>
   LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) final override;
 
+  const char* LookupAnonymousExecImageName(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) final override;
+
   int OpenCodeMapFile() override;
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override;
@@ -685,6 +687,18 @@ public:
   constexpr static size_t LDT_ENTRY_SIZE = sizeof(FEXCore::Core::CPUState::gdt_segment);
 
   VMATracking::VMATracking VMATracking;
+
+  // LookupAnonymousExecImageName caches. Positive entries are keyed by the
+  // discovered image base and interned for the process lifetime (the public
+  // interface hands out raw const char* — see the contract in
+  // FEXCore/include/FEXCore/HLE/SyscallHandler.h). Negative entries are keyed
+  // by the VMA base the query landed in, so Mono/JIT arenas don't pay the
+  // backward walk on every compiled block. Neither is invalidated on unmap:
+  // a stale label on a recycled base mislabels a profile line, it cannot
+  // corrupt state.
+  std::mutex AnonImageNameMutex;
+  fextl::map<uint64_t, fextl::unique_ptr<fextl::string>> AnonImageNames;
+  fextl::map<uint64_t, const char*> AnonImageLookupCache;
 
   // Identifies the code generator, so a cache file is only ever opened by a
   // process whose codegen matches the one that wrote it. Combined with the

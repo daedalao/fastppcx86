@@ -17,6 +17,10 @@ $end_info$
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/shm.h>
+#include <sys/uio.h>
+
+#include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/memory.h>
 
 #include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
@@ -1063,6 +1067,149 @@ SyscallHandler::LookupExecutableFileSection(FEXCore::Core::InternalThreadState* 
 
   auto& [MappingBaseAddr, Entry] = *EntryIt;
   return BuildSectionInfo(*Entry.Resource, MappingBaseAddr, Entry.Length);
+}
+
+namespace {
+// Guest-memory read that can never fault: process_vm_readv on our own pid
+// respects page protections and returns a short count instead of delivering
+// SIGSEGV, so a concurrently-unmapped or PROT_NONE page is a clean failure.
+// The syscall cost is irrelevant here — every caller is behind the per-region
+// name cache and runs at most a handful of times per image.
+bool SafeReadGuest(void* Dst, uint64_t Src, size_t Size) {
+  const struct iovec Local {.iov_base = Dst, .iov_len = Size};
+  const struct iovec Remote {.iov_base = reinterpret_cast<void*>(Src), .iov_len = Size};
+  return process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0) == static_cast<ssize_t>(Size);
+}
+
+template<typename T>
+bool SafeReadGuest(T& Out, uint64_t Src) {
+  return SafeReadGuest(&Out, Src, sizeof(T));
+}
+
+// Extracts the module name of a PE image mapped at Base, from the export
+// directory's name RVA. Empty when the image has no export directory (common
+// for EXEs) or any field fails validation — the caller still knows Base is a
+// PE from the magic check and can label it generically.
+fextl::string ReadPEExportName(uint64_t Base) {
+  uint32_t PEOffset {};
+  if (!SafeReadGuest(PEOffset, Base + 0x3C) || PEOffset == 0 || PEOffset > 0x10000) {
+    return {};
+  }
+  uint32_t Signature {};
+  if (!SafeReadGuest(Signature, Base + PEOffset) || Signature != 0x00004550 /* "PE\0\0" */) {
+    return {};
+  }
+  const uint64_t OptHeader = Base + PEOffset + 4 + 20;
+  uint16_t OptMagic {};
+  if (!SafeReadGuest(OptMagic, OptHeader)) {
+    return {};
+  }
+  // Data directory offset differs between PE32 (0x10b) and PE32+ (0x20b).
+  uint64_t DataDir = 0;
+  uint32_t NumDirs = 0;
+  if (OptMagic == 0x20b) {
+    if (!SafeReadGuest(NumDirs, OptHeader + 108)) {
+      return {};
+    }
+    DataDir = OptHeader + 112;
+  } else if (OptMagic == 0x10b) {
+    if (!SafeReadGuest(NumDirs, OptHeader + 92)) {
+      return {};
+    }
+    DataDir = OptHeader + 96;
+  } else {
+    return {};
+  }
+  if (NumDirs < 1) {
+    return {};
+  }
+  uint32_t ExportRVA {};
+  if (!SafeReadGuest(ExportRVA, DataDir) || ExportRVA == 0) {
+    return {};
+  }
+  uint32_t NameRVA {};
+  if (!SafeReadGuest(NameRVA, Base + ExportRVA + 0x0C) || NameRVA == 0) {
+    return {};
+  }
+  char Name[128] {};
+  // Short read is fine near the end of a mapping — whatever prefix arrived is
+  // NUL-terminated by the zero-initialization above (last byte never written).
+  SafeReadGuest(Name, Base + NameRVA, sizeof(Name) - 1);
+  for (char* c = Name; *c; ++c) {
+    if (*c < 0x20 || *c > 0x7E) {
+      // Garbage where a filename should be: treat the whole string as invalid
+      // rather than emitting control bytes into /tmp/perf-<pid>.map, whose
+      // format is line- and space-delimited.
+      return {};
+    }
+  }
+  return fextl::string {Name};
+}
+} // namespace
+
+const char* SyscallHandler::LookupAnonymousExecImageName(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) {
+  uint64_t VMABase = 0;
+  uint64_t ImageBase = 0;
+  {
+    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+
+    auto EntryIt = VMATracking.FindVMAEntry(GuestAddr);
+    if (EntryIt == VMATracking.VMAs.end() || EntryIt->second.Resource) {
+      // Unmapped, or file-backed — the latter is LookupExecutableFileSection's
+      // job and it already declined or answered.
+      return nullptr;
+    }
+    VMABase = EntryIt->first;
+
+    {
+      std::lock_guard clk {AnonImageNameMutex};
+      auto Cached = AnonImageLookupCache.find(VMABase);
+      if (Cached != AnonImageLookupCache.end()) {
+        return Cached->second;
+      }
+    }
+
+    // Find the image base: walk backward over contiguous anonymous VMAs
+    // (wine's per-section mprotects split one image into several entries) and
+    // probe each entry's start for the DOS magic. Closest hit below the query
+    // wins. The walk is bounded: a manually-loaded image is split into at most
+    // a few dozen section-protection ranges, and Mono/JIT arenas — the other
+    // thing living in anon exec memory — fail every probe and fall out at the
+    // contiguity break.
+    auto It = EntryIt;
+    for (int Steps = 0; Steps < 128; ++Steps) {
+      uint16_t Magic {};
+      if (SafeReadGuest(Magic, It->first) && Magic == 0x5A4D /* "MZ" */) {
+        ImageBase = It->first;
+        break;
+      }
+      if (It == VMATracking.VMAs.begin()) {
+        break;
+      }
+      auto Prev = std::prev(It);
+      if (Prev->second.Resource || Prev->first + Prev->second.Length != It->first) {
+        break;
+      }
+      It = Prev;
+    }
+  }
+
+  std::lock_guard clk {AnonImageNameMutex};
+  const char* Result = nullptr;
+  if (ImageBase != 0) {
+    auto Existing = AnonImageNames.find(ImageBase);
+    if (Existing != AnonImageNames.end()) {
+      Result = Existing->second->c_str();
+    } else {
+      auto ExportName = ReadPEExportName(ImageBase);
+      auto Label = fextl::fmt::format("PE:{}@0x{:x}", ExportName.empty() ? "image" : ExportName.c_str(), ImageBase);
+      Result = AnonImageNames.emplace(ImageBase, fextl::make_unique<fextl::string>(std::move(Label))).first->second->c_str();
+    }
+  }
+  // Negative results are cached too (Result == nullptr): JIT arenas compile
+  // thousands of blocks and must not pay the walk each time.
+  AnonImageLookupCache.emplace(VMABase, Result);
+  return Result;
 }
 
 FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
