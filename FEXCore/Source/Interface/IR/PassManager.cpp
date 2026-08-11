@@ -81,8 +81,10 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
     // WITHOUT checking IR::HasSideEffects(), so side-effecting flag writers
     // (StoreNZCV/StorePF/StoreAF/InvalidateFlags/...) were deleted outright
     // rather than falling through to the in-place Replacement rewrite. That
-    // is now guarded; see the comment at the Remove site in
-    // Passes/RedundantFlagCalculationElimination.cpp.
+    // was guarded from 2026-08-05 to 2026-08-10; the guard is now a runtime
+    // knob (FEX_DISABLEDFCESTOREELIM, default off) after the reproducers were
+    // re-verified clean with the Remove arm active. See the comment at the
+    // Remove site in Passes/RedundantFlagCalculationElimination.cpp.
     //
     // The pass is a pure IR transform with no correctness mandate, and a
     // wrong flag elimination surfaces as a wrong conditional branch --

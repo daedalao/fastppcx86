@@ -812,6 +812,19 @@
           "Unlike FEX_O0 this affects only this one pass; X87StackOptimization and the rest of the default pass set stay enabled."
         ]
       },
+      "DisableDFCEStoreElim": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the Remove arm of DeadFlagCalculationElimination (FEX_DISABLEDFCESTOREELIM=1 turns it OFF; the rest of the pass stays on).",
+          "The arm deletes side-effecting flag writers (StorePF/StoreAF/StoreNZCV/ShiftFlags/TestNZ/...) whose written flags are dead per the",
+          "pass's converged cross-block liveness and whose SSA result is unused. From 2026-08-05 to 2026-08-10 this was unconditionally guarded",
+          "off out of caution after the 2026-05-11 reproducers; those were re-tested clean with the arm enabled (full ASM suite, both reproducers,",
+          "60 bash startups). Enabled by default because variable-shift/parity flag chains that stay dead-but-emitted dominate hot decompressor",
+          "loops on PPC64LE, where NZCV lives in CR0/XER and every survived write costs an mfocrf/mfxer/rlwimi packing storm.",
+          "A wrong elimination surfaces as a wrong conditional branch -- silent and data-dependent -- hence a field kill switch of its own."
+        ]
+      },
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",
