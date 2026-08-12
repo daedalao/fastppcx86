@@ -5734,13 +5734,69 @@ DEF_OP(VSha256H2) {
   const auto Op = IROp->C<IR::IROp_VSha256H2>();
   EMIT_SHA_3ARG(PPC64_HELPER_VSha256H2, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
 }
+// VSha256U0(Vd, Vn): SHA-256 message schedule sigma0 helper (x86 SHA256MSG1).
+//   IR_result[i] = sigma0(T[i]),  T = [Vd[1], Vd[2], Vd[3], Vn[0]], then + Vd
+// POWER8 vshasigmaw with ST=0, SIX=0 is lane-wise sigma0, and was verified on
+// hardware to line up lane-for-lane with the IR input. No byte reversal: these
+// are 32-bit lane ops and the element convention already matches.
 DEF_OP(VSha256U0) {
-  const auto Op = IROp->C<IR::IROp_VSha256U0>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U0, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  const auto Op  = IROp->C<IR::IROp_VSha256U0>();
+  const auto Dst = GetVReg(Node);
+  const auto Vd  = GetVReg(Op->Src1);
+  const auto Vn  = GetVReg(Op->Src2);
+
+  // IR lane i lives at phys[12-4i..15-4i], so
+  //   T_phys[0..3]  = Vn_phys[12..15] (IR Vn[0])
+  //   T_phys[4..15] = Vd_phys[0..11]  (IR Vd[3..1])
+  // vsldoi(T, Vn, Vd, 12) = (Vn::Vd) << 12 bytes = Vn[12..15] :: Vd[0..11].
+  vsldoi(VTMP1, Vn, Vd, 12);
+  vshasigmaw(VTMP2, VTMP1, 0, 0);
+  vadduwm(Dst, VTMP2, Vd);
 }
+
+// VSha256U1(Vn, Vm): SHA-256 message schedule sigma1 helper (x86 SHA256MSG2).
+//   IR_result[0] = Vn[1] + sigma1(Vm[2])
+//   IR_result[1] = Vn[2] + sigma1(Vm[3])
+//   IR_result[2] = Vn[3] + sigma1(IR_result[0])   <- recurrence
+//   IR_result[3] = Vm[0] + sigma1(IR_result[1])   <- recurrence
+// The recurrence forces two passes: lanes 0,1 first, then lanes 2,3 from
+// those. With only VTMP1/VTMP2 available the partial has to be parked, so it
+// goes to STATE+JITScratch rather than an r1-relative red-zone slot (see the
+// note on VAESKeyGenAssist above).
 DEF_OP(VSha256U1) {
-  const auto Op = IROp->C<IR::IROp_VSha256U1>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  const auto Op  = IROp->C<IR::IROp_VSha256U1>();
+  const auto Dst = GetVReg(Node);
+  const auto Vn  = GetVReg(Op->Src1);
+  const auto Vm  = GetVReg(Op->Src2);
+
+  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
+                "JITScratch offset must fit in int16 for addi-based addressing");
+
+  // Pass 1: partial lanes 0,1. sigma1 across Vm, then slide so
+  // sigma1(Vm[2,3]) land in IR lanes 0,1; slide Vn so Vn[1,2] land there too.
+  vshasigmaw(VTMP1, Vm, 0, 0xF);
+  vsldoi(VTMP2, VTMP1, VTMP1, 8);
+  vsldoi(VTMP1, Vn, Vn, 12);
+  vadduwm(VTMP1, VTMP2, VTMP1);
+
+  // Park the partial so VTMP1 can be reused as the sigma1 input.
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  li(TMP1, 0);
+  stvx(VTMP1, TMP3, TMP1);
+
+  // Pass 2: final lanes 2,3 = [Vn[3], Vm[0]] + sigma1(partial[0,1]).
+  vshasigmaw(VTMP1, VTMP1, 0, 0xF);
+  vsldoi(VTMP1, VTMP1, VTMP1, 8);
+  vsldoi(VTMP2, Vm, Vn, 12);
+  vadduwm(VTMP1, VTMP1, VTMP2);
+
+  // Reload the partial and merge: Dst hi half (phys[0..7] = IR lanes 2,3)
+  // from VTMP1, lo half (phys[8..15] = IR lanes 0,1) from the partial.
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  li(TMP1, 0);
+  lvx(VTMP2, TMP3, TMP1);
+  xxpermdi(Dst, VTMP1, VTMP2, 0b01);
 }
 
 #undef EMIT_SHA_3ARG
