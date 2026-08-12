@@ -201,6 +201,84 @@ static inline T OneShotWFEBitComparison(T* Futex, T Mask, T Comp) {
   return Result;
 }
 
+#elif defined(ARCHITECTURE_ppc64le)
+
+// POWER has no WFE, but a spinning hardware thread must not spin at normal
+// dispatch priority: on SMT4/SMT8 that steals issue slots from every sibling
+// on the core (the same starvation the JIT's guest-side spin-loop hints
+// address). Drop to HMT very-low for the polling loop and restore medium
+// (the default problem-state priority) on every exit path. The hint forms
+// are architecturally nop-class `or rx,rx,rx`, so they are safe anywhere.
+static inline void SMTPriorityVeryLow() {
+  __asm volatile("or 31,31,31" ::: "memory");
+}
+static inline void SMTPriorityMedium() {
+  __asm volatile("or 2,2,2" ::: "memory");
+}
+
+///< Timebase read for the timeout path: one mfspr instead of a clock_gettime
+/// per poll iteration. POWER servers use a 512MHz timebase in practice, but
+/// the frequency is read once via glibc's __ppc_get_timebase_freq (AT_HWCAP
+/// auxv) and cached — defined in SpinWaitLock.cpp.
+uint64_t GetTimebaseFrequency();
+
+static inline uint64_t GetCycleCounter() {
+  uint64_t TB;
+  __asm volatile("mfspr %0, 268" : "=r"(TB));
+  return TB;
+}
+
+static inline uint64_t ConvertNanosecondsToCycles(const std::chrono::nanoseconds& Nanoseconds) {
+  // TB ticks = ns * freq / 1e9, kept in 128-bit intermediate to avoid overflow.
+  return static_cast<uint64_t>((static_cast<unsigned __int128>(Nanoseconds.count()) * GetTimebaseFrequency()) / 1'000'000'000ull);
+}
+
+template<typename Pred, typename T>
+static inline void WaitPred(T* Futex, T ComparisonValue) {
+  auto AtomicFutex = std::atomic_ref<T>(*Futex);
+  T Result = AtomicFutex.load();
+
+  if (Pred {}(Result, ComparisonValue)) {
+    return;
+  }
+
+  SMTPriorityVeryLow();
+  do {
+    Result = AtomicFutex.load();
+  } while (!Pred {}(Result, ComparisonValue));
+  SMTPriorityMedium();
+}
+
+template<typename T, typename TT>
+static inline bool Wait(T* Futex, TT ExpectedValue, const std::chrono::nanoseconds& Timeout) {
+  auto AtomicFutex = std::atomic_ref<T>(*Futex);
+
+  T Result = AtomicFutex.load();
+
+  // Early exit if possible.
+  if (Result == ExpectedValue) {
+    return true;
+  }
+
+  const auto TimeoutCycles = ConvertNanosecondsToCycles(Timeout);
+  const auto Begin = GetCycleCounter();
+
+  SMTPriorityVeryLow();
+  do {
+    Result = AtomicFutex.load();
+
+    if ((GetCycleCounter() - Begin) >= TimeoutCycles) {
+      SMTPriorityMedium();
+      // Couldn't get value before timeout.
+      return false;
+    }
+  } while (Result != ExpectedValue);
+  SMTPriorityMedium();
+
+  // We got our result.
+  return true;
+}
+
 #else
 
 template<typename Pred, typename T>
