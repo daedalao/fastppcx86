@@ -1612,63 +1612,62 @@ DEF_OP(PDep) {
 }
 
 DEF_OP(PExt) {
-  // Parallel bits extract. Iterate set bits of mask LSB-first; for each, append
-  // that input bit to Dest at position OutPos (held on the stack to free a TMP).
+  // Parallel bits extract, branchless (Hacker's Delight 7-4 "compress right").
+  // Rounds s = 1,2,4,8,16(,32) each shift every kept bit right past the mask
+  // zeros below it, guided by a parallel-suffix XOR of the zero counts.
+  // Straight-line, ~100 (i32) / ~130 (i64) instructions, and — the point —
+  // NO compares: x86 PEXT is architecturally flag-transparent, and CR0 holds
+  // the packed NZCV, so the old per-set-bit loop had to save/restore CR0
+  // around its cmpdi spine (and once corrupted it; see pext_pdep_flags.asm).
+  // Cost is also independent of mask density where the loop paid ~10
+  // instructions and two branches PER SET BIT (a 32-bit Morton mask: ~320
+  // instructions + 64 branches, versus ~100 with no branch at all).
   auto Op       = IROp->C<IR::IROp_PExt>();
   auto Dest     = GetReg(Node);
   auto OrigIn   = GetReg(Op->Input);
   auto OrigMask = GetReg(Op->Mask);
 
-  GPR InputSnap = TMP1, Mask = TMP2, LowBit = TMP3, Scratch = TMP4;
-  PPC64Emitter::Label NextBit, Done, NoSet;
+  // Register plan: x compresses in place in Dest; m = TMP1, mk = TMP2,
+  // mp/t = TMP3, mv = TMP4. Dest may alias either source, so m is copied
+  // out first and x is formed from OrigIn & m (never read again after).
+  const bool Is32 = IROp->Size == IR::OpSize::i32Bit;
+  if (Is32) {
+    // Confine the mask to the low word up front: a stale mask bit >= 32
+    // would pull an input bit into a low result position. x = in & m is
+    // then confined by construction, upper input bits included.
+    rldicl(TMP1, OrigMask, 0, 32);
+  } else {
+    mr(TMP1, OrigMask);
+  }
+  and_(Dest, OrigIn, TMP1);            // x  = input & mask
+  nor(TMP2, TMP1, TMP1);               // mk = ~m ...
+  sldi(TMP2, TMP2, 1);                 //   ... << 1: zeros below each bit
 
-  // Snapshot inputs before clobbering Dest (Dest may alias either source).
-  mr(InputSnap, OrigIn);
-  mr(Mask, OrigMask);
-  li(Dest, 0);
-  // x86 BMI2 PEXT preserves flags per Intel SDM.  Save CR0 (the canonical
-  // packed-NZCV scratch) to a red-zone slot and restore at op end.
-  // mfocrf 0x80: only the CR0 nibble is defined pre-3.0C; the sole consumer
-  // is the mtocrf(0x80) restore, which reads only that nibble.
-  mfocrf(Scratch, 0x80);
-  std(Scratch, -16, r1);
-  cmpdi(Mask, 0);
-  bc(CC_EQ, &Done);
-
-  // OutPos counter lives in CTR, NOT a stack slot. The old form did
-  // `addi r1, r1, -16` and kept the counter at 0(new r1) — which is the
-  // same address as the CR0 stash above (old r1-16), so every nonzero-mask
-  // PEXT restored a counter value into CR0 and destroyed the guest's packed
-  // NZCV. CTR is free here: no IR op keeps CTR live across ops (every
-  // bctr/bctrl/bdnz consumer loads it via mtctr first).
-  li(Scratch, 0);
-  mtctr(Scratch);
-
-  Bind(&NextBit);
-  neg(LowBit, Mask);
-  and_(LowBit, LowBit, Mask);          // LowBit = isolated low set bit
-  and_(Scratch, LowBit, InputSnap);    // input bit at that position
-  cmpdi(Scratch, 0);
-  bc(CC_EQ, &NoSet);
-  mfctr(Scratch);                      // OutPos
-  li(LowBit, 1);                       // (recompute LowBit later)
-  sld(LowBit, LowBit, Scratch);
-  or_(Dest, Dest, LowBit);
-  neg(LowBit, Mask);                   // recompute isolated low bit for clear
-  and_(LowBit, LowBit, Mask);
-  Bind(&NoSet);
-  andc(Mask, Mask, LowBit);            // strip processed bit
-  mfctr(Scratch);
-  addi(Scratch, Scratch, 1);
-  mtctr(Scratch);
-  cmpdi(Mask, 0);
-  bc(CC_NE, &NextBit);
-
-  Bind(&Done);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
-  // Restore CR0 so the packed-NZCV scratch held there pre-PExt survives.
-  ld(Scratch, -16, r1);
-  mtocrf(0x80, Scratch);
+  // 5 rounds move any 32-bit distance; the 6th (s=32) only matters for the
+  // 64-bit form. Same for the mp suffix-XOR width.
+  const uint32_t Rounds = Is32 ? 5 : 6;
+  const uint32_t PrefixTop = Is32 ? 16 : 32;
+  for (uint32_t Round = 0; Round < Rounds; ++Round) {
+    const uint32_t s = 1u << Round;
+    // mp = parallel-suffix XOR of mk: parity of mk below each bit position.
+    sldi(TMP3, TMP2, 1);
+    xor_(TMP3, TMP3, TMP2);
+    for (uint32_t Sh = 2; Sh <= PrefixTop; Sh <<= 1) {
+      sldi(TMP4, TMP3, Sh);
+      xor_(TMP3, TMP3, TMP4);
+    }
+    and_(TMP4, TMP3, TMP1);            // mv = mp & m: bits moving this round
+    andc(TMP2, TMP2, TMP3);            // mk &= ~mp (mp dead; TMP3 becomes t)
+    xor_(TMP1, TMP1, TMP4);            // m ^= mv ...
+    and_(TMP3, Dest, TMP4);            // t = x & mv
+    xor_(Dest, Dest, TMP3);            // x ^= t ...
+    srdi(TMP3, TMP3, s);
+    or_(Dest, Dest, TMP3);             // ... x |= t >> s
+    srdi(TMP4, TMP4, s);
+    or_(TMP1, TMP1, TMP4);             // ... m |= mv >> s
+  }
+  // Result is exactly popcount(mask) low bits; for i32 that is <= 32 and x
+  // stayed confined to the low word throughout, so no final mask is needed.
 }
 
 // =========================================================================
