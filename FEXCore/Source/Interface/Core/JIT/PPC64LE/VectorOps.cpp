@@ -1277,25 +1277,21 @@ DEF_OP(VSQXTNPair) {
   const auto VUpp   = GetVReg(Op->VectorUpper);
 
   if (IROp->Size == IR::OpSize::i64Bit) {
-    // MMX: valid data is only in LE bytes 0-7 (phys bytes 15-8).
-    // vpkXXss(Dst, VUpp, VLow) would place VUpp's narrow result in LE bytes 8-15
-    // (phys 0-7), invisible to the 64-bit MM register.
-    // Instead: pack each source against zero, shift VUpp's result left by 4 bytes
-    // in LE, then OR both halves together.
+    // MMX: valid data is only in LE bytes 0-7 (phys dw1); the upper
+    // doubleword of an MMX-carrying vector is not guaranteed zero.  Packing a
+    // source register whole therefore folds saturated junk from its upper
+    // half into LE bytes 4-7 of the result (Portal 2 mixer: volume words 2-3
+    // became [0x7FFF, 0], every odd frame mixed at garbage gain).
+    // Merge the two payload doublewords first, then pack once against zero:
+    //   VTMP1.phys_dw0 = VUpp payload, VTMP1.phys_dw1 = VLow payload
+    //   => VTMP1.LE_w[0..3] = [VLow.d0, VLow.d1, VUpp.d0, VUpp.d1]
+    xxpermdi(VTMP1, VUpp, VLow, 3);
     vspltisw(VTMP2, 0);
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      vpkshss(Dst,   VTMP2, VLow);  // Dst.LE[0..3]   = sat8(VLow.LE_hw[0..3])
-      vpkshss(VTMP1, VTMP2, VUpp);  // VTMP1.LE[0..3] = sat8(VUpp.LE_hw[0..3])
-      break;
-    case IR::OpSize::i16Bit:
-      vpkswss(Dst,   VTMP2, VLow);  // Dst.LE[0..3]   = sat16(VLow.LE_w[0..1])
-      vpkswss(VTMP1, VTMP2, VUpp);  // VTMP1.LE[0..3] = sat16(VUpp.LE_w[0..1])
-      break;
+    case IR::OpSize::i8Bit:  vpkshss(Dst, VTMP2, VTMP1); break;
+    case IR::OpSize::i16Bit: vpkswss(Dst, VTMP2, VTMP1); break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    vsldoi(VTMP1, VTMP1, VTMP2, 4); // VTMP1.LE[4..7] = old_VTMP1.LE[0..3], LE[0..3]=0
-    vor(Dst, Dst, VTMP1);
     return;
   }
 
@@ -1347,21 +1343,15 @@ DEF_OP(VSQXTUNPair) {
   const auto VUpp   = GetVReg(Op->VectorUpper);
 
   if (IROp->Size == IR::OpSize::i64Bit) {
-    // MMX: same split-pack approach as VSQXTNPair.
+    // MMX: same payload-merge as VSQXTNPair — never pack the raw sources,
+    // their upper doublewords may hold junk.
+    xxpermdi(VTMP1, VUpp, VLow, 3);
     vspltisw(VTMP2, 0);
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      vpkshus(Dst,   VTMP2, VLow);
-      vpkshus(VTMP1, VTMP2, VUpp);
-      break;
-    case IR::OpSize::i16Bit:
-      vpkswus(Dst,   VTMP2, VLow);
-      vpkswus(VTMP1, VTMP2, VUpp);
-      break;
+    case IR::OpSize::i8Bit:  vpkshus(Dst, VTMP2, VTMP1); break;
+    case IR::OpSize::i16Bit: vpkswus(Dst, VTMP2, VTMP1); break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    vsldoi(VTMP1, VTMP1, VTMP2, 4);
-    vor(Dst, Dst, VTMP1);
     return;
   }
 
