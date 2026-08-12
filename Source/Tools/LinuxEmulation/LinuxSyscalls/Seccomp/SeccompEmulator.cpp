@@ -380,37 +380,65 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   }
 
   // Revalidate the per-thread verdict cache against the filter-set generation.
+  using VerdictCache = decltype(Thread->SeccompCache);
   auto& Cache = Thread->SeccompCache;
   const uint64_t CurrentGen = FilterGeneration.load(std::memory_order_relaxed);
-  if (Cache.Generation != CurrentGen) {
-    bool Cacheable = true;
-    bool NeedsRIP = false;
+  if (Cache.Generation != CurrentGen) [[unlikely]] {
+    bool AnyArgs = false;
+    bool AnyIP = false;
     for (const auto* Filter : Thread->Filters) {
-      Cacheable &= !(Filter->ReadsIP || Filter->ReadsArgs);
-      NeedsRIP |= Filter->ReadsIP;
+      AnyArgs |= Filter->ReadsArgs;
+      AnyIP |= Filter->ReadsIP;
     }
-    Cache.Cacheable = Cacheable;
-    Cache.NeedsRIP = NeedsRIP;
+    Cache.Mode = AnyArgs ? VerdictCache::CacheMode::None :
+                 AnyIP  ? VerdictCache::CacheMode::NrRIP :
+                          VerdictCache::CacheMode::NrOnly;
+    Cache.NeedsRIP = AnyIP;
     memset(Cache.AllowedNrs, 0, sizeof(Cache.AllowedNrs));
+    memset(Cache.RIPAllowed, 0, sizeof(Cache.RIPAllowed));
     Cache.Generation = CurrentGen;
   }
 
-  // Fast path: this syscall number already produced ALLOW under the current
-  // filter set and no filter can see args/ip, so the verdict replays as-is.
-  // ALLOW has no side effects (never logs, never signals), so skipping the
-  // interpreter and the RIP reconstruction is invisible to the guest.
+  // Fast paths: replay a previous ALLOW verdict when the cache key covers
+  // every seccomp_data field the installed programs can load. ALLOW has no
+  // side effects (never logs, never signals), so skipping the interpreter is
+  // invisible to the guest. The probes stay in this thin wrapper so the hot
+  // per-syscall path never builds ExecuteFilterSlow's register-heavy frame.
   const uint64_t Nr = Args->Argument[0];
-  const bool NrCacheable = Cache.Cacheable && Nr < decltype(Thread->SeccompCache)::MAX_CACHED_NR;
-  if (NrCacheable && (Cache.AllowedNrs[Nr / 64] & (1ULL << (Nr % 64)))) {
-    return {false, 0};
+  if (Cache.Mode == VerdictCache::CacheMode::NrOnly) {
+    if (Nr < VerdictCache::MAX_CACHED_NR && (Cache.AllowedNrs[Nr / 64] & (1ULL << (Nr % 64)))) {
+      return {false, 0};
+    }
+  } else if (Cache.Mode == VerdictCache::CacheMode::NrRIP) {
+    // Guest-RIP reconstruction is cheap (never registered in profiles); the
+    // expense this probe avoids is the interpreter frame + program walk.
+    const uint64_t RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+    const auto& Entry = Cache.RIPAllowed[(RIP ^ (RIP >> 7) ^ Nr) & (VerdictCache::RIP_WAYS - 1)];
+    if (Entry.RIP == RIP && Entry.NrPlusOne == Nr + 1) {
+      return {false, 0};
+    }
+    return ExecuteFilterSlow(Frame, JITPC, Args, Thread, RIP, true);
   }
 
-  // Reconstructing the RIP from the JITPC takes a lock and a binary search;
-  // only pay for it when a filter actually loads instruction_pointer. The
-  // rare non-ALLOW verdicts that need a RIP for audit logs or SIGSYS info
-  // reconstruct it on demand below.
-  uint64_t RIP = Cache.NeedsRIP ? Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC) : 0;
-  bool RIPValid = Cache.NeedsRIP;
+  return ExecuteFilterSlow(Frame, JITPC, Args, Thread, 0, false);
+}
+
+SeccompEmulator::ExecuteFilterResult SeccompEmulator::ExecuteFilterSlow(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC,
+                                                                        FEXCore::HLE::SyscallArguments* Args,
+                                                                        FEX::HLE::ThreadStateObject* Thread, uint64_t PrecomputedRIP,
+                                                                        bool HaveRIP) {
+  using VerdictCache = decltype(Thread->SeccompCache);
+  auto& Cache = Thread->SeccompCache;
+  const uint64_t Nr = Args->Argument[0];
+
+  // The rare non-ALLOW verdicts that need a RIP for audit logs or SIGSYS info
+  // reconstruct it on demand.
+  uint64_t RIP = PrecomputedRIP;
+  bool RIPValid = HaveRIP;
+  if (!RIPValid && Cache.NeedsRIP) {
+    RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+    RIPValid = true;
+  }
   auto GetRIP = [&]() {
     if (!RIPValid) {
       RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
@@ -480,8 +508,14 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   const auto ActionMasked = SeccompResult & SECCOMP_RET_ACTION_FULL;
   const auto DataMasked = SeccompResult & SECCOMP_RET_DATA;
 
-  if (NrCacheable && ActionMasked == SECCOMP_RET_ALLOW) {
-    Cache.AllowedNrs[Nr / 64] |= 1ULL << (Nr % 64);
+  if (ActionMasked == SECCOMP_RET_ALLOW) {
+    if (Cache.Mode == VerdictCache::CacheMode::NrOnly && Nr < VerdictCache::MAX_CACHED_NR) {
+      Cache.AllowedNrs[Nr / 64] |= 1ULL << (Nr % 64);
+    } else if (Cache.Mode == VerdictCache::CacheMode::NrRIP) {
+      // NrRIP mode always enters with HaveRIP: RIP here is the same value the
+      // wrapper's probe will compute for the next hit.
+      Cache.RIPAllowed[(RIP ^ (RIP >> 7) ^ Nr) & (VerdictCache::RIP_WAYS - 1)] = {RIP, Nr + 1};
+    }
   }
 
   // Logging rules

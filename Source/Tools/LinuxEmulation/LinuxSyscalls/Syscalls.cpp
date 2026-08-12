@@ -1241,10 +1241,17 @@ uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, 
     DrainSMCLazyDirtyPages(Frame->Thread, FEX::HLE::SMCLazy::DrainPoint::Syscall);
   }
 
-  const auto SeccompResult = SeccompEmulator.ExecuteFilter(Frame, JITPC, Args);
+  // Gate on the filter list here rather than inside ExecuteFilter: this call
+  // sits on every syscall, and even ExecuteFilter's cache-probe wrapper costs
+  // a frame. Most processes (including wine, which currently declines to
+  // install its dispatch filter under FEX's low-address library layout) never
+  // install any filter.
+  if (!FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame)->Filters.empty()) [[unlikely]] {
+    const auto SeccompResult = SeccompEmulator.ExecuteFilter(Frame, JITPC, Args);
 
-  if (SeccompResult.EarlyReturn) {
-    return SeccompResult.Result;
+    if (SeccompResult.EarlyReturn) {
+      return SeccompResult.Result;
+    }
   }
 
   if (Args->Argument[0] >= Definitions.size()) {

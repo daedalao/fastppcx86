@@ -77,6 +77,12 @@ public:
     uint64_t Result;
   };
   ExecuteFilterResult ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC, FEXCore::HLE::SyscallArguments* Args);
+  // The interpreting path behind ExecuteFilter's cache probe. noinline keeps
+  // its register-heavy frame (the inlined BPF interpreter saves 15+ GPRs and
+  // vector state in its prologue) off the per-syscall fast path.
+  [[gnu::noinline]] ExecuteFilterResult ExecuteFilterSlow(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC,
+                                                          FEXCore::HLE::SyscallArguments* Args, FEX::HLE::ThreadStateObject* Thread,
+                                                          uint64_t PrecomputedRIP, bool HaveRIP);
   int GetKillSignal() const {
     return CurrentKillSignal;
   }

@@ -122,18 +122,34 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   fextl::vector<FEX::HLE::SeccompFilterInfo*> Filters {};
 
   // Per-thread seccomp verdict cache (owned and touched only by this thread;
-  // see SeccompEmulator::ExecuteFilter). When no installed filter reads the
-  // instruction pointer or the syscall arguments, a verdict depends only on
-  // the syscall number, so an ALLOW verdict can be replayed without running
-  // the BPF interpreter. Only ALLOW is cached: it is the only action with no
-  // side effects (no logging, no signal, no errno).
+  // see SeccompEmulator::ExecuteFilter). A cBPF verdict is a pure function of
+  // the seccomp_data fields the installed programs actually load (discovered
+  // at install time), so an ALLOW verdict can be replayed without running the
+  // BPF interpreter when every loaded field is part of the cache key:
+  //  - NrOnly:  no filter reads ip or args -> key is the syscall number.
+  //  - NrRIP:   filters read ip but not args (wine's syscall-dispatch filter)
+  //             -> key is (guest RIP, nr). Guest RIPs are stable across JIT
+  //             recompiles, unlike host JITPCs.
+  // Only ALLOW is cached: it is the only action with no side effects (no
+  // audit log, no signal, no errno).
   struct SeccompVerdictCache {
     constexpr static uint32_t MAX_CACHED_NR = 512;
+    constexpr static uint32_t RIP_WAYS = 64;
+    enum class CacheMode : uint8_t {
+      None,   // Some filter reads args; every syscall interprets.
+      NrOnly, // AllowedNrs bitmap is usable.
+      NrRIP,  // RIPAllowed direct-mapped table is usable.
+    };
     // Compared against SeccompEmulator::FilterGeneration; mismatch clears.
     uint64_t Generation {};
-    bool Cacheable {}; // No filter reads ip/args; AllowedNrs is usable.
-    bool NeedsRIP {};  // Some filter reads ip; reconstruct RIP up front.
+    CacheMode Mode {CacheMode::None};
+    bool NeedsRIP {}; // Some filter loads instruction_pointer.
     uint64_t AllowedNrs[MAX_CACHED_NR / 64] {};
+    struct RIPEntry {
+      uint64_t RIP;
+      uint64_t NrPlusOne; // 0 = empty
+    };
+    RIPEntry RIPAllowed[RIP_WAYS] {};
   } SeccompCache {};
 
   // personality emulation.
