@@ -1609,10 +1609,14 @@ DEF_OP(PExt) {
   cmpdi(Mask, 0);
   bc(CC_EQ, &Done);
 
-  // Stack slot for OutPos counter.
-  addi(r1, r1, -16);
+  // OutPos counter lives in CTR, NOT a stack slot. The old form did
+  // `addi r1, r1, -16` and kept the counter at 0(new r1) — which is the
+  // same address as the CR0 stash above (old r1-16), so every nonzero-mask
+  // PEXT restored a counter value into CR0 and destroyed the guest's packed
+  // NZCV. CTR is free here: no IR op keeps CTR live across ops (every
+  // bctr/bctrl/bdnz consumer loads it via mtctr first).
   li(Scratch, 0);
-  std(Scratch, 0, r1);
+  mtctr(Scratch);
 
   Bind(&NextBit);
   neg(LowBit, Mask);
@@ -1620,7 +1624,7 @@ DEF_OP(PExt) {
   and_(Scratch, LowBit, InputSnap);    // input bit at that position
   cmpdi(Scratch, 0);
   bc(CC_EQ, &NoSet);
-  ld(Scratch, 0, r1);                  // OutPos
+  mfctr(Scratch);                      // OutPos
   li(LowBit, 1);                       // (recompute LowBit later)
   sld(LowBit, LowBit, Scratch);
   or_(Dest, Dest, LowBit);
@@ -1628,12 +1632,11 @@ DEF_OP(PExt) {
   and_(LowBit, LowBit, Mask);
   Bind(&NoSet);
   andc(Mask, Mask, LowBit);            // strip processed bit
-  ld(Scratch, 0, r1);
+  mfctr(Scratch);
   addi(Scratch, Scratch, 1);
-  std(Scratch, 0, r1);
+  mtctr(Scratch);
   cmpdi(Mask, 0);
   bc(CC_NE, &NextBit);
-  addi(r1, r1, 16);
 
   Bind(&Done);
   if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
