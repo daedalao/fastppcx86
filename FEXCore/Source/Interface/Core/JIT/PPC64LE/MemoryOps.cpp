@@ -402,6 +402,35 @@ DEF_OP(FillRegister) {
   }
 }
 
+// PPC64LE-only fused byte-reversed memory ops — the MOVBE lowering. The
+// frontend only emits these with TSO emulation off, so a plain-ordered
+// X-form access is correct. EA = (Addr|0) + r0; Addr sits in the RA slot
+// where 0 would mean literal zero, but GetReg can never hand back r0 (it is
+// not in any allocation pool), and r0 == 0 is the backend invariant for RB.
+DEF_OP(LoadMemRev) {
+  auto Op = IROp->C<IR::IROp_LoadMemRev>();
+  auto Dst = GetReg(Node);
+  auto Addr = GetReg(Op->Addr);
+  switch (IROp->Size) {
+  case IR::OpSize::i16Bit: lhbrx(Dst, Addr, r0); break;
+  case IR::OpSize::i32Bit: lwbrx(Dst, Addr, r0); break;
+  case IR::OpSize::i64Bit: ldbrx(Dst, Addr, r0); break;
+  default: LOGMAN_MSG_A_FMT("LoadMemRev: unsupported size {}", IROp->Size); break;
+  }
+}
+
+DEF_OP(StoreMemRev) {
+  auto Op = IROp->C<IR::IROp_StoreMemRev>();
+  auto Addr = GetReg(Op->Addr);
+  auto Value = GetReg(Op->Value);
+  switch (IROp->Size) {
+  case IR::OpSize::i16Bit: sthbrx(Value, Addr, r0); break;
+  case IR::OpSize::i32Bit: stwbrx(Value, Addr, r0); break;
+  case IR::OpSize::i64Bit: stdbrx(Value, Addr, r0); break;
+  default: LOGMAN_MSG_A_FMT("StoreMemRev: unsupported size {}", IROp->Size); break;
+  }
+}
+
 // =========================================================================
 // Static register save/restore (LoadRegister / StoreRegister)
 // =========================================================================

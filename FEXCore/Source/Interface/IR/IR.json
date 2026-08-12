@@ -608,6 +608,29 @@
         "DestSize": "Size"
       },
 
+      "GPR = LoadMemRev OpSize:#Size, GPR:$Addr": {
+        "Desc": [ "Loads Size bytes (2/4/8) from Addr byte-reversed, zero-extended — the",
+                  "load half of x86 MOVBE fused with its swap.",
+                  "PPC64LE-only: the OpcodeDispatcher only emits this under",
+                  "ARCHITECTURE_ppc64le (and only when TSO emulation is off — the lowering",
+                  "is a plain-ordered l{h,w,d}brx, one instruction). Other backends keep",
+                  "the LoadMem+Rev decomposition, so JITDispatch:false and hand-wired in",
+                  "the PPC64LE JIT's op table like VMaddPairwise16."
+                ],
+        "DestSize": "Size",
+        "JITDispatch": false
+      },
+
+      "StoreMemRev OpSize:#Size, GPR:$Addr, GPR:$Value": {
+        "Desc": [ "Stores the low Size bytes (2/4/8) of Value to Addr byte-reversed — the",
+                  "store half of x86 MOVBE. Same PPC64LE-only/TSO-off gating as LoadMemRev;",
+                  "lowers to st{h,w,d}brx."
+                ],
+        "HasSideEffects": true,
+        "DestSize": "Size",
+        "JITDispatch": false
+      },
+
       "FPR = VLoadVectorMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Mask, GPR:$Addr, GPR:$Offset, MemOffsetType:$OffsetType, u8:$OffsetScale": {
         "Desc": ["Does a masked load similar to VPMASKMOV/VMASKMOV where the upper bit of each element",
                  "determines whether or not that element will be loaded from memory"],

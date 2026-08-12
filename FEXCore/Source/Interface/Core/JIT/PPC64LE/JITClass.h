@@ -778,6 +778,11 @@ private:
   DEF_OP(VExtractSignBits);
   DEF_OP(VAnyNonZero);
 
+  // PPC64LE-only fused byte-reversed memory ops (MemoryOps.cpp) — the MOVBE
+  // lowering. Same JITDispatch:false / hand-registered mechanism as above.
+  DEF_OP(LoadMemRev);
+  DEF_OP(StoreMemRev);
+
   // -----------------------------------------------------------------------
   // x87 stack bookkeeping ops (X87Ops.cpp).
   // These IR ops are normally lowered away by the x87StackOptimization pass
