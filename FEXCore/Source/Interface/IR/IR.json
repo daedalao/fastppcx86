@@ -608,23 +608,24 @@
         "DestSize": "Size"
       },
 
-      "GPR = LoadMemRev OpSize:#Size, GPR:$Addr": {
+      "GPR = LoadMemRev OpSize:#Size, GPR:$Addr, u8:$TSO": {
         "Desc": [ "Loads Size bytes (2/4/8) from Addr byte-reversed, zero-extended — the",
                   "load half of x86 MOVBE fused with its swap.",
+                  "TSO carries the frontend's IsTSOEnabled(GPR) decision; the lowering adds",
+                  "the same acquire barrier LoadMemTSO uses when set.",
                   "PPC64LE-only: the OpcodeDispatcher only emits this under",
-                  "ARCHITECTURE_ppc64le (and only when TSO emulation is off — the lowering",
-                  "is a plain-ordered l{h,w,d}brx, one instruction). Other backends keep",
-                  "the LoadMem+Rev decomposition, so JITDispatch:false and hand-wired in",
-                  "the PPC64LE JIT's op table like VMaddPairwise16."
+                  "ARCHITECTURE_ppc64le, where it lowers to a single l{h,w,d}brx. Other",
+                  "backends keep the LoadMem+Rev decomposition, so JITDispatch:false and",
+                  "hand-wired in the PPC64LE JIT's op table like VMaddPairwise16."
                 ],
         "DestSize": "Size",
         "JITDispatch": false
       },
 
-      "StoreMemRev OpSize:#Size, GPR:$Addr, GPR:$Value": {
+      "StoreMemRev OpSize:#Size, GPR:$Addr, GPR:$Value, u8:$TSO": {
         "Desc": [ "Stores the low Size bytes (2/4/8) of Value to Addr byte-reversed — the",
-                  "store half of x86 MOVBE. Same PPC64LE-only/TSO-off gating as LoadMemRev;",
-                  "lowers to st{h,w,d}brx."
+                  "store half of x86 MOVBE. Same PPC64LE-only mechanism as LoadMemRev;",
+                  "lowers to st{h,w,d}brx, with StoreMemTSO's release barrier when TSO."
                 ],
         "HasSideEffects": true,
         "DestSize": "Size",

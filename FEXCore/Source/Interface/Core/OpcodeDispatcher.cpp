@@ -5217,20 +5217,22 @@ void OpDispatchBuilder::MOVBEOp(OpcodeArgs) {
 
 #ifdef ARCHITECTURE_ppc64le
   // Fuse the swap into the memory access: l{h,w,d}brx / st{h,w,d}brx do the
-  // byte-reversed load/store in one plain-ordered instruction, replacing the
-  // LoadMem+Rev / Rev+StoreMem pair (Rev alone is 2-4 instructions, plus a
-  // red-zone bounce for 64-bit). MOVBE always has exactly one memory operand,
-  // so DestIsMem distinguishes the two forms. Skip under TSO emulation: the
-  // fused ops carry no barriers, while LoadSource/StoreResult would emit
-  // TSO-ordered accesses there.
-  if (!CTX->IsAtomicTSOEnabled()) {
+  // byte-reversed load/store in one instruction, replacing the LoadMem+Rev /
+  // Rev+StoreMem pair (Rev alone is 2-4 instructions, plus a red-zone bounce
+  // for 64-bit). MOVBE always has exactly one memory operand, so DestIsMem
+  // distinguishes the two forms. The TSO flag carries this access's
+  // IsTSOEnabled(GPR) decision — the lowering brackets the access with the
+  // same barriers the LoadMemTSO/StoreMemTSO paths use, so the fusion is
+  // valid (and taken) under TSO emulation too.
+  {
+    const uint8_t TSO = IsTSOEnabled(RegClass::GPR) ? 1 : 0;
     if (DestIsMem(Op)) {
       Ref Src = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.Align = OpSize::i8Bit});
       Ref Addr = MakeSegmentAddress(Op, Op->Dest);
-      _StoreMemRev(SrcSize, Addr, Src);
+      _StoreMemRev(SrcSize, Addr, Src, TSO);
     } else {
       Ref Addr = MakeSegmentAddress(Op, Op->Src[0]);
-      Ref Swapped = _LoadMemRev(SrcSize, Addr);
+      Ref Swapped = _LoadMemRev(SrcSize, Addr, TSO);
       if (SrcSize == OpSize::i16Bit) {
         // 16-bit form merges into the destination's low 16 bits. The fused
         // load is already zero-extended with the swapped value at bits 15:0.
@@ -5243,7 +5245,7 @@ void OpDispatchBuilder::MOVBEOp(OpcodeArgs) {
     }
     return;
   }
-#endif
+#else
 
   Ref Src = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.Align = OpSize::i8Bit});
 
@@ -5259,6 +5261,7 @@ void OpDispatchBuilder::MOVBEOp(OpcodeArgs) {
     auto Result = _Bfxil(GPRSize, 16, 16, Dest, Src);
     StoreResultGPR_WithOpSize(Op, Op->Dest, Result, GPRSize);
   }
+#endif
 }
 
 void OpDispatchBuilder::CLWBOrTPause(OpcodeArgs) {
