@@ -537,6 +537,21 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
     }
   }
 
+#ifdef ARCHITECTURE_ppc64le
+  // AVX-high VSX bank: guest YMM_hi[i] lives in host vs(First+i) while the
+  // thread runs JIT code (Count is zero unless AVX is advertised). Capture
+  // into State.avx_high so the guest sigframe XSTATE and any State readers
+  // see current high halves. Register layout is the VR convention: dw1 =
+  // guest LOW qword -> avx_high[i][0], dw0 = guest HIGH -> [i][1]. The bank
+  // is ELFv2 callee-saved, so the frame values are valid even when the
+  // signal landed inside a host helper call.
+  for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
+    const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
+    Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
+    Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+  }
+#endif
+
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);

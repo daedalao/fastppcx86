@@ -111,6 +111,26 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
     stvx(SRAFPR[i], STATE, tmp);
   }
 
+  // AVX-high bank -> State.avx_high[i]. Memory image must be byte-identical
+  // to a stvx of the same value (SpillSRA and the guest sigframe XSTATE
+  // builder read avx_high[] as ordinary LE 128-bit values): stxvx has that
+  // layout natively on ISA 3.0; pre-3.0 goes dword-swapped stxvd2x with an
+  // xxpermdi fix-up through VTMP3_VSX (op-local scratch, same idiom as
+  // StoreUnalignedV128's pre-3.0 path).
+  if (EmitterCTX->HostFeatures.SupportsAVX) {
+    for (size_t i = 0; i < SRAFPR.size(); ++i) {
+      int32_t off = static_cast<int32_t>(
+        offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[i][0]));
+      LoadImm32(tmp, static_cast<uint32_t>(off));
+      if (EmitterCTX->HostFeatures.SupportsISA30) {
+        stxvx(AVXHighBankReg(i), STATE, tmp);
+      } else {
+        xxpermdi(VTMP3_VSX, AVXHighBankReg(i), AVXHighBankReg(i), 2);
+        stxvd2x(VTMP3_VSX, STATE, tmp);
+      }
+    }
+  }
+
   // Save NZCV across the dispatcher / C++ slow paths. Pack CR0 + XER into the
   // ARM-style 32-bit NZCV layout (N=LSB31, Z=30, C=29, V=28) and store at
   // flags[RFLAG_NZCV_LOC..NZCV_3_LOC]. Mirrors DEF_OP(LoadNZCV) bit shuffles.
@@ -242,6 +262,24 @@ void PPC64EmitterBase::FillStaticRegs(FillMode Mode) {
       offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data[i][0]));
     LoadImm32(TMP1, static_cast<uint32_t>(xmm_off));
     lvx(SRAFPR[i], STATE, TMP1);
+  }
+
+  // State.avx_high[i] -> AVX-high bank. Mirror of the spill above; runs on
+  // every dispatcher entry, which is what makes context memory writes by
+  // non-JIT code (guest signal handlers via sigreturn, gdbserver, thread
+  // bring-up) reach the registers.
+  if (EmitterCTX->HostFeatures.SupportsAVX) {
+    for (size_t i = 0; i < SRAFPR.size(); ++i) {
+      int32_t off = static_cast<int32_t>(
+        offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[i][0]));
+      LoadImm32(TMP1, static_cast<uint32_t>(off));
+      if (EmitterCTX->HostFeatures.SupportsISA30) {
+        lxvx(AVXHighBankReg(i), STATE, TMP1);
+      } else {
+        lxvd2x(VTMP3_VSX, STATE, TMP1);
+        xxpermdi(AVXHighBankReg(i), VTMP3_VSX, VTMP3_VSX, 2);
+      }
+    }
   }
 
   // Restore NZCV across the dispatcher / C++ slow paths. Inverse of the

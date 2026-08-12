@@ -81,6 +81,44 @@ constexpr auto VTMP3_VSX = VSXR{12};
 constexpr auto VZERO_VSX = VSXR{14};
 
 // -------------------------------------------------------------------------
+// AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).
+//
+// Active ONLY when HostFeatures.SupportsAVX (default OFF on this tree).
+// The AVX_128 frontend splits YMM into two 128-bit halves; the low half is
+// SRA (v0-15) and the high half historically lived in State.avx_high[]
+// context MEMORY — every VEX-encoded op paid a load/store round trip. The
+// FPR-aliased low VSX bank is idle from vs16 up, and f16-f31 are ELFv2
+// callee-saved, so the halves live in registers instead:
+//
+//  * In-register layout matches the VR convention exactly (dw0 = guest high
+//    qword, dw1 = guest low qword) — moves between the bank and VRs are a
+//    single full-VSX xxlor, and the memory image written by the spill path
+//    below is byte-identical to a stvx of the same value.
+//  * Host C calls preserve the bank by ABI (callee-saved), so
+//    SpillForABICall needs nothing; only SpillStaticRegs/FillStaticRegs
+//    sync bank <-> State.avx_high[] (gated on SupportsAVX) so context
+//    memory is authoritative whenever the thread is outside JIT code.
+//  * Mid-JIT signals: the host-side SpillSRA reads the bank straight out of
+//    the mcontext (fp_regs dw0 + the VSX-dw1 area) — see
+//    MContext_ppc64le.h. Because the bank is callee-saved this is valid
+//    even for signals landing inside a host helper call.
+//  * VSX-form instructions only (same rule as VTMP3_VSX/VZERO_VSX);
+//    PushCalleeSavedRegisters already saves/restores f14-f31 on dispatcher
+//    entry, protecting the host caller's values.
+//
+// Both guest modes bank SRAFPR.size() entries (16 in x64, 8 in x32).
+constexpr uint32_t AVXHIGH_BANK_FIRST = 16;
+constexpr VSXR AVXHighBankReg(size_t i) {
+  return VSXR{static_cast<uint32_t>(AVXHIGH_BANK_FIRST + i)};
+}
+
+// A VMX register's name in the full 64-entry VSX file (VR n == vs(32+n)),
+// for the VSX-form ops that move values between the banks.
+constexpr VSXR AsVSX(VR v) {
+  return VSXR{32u + v.idx};
+}
+
+// -------------------------------------------------------------------------
 // ELFv2 volatility boundaries, plus the compile-time checks that keep each
 // mode's "which pool registers survive a host call" answer honest.
 //

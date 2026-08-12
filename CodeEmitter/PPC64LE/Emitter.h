@@ -893,6 +893,9 @@ public:
   // Bitwise VSX (XO = 144..168).  These overlap with vand/vxor but operate on 128-bit
   // VSX values directly without going through AltiVec.
   void xxlor  (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 146); }
+  // Full-VSX xxlor: the register move that crosses the vs0-31 / vs32-63
+  // boundary (VMX-form vmr cannot address the low bank at all).
+  void xxlor  (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 146); }
   void xxlxor (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 154); }
   void xxland (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 130); }
   void xxlandc(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 138); }
@@ -1127,13 +1130,17 @@ public:
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
   void stxvd2x(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 972, 1); }
-  // VSXR overloads of the indexed stores: the SX bit (the slot EmitX calls
-  // `rc`) is DERIVED from bit 5 of the register number instead of hardcoded,
-  // which is what makes the FPR-aliased low half (vs0-vs31) reachable — same
-  // scheme as EmitXX3VSX. Loads deliberately not overloaded: no lowering
-  // needs a low-bank scalar load yet, and the load side's dword[1]-undefined
-  // caveats make a blind overload a trap.
+  // VSXR overloads of the indexed loads/stores: the TX/SX bit (the slot EmitX
+  // calls `rc`) is DERIVED from bit 5 of the register number instead of
+  // hardcoded, which is what makes the FPR-aliased low half (vs0-vs31)
+  // reachable — same scheme as EmitXX3VSX. The full-vector lxvd2x/lxvx loads
+  // define BOTH doublewords on all ISA levels, so they are safe to overload;
+  // the SCALAR loads below stay VR-only (their dword[1]-undefined caveats on
+  // pre-3.0 hardware make a blind low-bank overload a trap).
   void stxvd2x(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 972, (vss.idx >> 5) & 1u); }
+  void lxvd2x (VSXR vst, GPR ra, GPR rb) { EmitX(31, vst.idx & 31u, ra.idx, rb.idx, 844, (vst.idx >> 5) & 1u); }
+  void lxvx   (VSXR vst, GPR ra, GPR rb) { EmitX(31, vst.idx & 31u, ra.idx, rb.idx, 268, (vst.idx >> 5) & 1u); }
+  void stxvx  (VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 396, (vss.idx >> 5) & 1u); }
 
   // Scalar loads into dword[0].  CAUTION: ISA 3.0 defines dword[1] ← 0 for
   // all four, but on ISA 2.06/2.07 hardware (POWER7/POWER8) lxsdx/lxsiwzx

@@ -1538,6 +1538,11 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
 
     .SRAGPRMapping = GPRMapping,
     .SRAFPRMapping = FPRMapping,
+
+    // AVX-high bank: one entry per SRA XMM when AVX is advertised. FPRCount
+    // already reflects guest bitness (16 x64 / 8 x32).
+    .SRAAVXHighBankFirst = static_cast<uint16_t>(AVXHIGH_BANK_FIRST),
+    .SRAAVXHighBankCount = static_cast<uint16_t>(CTX->HostFeatures.SupportsAVX ? FPRCount : 0),
   };
 }
 
