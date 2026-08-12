@@ -1085,6 +1085,15 @@ void PPC64Dispatcher::EmitDispatcher() {
 uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   const auto Address = GetCursorAddress<uint64_t>();
 
+  // These stubs are shared by every callsite, so they cannot know which
+  // dynamic VRs are live — the volatile dynamic pool is CALLER-saved around
+  // the bctrl into an ABIPointers stub (SaveDynVRsToFrame at the two FABI
+  // callsite emitters: JIT.cpp Op_Unhandled and X87Ops.cpp EmitFABICall).
+  // Emit the whole stub with the Push/PopDynamicRegs VR mask empty; the
+  // spill-frame SIZE is unchanged (see the DynVRSpillMask contract in
+  // PPC64Emitter.h), so all kSpill-relative mini-frame math below is intact.
+  DynVRSpillMask = 0;
+
   // The spill frame size differs between guest bitnesses (x32 has larger RA
   // and RAFPR pools), so every post-spill mini-frame access must be
   // bitness-aware. Always go through kDynRegSaveSize; never a literal.
@@ -1484,6 +1493,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     break;
   }
 
+  DynVRSpillMask = ~0u;
   return Address;
 }
 

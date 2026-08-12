@@ -462,6 +462,13 @@ static inline void EmitFABICall(PPC64JITCore* self, FEXCore::Core::FallbackHandl
 
   // Save LR via TMP2; use 512-byte frame to protect JIT spill slots.
   self->mflr(TMP2); self->addi(r1, r1, -512); self->std(TMP2, 0, r1);
+  // Volatile dynamic VRs are caller-saved around ABIPointers stubs (the stubs
+  // emit Push/PopDynamicRegs under an empty VR mask — DynVRSpillMask contract,
+  // PPC64Emitter.h). Live set at [r1+16..]: worst case 12 regs = 208 bytes,
+  // inside the 512-byte frame. Clobbers TMP3 (already in this helper's
+  // contract); sources were staged in VTMP1/VTMP2 before this call and VTMPs
+  // are not in the saved pool.
+  self->SaveDynVRsToFrame(16);
   // See JIT.cpp Op_Unhandled for the identical rationale; d-form `ld` here removes a silent
   // uint32_t→int16_t hazard and the TMP2 serialisation in front of mtctr/bctrl.
   static_assert(
@@ -473,6 +480,7 @@ static inline void EmitFABICall(PPC64JITCore* self, FEXCore::Core::FallbackHandl
   self->ld(TMP4, static_cast<int16_t>(FuncOff), STATE);
   // Sources are already in VTMP1 / (VTMP2 for binary) per the contract above.
   self->mtctr(r(0)); self->bctrl();
+  self->RestoreDynVRsFromFrame(16);
   self->ld(TMP2, 0, r1); self->mtlr(TMP2); self->addi(r1, r1, 512); self->li(r(0), 0);
 }
 

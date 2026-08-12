@@ -334,6 +334,40 @@ public:
   size_t PushDynamicRegs(GPR tmp);
   void   PopDynamicRegs();
 
+  // Which dynamic-pool FPRs Push/PopDynamicRegs (and the FABI callsite
+  // caller-save helpers below) actually store, as a bitmask of RAFPR POOL
+  // INDICES (bit i = RAFPR[i], NOT VR numbers). The effective saved set is
+  // always additionally intersected with the ELFv2-volatile subset
+  // (RAFPRVolatile, idx < 20) — callee-saved pool entries are never stored
+  // regardless of this mask.
+  //
+  // Contract:
+  //   * ~0u (default) = save every volatile pool entry. Anything that emits
+  //     Push/Pop outside a per-IR-op context (dispatcher stubs, CompileCode
+  //     tail thunks) runs under this default and stays conservative.
+  //   * CompileCode sets it per IR op to the RA live-in set ∪ dest before
+  //     dispatching the op handler and resets it to ~0u right after, so any
+  //     SpillForABICall/FillForABICall pair emitted inside a handler saves
+  //     only vector values that are actually live across the call.
+  //   * GenerateABICall (FABI bridge stubs) emits under mask 0: the volatile
+  //     dynamic VRs are CALLER-saved at the two FABI callsite emitters
+  //     (JIT.cpp Op_Unhandled, X87Ops.cpp EmitFABICall) via the helpers
+  //     below, because only the callsite knows the live set at emit time.
+  //     Every new path that branches into an ABIPointers stub MUST emit the
+  //     caller-save pair.
+  //
+  // Frame layout is deliberately unaffected — masked-out registers keep
+  // their (unwritten) slots, so kDynFPRStart/kDynRegSaveSize arithmetic and
+  // every consumer of those constants stay valid.
+  uint32_t DynVRSpillMask = ~0u;
+
+  // FABI-callsite caller-save pair: store/reload the DynVRSpillMask-selected
+  // volatile dynamic VRs at [r1 + BaseOffset + k*16] (16-byte aligned slots,
+  // one per SAVED register, densely packed). Clobbers TMP3. Worst case needs
+  // BaseOffset + 12*16 bytes of frame (x32's full volatile set).
+  void SaveDynVRsToFrame(int32_t BaseOffset);
+  void RestoreDynVRsFromFrame(int32_t BaseOffset);
+
   // Spill/fill everything before/after a C ABI call (clobbers r3-r12, v0-v19).
   void SpillForABICall(GPR tmp, bool FPRs = true);
   void FillForABICall(bool FPRs = true);

@@ -1045,6 +1045,25 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   // ABI correctness.
   mflr(TMP2); addi(r1, r1, -4096); std(TMP2, 0, r1);
 
+  // Volatile dynamic VRs are caller-saved around ABIPointers stubs (the stub's
+  // own Push/PopDynamicRegs run under an empty VR mask — see the
+  // DynVRSpillMask contract in PPC64Emitter.h). Save exactly the pool entries
+  // live across this IR op into this scratch frame at [r1+16..]; only [r1+0]
+  // (LR) is otherwise in use below. Must precede the source staging in the
+  // switch: it clobbers TMP3, which the VPCMPESTRX case loads afterwards.
+  SaveDynVRsToFrame(16);
+
+  // Restore mirror + the frame teardown every case below shares. The restore
+  // must happen while the frame is still live and must precede the per-case
+  // result moves (which target the just-restored pool registers).
+  auto FABIFrameLeave = [&]() {
+    RestoreDynVRsFromFrame(16);
+    ld(TMP2, 0, r1);
+    mtlr(TMP2);
+    addi(r1, r1, 4096);
+    li(r(0), 0);
+  };
+
   // Load ABIHandler into r0, Func into TMP4.
   // Both offsets are FallbackHandlerPointers base + Idx*sizeof(FallbackABIInfo) + (0|8) —
   // 8-byte aligned by construction and bounded well below INT16_MAX (see static_assert), so
@@ -1066,7 +1085,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects VTMP1 = source float/double vector (LE-element-0)
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1075,7 +1094,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects TMP2(r4) = sign-extended int16
     extsh(TMP2, GetReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1084,7 +1103,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects TMP2(r4) = sign-extended int32
     extsw(TMP2, GetReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1095,7 +1114,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   case FABI_F80_I16_F80_PTR: {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1105,7 +1124,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     vmr(VTMP2, GetVReg(IROp->Args[1]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1115,7 +1134,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   case FABI_I64_I16_F80_PTR: {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1124,7 +1143,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     vmr(VTMP2, GetVReg(IROp->Args[1]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1135,7 +1154,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     const auto DstHi = GetVReg(IROp->Args[2]);
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(DstLo, VTMP1);
     vmr(DstHi, VTMP2);
     break;
@@ -1147,7 +1166,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     const auto DstHi = GetVReg(IROp->Args[2]);
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(DstLo, VTMP1);
     vmr(DstHi, VTMP2);
     break;
@@ -1162,7 +1181,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     li(TMP3, static_cast<int16_t>(Op->Control));
     mr(TMP1, GetReg(Op->RAX));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1174,7 +1193,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP2, GetVReg(Op->RHS));
     li(TMP1, static_cast<int16_t>(Op->Control));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1185,7 +1204,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     LOGMAN_MSG_A_FMT("Unhandled IR Fallback ABI: {} {}", FEXCore::IR::GetName(IROp->Op), ToUnderlying(Info.ABI));
 #endif
     // Still need to pop LR frame
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     break;
   }
 }
@@ -3597,9 +3616,69 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // Intra-block jumps skip the stdu because the calling block already has
   // the frame live; dispatcher hits run the stdu. Both paths balance at
   // ExitFunction's ResetStack.
+  //
+  // Per-op live-in masks for the dynamic FPR pool (bit i = RAFPR pool index
+  // i), keyed by node ID. Feeds DynVRSpillMask so helper calls save only the
+  // vector values actually live across them. Exact, not heuristic: RA is
+  // strictly block-local (every class starts each block with all registers
+  // available — RegisterAllocationPass.cpp Run()), so a backward
+  // physical-register scan per block sees every live range. The op's own dest
+  // is defensively INCLUDED (some handler shapes write the dest before the
+  // helper call; saving a possibly-garbage register is harmless, losing a
+  // written one is not). FEX_NO_ABI_LIVEMASK reverts to full saves for A/B.
+  static const bool DisableABILiveMask = getenv("FEX_NO_ABI_LIVEMASK") != nullptr;
+  fextl::vector<uint32_t> DynVRLiveIn;
+  if (!DisableABILiveMask) {
+    DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
+  }
+
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
     CurrentBlockID = BlockIROp->ID;
+
+    if (!DynVRLiveIn.empty()) {
+      // Backward scan: Live holds the live-after set of the op under the
+      // cursor; live-before = (live-after − def) ∪ uses. Args of inline
+      // constants and other non-RA'd references carry an Invalid class byte
+      // and fall out of the RegClass::FPR test; a stray false positive would
+      // only add a redundant save, never lose one.
+      uint32_t Live = 0;
+      auto CodeBegin = IRView->at(BlockIROp->Begin);
+      auto CodeLast = IRView->at(BlockIROp->Last);
+      while (1) {
+        auto [CodeNode, IROp] = CodeLast();
+
+        uint32_t Def = 0;
+        if (IR::GetHasDest(IROp->Op)) {
+          const IR::PhysicalRegister PR(CodeNode);
+          if (PR.AsRegClass() == IR::RegClass::FPR) {
+            Def = 1u << PR.Reg;
+          }
+        }
+
+        uint32_t Use = 0;
+        const int NumArgs = IR::GetRAArgs(IROp->Op);
+        for (int i = 0; i < NumArgs; ++i) {
+          const auto Arg = IROp->Args[i];
+          if (Arg.IsInvalid()) {
+            continue;
+          }
+          const IR::PhysicalRegister PR =
+            Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
+          if (PR.AsRegClass() == IR::RegClass::FPR) {
+            Use |= 1u << PR.Reg;
+          }
+        }
+
+        Live = (Live & ~Def) | Use;
+        DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
+
+        if (CodeLast == CodeBegin) {
+          break;
+        }
+        --CodeLast;
+      }
+    }
 
     // Start of this IR block's out-of-band prologue (EntryPoint marker store,
     // suspend check, spill-frame stdu). Attributed to a synthetic bucket, not
@@ -3694,11 +3773,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // the op that emitted it, which is what we want.)
       [[maybe_unused]] const size_t OpStart = GetOffset();
 
+      // Any helper call this op emits saves only the dynamic VRs live across
+      // it (DynVRSpillMask contract, PPC64Emitter.h). Reset right after the
+      // handler: everything emitted outside a per-op context (block-link
+      // thunks, deferred stubs at the CompileCode tail) must stay
+      // conservative.
+      if (!DynVRLiveIn.empty()) {
+        DynVRSpillMask = DynVRLiveIn[IRView->GetID(CodeNode).Value];
+      }
       if (Op <= static_cast<uint16_t>(IR::IROps::OP_LAST)) {
         (this->*OpHandlers[Op])(IROp, CodeNode);
       } else {
         Op_Unhandled(IROp, CodeNode);
       }
+      DynVRSpillMask = ~0u;
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
                           Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? static_cast<size_t>(Op) :

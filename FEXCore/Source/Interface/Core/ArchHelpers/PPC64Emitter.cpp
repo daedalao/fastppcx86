@@ -424,6 +424,9 @@ size_t PPC64EmitterBase::PushDynamicRegs(GPR tmp) {
     if (RAFPR[i].idx >= 20) {
       continue;  // v20-v31: ELFv2 callee-saved
     }
+    if (!(DynVRSpillMask & (1u << i))) {
+      continue;  // not live across this call (see DynVRSpillMask contract)
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(tmp, static_cast<uint32_t>(off));
     stvx(RAFPR[i], r1, tmp);
@@ -444,12 +447,52 @@ void PPC64EmitterBase::PopDynamicRegs() {
     if (RAFPR[i].idx >= 20) {
       continue;  // v20-v31: ELFv2 callee-saved, never spilled
     }
+    if (!(DynVRSpillMask & (1u << i))) {
+      continue;  // not spilled by PushDynamicRegs (mask unchanged in between)
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(TMP1, static_cast<uint32_t>(off));
     lvx(RAFPR[i], r1, TMP1);
   }
 
   addi(r1, r1, static_cast<int16_t>(SaveSize));
+}
+
+// FABI-callsite caller-save of the live volatile dynamic VRs. The FABI bridge
+// stubs (PPC64Dispatcher::GenerateABICall) are shared across every callsite,
+// so they cannot know which dynamic VRs are live — their Push/PopDynamicRegs
+// run under mask 0 and the two callsite emitters bracket the bctrl with this
+// pair instead, storing into the callsite's own scratch frame. Slots are
+// packed by SAVED register (k counts set mask bits, not pool indices) so the
+// save/restore loops must stay in lockstep — both iterate the same mask.
+void PPC64EmitterBase::SaveDynVRsToFrame(int32_t BaseOffset) {
+  const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
+  const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
+
+  int32_t off = BaseOffset;
+  for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20 || !(DynVRSpillMask & (1u << i))) {
+      continue;
+    }
+    LoadImm32(TMP3, static_cast<uint32_t>(off));
+    stvx(RAFPR[i], r1, TMP3);
+    off += 16;
+  }
+}
+
+void PPC64EmitterBase::RestoreDynVRsFromFrame(int32_t BaseOffset) {
+  const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
+  const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
+
+  int32_t off = BaseOffset;
+  for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20 || !(DynVRSpillMask & (1u << i))) {
+      continue;
+    }
+    LoadImm32(TMP3, static_cast<uint32_t>(off));
+    lvx(RAFPR[i], r1, TMP3);
+    off += 16;
+  }
 }
 
 // Unaligned 128-bit load/store.
