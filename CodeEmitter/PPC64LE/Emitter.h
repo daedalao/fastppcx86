@@ -8,6 +8,7 @@
 
 #include <FEXCore/Utils/LogManager.h>
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -1140,6 +1141,13 @@ public:
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
   void stxvd2x(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 972, 1); }
+  // VSXR overloads of the indexed stores: the SX bit (the slot EmitX calls
+  // `rc`) is DERIVED from bit 5 of the register number instead of hardcoded,
+  // which is what makes the FPR-aliased low half (vs0-vs31) reachable — same
+  // scheme as EmitXX3VSX. Loads deliberately not overloaded: no lowering
+  // needs a low-bank scalar load yet, and the load side's dword[1]-undefined
+  // caveats make a blind overload a trap.
+  void stxvd2x(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 972, (vss.idx >> 5) & 1u); }
 
   // Scalar loads into dword[0].  CAUTION: ISA 3.0 defines dword[1] ← 0 for
   // all four, but on ISA 2.06/2.07 hardware (POWER7/POWER8) lxsdx/lxsiwzx
@@ -1157,11 +1165,13 @@ public:
   // stxsdx XS,RA,RB — ISA 2.06 — p.504, XO=716. Stores dword[0] as an 8-byte
   // LE integer at EA.  dword[1] is not read.
   void stxsdx(VR vrs, GPR ra, GPR rb)   { EmitX(31, vrs.idx, ra.idx, rb.idx, 716, 1); }
+  void stxsdx(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 716, (vss.idx >> 5) & 1u); }
   // stxsiwx XS,RA,RB — ISA 2.07 (POWER8+) — p.506, XO=140. Stores word
   // element 1 of VSR[XS] (bits 32:63, i.e. the LOW word of dword[0]) as a
   // 4-byte LE integer at EA.  This is the half lxsiwzx fills, so a value
   // round-trips through lxsiwzx/stxsiwx unchanged.
   void stxsiwx(VR vrs, GPR ra, GPR rb)  { EmitX(31, vrs.idx, ra.idx, rb.idx, 140, 1); }
+  void stxsiwx(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 140, (vss.idx >> 5) & 1u); }
 
   // lxsibzx XT,RA,RB — **ISA 3.0 (POWER9)** — p.486, XO=781. dword[0] =
   // zero-extended byte at EA; dword[1] = 0 (architectural, v3.0 instruction).
@@ -1447,17 +1457,21 @@ public:
   // Branches (B-form and I-form and XL-form)
   // =========================================================================
 
-  // Unconditional branch (I-form): b target, relative offset
+  // Unconditional branch (I-form): b target, relative offset.
+  // Range guards use LOGMAN, not assert: NDEBUG builds must still refuse to
+  // emit a truncated LI field, which would branch into an unrelated block
+  // (same rationale as EmitM's field guards).
   void b(int32_t offset) {
-    assert((offset & 3) == 0 && "Branch target must be 4-byte aligned");
-    assert(offset >= -(1<<25) && offset < (1<<25) && "Branch offset too large");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "b: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "b: LI offset {:#x} out of 24-bit signed range", offset);
     uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
     Emit32((18u << 26) | (li << 2) | 0u);  // AA=0, LK=0
   }
 
   // Branch with link (bl)
   void bl(int32_t offset) {
-    assert((offset & 3) == 0);
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bl: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "bl: LI offset {:#x} out of 24-bit signed range", offset);
     uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
     Emit32((18u << 26) | (li << 2) | 1u);  // AA=0, LK=1
   }
@@ -1494,8 +1508,8 @@ public:
   // Silent masking here means out-of-range forward branches land in random
   // nearby blocks; assert so we catch JIT block growths past the limit.
   void bc(uint32_t bo, uint32_t bi, int32_t offset) {
-    assert((offset & 3) == 0);
-    assert(offset >= -32768 && offset <= 32764 && "bc offset out of 14-bit signed range");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bc: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "bc: BD offset {:#x} out of 14-bit signed range", offset);
     uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 0u);
   }
@@ -1506,8 +1520,8 @@ public:
   // exact encoding the CPU's link-stack predictor does *not* push, per
   // POWER ISA; GCC emits it for PIC prologues for the same reason).
   void bcl(uint32_t bo, uint32_t bi, int32_t offset) {
-    assert((offset & 3) == 0);
-    assert(offset >= -32768 && offset <= 32764 && "bcl offset out of 14-bit signed range");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bcl: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "bcl: BD offset {:#x} out of 14-bit signed range", offset);
     uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 1u);
   }
@@ -1715,6 +1729,30 @@ public:
       clrldi(rt, rt, 32);
       return;
     }
+    // Two-instruction patterns for values wider than 32 bits, which would
+    // otherwise pay the 4-5 instruction general sequence below.
+    //
+    // Shifted 16-bit immediate: imm == (int16 v) << tz. Common for
+    // power-of-two and page/segment-granular constants (e.g. 0x1_0000_0000).
+    {
+      const unsigned tz = std::countr_zero(imm);
+      const int64_t v = static_cast<int64_t>(imm) >> tz;
+      if (v >= -32768 && v <= 32767 && (static_cast<uint64_t>(v) << tz) == imm) {
+        li(rt, static_cast<int16_t>(v));
+        sldi(rt, rt, tz);
+        return;
+      }
+    }
+    // Contiguous ones mask (e.g. 0xFFFF_FFFF_0000_0000): rotate a -1 into
+    // place. rldic RA,RS,SH,MB with RS=-1 leaves ones exactly at BE bits
+    // MB..63-SH, i.e. LE bits (63-MB) down to SH.
+    if (std::popcount(imm) + std::countl_zero(imm) + std::countr_zero(imm) == 64) {
+      const unsigned lo = std::countr_zero(imm);
+      const unsigned hi = 63 - std::countl_zero(imm);
+      li(rt, -1);
+      rldic(rt, rt, lo, 63 - hi);
+      return;
+    }
     // Full 64-bit load: lis + ori + sldi 32 + oris + ori
     uint32_t hi = static_cast<uint32_t>(imm >> 32);
     uint32_t lo = static_cast<uint32_t>(imm);
@@ -1772,14 +1810,14 @@ public:
     memcpy(&insn, Buffer + patch_offset, 4);
     uint32_t opcode = insn >> 26;
     int32_t offset = static_cast<int32_t>(target_offset) - static_cast<int32_t>(patch_offset);
-    assert((offset & 3) == 0);
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "PatchBranchAt: misaligned branch offset");
 
     if (opcode == 18) {  // unconditional branch
-      assert(offset >= -(1 << 25) && offset < (1 << 25) && "b: LI offset out of 24-bit signed range");
+      LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "PatchBranchAt: b LI offset {:#x} out of 24-bit signed range", offset);
       uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
       insn = (insn & 0xFC000003u) | (li << 2);
     } else if (opcode == 16) {  // conditional branch
-      assert(offset >= -32768 && offset <= 32764 && "bc: BD offset out of 14-bit signed range");
+      LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "PatchBranchAt: bc BD offset {:#x} out of 14-bit signed range", offset);
       uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
       insn = (insn & 0xFFFF0003u) | (bd << 2);
     }
