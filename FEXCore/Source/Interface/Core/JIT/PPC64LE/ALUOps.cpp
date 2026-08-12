@@ -401,8 +401,22 @@ DEF_OP(Div) {
     }
     if (Is16) extsh(TMP4, Divisor);
     else      extsw(TMP4, Divisor);
-    divd(Quotient, TMP1, TMP4);
-    mulld(TMP3, Quotient, TMP4);
+    if (LongDiv && !Is16) {
+      // True 64/32 EDX:EAX composition — needs the doubleword divide.
+      divd(Quotient, TMP1, TMP4);
+      mulld(TMP3, Quotient, TMP4);
+    } else {
+      // Dividend fits in signed 32 bits (16-bit composition, or an i32 whose
+      // Upper the post-RA merge proved a sign-extension): word divide, which
+      // POWER8 completes in roughly half divd's worst case — and a negative
+      // sign-extended dividend has 64 significant bits, denying divd any
+      // magnitude early-out. TMP1 holds the exact sign-extended dividend and
+      // mullw the exact 32x32 signed product, so the 64-bit subf remainder
+      // is exact; the masks below keep only the low 32 either way. divw's
+      // undefined-on-overflow/zero cases match divd's (PPC never traps).
+      divw(Quotient, TMP1, TMP4);
+      mullw(TMP3, Quotient, TMP4);
+    }
     subf(Remainder, TMP3, TMP1);
     rldicl(Quotient,  Quotient,  0, 32);
     rldicl(Remainder, Remainder, 0, 32);
@@ -498,8 +512,20 @@ DEF_OP(UDiv) {
       rldicl(TMP1, Lower, 0, MaskBits);
     }
     rldicl(TMP4, Divisor, 0, MaskBits);
-    divdu(Quotient, TMP1, TMP4);
-    mulld(TMP3, Quotient, TMP4);
+    if (LongDiv && IROp->Size != IR::OpSize::i16Bit) {
+      // True 64/32 EDX:EAX composition — needs the doubleword divide.
+      divdu(Quotient, TMP1, TMP4);
+      mulld(TMP3, Quotient, TMP4);
+    } else {
+      // Dividend fits in 32 bits (16-bit composition, or an i32 whose Upper
+      // the post-RA merge proved zero): word divide. divwu's worst-case
+      // latency on POWER8 is roughly half divdu's, and a zero-extended
+      // 32-bit value gives divdu no early-out to compensate. mullw's low 32
+      // product bits match mulld's for any signedness, and only the low 32
+      // of Quotient/Remainder survive the masks below.
+      divwu(Quotient, TMP1, TMP4);
+      mullw(TMP3, Quotient, TMP4);
+    }
     subf(Remainder, TMP3, TMP1);
     rldicl(Quotient,  Quotient,  0, 32);
     rldicl(Remainder, Remainder, 0, 32);
