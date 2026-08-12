@@ -2323,6 +2323,10 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // and needs a walk ordered against every thread's compile activity.
   BlockLinkingEnabled = CTX->Config.BlockLinking() && !FEXCore::Config::Get_ENABLECODECACHINGWIP();
 
+  // Spin-loop SMT priority hints: pure nop-class emission, safe under every
+  // other feature combination, so only the explicit kill switch gates it.
+  SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
+
   // SMC interlocks: two fork features are only sound when every constant-target
   // exit re-probes the lookup path, which is exactly what a established direct
   // link bypasses.
@@ -3020,6 +3024,166 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 #endif
 
 // -------------------------------------------------------------------------
+// AnalyzeSpinLoops: mark spin-loop backedges/exits for SMT priority hints
+//
+// A "spin loop" here is a tiny backward-branching region that only polls
+// memory and computes: <=3 blocks, <=64 IR ops, at least one memory load,
+// and no side effects beyond guest register/flag state and control flow.
+// No stores, no atomics, no syscalls -- a loop that writes shared state is
+// making progress and must not be deprioritized.
+//
+// For each detected region, the backedge gets `or r31,r31,r31` (SMT very-low
+// priority) and every edge leaving the region gets `or r2,r2,r2` (medium,
+// the default) so real work never runs deprioritized. Both are architectural
+// nops: misdetection cannot alter semantics, only dispatch priority. The
+// dispatcher loop top carries a medium-priority safety net for paths that
+// leave a spin region through a signal/suspend detour instead of a marked
+// edge (the kernel also restores medium on every syscall entry).
+//
+// Motivation: CP2077's redDispatcher work-steal spin was 25% of the whole
+// process's samples across 19 threads; its iteration-counted budget means
+// emulation slowness multiplies spin wall time, and on SMT the spin steals
+// dispatch bandwidth from the sibling thread (audio). See
+// cp2077-reddispatcher-spin-anatomy.
+// -------------------------------------------------------------------------
+void PPC64JITCore::AnalyzeSpinLoops() {
+  struct BlockInfo {
+    uint32_t ID = UINT32_MAX;
+    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX};  // CodeBlock IDs
+    uint32_t OpCount = 0;
+    bool Clean = false;
+    bool HasPollLoad = false;
+  };
+
+  fextl::vector<BlockInfo> Blocks;
+  const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
+  Blocks.reserve(NumBlocks);
+  // CodeBlock ID -> layout index (IDs are dense 0..NumBlocks-1, same keying
+  // as JumpTargets).
+  fextl::vector<uint32_t> IdxOfID(NumBlocks, UINT32_MAX);
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    BlockInfo Info {};
+    Info.ID = BlockIROp->ID;
+    Info.Clean = true;
+
+    // The block's branch terminator. NOTE: it is not the final op in the
+    // code list -- every block carries a trailing EndBlock marker after the
+    // branch -- so capture it when the switch sees it.
+    const FEXCore::IR::IROp_Header* Term = nullptr;
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      ++Info.OpCount;
+      switch (IROp->Op) {
+      case IR::OP_LOADMEM:
+      case IR::OP_LOADMEMTSO:
+        Info.HasPollLoad = true;
+        break;
+      // Side-effecting ops that are still pure "this thread's guest state":
+      // register/flag/context writes and control flow. Anything else with
+      // side effects (stores, atomics, syscalls, cache ops, ...) disqualifies
+      // the block.
+      case IR::OP_STOREREGISTER:
+      case IR::OP_STORECONTEXT:
+      case IR::OP_STORENZCV:
+      case IR::OP_STOREPF:
+      case IR::OP_STOREAF:
+      case IR::OP_CONDJUMP:
+      case IR::OP_JUMP:
+        Term = IROp;
+        break;
+      case IR::OP_GUESTOPCODE:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      // Pseudo-ops that carry HasSideEffects only as an optimizer barrier;
+      // they emit no code (InlineConstant/InlineEntrypointOffset are folded
+      // into their consumers).
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+        break;
+      default:
+        if (IR::HasSideEffects(IROp->Op)) {
+          Info.Clean = false;
+        }
+        break;
+      }
+    }
+
+    if (Term != nullptr && Term->Op == IR::OP_CONDJUMP) {
+      auto Op = Term->C<IR::IROp_CondJump>();
+      Info.Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock)->ID;
+      Info.Targets[1] = IR->GetOp<IR::IROp_CodeBlock>(Op->FalseBlock)->ID;
+    } else if (Term != nullptr && Term->Op == IR::OP_JUMP) {
+      auto Op = Term->C<IR::IROp_Jump>();
+      Info.Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Op->TargetBlock)->ID;
+    } else {
+      // Region blocks must end in plain control flow (ExitFunction, Break,
+      // ... terminators leave the compile unit and can't be hint-tracked).
+      Info.Clean = false;
+    }
+
+    if (Info.ID < NumBlocks) {
+      IdxOfID[Info.ID] = static_cast<uint32_t>(Blocks.size());
+    }
+    Blocks.push_back(Info);
+  }
+
+  constexpr uint32_t MaxRegionBlocks = 3;
+  constexpr uint32_t MaxRegionOps = 64;
+
+  auto PushUnique = [](fextl::vector<uint64_t>& Vec, uint64_t Key) {
+    for (const auto V : Vec) {
+      if (V == Key) {
+        return;
+      }
+    }
+    Vec.push_back(Key);
+  };
+
+  for (uint32_t bi = 0; bi < Blocks.size(); ++bi) {
+    for (const uint32_t TargetID : Blocks[bi].Targets) {
+      if (TargetID == UINT32_MAX || TargetID >= NumBlocks) {
+        continue;
+      }
+      const uint32_t ti = IdxOfID[TargetID];
+      if (ti == UINT32_MAX || ti > bi) {
+        continue;  // forward edge
+      }
+      if (bi - ti + 1 > MaxRegionBlocks) {
+        continue;
+      }
+      // Validate the candidate region [ti, bi].
+      uint32_t TotalOps = 0;
+      bool Clean = true;
+      bool HasPollLoad = false;
+      for (uint32_t ri = ti; ri <= bi; ++ri) {
+        TotalOps += Blocks[ri].OpCount;
+        Clean &= Blocks[ri].Clean;
+        HasPollLoad |= Blocks[ri].HasPollLoad;
+      }
+      if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
+        continue;
+      }
+      PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      // Every edge from a region block to a block outside [ti, bi] restores
+      // medium priority.
+      for (uint32_t ri = ti; ri <= bi; ++ri) {
+        for (const uint32_t T : Blocks[ri].Targets) {
+          if (T == UINT32_MAX || T >= NumBlocks) {
+            continue;
+          }
+          const uint32_t tidx = IdxOfID[T];
+          if (tidx < ti || tidx > bi) {
+            PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+          }
+        }
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
 CPUBackend::CompiledCode PPC64JITCore::CompileCode(
@@ -3259,6 +3423,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     CallReturnEntryLabels.resize(NumBlocks, {});
   }
 
+  // Detect tiny memory-polling loops and mark their backedges/exit edges for
+  // SMT priority hints (see JITClass.h and DEF_OP(CondJump)/DEF_OP(Jump)).
+  SpinBackedges.clear();
+  SpinRestoreEdges.clear();
+  if (SpinLoopHintEnabled) {
+    AnalyzeSpinLoops();
+  }
+
   // Belt-and-suspenders: any pending forward-branch fixups left over from a
   // prior compilation (which would also be a bug) point into a buffer that
   // no longer exists; drop them.
@@ -3425,6 +3597,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // ExitFunction's ResetStack.
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    CurrentBlockID = BlockIROp->ID;
 
     // Start of this IR block's out-of-band prologue (EntryPoint marker store,
     // suspend check, spill-frame stdu). Attributed to a synthetic bucket, not

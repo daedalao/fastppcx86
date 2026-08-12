@@ -457,6 +457,8 @@ DEF_OP(Jump) {
   if (Target->bound) {
     EmitSuspendInterruptCheck();
   }
+  // Spin-loop SMT priority hint for this edge, if AnalyzeSpinLoops marked it.
+  EmitSpinEdgeHint(Op->TargetBlock);
   b(Target);
 }
 
@@ -541,12 +543,16 @@ DEF_OP(CondJump) {
   if (TrueTarget->bound) {
     EmitSuspendInterruptCheck();
   }
+  // Spin-loop SMT priority hints, per edge (see AnalyzeSpinLoops). Emitted
+  // inside each leg so the hint executes exactly when that edge is taken.
+  EmitSpinEdgeHint(Op->TrueBlock);
   b(TrueTarget);
   Bind(&Skip);
   auto FalseTarget = JumpTarget(Op->FalseBlock);
   if (FalseTarget->bound) {
     EmitSuspendInterruptCheck();
   }
+  EmitSpinEdgeHint(Op->FalseBlock);
   b(FalseTarget);
 }
 

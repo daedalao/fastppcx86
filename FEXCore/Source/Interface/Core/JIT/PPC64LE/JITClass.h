@@ -260,6 +260,48 @@ private:
     return &JumpTargets[Block->ID];
   }
 
+  // -------------------------------------------------------------------------
+  // Spin-loop SMT priority hints (FEX_DISABLESPINLOOPHINT kill switch).
+  // AnalyzeSpinLoops (JIT.cpp) fills these per compile; DEF_OP(CondJump)/
+  // DEF_OP(Jump) consult them per emitted edge via EmitSpinEdgeHint.
+  // Edges are keyed (from CodeBlock ID << 32) | to CodeBlock ID. Plain
+  // vectors + linear scan: a compile unit rarely carries more than one spin
+  // loop, so these hold a handful of entries at most.
+  // -------------------------------------------------------------------------
+  bool SpinLoopHintEnabled {};
+  fextl::vector<uint64_t> SpinBackedges;     // edges that re-enter a spin loop
+  fextl::vector<uint64_t> SpinRestoreEdges;  // edges that leave a spin loop
+  uint32_t CurrentBlockID {UINT32_MAX};      // IROp_CodeBlock::ID being emitted
+
+  static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
+    return (static_cast<uint64_t>(From) << 32) | To;
+  }
+
+  void AnalyzeSpinLoops();
+
+  // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.
+  // Called immediately before the branch instruction so the hint executes
+  // exactly when the edge is taken.
+  void EmitSpinEdgeHint(IR::OrderedNodeWrapper Target) {
+    if (SpinBackedges.empty() && SpinRestoreEdges.empty()) {
+      return;
+    }
+    const auto To = IR->GetOp<IR::IROp_CodeBlock>(Target)->ID;
+    const auto Key = SpinEdgeKey(CurrentBlockID, To);
+    for (const auto Edge : SpinBackedges) {
+      if (Edge == Key) {
+        smt_very_low_priority();
+        return;
+      }
+    }
+    for (const auto Edge : SpinRestoreEdges) {
+      if (Edge == Key) {
+        smt_medium_priority();
+        return;
+      }
+    }
+  }
+
   // Block linking: one pending jump thunk per linkable constant-jump exit,
   // emitted after the block bodies at the tail of CompileCode. fextl::list,
   // NOT vector: the emitter's pending-branch fixups hold Label* into these

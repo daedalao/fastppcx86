@@ -836,6 +836,19 @@
           "A wrong elimination surfaces as a wrong conditional branch -- silent and data-dependent -- hence a field kill switch of its own."
         ]
       },
+      "DisableSpinLoopHint": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for spin-loop SMT priority hints in the PPC64LE JIT (FEX_DISABLESPINLOOPHINT=1 turns them OFF).",
+          "The backend detects tiny memory-polling loops (<=3 blocks, no stores/atomics/syscalls, at least one memory load) and emits POWER",
+          "thread-priority nops: `or r31,r31,r31` (very low) on the spin backedge, `or r2,r2,r2` (medium, the default) on every loop-exit edge",
+          "plus a safety net at the dispatcher loop top. A spinning guest thread then donates its SMT sibling's dispatch bandwidth instead of",
+          "stealing it -- measured motivation: one iteration-counted spin block was 25% of ALL CP2077 CPU across 19 redDispatcher workers,",
+          "starving same-core audio threads (see cp2077-reddispatcher-spin-anatomy). The hints are architecturally nops, so misdetection",
+          "cannot change program semantics -- worst case is a priority dip in a loop that was about to do real work."
+        ]
+      },
       "DisableCmpBranchFusion": {
         "Type": "bool",
         "Default": "false",

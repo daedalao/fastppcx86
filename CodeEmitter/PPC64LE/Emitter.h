@@ -137,6 +137,14 @@ public:
 
   void nop() { Emit32(0x60000000u); }  // ori r0, r0, 0
 
+  // POWER SMT thread-priority hints: architecturally nop-class `or rx,rx,rx`
+  // forms that adjust the hardware thread's dispatch priority (PPR). Problem
+  // state may set very-low/low/medium-low/medium; if a level is not permitted
+  // the instruction executes as a plain nop, so these are always safe to emit.
+  void smt_very_low_priority() { Emit32(0x7FFFFB78u); }  // or r31,r31,r31 (HMT_very_low)
+  void smt_low_priority()      { Emit32(0x7C210B78u); }  // or r1,r1,r1    (HMT_low)
+  void smt_medium_priority()   { Emit32(0x7C421378u); }  // or r2,r2,r2    (HMT_medium, default)
+
   // =========================================================================
   // Integer ALU
   // =========================================================================

@@ -253,6 +253,13 @@ void PPC64Dispatcher::EmitDispatcher() {
     // already performs several loads.
     li(r(0), 0);
 
+    // Spin-loop SMT priority safety net: a thread can leave a hint-marked
+    // spin region through a signal/suspend detour instead of a marked exit
+    // edge, arriving here still at very-low priority. Restore medium (the
+    // default) on every dispatcher-mediated entry. Architectural nop
+    // otherwise; see AnalyzeSpinLoops in JIT.cpp.
+    smt_medium_priority();
+
     // Load current RIP from Frame->State.rip
     int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
     ld(TMP1, rip_off, STATE);  // TMP1 = guest RIP
