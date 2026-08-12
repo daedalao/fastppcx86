@@ -995,11 +995,13 @@ namespace x64 {
       default: break;
       }
 
-      // DRM type 'd' (0x64) and udmabuf type 'u' (0x75) ioctls rely on
-      // _IOC encoding; translate their direction bits from x86's 2-bit
-      // layout to PPC's 3-bit layout.  Anything else passes through.
+      // DRM type 'd' (0x64), udmabuf type 'u' (0x75) and ntsync type 'N'
+      // (0x4E) ioctls rely on _IOC encoding; translate their direction bits
+      // from x86's 2-bit layout to PPC's 3-bit layout.  Anything else passes
+      // through.  ntsync payloads are fixed-width __u32/__u64 structs, so the
+      // command number is the only thing that needs translating.
       const uint32_t type = (cmd >> 8) & 0xFFu;
-      if (type != 0x64u && type != 0x75u) {
+      if (type != 0x64u && type != 0x75u && type != 0x4Eu) {
         return cmd;
       }
 
