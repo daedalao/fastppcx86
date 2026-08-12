@@ -2065,19 +2065,25 @@ DEF_OP(AdcWithFlags) {
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
   adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
-  rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may be the same register as S1 and/or S2 — DFCE's
+  // store-elimination lets the RA coalesce the SRA destination onto a source,
+  // so `adc eax,eax` arrives with Dst==S1==S2. Every source-derived flag bit
+  // must therefore come from the zx32 copies in TMP1/TMP2 BEFORE Dst is
+  // written. Reading S1/S2 after the Dst write computed OF from the result —
+  // (Dst^Dst)-shaped, always 0 — and broke `seto` after `adc` (2026-08-12
+  // differential probe; falsely pinned on the DFCE Remove arm at first).
+  // OF = (S1[31] == S2[31]) AND (S1[31] != Sum[31]); Sum[31] == Dst[31].
+  xor_(TMP2, TMP2, TMP1);                   // S1^S2
+  xor_(TMP1, TMP3, TMP1);                   // Sum^S1
+  andc(TMP1, TMP1, TMP2);                   // (Sum^S1) & ~(S1^S2): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);               // OF -> LSB (kept in TMP2)
 
   // CA = bit-32 of TMP3 = x86_CF_out, stored directly (CFInverted=false).
   rldicl(TMP4, TMP3, 32, 63);
 
-  // OF = (S1[31] == S2[31]) AND (S1[31] != Dst[31]).
-  rldicl(TMP1, S1,  33, 63);
-  rldicl(TMP2, S2,  33, 63);
-  rldicl(TMP3, Dst, 33, 63);
-  xor_(TMP2, TMP2, TMP1);
-  xor_(TMP3, TMP3, TMP1);
-  andc(TMP3, TMP3, TMP2);
+  rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
   // Patch XER: new CA = TMP4's LSB, new OV = TMP3's LSB.
   //
@@ -2101,7 +2107,7 @@ DEF_OP(AdcWithFlags) {
   // discarded — the same guarantee the sldi/or_ pair relied on.
   mfspr(TMP1, 1);
   rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
@@ -2129,25 +2135,26 @@ DEF_OP(SbbWithFlags) {
   rldicl(TMP1, S1, 0, 32);
   rldicl(TMP2, S2, 0, 32);
   subfe(TMP3, TMP2, TMP1);                 // TMP3 = TMP1 + ~TMP2 + CA_in
-  rldicl(Dst, TMP3, 0, 32);
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may alias S1/S2 (see AdcWithFlags) — derive OF from
+  // the zx32 copies BEFORE Dst is written.
+  // OF for SBB: (S1[31] != S2[31]) AND (S1[31] != Diff[31]); Diff[31] == Dst[31].
+  xor_(TMP2, TMP2, TMP1);                  // S1^S2
+  xor_(TMP1, TMP3, TMP1);                  // S1^Diff
+  and_(TMP1, TMP1, TMP2);                  // (S1^S2) AND (S1^Diff): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);              // OF -> LSB (kept in TMP2)
 
   // CF (CFInverted-stored) = NOT(bit 32 of TMP3).
   rldicl(TMP4, TMP3, 32, 63);              // bit 32 of TMP3 in LSB
   xori(TMP4, TMP4, 1);                      // invert LSB
 
-  // OF for SBB: (S1[31] != S2[31]) AND (S1[31] != Dst[31]).
-  rldicl(TMP1, S1,  33, 63);
-  rldicl(TMP2, S2,  33, 63);
-  rldicl(TMP3, Dst, 33, 63);
-  xor_(TMP2, TMP2, TMP1);                  // S1^S2
-  xor_(TMP3, TMP3, TMP1);                  // S1^Dst
-  and_(TMP3, TMP3, TMP2);                  // (S1^S2) AND (S1^Dst) = OF
+  rldicl(Dst, TMP3, 0, 32);
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
   // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
   rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
@@ -2202,24 +2209,27 @@ DEF_OP(AdcZeroWithFlags) {
   // i32Bit (and smaller): manual 32-bit add and patch XER.
   rldicl(TMP1, Src, 0, 32);                  // zx32(Src)
   add(TMP3, TMP1, TMP4);                     // TMP3 = zx32(Src) + x86_CF (≤ 33-bit)
-  rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may alias Src (see AdcWithFlags) — derive OF from the
+  // zx32 copy and the sum BEFORE Dst is written.
+  // OF for ADC-with-zero (carry ∈ {0,1}, sign-bit always 0):
+  // OF = !Src[31] AND Sum[31]; Sum[31] == Dst[31].
+  rldicl(TMP4, TMP3, 33, 63);                 // Sum[31] (TMP4's carry consumed by add)
+  rldicl(TMP1, TMP1, 33, 63);                 // Src[31] from the zx copy
+  xori(TMP1, TMP1, 1);                        // !Src[31]
+  and_(TMP4, TMP4, TMP1);                     // OF in LSB
 
   // CA = bit-32 of TMP3 = x86_CF_out, stored DIRECT (CFInverted=false) to match
   // the dispatcher's `CFInverted = false` after this op — same convention as
   // the 64-bit path above and AdcWithFlags' i32 path.
-  rldicl(TMP3, TMP3, 32, 63);
+  rldicl(TMP2, TMP3, 32, 63);
 
-  // OF for ADC-with-zero (TMP4 ∈ {0,1}, sign-bit always 0):
-  // OF = !Src[31] AND Dst[31]
-  rldicl(TMP1, Src, 33, 63);
-  xori(TMP1, TMP1, 1);                        // !Src[31]
-  rldicl(TMP4, Dst, 33, 63);                  // Dst[31]
-  and_(TMP4, TMP4, TMP1);                     // OF in LSB
+  rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
   // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 29, 2, 2);   // CA <- TMP2 LSB
   rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
