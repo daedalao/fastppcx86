@@ -1412,8 +1412,33 @@ public:
 
   // POWER8 ISA 2.07 crypto (AES + carry-less polynomial multiply + perm-xor).
   // VX-form except vpermxor which is VA-form. vsbox takes only VRA (VRB=0).
-  // x86 mappings: vcipher = AESENC round, vcipherlast = AESENCLAST,
-  // vncipher = AESDEC, vncipherlast = AESDECLAST, vsbox = AES InvSubBytes.
+  //
+  // BYTE ORDER: these read the AES state in BIG-ENDIAN order (state byte 0 ==
+  // BE byte element 0). This backend holds a guest XMM in the opposite image -
+  // guest byte 0 lands at BE element 15, see LoadUnalignedV128 - so callers
+  // must byte-reverse in and out. AES_REVMASK_VSX (PPC64Emitter.h) is the
+  // pinned mask for exactly that; EmitAESRevIn/EmitAESRevOut wrap it.
+  //
+  // x86 mappings, forward direction, exact:
+  //   vcipher(A,K)      == AESENC(A,K)       (FIPS-197 round, then ^K)
+  //   vcipherlast(A,K)  == AESENCLAST(A,K)
+  //   vncipherlast(A,K) == AESDECLAST(A,K)
+  //
+  // vncipher is NOT AESDEC. It implements the EQUIVALENT INVERSE CIPHER, which
+  // applies InvMixColumns AFTER the VRB xor rather than before:
+  //   vncipher(A,B) = InvMixColumns( InvSubBytes(InvShiftRows(A)) ^ B )
+  //   AESDEC(A,K)   = InvMixColumns( InvSubBytes(InvShiftRows(A)) ) ^ K
+  // Assuming they are the same op is what forced the old scalar software
+  // InvMixColumns helper. They reconcile for free: InvMixColumns is linear over
+  // GF(2), so InvMixColumns(0) == 0 and therefore
+  //   AESDEC(A,K) == vncipher(A, 0) ^ K
+  // i.e. pass a zero VRB and xor the round key yourself. Likewise
+  //   AESIMC(S)   == vncipher(vcipherlast(S, 0), 0)
+  // because vcipherlast(S,0) = ShiftRows(SubBytes(S)) and vncipher's leading
+  // InvShiftRows/InvSubBytes then cancel it, leaving pure InvMixColumns.
+  //
+  // vsbox is plain SubBytes. Being bytewise it is the one AES primitive that
+  // commutes with the byte reversal, so it needs no vperm bracketing.
   void vcipher    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1288); }
   void vcipherlast(VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1289); }
   void vncipher   (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1352); }
@@ -1424,6 +1449,19 @@ public:
   void vpmsumw    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1160); }
   void vpmsumd    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1224); }
   void vpermxor   (VR vrt, VR vra, VR vrb, VR vrc)    { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 45); }
+
+  // SHA-256 / SHA-512 sigma. VX-form, but the VRB field is not a register: it
+  // carries ST (1 bit) and SIX (4 bits) as VRB = (ST << 4) | SIX.
+  //   vshasigmaw ST=0 SIX=0    -> lane-wise sigma0 (x86 SHA256MSG1 helper)
+  //   vshasigmaw ST=0 SIX=0xF  -> lane-wise sigma1 (x86 SHA256MSG2 helper)
+  // These are lane-wise on 32-bit elements and need no byte reversal, since
+  // the JIT's element convention already matches (IR lane i at phys[12-4i]).
+  void vshasigmaw(VR vrt, VR vra, uint32_t st, uint32_t six) {
+    EmitVX(vrt.idx, vra.idx, ((st & 1u) << 4) | (six & 0xFu), 1666);
+  }
+  void vshasigmad(VR vrt, VR vra, uint32_t st, uint32_t six) {
+    EmitVX(vrt.idx, vra.idx, ((st & 1u) << 4) | (six & 0xFu), 1730);
+  }
 
   // mfvscr / mtvscr
   // VX-form XO occupies all 11 low bits and there is no Rc, so the XO value is

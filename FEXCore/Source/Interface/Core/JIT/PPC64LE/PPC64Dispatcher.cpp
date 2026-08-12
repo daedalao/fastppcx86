@@ -154,11 +154,32 @@ void PPC64Dispatcher::EmitDispatcher() {
   // Establish a standard ELFv2 stack frame for the C ABI.
   PushCalleeSavedRegisters();
 
-  // Establish the VZERO_VSX invariant for the life of this dispatcher frame:
-  // vs14 == f14 is callee-saved (Push/PopCalleeSavedRegisters handle the
-  // outer caller's value), non-volatile across every host call the JIT makes,
-  // and written nowhere else. See the VZERO_VSX comment in PPC64Emitter.h.
-  xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
+  // Establish the pinned-vector-constant invariants for the life of this
+  // dispatcher frame. Both live in the FPR-aliased low VSX bank, in the
+  // callee-saved f14-f31 block that Push/PopCalleeSavedRegisters brackets, so
+  // they are non-volatile across every host call the JIT makes and are written
+  // nowhere else. See the VZERO_VSX / AES_REVMASK_VSX comments in
+  // PPC64Emitter.h.
+  //
+  // Kept as one helper because there are TWO entries that must establish them
+  // (here, and the DispatcherLoopTopFillSRA cold entry reached from signal
+  // return / pause resume, where the host context's f14-f15 belong to some
+  // C++ callee and this prologue never ran). Anything pinned in future must
+  // be added here and will then be correct on both paths by construction.
+  const auto EmitPinnedVectorConstants = [this]() {
+    xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
+    // AES_REVMASK_VSX = {15,14,...,1,0}, built without memory or a constant
+    // pool: vspltisb -> {15,...,15}, lvsl @EA=0 -> {0,...,15}, subtract.
+    // lvsl's RA field encodes r0, which the ISA reads as a literal zero, and
+    // its RB reads GPR[0] which li pins to 0 on the line above - EA is 0 by
+    // both routes. VTMP1/VTMP2 (v30/v31) are scratch and dead at both entries.
+    li(GPRegs::r0, 0);
+    vspltisb(VTMP1, 15);
+    lvsl(VTMP2, GPRegs::r0, GPRegs::r0);
+    vsububm(VTMP1, VTMP1, VTMP2);
+    xxlor(AES_REVMASK_VSX, AsVSX(VTMP1), AsVSX(VTMP1));
+  };
+  EmitPinnedVectorConstants();
 
   // STATE (r27) = Frame* (r3)
   mr(STATE, r3);
@@ -213,10 +234,10 @@ void PPC64Dispatcher::EmitDispatcher() {
   PPC64Emitter::Label ThreadStopNoSpillLabel{};
   DispatcherLoopTopFillSRAAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   // Signal-return / pause-resume can land here from a redirected host context
-  // whose f14 was a C++ callee's live value, not this frame's zero — the
-  // DispatchPtr prologue's xxlxor didn't run on that path. Re-establish the
-  // VZERO_VSX invariant on this cold entry before refilling SRA.
-  xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
+  // whose f14/f15 were a C++ callee's live values, not this frame's constants —
+  // the DispatchPtr prologue never ran on that path. Re-establish every pinned
+  // vector constant on this cold entry before refilling SRA.
+  EmitPinnedVectorConstants();
   cmpdi(r4, 0);
   bc(CC_NE, &CompileSingleStepLabel);
   FillStaticRegs();

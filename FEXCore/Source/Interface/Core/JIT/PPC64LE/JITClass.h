@@ -756,6 +756,18 @@ private:
   FEXCore::Core::DebugData*   DebugData {};
 
   // -----------------------------------------------------------------------
+  // AES lowering helpers (VectorOps.cpp)
+  //
+  // The POWER8 cipher instructions read the AES state big-endian while a guest
+  // XMM is held with guest byte 0 at BE byte element 15, so every AES round is
+  // bracketed by a byte reversal against the pinned AES_REVMASK_VSX. These two
+  // wrap that bracketing; both use VTMP1 as scratch and pass the state in
+  // VTMP2. See the block comment above DEF_OP(VAESImc).
+  // -----------------------------------------------------------------------
+  void EmitAESStateIn(PPC64Emitter::VR Src);
+  void EmitAESStateOut(PPC64Emitter::VR Dst);
+
+  // -----------------------------------------------------------------------
   // Op handler declarations (filled in by the separate *.cpp files)
   // -----------------------------------------------------------------------
 #define DEF_OP(x) void Op_##x(IR::IROp_Header const* IROp, IR::Ref Node)

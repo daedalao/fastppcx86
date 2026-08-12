@@ -80,6 +80,30 @@ constexpr auto VTMP3_VSX = VSXR{12};
 // LoadFPRSized was ~one xxlxor per guest movss/movsd before this existed).
 constexpr auto VZERO_VSX = VSXR{14};
 
+// Pinned AES byte-reverse permute mask {15,14,...,1,0}, in the same RA-free
+// FPR-aliased half of the VSX file. vs15 == f15: the last free slot below the
+// AVX-high bank (which starts at vs16), and never otherwise named.
+//
+// WHY IT EXISTS: the POWER8 crypto ops (vcipher/vncipher/vpmsum*) read the AES
+// state in big-endian byte order, while a guest XMM sits in this backend's
+// registers in the opposite image - guest byte 0 lands at BE byte element 15
+// (see LoadUnalignedV128 / LoadFPRSized). The two conventions differ by a full
+// 128-bit byte reversal, and it cannot be algebraically absorbed: reversal maps
+// AES state index i -> 15-i, i.e. (row,col) -> (3-row,3-col), which changes
+// ShiftRows' shift direction and MixColumns' circulant. So every AES/PCLMUL
+// lowering brackets the crypto op with a pair of vperms against this mask.
+//
+// POWER9 could use a single xxbrq, but this tree targets POWER8, where the only
+// byte-granular permute is VMX-form vperm - and vperm cannot encode vs0-vs31.
+// Hence the mask is PARKED here (RA-free) and copied into a VMX temp with one
+// xxlor at each use, rather than burning a v0-v31 register the allocator wants.
+//
+// Same rules as VZERO_VSX: VSX-form instructions only, never written by the
+// backend after dispatcher entry. f15 is non-volatile under ELFv2 §2.2 and is
+// covered by the f14-f31 block that Push/PopCalleeSavedRegisters already saves,
+// so it survives host C++ calls and signal delivery without re-materialisation.
+constexpr auto AES_REVMASK_VSX = VSXR{15};
+
 // -------------------------------------------------------------------------
 // AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).
 //
