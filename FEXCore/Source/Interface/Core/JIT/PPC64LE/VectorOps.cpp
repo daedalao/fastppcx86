@@ -5584,7 +5584,7 @@ DEF_OP(VAESKeyGenAssist) {
   // KeyGenTBLSwizzle and ZeroReg remain valid IR sources so RA keeps the live
   // ranges sound, but no host instruction reads them on this path.
 
-  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  constexpr int32_t kScratchOff = offsetof(::FEXCore::Core::CpuStateFrame, JITScratch);
   static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
                 "JITScratch offset must fit in int16 for addi-based addressing");
 
@@ -5769,7 +5769,7 @@ DEF_OP(VSha256U1) {
   const auto Vn  = GetVReg(Op->Src1);
   const auto Vm  = GetVReg(Op->Src2);
 
-  constexpr int32_t kScratchOff = offsetof(FEXCore::Core::CpuStateFrame, JITScratch);
+  constexpr int32_t kScratchOff = offsetof(::FEXCore::Core::CpuStateFrame, JITScratch);
   static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
                 "JITScratch offset must fit in int16 for addi-based addressing");
 
