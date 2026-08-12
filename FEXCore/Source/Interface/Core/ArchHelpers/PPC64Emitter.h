@@ -45,8 +45,8 @@ constexpr auto VTMP2 = VR{31};
 
 // Third vector temporary, taken from the FPR-aliased half of the VSX file
 // (vs0-vs31) instead of the VMX pool, so it costs the register allocator
-// nothing. vs12 == f12, which this backend never names (only f0, f1, f2, f13
-// and f16 appear anywhere in the JIT).
+// nothing. vs12 == f12, which this backend never names (only f0, f1 and f2
+// appear as FPRs anywhere in the JIT — see CodeEmitter Registers.h FPRegs).
 //
 // TWO RULES, both different from VTMP1/VTMP2:
 //

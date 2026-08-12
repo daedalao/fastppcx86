@@ -274,7 +274,13 @@ private:
 
   void CalculateNextUses(IROp_CodeBlock* BlockIROp, IROp_Header* Until) {
     SourcesNextUses.clear();
-    NextUses.resize(IR->GetSSACount(), 0);
+    // resize() alone leaves stale next-use entries from earlier blocks (the
+    // SSA count doesn't change between calls). Today that is benign only by
+    // accident — dead defs are the sole readers of stale entries, and a
+    // stale 0 means "spill me first", which is the right answer for a dead
+    // def anyway. Zero explicitly so the "0 = no later use in this block"
+    // invariant is real rather than accidental.
+    NextUses.assign(IR->GetSSACount(), 0);
 
     // IP relative to the end of the block.
     uint32_t IP = 1;

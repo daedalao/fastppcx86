@@ -85,13 +85,17 @@ namespace GPRegs {
   static constexpr GPR r31 = r(31);  // RA pool
 }
 
-// Floating-point / vector register names
+// Floating-point register names. The backend names only f0-f2 as FPRs
+// (f0: op-local scratch + SpillForABICall's TMP2 stash; f1/f2: ELFv2 FP
+// argument/result registers in the FABI bridge and float compare paths).
+// The FPR-aliased low VSX bank is reached separately via VSXR (vs12 VTMP3,
+// vs14 VZERO — see ArchHelpers/PPC64Emitter.h); keep this comment in sync
+// with that file's inventory when claiming a new FPR name.
 namespace FPRegs {
   static constexpr FPR f0  = f(0);
   static constexpr FPR f1  = f(1);
-  // VTMP registers
   static constexpr FPR f2  = f(2);
-  static constexpr FPR f3  = f(3);
+  static constexpr FPR f3  = f(3);  // unnamed by the backend today
 }
 
 namespace VRegs {

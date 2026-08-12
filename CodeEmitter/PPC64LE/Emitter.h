@@ -81,14 +81,6 @@ static constexpr Cond InvertCond(Cond c) {
 }
 
 // ---------------------------------------------------------------------------
-// Relocation entry: a position in the code buffer that needs patching
-// ---------------------------------------------------------------------------
-struct PendingBranch {
-  int64_t patch_offset;  // byte offset in code buffer of the instruction
-  Label*  target;
-};
-
-// ---------------------------------------------------------------------------
 // Emitter class
 // ---------------------------------------------------------------------------
 class Emitter {
@@ -143,6 +135,9 @@ public:
   // state may set very-low/low/medium-low/medium; if a level is not permitted
   // the instruction executes as a plain nop, so these are always safe to emit.
   void smt_very_low_priority() { Emit32(0x7FFFFB78u); }  // or r31,r31,r31 (HMT_very_low)
+  // Unused: the spin-hint machinery drops straight to very_low and returns to
+  // medium. Kept as the reserved middle tier for waits that shouldn't yield
+  // that hard (e.g. short bounded spins).
   void smt_low_priority()      { Emit32(0x7C210B78u); }  // or r1,r1,r1    (HMT_low)
   void smt_medium_priority()   { Emit32(0x7C421378u); }  // or r2,r2,r2    (HMT_medium, default)
 
@@ -349,19 +344,10 @@ public:
     EmitX(31, rs.idx, ra.idx, sh, 824, 1);
   }
 
-  // sradi RA, RS, SH  (shift right algebraic doubleword immediate, XO 413)
-  // Encoding is special: SH field spans 5 bits plus 1 extra bit at bit position 30
+  // sradi RA, RS, SH  (shift right algebraic doubleword immediate, XS-form)
+  // XS-form: 9-bit XO=413 at bits [21:29], the 6th SH bit at bit 30, Rc at 31.
   void sradi(GPR ra, GPR rs, uint32_t sh) {
     assert(sh < 64);
-    // Format: op=31 | RS | RA | sh(low5) | XO=413 | sh(bit5) | Rc=0
-    // XO=413 occupies bits [21:29] but the extra SH bit is at bit 30
-    // Standard XO encoding would put XO in bits [22:30], but sradi is different:
-    // It's at bits [21:29] = 413 >> 1 and the extra sh bit is at bit 30 (= 413 & 1)
-    // Let me look at the exact encoding:
-    // sradi: primary opcode 31, bits[21:30]=0b1100111010 = 826, Rc at bit 31
-    // Wait, sradi XO is 413 but in the 10-bit XO field it's:
-    // XO field bits [21:30]: 413 = 0b110011101 (9 bits) but the top bit is the extra SH bit
-    // Actually: bits[21:29] = 413 (for sradi), bits[30] = sh>>5, bit[31]=Rc
     uint32_t sh_low = sh & 0x1F;
     uint32_t sh_high = (sh >> 5) & 1;
     Emit32((31u << 26) | (rs.idx << 21) | (ra.idx << 16) | (sh_low << 11) |
@@ -1252,12 +1238,12 @@ public:
   void vaddsbs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 768);  }
   void vaddshs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 832);  }
   void vaddsws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 896);  }
-  void vsububs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1536); }  // check XO
+  void vsububs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1536); }
   void vsubsbs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1792); }
   void vsubshs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1856); }
   void vsubsws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1920); }
-  void vsubuhs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1600); }  // check XO
-  void vsubuws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1664); }  // check XO
+  void vsubuhs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1600); }
+  void vsubuws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1664); }
 
   // Average (unsigned): vavgub XO=1026, vavguh XO=1090, vavguw XO=1154
   void vavgub(VR vrt, VR vra, VR vrb)   { EmitVX(vrt.idx, vra.idx, vrb.idx, 1026); }
@@ -1476,12 +1462,6 @@ public:
     Emit32((18u << 26) | (li << 2) | 1u);  // AA=0, LK=1
   }
 
-  // Branch to address (absolute)
-  void ba(uint64_t target) {
-    int64_t offset = static_cast<int64_t>(target) - static_cast<int64_t>(reinterpret_cast<uintptr_t>(Buffer + Offset));
-    b(static_cast<int32_t>(offset));
-  }
-
   // Branch relative using label
   void b(Label* lbl) {
     if (lbl->bound) {
@@ -1560,7 +1540,7 @@ public:
   // blrl: branch to link register and link
   void blrl() { Emit32((19u << 26) | (20u << 21) | (0u << 16) | (16u << 1) | 1u); }
 
-  // bcl (conditional branch and link to count/cond register)
+  // bclr: conditional branch to link register (XL-form, LK=0 — no link)
   void bclr(uint32_t bo, uint32_t bi) {
     Emit32((19u << 26) | (bo << 21) | (bi << 16) | (16u << 1) | 0u);
   }
