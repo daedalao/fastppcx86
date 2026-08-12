@@ -825,18 +825,18 @@
       },
       "DisableDFCEStoreElim": {
         "Type": "bool",
-        "Default": "true",
+        "Default": "false",
         "Desc": [
-          "Kill switch for the Remove arm of DeadFlagCalculationElimination (the rest of the pass stays on). FEX_DISABLEDFCESTOREELIM=0 turns the arm ON.",
-          "DEFAULT OFF since 2026-08-12: CONVICTED of a miscompile by a differential probe. stc;adc r,r;setc/seto chains interleaved with",
-          "shl/shr/add/xor flag writers in one large translation block produce wrong setcc outputs (register-allocation-sensitive: inserting",
-          "calls between the chains hides it; FEX_MAXINST=1 also hides it). Repro: scratchpad alias_probe.c from the 2026-08-12 session -- native",
-          "checksum 7a09edb86a169f26, with this arm enabled 9b43c6d5bff0bcbb, disabled matches native. Root-cause task open; do not re-enable",
-          "by default until the reproducer is green with the arm on.",
+          "Kill switch for the Remove arm of DeadFlagCalculationElimination (FEX_DISABLEDFCESTOREELIM=1 turns it OFF; the rest of the pass stays on).",
+          "HISTORY: briefly default-off on 2026-08-12 after a differential probe (alias_probe.c, native checksum 7a09edb86a169f26) showed wrong",
+          "seto output after adc r,r. Root cause was NOT this arm: it was the Adc/Sbb/AdcZero-WithFlags i32 lowerings reading their sources for",
+          "the OF computation AFTER writing Dst -- the arm's store elimination merely let the RA coalesce Dst onto a source (adc eax,eax ->",
+          "Dst==S1==S2), exposing the latent aliasing bug. Fixed in the same-day ALUOps commit; the probe is green with the arm on since.",
           "The arm deletes side-effecting flag writers (StorePF/StoreAF/StoreNZCV/ShiftFlags/TestNZ/...) whose written flags are dead per the",
-          "pass's converged cross-block liveness and whose SSA result is unused. Motivation for the arm: variable-shift/parity flag chains that",
+          "pass's converged cross-block liveness and whose SSA result is unused. Enabled by default because variable-shift/parity flag chains that",
           "stay dead-but-emitted dominate hot decompressor loops on PPC64LE, where NZCV lives in CR0/XER and every survived write costs an",
-          "mfocrf/mfxer/rlwimi packing storm. A wrong elimination surfaces as wrong flags/branches -- silent and data-dependent -- as observed."
+          "mfocrf/mfxer/rlwimi packing storm. A wrong elimination surfaces as wrong flags/branches -- silent and data-dependent -- hence the",
+          "field kill switch."
         ]
       },
       "DisableSpinLoopHint": {
