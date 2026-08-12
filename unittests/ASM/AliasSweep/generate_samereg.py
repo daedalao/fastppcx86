@@ -303,6 +303,10 @@ for op in ("adc", "sbb"):
       adc_cases.append((op, "r", val, cf))
 
 body = ADC_HDR.format(features="")
+# Suite convention (see CALL.asm): tests that touch the stack must point RSP
+# at the harness-mapped region themselves -- the default RSP is not usable
+# and pushfq faults without this.
+body += "mov rsp, 0xe8000000\n"
 for bit, (op, width, val, cf) in enumerate(adc_cases):
   if width == "e":
     ref_d, ref_s, ali = "ecx", "esi", "eax"

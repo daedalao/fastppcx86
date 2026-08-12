@@ -14,6 +14,7 @@
 ; RBX must be 0. A set bit convicts the lowering named at that bit's section.
 
 xor rbx, rbx
+mov rsp, 0xe8000000
 
 ; bit 0: adc ecx-width, V=0x7FFFFFFF, stc  (dst==src two-op form)
 mov ecx, 0x7FFFFFFF
