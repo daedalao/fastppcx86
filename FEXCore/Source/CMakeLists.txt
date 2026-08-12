@@ -62,10 +62,12 @@ list(APPEND SRCS
   Interface/IR/IRDumper.cpp
   Interface/IR/IREmitter.cpp
   Interface/IR/PassManager.cpp
+  Interface/IR/Passes/CompareBranchFusion.cpp
   Interface/IR/Passes/IRDumperPass.cpp
   Interface/IR/Passes/IRValidation.cpp
   Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
   Interface/IR/Passes/RegisterAllocationPass.cpp
+  Interface/IR/Passes/ScalarSplatChain.cpp
   Interface/IR/Passes/x87StackOptimizationPass.cpp
   Utils/LongJump.cpp
   Utils/Telemetry.cpp

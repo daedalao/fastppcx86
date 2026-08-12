@@ -1246,6 +1246,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       if (Config.GDBSymbols()) {
         GDBJITRegister(MappedSection->FileInfo, MappedSection->FileStartVA, GuestRIP, (uintptr_t)CodePtr, *DebugData);
       }
+    } else if (Config.LibraryJITNaming()) {
+      // No file section — the code may live in a manually-loaded image in
+      // anonymous memory (wine's main PE), which the frontend can still
+      // identify. Naming only: GDBJIT needs a real file to read and is
+      // deliberately not fed a synthesized label.
+      if (const char* AnonImage = SyscallHandler->LookupAnonymousExecImageName(Thread, GuestRIP)) {
+        Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CompiledCode.BlockBegin, CompiledCode.Size, AnonImage);
+      }
     }
   }
 

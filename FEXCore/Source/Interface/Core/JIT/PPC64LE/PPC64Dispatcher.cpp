@@ -154,6 +154,12 @@ void PPC64Dispatcher::EmitDispatcher() {
   // Establish a standard ELFv2 stack frame for the C ABI.
   PushCalleeSavedRegisters();
 
+  // Establish the VZERO_VSX invariant for the life of this dispatcher frame:
+  // vs14 == f14 is callee-saved (Push/PopCalleeSavedRegisters handle the
+  // outer caller's value), non-volatile across every host call the JIT makes,
+  // and written nowhere else. See the VZERO_VSX comment in PPC64Emitter.h.
+  xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
+
   // STATE (r27) = Frame* (r3)
   mr(STATE, r3);
 
@@ -206,6 +212,11 @@ void PPC64Dispatcher::EmitDispatcher() {
   // hence this label.
   PPC64Emitter::Label ThreadStopNoSpillLabel{};
   DispatcherLoopTopFillSRAAddress = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
+  // Signal-return / pause-resume can land here from a redirected host context
+  // whose f14 was a C++ callee's live value, not this frame's zero — the
+  // DispatchPtr prologue's xxlxor didn't run on that path. Re-establish the
+  // VZERO_VSX invariant on this cold entry before refilling SRA.
+  xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
   cmpdi(r4, 0);
   bc(CC_NE, &CompileSingleStepLabel);
   FillStaticRegs();

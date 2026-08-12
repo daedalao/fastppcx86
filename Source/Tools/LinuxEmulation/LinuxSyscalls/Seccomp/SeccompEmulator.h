@@ -49,6 +49,13 @@ struct SeccompFilterInfo final {
   uint64_t RefCount;
   uint32_t FilterInstructions;
   bool ShouldLog;
+  // Which seccomp_data fields the program can load, discovered by a one-time
+  // scan at install. A filter that reads neither the instruction pointer nor
+  // the arguments produces a verdict that depends only on (arch, nr), which
+  // makes the per-thread ALLOW cache in ExecuteFilter sound; ReadsIP alone
+  // gates the RIP reconstruction.
+  bool ReadsIP;
+  bool ReadsArgs;
 };
 
 class SeccompEmulator final {
@@ -70,12 +77,22 @@ public:
     uint64_t Result;
   };
   ExecuteFilterResult ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC, FEXCore::HLE::SyscallArguments* Args);
+  // The interpreting path behind ExecuteFilter's cache probe. noinline keeps
+  // its register-heavy frame (the inlined BPF interpreter saves 15+ GPRs and
+  // vector state in its prologue) off the per-syscall fast path.
+  [[gnu::noinline]] ExecuteFilterResult ExecuteFilterSlow(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC,
+                                                          FEXCore::HLE::SyscallArguments* Args, FEX::HLE::ThreadStateObject* Thread,
+                                                          uint64_t PrecomputedRIP, bool HaveRIP);
   int GetKillSignal() const {
     return CurrentKillSignal;
   }
 
   std::optional<int> SerializeFilters(FEXCore::Core::CpuStateFrame* Frame);
   void DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, int FD);
+
+  // Bumped on every filter-set mutation (install, TSYNC, execve inherit);
+  // per-thread verdict caches compare against it and rebuild on mismatch.
+  std::atomic<uint64_t> FilterGeneration {1};
 
 private:
   FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
@@ -101,6 +118,10 @@ private:
   void TSyncFilters(FEXCore::Core::CpuStateFrame* Frame);
 
   static void DumpProgram(const sock_fprog* prog);
+
+  // One-time scan of a validated program for which seccomp_data fields it can
+  // load; fills Filter.ReadsIP/ReadsArgs (conservatively on anything odd).
+  static void AnalyzeFilterLoads(SeccompFilterInfo& Filter);
 
   // Multiple filter instruction count penalty.
   // When multiple filters are installed there is a penalty per filter counted towards the maximum number of instructions.

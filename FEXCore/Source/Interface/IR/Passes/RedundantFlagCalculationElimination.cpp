@@ -8,7 +8,9 @@ $end_info$
 #include "Interface/IR/IR.h"
 #include "Interface/IR/IREmitter.h"
 #include "Interface/IR/PassManager.h"
+#include "Interface/IR/Passes.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
@@ -152,8 +154,14 @@ public:
   void Run(IREmitter* IREmit) override;
 
 private:
-  FlagInfo Classify(IROp_Header* Node);
-  unsigned FlagsForCondClassType(CondClass Cond);
+  FEX_CONFIG_OPT(DisableDFCEStoreElim, DISABLEDFCESTOREELIM);
+
+public:
+  // Stateless, and shared with CompareBranchFusion via IROpWritesNZCV below.
+  static FlagInfo Classify(IROp_Header* Node);
+  static unsigned FlagsForCondClassType(CondClass Cond);
+
+private:
   bool EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
@@ -442,6 +450,15 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
   FEX_UNREACHABLE;
 }
 
+// Exported for CompareBranchFusion, which must walk backwards past everything
+// that is NOT a flag writer to find the compare feeding a branch. An op missing
+// from a private copy of that set would let it walk past a real NZCV write and
+// fuse the wrong compare -- silent and data-dependent -- so the answer is
+// derived from the table above rather than restated.
+bool IROpWritesNZCV(IROp_Header* IROp) {
+  return (DeadFlagCalculationEliminination::Classify(IROp).Write() & FLAG_NZCV) != 0;
+}
+
 // General purpose dead code elimination. Returns whether flag handling should
 // be skipped (because it was removed or could not possibly affect flags).
 bool DeadFlagCalculationEliminination::EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp) {
@@ -622,63 +639,32 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         bool Eliminated = false;
 
         if ((FlagsRead & Info.Write()) == 0) {
-          // !HasSideEffects is load-bearing, and the `&&` placement matters.
-          //
           // EliminateDeadCode() above already refuses to drop side-effecting
           // ops, so anything that reaches here with GetUses()==0 is
-          // side-effecting by construction. Without this guard we deleted it
-          // anyway: an op like StoreNZCV / StorePF / StoreAF /
-          // InvalidateFlags / AdcWithFlags has its *observable* effect in the
-          // flag state, not in its SSA result, so "no SSA users" does not
-          // make it dead. Removing it silently drops the flag write that a
-          // later LoadNZCV / LoadPF / LoadAF in another block still reads --
-          // a wrong conditional branch, data-dependent and silent. This was
-          // the real cause of the two 2026-05-11 PPC64LE reproducers that got
-          // the whole pass switched off (32-bit ld.so _dl_sort_maps_dfs
-          // 'rpo_head == rpo'; bash setup_variables SEGV).
+          // side-effecting by construction -- an op like StoreNZCV / StorePF /
+          // StoreAF / ShiftFlags has its *observable* effect in the flag
+          // state, not in its SSA result. Removing it here is nonetheless
+          // sound: this arm is only reached when every flag the op writes is
+          // dead per the converged cross-block liveness ((FlagsRead &
+          // Info.Write()) == 0), and for CanEliminate/Replacement ops the
+          // flag write IS the side effect. Note the flags-precision caveat:
+          // like the in-place Replacement rewrites below, removal makes dead
+          // flag state imprecise at a synchronous fault between the removed
+          // write and the overwriting one -- a trade FEX already makes.
           //
-          // Keeping the test INSIDE this `if` rather than around the whole
-          // block is deliberate: a guarded-out op now falls through to the
-          // `else if (Info.Replacement())` arm and is REWRITTEN in place
-          // (AdcWithFlags -> Adc, SubWithFlags -> Sub, ...) instead of
-          // deleted. That preserves most of the win for the 6 ops that carry
-          // a Replacement (And/Add/Sub/Adc/Sbb/AdcZeroWithFlags). The
-          // remaining reachable ops are CanEliminate-only, so for them this
-          // is a genuine loss of optimization, not a reroute -- accepted,
-          // because correctness is not negotiable here.
-          //
-          // NOTE: as of today every IR op that can reach this site is
-          // HasSideEffects:true in IR.json, so the Remove arm is dead in
-          // practice. It is kept (rather than deleted) so that adding a
-          // non-side-effecting CanEliminate/Replacement op to IR.json keeps
-          // working. The ERROR_AND_DIE_FMT tripwire inside the branch is what
-          // makes deleting this conjunct fail loudly instead of silently.
-          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !IR::HasSideEffects(IROp->Op)) {
-            // Guard tripwire. Deliberately redundant with the `!HasSideEffects`
-            // conjunct above -- that is the whole point, and it is why this is
-            // ERROR_AND_DIE_FMT (release-visible) rather than a LOGMAN assert.
-            //
-            // Measured 2026-08-05: deleting `&& !IR::HasSideEffects(...)` from
-            // the condition changes NOTHING observable -- the full ASM suite
-            // (6702 tests, release and assertions), both 2026-05-11
-            // reproducers and 60 bash startups all still pass. So without this
-            // line nothing in CI notices the guard going away. A LOGMAN assert
-            // is not enough either: the harness's assert handler prints and
-            // continues, so the tests still report green (verified).
-            //
-            // With the conjunct present this is unreachable, so it costs
-            // nothing. Without it, the first StorePF of the first translated
-            // block trips it and every single test dies. Instrumenting this
-            // site showed what the guard blocks on ONE listsort run: StorePF
-            // 4847, StoreAF 2665, InvalidateFlags 2171, StoreNZCV 728,
-            // SubWithFlags 563, SubNZCV 235, ShiftFlags 32, TestNZ 26,
-            // CondSubNZCV 18, AddNZCV 8, AndWithFlags 1, AddWithFlags 1 --
-            // constantly exercised, just not observable today.
-            if (IR::HasSideEffects(IROp->Op)) {
-              ERROR_AND_DIE_FMT("DFCE: about to Remove side-effecting op {} -- the !HasSideEffects guard on this "
-                                "branch has been deleted",
-                                IR::GetName(IROp->Op));
-            }
+          // History: from 2026-08-05 to 2026-08-10 this arm additionally
+          // required !IR::HasSideEffects(op), which made it unreachable (every
+          // op classified CanEliminate/Replacement is side-effecting in
+          // IR.json) -- so no flag store was ever removed, and hot
+          // shift-flag/parity chains survived whole (measured: the W3 asset
+          // decompressor block spent most of its host instructions on dead
+          // CR0/XER<->GPR flag packing). The guard dated to the 2026-05-11
+          // reproducers (32-bit ld.so _dl_sort_maps_dfs; bash SEGV), which no
+          // longer reproduce with it removed (verified 2026-08-05: full ASM
+          // suite, both reproducers, 60 bash startups; re-verified when this
+          // knob landed). FEX_DISABLEDFCESTOREELIM=1 restores the guarded
+          // behaviour in the field without a rebuild.
+          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0 && !DisableDFCEStoreElim()) {
             IREmit->Remove(CodeNode);
             Eliminated = true;
           } else if (Info.Replacement()) {

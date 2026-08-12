@@ -18,6 +18,7 @@ $end_info$
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <cstring>
 #include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/bpf_common.h>
@@ -327,6 +328,7 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
     }
 
     auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, SFilter.FilterInstructions, SFilter.ShouldLog});
+    AnalyzeFilterLoads(it);
     TotalFilterInstructions += SFilter.FilterInstructions;
 
     // Append the filter to the thread.
@@ -334,7 +336,38 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
   }
 
   Thread->SeccompMode = Header.SeccompMode;
+  FilterGeneration.fetch_add(1, std::memory_order_relaxed);
   close(FD);
+}
+
+void SeccompEmulator::AnalyzeFilterLoads(SeccompFilterInfo& Filter) {
+  // seccomp cBPF may only read seccomp_data through 32-bit BPF_ABS loads (the
+  // validator enforces alignment and bounds); BPF_MEM touches scratch memory
+  // and BPF_IMM/BPF_LEN don't read the data at all. Anything else shouldn't
+  // pass validation -- treat it as reading everything so the caches stay off.
+  bool ReadsIP {};
+  bool ReadsArgs {};
+  for (const auto& Inst : Filter.Program) {
+    const uint16_t Class = BPF_CLASS(Inst.code);
+    if (Class != BPF_LD && Class != BPF_LDX) {
+      continue;
+    }
+    const uint16_t Mode = BPF_MODE(Inst.code);
+    if (Mode == BPF_IMM || Mode == BPF_MEM || Mode == BPF_LEN) {
+      continue;
+    }
+    if (Mode != BPF_ABS) {
+      ReadsIP = ReadsArgs = true;
+      break;
+    }
+    if (Inst.k >= offsetof(seccomp_data, args)) {
+      ReadsArgs = true;
+    } else if (Inst.k >= offsetof(seccomp_data, instruction_pointer)) {
+      ReadsIP = true;
+    }
+  }
+  Filter.ReadsIP = ReadsIP;
+  Filter.ReadsArgs = ReadsArgs;
 }
 
 SeccompEmulator::ExecuteFilterResult
@@ -346,8 +379,73 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     return {false, 0};
   }
 
-  // Reconstruct the RIP from the JITPC.
-  const uint64_t RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+  // Revalidate the per-thread verdict cache against the filter-set generation.
+  using VerdictCache = decltype(Thread->SeccompCache);
+  auto& Cache = Thread->SeccompCache;
+  const uint64_t CurrentGen = FilterGeneration.load(std::memory_order_relaxed);
+  if (Cache.Generation != CurrentGen) [[unlikely]] {
+    bool AnyArgs = false;
+    bool AnyIP = false;
+    for (const auto* Filter : Thread->Filters) {
+      AnyArgs |= Filter->ReadsArgs;
+      AnyIP |= Filter->ReadsIP;
+    }
+    Cache.Mode = AnyArgs ? VerdictCache::CacheMode::None :
+                 AnyIP  ? VerdictCache::CacheMode::NrRIP :
+                          VerdictCache::CacheMode::NrOnly;
+    Cache.NeedsRIP = AnyIP;
+    memset(Cache.AllowedNrs, 0, sizeof(Cache.AllowedNrs));
+    memset(Cache.RIPAllowed, 0, sizeof(Cache.RIPAllowed));
+    Cache.Generation = CurrentGen;
+  }
+
+  // Fast paths: replay a previous ALLOW verdict when the cache key covers
+  // every seccomp_data field the installed programs can load. ALLOW has no
+  // side effects (never logs, never signals), so skipping the interpreter is
+  // invisible to the guest. The probes stay in this thin wrapper so the hot
+  // per-syscall path never builds ExecuteFilterSlow's register-heavy frame.
+  const uint64_t Nr = Args->Argument[0];
+  if (Cache.Mode == VerdictCache::CacheMode::NrOnly) {
+    if (Nr < VerdictCache::MAX_CACHED_NR && (Cache.AllowedNrs[Nr / 64] & (1ULL << (Nr % 64)))) {
+      return {false, 0};
+    }
+  } else if (Cache.Mode == VerdictCache::CacheMode::NrRIP) {
+    // Guest-RIP reconstruction is cheap (never registered in profiles); the
+    // expense this probe avoids is the interpreter frame + program walk.
+    const uint64_t RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+    const auto& Entry = Cache.RIPAllowed[(RIP ^ (RIP >> 7) ^ Nr) & (VerdictCache::RIP_WAYS - 1)];
+    if (Entry.RIP == RIP && Entry.NrPlusOne == Nr + 1) {
+      return {false, 0};
+    }
+    return ExecuteFilterSlow(Frame, JITPC, Args, Thread, RIP, true);
+  }
+
+  return ExecuteFilterSlow(Frame, JITPC, Args, Thread, 0, false);
+}
+
+SeccompEmulator::ExecuteFilterResult SeccompEmulator::ExecuteFilterSlow(FEXCore::Core::CpuStateFrame* Frame, uint64_t JITPC,
+                                                                        FEXCore::HLE::SyscallArguments* Args,
+                                                                        FEX::HLE::ThreadStateObject* Thread, uint64_t PrecomputedRIP,
+                                                                        bool HaveRIP) {
+  using VerdictCache = decltype(Thread->SeccompCache);
+  auto& Cache = Thread->SeccompCache;
+  const uint64_t Nr = Args->Argument[0];
+
+  // The rare non-ALLOW verdicts that need a RIP for audit logs or SIGSYS info
+  // reconstruct it on demand.
+  uint64_t RIP = PrecomputedRIP;
+  bool RIPValid = HaveRIP;
+  if (!RIPValid && Cache.NeedsRIP) {
+    RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+    RIPValid = true;
+  }
+  auto GetRIP = [&]() {
+    if (!RIPValid) {
+      RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+      RIPValid = true;
+    }
+    return RIP;
+  };
 
   const auto Arch = Is64BitMode() ? AUDIT_ARCH_X86_64 : AUDIT_ARCH_I386;
   bool ShouldLog {};
@@ -410,6 +508,16 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   const auto ActionMasked = SeccompResult & SECCOMP_RET_ACTION_FULL;
   const auto DataMasked = SeccompResult & SECCOMP_RET_DATA;
 
+  if (ActionMasked == SECCOMP_RET_ALLOW) {
+    if (Cache.Mode == VerdictCache::CacheMode::NrOnly && Nr < VerdictCache::MAX_CACHED_NR) {
+      Cache.AllowedNrs[Nr / 64] |= 1ULL << (Nr % 64);
+    } else if (Cache.Mode == VerdictCache::CacheMode::NrRIP) {
+      // NrRIP mode always enters with HaveRIP: RIP here is the same value the
+      // wrapper's probe will compute for the next hit.
+      Cache.RIPAllowed[(RIP ^ (RIP >> 7) ^ Nr) & (VerdictCache::RIP_WAYS - 1)] = {RIP, Nr + 1};
+    }
+  }
+
   // Logging rules
   // - Log if explicitly returning SECCOMP_RET_LOG
   // - Log if the filter enabled the logging flag and the action is something other than SECCOMP_RET_ALLOW.
@@ -429,7 +537,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     clock_gettime(CLOCK_MONOTONIC, &tp);
     LogMan::Msg::IFmt("audit: type={} audit({}.{:03}:{}): uid={} gid={} pid={} comm={} sig={} arch={:x} syscall={} ip=0x{:x} code=0x{:x}",
                       AUDIT_SECCOMP, tp.tv_sec, tp.tv_nsec / 1'000'000, AuditSerialIncrement(), ::getuid(), ::getgid(), ::getpid(),
-                      Filename(), Signal, Arch, Args->Argument[0], RIP, SeccompResult);
+                      Filename(), Signal, Arch, Args->Argument[0], GetRIP(), SeccompResult);
   }
 
   switch (ActionMasked) {
@@ -462,7 +570,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
       .si_code = 1, // SYS_SECCOMP
     };
 
-    Info.si_call_addr = reinterpret_cast<void*>(RIP);
+    Info.si_call_addr = reinterpret_cast<void*>(GetRIP());
     Info.si_syscall = Args->Argument[0];
     Info.si_arch = Arch;
 
@@ -695,6 +803,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     // Copy the program out of guest memory: the guest may reuse or unmap its buffer the moment this returns.
     fextl::vector<sock_filter> Program(prog->filter, prog->filter + prog->len);
     auto& it = Filters.emplace_back(SeccompFilterInfo {std::move(Program), 1, prog->len, LoggingEnabled});
+    AnalyzeFilterLoads(it);
     TotalFilterInstructions += prog->len;
 
     // Append the filter to the thread.
@@ -703,6 +812,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
       TSyncFilters(Frame);
     }
+    FilterGeneration.fetch_add(1, std::memory_order_relaxed);
   }
 
   return Result;

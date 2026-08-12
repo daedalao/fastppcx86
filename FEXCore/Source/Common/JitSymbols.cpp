@@ -76,7 +76,13 @@ void JITSymbols::Register(FEXCore::JITSymbolBuffer* Buffer, const void* HostAddr
   }
 
   Buffer->Offset += FMTResult.size;
-  WriteBuffer(Buffer);
+  // Write-through: JIT naming is an opt-in profiling mode, and a buffered
+  // entry is worthless if it never lands — a worker thread that compiles its
+  // spin/park loop once and then never registers again would otherwise hold
+  // its entries forever (observed on Dex: 77% of samples at three unnamed
+  // PCs; the park blocks were exactly the ones stuck in thread buffers). One
+  // write(2) per compiled block is noise next to the compile itself.
+  WriteBuffer(Buffer, true);
 }
 
 void JITSymbols::Register(FEXCore::JITSymbolBuffer* Buffer, const void* HostAddr, uint32_t CodeSize, std::string_view Name, uintptr_t Offset) {
@@ -101,7 +107,13 @@ void JITSymbols::Register(FEXCore::JITSymbolBuffer* Buffer, const void* HostAddr
   }
 
   Buffer->Offset += FMTResult.size;
-  WriteBuffer(Buffer);
+  // Write-through: JIT naming is an opt-in profiling mode, and a buffered
+  // entry is worthless if it never lands — a worker thread that compiles its
+  // spin/park loop once and then never registers again would otherwise hold
+  // its entries forever (observed on Dex: 77% of samples at three unnamed
+  // PCs; the park blocks were exactly the ones stuck in thread buffers). One
+  // write(2) per compiled block is noise next to the compile itself.
+  WriteBuffer(Buffer, true);
 }
 
 void JITSymbols::RegisterNamedRegion(FEXCore::JITSymbolBuffer* Buffer, const void* HostAddr, uint32_t CodeSize, std::string_view Name) {
@@ -125,13 +137,25 @@ void JITSymbols::RegisterNamedRegion(FEXCore::JITSymbolBuffer* Buffer, const voi
   }
 
   Buffer->Offset += FMTResult.size;
-  WriteBuffer(Buffer);
+  // Write-through: JIT naming is an opt-in profiling mode, and a buffered
+  // entry is worthless if it never lands — a worker thread that compiles its
+  // spin/park loop once and then never registers again would otherwise hold
+  // its entries forever (observed on Dex: 77% of samples at three unnamed
+  // PCs; the park blocks were exactly the ones stuck in thread buffers). One
+  // write(2) per compiled block is noise next to the compile itself.
+  WriteBuffer(Buffer, true);
 }
 
 void JITSymbols::WriteBuffer(FEXCore::JITSymbolBuffer* Buffer, bool ForceWrite) {
   auto Now = std::chrono::steady_clock::now();
   if (!ForceWrite) {
-    if (((Buffer->LastWrite - Now) < Buffer->MAXIMUM_THRESHOLD) && Buffer->Offset < Buffer->NEEDS_WRITE_DISTANCE) {
+    // Operand order matters: LastWrite - Now is a negative duration, which is
+    // always below the threshold — written the original way, the time-based
+    // flush never fired and entries only ever left a buffer via the size
+    // clause. Kept for non-Register callers, but note the threshold can only
+    // help threads that keep registering: it is checked from inside Register,
+    // so a thread's final entries otherwise sit unflushed forever.
+    if (((Now - Buffer->LastWrite) < Buffer->MAXIMUM_THRESHOLD) && Buffer->Offset < Buffer->NEEDS_WRITE_DISTANCE) {
       // Still buffering, no need to write.
       return;
     }

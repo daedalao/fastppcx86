@@ -5,11 +5,14 @@ desc: Uses glXGetProcAddress instead of dlsym
 $end_info$
 */
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string_view>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -410,6 +413,27 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glUnmapNamedBuffer;
   } else if (name_sv == "glUnmapNamedBufferEXT") {
     return (VoidFn)fexfn_impl_libGL_glUnmapNamedBufferEXT;
+    // Explicit flush. Same reason as the map/unmap entries above, and it is the
+    // one that matters most for Unity: it resolves the whole buffer-mapping
+    // family through glXGetProcAddress, and a flush that reaches the driver
+    // without going through the staging copy uploads the range as it was at map
+    // time.
+    //
+    // Each is gated on the host actually exporting it. glXGetProcAddress is
+    // spec'd to return non-null for unsupported functions, but titles use it as
+    // a support probe (see the Psychonauts note above), and unlike the map
+    // family these are not universally present -- APPLE_flush_buffer_range is
+    // not a Mesa extension and the DSA spellings need GL 4.5 / EXT_DSA. Handing
+    // back an impl that forwards into a null loader pointer would turn "not
+    // supported" into a crash.
+  } else if (name_sv == "glFlushMappedBufferRange") {
+    return fexldr_ptr_libGL_glFlushMappedBufferRange ? (VoidFn)fexfn_impl_libGL_glFlushMappedBufferRange : nullptr;
+  } else if (name_sv == "glFlushMappedBufferRangeAPPLE") {
+    return fexldr_ptr_libGL_glFlushMappedBufferRangeAPPLE ? (VoidFn)fexfn_impl_libGL_glFlushMappedBufferRangeAPPLE : nullptr;
+  } else if (name_sv == "glFlushMappedNamedBufferRange") {
+    return fexldr_ptr_libGL_glFlushMappedNamedBufferRange ? (VoidFn)fexfn_impl_libGL_glFlushMappedNamedBufferRange : nullptr;
+  } else if (name_sv == "glFlushMappedNamedBufferRangeEXT") {
+    return fexldr_ptr_libGL_glFlushMappedNamedBufferRangeEXT ? (VoidFn)fexfn_impl_libGL_glFlushMappedNamedBufferRangeEXT : nullptr;
 #endif
 #ifdef IS_32BIT_THUNK
   } else if (name_sv == "glBindBuffersRange") {
@@ -523,25 +547,68 @@ GLuint fexfn_impl_libGL_glCreateShaderProgramv(GLuint a_0, GLsizei count, guest_
   return fexldr_ptr_libGL_glCreateShaderProgramv(a_0, count, sources);
 }
 
+#ifdef IS_32BIT_THUNK
+namespace {
+// Defined with the buffer-mapping staging cache further down. GL_BUFFER_MAP_POINTER
+// has to answer with the staging buffer, because that -- not the driver's
+// mapping -- is what glMapBuffer* handed the guest. Returning the host mapping
+// would narrow a 0x3fff'xxxx'xxxx pointer into a 32-bit slot, which is the
+// truncation 6b8ac0a56 made fatal. Return 0 when there is no live mapping, in
+// which case the query falls through to the driver, whose answer is then the
+// null that an unmapped buffer is required to report.
+uintptr_t StagingPointerForTarget(GLenum target);
+uintptr_t StagingPointerForName(GLuint buffer);
+
+// Shared by the four GL_BUFFER_MAP_POINTER queries below.
+bool WriteStagingPointer(uintptr_t Staging, guest_layout<void**>& GuestOut) {
+  if (!Staging) {
+    return false;
+  }
+  *GuestOut.get_pointer() = guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
+  return true;
+}
+} // namespace
+#endif
+
 void fexfn_impl_libGL_glGetBufferPointerv(GLenum a_0, GLenum a_1, guest_layout<void**> GuestOut) {
+#ifdef IS_32BIT_THUNK
+  if (a_1 == GL_BUFFER_MAP_POINTER && WriteStagingPointer(StagingPointerForTarget(a_0), GuestOut)) {
+    return;
+  }
+#endif
   void* HostOut;
   fexldr_ptr_libGL_glGetBufferPointerv(a_0, a_1, &HostOut);
   *GuestOut.get_pointer() = to_guest(to_host_layout(HostOut));
 }
 
 void fexfn_impl_libGL_glGetBufferPointervARB(GLenum a_0, GLenum a_1, guest_layout<void**> GuestOut) {
+#ifdef IS_32BIT_THUNK
+  if (a_1 == GL_BUFFER_MAP_POINTER && WriteStagingPointer(StagingPointerForTarget(a_0), GuestOut)) {
+    return;
+  }
+#endif
   void* HostOut;
   fexldr_ptr_libGL_glGetBufferPointervARB(a_0, a_1, &HostOut);
   *GuestOut.get_pointer() = to_guest(to_host_layout(HostOut));
 }
 
 void fexfn_impl_libGL_glGetNamedBufferPointerv(GLuint a_0, GLenum a_1, guest_layout<void**> GuestOut) {
+#ifdef IS_32BIT_THUNK
+  if (a_1 == GL_BUFFER_MAP_POINTER && WriteStagingPointer(StagingPointerForName(a_0), GuestOut)) {
+    return;
+  }
+#endif
   void* HostOut;
   fexldr_ptr_libGL_glGetNamedBufferPointerv(a_0, a_1, &HostOut);
   *GuestOut.get_pointer() = to_guest(to_host_layout(HostOut));
 }
 
 void fexfn_impl_libGL_glGetNamedBufferPointervEXT(GLuint a_0, GLenum a_1, guest_layout<void**> GuestOut) {
+#ifdef IS_32BIT_THUNK
+  if (a_1 == GL_BUFFER_MAP_POINTER && WriteStagingPointer(StagingPointerForName(a_0), GuestOut)) {
+    return;
+  }
+#endif
   void* HostOut;
   fexldr_ptr_libGL_glGetNamedBufferPointervEXT(a_0, a_1, &HostOut);
   *GuestOut.get_pointer() = to_guest(to_host_layout(HostOut));
@@ -712,16 +779,26 @@ void fexfn_impl_libGL_glTransformFeedbackVaryingsEXT(GLuint program, GLsizei cou
 // map would leak the guest's 4 GiB heap within minutes of gameplay. A game uses
 // a bounded set of targets, so the cache is bounded too.
 //
-// GL_MAP_FLUSH_EXPLICIT_BIT is not honoured: the whole mapped range is copied
-// back on unmap rather than only the explicitly flushed sub-ranges, and
-// glFlushMappedBufferRange stays a passthrough whose effect the unmap copy
-// subsumes. That costs bandwidth but is correct, *given* the unconditional
-// seeding above — without it, untouched bytes carry stale contents back into
-// the buffer, which is a correctness bug and not merely a slow path.
+// GL_MAP_FLUSH_EXPLICIT_BIT needs the flush itself to be intercepted, and this
+// is why: glFlushMappedBufferRange is the point at which the driver takes the
+// mapped range's current contents. Under the staging scheme the guest's writes
+// are in the staging buffer, and nothing has copied them into the driver's
+// mapping yet — the copy used to happen only at unmap, strictly *after* every
+// flush. So the driver latched the range as it stood at map time, i.e. the
+// seeded (previous) contents, and for a FLUSH_EXPLICIT mapping the unmap copy
+// that followed was not required to be uploaded at all: GL only promises to
+// upload sub-ranges that were explicitly flushed.
 //
-// Honouring the flag properly would mean a custom glFlushMappedBufferRange that
-// records flushed sub-ranges and copying back only those. Worth doing if buffer
-// upload ever shows up in a profile.
+// That is one frame's geometry surviving into the next — the same visible
+// failure the unconditional seeding above was written for, which seeding could
+// only change from "random garbage" into "last frame's contents".
+//
+// So the four flush entry points get custom impls on 32-bit that copy the
+// flushed sub-range staging -> host mapping before forwarding. The full
+// copy-back at unmap stays: it is what serves mappings *without*
+// FLUSH_EXPLICIT, and for a flushed mapping it rewrites bytes that already
+// match. Copying back only the flushed sub-ranges is a bandwidth optimisation
+// that can come later; unlike this, it is not a correctness matter.
 #ifdef IS_32BIT_THUNK
 namespace {
 struct MappedBuffer {
@@ -733,7 +810,36 @@ struct MappedBuffer {
 };
 
 std::mutex MappedBufferMutex;
-std::unordered_map<GLenum, MappedBuffer> MappedBuffers;
+
+// Keyed by (context, target), NOT by target alone.
+//
+// A GL target names at most one buffer per context, so a target-only key looks
+// sufficient right up until a title renders from two contexts. Unity does: the
+// main thread and the render thread each hold a context, and both stream
+// per-frame dynamic geometry through GL_ARRAY_BUFFER. With one slot per target
+// the second map overwrote the first's HostPtr/Length and handed out the same
+// staging buffer, so the two streams wrote over each other and each unmap
+// copied whatever the other had left behind into its own buffer. Observed in
+// Dex as font glyphs piled up inside the trail effect's draw and white
+// degenerate-triangle streaks through the glyph region -- two dynamic streams
+// cross-contaminated, while everything static drew correctly.
+//
+// The context is the right granularity, not the thread: GL requires the
+// context to be current for the call, and a context is current on at most one
+// thread at a time, so a title that maps on one thread and unmaps on another
+// must make the same context current in both -- same key either way. Keying by
+// thread would instead split that legal pattern across two entries and lose
+// the mapping.
+using TargetKey = std::pair<GLXContext, GLenum>;
+std::map<TargetKey, MappedBuffer> MappedBuffers;
+
+// The current context, read straight from the loader rather than through the
+// generated thunk: the token map that 32-bit guests see is not wanted here, the
+// driver's own pointer is what identifies the context. It is per-thread state
+// inside the driver, so this needs no lock of its own.
+GLXContext CurrentContext() {
+  return fexldr_ptr_libGL_glXGetCurrentContext();
+}
 
 // Returns the guest staging pointer for this target, growing it if needed.
 // Caller must hold MappedBufferMutex; note GuestMalloc re-enters the JIT, which
@@ -763,8 +869,17 @@ guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length
     return guest_layout<void*> {.data = 0};
   }
 
+  const TargetKey Key {CurrentContext(), target};
   std::lock_guard lk {MappedBufferMutex};
-  auto& Entry = MappedBuffers[target];
+  auto& Entry = MappedBuffers[Key];
+  if (Entry.HostPtr && FexLibGLDebug()) {
+    // Two live mappings on one (context, target) is not a thing GL can produce:
+    // a target names one buffer, and a buffer maps once. If this ever fires,
+    // the key is again too coarse and the staging buffer is about to be shared
+    // between two mappings -- the exact failure this keying was introduced to
+    // end, so say so rather than silently clobbering.
+    fprintf(stderr, "[fex-libGL] staging: second live map on ctx=%p target=0x%x (previous host=%p)\n", (void*)Key.first, target, Entry.HostPtr);
+  }
   const uintptr_t Staging = GetStagingBuffer(Entry, Length);
   if (!Staging) {
     // Guest heap exhausted, or the guest never registered its malloc. Unmap
@@ -801,8 +916,9 @@ guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length
 }
 
 GLboolean UnmapBufferFromGuest(GLenum target) {
+  const TargetKey Key {CurrentContext(), target};
   std::lock_guard lk {MappedBufferMutex};
-  auto It = MappedBuffers.find(target);
+  auto It = MappedBuffers.find(Key);
   if (It != MappedBuffers.end() && It->second.HostPtr) {
     auto& Entry = It->second;
     if (Entry.CopyBackOnUnmap && Entry.GuestPtr) {
@@ -826,7 +942,21 @@ size_t BufferSizeForTarget(GLenum target) {
 // spelling). Same staging scheme, keyed by buffer name instead of target since
 // DSA never binds. Kept in a separate map so a buffer can legitimately be
 // mapped via glMapNamedBuffer while a different one is mapped to a target.
-std::unordered_map<GLuint, MappedBuffer> MappedNamedBuffers;
+// Deliberately keyed by name ALONE, unlike the target map above.
+//
+// A buffer name belongs to the share group, not to the context, so within a
+// share group the name already identifies the buffer uniquely and a title may
+// legally map it with one context current and unmap it with another. Adding the
+// context to the key would split that legal pattern across two entries and lose
+// the mapping -- strictly worse than what it would buy.
+//
+// What it would buy is narrow: two contexts that do NOT share can each own a
+// distinct buffer that happens to have the same name, and those two collide
+// here the way targets used to. There is no way to ask GL which share group a
+// context belongs to, so distinguishing them is not available; the collision
+// stays as a known limit. It needs DSA, two unshared contexts, and colliding
+// names to bite, whereas the target collision needed only two contexts.
+std::map<GLuint, MappedBuffer> MappedNamedBuffers;
 
 size_t BufferSizeForName(GLuint buffer) {
   GLint Size = 0;
@@ -888,7 +1018,97 @@ GLboolean UnmapNamedBufferFromGuest(GLuint buffer) {
   }
   return fexldr_ptr_libGL_glUnmapNamedBuffer(buffer);
 }
+
+// Push a flushed sub-range from the staging buffer into the driver's mapping,
+// so that the flush the guest is about to perform sees the bytes it wrote.
+//
+// `offset` is relative to the start of the mapped range (GL spec), which is
+// also how the staging buffer is laid out, so the same offset indexes both.
+// Ranges are clamped against the recorded mapped length: a guest may pass an
+// out-of-range flush (the driver will raise GL_INVALID_VALUE for it), and this
+// runs before that validation, so it must not read or write past either buffer.
+// A target/name with no live mapping copies nothing and just forwards.
+void FlushStagingSubRange(MappedBuffer* Entry, GLintptr offset, GLsizeiptr length) {
+  if (!Entry || !Entry->HostPtr || !Entry->GuestPtr || offset < 0 || length <= 0) {
+    return;
+  }
+  const size_t Offset = static_cast<size_t>(offset);
+  if (Offset >= Entry->Length) {
+    return;
+  }
+  const size_t Length = std::min(static_cast<size_t>(length), Entry->Length - Offset);
+  std::memcpy(reinterpret_cast<char*>(Entry->HostPtr) + Offset, reinterpret_cast<const char*>(Entry->GuestPtr) + Offset, Length);
+}
+
+void FlushMappedTargetRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  const TargetKey Key {CurrentContext(), target};
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedBuffers.find(Key);
+  FlushStagingSubRange(It != MappedBuffers.end() ? &It->second : nullptr, offset, length);
+}
+
+void FlushMappedNameRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedNamedBuffers.find(buffer);
+  FlushStagingSubRange(It != MappedNamedBuffers.end() ? &It->second : nullptr, offset, length);
+}
+
+// Definitions for the forward declarations near the GL_BUFFER_MAP_POINTER
+// queries. A live mapping is one with a HostPtr; after unmap the entry survives
+// for its staging allocation only, and must then answer "no mapping" so the
+// query falls through to the driver's null.
+uintptr_t StagingPointerForTarget(GLenum target) {
+  const TargetKey Key {CurrentContext(), target};
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedBuffers.find(Key);
+  return (It != MappedBuffers.end() && It->second.HostPtr) ? It->second.GuestPtr : 0;
+}
+
+uintptr_t StagingPointerForName(GLuint buffer) {
+  std::lock_guard lk {MappedBufferMutex};
+  auto It = MappedNamedBuffers.find(buffer);
+  return (It != MappedNamedBuffers.end() && It->second.HostPtr) ? It->second.GuestPtr : 0;
+}
+
+// Drop a destroyed context's staging entries, so the target map stays bounded by
+// the number of live contexts rather than by every context the title ever made.
+// SDL2 -- hence Unity -- builds a probe context and throws it away during
+// startup, so this is not a theoretical case.
+//
+// Only the bookkeeping is reclaimed: the staging allocations themselves are
+// abandoned, because the guest registers a malloc and no free (see
+// GetStagingBuffer). That is the pre-existing bargain here and it stays bounded
+// in practice, since a context that is gone cannot map anything more.
+//
+// The named-buffer map is not pruned by context, since it is not keyed by one.
+// Its entries are bounded by the number of distinct buffer names a title maps.
+void RetireStagingForContext(GLXContext Context) {
+  std::lock_guard lk {MappedBufferMutex};
+  std::erase_if(MappedBuffers, [Context](const auto& Entry) { return Entry.first.first == Context; });
+}
 } // namespace
+
+void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  FlushMappedTargetRange(target, offset, length);
+  fexldr_ptr_libGL_glFlushMappedBufferRange(target, offset, length);
+}
+
+// APPLE_flush_buffer_range spells the same operation with a `size` parameter;
+// the staging handling is identical.
+void fexfn_impl_libGL_glFlushMappedBufferRangeAPPLE(GLenum target, GLintptr offset, GLsizeiptr size) {
+  FlushMappedTargetRange(target, offset, size);
+  fexldr_ptr_libGL_glFlushMappedBufferRangeAPPLE(target, offset, size);
+}
+
+void fexfn_impl_libGL_glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  FlushMappedNameRange(buffer, offset, length);
+  fexldr_ptr_libGL_glFlushMappedNamedBufferRange(buffer, offset, length);
+}
+
+void fexfn_impl_libGL_glFlushMappedNamedBufferRangeEXT(GLuint buffer, GLintptr offset, GLsizeiptr length) {
+  FlushMappedNameRange(buffer, offset, length);
+  fexldr_ptr_libGL_glFlushMappedNamedBufferRangeEXT(buffer, offset, length);
+}
 
 // Retire the GLsync token when the guest deletes the sync object. Unlike a GLX
 // context this genuinely matters: a title that fences once per frame creates a
@@ -1286,6 +1506,10 @@ void fexfn_impl_libGL_glXDestroyContext(Display* Display, GLXContext Context) {
   // token for a different context. SDL2 (hence Unity) creates a probe context,
   // destroys it and creates the real one during startup, so this path runs.
   ContextRegistry.Retire(Context);
+  // Same reasoning for the buffer-mapping staging cache, which is keyed by
+  // context: drop this context's entries before the context pointer can be
+  // recycled by a later glXCreateContext and start matching someone else's key.
+  RetireStagingForContext(Context);
 #endif
   fexldr_ptr_libGL_glXDestroyContext(Display, Context);
 }

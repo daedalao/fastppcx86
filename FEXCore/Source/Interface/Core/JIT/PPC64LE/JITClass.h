@@ -272,6 +272,22 @@ private:
   };
   fextl::list<PendingJumpThunk> PendingJumpThunks;
 
+  // Shared miss-leg spill stubs, one pair per compile unit, emitted at the
+  // CompileCode tail next to the jump thunks and bound only when some exit
+  // used them. Every ExitFunction miss leg used to inline SpillStaticRegs
+  // (~90 instructions of cold code between hot blocks — the dominant static
+  // bloat in DSP-heavy Witcher 3 mixer blocks, 16 stvx + 16 std per exit);
+  // now a miss is a single `b` here. The spill must still execute inside the
+  // code buffer (IsAddressInCodeBuffer is the signal delegator's proxy for
+  // "SRA may be live"), which a tail stub satisfies just as well as an
+  // inline one. Labels are members (not locals) because the emitter's
+  // pending-fixup chain lives in the Label — see the COPY HAZARD note in
+  // CodeEmitter's Label. Reset alongside PendingJumpThunks each compile.
+  PPC64Emitter::Label SharedSpillExitLabel {};      // non-linkable: -> Pointers.ExitFunctionLinker
+  PPC64Emitter::Label SharedSpillLinkLabel {};      // linkable thunk tail: TMP2=&record -> record.StubAddr
+  bool SharedSpillExitUsed {};
+  bool SharedSpillLinkUsed {};
+
   // Resolved once at construction: BlockLinking knob AND code caching off.
   // See the resolution site in JIT.cpp for the hard-gate rationale.
   bool BlockLinkingEnabled {};
@@ -411,6 +427,24 @@ private:
 
   [[nodiscard]]
   bool IsInlineEntrypointOffset(const IR::OrderedNodeWrapper& WNode, uint64_t* Value) const;
+
+  // Does this operand hold element 0's bits replicated across every element, so
+  // that a consumer needing only element 0 may read any element and skip its
+  // own splat? True for a VF*ScalarInsert the ScalarSplatChain IR pass granted
+  // SplatResult, and for a LoadRegister it stamped with SplatElementSize -- the
+  // latter matters because the frontend's per-instruction register-cache flush
+  // routes almost every chain edge through the guest XMM's static register.
+  //
+  // Answering from the defining op is what makes this safe in both directions:
+  // the producer's DEF_OP tests the exact same bit when it decides to leave the
+  // result splatted, and anything that stands between def and use -- an
+  // RA-inserted fill or copy -- changes the defining op to one that is not a
+  // marked ScalarInsert, so the test degrades to "assume architectural" and the
+  // splat gets emitted. (A fill is a full-width lvx of a full-width stvx, so
+  // the value really is still splatted there; re-splatting it is merely
+  // redundant, never wrong.)
+  [[nodiscard]]
+  bool IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpSize ElementSize) const;
 
   // Get a register that may be zero-register if the node is constant 0
   [[nodiscard]]
@@ -725,6 +759,12 @@ private:
   DEF_OP(StackValidTag);
   DEF_OP(SyncStackToSlow);
   DEF_OP(StackForceSlow);
+
+  // Native f64→f80 conversion (X87Ops.cpp). IR.json marks F80CVTTO
+  // JITDispatch:false (every other size/backend uses the FABI softfloat
+  // bridge); we override the i64 source case with a branchy bit-manipulation
+  // lowering because FXSAVE in ReducedPrecisionMode hammers it.
+  DEF_OP(F80CVTTo);
 
   // Bucket C: stack-form arithmetic ops that survive the optimisation pass.
   // Each is a thin wrapper that loads operands from x87 stack slots, calls

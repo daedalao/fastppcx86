@@ -872,6 +872,8 @@ public:
     EmitXX3VSX(t.idx, a.idx, b.idx, 10u | ((dm & 3u) << 5));
   }
 
+  void xxlxor(VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 154); }
+
   void xxspltw(VSXR t, VSXR b, uint32_t uim) {
     assert(uim < 4);
     Emit32((60u << 26) | ((t.idx & 31u) << 21) | ((uim & 3u) << 16) | ((b.idx & 31u) << 11) |

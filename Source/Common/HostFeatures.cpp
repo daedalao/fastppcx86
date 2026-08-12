@@ -665,10 +665,18 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   // lowering decomposes 256-bit YMM ops into pairs of 128-bit XMM ops with
   // separate Low/High vector values at IR-generation time. The high half is
   // routed by the IR allocator into either a host VR or avx_high[] context
-  // memory. So as long as our 128-bit vector ops are functional, AVX/AVX2 is
-  // viable without true 256-bit hardware. Reporting AVX lets glibc IFUNCs
-  // pick their AVX-aware paths instead of falling through to slower variants.
-  HostFeatures.SupportsAVX = true;
+  // memory. So AVX/AVX2 is *correct* without true 256-bit hardware -- but it
+  // is not *fast*: every YMM op costs two host ops plus high-half spill
+  // traffic, and guests that see AVX in CPUID select their widest code paths.
+  // Measured on POWER8: glibc string-op IFUNCs are 36-67% faster on their SSE
+  // paths, and a Witcher 3 in-world A/B (2026-08-10, 120s driven-gameplay
+  // perf captures) burned 16% less total CPU with AVX hidden -- the single
+  // hottest block of the session was an engine YMM loop that disappears
+  // entirely once the engine's startup CPUID check picks its SSE path.
+  // Default OFF therefore; FEX_HOSTFEATURES=enableavx (or a per-app config)
+  // re-advertises it for the rare guest that hard-requires AVX to launch
+  // (e.g. Cyberpunk 2077 refuses to start without it).
+  HostFeatures.SupportsAVX = false;
   // AES-NI lowering uses the FABI software-helper path (PPC64_VAESEnc et al.
   // in JIT.cpp) — POWER8 has hardware vcipher/vncipher but the bridge through
   // the existing FABI mini-frame is the simplest correct first cut. Without

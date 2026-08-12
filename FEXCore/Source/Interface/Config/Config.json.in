@@ -812,6 +812,69 @@
           "Unlike FEX_O0 this affects only this one pass; X87StackOptimization and the rest of the default pass set stay enabled."
         ]
       },
+      "SMCMarkMemo": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "Memoise the no-op case of MarkGuestExecutableRange (FEX_SMCMARKMEMO=0 disables).",
+          "A 16.5-minute Witcher 3 SMC audit measured 114K of 120K mark calls as pure no-ops that still took the VMA mutex on the compile path.",
+          "The memo answers those lock-free, invalidated wholesale by a VMA-map generation counter bumped in every mutating funnel.",
+          "Throughput effect is small (0.4% hit rate on W3); the knob exists because the mark path contends the VMA mutex with the syscall side,",
+          "so the memo's real effect is on hitch/latency tails -- A/B it with stutterwatch (audio zero-runs, hitch stats), not with perf means."
+        ]
+      },
+      "DisableDFCEStoreElim": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the Remove arm of DeadFlagCalculationElimination (FEX_DISABLEDFCESTOREELIM=1 turns it OFF; the rest of the pass stays on).",
+          "The arm deletes side-effecting flag writers (StorePF/StoreAF/StoreNZCV/ShiftFlags/TestNZ/...) whose written flags are dead per the",
+          "pass's converged cross-block liveness and whose SSA result is unused. From 2026-08-05 to 2026-08-10 this was unconditionally guarded",
+          "off out of caution after the 2026-05-11 reproducers; those were re-tested clean with the arm enabled (full ASM suite, both reproducers,",
+          "60 bash startups). Enabled by default because variable-shift/parity flag chains that stay dead-but-emitted dominate hot decompressor",
+          "loops on PPC64LE, where NZCV lives in CR0/XER and every survived write costs an mfocrf/mfxer/rlwimi packing storm.",
+          "A wrong elimination surfaces as a wrong conditional branch -- silent and data-dependent -- hence a field kill switch of its own."
+        ]
+      },
+      "DisableCmpBranchFusion": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the CompareBranchFusion IR pass (FEX_DISABLECMPBRANCHFUSION=1 turns the pass OFF).",
+          "x86 'cmp a,b; jcc' arrives as SubWithFlags + a FromNZCV CondJump, and the PPC64LE lowering of that branch has to rebuild C/V out of",
+          "XER (mfxer + rlwinm + mtocrf + a cr-logical composite before the bc); mfxer serialises on POWER8 and this sits on every hot loop",
+          "backedge. The pass rewrites the branch into the backend's existing direct-compare form (cmp into cr7 + bc) when the NZCV it reads",
+          "provably comes from a SubWithFlags earlier in the same block, letting DeadFlagCalculationElimination then drop the flag computation.",
+          "Only the ten register-comparable conditions are fused (EQ/NEQ/UGE/ULT/UGT/ULE/SGE/SLT/SGT/SLE); MI/PL and VS/VC are excluded because",
+          "the compare form cannot reproduce N-alone or V. A mis-fused branch is a wrong-direction conditional jump -- silent and",
+          "data-dependent -- hence a field kill switch of its own."
+        ]
+      },
+      "DisableScalarSplatChain": {
+        "Type": "bool",
+        "Default": "true",
+        "Desc": [
+          "Kill switch for the ScalarSplatChain IR pass (FEX_DISABLESCALARSPLATCHAIN=0 opts IN; the pass is OFF by default).",
+          "DEFAULT OFF 2026-08-11: the superseded-store rule is unsound under mid-block fault resume. A guest fault inside a marked",
+          "chain (Witcher 3 save-load = SMC fault storm) spills the splat-form register, resumes at the fault RIP in a fresh block,",
+          "and the superseding store of the ORIGINAL block never runs -- the splatted upper elements become architectural state and",
+          "propagate (two reproducible save-load crashes; clean with the pass off). Sound rescue paths are documented in the pass",
+          "header; do not re-enable by default without solving mid-block re-entry.",
+          "A guest scalar-SSE float chain (movss; subss; mulss; movss) becomes a chain of VF*ScalarInsert ops, each of which the PPC64LE",
+          "backend lowers as splat(Vector1) + splat(Vector2) + one xv*sp + a two-instruction lane-0 merge -- and the next link then splats the",
+          "merged value straight back apart. Since xv*sp over two splatted operands yields an already-splatted result, both the merge and the",
+          "consumer's re-splat are dead work whenever nothing observes the upper elements. The pass proves that (every use is another",
+          "ScalarInsert of the same element size, a narrow FPR store, or a guest-XMM writeback that a later one in the block supersedes) and",
+          "sets the SplatResult / SplatElementSize permission bits the backend then honours, taking a chain-internal scalar op down to one or",
+          "two instructions. It has to model the frontend's per-instruction register-cache flush to see the chains at all, since every guest",
+          "XMM def is written back and re-read rather than forwarded along an SSA edge.",
+          "ACCEPTED IMPRECISION: a splat may be live in a guest XMM's static register between two guest instructions inside a block, so a",
+          "signal taken there delivers a frame whose XMM UPPER elements read as the replicated element 0. Element 0 itself, every GPR, and",
+          "all state at block boundaries and across syscalls/thunks stay exact. Setting this to 1 restores exact upper elements everywhere.",
+          "The bits are permissions, so mis-marking does not crash -- it silently leaves the splat where architectural upper elements belong,",
+          "which is exactly the kind of data-dependent corruption that wants a field kill switch of its own."
+        ]
+      },
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",

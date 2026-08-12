@@ -580,6 +580,10 @@ EmulatedFDManager::EmulatedFDManager(FEXCore::Context::Context* ctx)
 
   FDReadCreators["/sys/devices/system/cpu/online"] = NumCPUCores;
   FDReadCreators["/sys/devices/system/cpu/present"] = NumCPUCores;
+  // glibc 2.34+ derives _SC_NPROCESSORS_CONF from "possible"; without this
+  // the guest sees every configured host CPU (160 on SMT-off POWER8) no
+  // matter what online/present say.
+  FDReadCreators["/sys/devices/system/cpu/possible"] = NumCPUCores;
 
   fextl::string procAuxv = fextl::fmt::format("/proc/{}/auxv", getpid());
 

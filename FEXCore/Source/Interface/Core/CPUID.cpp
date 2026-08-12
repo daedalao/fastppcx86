@@ -24,6 +24,8 @@ $end_info$
 
 #include "git_version.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace FEXCore {
@@ -446,6 +448,64 @@ void CPUIDEmu::SetupHostHybridFlag() {
   PerCPUData.resize(Cores);
   for (auto& e : PerCPUData) {
     e.ProductName = ProductNames::ARM_UNKNOWN;
+  }
+
+  // Pass the host CPU through as the brand string instead of the generic
+  // fallback: parse the first "cpu :" (and "clock :") lines of /proc/cpuinfo,
+  // e.g. "POWER8 (raw), altivec supported @ 3.49GHz". x86 brand strings are
+  // capped at 48 bytes including the terminator; the fallback stays if the
+  // parse finds nothing.
+  static char HostBrand[48] {};
+  fextl::string CpuInfo {};
+  if (FEXCore::FileLoading::LoadFile(CpuInfo, "/proc/cpuinfo")) {
+    auto FieldAfter = [&CpuInfo](std::string_view Key) -> fextl::string {
+      auto Pos = CpuInfo.find(Key);
+      while (Pos != fextl::string::npos && !(Pos == 0 || CpuInfo[Pos - 1] == '\n')) {
+        Pos = CpuInfo.find(Key, Pos + 1);
+      }
+      if (Pos == fextl::string::npos) {
+        return {};
+      }
+      auto Colon = CpuInfo.find(':', Pos);
+      auto End = CpuInfo.find('\n', Pos);
+      if (Colon == fextl::string::npos || End == fextl::string::npos || Colon > End) {
+        return {};
+      }
+      auto Start = CpuInfo.find_first_not_of(" \t", Colon + 1);
+      if (Start == fextl::string::npos || Start >= End) {
+        return {};
+      }
+      return CpuInfo.substr(Start, End - Start);
+    };
+
+    auto Model = FieldAfter("cpu\t");
+    if (Model.empty()) {
+      Model = FieldAfter("model name");
+    }
+    if (!Model.empty()) {
+      // Rated frequency, not the governor's current pick: sysfs max freq
+      // (kHz) first, the /proc/cpuinfo clock line (MHz, scales with load)
+      // as fallback.
+      // (LoadFile can't read sysfs: those files stat as one page and its
+      // known-size path treats the short read as failure.)
+      double MHz {};
+      char MaxFreq[32] {};
+      if (FEXCore::FileLoading::LoadFileToBuffer("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", {MaxFreq, sizeof(MaxFreq) - 1}) > 0) {
+        MHz = strtod(MaxFreq, nullptr) / 1000.0;
+      }
+      if (MHz <= 0.0) {
+        auto Clock = FieldAfter("clock\t");
+        MHz = Clock.empty() ? 0.0 : strtod(Clock.c_str(), nullptr);
+      }
+      if (MHz > 0.0) {
+        snprintf(HostBrand, sizeof(HostBrand), "%s @ %.2fGHz", Model.c_str(), MHz / 1000.0);
+      } else {
+        snprintf(HostBrand, sizeof(HostBrand), "%s", Model.c_str());
+      }
+      for (auto& e : PerCPUData) {
+        e.ProductName = HostBrand;
+      }
+    }
   }
 }
 

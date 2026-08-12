@@ -174,7 +174,7 @@ uint64_t GetDentsEmulation(int fd, T* dirp, uint32_t count) {
 
       TmpOffset += Tmp->d_reclen;
 
-      if (FEX::HLE::_SyscallHandler->FM.IsProtectedFile(fd, Outgoing->d_ino)) {
+      if (FEX::HLE::_SyscallHandler->FM.IsHiddenDentry(fd, Outgoing->d_ino, Outgoing->d_name)) {
         continue;
       }
 
@@ -1241,10 +1241,17 @@ uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, 
     DrainSMCLazyDirtyPages(Frame->Thread, FEX::HLE::SMCLazy::DrainPoint::Syscall);
   }
 
-  const auto SeccompResult = SeccompEmulator.ExecuteFilter(Frame, JITPC, Args);
+  // Gate on the filter list here rather than inside ExecuteFilter: this call
+  // sits on every syscall, and even ExecuteFilter's cache-probe wrapper costs
+  // a frame. Most processes (including wine, which currently declines to
+  // install its dispatch filter under FEX's low-address library layout) never
+  // install any filter.
+  if (!FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame)->Filters.empty()) [[unlikely]] {
+    const auto SeccompResult = SeccompEmulator.ExecuteFilter(Frame, JITPC, Args);
 
-  if (SeccompResult.EarlyReturn) {
-    return SeccompResult.Result;
+    if (SeccompResult.EarlyReturn) {
+      return SeccompResult.Result;
+    }
   }
 
   if (Args->Argument[0] >= Definitions.size()) {

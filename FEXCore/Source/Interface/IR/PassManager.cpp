@@ -69,9 +69,24 @@ void PassManager::Finalize() {
 void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
   FEX_CONFIG_OPT(DisablePasses, O0);
   FEX_CONFIG_OPT(DisableDFCE, DISABLEDFCE);
+  FEX_CONFIG_OPT(DisableCmpBranchFusion, DISABLECMPBRANCHFUSION);
+  FEX_CONFIG_OPT(DisableScalarSplatChain, DISABLESCALARSPLATCHAIN);
 
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
+
+    // Must precede DFCE: fusion turns a FromNZCV CondJump into a direct
+    // register compare, and it is DFCE that then observes the branch no longer
+    // reads NZCV and demotes/removes the SubWithFlags feeding it. Running it
+    // the other way round would leave the flag computation emitted. It must
+    // also precede RA, since it adds two operand uses to the branch.
+    //
+    // Same kill-switch reasoning as DFCE below -- a mis-fused branch is a
+    // wrong-direction conditional jump, silent and data-dependent:
+    //     FEX_DISABLECMPBRANCHFUSION=1
+    if (!DisableCmpBranchFusion()) {
+      InsertPass(CreateCompareBranchFusion());
+    }
 
     // DeadFlagCalculationElimination was disabled on PPC64LE from 2026-05-11
     // (8774c7dda) to 2026-08-05. The diagnosis recorded at the time -- "the
@@ -81,8 +96,10 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
     // WITHOUT checking IR::HasSideEffects(), so side-effecting flag writers
     // (StoreNZCV/StorePF/StoreAF/InvalidateFlags/...) were deleted outright
     // rather than falling through to the in-place Replacement rewrite. That
-    // is now guarded; see the comment at the Remove site in
-    // Passes/RedundantFlagCalculationElimination.cpp.
+    // was guarded from 2026-08-05 to 2026-08-10; the guard is now a runtime
+    // knob (FEX_DISABLEDFCESTOREELIM, default off) after the reproducers were
+    // re-verified clean with the Remove arm active. See the comment at the
+    // Remove site in Passes/RedundantFlagCalculationElimination.cpp.
     //
     // The pass is a pure IR transform with no correctness mandate, and a
     // wrong flag elimination surfaces as a wrong conditional branch --
@@ -93,6 +110,23 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
     // turns just this pass off at runtime, no rebuild.
     if (!DisableDFCE()) {
       InsertPass(CreateDeadFlagCalculationEliminination());
+    }
+
+    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult and
+    // LoadRegister nodes with SplatElementSize, and the analysis reads
+    // OrderedNode::GetUses() plus the frontend's explicit LoadRegister/
+    // StoreRegister register-cache traffic -- all of which RA rewrites. It is
+    // otherwise order-independent (it neither reads nor writes flags, and
+    // adds/removes no operand uses), so it sits last among the optimisation
+    // passes.
+    //
+    // Own kill switch for the same reason as the two above, plus one more: the
+    // pass deliberately trades exactness of a guest XMM's UPPER elements
+    // mid-block for shorter scalar-float chains, so turning it off is also how
+    // you restore exact upper elements in a signal frame:
+    //     FEX_DISABLESCALARSPLATCHAIN=1
+    if (!DisableScalarSplatChain()) {
+      InsertPass(CreateScalarSplatChain());
     }
   }
 }

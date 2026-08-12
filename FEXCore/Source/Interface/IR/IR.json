@@ -370,9 +370,13 @@
       }
     },
     "StaticRA": {
-      "SSA = LoadRegister u32:$Reg, RegisterClass:$Class, OpSize:#Size": {
+      "SSA = LoadRegister u32:$Reg, RegisterClass:$Class, OpSize:#Size, OpSize:$SplatElementSize{OpSize::iInvalid}": {
         "Desc": ["Loads a value from the given register",
-                 "Size must match the execution mode."],
+                 "Size must match the execution mode.",
+                 "SplatElementSize is a PERMISSION set by the ScalarSplatChain pass on FPR loads only: when it is not",
+                 "iInvalid, the value in this static register is known to hold element 0 replicated across every element",
+                 "at that element size, so a consumer needing only element 0 may read any element. A backend that",
+                 "ignores it stays correct."],
         "DestSize": "Size"
       },
 
@@ -1653,42 +1657,58 @@
       }
     },
     "VectorScalar": {
-      "FPR = VFAddScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits": {
+      "FPR = VFAddScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits, i1:$SplatResult{false}": {
         "Desc": ["Does a scalar 'add' between Vector1 and Vector2.",
                  "Inserting the result in to the lower element of Vector1 and returning the results.",
                  "If ZeroUpperBits is set then in a 256-bit wide operation it will zero the upper 128-bits of the destination.",
                  "For 128-bit operation this matches SSE insert semantics.",
-                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics."
+                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics.",
+                 "SplatResult is a PERMISSION, not a requirement: when set, the backend MAY leave the",
+                 "result splatted across every element instead of preserving Vector1's upper elements,",
+                 "because the ScalarSplatChain pass proved that no consumer observes them. A backend",
+                 "that ignores the flag and produces the architectural result stays correct."
                 ],
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
-      "FPR = VFSubScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits": {
+      "FPR = VFSubScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits, i1:$SplatResult{false}": {
         "Desc": ["Does a scalar 'sub' between Vector1 and Vector2.",
                  "Inserting the result in to the lower element of Vector1 and returning the results.",
                  "If ZeroUpperBits is set then in a 256-bit wide operation it will zero the upper 128-bits of the destination.",
                  "For 128-bit operation this matches SSE insert semantics.",
-                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics."
+                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics.",
+                 "SplatResult is a PERMISSION, not a requirement: when set, the backend MAY leave the",
+                 "result splatted across every element instead of preserving Vector1's upper elements,",
+                 "because the ScalarSplatChain pass proved that no consumer observes them. A backend",
+                 "that ignores the flag and produces the architectural result stays correct."
                 ],
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
-      "FPR = VFMulScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits": {
+      "FPR = VFMulScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits, i1:$SplatResult{false}": {
         "Desc": ["Does a scalar 'mul' between Vector1 and Vector2.",
                  "Inserting the result in to the lower element of Vector1 and returning the results.",
                  "If ZeroUpperBits is set then in a 256-bit wide operation it will zero the upper 128-bits of the destination.",
                  "For 128-bit operation this matches SSE insert semantics.",
-                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics."
+                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics.",
+                 "SplatResult is a PERMISSION, not a requirement: when set, the backend MAY leave the",
+                 "result splatted across every element instead of preserving Vector1's upper elements,",
+                 "because the ScalarSplatChain pass proved that no consumer observes them. A backend",
+                 "that ignores the flag and produces the architectural result stays correct."
                 ],
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
-      "FPR = VFDivScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits": {
+      "FPR = VFDivScalarInsert OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2, i1:$ZeroUpperBits, i1:$SplatResult{false}": {
         "Desc": ["Does a scalar 'div' between Vector1 and Vector2.",
                  "Inserting the result in to the lower element of Vector1 and returning the results.",
                  "If ZeroUpperBits is set then in a 256-bit wide operation it will zero the upper 128-bits of the destination.",
                  "For 128-bit operation this matches SSE insert semantics.",
-                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics."
+                 "For 256-bit operation with ZeroUpperBits, this matches AVX insert semantics.",
+                 "SplatResult is a PERMISSION, not a requirement: when set, the backend MAY leave the",
+                 "result splatted across every element instead of preserving Vector1's upper elements,",
+                 "because the ScalarSplatChain pass proved that no consumer observes them. A backend",
+                 "that ignores the flag and produces the architectural result stays correct."
                 ],
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"

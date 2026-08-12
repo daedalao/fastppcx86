@@ -1956,14 +1956,36 @@ template<>
 struct fex_gen_config<glFinishTextureSUNX> {};
 template<>
 struct fex_gen_config<glFlush> {};
+// The explicit-flush family is custom on 32-bit. There the guest writes into a
+// staging buffer rather than into the driver's mapping (see MapBufferToGuest in
+// libGL_Host.cpp), so a passthrough flush hands the driver the range as it was
+// at map time — before the guest wrote anything. The custom impls copy the
+// flushed sub-range across first. 64-bit maps the driver pointer straight
+// through and needs none of this.
 template<>
-struct fex_gen_config<glFlushMappedBufferRangeAPPLE> {};
+struct fex_gen_config<glFlushMappedBufferRangeAPPLE>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<glFlushMappedBufferRange> {};
+struct fex_gen_config<glFlushMappedBufferRange>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<glFlushMappedNamedBufferRangeEXT> {};
+struct fex_gen_config<glFlushMappedNamedBufferRangeEXT>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<glFlushMappedNamedBufferRange> {};
+struct fex_gen_config<glFlushMappedNamedBufferRange>
+#ifdef IS_32BIT_THUNK
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<glFlushPixelDataRangeNV> {};
 template<>

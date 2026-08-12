@@ -169,6 +169,11 @@ void VMATracking::TrackVMARange(FEXCore::Context::Context* CTX, MappedResource* 
                                 uintptr_t Length, VMAFlags Flags, VMAProt Prot) {
   Mutex.check_lock_owned_by_self_as_write();
 
+  // Retire the MarkGuestExecutableRange memo: this range's mapping, protection
+  // or sharing state is about to change. (DeleteVMARange below bumps as well;
+  // a double bump is free and keeps each function correct on its own.)
+  BumpGeneration();
+
   DeleteVMARange(CTX, Base, Length, MappedResource);
 
   auto PrevResVMA = MappedResource ? MappedResource->FirstVMA : nullptr;
@@ -197,6 +202,9 @@ void VMATracking::TrackVMARange(FEXCore::Context::Context* CTX, MappedResource* 
 // freeing their associated MappedResource unless it is equal to PreservedMappedResource
 void VMATracking::DeleteVMARange(FEXCore::Context::Context* CTX, uintptr_t Base, uintptr_t Length, MappedResource* PreservedMappedResource) {
   Mutex.check_lock_owned_by_self_as_write();
+
+  // Retire the MarkGuestExecutableRange memo, see SyscallsVMATracking.h.
+  BumpGeneration();
 
   const auto Top = Base + Length;
 
@@ -280,6 +288,11 @@ void VMATracking::DeleteVMARange(FEXCore::Context::Context* CTX, uintptr_t Base,
 // Change flags of mappings in a range and split the mappings if needed
 void VMATracking::ChangeProtectionFlags(uintptr_t Base, uintptr_t Length, VMAProt NewProt) {
   Mutex.check_lock_owned_by_self_as_write();
+
+  // Retire the MarkGuestExecutableRange memo, see SyscallsVMATracking.h. Done
+  // before the zero-length early-out below: bumping for an operation that
+  // turns out to change nothing only costs a missed memo hit.
+  BumpGeneration();
 
   // Handle 0 size as no-op like the kernel
   if (Length == 0) {
@@ -516,6 +529,8 @@ void VMATracking::ChangeProtectionFlags(uintptr_t Base, uintptr_t Length, VMAPro
 
 // This matches the peculiarities algorithm used in linux ksys_shmdt (linux kernel 5.16, ipc/shm.c)
 uintptr_t VMATracking::DeleteSHMRegion(FEXCore::Context::Context* CTX, uintptr_t Base) {
+  // Retire the MarkGuestExecutableRange memo, see SyscallsVMATracking.h.
+  BumpGeneration();
 
   // Find first VMA at or after Base
   // Iterate until first SHM VMA, with matching offset, get length

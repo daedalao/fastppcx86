@@ -62,6 +62,24 @@ constexpr auto VTMP2 = VR{31};
 //     restores the whole register file, and resume is via sigreturn.
 constexpr auto VTMP3_VSX = VSXR{12};
 
+// Pinned all-zeroes vector, from the same RA-free FPR-aliased half of the VSX
+// file as VTMP3_VSX. vs14 == f14, which the backend never names otherwise.
+// The dispatcher zeroes it once, right after PushCalleeSavedRegisters (which
+// already saves/restores f14 as part of the f14-f31 callee-saved block), and
+// it stays zero for the life of the dispatcher frame:
+//
+//  * f14 is NON-volatile under ELFv2 §2.2, so every host C++ call the JIT or
+//    dispatcher makes preserves it by ABI - no re-materialisation needed.
+//  * Signal delivery/resume goes through the kernel, which saves and restores
+//    the whole register file.
+//  * Nothing in the backend may ever WRITE it (it is not a temp). VSX-form
+//    reads only, same type-enforcement as VTMP3_VSX rule 1.
+//
+// Use it wherever a lowering needs a known-zero vector operand instead of
+// burning an xxlxor + a vector temp per op (the scalar-load zero-merge in
+// LoadFPRSized was ~one xxlxor per guest movss/movsd before this existed).
+constexpr auto VZERO_VSX = VSXR{14};
+
 // -------------------------------------------------------------------------
 // ELFv2 volatility boundaries, plus the compile-time checks that keep each
 // mode's "which pool registers survive a host call" answer honest.

@@ -98,6 +98,7 @@ C++ Functions to generate IR. See IR.json for spec.
 IR to IR Optimization
 - [PassManager.cpp](../FEXCore/Source/Interface/IR/PassManager.cpp): Defines which passes are run, and runs them
 - [PassManager.h](../FEXCore/Source/Interface/IR/PassManager.h)
+- [CompareBranchFusion.cpp](../FEXCore/Source/Interface/IR/Passes/CompareBranchFusion.cpp): Fuses a flag-setting SubWithFlags into the CondJump that consumes it
 - [IRValidation.cpp](../FEXCore/Source/Interface/IR/Passes/IRValidation.cpp): Sanity checking pass
 - [RedundantFlagCalculationElimination.cpp](../FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp)
 - [RegisterAllocationPass.cpp](../FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp)

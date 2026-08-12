@@ -17,6 +17,10 @@ $end_info$
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/shm.h>
+#include <sys/uio.h>
+
+#include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/memory.h>
 
 #include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
@@ -212,7 +216,10 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // If the write spans two pages, they will be flushed one at a time (generating two faults)
     auto Entry = VMATracking->FindVMAEntry(FaultAddress);
 
-    // If an untracked address, or the mapping wasn't writable, it can't be handled here
+    // If an untracked address, or the mapping wasn't writable, it can't be handled here.
+    // The "UNHANDLED untracked" audit tag below therefore means "this fault is not ours":
+    // the address has no VMA entry, so mtrack never write-protected it and returning false
+    // (letting the fault reach the guest's own handler) is the correct outcome, not a miss.
     if (Entry == VMATracking->VMAs.end() || !Entry->second.Prot.Writable) {
       SMC_AUDIT("[%d] fault addr=%lx UNHANDLED %s\n", FHU::Syscalls::gettid(), FaultAddress,
                 Entry == VMATracking->VMAs.end() ? "untracked" : "vma-not-writable");
@@ -614,12 +621,38 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   const auto Base = Start & FEXCore::Utils::FEX_PAGE_MASK;
   const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_PAGE_SIZE);
 
-  {
-    if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
-      return;
-    }
+  if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
+    return;
+  }
 
+  // Sample the VMA map version *before* looking at anything else. Used both to
+  // validate a memo hit below and to stamp the memo we may publish at the end.
+  // Sampling it before the lock is deliberate and safe -- see the invariant
+  // argument at the memo's definition in SyscallsVMATracking.h.
+  const auto Generation = VMATracking.LoadGeneration();
+
+  // Only single-page ranges are memoised. That is what the compile path asks
+  // for (Core.cpp and CodeCache.cpp both call with FEX_PAGE_SIZE), and it keeps
+  // the memo one lookup rather than a loop. FEX_SMCMARKMEMO=0 disables the
+  // memo entirely for A/B work: its throughput benefit measured small (0.4%
+  // FASTSKIP hit rate on W3), but the mark path contends the VMA mutex with
+  // the syscall side, so the interesting axis is hitch/latency tails, not
+  // mean CPU -- judge it with stutterwatch, not perf.
+  const bool Memoisable = SMCMarkMemo() && (Top - Base) == FEXCore::Utils::FEX_PAGE_SIZE;
+
+  if (Memoisable && VMATracking.IsMarkNoOp(Base, Generation)) {
+    // Known to be a private, non-writable mapping (or no mapping at all) as of
+    // Generation, so the walk below would find nothing to protect.
+    SMC_AUDIT("[%d] mark FASTSKIP base=%lx\n", FHU::Syscalls::gettid(), Base);
+    return;
+  }
+
+  {
     auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+
+    // Cleared as soon as the walk finds anything actionable for this range;
+    // only a walk that stays true may be memoised.
+    bool NoActionNeeded = true;
 
     // Find the first mapping at or after the range ends, or ::end().
     // Top points to the address after the end of the range
@@ -649,6 +682,11 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
         const auto ProtectSize = std::min(MapTop, Top) - ProtectBase;
 
         if (Mapping->second.Flags.Shared) {
+          // Whether a shared mapping needs work depends on the protections of
+          // every mirror of its resource, so don't memoise it -- the mirror
+          // list is walked below anyway.
+          NoActionNeeded = false;
+
           LOGMAN_THROW_A_FMT(Mapping->second.Resource, "VMA tracking error");
 
           const auto OffsetBase = ProtectBase - Mapping->first + Mapping->second.Offset;
@@ -695,6 +733,12 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           } while ((VMA = VMA->ResourceNextVMA));
 
         } else if (Mapping->second.Prot.Writable) {
+          // Writable-private: either we protect it now, or SMC detection is
+          // disabled for it. The latter is a no-op today, but it depends on
+          // SMCDetectionDisabled rather than on the VMA map, so it is not
+          // covered by the generation counter -- don't memoise either case.
+          NoActionNeeded = false;
+
           // Once the mono backpatcher hook is installed, writable+executable
           // mappings (mono's JIT arenas) are covered by MonoBackpatcherWrite and
           // per-instruction validation on tailcall sites instead of by faulting,
@@ -752,6 +796,14 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
                     Mapping->second.Flags.Shared ? 1 : 0, Mapping->second.Prot.Writable ? 1 : 0);
         }
       }
+    }
+
+    // Nothing to protect for this page: every overlapping mapping was private
+    // and non-writable (or there was no mapping at all). Record that against
+    // the generation sampled before the walk, so the next compile that touches
+    // this page answers without the lock. Any VMA change retires this.
+    if (Memoisable && NoActionNeeded) {
+      VMATracking.RecordMarkNoOp(Base, Generation);
     }
   }
 }
@@ -1023,6 +1075,16 @@ void SyscallHandler::DisableSMCDetectionLocked(FEXCore::Core::InternalThreadStat
     return;
   }
 
+  // Defence in depth for the MarkGuestExecutableRange memo. It only ever
+  // records private, non-writable mappings, which this sweep never touches, so
+  // no entry can go stale here -- but this is the one place outside the VMA
+  // mutators that changes what a mark would do, and it is a one-shot, so pay
+  // the bump rather than leave the reasoning load-bearing. Note the caller only
+  // holds the mutex shared: that is fine, a bump is sound from any context
+  // because a memo entry is only trusted while its stamp is the live
+  // generation (see SyscallsVMATracking.h).
+  VMATracking.BumpGeneration();
+
   // One-time sweep: anything we already write-protected that the guest asked to
   // be both writable and executable goes back to its requested protection.
   // NOTE: the caller holds VMATracking.Mutex (shared).  We only mprotect here;
@@ -1063,6 +1125,174 @@ SyscallHandler::LookupExecutableFileSection(FEXCore::Core::InternalThreadState* 
 
   auto& [MappingBaseAddr, Entry] = *EntryIt;
   return BuildSectionInfo(*Entry.Resource, MappingBaseAddr, Entry.Length);
+}
+
+namespace {
+// Guest-memory read that can never fault: process_vm_readv on our own pid
+// respects page protections and returns a short count instead of delivering
+// SIGSEGV, so a concurrently-unmapped or PROT_NONE page is a clean failure.
+// The syscall cost is irrelevant here — every caller is behind the per-region
+// name cache and runs at most a handful of times per image.
+bool SafeReadGuest(void* Dst, uint64_t Src, size_t Size) {
+  const struct iovec Local {.iov_base = Dst, .iov_len = Size};
+  const struct iovec Remote {.iov_base = reinterpret_cast<void*>(Src), .iov_len = Size};
+  return process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0) == static_cast<ssize_t>(Size);
+}
+
+template<typename T>
+bool SafeReadGuest(T& Out, uint64_t Src) {
+  return SafeReadGuest(&Out, Src, sizeof(T));
+}
+
+// Extracts the module name of a PE image mapped at Base, from the export
+// directory's name RVA. Empty when the image has no export directory (common
+// for EXEs) or any field fails validation — the caller still knows Base is a
+// PE from the magic check and can label it generically.
+fextl::string ReadPEExportName(uint64_t Base) {
+  uint32_t PEOffset {};
+  if (!SafeReadGuest(PEOffset, Base + 0x3C) || PEOffset == 0 || PEOffset > 0x10000) {
+    return {};
+  }
+  uint32_t Signature {};
+  if (!SafeReadGuest(Signature, Base + PEOffset) || Signature != 0x00004550 /* "PE\0\0" */) {
+    return {};
+  }
+  const uint64_t OptHeader = Base + PEOffset + 4 + 20;
+  uint16_t OptMagic {};
+  if (!SafeReadGuest(OptMagic, OptHeader)) {
+    return {};
+  }
+  // Data directory offset differs between PE32 (0x10b) and PE32+ (0x20b).
+  uint64_t DataDir = 0;
+  uint32_t NumDirs = 0;
+  if (OptMagic == 0x20b) {
+    if (!SafeReadGuest(NumDirs, OptHeader + 108)) {
+      return {};
+    }
+    DataDir = OptHeader + 112;
+  } else if (OptMagic == 0x10b) {
+    if (!SafeReadGuest(NumDirs, OptHeader + 92)) {
+      return {};
+    }
+    DataDir = OptHeader + 96;
+  } else {
+    return {};
+  }
+  if (NumDirs < 1) {
+    return {};
+  }
+  uint32_t ExportRVA {};
+  if (!SafeReadGuest(ExportRVA, DataDir) || ExportRVA == 0) {
+    return {};
+  }
+  uint32_t NameRVA {};
+  if (!SafeReadGuest(NameRVA, Base + ExportRVA + 0x0C) || NameRVA == 0) {
+    return {};
+  }
+  char Name[128] {};
+  // Short read is fine near the end of a mapping — whatever prefix arrived is
+  // NUL-terminated by the zero-initialization above (last byte never written).
+  SafeReadGuest(Name, Base + NameRVA, sizeof(Name) - 1);
+  for (char* c = Name; *c; ++c) {
+    if (*c < 0x20 || *c > 0x7E) {
+      // Garbage where a filename should be: treat the whole string as invalid
+      // rather than emitting control bytes into /tmp/perf-<pid>.map, whose
+      // format is line- and space-delimited.
+      return {};
+    }
+  }
+  return fextl::string {Name};
+}
+} // namespace
+
+const char* SyscallHandler::LookupAnonymousExecImageName(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) {
+  uint64_t VMABase = 0;
+  uint64_t ImageBase = 0;
+  fextl::string NameHint {};
+  {
+    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+
+    auto EntryIt = VMATracking.FindVMAEntry(GuestAddr);
+    if (EntryIt == VMATracking.VMAs.end() || EntryIt->second.Resource) {
+      // Unmapped, or file-backed — the latter is LookupExecutableFileSection's
+      // job and it already declined or answered.
+      return nullptr;
+    }
+    VMABase = EntryIt->first;
+
+    {
+      std::lock_guard clk {AnonImageNameMutex};
+      auto Cached = AnonImageLookupCache.find(VMABase);
+      if (Cached != AnonImageLookupCache.end()) {
+        return Cached->second;
+      }
+    }
+
+    // Find the image base: walk backward over contiguous VMAs (wine's
+    // per-section mprotects split one image into several entries) and probe
+    // entry starts for the DOS magic. Closest hit below the query wins.
+    //
+    // The header page needs special handling: wine maps the PE HEADERS
+    // file-backed (a single r--p page at file offset 0, which is where the
+    // magic lives) and only the copied-in sections above it anonymously —
+    // observed layout for Dex.exe:
+    //   7afc0000-7afc1000 r--p 00000000 .../Dex.exe   <- headers, MZ here
+    //   7afc1000-7bbf2000 r-xp 00000000 00:00 0       <- .text, anonymous
+    // So a file-backed predecessor is probed too, but only when its mapping
+    // starts at file offset 0 (a section mapping of some unrelated library
+    // never does), and the walk stops at it either way — walking past a
+    // foreign file mapping could only misattribute. When the magic is found
+    // in such an entry, the module name comes from its filename, which beats
+    // the export-directory parse (EXEs commonly export nothing).
+    //
+    // The walk is bounded: a manually-loaded image is split into at most a
+    // few dozen section-protection ranges, and Mono/JIT arenas — the other
+    // thing living in anon exec memory — fail every probe and fall out at
+    // the contiguity break.
+    auto It = EntryIt;
+    for (int Steps = 0; Steps < 128; ++Steps) {
+      const bool FileBacked = It->second.Resource != nullptr;
+      if (!FileBacked || It->second.Offset == 0) {
+        uint16_t Magic {};
+        if (SafeReadGuest(Magic, It->first) && Magic == 0x5A4D /* "MZ" */) {
+          ImageBase = It->first;
+          if (FileBacked && It->second.Resource->MappedFile) {
+            const auto& Path = It->second.Resource->MappedFile->Filename;
+            auto Slash = Path.rfind('/');
+            NameHint = Slash == Path.npos ? Path : Path.substr(Slash + 1);
+          }
+          break;
+        }
+      }
+      if (FileBacked || It == VMATracking.VMAs.begin()) {
+        break;
+      }
+      auto Prev = std::prev(It);
+      if (Prev->first + Prev->second.Length != It->first) {
+        break;
+      }
+      It = Prev;
+    }
+  }
+
+  std::lock_guard clk {AnonImageNameMutex};
+  const char* Result = nullptr;
+  if (ImageBase != 0) {
+    auto Existing = AnonImageNames.find(ImageBase);
+    if (Existing != AnonImageNames.end()) {
+      Result = Existing->second->c_str();
+    } else {
+      if (NameHint.empty()) {
+        NameHint = ReadPEExportName(ImageBase);
+      }
+      auto Label = fextl::fmt::format("PE:{}@0x{:x}", NameHint.empty() ? "image" : NameHint.c_str(), ImageBase);
+      Result = AnonImageNames.emplace(ImageBase, fextl::make_unique<fextl::string>(std::move(Label))).first->second->c_str();
+    }
+  }
+  // Negative results are cached too (Result == nullptr): JIT arenas compile
+  // thousands of blocks and must not pay the walk each time.
+  AnonImageLookupCache.emplace(VMABase, Result);
+  return Result;
 }
 
 FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {

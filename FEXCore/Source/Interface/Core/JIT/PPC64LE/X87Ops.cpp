@@ -64,6 +64,7 @@
 // rely on r0 here — the formulas are all `STATE + computed_offset_in_TMP3`,
 // so we use `... STATE, TMP3`.
 
+#include "Interface/Context/Context.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
 #include <FEXCore/Core/CoreState.h>
@@ -774,6 +775,97 @@ DEF_OP(F80VBSLStack) {
   // valid based on (SrcStack1 && SrcStack2). Match that.
   bool SetValid = (Op->SrcStack1 != 0) && (Op->SrcStack2 != 0);
   StoreStackSlot(this, VTMP1, 0, SetValid);
+}
+
+// -------------------------------------------------------------------------
+// Native conversions
+// -------------------------------------------------------------------------
+
+// F80CVTTo: f64 (or f32) → f80, no rounding involved — every binary64 value
+// is exactly representable in binary80, so this is pure bit manipulation.
+// Lowered natively because it is the hottest fallback in ReducedPrecisionMode:
+// FXSAVE/FNSAVE convert all eight f64 stack slots to the 80-bit memory format,
+// and wine's syscall dispatcher runs FXSAVE on every win32↔unix transition,
+// so the softfloat helper call (f64_to_extF80) showed up at ~4.5% of
+// Cyberpunk 2077's game thread.
+//
+// Output layout matches VLoadTwoGPRs: mantissa (explicit integer bit at 63)
+// in LE element 0, sign|15-bit-exponent halfword in LE element 1.
+//
+// Deliberate divergence from the softfloat helper: an SNaN's quiet bit is NOT
+// set during the conversion (softfloat forces bit 62 and raises invalid; see
+// s_commonNaNToExtF80UI.c). That matches hardware FSTP-m80 (raw register
+// store) and is the correct behaviour for FXSAVE — a context save must
+// round-trip the register file exactly — but it would change full-precision
+// FLD m64 of an SNaN, where hardware (and the helper) quiet on conversion.
+// So the native path is gated to ReducedPrecisionMode, whose f64 pipeline
+// already keeps SNaN bits intact at loads.
+DEF_OP(F80CVTTo) {
+  auto Op = IROp->C<IR::IROp_F80CVTTo>();
+
+  if (Op->SrcSize != IR::OpSize::i64Bit || !CTX->Config.x87ReducedPrecision()) {
+    // f32 sources and full-precision mode keep the FABI softfloat fallback
+    // (full precision needs the SNaN-quieting FLD semantics).
+    Op_Unhandled(IROp, Node);
+    return;
+  }
+
+  const auto Dst = GetVReg(Node);
+  const auto Src = GetVReg(Op->X80Src);
+
+  // Scalar f64 lives at LE element 0 = physical bytes [8..15]; rotate so
+  // mfvsrd (which reads physical [0..7]) sees it.
+  vsldoi(VTMP1, Src, Src, 8);
+  mfvsrd(TMP1, VTMP1);
+
+  // TMP2 = sign bit moved from bit 63 to bit 15.
+  srdi(TMP2, TMP1, 48);
+  andi_(TMP2, TMP2, 0x8000);
+
+  rldicl(TMP3, TMP1, 12, 53); // TMP3 = biased 11-bit exponent (bits 62:52)
+  rldicl(TMP4, TMP1, 0, 12);  // TMP4 = 52-bit fraction (bits 51:0)
+
+  Label ZeroOrDenormal, Normal, Merge, Done;
+  cmpdi(TMP3, 0);
+  bc(CC_EQ, &ZeroOrDenormal);
+  cmpdi(TMP3, 0x7ff);
+  bc(CC_NE, &Normal);
+
+  // Inf/NaN: exponent saturates; mantissa path below preserves the payload
+  // (f64 quiet bit 51 lands on f80 quiet bit 62 after the <<11).
+  li(TMP3, 0x7fff);
+  b(&Merge);
+
+  Bind(&Normal);
+  addi(TMP3, TMP3, 16383 - 1023); // rebias
+
+  Bind(&Merge);
+  // Mantissa = (fraction << 11) | explicit integer bit.
+  sldi(TMP4, TMP4, 11);
+  li(TMP1, 1);
+  sldi(TMP1, TMP1, 63);
+  or_(TMP4, TMP4, TMP1);
+  or_(TMP2, TMP2, TMP3);
+  b(&Done);
+
+  Bind(&ZeroOrDenormal);
+  cmpdi(TMP4, 0);
+  bc(CC_EQ, &Done); // ±0: mantissa 0, exponent 0, sign already in TMP2.
+  // Denormal: value = fraction × 2^-1074. Normalise the fraction to bit 63;
+  // the result is always a normal f80 (its exponent range is far wider).
+  //   mantissa = fraction << n            (n = clz, ≥ 12 since fraction < 2^52)
+  //   exponent = 16383 + 63 - 1074 - n = 15372 - n
+  cntlzd(TMP3, TMP4);
+  sld(TMP4, TMP4, TMP3);
+  subfic(TMP3, TMP3, 15372);
+  or_(TMP2, TMP2, TMP3);
+
+  Bind(&Done);
+  // Assemble per VLoadTwoGPRs: Hi (sign|exp) → LE element 1, Lo (mantissa) →
+  // LE element 0.
+  mtvsrd(VTMP1, TMP2);
+  mtvsrd(VTMP2, TMP4);
+  xxpermdi(Dst, VTMP1, VTMP2, 0);
 }
 
 } // namespace FEXCore::CPU

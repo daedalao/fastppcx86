@@ -3802,7 +3802,14 @@ DEF_OP(VFNMLS) {
 //      sticky bits raised are exactly those the one real computation raises,
 //      and rounding follows FPSCR.RN like the scalar op did.
 //   3. Merge the result lane back over Vec1's element 0: xxpermdi for f64
-//      (dw-granular), xxsel with a pooled lane mask for f32.
+//      (dw-granular); for f32 a two-xxsldwi rotate pair — word-granular
+//      permutes can compose the {Vec1.w0..w2, result.w3} layout directly:
+//        xxsldwi(T, R, Keep, 3)  = {R.w3, Keep.w0, Keep.w1, Keep.w2}
+//        xxsldwi(D, T, T, 1)     = {Keep.w0, Keep.w1, Keep.w2, R.w3}
+//      which replaced the earlier pooled-mask xxsel (a 2-3 instruction
+//      EmitLoadPPC64VConst plus the load-use stall on its lvx, per op —
+//      measured as 120 lvx mask loads inside ONE Wwise mixer block).
+//      Only R's word 3 is read, so R may hold junk in other lanes.
 //
 // Why vector-domain and not xs* scalar: measured on op4k (2026-08-05,
 // notes/denormal_bench.c), xs*/f* SCALAR float ops take a ~22.8x denormal
@@ -3812,25 +3819,63 @@ DEF_OP(VFNMLS) {
 // through xv* removes the cliff without any MXCSR machinery. It also deletes
 // the two GPR-store->vector-load forwarding stalls of the old lowering.
 //   old: 9 instructions + 2 store-hit-load stalls + denormal cliff
-//   new: f64 = 4 instructions, f32 = 7 (3 of them the pool load), no stalls
+//   new: f64 = 4 instructions, f32 = 5, no stalls, no memory traffic
+//
+// SPLAT CHAINS (see Interface/IR/Passes/ScalarSplatChain.cpp).
+//
+// Step 2 above is the whole trick: with both operands splatted, the xv* result
+// is ALREADY splatted in every element. So for a scalar op sitting inside a
+// guest chain (movss; subss; mulss; movss) the step-3 merge only exists to
+// rebuild upper elements that the next link immediately throws away again.
+//
+// The IR pass proves per node that nothing observes the upper elements and sets
+// SplatResult. Two independent savings follow, both keyed off that one bit:
+//   * Op->SplatResult      -> skip the merge, write the xv* straight to Dst.
+//   * operand is splat-form -> skip that operand's splat, feed it in directly.
+// A chain-internal op with both a marked producer and a marked self is then a
+// single xv* instruction, down from five.
+//
+// The backend keeps no value state and does not need any: the splat-form test
+// reads the SplatResult bit off the operand's DEFINING op, which is the same
+// bit that op's own lowering consulted when it decided not to merge. The pass
+// guarantees a marked value never leaves its block, never reaches a
+// StoreRegister/StoreContext, never reaches a 16-byte store, and never reaches
+// a consumer that reads anything above element 0.
+//
+// Denormals are unaffected: every lane still computes the same value with the
+// same xv* op, exactly as the splat-both-operands lowering already did. Do not
+// be tempted to "simplify" a splat chain into xs*/f* scalar ops -- that is the
+// 22.8x POWER8 denormal assist this lowering exists to avoid.
 #define DEF_SCALAR_INSERT(NAME, XVOP_S, XVOP_D)                                \
 DEF_OP(NAME) {                                                                 \
   const auto Op   = IROp->C<IR::IROp_##NAME>();                                \
+  const auto ElemSz = Op->Header.ElementSize;                                  \
   const auto Dst  = GetVReg(Node);                                             \
   const auto Vec1 = GetVReg(Op->Vector1);                                      \
   const auto Vec2 = GetVReg(Op->Vector2);                                      \
-  if (Op->Header.ElementSize == IR::OpSize::i32Bit) {                          \
-    xxspltw(VTMP1, Vec1, 3);                                                   \
-    xxspltw(VTMP2, Vec2, 3);                                                   \
-    XVOP_S(VTMP1, VTMP1, VTMP2);                                               \
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
-                        TMP1, TMP2);                                           \
-    xxsel(Dst, Vec1, VTMP1, VTMP2);                                            \
+  const bool Splat1 = IsSplatFormValue(Op->Vector1, ElemSz);                   \
+  const bool Splat2 = IsSplatFormValue(Op->Vector2, ElemSz);                   \
+  VR A = Vec1, B = Vec2;                                                       \
+  if (ElemSz == IR::OpSize::i32Bit) {                                          \
+    if (!Splat1) { xxspltw(VTMP1, Vec1, 3); A = VTMP1; }                       \
+    if (!Splat2) { xxspltw(VTMP2, Vec2, 3); B = VTMP2; }                       \
+    if (Op->SplatResult) {                                                     \
+      XVOP_S(Dst, A, B);                                                       \
+    } else {                                                                   \
+      /* Vec1 is read again below, so the xv* must land in a scratch. */       \
+      XVOP_S(VTMP1, A, B);                                                     \
+      xxsldwi(VTMP2, VTMP1, Vec1, 3);                                          \
+      xxsldwi(Dst, VTMP2, VTMP2, 1);                                           \
+    }                                                                          \
   } else {                                                                     \
-    xxpermdi(VTMP1, Vec1, Vec1, 3);                                            \
-    xxpermdi(VTMP2, Vec2, Vec2, 3);                                            \
-    XVOP_D(VTMP1, VTMP1, VTMP2);                                               \
-    xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */                \
+    if (!Splat1) { xxpermdi(VTMP1, Vec1, Vec1, 3); A = VTMP1; }                \
+    if (!Splat2) { xxpermdi(VTMP2, Vec2, Vec2, 3); B = VTMP2; }                \
+    if (Op->SplatResult) {                                                     \
+      XVOP_D(Dst, A, B);                                                       \
+    } else {                                                                   \
+      XVOP_D(VTMP1, A, B);                                                     \
+      xxpermdi(Dst, Vec1, VTMP1, 1); /* {Vec1.dw0, result.dw1} */              \
+    }                                                                          \
   }                                                                            \
 }
 DEF_SCALAR_INSERT(VFAddScalarInsert, xvaddsp, xvadddp)
@@ -3867,8 +3912,8 @@ DEF_OP(VFMinScalarInsert) {
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec2, Vec1);          // mask = Vec2 > Vec1
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel   (Dst, Vec1, VTMP1, VTMP2);    // guest f32 elem0 = BE word 3
+    xxsldwi (VTMP2, VTMP1, Vec1, 3);      // {result.w3, Vec1.w0..w2}
+    xxsldwi (Dst, VTMP2, VTMP2, 1);       // rotate: result into BE word 3 (elem0)
   } else {
     xvcmpgtdp(VTMP1, Vec2, Vec1);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
@@ -3886,8 +3931,8 @@ DEF_OP(VFMaxScalarInsert) {
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     vcmpgtfp(VTMP1, Vec1, Vec2);          // mask = Vec1 > Vec2
     vsel    (VTMP1, Vec2, Vec1, VTMP1);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel   (Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi (VTMP2, VTMP1, Vec1, 3);      // {result.w3, Vec1.w0..w2}
+    xxsldwi (Dst, VTMP2, VTMP2, 1);       // rotate: result into BE word 3 (elem0)
   } else {
     xvcmpgtdp(VTMP1, Vec1, Vec2);
     xxsel    (VTMP1, Vec2, Vec1, VTMP1);
@@ -3915,8 +3960,8 @@ DEF_OP(VFSqrtScalarInsert) {
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     xxspltw (VTMP1, Vec2, 3);             // guest f32 elem0 = BE word 3
     xvsqrtsp(VTMP1, VTMP1);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel   (Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi (VTMP2, VTMP1, Vec1, 3);      // {result.w3, Vec1.w0..w2}
+    xxsldwi (Dst, VTMP2, VTMP2, 1);       // rotate: result into BE word 3 (elem0)
   } else {
     xxpermdi(VTMP1, Vec2, Vec2, 3);       // guest f64 elem0 = BE dw1
     xvsqrtdp(VTMP1, VTMP1);
@@ -3937,8 +3982,8 @@ DEF_OP(VFRSqrtScalarInsert) {
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     xxspltw  (VTMP1, Vec2, 3);            // guest f32 elem0 = BE word 3
     vrsqrtefp(VTMP1, VTMP1);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel    (Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi  (VTMP2, VTMP1, Vec1, 3);     // {result.w3, Vec1.w0..w2}
+    xxsldwi  (Dst, VTMP2, VTMP2, 1);      // rotate: result into BE word 3 (elem0)
     return;
   }
 
@@ -3964,8 +4009,8 @@ DEF_OP(VFRecpScalarInsert) {
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
     xxspltw(VTMP1, Vec2, 3);              // guest f32 elem0 = BE word 3
     vrefp  (VTMP1, VTMP1);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel  (Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi(VTMP2, VTMP1, Vec1, 3);       // {result.w3, Vec1.w0..w2}
+    xxsldwi(Dst, VTMP2, VTMP2, 1);        // rotate: result into BE word 3 (elem0)
     return;
   }
 
@@ -4018,13 +4063,13 @@ DEF_OP(VFToFScalarInsert) {
     xxpermdi(VTMP1, Vec2, Vec2, 3);
     xvcvdpsp(VTMP1, VTMP1);
     xxspltw (VTMP1, VTMP1, 0);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel   (Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi (VTMP2, VTMP1, Vec1, 3);      // {result.w3, Vec1.w0..w2}
+    xxsldwi (Dst, VTMP2, VTMP2, 1);       // rotate: result into BE word 3 (elem0)
   } else {
     // Same size: a lane copy, no conversion at all.
     if (DstES == IR::OpSize::i32Bit) {
-      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-      xxsel(Dst, Vec1, Vec2, VTMP2);
+      xxsldwi(VTMP2, Vec2, Vec1, 3);      // {Vec2.w3, Vec1.w0..w2}
+      xxsldwi(Dst, VTMP2, VTMP2, 1);      // rotate: Vec2.elem0 into BE word 3
     } else {
       xxpermdi(Dst, Vec1, Vec2, 1);
     }
@@ -4053,8 +4098,8 @@ DEF_OP(VSToFVectorInsert) {
     if (DstES == IR::OpSize::i32Bit) {
       // i32 -> f32, lane-wise; the guest element stays in BE word 3.
       xvcvsxwsp(VTMP1, Vec2);
-      EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-      xxsel(Dst, Vec1, VTMP1, VTMP2);
+      xxsldwi(VTMP2, VTMP1, Vec1, 3);     // {result.w3, Vec1.w0..w2}
+      xxsldwi(Dst, VTMP2, VTMP2, 1);      // rotate: result into BE word 3 (elem0)
     } else {
       // i32 -> f64. xvcvsxwdp reads BE words 0 and 2, so splat the guest
       // element across the register first; both doublewords then match.
@@ -4071,8 +4116,8 @@ DEF_OP(VSToFVectorInsert) {
     // Single rounding, as in VSToFGPRInsert; results land in BE words 0 and 2.
     xvcvsxdsp(VTMP1, VTMP1);
     xxspltw(VTMP1, VTMP1, 0);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel(Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi(VTMP2, VTMP1, Vec1, 3);       // {result.w3, Vec1.w0..w2}
+    xxsldwi(Dst, VTMP2, VTMP2, 1);        // rotate: result into BE word 3 (elem0)
   } else {
     xvcvsxddp(VTMP1, VTMP1);
     xxpermdi(Dst, Vec1, VTMP1, 1);
@@ -4107,8 +4152,8 @@ DEF_OP(VSToFGPRInsert) {
     // register to reach word 3 where the guest element lives.
     xvcvsxdsp(VTMP1, VTMP1);
     xxspltw(VTMP1, VTMP1, 0);
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel(Dst, Vec, VTMP1, VTMP2);
+    xxsldwi(VTMP2, VTMP1, Vec, 3);        // {result.w3, Vec.w0..w2}
+    xxsldwi(Dst, VTMP2, VTMP2, 1);        // rotate: result into BE word 3 (elem0)
   } else {
     xvcvsxddp(VTMP1, VTMP1);
     xxpermdi(Dst, Vec, VTMP1, 1);       // {Vec.dw0, result.dw1}
@@ -4162,9 +4207,8 @@ DEF_OP(VFToIScalarInsert) {
     EmitRound(VTMP1, VTMP1);
     xscvdpspn(VTMP1, VTMP1);       // f64 (dw0) -> f32 (word 0), exact here
     xxspltw(VTMP1, VTMP1, 0);      // result to every word incl. elem0's
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,
-                        TMP1, TMP2);
-    xxsel(Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi(VTMP2, VTMP1, Vec1, 3); // {result.w3, Vec1.w0..w2}
+    xxsldwi(Dst, VTMP2, VTMP2, 1);  // rotate: result into BE word 3 (elem0)
   } else {
     xxpermdi(VTMP1, Vec2, Vec2, 3);  // elem0 f64 -> dw0 (and dw1)
     EmitRound(VTMP1, VTMP1);
@@ -4251,8 +4295,8 @@ DEF_OP(VFCMPScalarInsert) {
   // Merge the mask into element 0, upper elements from Vec1 - same lane-0
   // merge as the arithmetic ScalarInsert path.
   if (Is32) {
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
-    xxsel(Dst, Vec1, VTMP1, VTMP2);
+    xxsldwi(VTMP2, VTMP1, Vec1, 3);       // {mask.w3, Vec1.w0..w2}
+    xxsldwi(Dst, VTMP2, VTMP2, 1);        // rotate: mask into BE word 3 (elem0)
   } else {
     xxpermdi(Dst, Vec1, VTMP1, 1);
   }
@@ -4305,9 +4349,8 @@ DEF_OP(NAME) {                                                                 \
     xxspltw(toVSX(VTMP2), toVSX(V1), 3);                                       \
     xxspltw(VTMP3_VSX, toVSX(V2), 3);                                          \
     XVOP_S(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
-    EmitLoadPPC64VConst(VTMP2, FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32,      \
-                        TMP1, TMP2);                                           \
-    xxsel(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), toVSX(VTMP2));               \
+    xxsldwi(VTMP2, VTMP1, Upper, 3); /* {result.w3, Upper.w0..w2} */           \
+    xxsldwi(Dst, VTMP2, VTMP2, 1);   /* rotate: result into BE word 3 */       \
   } else {                                                                     \
     xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                         \
     xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                           \
