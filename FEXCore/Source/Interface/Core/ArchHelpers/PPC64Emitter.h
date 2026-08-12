@@ -347,18 +347,20 @@ public:
   // else lxvd2x/stxvd2x + xxpermdi (2 insns, ISA 2.06). CLOBBER CONTRACT
   // (superset across paths — callers must assume all of it): TMP1, TMP2, TMP3
   // (historical bounce contract, kept so callsites stay conservative), plus
-  // VTMP2 (or VTMP1 when src==VTMP2) on the pre-3.0 store path. `ea` must not
-  // be r0 (RA=0 encodes literal zero).
+  // VTMP3_VSX (vs12, RA-invisible low bank) on the pre-3.0 store path. No
+  // VMX register (VTMP1/VTMP2 included) is clobbered on any path. `ea` must
+  // not be r0 (RA=0 encodes literal zero).
   void LoadUnalignedV128(VR dst, GPR ea);
   void StoreUnalignedV128(VR src, GPR ea);
 
   // Size-correct FPR memory ops (x86 movd/movq/movdqu semantics): for size <16
   // the load zero-extends the upper bits of dst, and the store writes only the
   // low `size` bytes to *ea. Sizes accepted: 1, 2, 4, 8, 16 (load also 10).
-  // Same superset clobber contract as above: TMP1..TMP3, plus VTMP2 (or VTMP1
-  // on aliasing) on the pre-3.0 scalar-load, scalar-store and V128 store
-  // paths. Sizes 4/8 take a register-only path on both load and store and
-  // clobber no TMP GPR at all, but callers must keep assuming the superset.
+  // Same superset clobber contract as above: TMP1..TMP3 plus VTMP3_VSX; no
+  // VMX register is clobbered on any path (the pre-3.0 scalar/V128 store swap
+  // goes through VTMP3_VSX, the pre-3.0 scalar load merges against VZERO_VSX).
+  // Sizes 4/8 take a register-only path on both load and store and clobber no
+  // TMP GPR at all, but callers must keep assuming the superset.
   void LoadFPRSized(VR dst, GPR ea, uint32_t size);
   void StoreFPRSized(VR src, GPR ea, uint32_t size);
 

@@ -466,9 +466,9 @@ void PPC64EmitterBase::PopDynamicRegs() {
 //     DOUBLEWORD-SWAPPED image (dword[0] = LE int mem[EA..7], dword[1] =
 //     LE int mem[EA+8..15]); xxpermdi DM=2 (T.dw0 = A.dw1, T.dw1 = B.dw0)
 //     swaps the halves — 2 instructions.
-// Register-contract change vs the bounce: these paths clobber NO TMP GPRs.
-// The store's pre-3.0 path clobbers one vector temp (VTMP2, or VTMP1 when
-// src==VTMP2); no current caller keeps VTMP1/VTMP2 live across these helpers.
+// Register-contract change vs the bounce: these paths clobber NO TMP GPRs
+// and NO VMX registers. The store's pre-3.0 path swaps through VTMP3_VSX
+// (vs12, the RA-invisible low bank) — it used to burn VTMP2/VTMP1.
 // Fault behaviour: si_addr/DAR precision for lxvx/stxvx across protected page
 // boundaries was measured good on the target (POWER9 DD2.2, Radix) in all
 // first/second/both-page patterns — see docs/POWER9_PORT_PLAN.md §2.1.
@@ -490,10 +490,12 @@ void PPC64EmitterBase::StoreUnalignedV128(VR src, GPR ea) {
     return;
   }
   // Pre-3.0 VSX fallback: stxvd2x writes the doubleword-swapped image, so
-  // swap into a scratch VR first (src must be preserved for the caller).
-  const VR VScratch = (src == VTMP2) ? VTMP1 : VTMP2;
-  xxpermdi(VScratch, src, src, 2);
-  stxvd2x(VScratch, ea, GPRegs::r0);
+  // swap into a scratch first (src must be preserved for the caller). The
+  // scratch is VTMP3_VSX from the RA-invisible low bank — both consumers
+  // (xxpermdi, stxvd2x) are VSX-form so they can encode it, and using it
+  // instead of VTMP1/VTMP2 means this path clobbers NO VMX register at all.
+  xxpermdi(VTMP3_VSX, toVSX(src), toVSX(src), 2);
+  stxvd2x(VTMP3_VSX, ea, GPRegs::r0);
 }
 
 // x86 sub-128-bit FPR memory ops (vmovd/vmovq/vmov{ss,sd}) write/read only
@@ -530,20 +532,21 @@ void PPC64EmitterBase::StoreFPRSized(VR src, GPR ea, uint32_t size) {
   // dword[1]. Nothing outside the `size` bytes is written, which is the
   // whole point of not using stvx here (hello_static __tls_init_tp SEGV).
   //
-  // src must be preserved for the caller, so permute into a vector scratch:
-  // VTMP2, or VTMP1 when src is VTMP2. Same scratch choice, and therefore
-  // the same clobber contract, as the pre-3.0 StoreUnalignedV128 path.
+  // src must be preserved for the caller, so permute into VTMP3_VSX (the
+  // RA-invisible low-bank scratch) — same choice, and therefore the same
+  // clobbers-no-VMX-register contract, as the pre-3.0 StoreUnalignedV128
+  // path. All three consumers here are VSX-form, which is what makes the
+  // low bank encodable at all.
   // stxsdx is ISA 2.06 and stxsiwx ISA 2.07, so both are POWER8-legal with
   // no feature gate — matching the ungated lxsdx/lxsiwzx on the load side.
   // `ea` sits in RA (where RA=0 would mean literal zero), so it must not be
   // r0; that is already the documented precondition for these helpers.
   if (size == 4 || size == 8) {
-    const VR VScratch = (src == VTMP2) ? VTMP1 : VTMP2;
-    xxpermdi(VScratch, src, src, 2);
+    xxpermdi(VTMP3_VSX, toVSX(src), toVSX(src), 2);
     if (size == 8) {
-      stxsdx(VScratch, ea, GPRegs::r0);
+      stxsdx(VTMP3_VSX, ea, GPRegs::r0);
     } else {
-      stxsiwx(VScratch, ea, GPRegs::r0);
+      stxsiwx(VTMP3_VSX, ea, GPRegs::r0);
     }
     return;
   }
