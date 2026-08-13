@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -62,8 +64,10 @@ public:
     return reinterpret_cast<T>(CurrentOffset);
   }
 
+  // No caller in this tree today, but it must not come back as a no-op if one
+  // appears: __builtin___clear_cache emits nothing on ppc64le.
   static void ClearICache(void* Begin, std::size_t Length) {
-    __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+    FEXCore::ArchHelpers::PPC64::FlushICacheRange(Begin, Length);
   }
 
   size_t GetCursorOffset() const {

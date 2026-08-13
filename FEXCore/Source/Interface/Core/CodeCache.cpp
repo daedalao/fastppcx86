@@ -15,6 +15,7 @@
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 
 #include <FEXHeaderUtils/Filesystem.h>
 
@@ -1299,8 +1300,9 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   // dispatcher can fetch whatever the I-cache last held for those lines — the
   // exact hazard the JIT's own Finalise (JIT/PPC64LE/JIT.cpp) flushes for after
   // every compile. ARM64 needs the equivalent maintenance for the same reason.
-  __builtin___clear_cache(reinterpret_cast<char*>(CodeBufferRange.data()),
-                          reinterpret_cast<char*>(CodeBufferRange.data()) + CodeBufferRange.size_bytes());
+  // (Was __builtin___clear_cache, which emits no cache maintenance at all on
+  // ppc64le — see FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h.)
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(CodeBufferRange.data(), CodeBufferRange.size_bytes());
 
   // B1: structural check of the guest -> host block mapping, before anything is
   // registered as an executable entry point. Deliberately NOT gated on

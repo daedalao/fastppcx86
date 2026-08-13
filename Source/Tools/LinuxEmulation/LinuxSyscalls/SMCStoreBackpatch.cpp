@@ -18,6 +18,7 @@ $end_info$
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/TypeDefines.h>
@@ -419,7 +420,7 @@ namespace {
     EmitSharedTail(Em, HelperAddr);
     Pool.Used = FEXCore::AlignUp(Em.GetOffset(), 16);
     Pool.TailOffset = 0;
-    __builtin___clear_cache(reinterpret_cast<char*>(Pool.Base), reinterpret_cast<char*>(Pool.Base + Pool.Used));
+    FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Pool.Base), Pool.Used);
 
     if (Pool.Used + Bytes > kPoolSize) {
       // Cannot happen: the shared tail is a couple hundred bytes. Leak the
@@ -780,7 +781,7 @@ const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64
   LOGMAN_THROW_A_FMT(Size <= kMaxStubBytes, "SMC backpatch stub overflow");
 
   // Publish the stub's instructions before anything can branch to them.
-  __builtin___clear_cache(reinterpret_cast<char*>(Stub), reinterpret_cast<char*>(Stub + Size));
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Stub), Size);
 
   const int64_t Delta = static_cast<int64_t>(StubAddr) - static_cast<int64_t>(StorePC);
   if (Delta < -(int64_t {1} << 25) || Delta >= (int64_t {1} << 25)) {
@@ -794,14 +795,14 @@ const char* TryBackpatchStore(FEXCore::Core::InternalThreadState* Thread, uint64
   }
   const uint32_t Branch = (18u << 26) | ((static_cast<uint32_t>(static_cast<int32_t>(Delta) >> 2) & 0x00FFFFFFu) << 2);
 
-  // Cross-modifying-code protocol, copied verbatim from the dispatcher's
-  // publication loop (PPC64Dispatcher.cpp:941): a single naturally-aligned
-  // 4-byte store, then dcbst / sync / icbi / isync on that word. See the
-  // header for why a concurrently-executing thread needs no handshake: the
-  // pre-patch instruction is a faulting store that HandleSegfault already
-  // resolves correctly, so both the old and the new instruction are valid.
+  // Cross-modifying-code protocol, shared with the dispatcher's publication
+  // path: a single naturally-aligned 4-byte store, then dcbst / sync / icbi /
+  // sync / isync on that word's cache block. See the header for why a
+  // concurrently-executing thread needs no handshake: the pre-patch instruction
+  // is a faulting store that HandleSegfault already resolves correctly, so both
+  // the old and the new instruction are valid.
   __atomic_store_n(reinterpret_cast<uint32_t*>(StorePC), Branch, __ATOMIC_RELAXED);
-  asm volatile("dcbst 0,%0; sync; icbi 0,%0; isync" ::"r"(StorePC) : "memory");
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(StorePC), 4);
 
   gPatched.emplace(StorePC, PatchRecord {Insn, Branch, Stub});
 

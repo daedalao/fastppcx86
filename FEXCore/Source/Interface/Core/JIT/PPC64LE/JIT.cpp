@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -2048,14 +2049,23 @@ uint32_t PPC64EncodeBranch(int64_t Delta) {
 
 // Single atomic 4-byte instruction rewrite + icache maintenance. The store
 // is naturally atomic (4-byte aligned); atomic_ref documents the intent and
-// forbids tearing at the C++ level. __builtin___clear_cache lowers to
-// dcbst; sync; icbi; isync on ppc64le — icbi is broadcast on POWER9, so
-// remote harts stop fetching the stale word once this returns; instructions
-// already in a remote pipeline may still retire as the OLD word, which every
-// transition above tolerates (old word is always a correct-behaviour path).
+// forbids tearing at the C++ level. FlushICacheRange issues
+// dcbst; sync; icbi; sync; isync for the containing cache block — icbi is
+// broadcast on POWER9, so remote harts stop fetching the stale word once this
+// returns; instructions already in a remote pipeline may still retire as the
+// OLD word, which every transition above tolerates (old word is always a
+// correct-behaviour path).
+//
+// This used to call __builtin___clear_cache, which emits NO cache maintenance
+// on ppc64le with either compiler in this toolchain (see
+// FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h for the measurement). That made
+// the broadcast-icbi argument above vacuous, and on the DELINK direction —
+// PPC64DirectBlockDelinker / PPC64IndirectBlockDelinker below — a missed
+// invalidate can leave a remote hart fetching a live branch INTO a block that
+// is being invalidated. That is a correctness hazard, not a lost optimisation.
 void PPC64PatchInstruction(uintptr_t Address, uint32_t Word) {
   std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Address)).store(Word, std::memory_order_relaxed);
-  __builtin___clear_cache(reinterpret_cast<char*>(Address), reinterpret_cast<char*>(Address) + 4);
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Address), 4);
 }
 
 // Both delinkers run under the LookupCache WRITE lock (GuestToHostMap::Erase
@@ -2160,8 +2170,9 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
     // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
-    // between. __builtin___clear_cache orders nothing for REMOTE observers
-    // and runs after both stores anyway — without the hwsync a remote hart
+    // between. The icache maintenance inside PPC64PatchInstruction runs after
+    // BOTH stores, so its own `sync` cannot order one against the other —
+    // without the hwsync here a remote hart
     // can fetch the new bcl leg and still read a stale HostCode, branching
     // to garbage. Sequence: store HostCode; hwsync; store patch word;
     // icache maintenance. hwsync's cumulativity guarantees any hart that
@@ -3729,9 +3740,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // block at a code-buffer offset whose underlying page was previously
   // executed as different host code. ARM64's CompileCode does the equivalent
   // via ClearICache (FEXCore/Source/Interface/Core/JIT/JIT.cpp:1123).
-  // __builtin___clear_cache lowers to dcbst/sync/icbi/isync on PPC64.
-  __builtin___clear_cache(reinterpret_cast<char*>(CodeData.BlockBegin),
-                          reinterpret_cast<char*>(CodeData.BlockBegin) + CodeSize);
+  //
+  // This was __builtin___clear_cache until 2026-08-13. On ppc64le that builtin
+  // emits nothing with gcc and an empty libgcc stub call with clang, i.e. this
+  // — the primary code-publication point of the whole backend — performed no
+  // cache maintenance at all. See FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(CodeData.BlockBegin), CodeSize);
 
   CodeBuffers.LatestOffset += CodeSize;
 

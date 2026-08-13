@@ -5,6 +5,8 @@ $end_info$
 */
 
 #pragma once
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -162,7 +164,10 @@ inline void* MakeLow32HostTrampoline(void* Target) {
   Insns[2] = 0x7C0C0378; // mr    r12, r0   (or r12, r0, r0)
   Insns[3] = 0x4E800420; // bctr
   memcpy(Tramp + 16, &Target, 8);
-  __builtin___clear_cache(reinterpret_cast<char*>(Tramp), reinterpret_cast<char*>(Tramp + 16));
+  // Only the four instruction words need I-cache publication; the literal at
+  // +16 is read by `ld`, i.e. through the data path. Not
+  // __builtin___clear_cache: it emits no cache maintenance on ppc64le.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Tramp, 16);
   Cache.emplace(Target, Tramp);
   return Tramp;
 #else
