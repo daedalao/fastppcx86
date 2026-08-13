@@ -1373,6 +1373,17 @@ DEF_OP(Bfe) {
   auto Src = GetReg(Op->Src);
   uint32_t width  = Op->Width;
   uint32_t lsb    = Op->lsb;
+  // The 64-bit-mode frontend canonicalizes every 32-bit guest result with
+  // Bfe(#32, #0) — THIS op is the tail mask in that idiom. When the prepass
+  // proved the mask dead (see Elide32MaskSet in JITClass.h), the whole op
+  // degenerates to a register copy, or to nothing when RA coalesced Dst==Src.
+  if (width == 32 && lsb == 0 && IROp->Size > IR::OpSize::i32Bit) {
+    const auto ID = IR->GetID(Node).Value;
+    if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      if (Dst != Src) mr(Dst, Src);
+      return;
+    }
+  }
   if (IROp->Size <= IR::OpSize::i32Bit) {
     // rlwinm RA, RS, SH, MB, ME where:
     // We want bits [lsb, lsb+width-1] of Src in low bits of Dst.

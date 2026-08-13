@@ -3190,7 +3190,19 @@ void PPC64JITCore::Compute32MaskElision() {
       PrevNode = CodeNode;
       PrevOp = IROp;
 
-      if (!DefOp || DefOp->Size != IR::OpSize::i32Bit || !IR::GetHasDest(DefOp->Op)) {
+      if (!DefOp || !IR::GetHasDest(DefOp->Op)) {
+        continue;
+      }
+      // Two def shapes qualify: an i32-sized ALU op (its handler emits the
+      // rldicl tail via Mask32Tail — the 32-bit-guest idiom), or the 64-bit
+      // frontend's canonicalizing Bfe(#32,#0) itself (the whole op IS the
+      // mask; DEF_OP(Bfe) degenerates it to mr/nothing when elided).
+      bool DefIsMask = DefOp->Size == IR::OpSize::i32Bit;
+      if (!DefIsMask && DefOp->Op == IR::OP_BFE && DefOp->Size == IR::OpSize::i64Bit) {
+        auto B = DefOp->C<IR::IROp_Bfe>();
+        DefIsMask = B->Width == 32 && B->lsb == 0;
+      }
+      if (!DefIsMask) {
         continue;
       }
       const IR::PhysicalRegister DefPR(DefNode);
