@@ -3880,7 +3880,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // per block, in the exact order the loop below emits them. See the
   // FallthroughBlockID comment in JITClass.h for why EntryPoint successors
   // are never fallthrough candidates.
-  static const bool DisableFallthrough = getenv("FEX_NOFALLTHROUGH") != nullptr;
+  // Fallthrough elision measured a ~4.7% REGRESSION on a tight RMW microloop:
+  // removing the loop terminator branch shifts loop-top alignment, and POWER8
+  // fetch groups punish that more than the saved branch pays. Opt-in via
+  // FEX_FALLTHROUGH=1 until backward-branch-target alignment lands.
+  static const bool DisableFallthrough = getenv("FEX_FALLTHROUGH") == nullptr;
   fextl::vector<std::pair<uint32_t, bool>> BlockEmissionOrder;
   if (!DisableFallthrough) {
     BlockEmissionOrder.reserve(IRView->GetHeader()->BlockCount);
