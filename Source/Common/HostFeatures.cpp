@@ -530,6 +530,11 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
 
   ///< Only force enable SVE256 if SVE is already enabled and ForceSVEWidth is set to >= 256.
   Features->SupportsSVE256 = ForceSVEWidth && ForceSVEWidth >= 256;
+
+  // SupportsTSODisp16 (PPC64LE) is a strict widening of SupportsTSOImm9's TSO
+  // displacement folding; ride the LRCPC2 override so
+  // FEX_HOSTFEATURES=disablelrcpc2 disables TSO displacement folding wholesale.
+  Features->SupportsTSODisp16 &= Features->SupportsTSOImm9;
 }
 
 static void HandleErrata(FEXCore::HostFeatures* HostFeatures, uint64_t MIDR) {
@@ -747,6 +752,18 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     } else {
       HostFeatures.ICacheLineSize = 128;
     }
+
+    // TSO displacement folding. On ARM these bits track LRCPC2 because LDAPUR
+    // is the only acquire load with a displacement form (SIMM9). On POWER the
+    // barrier (lwsync) is a separate instruction from the access, so a TSO
+    // load/store may use any addressing form; leaving these off forces every
+    // displaced TSO access through an explicit IR Add (extra addi on the
+    // critical path plus an extra live SSA temp). SupportsTSOImm9 unlocks the
+    // frontend's ±256 fold; SupportsTSODisp16 widens it to the full ±32K
+    // D/DS-form displacement range the backend already handles.
+    // FEX_HOSTFEATURES=disablelrcpc2 turns both off for A/B (see OverrideFeatures).
+    HostFeatures.SupportsTSOImm9 = true;
+    HostFeatures.SupportsTSODisp16 = true;
   }
 #endif
 

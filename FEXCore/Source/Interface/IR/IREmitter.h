@@ -19,9 +19,10 @@ namespace FEXCore::IR {
 
 class IREmitter {
 public:
-  IREmitter(FEXCore::Utils::IntrusivePooledAllocator& ThreadAllocator, bool SupportsTSOImm9)
+  IREmitter(FEXCore::Utils::IntrusivePooledAllocator& ThreadAllocator, bool SupportsTSOImm9, bool SupportsTSODisp16)
     : DualListData {ThreadAllocator, 8 * 1024 * 1024}
-    , SupportsTSOImm9(SupportsTSOImm9) {}
+    , SupportsTSOImm9(SupportsTSOImm9)
+    , SupportsTSODisp16(SupportsTSODisp16) {}
 
   virtual ~IREmitter() = default;
 
@@ -61,13 +62,18 @@ public:
     bool IsSIMM9 = ((int64_t)Imm >= -256) && ((int64_t)Imm <= 255);
     IsSIMM9 &= (SupportsTSOImm9 || !TSO);
 
+    // Full signed 16-bit displacement for TSO accesses on hosts where the TSO
+    // barrier is a separate instruction from the access (PPC64LE D/DS-form).
+    // TSO-only: non-TSO folding keeps the SIMM9/extended rules above.
+    bool IsTSODisp16 = TSO && SupportsTSODisp16 && ((int64_t)Imm >= -32768) && ((int64_t)Imm <= 32767);
+
     // Extended offsets for regular loadstore only.
     LOGMAN_THROW_A_FMT(Size >= IR::OpSize::i8Bit && Size <= IR::OpSize::i256Bit, "Must be sized");
 
     bool IsExtended = (Imm & (IR::OpSizeToSize(Size) - 1)) == 0 && Imm / IR::OpSizeToSize(Size) <= 4095;
     IsExtended &= !TSO;
 
-    if (IsSIMM9 || IsExtended) {
+    if (IsSIMM9 || IsTSODisp16 || IsExtended) {
       OffsetScale = 1;
       return _InlineConstant(Imm);
     } else {
@@ -519,6 +525,7 @@ protected:
   fextl::vector<Ref> CodeBlocks;
   uint64_t Entry {};
   bool SupportsTSOImm9 {};
+  bool SupportsTSODisp16 {};
 
 private:
   void ResetWorkingList();

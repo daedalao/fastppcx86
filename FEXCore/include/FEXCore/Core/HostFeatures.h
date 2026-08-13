@@ -21,6 +21,11 @@ struct HostFeatures {
   bool SupportsAtomics {};
   bool SupportsRCPC {};
   bool SupportsTSOImm9 {};
+  // Host can fold a full signed 16-bit displacement into a TSO GPR access.
+  // Set on PPC64LE: the TSO barrier (lwsync) is a separate instruction, so the
+  // access itself may use any addressing form — the LDAPUR-style SIMM9
+  // restriction behind SupportsTSOImm9 is an ARM artifact. Never set on ARM64.
+  bool SupportsTSODisp16 {};
   bool SupportsRAND {};
   bool SupportsAVX {};
   bool SupportsSVE128 {};

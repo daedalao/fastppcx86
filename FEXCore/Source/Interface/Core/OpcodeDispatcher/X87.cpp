@@ -129,7 +129,7 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
   const auto SourceSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::f80Bit;
   AddressMode A = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, false);
 
-  A = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, false, false, Width);
+  A = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, CTX->HostFeatures.SupportsTSODisp16, false, false, Width);
   _StoreStackMem(SourceSize, Width, A.Base, A.Index, OpSize::iInvalid, A.IndexType, A.IndexScale);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {

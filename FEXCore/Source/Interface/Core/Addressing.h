@@ -22,7 +22,7 @@ struct AddressMode {
 };
 
 Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool AddSegmentBase, bool AllowUpperGarbage = false);
-AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9, bool AtomicTSO,
-                              bool Vector, IR::OpSize AccessSize);
+AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9,
+                              bool HostSupportsTSODisp16, bool AtomicTSO, bool Vector, IR::OpSize AccessSize);
 
 } // namespace FEXCore::IR

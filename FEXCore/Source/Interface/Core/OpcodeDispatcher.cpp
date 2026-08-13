@@ -4916,7 +4916,7 @@ void OpDispatchBuilder::StoreResult(RegClass Class, X86Tables::DecodedOp Op, Ref
 }
 
 OpDispatchBuilder::OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx)
-  : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9}
+  : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9, ctx->HostFeatures.SupportsTSODisp16}
   , CTX {ctx} {
   if (CTX->HostFeatures.SupportsAVX && CTX->HostFeatures.SupportsSVE256) {
     SaveAVXStateFunc = &OpDispatchBuilder::SaveAVXState;
