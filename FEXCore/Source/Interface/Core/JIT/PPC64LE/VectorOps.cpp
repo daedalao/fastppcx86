@@ -410,19 +410,12 @@ DEF_OP(VFRecp) {
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
-    // 1.0 / Src per lane, via stack roundtrip (POWER8 has no xvredp).
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    LoadConstant(TMP2, 0x3FF0000000000000ULL); // 1.0
-    std(TMP2, -24, r1);
-    lfd(f0, -24, r1);
-    lfd(f1, 0, TMP1);   // lane 0
-    fdiv(f1, f0, f1);
-    stfd(f1, 0, TMP1);
-    lfd(f1, 8, TMP1);   // lane 1
-    fdiv(f1, f0, f1);
-    stfd(f1, 8, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // 1.0 / Src per lane. The old comment claimed POWER8 lacks xvredp - it
+    // does exist (ISA 2.06) but is an ESTIMATE; the precise-divide semantic
+    // wanted here is xvdivdp, same operation the old per-lane fdiv
+    // stack-roundtrip computed, minus the spill and two store-hit-loads.
+    EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_F64_ONE, TMP1, TMP2);
+    xvdivdp(Dst, VTMP1, Src);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -492,20 +485,11 @@ DEF_OP(VFRSqrt) {
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
-    // 1.0 / sqrt(x) per lane via xvsqrtdp + per-lane fdiv (no xvrsqrtedp).
-    xvsqrtdp(VTMP1, Src);
-    addi(TMP1, r1, -16);
-    stvx(VTMP1, r(0), TMP1);
-    LoadConstant(TMP2, 0x3FF0000000000000ULL);
-    std(TMP2, -24, r1);
-    lfd(f0, -24, r1);
-    lfd(f1, 0, TMP1);
-    fdiv(f1, f0, f1);
-    stfd(f1, 0, TMP1);
-    lfd(f1, 8, TMP1);
-    fdiv(f1, f0, f1);
-    stfd(f1, 8, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // 1.0 / sqrt(x) per lane: precise sqrt then precise vector divide,
+    // replacing the per-lane fdiv stack roundtrip.
+    xvsqrtdp(VTMP2, Src);
+    EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_F64_ONE, TMP1, TMP2);
+    xvdivdp(Dst, VTMP1, VTMP2);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -1974,20 +1958,16 @@ DEF_OP(VUnZip) {
     //   result.LE_elt[0..N/2-1]   = VL.LE_elt[0,2,...]
     //   result.LE_elt[N/2..N-1]   = VU.LE_elt[0,2,...]
     // Build via vperm with a 16-byte ctrl whose phys[0..7] is don't-care (0).
-    uint64_t lo;
+    // The even-gather controls are byte-identical to VAddP's MMX even
+    // selectors — reuse those pool entries instead of an inline build.
+    PPC64VConstIndex Idx;
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      lo = 0x191B1D1F090B0D0FULL; break; // VU.even, VL.even — bytes
-    case IR::OpSize::i16Bit:
-      lo = 0x1A1B1E1F0A0B0E0FULL; break; // halves
-    case IR::OpSize::i32Bit:
-      lo = 0x1C1D1E1F0C0D0E0FULL; break; // words (single VL[0] + single VU[0])
+    case IR::OpSize::i8Bit:  Idx = PPC64_VCONST_ADDP_EVEN_B64; break;
+    case IR::OpSize::i16Bit: Idx = PPC64_VCONST_ADDP_EVEN_H64; break;
+    case IR::OpSize::i32Bit: Idx = PPC64_VCONST_ADDP_EVEN_W64; break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    LoadConstant(TMP1, lo); std(TMP1, -16, r1);
-    li(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(VTMP1, r(0), TMP3);
+    EmitLoadPPC64VConst(VTMP1, Idx, TMP1, TMP2);
     vperm(Dst, VL, VU, VTMP1);
     return;
   }
@@ -2010,20 +1990,15 @@ DEF_OP(VUnZip2) {
 
   if (RegSz == IR::OpSize::i64Bit) {
     // MMX odd-gather: result low 64 = [VL.LE_elt[1,3,...], VU.LE_elt[1,3,...]].
-    uint64_t lo;
+    // Byte-identical to VAddP's MMX odd selectors — reuse the pool entries.
+    PPC64VConstIndex Idx;
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      lo = 0x181A1C1E080A0C0EULL; break;
-    case IR::OpSize::i16Bit:
-      lo = 0x18191C1D08090C0DULL; break;
-    case IR::OpSize::i32Bit:
-      lo = 0x18191A1B08090A0BULL; break;
+    case IR::OpSize::i8Bit:  Idx = PPC64_VCONST_ADDP_ODD_B64; break;
+    case IR::OpSize::i16Bit: Idx = PPC64_VCONST_ADDP_ODD_H64; break;
+    case IR::OpSize::i32Bit: Idx = PPC64_VCONST_ADDP_ODD_W64; break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    LoadConstant(TMP1, lo); std(TMP1, -16, r1);
-    li(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(VTMP1, r(0), TMP3);
+    EmitLoadPPC64VConst(VTMP1, Idx, TMP1, TMP2);
     vperm(Dst, VL, VU, VTMP1);
     return;
   }
@@ -2595,7 +2570,11 @@ DEF_OP(VAnyNonZero) {
   const auto Src = GetVReg(Op->Vector);
   vspltisb(VTMP1, 0);
   vcmpequb_(VTMP2, Src, VTMP1);
-  mfcr(TMP1);
+  // mfocrf reads only CR6 (FXM 0x02); mfcr serializes all eight CR fields on
+  // POWER8. Bits outside the addressed field are undefined but the rlwinm
+  // masks to the single CR6 bit we consume - same argument as the CRC-area
+  // flag extraction in ALUOps.cpp.
+  mfocrf(TMP1, 0x02);
   rlwinm(TMP1, TMP1, 25, 31, 31);
   xori(Dst, TMP1, 1);
 }
@@ -2609,9 +2588,7 @@ DEF_OP(VUMulH) {
   if (ElemSz != IR::OpSize::i16Bit) { Op_Unhandled(IROp, Node); return; }
   vmulouh(VTMP1, V1, V2);
   vmuleuh(VTMP2, V1, V2);
-  LoadConstant(TMP1, 0x181908091C1D0C0DULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1011000114150405ULL); std(TMP1,  -8, r1);
-  addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
+  EmitLoadPPC64VConst(Dst, PPC64_VCONST_MULH_HI_I16, TMP1, TMP2);
   vperm(Dst, VTMP1, VTMP2, Dst);
 }
 
@@ -2624,9 +2601,7 @@ DEF_OP(VSMulH) {
   if (ElemSz != IR::OpSize::i16Bit) { Op_Unhandled(IROp, Node); return; }
   vmulosh(VTMP1, V1, V2);
   vmulesh(VTMP2, V1, V2);
-  LoadConstant(TMP1, 0x181908091C1D0C0DULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1011000114150405ULL); std(TMP1,  -8, r1);
-  addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
+  EmitLoadPPC64VConst(Dst, PPC64_VCONST_MULH_HI_I16, TMP1, TMP2);
   vperm(Dst, VTMP1, VTMP2, Dst);
 }
 
@@ -5378,6 +5353,10 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W64 + 1] = 0x0000000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 0]  = 0x18191A1B08090A0BULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_MULH_HI_I16 + 0]   = 0x181908091C1D0C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_MULH_HI_I16 + 1]   = 0x1011000114150405ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_ONE + 0]       = 0x3FF0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_ONE + 1]       = 0x3FF0000000000000ULL,
   },
 };
 } // namespace

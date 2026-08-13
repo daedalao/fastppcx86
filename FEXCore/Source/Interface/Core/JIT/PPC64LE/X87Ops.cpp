@@ -349,10 +349,10 @@ DEF_OP(StoreStackMem) {
   auto Op = IROp->C<IR::IROp_StoreStackMem>();
 
   if (Op->StoreSize != IR::OpSize::f80Bit || Op->SourceSize != IR::OpSize::f80Bit) {
-    // Unsupported conversion path — emit a trap. 0x7FE00008 is `trap` (tw 31,r0,r0),
-    // an unconditional program-check on PPC64. This is the project-wide
-    // convention for "I don't know what this means; fail loudly".
-    Emit32(0x7FE00008);
+    // Unsupported conversion path — emit an unconditional trap (program
+    // check). Project-wide convention for "I don't know what this means;
+    // fail loudly".
+    tw(31, r(0), r(0));
     return;
   }
 

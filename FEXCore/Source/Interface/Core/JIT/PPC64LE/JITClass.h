@@ -159,6 +159,11 @@ enum PPC64VConstIndex : uint32_t {
   PPC64_VCONST_ADDP_EVEN_B64, PPC64_VCONST_ADDP_ODD_B64,
   PPC64_VCONST_ADDP_EVEN_H64, PPC64_VCONST_ADDP_ODD_H64,
   PPC64_VCONST_ADDP_EVEN_W64, PPC64_VCONST_ADDP_ODD_W64,
+  // VUMulH/VSMulH i16: vperm control interleaving the high halfwords of the
+  // vmulo/vmule pair back into element order. Shared by both signednesses.
+  PPC64_VCONST_MULH_HI_I16,
+  // Splat f64(1.0) — numerator for VFRecp/VFRSqrt i64 xvdivdp paths.
+  PPC64_VCONST_F64_ONE,
   PPC64_VCONST_MAX,
 };
 
