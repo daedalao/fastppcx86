@@ -316,6 +316,43 @@ private:
   // backward-edge suspend poke in the jump handlers is never skipped by this.
   uint32_t FallthroughBlockID {UINT32_MAX};
 
+  // -------------------------------------------------------------------------
+  // 32-bit tail-mask elision (FEX_ZEXTOPT=0 kill switch).
+  //
+  // Every i32 GPR ALU handler canonicalizes its result with
+  // rldicl(Dst,Dst,0,32) so that any observer — SRA writeback via a coalesced
+  // StoreRegister, spill slots, signal-frame state reconstruction — sees the
+  // guest's zero-extended 32-bit value. The LZMA-loop audit (2026-08-13)
+  // measured those masks at 15% of emitted instructions, many provably dead.
+  //
+  // Elide32MaskSet[def ID] means the def's tail mask may be skipped. The
+  // prepass (Compute32MaskElision) sets it only under ALL of:
+  //   1. the def has exactly one IR use (OrderedNode::GetUses() == 1),
+  //   2. that use is the IMMEDIATELY NEXT op in the same block (so the
+  //      unmasked value cannot reach a spill, a block boundary, or an
+  //      SRA-coalesced StoreRegister — the value dies at the next op), and
+  //   3. the consumer's emitted encoding reads only the low 32 bits of that
+  //      operand position, as a static ISA fact (word compares, word shifts,
+  //      mullw/mulli-mod-2^32, narrow stores). See the table in
+  //      Compute32MaskElision for the per-op verification notes.
+  // Rule 2 is what keeps signal observation sound: a synchronous fault in a
+  // LATER guest instruction can never observe this def as architectural
+  // state, because the def is dead before any later instruction begins.
+  // Spill/Fill are IR ops, so an RA-inserted spill between def and use breaks
+  // the "immediately next" test and conservatively keeps the mask.
+  // -------------------------------------------------------------------------
+  fextl::vector<bool> Elide32MaskSet;
+  void Compute32MaskElision();
+
+  // Tail-mask emission for i32 GPR results: rldicl unless provably dead.
+  void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      return;
+    }
+    rldicl(Dst, Dst, 0, 32);
+  }
+
   static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
     return (static_cast<uint64_t>(From) << 32) | To;
   }

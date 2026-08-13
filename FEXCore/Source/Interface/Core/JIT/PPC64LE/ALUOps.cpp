@@ -138,8 +138,8 @@ DEF_OP(Add) {
     add(Dst, S1, GetReg(Op->Src2));
   }
   if (IROp->Size == IR::OpSize::i32Bit) {
-    // Mask to 32 bits (zero-extend)
-    rldicl(Dst, Dst, 0, 32);
+    // Mask to 32 bits (zero-extend) — elided when provably dead, see Mask32Tail
+    Mask32Tail(Dst, Node);
   }
 }
 
@@ -185,7 +185,7 @@ DEF_OP(Sub) {
     auto S1 = GetReg(Op->Src1);
     subf(Dst, GetReg(Op->Src2), S1);  // subf RT,RA,RB → RT = RB - RA
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Neg) {
@@ -218,14 +218,14 @@ DEF_OP(Neg) {
     auto CC = MapNZCVCC(IntegerNZCVCond(Op->Cond));
     iselcc(Dst, CC, TMP4, Src);
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Not) {
   auto Op  = IROp->C<IR::IROp_Not>();
   auto Dst = GetReg(Node);
   not_(Dst, GetReg(Op->Src));
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Mul) {
@@ -247,7 +247,7 @@ DEF_OP(Mul) {
       mulld(Dst, S1, S2);
   }
   // mullw/mulli sign-extend the 32-bit product into bits 0..31.
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(UMul) {
@@ -259,7 +259,7 @@ DEF_OP(UMul) {
     mullw(Dst, S1, S2);
   else
     mulld(Dst, S1, S2);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(UMull) {
@@ -617,7 +617,7 @@ DEF_OP(Or) {
   } else {
     or_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(And) {
@@ -633,7 +633,7 @@ DEF_OP(And) {
   } else {
     and_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Xor) {
@@ -653,7 +653,7 @@ DEF_OP(Xor) {
   } else {
     xor_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Andn) {
@@ -667,7 +667,7 @@ DEF_OP(Andn) {
   } else {
     andc(Dst, GetReg(Op->Src1), GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Orlshl) {
@@ -677,7 +677,7 @@ DEF_OP(Orlshl) {
   auto S2  = GetReg(Op->Src2);
   sldi(TMP4, S2, Op->BitShift);
   or_(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Orlshr) {
@@ -687,7 +687,7 @@ DEF_OP(Orlshr) {
   auto S2  = GetReg(Op->Src2);
   srdi(TMP4, S2, Op->BitShift);
   or_(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Ornror) {
@@ -700,7 +700,7 @@ DEF_OP(Ornror) {
   uint32_t sh = (64 - Op->BitShift) & 63;
   rldicl(TMP4, S2, sh, 0);   // TMP4 = ROR(S2, BitShift)
   orc(Dst, S1, TMP4);         // Dst = S1 | NOT(TMP4)
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 // XorShift / XornShift / AndShift: Honor the IR ShiftType field. Earlier
@@ -760,7 +760,7 @@ DEF_OP(XorShift) {
       break;
   }
   xor_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(XornShift) {
@@ -812,7 +812,7 @@ DEF_OP(XornShift) {
   }
   not_(TMP4, TMP4);
   xor_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(AndShift) {
@@ -863,7 +863,7 @@ DEF_OP(AndShift) {
       break;
   }
   and_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(AndWithFlags) {
@@ -3087,7 +3087,7 @@ DEF_OP(AddShift) {
     sldi(TMP4, S2, Op->ShiftAmount);
   }
   add(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(SubShift) {
@@ -3097,7 +3097,7 @@ DEF_OP(SubShift) {
   auto S2  = GetReg(Op->Src2);
   sldi(TMP4, S2, Op->ShiftAmount);
   subf(Dst, TMP4, S1);  // S1 - TMP4
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 // =========================================================================

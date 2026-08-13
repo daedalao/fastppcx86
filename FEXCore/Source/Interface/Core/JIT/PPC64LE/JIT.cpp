@@ -3126,6 +3126,118 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 // dispatch bandwidth from the sibling thread (audio). See
 // cp2077-reddispatcher-spin-anatomy.
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// 32-bit tail-mask elision prepass. See the Elide32MaskSet block comment in
+// JITClass.h for the soundness argument (single use + immediately-next-op +
+// encoding reads only low 32 bits of that operand position).
+//
+// Per-consumer verification notes (all against the emitting handler, not
+// assumed from the ISA index):
+//  * CondJump, !FromNZCV, no VCmp fusion, Cond not TSTZ/TSTNZ, CompareSize
+//    i32: EmitCompare's i32 arm emits cmplw/cmplwi/cmpw/cmpwi exclusively —
+//    word compares read bits 32:63 only. TSTZ/TSTNZ excluded because the
+//    rldicl bit-extract can address a high bit.
+//  * Lshl/Lshr/Ashr at Size <= i32: value operand is read by
+//    rlwinm/slw/srw/extsw (low word only); the register shift count is
+//    pre-masked with rldicl(...,0,59) (low 5 bits).
+//  * Mul/UMul at Size <= i32: mullw reads low words; mulli's low-32 product
+//    depends only on the low 32 of RA (multiplication mod 2^32). The
+//    handler's own tail mask re-canonicalizes the polluted high half.
+//  * StoreMem, GPR class, Size <= i32: EmitStoreGPR emits stw/sth/stb for
+//    the value. Only the Value operand qualifies — Addr/Offset feed address
+//    arithmetic that reads all 64 bits.
+// -------------------------------------------------------------------------
+void PPC64JITCore::Compute32MaskElision() {
+  static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
+  static const bool ZExtOff = ZExtEnv && ZExtEnv[0] == '0';
+  Elide32MaskSet.assign(IR->GetSSACount(), false);
+  if (ZExtOff) {
+    return;
+  }
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    IR::Ref PrevNode = nullptr;
+    const IR::IROp_Header* PrevOp = nullptr;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      // Emission no-ops (Op_NoOp table entries) are transparent to the
+      // "immediately next op" adjacency test: they emit no host code and, as
+      // non-uses, cannot spill or observe the pending def. Without this the
+      // inline-constant node between a def and its compare-with-immediate
+      // consumer (the LZMA hot-loop shape) defeats every elision.
+      switch (IROp->Op) {
+      case IR::OP_DUMMY:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET: continue;
+      default: break;
+      }
+
+      const IR::Ref DefNode = PrevNode;
+      const IR::IROp_Header* DefOp = PrevOp;
+      PrevNode = CodeNode;
+      PrevOp = IROp;
+
+      if (!DefOp || DefOp->Size != IR::OpSize::i32Bit || !IR::GetHasDest(DefOp->Op)) {
+        continue;
+      }
+      const IR::PhysicalRegister DefPR(DefNode);
+      if (DefPR.AsRegClass() != IR::RegClass::GPR) {
+        continue;
+      }
+      if (DefNode->GetUses() != 1) {
+        continue;
+      }
+      const auto DefID = IR->GetID(DefNode);
+      const auto IsDef = [DefID, this](IR::OrderedNodeWrapper Arg) {
+        return !Arg.IsInvalid() && !Arg.IsImmediate() && IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
+      };
+
+      bool Elide = false;
+      switch (IROp->Op) {
+      case IR::OP_CONDJUMP: {
+        auto Op = IROp->C<IR::IROp_CondJump>();
+        if (!Op->FromNZCV && Op->VCmpElementSize == IR::OpSize::iInvalid &&
+            Op->Cond != IR::CondClass::TSTZ && Op->Cond != IR::CondClass::TSTNZ &&
+            Op->CompareSize == IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Cmp1) || IsDef(Op->Cmp2);
+        }
+        break;
+      }
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_MUL:
+      case IR::OP_UMUL: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_STOREMEM: {
+        auto Op = IROp->C<IR::IROp_StoreMem>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      default: break;
+      }
+
+      if (Elide) {
+        Elide32MaskSet[DefID.Value] = true;
+      }
+    }
+  }
+}
+
 void PPC64JITCore::AnalyzeSpinLoops() {
   struct BlockInfo {
     uint32_t ID = UINT32_MAX;
@@ -3692,6 +3804,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   if (!DisableABILiveMask) {
     DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
   }
+
+  Compute32MaskElision();
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
