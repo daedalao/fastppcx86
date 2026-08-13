@@ -1,6 +1,6 @@
 %ifdef CONFIG
 {
-  "HostFeatures": ["AES256"],
+  "HostFeatures": ["AES256", "AVX"],
   "RegData": {
     "XMM1": ["0xD5D56A6A6AD5D56A", "0x6A6AD5D5D56A6AD5", "0xd5d56a6a6ad5d56a", "0x6a6ad5d5d56a6ad5"],
     "XMM2": ["0x2A2A9595952A2A95", "0x95952A2A2A95952A", "0x2a2a9595952a2a95", "0x95952a2a2a95952a"],
