@@ -23,8 +23,10 @@ own bundled libraries still need the rootfs for libc.
 
 **Thunk libraries, if you want working graphics.** Build with `-DBUILD_THUNKS=ON` so guest OpenGL
 and Vulkan calls land in the host's driver instead of being emulated instruction by instruction.
-Thunks are enabled per library in the `ThunksDB` block of `Config.json`. 32-bit games additionally
-need `BUILD_THUNKS_32BIT` and a 32-bit guest toolchain.
+Thunks are enabled per library in the `ThunksDB` block of `Config.json`. 32-bit games need both
+halves of the 32-bit pair: `BUILD_THUNKS_32BIT` (on by default) for the host side, and
+`BUILD_GUEST_THUNKS_32` with `X86_DEV_ROOTFS_32` pointed at a multilib x86 sysroot for the guest
+stubs. Without the guest half, 32-bit titles fall back to the emulated libraries in the rootfs.
 
 **An X display.** XCB is the only working window-system integration for an x86 guest on a PPC64LE
 host; the Wayland and Xlib paths break on cross-architecture guest-callback dispatch. Launch under
@@ -141,10 +143,18 @@ count, not by invalidation.
 
 These are the ones that earned their place in real sessions.
 
-`FEX_ENABLEAVX=0` pushes guest code onto SSE paths. POWER's vector units are 128-bit, so
-emulating 256-bit AVX costs more than the guest saves by using it; glibc string routines measured
-36 to 67% faster with AVX reporting off. Not a universal win, so A/B it. Moonlighter was faster with
-AVX left on.
+`FEX_HOSTFEATURES=enableavx` re-advertises AVX to the guest. **AVX is hidden by default on this
+port**, so guests pick their SSE paths. POWER's vector units are 128-bit and the dispatcher
+decomposes every 256-bit YMM op into a pair of 128-bit ops plus high-half spill traffic, which
+costs more than the guest gains: glibc string routines measured 36 to 67% faster on their SSE
+paths, and a driven Witcher 3 capture burned 16% less CPU with AVX hidden.
+
+Turn it on for the titles that need it. Cyberpunk 2077 refuses to start without AVX. Moonlighter
+measured faster with it on. `FEX_HOSTFEATURES=disableavx` forces it back off if a config layer
+enabled it.
+
+Note that this is a value of the `HostFeatures` option, not an option of its own. There is no
+`FEX_ENABLEAVX`; setting one does nothing.
 
 `FEX_REPORTED_CPUS=N`: see the cage section above.
 
@@ -155,18 +165,38 @@ loops. No longer required for correctness anywhere in the census, but the automa
 short-circuiting around 1017 library spin loops in Ziggurat, so it remains a measurable
 performance opt-in. Off by default; arm it per title.
 
+## Hardware TSO (experimental)
+
+`FEX_HWTSO=1` replaces per-access barrier emulation with POWER's Strong Access
+Ordering. Every guest mapping is created `PROT_SAO`, the hardware orders the
+accesses, and the JIT stops emitting TSO IR ops entirely: scalar, vector and
+memcpy barriers all disappear. Default off.
+
+Unlike `FEX_LOCKONLYTSO` this is sound. SAO pages are hardware TSO, and the MP
+litmus that fires roughly 1.2% per round on ordinary POWER8 pages produced zero
+violations in 16.3 million rounds on SAO pages.
+
+It is marked experimental because it depends on the host honouring `PROT_SAO`,
+which not every kernel and MMU configuration does. FEX probes at startup; if the
+kernel refuses, it warns once and falls back to barrier emulation, so enabling it
+on a host that cannot do it costs nothing but the warning. It was proven on the
+4K-page box only. Run `notes/tools/sao_litmus.c` on any new host class before
+trusting it there.
+
+Inert when off, and inert when `FEX_TSOENABLED=0`.
+
 ## Knobs that are known-unsound
 
 These are not in the list above and should not be treated as tuning. They make the emulator produce
 answers x86 says are impossible. They are documented because they exist and are fast, not because
 they are advisable.
 
-`FEX_LOCKONLYTSO=1` — **unsound. Measured, not theoretical.** The emulator normally emits
+`FEX_LOCKONLYTSO=1` is **unsound: measured, not theoretical.** The emulator normally emits
 acquire/release sequences around every guest load and store to preserve x86's memory ordering on a
 weakly-ordered host. This restricts that to instructions actually carrying a `LOCK` prefix, plus
 ranges explicitly forced by Mono detection; plain loads and stores lose their barriers entirely.
 
-The `MP` litmus shape — two stores on one thread, two loads on another — is *forbidden* on x86.
+The `MP` litmus shape (two stores on one thread, two loads on another) is *forbidden* on x86.
 Under FEX on POWER9, same guest binary, only the environment variable changed:
 
 | configuration | MP observations |
@@ -178,23 +208,59 @@ Every one of those is a guest-visible violation of the memory model FEX exists t
 swings ~50x between repetitions, so the specific numbers mean nothing; zero-every-time versus
 nonzero-every-time is the result. It costs about 1.6x in speed to be correct here.
 
-A second, independent litmus shape agrees. `IRIW` — also forbidden on x86 — was observed **552
+A second, independent litmus shape agrees. `IRIW`, also forbidden on x86, was observed **552
 times in 1,000,000 iterations** under `FEX_LOCKONLYTSO=1`, against **0 in 67,200,000 iterations**
 on the default config, with native `lwsync` and `hwsync` controls both at 0/200,000,000. Two
 different forbidden outcomes, two harnesses, same verdict.
 
-A sequential-consistency test does *not* detect this — `seqcst_discriminator.c` reads 0/60,000 both
-ways — because `LOCK` operations keep their full fence. It takes the MP or IRIW shape to see it.
+A sequential-consistency test does *not* detect this: `seqcst_discriminator.c` reads 0/60,000 both
+ways, because `LOCK` operations keep their full fence. It takes the MP or IRIW shape to see it.
 Reproduce with `powerpc64le-handbook/probes/atomics_litmus.c` (MP is the discriminator),
 `powerpc64le-handbook/probes/iriw.c`, and `powerpc64le-handbook/probes/seqcst_discriminator.c`.
 
 glibc futex and lazy-symbol-resolution are backed by `LOCK CMPXCHG` and therefore keep working,
-which is the only reason this option is usable at all — it is not a general reassurance. Anything
+which is the only reason this option is usable at all. That is not a general reassurance. Anything
 in the guest doing its own lock-free or `volatile`-based cross-thread communication may silently
 compute wrong results rather than crash. Use it only where a wrong answer is acceptable. FEX prints
 a warning on startup when it is enabled. It does nothing if `FEX_TSOENABLED=0`.
 
-### Per-application config files
+`FEX_NONTSORBP=1` is a narrower member of the same family. Accesses addressed
+through `RSP` already skip TSO barriers, on the assumption that the stack is
+thread-private. This extends that exemption to `RBP`, which matters for titles
+that keep frame pointers: every local-variable access through an `EBP` frame
+chain currently pays full barriers, and 32-bit code is built that way
+throughout. The soundness caveat is exactly the caveat on the existing `RSP`
+exemption, which is that a guest sharing stack memory between threads and
+relying on x86 ordering for it will get wrong answers. Per-app opt-in, off by
+default.
+
+## Kill switches and triage knobs
+
+These exist to bisect a regression, not to tune. Each disables an optimization
+that is on by default, or turns on logging that is off by default.
+
+`FEX_TSOPAIRELIDE=0` disables elision of the leading barrier in an adjacent
+TSO load/store pair. Set it if a title misbehaves in a way that smells like
+memory ordering, to rule the elision pass in or out.
+
+`FEX_NO_THUNK_PARTIAL_FILL=1` disables the sentinel-guarded partial GPR refill
+on thunk and host-call crossings, restoring the full refill. Suspect it when a
+crash lands in or just after a thunk call.
+
+`FEX_X11_SYNC_EVERY_CALL=1` restores a guest `XSync` on every Display-taking
+call. That was the default until 2026-08-13; it is now first-only, which is what
+makes the display lookup lock-free on the hot path. Set it when bisecting a
+`BadDrawable` or `BadMatch` at GL bootstrap or mode change.
+
+`FEX_VK_PROCADDR_TRACE=1` logs every Vulkan proc-address the guest successfully
+links. Useful when a Vulkan title fails at startup and you need to see which
+entry points resolved.
+
+Both `FEX_NO_THUNK_PARTIAL_FILL` and `FEX_VK_PROCADDR_TRACE` are tested for
+presence, not value, so `=0` enables them just as `=1` does. Unset them to turn
+them off. `FEX_TSOPAIRELIDE` and `FEX_X11_SYNC_EVERY_CALL` do read their value.
+
+## Per-application config files
 
 Setting these on the command line every time gets old. A JSON file at
 `~/.config/fex-emu/AppConfig/<guest-binary-basename>.json` applies to that title only:
