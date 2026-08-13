@@ -3214,8 +3214,20 @@ void PPC64JITCore::Compute32MaskElision() {
         continue;
       }
       const auto DefID = IR->GetID(DefNode);
-      const auto IsDef = [DefID, this](IR::OrderedNodeWrapper Arg) {
-        return !Arg.IsInvalid() && !Arg.IsImmediate() && IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
+      // Post-RA, consumer args are usually immediate-encoded PhysicalRegisters
+      // (see GetReg(OrderedNodeWrapper)) — node identity is gone. Matching by
+      // register is exact here BECAUSE of the adjacency precondition: no host
+      // instruction is emitted between the def and this consumer, so the
+      // register still holds precisely the def's value. Node-ref args (e.g.
+      // wrappers to InlineConstant nodes) keep the ID comparison.
+      const auto IsDef = [&DefPR, DefID, this](IR::OrderedNodeWrapper Arg) {
+        if (Arg.IsInvalid()) {
+          return false;
+        }
+        if (Arg.IsImmediate()) {
+          return IR::PhysicalRegister(Arg).Raw == DefPR.Raw;
+        }
+        return IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
       };
 
       bool Elide = false;
