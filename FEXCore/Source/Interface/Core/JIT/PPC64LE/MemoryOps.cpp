@@ -873,9 +873,12 @@ DEF_OP(LoadMemTSO) {
   // load is the plainest correct load-acquire on POWER, and it is the simpler of
   // two valid constructs. It replaced a self-compare / never-taken-branch /
   // `isync` sequence — also a documented and valid load-acquire, and cheaper,
-  // which is why the port originally chose it. `LockOnlyTSO` exists in the config
-  // precisely because per-load acquire cost "cumulatively dominates runtime in
-  // libc / pthread tight loops", so the cheap construct had a real motivation.
+  // which is why the port originally chose it. Per-load acquire cost is real —
+  // it "cumulatively dominates runtime in libc / pthread tight loops" — so the
+  // cheap construct had a real motivation. `LockOnlyTSO` also exists in the
+  // config for that reason, but it is NOT an alternative to getting this right:
+  // it is measurably unsound (see the block at the end of this function), and
+  // must not be treated as a way to buy back the cost of a barrier here.
   //
   // HONEST STATUS OF THE EVIDENCE, because an earlier version of this comment
   // overstated it twice and the corrections matter more than the conclusion:
@@ -900,11 +903,39 @@ DEF_OP(LoadMemTSO) {
   //      library gap is closed. That decides whether either construct matters.
   //   2. Get a recipe-compliant benchmark (SMT2, node-pinned) for the cost of
   //      `lwsync` per guest load. If it is significant and neither construct
-  //      affects correctness, the cheap one should come back — or `LockOnlyTSO`
-  //      becomes the better lever than either.
+  //      affects correctness, the cheap one should come back.
   //   3. Do not accept a zero-event run as proof of anything: at these rates 15
   //      trials cannot establish a zero, and 30 only rules out a true rate above
   //      about 10%.
+  //
+  // `LockOnlyTSO` IS NOT A CANDIDATE ANSWER TO (2). An earlier version of this
+  // comment said it "becomes the better lever than either". That was wrong, and
+  // the correction is not a matter of taste — it is measured. `FEX_LOCKONLYTSO=1`
+  // drops the barrier emitted here from every non-`LOCK` guest load and store,
+  // and that produces memory-ordering outcomes x86 forbids:
+  //
+  //   [MEASURED] AC922, same guest binary, only the env var changed
+  //   (powerpc64le-handbook/probes/atomics_litmus.c — the MP shape is the
+  //   discriminator; run via atomics_litmus_x86 under FEX):
+  //
+  //     default            MP  0 / 150000 rounds total (0/30000, 0/60000, 0/60000)
+  //     FEX_LOCKONLYTSO=1  MP  659 / 30000, then 12 / 30000, then 51 / 30000
+  //
+  //   MP is architecturally forbidden on x86 (no store-store or load-load
+  //   reordering visible to another processor), so every one of those is a guest-
+  //   visible violation of the memory model FEX claims to emulate. The rate swings
+  //   ~50x between repetitions, so no particular number means anything; 0/150000
+  //   against nonzero-every-time is the result.
+  //
+  //   powerpc64le-handbook/probes/seqcst_discriminator.c does NOT catch it —
+  //   0/60000 both ways [MEASURED] — because `LOCK` operations keep their full
+  //   fence. It is exactly the plain loads and stores that lose ordering, which
+  //   is why a seq_cst-shaped test passing is not evidence of anything here.
+  //
+  // It buys roughly 1.6x. It is a knowingly-unsound speed/correctness trade for a
+  // single-threaded-ish workload the user is prepared to have corrupt itself, not
+  // an engineering answer to barrier cost. Fixing the cost properly means a
+  // cheaper *correct* lowering, not deleting the barrier.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
     lwsync();
