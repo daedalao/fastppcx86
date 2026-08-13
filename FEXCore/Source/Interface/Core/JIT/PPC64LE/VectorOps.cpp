@@ -4767,9 +4767,10 @@ DEF_OP(Vector_FToF) {
     SpillForABICall(TMP1);
     addi(r3, r1, PostSpill(CryptoSlotA));
     addi(r4, r1, PostSpill(CryptoSlotA));
-    LoadConstant(r(12), SrcIsF16
-                          ? reinterpret_cast<uint64_t>(&PPC64_F16x4ToF32x4)
-                          : reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16x4));
+    // Table-resolved (S3.7-C5): a bare LoadConstant of the host address here
+    // is the serialized-block stale-pointer hazard — a cached block replayed
+    // in a new process would bctrl into the old ASLR layout.
+    EmitLoadPPC64Helper(r(12), SrcIsF16 ? PPC64_HELPER_F16x4ToF32x4 : PPC64_HELPER_F32x4ToF16x4);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
@@ -5368,6 +5369,8 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
   [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
   [::FEXCore::CPU::PPC64_HELPER_F64F2XM1]         = reinterpret_cast<uint64_t>(F64F2XM1Impl),
+  [::FEXCore::CPU::PPC64_HELPER_F16x4ToF32x4]     = reinterpret_cast<uint64_t>(&PPC64_F16x4ToF32x4),
+  [::FEXCore::CPU::PPC64_HELPER_F32x4ToF16x4]     = reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16x4),
   },
   // 128-bit constant pool. Each entry is written the way the inline
   // LoadConstant/std/std/lvx sequences it replaces wrote it: the first
@@ -5666,34 +5669,21 @@ DEF_OP(VAESKeyGenAssist) {
 // VSha1H: rotate-left 30 of element 0 (32-bit), upper lanes zeroed.
 // Trivial enough that we could inline-emit it, but we already have a helper
 // and consistency with the rest of the SHA path is more readable.
+// VSha1H: rotate-left-30 of guest element 0, upper lanes zeroed. Pure lane
+// arithmetic — vrlw rotates every 32-bit lane (the upper lanes' rotated
+// garbage is masked off), then the pooled lane0 mask isolates element 0.
+// Replaces a full FABI mini-frame + spill/fill + bctrl with 6 inline
+// instructions and no memory traffic beyond the pool lvx.
 DEF_OP(VSha1H) {
   const auto Op  = IROp->C<IR::IROp_VSha1H>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Src);
-  const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
-  const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; };
 
-  stdu(r1, -CryptoMiniFrameSize, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-  LoadConstant(TMP1, CryptoSlotA); stvx(Src, r1, TMP1);
-
-  SpillForABICall(TMP1);
-
-
-  addi(r3, r1, PostSpill(CryptoSlotA));
-  addi(r4, r1, PostSpill(CryptoSlotA));
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VSha1H);
-  std(r2, PostSpill(24), r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, PostSpill(24), r1);
-
-
-  FillForABICall();
-
-  LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
-  ld(r(0), 16, r1); mtlr(r(0));
-  addi(r1, r1, CryptoMiniFrameSize);
-  li(r(0), 0);
+  vspltisw(VTMP2, 15);
+  vadduwm(VTMP2, VTMP2, VTMP2);        // splat 30 (vspltisw imm caps at 15)
+  vrlw(VTMP1, Src, VTMP2);
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  vand(Dst, VTMP1, VTMP2);
 }
 
 // SHA1 / SHA256 round-step ops. POWER8 has no hardware SHA-NI, so each

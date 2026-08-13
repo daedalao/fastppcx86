@@ -60,10 +60,11 @@ enum PPC64HelperIndex : uint32_t {
   PPC64_HELPER_F64Atan,
   PPC64_HELPER_F64FYL2X,
   PPC64_HELPER_F64Scale,
-  // Deliberately NO F64F2XM1 entry — F64F2XM1Impl diverges from the
-  // upstream F64F2XM1Handler slot (expm1(x*ln2) vs exp2(src)-1.0, off by
-  // >1 ULP on 44.6% of inputs); reusing that Pointers slot re-breaks
-  // D9_F0_02_F64. Its call site keeps LoadConstant for now.
+  // No F64F2XM1 entry HERE — it was appended later (S3.7-C5, below) to keep
+  // table offsets stable. The still-true half of the old note: it MUST NOT
+  // reuse the upstream Pointers.F64F2XM1Handler slot — F64F2XM1Impl diverges
+  // from it (expm1(x*ln2) vs exp2(src)-1.0, off by >1 ULP on 44.6% of
+  // inputs); reusing that Pointers slot re-breaks D9_F0_02_F64.
   PPC64_HELPER_VAESImc,
   PPC64_HELPER_VAESKeyGenAssist,
   PPC64_HELPER_VAESEnc,
@@ -91,6 +92,12 @@ enum PPC64HelperIndex : uint32_t {
   // (F64F2XM1Impl in VectorOps.cpp) with different semantics from
   // F64F2XM1Handler; the helper table entry points at the local impl.
   PPC64_HELPER_F64F2XM1,
+  // Appended (same S3.7-C5 rule): the F16C f16x4<->f32x4 paths previously
+  // bctrl'd through a bare LoadConstant of the host function address — the
+  // exact serialized-block stale-pointer hazard the F64F2XM1 entry above was
+  // added to fix. Table-resolved now.
+  PPC64_HELPER_F16x4ToF32x4,
+  PPC64_HELPER_F32x4ToF16x4,
   PPC64_HELPER_MAX,
 };
 
