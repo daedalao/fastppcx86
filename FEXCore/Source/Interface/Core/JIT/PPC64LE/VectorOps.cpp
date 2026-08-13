@@ -4724,33 +4724,26 @@ DEF_OP(Vector_FToF) {
   const uint32_t Conv = (IR::OpSizeToSize(DstSz) << 8) | IR::OpSizeToSize(SrcSz);
 
   if (Conv == 0x0804) {
-    // f32 → f64 packed.  Source has 4 f32 lanes; we promote elements 0,1 into
-    // a 2-lane f64 result.  Spill source at -16, write f64 results at -32..-17.
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    lfs(f0, 0, TMP1);                 // f32 elem 0 → f64 in f0 (lfs auto-promotes)
-    stfd(f0, -32, r1);
-    lfs(f0, 4, TMP1);                 // f32 elem 1
-    stfd(f0, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // f32 -> f64 packed (CVTPS2PD low): promote guest elements 0,1. Guest f32
+    // element k sits at BE word (3-k); xvcvspdp converts BE words 0 and 2
+    // into dw0 and dw1. vmrglw(Src,Src) = [w2,w2,w3,w3] puts f32 e1 at w0 and
+    // e0 at w2, so the convert lands e1 in dw0 (guest f64 e1) and e0 in dw1
+    // (guest f64 e0) - exactly the target layout. Two instructions replace a
+    // spill + two lfs/stfd round trips (two store-hit-loads).
+    vmrglw(VTMP1, Src, Src);
+    xvcvspdp(Dst, VTMP1);
     return;
   }
   if (Conv == 0x0408) {
-    // f64 → f32 packed.  Source 2 f64 lanes → 2 f32 lanes in low half;
-    // upper half zeroed (matches CVTPD2PS).
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    lfd(f0, 0, TMP1);
-    frsp(f0, f0);
-    stfs(f0, -32, r1);
-    lfd(f0, 8, TMP1);
-    frsp(f0, f0);
-    stfs(f0, -28, r1);
-    li(TMP3, 0);
-    std(TMP3, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // f64 -> f32 packed (CVTPD2PS): narrow both f64s into the low half,
+    // upper half zeroed. xvcvdpsp leaves the results at BE words 0 and 2;
+    // the vmrghw-with-shifted-self trick packs [w0:w2] into one doubleword,
+    // and the final xxpermdi pairs it with VZERO's dw0 (the ABI-preserved
+    // half). Rounding: xvcvdpsp honours FPSCR.RN exactly as frsp did.
+    xvcvdpsp(VTMP1, Src);
+    xxsldwi(VTMP2, VTMP1, VTMP1, 2);
+    vmrghw(VTMP1, VTMP1, VTMP2);         // dw0 = cvt(e1) : cvt(e0)
+    xxpermdi(AsVSX(Dst), VZERO_VSX, AsVSX(VTMP1), 0b00);
     return;
   }
   if (Conv == 0x0402 || Conv == 0x0204) {
@@ -4793,15 +4786,11 @@ DEF_OP(VFCVTL2) {
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
   if (Op->Header.ElementSize == IR::OpSize::i64Bit) {
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    // f32 elem 2 at byte offset 8, f32 elem 3 at offset 12.
-    lfs(f0, 8, TMP1);
-    stfd(f0, -32, r1);
-    lfs(f0, 12, TMP1);
-    stfd(f0, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // Promote guest f32 elements 2,3 (CVTPS2PD upper). Elements 2,3 sit at BE
+    // words 1,0; vmrghw(Src,Src) = [w0,w0,w1,w1] positions e3 at w0 and e2 at
+    // w2, exactly where xvcvspdp reads. Mirror of the Conv 0x0804 path.
+    vmrghw(VTMP1, Src, Src);
+    xvcvspdp(Dst, VTMP1);
     return;
   }
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
@@ -4838,19 +4827,15 @@ DEF_OP(VFCVTN2) {
   const auto VL  = GetVReg(Op->VectorLower);
   const auto VU  = GetVReg(Op->VectorUpper);
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    // Spill VL at -32 (becomes result base), spill VU at -16 (source f64s).
-    addi(TMP1, r1, -32);
-    stvx(VL, r(0), TMP1);
-    addi(TMP2, r1, -16);
-    stvx(VU, r(0), TMP2);
-    // Narrow VU's two f64s into upper half of -32 buffer (offsets 8, 12).
-    lfd(f0, 0, TMP2);
-    frsp(f0, f0);
-    stfs(f0, 8, TMP1);
-    lfd(f0, 8, TMP2);
-    frsp(f0, f0);
-    stfs(f0, 12, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // Narrow VU's two f64s into guest f32 elements 2,3; elements 0,1 come
+    // from VL. Same [w0:w2] packing trick as the Conv 0x0408 path, but the
+    // packed doubleword lands in dw0 (guest upper half) and the closing
+    // xxpermdi takes dw1 from VL. All sources are consumed before Dst is
+    // written, so Dst may alias VL or VU.
+    xvcvdpsp(VTMP1, VU);
+    xxsldwi(VTMP2, VTMP1, VTMP1, 2);
+    vmrghw(VTMP1, VTMP1, VTMP2);         // dw0 = cvt(e1) : cvt(e0)
+    xxpermdi(AsVSX(Dst), AsVSX(VTMP1), AsVSX(VL), 0b01);
     return;
   }
   if (Op->Header.ElementSize == IR::OpSize::i16Bit) {
