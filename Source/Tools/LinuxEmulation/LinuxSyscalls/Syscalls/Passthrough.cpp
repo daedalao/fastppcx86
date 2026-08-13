@@ -25,6 +25,7 @@ $end_info$
 #include <sched.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -478,41 +479,66 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
   //     with a deferred frame queued, and must recheck periodically because
   //     a frame can be queued between any check and the trap.
   //
-  // Resolution: for untimed FUTEX_WAIT / FUTEX_WAIT_BITSET, wait in 100ms
-  // slices. Entry and every slice boundary recheck the deferred queue and
-  // convert to -EINTR (the unwind that delivers); internal-only EINTRs
-  // restart the slice. Guest-supplied timeouts keep the single-shot path:
-  // they self-recover at the guest deadline.
+  // Resolution, two tiers:
   //
-  // PI waits (LOCK_PI, WAIT_REQUEUE_PI, LOCK_PI2) are deliberately excluded:
-  // the kernel auto-restarts them across signals (ERESTARTNOINTR), glibc
-  // treats an EINTR from them as fatal, and WAIT_REQUEUE_PI must not be
-  // re-issued after the requeue has happened. Their wake comes from
-  // FUTEX_UNLOCK_PI, not a signal, so the black hole needs the owner to be
-  // wedged too — KNOWN-OPEN, revisit if a PI-mutex guest wedges.
+  // ALWAYS (the entry check): never enter a signal-wakeable untimed wait
+  // with a deferred frame already queued — return -EINTR, whose unwind
+  // delivers the signal. This closes the proven black hole for the common
+  // case (the frame is queued while the thread is still in JIT). A residual
+  // race remains: a frame queued between this check and the trap still
+  // parks (window is a few hundred instructions vs. the entire preceding
+  // JIT block chain before the fix). 32-bit caveat: the guest-SA_RESTART
+  // restart loop is 64-bit-only (Syscalls.cpp), so a 32-bit raw-futex user
+  // whose handler has SA_RESTART sees an EINTR here that a native kernel
+  // would hide behind an automatic restart. glibc loops on EINTR and is
+  // unaffected. KNOWN-OPEN: extend guest SA_RESTART to 32-bit.
   //
-  // Escape hatches: FEX_FUTEX_EINTR_PASSTHRU=1 restores always-surface
-  // EINTR, FEX_FUTEX_NOSLICE=1 restores single-shot untimed waits.
+  // OPT-IN (FEX_FUTEX_RESCUE=1): additionally wait in 100ms slices,
+  // rechecking the deferred queue at every boundary (closes the residual
+  // race), and after ~5s of no progress return a spurious wake (0) so the
+  // guest rechecks its predicate — FUTEX_WAIT is documented to wake
+  // spuriously, correct waiters must tolerate it.
+  //
+  // WHY THIS TIER IS DEFAULT-ON (measured, 2026-08-13): with only the entry
+  // check, futex_stress 'sig' mode still wedges ~half its runs — the
+  // check-to-trap window is readily hit under signal storms, so
+  // entry-check-only leaves a reachable PERMANENT hang in the default
+  // config. The slicing trade-off cuts the other way and is bounded:
+  // between slice re-issues the thread is briefly not queued on the futex.
+  // Protocols that mutate the word before waking (all of glibc) are safe —
+  // the re-issue converts the missed wake to EAGAIN via the kernel's
+  // *uaddr==val re-compare. A pure FUTEX_WAKE nudge with NO word change
+  // landing in that microsecond gap is lost until the 5s spurious wake
+  // recovers it — bounded latency, vs. the unbounded hang the black hole
+  // causes. Bounded beats unbounded, so the default is ON; slicing and
+  // rescue are one inseparable knob (slicing without the rescue would turn
+  // that lost nudge into a permanent hang), FEX_FUTEX_RESCUE=0 disables
+  // both.
+  //
+  // PI waits (LOCK_PI, WAIT_REQUEUE_PI, LOCK_PI2) are excluded from both
+  // tiers' wait paths: the kernel auto-restarts them across signals
+  // (ERESTARTNOINTR), glibc treats an EINTR from them as fatal, and
+  // WAIT_REQUEUE_PI must not be re-issued after the requeue has happened.
+  // Their wake comes from FUTEX_UNLOCK_PI, not a signal, so the black hole
+  // needs the owner to be wedged too — KNOWN-OPEN, revisit if a PI-mutex
+  // guest wedges.
+  //
+  // Escape hatch: FEX_FUTEX_EINTR_PASSTHRU=1 restores always-surface EINTR.
   constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)
   const uint64_t cmd = futex_op & FUTEX_CMD_MASK_LOCAL;
   const bool PlainWait = cmd == 0;   // FUTEX_WAIT: relative timeout or none
   const bool BitsetWait = cmd == 9;  // FUTEX_WAIT_BITSET: absolute timeout or none
   static const bool Passthru = (getenv("FEX_FUTEX_EINTR_PASSTHRU") != nullptr);
-  static const bool NoSlice = (getenv("FEX_FUTEX_NOSLICE") != nullptr);
+  static const bool Rescue = [] {
+    const char* Env = getenv("FEX_FUTEX_RESCUE");
+    return !(Env && Env[0] == '0' && Env[1] == '\0');
+  }();
 
   uint64_t result;
   if ((PlainWait || BitsetWait) && HasGuestDeliverableSignal(Frame)) {
     // Never enter a signal-wakeable sleep with a parked guest signal.
     result = static_cast<uint64_t>(-EINTR);
-  } else if ((PlainWait || BitsetWait) && timeout == 0 && !NoSlice) {
-    // Spurious-wake rescue: an untimed waiter parked for ~5s while the futex
-    // word never changes is the shape of every lost-wakeup wedge (CM login,
-    // Unity render threads). FUTEX_WAIT is documented to wake spuriously and
-    // every correct waiter rechecks its predicate in a loop, so returning 0
-    // here is within the guest's contract — it converts a permanent freeze
-    // into a bounded recheck, and costs one wakeup per parked thread per 5s.
-    // FEX_FUTEX_NORESCUE=1 disables (leaves pure kernel-side slicing).
-    static const bool NoRescue = (getenv("FEX_FUTEX_NORESCUE") != nullptr);
+  } else if ((PlainWait || BitsetWait) && timeout == 0 && Rescue) {
     int SlicesParked = 0;
     for (;;) {
       struct timespec Slice;
@@ -539,7 +565,7 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
           result = static_cast<uint64_t>(-EINTR);
           break;
         }
-        if (!NoRescue && ++SlicesParked >= 50) {
+        if (++SlicesParked >= 50) {
           result = 0; // spurious wake: guest rechecks its predicate
           break;
         }
@@ -610,9 +636,16 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       if (tls_tid == 0) {
         tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
       }
+      // process_vm_readv, not a raw memcpy: a WAKE can succeed against a
+      // uaddr the guest has since unmapped, and a raw read of it would
+      // SIGSEGV the emulator from inside its own diagnostic.
       uint32_t cur = 0xdeadbeef;
       if (uaddr && signed_result != -EFAULT) {
-        memcpy(&cur, reinterpret_cast<const void*>(uaddr), sizeof(cur));
+        struct iovec local {&cur, sizeof(cur)};
+        struct iovec remote {reinterpret_cast<void*>(uaddr), sizeof(cur)};
+        if (::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) != sizeof(cur)) {
+          cur = 0xdeadbeef;
+        }
       }
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
