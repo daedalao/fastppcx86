@@ -1146,21 +1146,62 @@ DEF_OP(StoreMemTSO) {
                               Op->OffsetType, Op->OffsetScale};
   const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
+  // ---------------------------------------------------------------------
+  // Leading-barrier elision (FEX_TSOPAIRELIDE=0 kill switch; prepass in
+  // JIT.cpp ComputeTSOPairElision, node set in JITClass.h).
+  //
+  // Soundness argument. TSO requires exactly {Load->Load, Load->Store,
+  // Store->Store} ordering; x86 permits Store->Load reordering, so no barrier
+  // is ever needed in that direction. lwsync provides exactly those three
+  // orderings across itself for accesses in program order on the executing
+  // hart. This store's leading lwsync is therefore redundant precisely when
+  // an lwsync has already been emitted since the last memory-access host
+  // instruction of any kind — every access before that barrier is ordered
+  // before this store by that barrier, and there is no access after it to
+  // order. The prepass proves that shape per node: the previous memory-
+  // touching IR op in this block is a LoadMemTSO (both of whose legs end
+  // with an unconditional trailing lwsync), and every IR op between it and
+  // this store is on a whitelist of handlers verified to emit zero memory-
+  // access host instructions. This handler's own pre-barrier emission
+  // (LoadConstant / MakeAddrForm) is arithmetic-only, preserving the shape.
+  //
+  // Why the intervening non-memory instructions don't matter: barrier
+  // semantics are program-order-relative on the hart; register/CR/XER
+  // operations neither participate in nor reorder around storage ordering.
+  // Why observers can't tell: no label binds between the load's barrier and
+  // this store (IR edges only target block heads, and the whitelisted
+  // handlers bind no external labels), so every execution reaching this
+  // store executed that lwsync first. If this store faults (SMC tracking,
+  // guard pages) or a signal delivers before it retires, the store has not
+  // been performed; whenever it is eventually re-executed on this hart the
+  // earlier lwsync still orders it after all pre-barrier accesses — lwsync
+  // ordering is not consumed by intervening handler/kernel activity (which
+  // itself synchronizes via sc/rfid and its own barriers).
+  // ---------------------------------------------------------------------
+  const bool ElideLeadingBarrier = TSOStoreLeadingBarrierElided(Node);
+
   if (Op->Class == IR::RegClass::FPR) {
     // Materialize before the barrier so the FPR path's instruction order across
     // the lwsync is exactly what it was; the GPR path now folds the
     // displacement into the store itself and needs no address arithmetic at all.
     GPR EA = MaterializeAddr(*this, EAF);
     // x86 TSO stores are release stores. lwsync before the store provides
-    // StoreStore + LoadStore release ordering relative to prior memory ops.
-    lwsync();
+    // StoreStore + LoadStore release ordering relative to prior memory ops —
+    // already provided by the adjacent TSO load's trailing lwsync when the
+    // prepass proved this pair (see the block comment above).
+    if (!ElideLeadingBarrier) {
+      lwsync();
+    }
     // Size-aware so TSO `vmovd m32, %xmm` writes 4B not 16B.
     StoreFPRSized(GetVReg(Op->Value), EA, IR::OpSizeToSize(IROp->Size));
     return;
   }
 
-  // Release barrier before the store — placement unchanged.
-  lwsync();
+  // Release barrier before the store — placement unchanged when not proven
+  // covered by the adjacent TSO load's trailing lwsync (block comment above).
+  if (!ElideLeadingBarrier) {
+    lwsync();
+  }
 
   // Same inline-constant-Value handling as StoreMem (e.g. TSO `mov [m], 0`).
   GPR GSrc;

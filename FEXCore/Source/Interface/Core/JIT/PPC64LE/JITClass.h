@@ -353,6 +353,35 @@ private:
     rldicl(Dst, Dst, 0, 32);
   }
 
+  // -------------------------------------------------------------------------
+  // TSO load->store adjacent-barrier elision (FEX_TSOPAIRELIDE=0 kill switch).
+  //
+  // DEF_OP(LoadMemTSO) ends with a trailing lwsync (acquire) and
+  // DEF_OP(StoreMemTSO) begins with a leading lwsync (release). When the two
+  // ops are adjacent up to non-memory register ops, the two barriers are
+  // architecturally one: lwsync orders {Load->Load, Load->Store, Store->Store}
+  // across itself, which is exactly TSO's requirement set (x86 permits
+  // Store->Load reordering, so that direction never needs a barrier). The
+  // store's leading lwsync is therefore redundant iff an lwsync has been
+  // emitted since the LAST memory-access host instruction of any kind.
+  //
+  // TSOPairElideSet[store node ID] means DEF_OP(StoreMemTSO) may skip its
+  // leading lwsync. The prepass (ComputeTSOPairElision) walks each block in
+  // emission order and sets it only when every IR op between the LoadMemTSO
+  // and the StoreMemTSO is on an explicit whitelist of ops whose DEF_OP
+  // provably emits ZERO memory-access host instructions (see the per-op
+  // verification table in ComputeTSOPairElision). A too-small whitelist only
+  // costs missed elisions, never soundness. The full soundness argument lives
+  // at the elision site in DEF_OP(StoreMemTSO).
+  // -------------------------------------------------------------------------
+  fextl::vector<bool> TSOPairElideSet;
+  void ComputeTSOPairElision();
+
+  bool TSOStoreLeadingBarrierElided(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < TSOPairElideSet.size() && TSOPairElideSet[ID];
+  }
+
   static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
     return (static_cast<uint64_t>(From) << 32) | To;
   }

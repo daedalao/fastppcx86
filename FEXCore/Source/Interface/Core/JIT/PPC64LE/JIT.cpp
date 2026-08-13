@@ -3366,6 +3366,127 @@ void PPC64JITCore::Compute32MaskElision() {
   }
 }
 
+// -------------------------------------------------------------------------
+// TSO load->store adjacent-barrier elision prepass. See the TSOPairElideSet
+// block comment in JITClass.h for the mechanism and DEF_OP(StoreMemTSO) for
+// the full soundness argument at the elision site.
+//
+// Walk each block in emission order tracking Fresh = "an lwsync has been
+// emitted since the last memory-access host instruction". LoadMemTSO sets it
+// (both its FPR and GPR legs end with an unconditional trailing lwsync and
+// have no other exit); a StoreMemTSO reached with Fresh set is recorded and
+// clears it (the store itself is a post-barrier memory access, so a following
+// StoreMemTSO still needs its own release barrier for Store->Store order).
+// EVERY op not on the whitelist below clears Fresh — including Spill/Fill
+// (RA-inserted spills are IR ops and appear in this same stream), all other
+// memory ops, and every op nobody has verified.
+//
+// Whitelist verification notes — an op may appear here ONLY if its DEF_OP
+// emits zero memory-access host instructions, checked against the emitting
+// handler (not assumed from the op's name). Branch/label-free is NOT required
+// (lwsync orders memory accesses in program order on the executing hart;
+// non-memory instructions between the barrier and the store are irrelevant),
+// but none of the listed handlers binds a label an external edge can enter
+// through — IR jumps only target block heads, so no path can reach the store
+// without executing the load's trailing lwsync first.
+//  * Emission no-ops, dispatch-table Op_NoOp entries (emit zero bytes):
+//    Dummy, IRHeader, CodeBlock, BeginBlock, EndBlock, InvalidateFlags,
+//    InlineConstant, InlineEntrypointOffset.
+//  * DEF_OP'd no-ops: GuestOpcode (DebugData table entry only, zero host
+//    instructions), SetSmallNZV / TelemetrySetValue / WFET (empty bodies).
+//  * Constant: TryInsertPatchableImmMove -> LoadConstantFixed
+//    (lis/ori/sldi/oris/ori) or LoadConstant -> LoadImm64 (li/lis/ori/sldi/
+//    rldic/oris family). EntrypointOffset: InsertEntrypointRIPMove ->
+//    LoadConstant or InsertGuestRIPMove -> LoadConstantFixed. All immediate
+//    builders, no memory.
+//  * Copy: mr only. Bfe/Sbfe: rlwinm/rldicl/extsb/extsh/extsw/neg/sldi/or_/mr.
+//  * Add/Sub/Neg/Not/Or/And/Xor/Andn: addi/addis/add/subf/neg/isel/nor/
+//    ori/oris/or/and/xor/xori/xoris/andc (+ LoadConstant, + rldicl tail).
+//  * Lshl/Lshr/Ashr: rlwinm/sldi/srdi/rldicl/slw/srw/sld/srd/extsw/li/subf/
+//    neg/or_ — the XER-safe shift lowerings, register-only by construction.
+//  * AddWithFlags/SubWithFlags/AddNZCV/SubNZCV: sldi/LoadConstant/addco_/
+//    subfco_/srdi (CR0/XER writes are register state, not memory).
+//  * TestNZ/TestZ/AndWithFlags: andi_/and__/addco/extsb_/extsh_/extsw_/cmpdi
+//    (+ LoadConstant).
+// Deliberately NOT whitelisted despite looking pure: Div/UDiv, Rev, Rbit,
+// PDep, ShiftFlags, RotateFlags — their handlers stash through r1 (std/ld
+// red-zone slots or stdbrx/stwbrx bounce buffers), which are memory accesses.
+// LoadMemRev/StoreMemRev (TSO=1) carry the same barriers as the ops handled
+// here but are left out of v1: they conservatively clear Fresh like any other
+// memory op (missed elision only).
+// -------------------------------------------------------------------------
+void PPC64JITCore::ComputeTSOPairElision() {
+  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+  static const bool PairOff = PairEnv && PairEnv[0] == '0';
+  TSOPairElideSet.assign(IR->GetSSACount(), false);
+  if (PairOff) {
+    return;
+  }
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    // Reset per block: a block can be entered from anywhere, so nothing about
+    // the previously emitted block's trailing barrier state may be assumed.
+    bool Fresh = false;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      switch (IROp->Op) {
+      case IR::OP_LOADMEMTSO:
+        Fresh = true;
+        break;
+
+      case IR::OP_STOREMEMTSO:
+        if (Fresh) {
+          TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
+        }
+        Fresh = false;
+        break;
+
+      // Whitelist — see the verification table above.
+      case IR::OP_DUMMY:
+      case IR::OP_IRHEADER:
+      case IR::OP_CODEBLOCK:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      case IR::OP_GUESTOPCODE:
+      case IR::OP_SETSMALLNZV:
+      case IR::OP_TELEMETRYSETVALUE:
+      case IR::OP_WFET:
+      case IR::OP_CONSTANT:
+      case IR::OP_ENTRYPOINTOFFSET:
+      case IR::OP_COPY:
+      case IR::OP_BFE:
+      case IR::OP_SBFE:
+      case IR::OP_ADD:
+      case IR::OP_SUB:
+      case IR::OP_NEG:
+      case IR::OP_NOT:
+      case IR::OP_OR:
+      case IR::OP_AND:
+      case IR::OP_XOR:
+      case IR::OP_ANDN:
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR:
+      case IR::OP_ADDWITHFLAGS:
+      case IR::OP_SUBWITHFLAGS:
+      case IR::OP_ADDNZCV:
+      case IR::OP_SUBNZCV:
+      case IR::OP_TESTNZ:
+      case IR::OP_TESTZ:
+      case IR::OP_ANDWITHFLAGS:
+        break;
+
+      default:
+        Fresh = false;
+        break;
+      }
+    }
+  }
+}
+
 void PPC64JITCore::AnalyzeSpinLoops() {
   struct BlockInfo {
     uint32_t ID = UINT32_MAX;
@@ -3934,6 +4055,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   }
 
   Compute32MaskElision();
+  ComputeTSOPairElision();
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
