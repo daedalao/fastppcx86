@@ -3289,8 +3289,11 @@ DEF_OP(XGetBV) {
 // the backend's indexed addressing invariant depends on.
 //
 // The IR op produces a single GPR. Validity is carried separately, in
-// RFLAG_ZF_RAW_LOC, which RDRANDOp in OpcodeDispatcher.cpp reads back as the
-// inverted CF -- neither arm writes it today; see the follow-up commit.
+// RFLAG_ZF_RAW_LOC: RDRANDOp in OpcodeDispatcher.cpp reads that slot straight
+// back as the INVERTED CF, so the contract is
+//   0 = success (x86 CF=1, "random value is valid")
+//   1 = failure (x86 CF=0, "not ready")
+// and BOTH arms must write it before returning.
 //
 // NOT REACHABLE BY DEFAULT: HostFeatures.cpp never sets SupportsRAND on
 // ppc64le (only the ARM64 and x86 host branches do), so RDRANDOp emits
@@ -3298,6 +3301,9 @@ DEF_OP(XGetBV) {
 // feature on with the ENABLE_DISABLE_OPTION knob (FEX_ENABLERNG).
 // =========================================================================
 DEF_OP(RDRAND) {
+  const int32_t zf_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, State.flags[FEXCore::X86State::RFLAG_ZF_RAW_LOC]));
+
   if (CTX->HostFeatures.SupportsISA30) {
     const auto Op = IROp->C<IR::IROp_RDRAND>();
     auto Dst = GetReg(Node);
@@ -3319,6 +3325,13 @@ DEF_OP(RDRAND) {
     darn(Dst, L);            // retry once
     cmpdi(cr(0), Dst, -1);   // re-establish CR0.EQ for the merged path
     Bind(&Done);
+
+    // ZF_RAW_LOC = 1 iff both attempts delivered all-ones. CR0.EQ is PPC CR
+    // bit 2 and holds exactly that on both edges into Done.
+    li(TMP1, 1);
+    li(TMP2, 0);
+    isel(TMP1, TMP1, TMP2, 2);
+    stb(TMP1, static_cast<int16_t>(zf_off), STATE);
     return;
   }
 
@@ -3352,6 +3365,11 @@ DEF_OP(RDRAND) {
   li(r(0), 0);
 
   mr(GetReg(Node), TMP1);
+
+  // The PRNG cannot fail, so ZF_RAW_LOC = 0 (x86 CF=1, "valid") always. TMP1
+  // is free again now that the result has been moved into Dst.
+  li(TMP1, 0);
+  stb(TMP1, static_cast<int16_t>(zf_off), STATE);
 }
 
 // =========================================================================
