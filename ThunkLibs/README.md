@@ -4,7 +4,15 @@ FEX supports special guest libraries that call out to host code for speed and co
 We support both guest->host thunks, as well as host->guest callbacks
 
 ## Building and using
-The thunked libraries can be built via the `guest-libs` and `host-libs` targets of the main FEX project. The outputs are in `$BUILDDIR/Guest` and `$BUILDDIR/Host`
+Configure the main FEX project with `-DBUILD_THUNKS=ON`. The host halves then build as part of the
+default target into `$BUILDDIR/HostLibs_64` (and `HostLibs_32`); the guest stubs are cross-built by
+the `guest-libs` and `guest-libs-32` ExternalProjects into `$BUILDDIR/Guest` and `$BUILDDIR/Guest_32`.
+
+**PPC64LE note.** The generator must parse each `libX_interface.cpp` with an **x86** target, because
+the code it emits encodes guest data layout. Parsing against the ppc64le system headers is unsound:
+it has silently produced different repack code for libwayland-client and made the generator reject
+valid Vulkan structs. The build finds an x86 sysroot from the `x86_64-pc-linux-gnu` cross toolchain,
+or takes one from `X86_DEV_ROOTFS`. Never point the parse at host headers to make a build succeed.
 
 After that, a guest rootfs is needed with the guest-libs installed. Typically this is done with symlinks that replace the native guest libraries. eg 
 ```
@@ -14,8 +22,8 @@ unlink $ROOTFS/lib/x86_64-linux-gnu/libX11.so.6
 ln -s $BUILDDIR/Guest/libX11-guest.so $ROOTFS/lib/x86_64-linux-gnu/libX11.so.6
 ```
 
-Finally, FEX needs to be told where to look for the matching host libraries with `-t /Host/Libs/Path`. eg
-```FEX_THUNKHOSTLIBS= $BUILDDIR/Host FEX /PATH/TO/ELF```
+Finally, FEX needs to be told where to find the matching host libraries. eg
+```FEX_THUNKHOSTLIBS=$BUILDDIR/HostLibs_64 FEX /PATH/TO/ELF```
 
 We currently don't have any unit tests for the guest libraries, only for OP_THUNK.
 

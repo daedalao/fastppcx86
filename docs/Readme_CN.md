@@ -1,3 +1,12 @@
+> **Note (English).** This is upstream FEX-Emu's Chinese README, kept for
+> reference. It is not maintained here and tracks an older upstream revision
+> than [`README.upstream.md`](../README.upstream.md) does. It describes ARM64
+> hosts, Ubuntu PPA installation and upstream's monthly release cadence, none of
+> which apply to FastPPCx86: this fork targets PPC64LE (POWER8 and later) and
+> ships no PPA. The install command below will not give you this project. For
+> this fork, see [`README.md`](../README.md) and
+> [`docs/GAMING.md`](GAMING.md).
+
 [English](https://github.com/FEX-Emu/FEX/blob/main/Readme.md)
 # FEX —— 快速的x86模拟器前端
 FEX和qemu-user以及box86类似，允许你在AArch64的host端运行x86和x86-64二进制程序。

@@ -1,33 +1,13 @@
-# FEX-2604
+# FEX-2604-811-g211e31a74
 
 ## FEXCore
 See [FEXCore/Readme.md](../FEXCore/Readme.md) for more details
 
-### Glossary
-
-- Splatter: a code generator backend that concatenates configurable macros instead of doing isel
-- IR: Intermediate Representation, our high-level opcode representation, loosely modeling arm64
-- SSA: Single Static Assignment, a form of representing IR in memory
-- Basic Block: A block of instructions with no control flow, terminated by control flow
-- Fragment: A Collection of basic blocks, possibly an entire guest function or a subset of it
-
-
 ### backend
 IR to host code generation
 
-#### arm64
-- [ALUOps.cpp](../FEXCore/Source/Interface/Core/JIT/ALUOps.cpp)
-- [Arm64Relocations.cpp](../FEXCore/Source/Interface/Core/JIT/Arm64Relocations.cpp): relocation logic of the arm64 splatter backend
-- [AtomicOps.cpp](../FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp)
-- [BranchOps.cpp](../FEXCore/Source/Interface/Core/JIT/BranchOps.cpp)
-- [ConversionOps.cpp](../FEXCore/Source/Interface/Core/JIT/ConversionOps.cpp)
-- [EncryptionOps.cpp](../FEXCore/Source/Interface/Core/JIT/EncryptionOps.cpp)
-- [JIT.cpp](../FEXCore/Source/Interface/Core/JIT/JIT.cpp): Main glue logic of the arm64 splatter backend
-- [JITClass.h](../FEXCore/Source/Interface/Core/JIT/JITClass.h)
-- [MemoryOps.cpp](../FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp)
-- [MiscOps.cpp](../FEXCore/Source/Interface/Core/JIT/MiscOps.cpp)
-- [MoveOps.cpp](../FEXCore/Source/Interface/Core/JIT/MoveOps.cpp)
-- [VectorOps.cpp](../FEXCore/Source/Interface/Core/JIT/VectorOps.cpp)
+#### ppc64le
+- [JIT.cpp](../FEXCore/Source/Interface/Core/JIT/PPC64LE/JIT.cpp): Main glue logic for the PPC64LE (POWER8) JIT backend
 
 #### shared
 - [CPUBackend.h](../FEXCore/Source/Interface/Core/CPUBackend.h)
@@ -103,6 +83,7 @@ IR to IR Optimization
 - [RedundantFlagCalculationElimination.cpp](../FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp)
 - [RegisterAllocationPass.cpp](../FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp)
 - [RegisterAllocationPass.h](../FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.h)
+- [ScalarSplatChain.cpp](../FEXCore/Source/Interface/IR/Passes/ScalarSplatChain.cpp): Marks chained scalar-FP inserts whose upper elements nobody observes
 
 
 
