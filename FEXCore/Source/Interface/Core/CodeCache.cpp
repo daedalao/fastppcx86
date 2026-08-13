@@ -21,6 +21,7 @@
 
 #include <git_version.h>
 
+#include <cstdlib>
 #include <xxhash.h>
 
 // ComputeCodeMapId streams the mapped file to derive a content-based cache
@@ -301,6 +302,11 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(VECTORTSOENABLED);
     HASH_OPT(MEMCPYSETTSOENABLED);
     HASH_OPT(HALFBARRIERTSOENABLED);
+    // HWTSO compiles with NO TSO barriers at all (hardware SAO pages carry the
+    // ordering); a cache built with it on is unsound in any session with it
+    // off. NONTSORBP drops barriers from RBP-addressed accesses the same way.
+    HASH_OPT(HWTSO);
+    HASH_OPT(NONTSORBP);
     HASH_OPT(STRICTINPROCESSSPLITLOCKS);
     HASH_OPT(SPLITLOCKINLINECONTAINED);
     HASH_OPT(KERNELUNALIGNEDATOMICBACKPATCHING);
@@ -332,6 +338,25 @@ uint64_t ComputeCodeCacheConfigId() {
     // every block exit on this backend.
     HASH_OPT(DISABLEL2CACHE);
     HASH_OPT(DYNAMICL1CACHE);
+
+    // Exit shape: the shadow call/ret stack adds push/pop sequences to every
+    // CALL/RET-hinted exit.
+    HASH_OPT(SHADOWRETSTACK);
+
+    // Backend env toggles that change emitted block bytes. Raw getenv switches
+    // with no config plumbing, so hash their EFFECTIVE values exactly as the
+    // emitters parse them (JIT.cpp Compute32MaskElision / ComputeTSOPairElision
+    // / the fallthrough gate; BranchOps.cpp DEF_OP(Thunk)). FALLTHROUGH is
+    // presence-enabled and NO_THUNK_PARTIAL_FILL presence-disabled — mirror,
+    // don't normalize.
+    {
+      const char* ZExtEnv = getenv("FEX_ZEXTOPT");
+      Hasher.Add(static_cast<uint64_t>(!(ZExtEnv && ZExtEnv[0] == '0')));
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_FALLTHROUGH") != nullptr));
+      const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+      Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr));
+    }
 
     // The scope option itself, because it decides whether the process runs as a
     // cache generator (section-bounded decode, relocations retained).
