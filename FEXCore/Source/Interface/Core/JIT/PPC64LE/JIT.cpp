@@ -3171,7 +3171,17 @@ void PPC64JITCore::Compute32MaskElision() {
       case IR::OP_ENDBLOCK:
       case IR::OP_INVALIDATEFLAGS:
       case IR::OP_INLINECONSTANT:
-      case IR::OP_INLINEENTRYPOINTOFFSET: continue;
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      // GuestOpcode markers only record (guest RIP, host PC) table entries —
+      // zero host instructions (see DEF_OP(GuestOpcode)). A marker between
+      // def and consumer relabels the guest boundary but adds nothing
+      // observable: async signals defer to drain points, and the window
+      // still contains no faulting host instruction (register-writing
+      // consumers cannot fault; faulting consumers like stores have no dest
+      // and are excluded for GPRFixed defs). Without this skip, the marker
+      // in front of every guest instruction defeats every cross-instruction
+      // elision — which is all of them.
+      case IR::OP_GUESTOPCODE: continue;
       default: break;
       }
 
@@ -3224,6 +3234,15 @@ void PPC64JITCore::Compute32MaskElision() {
       }
       case IR::OP_STOREMEM: {
         auto Op = IROp->C<IR::IROp_StoreMem>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      case IR::OP_STOREMEMTSO: {
+        // Same narrow-store value path as StoreMem (GetReg(Op->Value) into
+        // stw/sth/stb); the lwsync release barrier reads no register.
+        auto Op = IROp->C<IR::IROp_StoreMemTSO>();
         if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
           Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
         }
