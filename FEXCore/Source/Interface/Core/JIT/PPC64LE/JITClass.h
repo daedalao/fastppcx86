@@ -303,6 +303,19 @@ private:
   fextl::vector<uint64_t> SpinRestoreEdges;  // edges that leave a spin loop
   uint32_t CurrentBlockID {UINT32_MAX};      // IROp_CodeBlock::ID being emitted
 
+  // Fallthrough elision (FEX_NOFALLTHROUGH kill switch): the CodeBlock ID of
+  // the block emitted immediately after the current one, or UINT32_MAX when
+  // there is none or falling into it would be unsound. DEF_OP(Jump)/
+  // DEF_OP(CondJump) skip their trailing `b` when the edge targets this
+  // block. CompileCode's block loop maintains it, and only ever sets it for a
+  // non-EntryPoint successor: EntryPoint blocks emit an out-of-band prologue
+  // (InlineJITBlockHeader store, suspend poke, spill-frame stdu) BEFORE their
+  // intra-unit JumpTarget label binds, and intra-unit edges must land after
+  // that prologue — falling into it would run the stdu on an already-live
+  // frame. A fallthrough target is by construction forward/unbound, so the
+  // backward-edge suspend poke in the jump handlers is never skipped by this.
+  uint32_t FallthroughBlockID {UINT32_MAX};
+
   static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
     return (static_cast<uint64_t>(From) << 32) | To;
   }

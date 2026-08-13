@@ -3693,9 +3693,33 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
   }
 
+  // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
+  // per block, in the exact order the loop below emits them. See the
+  // FallthroughBlockID comment in JITClass.h for why EntryPoint successors
+  // are never fallthrough candidates.
+  static const bool DisableFallthrough = getenv("FEX_NOFALLTHROUGH") != nullptr;
+  fextl::vector<std::pair<uint32_t, bool>> BlockEmissionOrder;
+  if (!DisableFallthrough) {
+    BlockEmissionOrder.reserve(IRView->GetHeader()->BlockCount);
+    for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
+      auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+      BlockEmissionOrder.emplace_back(BlockIROp->ID, BlockIROp->EntryPoint);
+    }
+  }
+  size_t BlockEmissionIdx = 0;
+
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
     CurrentBlockID = BlockIROp->ID;
+
+    FallthroughBlockID = UINT32_MAX;
+    if (!DisableFallthrough) {
+      const size_t Next = BlockEmissionIdx + 1;
+      if (Next < BlockEmissionOrder.size() && !BlockEmissionOrder[Next].second) {
+        FallthroughBlockID = BlockEmissionOrder[Next].first;
+      }
+      ++BlockEmissionIdx;
+    }
 
     if (!DynVRLiveIn.empty()) {
       // Backward scan: Live holds the live-after set of the op under the
