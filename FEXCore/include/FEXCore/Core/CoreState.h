@@ -107,7 +107,22 @@ struct alignas(64) CPUState {
   uint64_t L1Pointer {};
   uint64_t L1Mask {};
   uint64_t callret_sp {};
-  uint64_t _pad1 {};
+  // Shadow call-ret stack bound mirrors. InternalThreadState::CallRetStackBase
+  // never changes after thread creation (allocated once, munmap'd only at
+  // thread teardown; the code-cache/buffer-rotation paths only VirtualDontNeed
+  // the CONTENTS), so both bounds are mirrored into the frame the same way
+  // L1Pointer is — one D-form ld off STATE instead of the two dependent loads
+  // Frame->Thread->CallRetStackBase (+addis) per CALL push / RET pop.
+  // Initialized alongside callret_sp in ThreadManager::CreateThread; zero for
+  // threads without a frontend-allocated call-ret stack (compile-only tools),
+  // for which every pop reads empty and every push takes the overflow-reset
+  // leg without storing.
+  //
+  // callret_end = base + CALLRET_STACK_SIZE (the empty/top bound, hot on the
+  // RET pop) lives here so it shares callret_sp's cache line; callret_base
+  // (push bound) sits at the struct tail where it consumes existing padding —
+  // see the layout note there.
+  uint64_t callret_end {};
 
   // Cacheline: 1,2,3,4
   // The high 128-bits of AVX registers when not being emulated by SVE256.
@@ -248,11 +263,23 @@ struct alignas(64) CPUState {
   constexpr static uint32_t SEGMENT_ARRAY_INDEX_GDT = 0;
   constexpr static uint32_t SEGMENT_ARRAY_INDEX_LDT = 1;
   Core::CPUState::gdt_segment private_gdt[32] {};
+
+  // callret_end's partner (see the comment at callret_end): the low bound the
+  // CALL push checks against. Placed at the struct tail because the cache line
+  // holding callret_sp/callret_end (gregs[12..15], L1Pointer, L1Mask) has no
+  // free slot left, and this position consumes what was previously tail
+  // padding — sizeof(CPUState) and every other member offset are unchanged
+  // (asserted below).
+  uint64_t callret_base {};
 };
 static_assert(std::is_trivially_copyable_v<CPUState>, "Needs to be trivial");
 static_assert(std::is_standard_layout_v<CPUState>, "This needs to be standard layout");
 static_assert(alignof(CPUState) == 64, "CPUState needs to be 64-byte aligned!");
 static_assert(offsetof(CPUState, avx_high) % 64 == 0, "avx_high needs to be 64-byte aligned!");
+static_assert(offsetof(CPUState, callret_end) == offsetof(CPUState, callret_sp) + 8,
+              "callret_sp/callret_end must share a cache line for the RET pop's two loads");
+static_assert(offsetof(CPUState, callret_base) + 8 <= 32760,
+              "callret mirrors must stay int16-reachable for D-form ld off STATE");
 static_assert(offsetof(CPUState, xmm) % 32 == 0, "xmm needs to be 256-bit aligned!");
 static_assert(offsetof(CPUState, mm) % 16 == 0, "mm needs to be 128-bit aligned!");
 static_assert(offsetof(CPUState, gregs[15]) <= 504, "gregs maximum offset must be <= 504 for ldp/stp to work");

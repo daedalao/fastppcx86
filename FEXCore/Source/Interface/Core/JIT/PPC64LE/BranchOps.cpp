@@ -200,12 +200,19 @@ DEF_OP(ExitFunction) {
   // NZCV and XER reach the target block / the miss-leg spill exactly as the
   // block left them (identical to the L1 probe below). r0 is rewritten (to 0)
   // only on the taken RET fast path, immediately before the bctr, preserving
-  // the X-form zero-index invariant. base is read per-op from
-  // Frame->Thread->CallRetStackBase — the code buffer is shared across threads
-  // so the bound cannot be an immediate — and [base, base+SIZE) is exactly the
-  // R/W region between the frontend's two guard pages, so the bounds checks
-  // never fault. Overflow (push) resets to empty and skips the store; empty
-  // (pop) skips the fast path; neither ever corrupts memory.
+  // the X-form zero-index invariant. The bounds are read per-op from the
+  // frame's callret_base/callret_end mirrors (CoreState.h) — the code buffer
+  // is shared across threads so they cannot be immediates, and the mirrors
+  // replace the former Frame->Thread->CallRetStackBase two-load pointer chase
+  // (+addis for base+SIZE) with one D-form ld off STATE; callret_end shares
+  // callret_sp's cache line for the pop. Both mirrors are set at thread
+  // creation next to callret_sp and never change (base is immutable until
+  // thread teardown). [base, base+SIZE) is exactly the R/W region between the
+  // frontend's two guard pages, so the bounds checks never fault. Overflow
+  // (push) resets to empty and skips the store; empty (pop) skips the fast
+  // path; neither ever corrupts memory. Threads without a frontend-allocated
+  // call-ret stack carry zero mirrors: pops read sp(0) >= end(0) -> empty,
+  // pushes see new sp(-16) < base(0) -> overflow reset, never storing.
   // ---------------------------------------------------------------------
   PPC64Emitter::Label ShadowRetReprobe{};
   const bool ShadowActive = ShadowRetStackEnabled &&
@@ -213,19 +220,14 @@ DEF_OP(ExitFunction) {
   if (ShadowActive) {
     const int16_t sp_off = static_cast<int16_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-    const int16_t thread_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, Thread));
     const int16_t base_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::InternalThreadState, CallRetStackBase));
-    // SIZE == 0x400000 == 0x40 << 16, materialised with a single addis.
-    static_assert(FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE == 0x400000,
-                  "shadow bounds addis assumes a 4 MiB call-ret stack");
+      offsetof(FEXCore::Core::CpuStateFrame, State.callret_base));
+    const int16_t end_off = static_cast<int16_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, State.callret_end));
 
     if (Op->Hint == IR::BranchHint::Return) {
       ld(TMP2, sp_off, STATE);            // TMP2 = sp
-      ld(TMP3, thread_off, STATE);
-      ld(TMP3, base_off, TMP3);           // TMP3 = base
-      addis(TMP3, TMP3, 0x40);            // TMP3 = base + SIZE (empty / top guard)
+      ld(TMP3, end_off, STATE);           // TMP3 = base + SIZE (empty / top guard)
       cmpd(cr(7), TMP2, TMP3);
       bc({4, 28}, &ShadowRetReprobe);     // sp >= base+SIZE -> empty -> probe
       ld(TMP3, 0, TMP2);                  // TMP3 = guest_ret_rip (top slot)
@@ -268,15 +270,14 @@ DEF_OP(ExitFunction) {
         li(TMP2, 0);                      // no return block: push a zero entry (never matches)
       }
       ld(TMP3, sp_off, STATE);            // TMP3 = sp
-      ld(TMP4, thread_off, STATE);
-      ld(TMP4, base_off, TMP4);           // TMP4 = base
+      ld(TMP4, base_off, STATE);          // TMP4 = base (frame mirror)
       addi(TMP3, TMP3, -16);              // TMP3 = new sp
       cmpd(cr(7), TMP3, TMP4);
       PPC64Emitter::Label l_do_push{}, l_push_done{};
       bc({4, 28}, &l_do_push);            // new sp >= base -> room to push
-      // Overflow: reset to empty (base+SIZE), skip the store, never write below
-      // the low guard page.
-      addis(TMP4, TMP4, 0x40);
+      // Overflow: reset to empty (base+SIZE, read from the end mirror), skip
+      // the store, never write below the low guard page.
+      ld(TMP4, end_off, STATE);
       std(TMP4, sp_off, STATE);
       b(&l_push_done);
       Bind(&l_do_push);
