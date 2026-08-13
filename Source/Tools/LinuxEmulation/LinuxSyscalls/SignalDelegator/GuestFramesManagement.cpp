@@ -265,10 +265,14 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
       //     dispatcher): a full FillStaticRegs is already pending before the
       //     guest reads these registers -- the JIT syscall op's tail reload, or
       //     the next block-entry fill -- so State is authoritative. No redirect.
-      //   * in-JIT delivery inside the syscall-op window (InSyscallInfo != 0):
-      //     same -- the syscall op tail runs an unconditional full FillStaticRegs
-      //     that reloads all 16 GPRs from State. No redirect (redirecting here
-      //     would re-enter the block at the syscall RIP and re-run the syscall).
+      //   * in-JIT delivery inside a host-call-crossing window
+      //     (InSyscallInfo != 0 — DEF_OP(Syscall)/DEF_OP(Thunk)/the FABI
+      //     stubs): same -- the crossing's tail refill is conditional on the
+      //     kInSyscallSentinel bit-24 tripwire, and THIS delivery killed it
+      //     (the uint16_t ContextBackup stash truncates bit 24), so the tail
+      //     provably reloads all 16 GPRs from State. No redirect (redirecting
+      //     here would re-enter the block at the crossing RIP and re-run the
+      //     syscall/host call).
       //   * in-JIT delivery in plain compute (InSyscallInfo == 0): resume is
       //     mid-block from the restored host SRA registers with no intervening
       //     fill, so the State writeback alone would be invisible. Route resume

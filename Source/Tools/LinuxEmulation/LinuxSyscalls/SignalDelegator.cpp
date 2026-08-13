@@ -814,6 +814,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   } else {
     // The interrupted context can still be mid-syscall even though the host
     // PC is outside the JIT: DEF_OP(Syscall) sets Frame->InSyscallInfo=0xFFFF
+    // (and, since the partial-refill port, DEF_OP(Thunk) and the FABI bridge
+    // stubs arm the same field around their host calls — see
+    // kInSyscallSentinel in FEXCore ArchHelpers/PPC64Emitter.h)
     // before bctrl'ing into C, so a thread blocked in e.g. sigsuspend carries
     // the in-syscall spill mask while it waits. The guest handler we are about
     // to dispatch runs fresh JIT blocks; if the stale mask is left set, any

@@ -5,6 +5,7 @@
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
 #include <bit>
+#include <cstdlib>
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -643,30 +644,13 @@ DEF_OP(Break) {
   bctr();
 }
 
-// Value parked in CpuStateFrame::InSyscallInfo for the duration of a
-// JIT-emitted Syscall op.
-//
-//   bits 0..15  : the SpillSRA IgnoreMask. 0xFFFF = "all 16 x64 SRA GPRs are
-//                 already spilled to the frame", exactly as before. This is
-//                 the only part any consumer outside this file looks at
-//                 (SignalDelegator.cpp:684 and SyscallsSMCTracking.cpp:151
-//                 both mask with 0xFFFF).
-//   bits 16..23 : deliberately ZERO. GdbServer.cpp:113 passes the raw
-//                 InSyscallInfo into SpillSRA's `uint32_t IgnoreMask` with no
-//                 masking, and SpillSRA tests `1U << SRAIdxMap` where
-//                 SRAIdxMap is the host register number — r16..r23 are SRA
-//                 members, so a sentinel bit in this window would silently
-//                 suppress their re-spill. Bit 24 is above every SRA register
-//                 number (max r23) and therefore inert in that path.
-//   bit  24     : the tripwire. ArchHelpers::Context::ContextBackup stores
-//                 InSyscallInfo as a *uint16_t* (MContext_ppc64le.h:77), so
-//                 this bit CANNOT survive a signal-delivery round trip:
-//                 HandleDispatcherGuestSignal zeroes the field, and
-//                 RestoreThreadState reinstates it truncated to 0xFFFF. Any
-//                 value read back with no bit above 15 set therefore means
-//                 "the guest state in the frame was republished by somebody
-//                 while we were inside the host call".
-static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
+// kInSyscallSentinel — the value parked in CpuStateFrame::InSyscallInfo for
+// the duration of a JIT host-call crossing — lives in ArchHelpers/
+// PPC64Emitter.h with its full bit-layout rationale, now that DEF_OP(Thunk)
+// and the FABI bridge stubs (PPC64Dispatcher.cpp GenerateABICall) share it
+// with this op via ArmInSyscallSentinel/FillForABICallChecked. This op keeps
+// its original inline copy of the check because the elision interleaves with
+// the RAX result handling below.
 
 DEF_OP(Syscall) {
   auto Op = IROp->C<IR::IROp_Syscall>();
@@ -883,7 +867,32 @@ DEF_OP(Thunk) {
   // registers retain their values until PushDynamicRegs overwrites them).
   auto Op = IROp->C<IR::IROp_Thunk>();
 
+  // Sentinel-guarded partial SRA GPR refill, ported from DEF_OP(Syscall)'s
+  // fill elision above: the ELFv2 callee cannot touch r14-r23, so the ten
+  // non-volatile SRA GPR reloads after the bctrl are pure overhead unless
+  // something republished the frame during the call. The sentinel proves the
+  // negative: a guest-signal delivery truncates it through the uint16_t
+  // ContextBackup stash on either HandleDispatcherGuestSignal branch, and a
+  // host->guest callback (thunk callees DO re-enter the guest — X11 event
+  // handlers etc.) clears it at the dispatcher's CallbackPtr entry before any
+  // callback guest block runs. Both the arm and the checked fill live on
+  // PPC64EmitterBase (shared with the FABI bridge stubs); see
+  // kInSyscallSentinel in ArchHelpers/PPC64Emitter.h for the full contract.
+  // 64-bit guests only — the 32-bit lwz zero-extension invariant forbids
+  // partial fills (PPC64Emitter.cpp FillStaticRegs) — and 32-bit keeps
+  // today's unarmed full-fill path byte for byte. XMM/VR fills are NEVER
+  // elidable: v0-v15 are ELFv2-volatile and the frame copy is also what
+  // signal delivery reads mid-call.
+  static const bool NoPartialFill = getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr;
+  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill;
+
   SpillForABICall(TMP1);
+  if (PartialFill) {
+    // Strictly after the spill completes (the mask claims "already
+    // spilled"), strictly before the callee can run. Clobbers TMP1 only —
+    // the ArgPtr/relocation setup below uses r3/TMP2 after this point.
+    ArmInSyscallSentinel();
+  }
 
   // Set up the single argument: ArgPtr in r3
   mr(r3, GetReg(Op->ArgPtr));
@@ -907,7 +916,11 @@ DEF_OP(Thunk) {
   bctrl();
   ld(r2, 24, r1);      // restore TOC
 
-  FillForABICall();
+  if (PartialFill) {
+    FillForABICallChecked();
+  } else {
+    FillForABICall();
+  }
 }
 
 } // namespace FEXCore::CPU
