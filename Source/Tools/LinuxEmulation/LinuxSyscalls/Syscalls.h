@@ -127,6 +127,48 @@ inline int TranslateGuestSockOptName(int level, int optname) {
   return optname;
 }
 
+// FEX_HWTSO: hardware TSO via PROT_SAO pages (ppc64le, default off).
+//
+// POWER's Strong Access Ordering page attribute makes plain loads/stores to a
+// page x86-TSO-ordered in hardware (proven on op4k 2026-08-13: the MP litmus
+// fires ~1.2%/round on plain pages, 0 in 16.3M rounds on SAO pages, and SB
+// stays observable — TSO-like, not SC; notes/tools/sao_litmus.c). With every
+// GUEST-visible page SAO, the JIT's atomic/barrier TSO emulation is
+// unnecessary: the frontend calls Context::SetHardwareTSOSupport(true) and no
+// TSO IR ops are emitted at all.
+//
+// Invariants:
+//  - Live is written EXACTLY ONCE, in FEX::Kernel::Init's TSO setup, before
+//    the syscall handler exists and before any guest mapping or compilation.
+//    Everything after startup may read it unsynchronized.
+//  - Every guest-visible mapping site must route its protection through
+//    ApplyGuestProt. The choke points are SyscallHandler::GuestMmap,
+//    GuestMprotect and GuestShmat — the ELF/image loader, brk, guest stack,
+//    VDSO and both 32-bit/64-bit guest allocators all funnel through them.
+//    GuestMremap needs nothing: mremap has no prot argument and the kernel
+//    carries VM_SAO on the VMA (grown pages inherit it).
+//  - Guest mprotect can never strip SAO: ApplyGuestProt ORs it back into
+//    every guest protection change while Live (the kernel also preserves
+//    VM_SAO across mprotect, this keeps the property explicit).
+//  - FEX-internal memory (JIT buffers, shadow call/ret stack, host thread
+//    stacks/alt-stacks, FEXCore arenas) is deliberately NOT SAO.
+namespace HardwareTSO {
+  // PROT_SAO from asm/mman.h; spelled here because glibc's sys/mman.h does
+  // not export it.
+  constexpr int PROT_SAO_BIT = 0x10;
+
+  extern bool Live;
+
+  // Startup-only: mmap-probe PROT_SAO acceptance; sets Live on success.
+  // Returns Live. Warns loudly on stderr when the probe fails, because the
+  // user explicitly asked for FEX_HWTSO.
+  bool ProbeAndEnable();
+
+  inline int ApplyGuestProt(int prot) {
+    return Live ? (prot | PROT_SAO_BIT) : prot;
+  }
+} // namespace HardwareTSO
+
 struct ExecveAtArgs {
   int dirfd;
   int flags;

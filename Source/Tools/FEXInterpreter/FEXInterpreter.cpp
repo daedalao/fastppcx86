@@ -284,6 +284,30 @@ bool QueryInterpreterInstalled(bool ExecutedWithFD, const FEX::Config::PortableI
 namespace FEX::Kernel {
 namespace TSO {
   void SetupTSOEmulation(FEXCore::Context::Context* CTX) {
+    {
+      // FEX_HWTSO (ppc64le): PROT_SAO hardware TSO. This must run HERE —
+      // before the syscall handler exists, before the ELF loader maps
+      // anything and before any guest code is compiled — because
+      // HardwareTSO::Live steers every subsequent GuestMmap/GuestMprotect/
+      // GuestShmat, and SetHardwareTSOSupport must be seen by the very first
+      // compiled block. Litmus-proven on op4k 2026-08-13
+      // (notes/tools/sao_litmus.c): MP violations 0/16.3M on SAO pages vs
+      // ~1.2%/round on plain pages; SB still observable (TSO, not SC).
+      FEX_CONFIG_OPT(HWTSOEnabled, HWTSO);
+      FEX_CONFIG_OPT(TSOEnabledForHW, TSOENABLED);
+      if (HWTSOEnabled() && TSOEnabledForHW()) {
+        if (FEX::HLE::HardwareTSO::ProbeAndEnable()) {
+          // Every guest-visible mapping now carries PROT_SAO; stop emitting
+          // TSO IR ops entirely (scalar, vector and memcpy).
+          CTX->SetHardwareTSOSupport(true);
+          return;
+        }
+        // ProbeAndEnable already warned; fall through to the prctl path
+        // (a no-op on ppc64le kernels without PR_GET_MEM_MODEL) and normal
+        // atomic/barrier TSO emulation.
+      }
+    }
+
     // Check to see if this is supported.
     auto Result = prctl(PR_GET_MEM_MODEL, 0, 0, 0, 0);
     if (Result == -1) {

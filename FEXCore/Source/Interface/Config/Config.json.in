@@ -707,6 +707,23 @@
           "Highly likely to break any multithreaded application if disabled."
         ]
       },
+      "HWTSO": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "ppc64le: hardware TSO via PROT_SAO (Strong Access Ordering) pages",
+          "instead of per-access barrier emulation. When enabled and the",
+          "kernel accepts PROT_SAO (probed at startup), every guest-visible",
+          "mapping is created with SAO and the JIT stops emitting TSO IR ops",
+          "entirely (scalar, vector and memcpy barriers all vanish). SOUND,",
+          "unlike LockOnlyTSO: SAO pages are hardware-TSO — the MP litmus",
+          "that fires ~1.2%/round on plain POWER8 pages showed 0 violations",
+          "in 16.3M rounds on SAO pages (notes/tools/sao_litmus.c,",
+          "2026-08-13). If the kernel rejects PROT_SAO (radix MMU, missing",
+          "CPU feature) FEX warns once and falls back to barrier emulation.",
+          "Inert when off or when TSOEnabled is false."
+        ]
+      },
       "LockOnlyTSO": {
         "Type": "bool",
         "Default": "false",

@@ -1585,6 +1585,18 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
 
   std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
 
+  // FEX_HWTSO: every guest-visible page must be Strongly Access Ordered, or
+  // the JIT (which emits no barriers in this mode) is unsound on it. HostProt
+  // is what reaches the host mmap; `prot` stays the guest's own request for
+  // all tracking below, so bookkeeping is bit-identical to the feature-off
+  // world. Applies to file-backed MAP_SHARED too. If a specific mapping
+  // refuses SAO, it is retried exactly as the guest asked — that retry
+  // succeeding is a real ordering hole (racing plain accesses through this
+  // mapping are weakly ordered), hence the loud warning. Device-file
+  // mappings whose driver overrides the page cache-control attribute lose
+  // SAO silently, which matches x86 semantics for WC memory.
+  const int HostProt = HardwareTSO::ApplyGuestProt(prot);
+
   {
     // NOTE: Frontend calls this with a nullptr Thread during initialization, but
     //       providing this code with a valid Thread object earlier would allow
@@ -1593,7 +1605,14 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
 
     bool Map32Bit = !Is64Bit || (flags & FEX::HLE::X86_64_MAP_32BIT);
     if (Map32Bit) {
-      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
+      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, HostProt, flags, fd, offset);
+      if (FEX::HLE::HasSyscallError(Result) && HostProt != prot) {
+        Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
+        if (!FEX::HLE::HasSyscallError(Result)) {
+          fprintf(stderr, "FEX: HWTSO: mmap(addr=%p len=%zx prot=%x flags=%x fd=%d) refused PROT_SAO; mapped WITHOUT it — this range is not hardware-TSO\n",
+                  addr, length, prot, flags, fd);
+        }
+      }
       if (FEX::HLE::HasSyscallError(Result)) {
         return reinterpret_cast<void*>(Result);
       }
@@ -1617,7 +1636,16 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
         HostOwnedRanges::ReportRefusal("mmap", reinterpret_cast<uint64_t>(addr), Size);
         return reinterpret_cast<void*>(-ENOMEM);
       }
-      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
+      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, HostProt, flags, fd, offset));
+      if (Result == ~0ULL && HostProt != prot) {
+        // See the HWTSO comment above: retry exactly as the guest asked; a
+        // success here is a documented ordering hole and must be loud.
+        Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
+        if (Result != ~0ULL) {
+          fprintf(stderr, "FEX: HWTSO: mmap(addr=%p len=%zx prot=%x flags=%x fd=%d) refused PROT_SAO; mapped WITHOUT it — this range is not hardware-TSO\n",
+                  addr, length, prot, flags, fd);
+        }
+      }
       if (Result == ~0ULL) {
         return reinterpret_cast<void*>(-errno);
       }
@@ -1737,6 +1765,9 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
 
 uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, void* old_address, size_t old_size,
                                      size_t new_size, int flags, void* new_address) {
+  // FEX_HWTSO: nothing to do here by design. mremap has no protection
+  // argument; the kernel carries the VMA's flags — VM_SAO included — to the
+  // moved/grown mapping, so a guest page that was SAO stays SAO.
   uint64_t Result {};
 
   {
@@ -1868,7 +1899,20 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
       HostOwnedRanges::ReportRefusal("mprotect", reinterpret_cast<uint64_t>(addr), len);
       return ((prot & PROT_WRITE) && !Hit.MayWrite) ? -EACCES : -ENOMEM;
     }
-    Result = ::mprotect(addr, len, prot);
+    // FEX_HWTSO: OR PROT_SAO back into every guest protection change so the
+    // guest can never strip the ordering attribute from a guest page (the
+    // kernel itself preserves VM_SAO across mprotect — this keeps the
+    // invariant explicit and covers any pre-SAO page the guest re-protects).
+    // `prot` stays the guest's request for all tracking below.
+    const int HostProt = HardwareTSO::ApplyGuestProt(prot);
+    Result = ::mprotect(addr, len, HostProt);
+    if (Result == -1 && HostProt != prot) {
+      Result = ::mprotect(addr, len, prot);
+      if (Result != -1) {
+        fprintf(stderr, "FEX: HWTSO: mprotect(addr=%p len=%zx prot=%x) refused PROT_SAO; applied WITHOUT it — this range is not hardware-TSO\n",
+                addr, len, prot);
+      }
+    }
     if (Result == -1) {
       return -errno;
     }
@@ -2032,6 +2076,22 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
     LOGMAN_THROW_A_FMT(res != -1, "shmctl IPC_STAT failed");
 
     Length = stat.shm_segsz;
+
+    // FEX_HWTSO: shmat has no protection argument, so SAO is applied with a
+    // follow-up mprotect carrying the attachment's effective protection plus
+    // PROT_SAO. SysV shm is guest-shared memory — the single most
+    // ordering-sensitive mapping class there is — so a refusal here is a
+    // real ordering hole and must be loud (the segment stays attached and
+    // functional either way; failing the guest's shmat over it would be
+    // worse than the hole).
+    if (HardwareTSO::Live) {
+      const int ShmProt = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE) | ((shmflg & SHM_EXEC) ? PROT_EXEC : 0);
+      if (::mprotect(reinterpret_cast<void*>(Result), Length, HardwareTSO::ApplyGuestProt(ShmProt)) == -1) {
+        fprintf(stderr, "FEX: HWTSO: shmat(shmid=%d) attached at %lx len=%lx but PROT_SAO was refused (errno=%d) — this segment is not hardware-TSO\n",
+                shmid, Result, Length, errno);
+      }
+    }
+
     TrackShmat(Thread, shmid, Result, shmflg, Length);
   }
 
