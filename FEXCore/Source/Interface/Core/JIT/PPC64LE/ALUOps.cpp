@@ -3318,13 +3318,32 @@ DEF_OP(TelemetrySetValue) { /* nop */ }
 // Rounding mode
 // =========================================================================
 DEF_OP(GetRoundingMode) {
-  // Read FPSCR RN field (bits [62:63])
+  // Read FPSCR RN field (bits [62:63]) and map it into the IR's x86 RC order.
+  //
+  // PPC FPSCR RN: 0=near, 1=trunc, 2=up, 3=down
+  // x86 / IR RC:  0=near, 1=down,  2=up, 3=trunc
+  //
+  // The map {0,1,2,3} -> {0,3,2,1} is an involution, so this is the exact same
+  // packed-nibble constant 0x1230 that SetRoundingMode below uses for the
+  // forward direction — read that comment for the derivation. Returning raw RN
+  // here (the previous behaviour) swapped down <-> trunc on every readback.
+  //
+  // andi. would clobber CR0; every instruction here is Rc-free so NZCV state
+  // survives for the flag-sensitive paths that may sit between this and a
+  // downstream Jcc.
   auto Dst = GetReg(Node);
   mffs(f(0));   // f0 = FPSCR
   mffprd(Dst, f(0));
-  // andi. would clobber CR0; Rc-free rldicl preserves NZCV state for the
-  // flag-sensitive paths that may sit between this and a downstream Jcc.
-  rldicl(Dst, Dst, 0, 62);  // extract RN bits
+  rldicl(Dst, Dst, 0, 62);   // Dst = raw RN (0-3)
+  sldi(TMP2, Dst, 2);        // TMP2 = RN * 4 (nibble shift amount)
+  li(TMP1, 0x1230);          // packed PPC RN -> x86 RC map (self-inverse)
+  srd(TMP1, TMP1, TMP2);     // 64-bit shift; shift amount is 0-12
+  rldicl(Dst, TMP1, 0, 62);  // x86 RC in bits 0-1
+  // Deliberate divergence from ARM64's GetRoundingMode, which also reports FTZ
+  // in bit 2 (FPCR.FZ). POWER has no scalar flush-to-zero control — VSCR.NJ is
+  // VMX-only and ignored by VSX — so there is no host state to report, and
+  // SetRoundingMode below drops guest FTZ on the same grounds. The final
+  // rldicl leaves bit 2 clear. Do not "fix" this by synthesising a value.
 }
 
 DEF_OP(SetRoundingMode) {
