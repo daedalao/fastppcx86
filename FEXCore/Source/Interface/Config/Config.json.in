@@ -730,6 +730,21 @@
           "Inert (no effect) when TSOEnabled is false."
         ]
       },
+      "NonTSORBP": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Opt-in: extend the RSP thread-private-stack TSO exemption to",
+          "RBP-based accesses. Accesses addressed through RSP already skip",
+          "TSO barriers on the assumption that the stack is thread-private;",
+          "titles that keep frame pointers address the same stack slots",
+          "through RBP and pay full barriers for every local-variable",
+          "access (all EBP frame chains in 32-bit code). Same soundness",
+          "class as the existing RSP exemption: unsound if the guest",
+          "shares stack memory between threads and relies on x86-TSO",
+          "ordering for it. Per-app opt-in, default off."
+        ]
+      },
       "SyscallObserve": {
         "Type": "bool",
         "Default": "false",

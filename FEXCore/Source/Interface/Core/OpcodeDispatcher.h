@@ -1653,9 +1653,12 @@ private:
     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation())) && !Operand.IsGPR();
   }
 
+  // RSP-addressed accesses skip TSO barriers on the assumption that the stack
+  // is thread-private. NonTSORBP (per-app opt-in, default off) extends the same
+  // exemption to RBP for titles that keep frame pointers — same soundness class.
   [[nodiscard]]
-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
+  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
+    return Access == MemoryAccessType::DEFAULT && (Reg == X86State::REG_RSP || (NonTSORBP && Reg == X86State::REG_RBP));
   }
 
   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
@@ -2547,6 +2550,9 @@ private:
 
   bool Multiblock {};
   bool Is64BitMode {};
+  // Cached once at construction from Config.NonTSORBP; consulted per decoded
+  // memory operand in IsNonTSOReg so no config read happens per decode.
+  bool NonTSORBP {};
   uint64_t Entry {};
 
   // Vector-scan fusion lookahead window, see SetDecodeWindow.
