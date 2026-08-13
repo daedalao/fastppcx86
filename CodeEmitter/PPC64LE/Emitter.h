@@ -921,6 +921,30 @@ public:
     Emit32((60u << 26) | (vrt << 21) | (vrb << 11) | ((xo & 0x1FFu) << 2) |
            (1u << 1) /*BX*/ | 1u /*TX*/);
   }
+  // xxbrq XT, XB — vector byte-reverse quadword. ISA 3.0 (POWER9) ONLY:
+  // emitting this on POWER8 is a SIGILL, so every call site must be gated on
+  // HostFeatures.SupportsISA30 with a 2.07 fallback arm (see
+  // PPC64EmitterBase::LoadUnalignedV128 for the canonical pattern).
+  //
+  // Reverses all 16 bytes of a VSR in one instruction — the single-instruction
+  // bridge between this backend's guest-XMM image (guest byte 0 at BE byte
+  // element 15) and the BE-byte-numbered raw image the AES cipher instructions
+  // want. Replaces a materialized {15..0} mask + vperm.
+  //
+  // XX2-form, but bits BE 11..15 are the byte-reverse WIDTH selector (UIM),
+  // not part of the opcode: 31 = quadword. EmitXX2 zeroes that field, so this
+  // sets it explicitly rather than reusing EmitXX2.
+  //
+  // Encoding verified against `llvm-mc -triple=powerpc64le --show-encoding`
+  // (VR n is vs(32+n), so BX/TX are always 1 here):
+  //   xxbrq 32, 33  ->  0xf01f0f6f   (xxbrq v0, v1)
+  //   xxbrq 34, 35  ->  0xf05f1f6f   (xxbrq v2, v3)
+  //   xxbrq 63, 63  ->  0xf3ffff6f   (xxbrq v31, v31)
+  void xxbrq(VR t, VR b) {
+    Emit32((60u << 26) | (t.idx << 21) | (31u << 16) | (b.idx << 11) |
+           ((475u & 0x1FFu) << 2) | (1u << 1) /*BX*/ | 1u /*TX*/);
+  }
+
   // XO field values for XX2 are taken straight from gas-emitted bytes (the
   // ISA-listed numbers in some books include extra bits and don't match the
   // 9-bit XO field at BE 21..29 directly).

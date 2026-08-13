@@ -5444,10 +5444,40 @@ uint64_t* GetPPC64HelperTable() {
 // legal because it is never live across a host call within a single lowering -
 // and pulled back for the outbound reversal.
 
+// ---------------------------------------------------------------------------
+// ISA 3.0 (POWER9) ARM.
+//
+// xxbrq reverses all 16 bytes of a VSR in ONE instruction, which is exactly
+// the G-image <-> AES-state-image bridge the mask+vperm above is emulating.
+// With it the whole mask apparatus disappears: no {15..0} materialization, no
+// vs12 park, no AESMaskCached bookkeeping, and no lvsl scratch clobber. The
+// key-folding structure is unchanged - revKey is just xxbrq instead of vperm,
+// and still feeds vcipher/vcipherlast/vncipherlast directly.
+//
+// Every AES handler below is written as two obviously parallel arms selected
+// on CTX->HostFeatures.SupportsISA30 (the JIT-layer spelling of the gate;
+// PPC64Emitter.cpp says EmitterCTX->HostFeatures.SupportsISA30 for the same
+// field - LoadUnalignedV128 is the canonical example). Emitting xxbrq on
+// POWER8 is a SIGILL, so the gate is load-bearing, and with it OFF the
+// POWER8 arm is byte-for-byte what it was before this change.
+//
+// AESMaskCached is untouched by the ISA 3.0 arm: EmitAESLoadMask is the only
+// writer of that flag and only the POWER8 arm calls it, so on an ISA 3.0 host
+// the flag is false for the life of the process and the vs12 park is never
+// created OR consumed. Nothing in the ISA 3.0 arm reads VTMP3_VSX.
+//
+// Instruction counts per guest op (POWER8 hot / POWER8 cold / ISA 3.0):
+//   VAESEnc, VAESEncLast, VAESDecLast   5 / 8 / 4
+//   VAESDec                             6 / 9 / 5
+//   VAESImc                             7 / 10 / 5
+// The ISA 3.0 arm also drops the r0 write and the VTMP2 cold-path clobber.
+// ---------------------------------------------------------------------------
+
 // VTMP1 <- {15,...,0} byte-reverse mask. Cold: 4-instruction register-only
 // materialization, then parked in VTMP3_VSX (vs12) and AESMaskCached set so
 // consecutive AES-family ops in the block pay a single xxlor instead.
 // Clobbers VTMP2 on the cold path (lvsl scratch) - callers load state after.
+// POWER8 (ISA 2.07) arm only - never called when SupportsISA30 is set.
 void PPC64JITCore::EmitAESLoadMask() {
   if (AESMaskCached) {
     xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
@@ -5468,6 +5498,15 @@ DEF_OP(VAESImc) {
   const auto Op  = IROp->C<IR::IROp_VAESImc>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, Src);
+    vxor(VTMP1, VTMP1, VTMP1); // stateless zero - never read VZERO's vector half
+    vcipherlast(VTMP2, VTMP2, VTMP1);
+    vncipher(VTMP2, VTMP2, VTMP1);
+    xxbrq(Dst, VTMP2);
+    return;
+  }
 
   EmitAESLoadMask();
   vperm(VTMP2, Src, Src, VTMP1);
@@ -5505,6 +5544,14 @@ DEF_OP(VAESEnc) {
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);          // revState
+    xxbrq(VTMP1, Key);            // revKey
+    vcipher(VTMP2, VTMP2, VTMP1); // rev(MixColumns(ShiftRows(SubBytes(s))) ^ k)
+    xxbrq(Dst, VTMP2);
+    return;
+  }
+
   EmitAESLoadMask();
   vperm(VTMP2, State, State, VTMP1);   // revState
   vperm(VTMP1, Key, Key, VTMP1);       // revKey (self-overwrite of mask is fine)
@@ -5519,6 +5566,14 @@ DEF_OP(VAESEncLast) {
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    xxbrq(VTMP1, Key);
+    vcipherlast(VTMP2, VTMP2, VTMP1); // rev(ShiftRows(SubBytes(s)) ^ k)
+    xxbrq(Dst, VTMP2);
+    return;
+  }
 
   EmitAESLoadMask();
   vperm(VTMP2, State, State, VTMP1);
@@ -5540,6 +5595,15 @@ DEF_OP(VAESDec) {
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    vxor(VTMP1, VTMP1, VTMP1); // stateless zero - never read VZERO's vector half
+    vncipher(VTMP2, VTMP2, VTMP1);
+    xxbrq(VTMP2, VTMP2);
+    vxor(Dst, VTMP2, Key);     // Key read in the same insn that writes Dst
+    return;
+  }
+
   EmitAESLoadMask();
   vperm(VTMP2, State, State, VTMP1);
   vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
@@ -5555,6 +5619,14 @@ DEF_OP(VAESDecLast) {
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    xxbrq(VTMP1, Key);
+    vncipherlast(VTMP2, VTMP2, VTMP1); // rev(InvSubBytes(InvShiftRows(s)) ^ k) - xor is after, folds
+    xxbrq(Dst, VTMP2);
+    return;
+  }
 
   EmitAESLoadMask();
   vperm(VTMP2, State, State, VTMP1);

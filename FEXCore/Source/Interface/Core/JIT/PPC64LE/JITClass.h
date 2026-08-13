@@ -803,6 +803,14 @@ private:
   // this by invalidating on every non-AES-family op and at every block bind;
   // the AES handlers' Op_Unhandled bail paths invalidate explicitly since
   // the loop-level check can't see them.
+  //
+  // ALL OF THE ABOVE IS THE POWER8 (ISA 2.07) ARM. When
+  // HostFeatures.SupportsISA30 is set the handlers take an xxbrq arm instead:
+  // one instruction per reversal, no mask, no vs12 park. EmitAESLoadMask is
+  // the only writer of AESMaskCached and only the POWER8 arm calls it, so on
+  // an ISA 3.0 host the flag stays false forever and the (still-running)
+  // CompileCode invalidation is a harmless no-op. Nothing needs to change
+  // there if a new AES-family op is added to the ISA 3.0 arm only.
   // -----------------------------------------------------------------------
   void EmitAESLoadMask();
   bool AESMaskCached = false;
