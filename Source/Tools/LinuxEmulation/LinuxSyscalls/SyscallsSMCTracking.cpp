@@ -1858,9 +1858,15 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     // A guest mprotect(PROT_NONE) over FEX's text is as fatal as unmapping it,
     // and it is exactly the shape wine64-preloader's reservation takes when the
     // range is already mapped. See HostOwnedRanges.h.
-    if (HostOwnedRanges::Overlaps(reinterpret_cast<uint64_t>(addr), len)) {
+    //
+    // The errno matters: for a range the kernel itself would never let anyone
+    // write ([vvar] -- the first overlapping VMA the kernel would visit) the
+    // native answer to a PROT_WRITE request is EACCES, and gvisor's
+    // VvarTest.WriteVvar checks for it. Everything else is refused as if the
+    // range were not mapped at all.
+    if (const auto Hit = HostOwnedRanges::FindOverlap(reinterpret_cast<uint64_t>(addr), len); Hit.End != 0) {
       HostOwnedRanges::ReportRefusal("mprotect", reinterpret_cast<uint64_t>(addr), len);
-      return -ENOMEM;
+      return ((prot & PROT_WRITE) && !Hit.MayWrite) ? -EACCES : -ENOMEM;
     }
     Result = ::mprotect(addr, len, prot);
     if (Result == -1) {

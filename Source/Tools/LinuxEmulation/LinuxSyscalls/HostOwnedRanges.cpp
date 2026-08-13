@@ -26,19 +26,26 @@ namespace {
   std::atomic<bool> Snapshotted {false};
   std::atomic<size_t> RangeCount {0};
 
-  void AddLocked(uint64_t Base, uint64_t End) {
+  void AddLocked(uint64_t Base, uint64_t End, bool MayWrite = true) {
     if (End <= Base) {
       return;
     }
-    Ranges.push_back({Base, End});
+    Ranges.push_back({Base, End, MayWrite});
   }
 
   void SortAndCoalesceLocked() {
     std::sort(Ranges.begin(), Ranges.end(), [](const auto& a, const auto& b) { return a.Base < b.Base; });
     size_t Out = 0;
     for (size_t i = 0; i < Ranges.size(); ++i) {
-      if (Out > 0 && Ranges[i].Base <= Ranges[Out - 1].End) {
+      const bool Overlapping = Out > 0 && Ranges[i].Base < Ranges[Out - 1].End;
+      // Merely adjacent ranges only merge when they agree on MayWrite, so
+      // [vvar] does not get absorbed into the vdso/library block behind it and
+      // lose its EACCES marker. Genuinely overlapping ones (only possible via
+      // Add()/the test hook) merge unconditionally, keeping the stricter flag.
+      const bool Adjacent = Out > 0 && Ranges[i].Base == Ranges[Out - 1].End && Ranges[i].MayWrite == Ranges[Out - 1].MayWrite;
+      if (Overlapping || Adjacent) {
         Ranges[Out - 1].End = std::max(Ranges[Out - 1].End, Ranges[i].End);
+        Ranges[Out - 1].MayWrite &= Ranges[i].MayWrite;
       } else {
         Ranges[Out++] = Ranges[i];
       }
@@ -121,7 +128,14 @@ namespace {
         return;
       }
 
-      Out.push_back({Start, Stop});
+      // [vvar] (and the split-off [vvar_vclock] on newer kernels) is the one
+      // mapping whose VM_MAYWRITE the kernel keeps clear: mprotect(PROT_WRITE)
+      // on it fails with EACCES for a native process, and the guest sees it in
+      // /proc/self/maps. Everything else in the table is refused as if
+      // unmapped. See Range::MayWrite.
+      const bool MayWrite = ::strncmp(P, "[vvar", 5) != 0;
+
+      Out.push_back({Start, Stop, MayWrite});
       PrevIncludedEnd = Stop;
       Any = true;
     };
@@ -174,7 +188,7 @@ void HostOwnedRanges::SnapshotSelf() {
     if (R.End <= FirstGuardedAddress) {
       continue;
     }
-    AddLocked(std::max(R.Base, FirstGuardedAddress), R.End);
+    AddLocked(std::max(R.Base, FirstGuardedAddress), R.End, R.MayWrite);
   }
 
   // TEST HOOK, off unless set: FEX_TEST_HOSTOWNED_ADD=<hexbase>-<hexend>[,...]
@@ -222,8 +236,9 @@ HostOwnedRanges::Range HostOwnedRanges::FindOverlap(uint64_t Base, uint64_t Size
   const uint64_t End = FEXCore::AlignUp(Base + Size, FEXCore::Utils::FEX_PAGE_SIZE);
   if (End <= Start) {
     // Wrapped: an absurd length. Report an overlap so it is refused rather than
-    // handed to the kernel.
-    return {Start, ~0ULL};
+    // handed to the kernel. MayWrite stays true: the kernel's errno for an
+    // absurd length is ENOMEM, never EACCES.
+    return {Start, ~0ULL, true};
   }
 
   // Ranges is sorted and disjoint after SortAndCoalesceLocked.

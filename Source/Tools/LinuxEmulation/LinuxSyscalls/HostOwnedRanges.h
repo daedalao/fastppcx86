@@ -96,6 +96,12 @@ public:
   struct Range {
     uint64_t Base;
     uint64_t End; // exclusive
+    // False only for mappings the kernel itself refuses to ever make writable
+    // ([vvar]: VM_MAYWRITE is clear). A refused mprotect(PROT_WRITE) over one
+    // of these must fail with the kernel's own EACCES rather than ENOMEM --
+    // the mapping is visible in the guest's /proc/self/maps, and gvisor's
+    // VvarTest.WriteVvar checks for exactly that errno.
+    bool MayWrite = true;
   };
 
   /// Test/diagnostic accessor.
