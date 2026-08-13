@@ -504,6 +504,15 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
     // Never enter a signal-wakeable sleep with a parked guest signal.
     result = static_cast<uint64_t>(-EINTR);
   } else if ((PlainWait || BitsetWait) && timeout == 0 && !NoSlice) {
+    // Spurious-wake rescue: an untimed waiter parked for ~5s while the futex
+    // word never changes is the shape of every lost-wakeup wedge (CM login,
+    // Unity render threads). FUTEX_WAIT is documented to wake spuriously and
+    // every correct waiter rechecks its predicate in a loop, so returning 0
+    // here is within the guest's contract — it converts a permanent freeze
+    // into a bounded recheck, and costs one wakeup per parked thread per 5s.
+    // FEX_FUTEX_NORESCUE=1 disables (leaves pure kernel-side slicing).
+    static const bool NoRescue = (getenv("FEX_FUTEX_NORESCUE") != nullptr);
+    int SlicesParked = 0;
     for (;;) {
       struct timespec Slice;
       if (BitsetWait) {
@@ -527,6 +536,10 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
         // re-issue, so a wake that raced the boundary converts to EAGAIN.
         if (HasGuestDeliverableSignal(Frame)) {
           result = static_cast<uint64_t>(-EINTR);
+          break;
+        }
+        if (!NoRescue && ++SlicesParked >= 50) {
+          result = 0; // spurious wake: guest rechecks its predicate
           break;
         }
         continue;
