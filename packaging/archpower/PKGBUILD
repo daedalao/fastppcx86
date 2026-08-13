@@ -1,12 +1,17 @@
 # Maintainer: daedalao <daedalao@hotmail.com>
 #
-# FastPPCx86 -- x86 / x86-64 emulation for 64-bit POWER (ppc64le).
+# FastPPCx86: x86 / x86-64 emulation for 64-bit POWER (ppc64le).
 # Downstream port of FEX-Emu; the installed binaries keep their FEX names.
 #
-# Builds from the public repository by default:
+# Builds the 'main' branch of the public repository by default:
 #   cd packaging/archpower && makepkg -s
+# main is the deployment branch. Development happens on daedalao-wt and is
+# merged into main at release time; see docs/ReleaseProcess.md.
+#
 # Point it at a local checkout or a fork with FASTPPCX86_GIT_URL:
 #   FASTPPCX86_GIT_URL='file:///home/you/src/fastppcx86' makepkg -s
+# Override the branch with FASTPPCX86_GIT_BRANCH (e.g. to test daedalao-wt
+# before a release merge).
 #
 # Library thunks (native host GL/Vulkan/wayland passthrough) are ON,
 # everything built from source. ArchPOWER packages a full x86_64 cross
@@ -24,7 +29,9 @@
 # back to emulated libraries.
 
 pkgname=fastppcx86
-pkgver=r0.0000000
+# Placeholder: pkgver() below recomputes this from the checkout at build time.
+# The committed value tracks the last metadata refresh so .SRCINFO is not stale.
+pkgver=r14884.211e31a
 pkgrel=1
 pkgdesc='Fast x86 and x86-64 emulation for 64-bit POWER'
 arch=('powerpc64le')
@@ -32,15 +39,30 @@ url='https://github.com/daedalao/fastppcx86'
 license=('MIT')
 
 # Runtime: fmt is linked as a shared library (the build prefers the system copy
-# over External/fmt); the Qt6 bits are only needed by the FEXConfig GUI.
+# over External/fmt); the Qt6 bits are only needed by the FEXConfig GUI
+# (find_package(Qt6 COMPONENTS Qml Quick Widgets) in Source/Tools).
+#
+# The host thunks resolve their target library with dlopen() at load time
+# (thunkgen emits fexldr_init_<lib>, see ThunkLibs/Generator/gen.cpp), so none
+# of it is DT_NEEDED and namcap cannot see it. Every library backing a thunk
+# that this package enables in ThunksDB below is therefore a hard depend:
+# a missing one makes fexldr_init_<lib> return false and the thunk silently
+# stops working.
 depends=(
   'gcc-libs'
   'glibc'
   'fmt'
-  'libglvnd'       # DT_NEEDED of the GL host thunk, which ships enabled
   'xxhash'
   'qt6-base'
   'qt6-declarative'
+  # dlopen'd by the enabled host thunks:
+  'libglvnd'            # libGL.so.1, libEGL.so.1 (GL and EGL thunks)
+  'vulkan-icd-loader'   # libvulkan.so.1 (Vulkan thunk)
+  'libdrm'              # libdrm.so.2 (drm thunk)
+  'libxshmfence'        # libxshmfence.so.1 (xshmfence thunk)
+  'wayland'             # libwayland-client.so.0 (WaylandClient thunk)
+  'libx11'              # libX11.so.6, dlopen'd by ThunkLibs X11Manager
+  'libxcb'              # libxcb.so.1, likewise
 )
 makedepends=(
   'clang'          # FEX refuses to build with GCC (hard FATAL_ERROR in CMakeLists);
@@ -71,8 +93,9 @@ optdepends=(
   'erofs-utils: mount EROFS x86-64 RootFS images'
   'wget: used by FEXRootFSFetcher to download a RootFS'
   'xz: RootFS extraction'
-  'vulkan-driver: native Vulkan passthrough via the thunk'
+  'vulkan-driver: an ICD for the Vulkan thunk to pass through to'
   'pipewire-pulse: PulseAudio server for guest audio (guests speak the PA protocol; pulseaudio works too)'
+  'alsa-lib: only needed if you enable the asound thunk, which ships disabled'
 )
 # nasm is deliberately absent: it is only needed by the ASM unit tests, and
 # BUILD_TESTING is off here.
@@ -81,6 +104,9 @@ options=('!lto')
 install="$pkgname.install"
 
 _repourl="${FASTPPCX86_GIT_URL:-https://github.com/daedalao/fastppcx86.git}"
+# Pinned explicitly rather than relying on the remote HEAD symref, so a change
+# to the repository's default branch cannot silently change what is packaged.
+_repobranch="${FASTPPCX86_GIT_BRANCH:-main}"
 _x86rootfs="${FASTPPCX86_X86_ROOTFS:-}"
 
 # The bundled third-party trees are git submodules. They are listed here as
@@ -91,7 +117,7 @@ _x86rootfs="${FASTPPCX86_X86_ROOTFS:-}"
 # *-tests-bins are all skipped. drm-headers is needed by the 32-bit ioctl
 # emulation in LinuxEmulation; Vulkan-Headers by the Vulkan thunk.
 source=(
-  "$pkgname::git+$_repourl"
+  "$pkgname::git+$_repourl#branch=$_repobranch"
   'drm-headers::git+https://github.com/FEX-Emu/drm-headers.git'
   'fmt::git+https://github.com/fmtlib/fmt.git'
   'xxhash::git+https://github.com/Cyan4973/xxHash.git'
@@ -161,9 +187,21 @@ build() {
 
   # Mirrors the known-good POWER9 configuration (build-smc): clang, Ninja,
   # RelWithDebInfo, jemalloc-glibc + FEX allocator on, LTO off, tests off.
-  # TUNE_CPU is forced to 'none' -- the upstream default of 'native' bakes
+  # TUNE_CPU is forced to 'none'; the upstream default of 'native' bakes
   # -march=native into a package that other machines then install.
   # Set it to power9/power10 for a machine-specific rebuild.
+  #
+  # Two options are deliberately left at their CMakeLists defaults:
+  #   BUILD_THUNKS_32BIT (ON)  32-bit host-side thunks. Independent of the
+  #     guest stubs below: it only controls the HostThunks_32 halves.
+  #   X86_DEV_ROOTFS ("/")     "/" is the cache default meaning "unset", which
+  #     is what makes CMakeLists fall back to the packaged
+  #     x86_64-pc-linux-gnu cross sysroot. Do not set it.
+  #
+  # Never point thunkgen's x86 interface parse at ppc64le headers to make a
+  # build succeed. That parse decides guest data layout; against the wrong
+  # headers it silently emits different repack code (see the comment at the
+  # top of ThunkLibs/HostLibs/CMakeLists.txt).
   cmake -S "$srcdir/$pkgname" -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=/usr \
