@@ -760,12 +760,23 @@ private:
   //
   // The POWER8 cipher instructions read the AES state big-endian while a guest
   // XMM is held with guest byte 0 at BE byte element 15, so every AES round is
-  // bracketed by a byte reversal against a per-use materialized mask. These two
-  // wrap that bracketing; both use VTMP1 as scratch and pass the state in
-  // VTMP2. See the block comment above DEF_OP(VAESImc).
+  // bracketed by a byte reversal. EmitAESLoadMask materializes the {15..0}
+  // vperm mask into VTMP1 - statelessly on a cold call (4 instructions, no
+  // memory, no cross-host-call register trust; see the vs14-vs31 dw1 hazard
+  // note in PPC64Emitter.h), or with a single xxlor from the VTMP3_VSX (vs12)
+  // park when AESMaskCached says a preceding AES-family op in this block
+  // already built it.
+  //
+  // AESMaskCached is EMISSION-TIME bookkeeping only. The invariant that makes
+  // a hit sound: between the op that parked the mask and the op that reuses
+  // it, no other host instruction was emitted at all. CompileCode enforces
+  // this by invalidating on every non-AES-family op and at every block bind;
+  // the AES handlers' Op_Unhandled bail paths invalidate explicitly since
+  // the loop-level check can't see them.
   // -----------------------------------------------------------------------
-  void EmitAESStateIn(PPC64Emitter::VR Src);
-  void EmitAESStateOut(PPC64Emitter::VR Dst);
+  void EmitAESLoadMask();
+  bool AESMaskCached = false;
+  void InvalidateAESCache() { AESMaskCached = false; }
 
   // -----------------------------------------------------------------------
   // Op handler declarations (filled in by the separate *.cpp files)

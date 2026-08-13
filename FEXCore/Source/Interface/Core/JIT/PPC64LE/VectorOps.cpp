@@ -5480,20 +5480,21 @@ uint64_t* GetPPC64HelperTable() {
 // legal because it is never live across a host call within a single lowering -
 // and pulled back for the outbound reversal.
 
-// VTMP1 <- {15,...,0}; VTMP2 <- byte-reversed Src; VTMP3_VSX <- parked mask.
-void PPC64JITCore::EmitAESStateIn(PPC64Emitter::VR Src) {
+// VTMP1 <- {15,...,0} byte-reverse mask. Cold: 4-instruction register-only
+// materialization, then parked in VTMP3_VSX (vs12) and AESMaskCached set so
+// consecutive AES-family ops in the block pay a single xxlor instead.
+// Clobbers VTMP2 on the cold path (lvsl scratch) - callers load state after.
+void PPC64JITCore::EmitAESLoadMask() {
+  if (AESMaskCached) {
+    xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+    return;
+  }
   li(r(0), 0);
   vspltisb(VTMP1, 15);
   lvsl(VTMP2, r(0), r(0));
   vsububm(VTMP1, VTMP1, VTMP2);
-  vperm(VTMP2, Src, Src, VTMP1);
   xxlor(VTMP3_VSX, AsVSX(VTMP1), AsVSX(VTMP1));
-}
-
-// Undo EmitAESStateIn's reversal (mask from VTMP3_VSX), landing in Dst.
-void PPC64JITCore::EmitAESStateOut(PPC64Emitter::VR Dst) {
-  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
-  vperm(Dst, VTMP2, VTMP2, VTMP1);
+  AESMaskCached = true;
 }
 
 // AESIMC: out = InvMixColumns(src).
@@ -5504,51 +5505,63 @@ DEF_OP(VAESImc) {
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
 
-  EmitAESStateIn(Src);
+  EmitAESLoadMask();
+  vperm(VTMP2, Src, Src, VTMP1);
   vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vcipherlast(VTMP2, VTMP2, VTMP1);
   vncipher(VTMP2, VTMP2, VTMP1);
-  EmitAESStateOut(Dst);
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
-// The four round ops. Each is: reverse state in, run the hardware round with a
-// zero key, reverse out, then xor the real round key. Keeping the key xor
-// outside the cipher instruction costs nothing (it is one vxor either way,
-// since supplying a reversed key would need a third vector temp we do not
-// have) and is what makes the vncipher decrypt path exact - see the block
-// comment above DEF_OP(VAESImc).
+// The four round ops, with two fusions over the naive bracketed form:
 //
-// Aliasing: the round result is kept in VTMP2 throughout, and Dst is written
-// only by the closing vxor, which reads both its sources in the same
-// instruction. State is dead after EmitAESStateIn. So Dst may alias State,
-// Key, or both.
+//  * MASK REUSE: EmitAESLoadMask parks the byte-reverse mask in vs12; runs of
+//    adjacent AES ops (every real-world AES code shape - key schedules, CBC
+//    interleaves, round chains) rebuild it with one xxlor instead of four
+//    instructions. CompileCode invalidates the park on any other op.
+//
+//  * KEY FOLDING: vcipher/vcipherlast/vncipherlast apply their B operand xor
+//    at the same point x86 applies the round key, so feeding them the
+//    byte-REVERSED key computes the whole x86 op in one instruction - the
+//    separate zero operand and trailing vxor disappear. AESDEC alone cannot
+//    fold: vncipher xors B BEFORE InvMixColumns (equivalent inverse cipher),
+//    x86 after, so it keeps the zero-operand + explicit key xor form. The
+//    InvMixColumns(0) == 0 linearity argument makes that exact - see the
+//    block comment above DEF_OP(VAESImc).
+//
+// Aliasing: every source is fully consumed before Dst is written (the final
+// vperm/vxor reads its sources in the same instruction), so Dst may alias
+// State, Key, or both. The SSE forms alias Dst==State on every instruction.
 
 DEF_OP(VAESEnc) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEnc>();
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
-  EmitAESStateIn(State);
-  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
-  vcipher(VTMP2, VTMP2, VTMP1);       // MixColumns(ShiftRows(SubBytes(state)))
-  EmitAESStateOut(VTMP2);
-  vxor(Dst, VTMP2, Key);
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);   // revState
+  vperm(VTMP1, Key, Key, VTMP1);       // revKey (self-overwrite of mask is fine)
+  vcipher(VTMP2, VTMP2, VTMP1);        // rev(MixColumns(ShiftRows(SubBytes(s))) ^ k)
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
 DEF_OP(VAESEncLast) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEncLast>();
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
-  EmitAESStateIn(State);
-  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
-  vcipherlast(VTMP2, VTMP2, VTMP1);   // ShiftRows(SubBytes(state)), no mixing
-  EmitAESStateOut(VTMP2);
-  vxor(Dst, VTMP2, Key);
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
+  vperm(VTMP1, Key, Key, VTMP1);
+  vcipherlast(VTMP2, VTMP2, VTMP1);    // rev(ShiftRows(SubBytes(s)) ^ k)
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
 // AESDEC(A,K) = InvMixColumns(InvSubBytes(InvShiftRows(A))) ^ K.
@@ -5557,31 +5570,34 @@ DEF_OP(VAESEncLast) {
 // exactly once the key xor is pulled out. This identity is the whole reason
 // the old scalar AES_InvMixColumns helper is gone.
 DEF_OP(VAESDec) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDec>();
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
-  EmitAESStateIn(State);
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
   vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vncipher(VTMP2, VTMP2, VTMP1);
-  EmitAESStateOut(VTMP2);
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(VTMP2, VTMP2, VTMP2, VTMP1);
   vxor(Dst, VTMP2, Key);
 }
 
 DEF_OP(VAESDecLast) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDecLast>();
   const auto Dst = GetVReg(Node);
   const auto State = GetVReg(Op->State);
   const auto Key = GetVReg(Op->Key);
 
-  EmitAESStateIn(State);
-  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
-  vncipherlast(VTMP2, VTMP2, VTMP1);  // InvSubBytes(InvShiftRows(state))
-  EmitAESStateOut(VTMP2);
-  vxor(Dst, VTMP2, Key);
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
+  vperm(VTMP1, Key, Key, VTMP1);
+  vncipherlast(VTMP2, VTMP2, VTMP1);   // rev(InvSubBytes(InvShiftRows(s)) ^ k) - xor is after, folds
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
 // AESKEYGENASSIST: x86 takes Src=[X3,X2,X1,X0] (32-bit lanes) and produces

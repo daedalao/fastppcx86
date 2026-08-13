@@ -3756,11 +3756,28 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // the cursor, so the prologue delta is complete here.
     Bind(JumpTarget(BlockNode));
 
+    // A block can be entered from anywhere; nothing about the previously
+    // emitted block's trailing register contents may be assumed here.
+    InvalidateAESCache();
+
     PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
       uint16_t Op = static_cast<uint16_t>(IROp->Op);
+
+      // AES mask-cache: only the AES-family handlers keep the vs12-parked
+      // byte-reverse mask alive (see EmitAESLoadMask). Any other op may
+      // clobber VTMP3_VSX or emit a host call, so the park dies here. The
+      // AES handlers' own Op_Unhandled bail paths invalidate explicitly.
+      switch (IROp->Op) {
+      case IR::OP_VAESENC:
+      case IR::OP_VAESENCLAST:
+      case IR::OP_VAESDEC:
+      case IR::OP_VAESDECLAST:
+      case IR::OP_VAESIMC: break;
+      default: InvalidateAESCache(); break;
+      }
 
       // Op-size profiler: the emitter cursor is the only ground truth for how
       // much host code a handler produced. Sampling it immediately either side
