@@ -25,6 +25,7 @@ $end_info$
 #include <sched.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -595,6 +596,16 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
   {
     static const bool trace_futex = (getenv("FEX_FUTEX_TRACE") != nullptr);
     if (trace_futex && access("/tmp/ftx_on", F_OK) == 0) {
+      // Own file, not stderr: guests (steamcmd) redirect or replace fd 2
+      // early, which silently ate the trace from exactly the process under
+      // investigation. Benign race on first use: a double open leaks one fd
+      // once per process.
+      static int trace_fd = -1;
+      if (trace_fd == -1) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/ftx.%d.log", static_cast<int>(::getpid()));
+        trace_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+      }
       static thread_local pid_t tls_tid = 0;
       if (tls_tid == 0) {
         tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
@@ -607,7 +618,7 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       int n = snprintf(buf, sizeof(buf), "[FTX] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
                        static_cast<int>(tls_tid), (unsigned long)futex_op, (unsigned long)uaddr, (unsigned long)val,
                        (unsigned long)timeout, (long)signed_result, cur);
-      [[maybe_unused]] auto _ = write(2, buf, n);
+      [[maybe_unused]] auto _ = write(trace_fd, buf, n);
     }
   }
 
