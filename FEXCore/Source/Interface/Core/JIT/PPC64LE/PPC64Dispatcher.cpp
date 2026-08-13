@@ -31,6 +31,7 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 
@@ -109,8 +110,9 @@ PPC64Dispatcher::PPC64Dispatcher(FEXCore::Context::ContextImpl* CTX)
   // CPU may execute stale bytes the I-cache happened to fetch on the same
   // physical line. mprotect(PROT_EXEC) typically (but not contractually) does
   // this, so we still issue it explicitly to match ARM64 behaviour.
-  __builtin___clear_cache(static_cast<char*>(Mem),
-                          static_cast<char*>(Mem) + DISPATCHER_CODE_SIZE);
+  // (EmitDispatcher already flushes the range it actually emitted, so this is
+  // belt-and-braces over the whole 64KiB buffer — 512 blocks, once per process.)
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Mem, DISPATCHER_CODE_SIZE);
 
   // Make the buffer read-only+executable after generation
   mprotect(Mem, DISPATCHER_CODE_SIZE, PROT_READ | PROT_EXEC);
@@ -158,6 +160,14 @@ void PPC64Dispatcher::EmitDispatcher() {
   // vs14 == f14 is callee-saved (Push/PopCalleeSavedRegisters handle the
   // outer caller's value), non-volatile across every host call the JIT makes,
   // and written nowhere else. See the VZERO_VSX comment in PPC64Emitter.h.
+  //
+  // CAVEAT (learned from the AES pinned-mask incident): the ELFv2 guarantee
+  // covers only the FPR half (dw0). The vector half (dw1) is volatile, and a
+  // host callee's scalar lfd f14 restore leaves it UNDEFINED per the ISA.
+  // Consumers may therefore only rely on VZERO's dw0 being zero after any
+  // host call; nothing may read its full 128 bits across one. A pinned
+  // full-width vector constant in vs14-vs31 is not implementable this way -
+  // materialize such constants per-use instead (see EmitAESLoadMask).
   xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
 
   // STATE (r27) = Frame* (r3)
@@ -252,6 +262,13 @@ void PPC64Dispatcher::EmitDispatcher() {
     // block entry regardless of how we got here. One instruction on a path that
     // already performs several loads.
     li(r(0), 0);
+
+    // Spin-loop SMT priority safety net: a thread can leave a hint-marked
+    // spin region through a signal/suspend detour instead of a marked exit
+    // edge, arriving here still at very-low priority. Restore medium (the
+    // default) on every dispatcher-mediated entry. Architectural nop
+    // otherwise; see AnalyzeSpinLoops in JIT.cpp.
+    smt_medium_priority();
 
     // Load current RIP from Frame->State.rip
     int32_t rip_off = static_cast<int32_t>(offsetof(CpuStateFrame, State.rip));
@@ -1032,12 +1049,13 @@ void PPC64Dispatcher::EmitDispatcher() {
     }
   }
 
-  // Flush instruction cache for entire generated region
+  // Flush instruction cache for entire generated region. This was one of three
+  // copy-pasted inline-asm blocks; it is now the shared helper, which also adds
+  // the "memory" clobber the copy here was missing and strides by the auxv
+  // cache-block size instead of a hardcoded 32.
   uint8_t* Start = reinterpret_cast<uint8_t*>(DispatcherBegin);
-  uint8_t* End   = GetCursorAddress<uint8_t*>();
-  for (uint8_t* p = Start; p < End; p += 32) {
-    asm volatile("dcbst 0,%0; sync; icbi 0,%0; isync" :: "r"(p));
-  }
+  uint8_t* End = GetCursorAddress<uint8_t*>();
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Start, static_cast<size_t>(End - Start));
 }
 
 // ============================================================
@@ -1077,6 +1095,15 @@ void PPC64Dispatcher::EmitDispatcher() {
 // ============================================================
 uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   const auto Address = GetCursorAddress<uint64_t>();
+
+  // These stubs are shared by every callsite, so they cannot know which
+  // dynamic VRs are live — the volatile dynamic pool is CALLER-saved around
+  // the bctrl into an ABIPointers stub (SaveDynVRsToFrame at the two FABI
+  // callsite emitters: JIT.cpp Op_Unhandled and X87Ops.cpp EmitFABICall).
+  // Emit the whole stub with the Push/PopDynamicRegs VR mask empty; the
+  // spill-frame SIZE is unchanged (see the DynVRSpillMask contract in
+  // PPC64Emitter.h), so all kSpill-relative mini-frame math below is intact.
+  DynVRSpillMask = 0;
 
   // The spill frame size differs between guest bitnesses (x32 has larger RA
   // and RAFPR pools), so every post-spill mini-frame access must be
@@ -1477,6 +1504,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     break;
   }
 
+  DynVRSpillMask = ~0u;
   return Address;
 }
 
@@ -1521,6 +1549,11 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
 
     .SRAGPRMapping = GPRMapping,
     .SRAFPRMapping = FPRMapping,
+
+    // AVX-high bank: one entry per SRA XMM when AVX is advertised. FPRCount
+    // already reflects guest bitness (16 x64 / 8 x32).
+    .SRAAVXHighBankFirst = static_cast<uint16_t>(AVXHIGH_BANK_FIRST),
+    .SRAAVXHighBankCount = static_cast<uint16_t>(CTX->HostFeatures.SupportsAVX ? FPRCount : 0),
   };
 }
 

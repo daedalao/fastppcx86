@@ -20,12 +20,22 @@
 // serialised, and since C3/C4 it also runs real ldarx/stdcx. (C3, doubleword
 // container) or lqarx/stqcx. (C4, quadword container) inside that mutex when
 // the operand fits — so misaligned-contained ops now compose with the
-// aligned LL/SC path on overlapping bytes in another thread. A crossing
-// residual remains: 8-byte ops at (EA & 15) > 8, and i386 `cmpxchg8b` at
-// offset 12 mod 16, still stay on the memcpy-crossing path which does not
-// compose with aligned LL/SC (Tier D atomics defect 1, narrowed by C3+C4
-// but not closed — closure requires a dual-container crossing path, deferred
-// as a future C4.5). The 8-bit (lbarx) path is always aligned by definition.
+// aligned LL/SC path on overlapping bytes in another thread. C4.5 then closed
+// the crossing cases the same way: 8-byte ops at (EA & 15) > 8 and i386
+// `cmpxchg8b` at offset 12 mod 16 no longer take a plain memcpy under the
+// mutex, but a dual-doubleword CAS — one aligned 8-byte CAS committed per
+// doubleword — so they compose with aligned LL/SC too, except in the window
+// between the two commits. A conflict in that window is DETECTED: it is
+// counted as a tear and reported to the guest as CAS failure / half-applied
+// RMW, never as silent success. Tier D atomics defect 1 is therefore narrowed
+// to a detected tear, not deferred; FEXCore/Utils/ArchHelpers/PPC64.h:37-48 is
+// the authoritative statement and this file agrees with it below (see the
+// EmitInlineContainedRMW preamble, which already depends on C4.5).
+//   [This paragraph read "closure requires a dual-container crossing path,
+//   deferred as a future C4.5" until 2026-08-13. C4.5 shipped 2026-08-03 in
+//   c48a741f6 and touched PPC64.{cpp,h} + Telemetry.{cpp,h} but not this file,
+//   so the text rotted into contradicting both PPC64.h and its own body.]
+// The 8-bit (lbarx) path is always aligned by definition.
 // Since C6/C7, when SplitLockInlineContained is set, the doubleword-contained
 // subset of the misaligned Fetch*/Swap and CAS ops (2-/4-byte fields with
 // (EA & 7) + size <= 8) is JIT-inlined as an aligned ldarx/stdcx. container
@@ -84,10 +94,13 @@ namespace FEXCore::CPU {
 // serialised, plus real ldarx/stdcx. or lqarx/stqcx. inside the mutex when
 // the operand is doubleword- or quadword-contained — Tier D atomics C3/C4).
 // This composes correctly with the aligned LL/SC path in another FEX thread
-// for every contained case. Crossing 8-byte ops at (EA & 15) > 8 still take
-// the plain memcpy fallback under the mutex only, which does not compose
-// with aligned LL/SC — a residual of Tier D atomics defect 1, narrowed by
-// C3+C4 but not closed. The `hwsync`/`isync` bracket around the helper call
+// for every contained case. Crossing 8-byte ops at (EA & 15) > 8 no longer
+// take a plain memcpy fallback either: since C4.5 they run a dual-doubleword
+// CAS (one aligned 8-byte CAS per doubleword) under the same mutex, which
+// composes except in the window between the two commits — and a conflict in
+// that window is detected and surfaced as a tear, never as silent success.
+// Tier D atomics defect 1 is thus narrowed to a detected tear rather than
+// left open. The `hwsync`/`isync` bracket around the helper call
 // is provided by each caller op (Tier D atomics C1 hoists `hwsync` above the
 // alignment test and moves `Bind(&done)` above `isync`, so both the aligned
 // and misaligned paths run inside it).

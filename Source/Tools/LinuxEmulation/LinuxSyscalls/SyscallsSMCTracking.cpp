@@ -22,6 +22,7 @@ $end_info$
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/memory.h>
 
+#include "LinuxSyscalls/HostOwnedRanges.h"
 #include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
@@ -1598,6 +1599,24 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       }
       LOGMAN_THROW_A_FMT(Is64Bit || (Result >> 32) == 0 || (Result >> 32) == 0xFFFFFFFF, "values must fit to 32 bits");
     } else {
+      // A 64-bit guest shares the address space with FEX itself, and its mmap
+      // flags are forwarded verbatim below. MAP_FIXED therefore lets the guest
+      // destroy FEX's own text/data: on ppc64le the kernel places FEX's PIE
+      // image in [4 GiB, 5 GiB), whose top is 0x1'4000'0000 -- the default
+      // ImageBase of every 64-bit Windows PE, which wine64-preloader reserves
+      // with an unconditional MAP_FIXED PROT_NONE mapping. See
+      // HostOwnedRanges.h for the full mechanism and the measured rate.
+      //
+      // Only MAP_FIXED needs the check. Plain mmap never places a mapping over
+      // an existing one, and MAP_FIXED_NOREPLACE is deliberately left to the
+      // kernel: it already fails with EEXIST when the range is occupied, so
+      // letting it through preserves both the exact errno its callers test for
+      // and the right answer in the one case this table cannot see -- a host
+      // range released after the snapshot that is genuinely free again.
+      if ((flags & MAP_FIXED) && HostOwnedRanges::Overlaps(reinterpret_cast<uint64_t>(addr), Size)) {
+        HostOwnedRanges::ReportRefusal("mmap", reinterpret_cast<uint64_t>(addr), Size);
+        return reinterpret_cast<void*>(-ENOMEM);
+      }
       Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
       if (Result == ~0ULL) {
         return reinterpret_cast<void*>(-errno);
@@ -1663,6 +1682,15 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
         return Result;
       }
     } else {
+      // Same hazard as GuestMmap: a guest munmap over FEX's own image removes
+      // the code FEX is about to execute. Nothing the guest legitimately owns
+      // is in HostOwnedRanges (it is snapshotted before any guest mapping
+      // exists), so this can only ever refuse a request that was going to be
+      // fatal.
+      if (HostOwnedRanges::Overlaps(reinterpret_cast<uint64_t>(addr), Size)) {
+        HostOwnedRanges::ReportRefusal("munmap", reinterpret_cast<uint64_t>(addr), Size);
+        return -EINVAL;
+      }
       Result = ::munmap(addr, length);
       if (Result == -1) {
         return -errno;
@@ -1714,6 +1742,16 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
     if (Is64Bit) {
+      // MREMAP_FIXED is the mmap(MAP_FIXED) hazard by another name: it silently
+      // replaces the destination. The source range matters too -- an mremap
+      // that moves FEX's own text elsewhere is just as fatal as unmapping it.
+      const bool DestinationFixed = (flags & MREMAP_FIXED) != 0;
+      if (HostOwnedRanges::Overlaps(reinterpret_cast<uint64_t>(old_address), old_size) ||
+          (DestinationFixed && HostOwnedRanges::Overlaps(reinterpret_cast<uint64_t>(new_address), new_size))) {
+        HostOwnedRanges::ReportRefusal("mremap", reinterpret_cast<uint64_t>(DestinationFixed ? new_address : old_address),
+                                       DestinationFixed ? new_size : old_size);
+        return -EINVAL;
+      }
       Result = reinterpret_cast<uint64_t>(::mremap(old_address, old_size, new_size, flags, new_address));
       if (Result == -1) {
         return -errno;
@@ -1817,6 +1855,19 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
+    // A guest mprotect(PROT_NONE) over FEX's text is as fatal as unmapping it,
+    // and it is exactly the shape wine64-preloader's reservation takes when the
+    // range is already mapped. See HostOwnedRanges.h.
+    //
+    // The errno matters: for a range the kernel itself would never let anyone
+    // write ([vvar] -- the first overlapping VMA the kernel would visit) the
+    // native answer to a PROT_WRITE request is EACCES, and gvisor's
+    // VvarTest.WriteVvar checks for it. Everything else is refused as if the
+    // range were not mapped at all.
+    if (const auto Hit = HostOwnedRanges::FindOverlap(reinterpret_cast<uint64_t>(addr), len); Hit.End != 0) {
+      HostOwnedRanges::ReportRefusal("mprotect", reinterpret_cast<uint64_t>(addr), len);
+      return ((prot & PROT_WRITE) && !Hit.MayWrite) ? -EACCES : -ENOMEM;
+    }
     Result = ::mprotect(addr, len, prot);
     if (Result == -1) {
       return -errno;

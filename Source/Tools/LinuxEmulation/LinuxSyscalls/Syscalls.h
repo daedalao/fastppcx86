@@ -95,6 +95,15 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler);
 uint64_t UnimplementedSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 uint64_t UnimplementedSyscallSafe(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 
+// Shared terminal stage of every guest futex entry point (x64 futex, x32
+// futex_time64, x32 classic futex after timespec32 conversion): deferred-
+// guest-signal guard, sliced untimed waits, internal-EINTR restart, and the
+// futex diagnostics. Returns a -errno-encoded result. Defined in
+// Syscalls/Passthrough.cpp; see the comment there for the lost-wakeup
+// mechanism this closes.
+uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t uaddr, uint64_t futex_op, uint64_t val,
+                              uint64_t timeout, uint64_t uaddr2, uint64_t val3);
+
 // x86 guests use the asm-generic SOL_SOCKET option numbering; powerpc is one
 // of the legacy architectures with its own numbers for six of them. Translate
 // the guest's optname before handing it to the host kernel — without this,

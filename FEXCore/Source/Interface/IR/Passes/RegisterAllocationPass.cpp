@@ -174,7 +174,7 @@ private:
   };
 
   uint32_t GetRegBits(PhysicalRegister Reg) {
-    return 1 << Reg.Reg;
+    return 1u << Reg.Reg;
   };
 
   bool IsInRegisterFile(Ref Node) {
@@ -270,11 +270,17 @@ private:
 
   // Helper macro to walk the set bits b in a 32-bit word x, using ffs to get
   // the next set bit and then clearing on each iteration.
-#define foreach_bit(b, x) for (uint32_t __x = (x), b; ((b) = __builtin_ffs(__x) - 1, __x); __x &= ~(1 << (b)))
+#define foreach_bit(b, x) for (uint32_t __x = (x), b; ((b) = __builtin_ffs(__x) - 1, __x); __x &= ~(1u << (b)))
 
   void CalculateNextUses(IROp_CodeBlock* BlockIROp, IROp_Header* Until) {
     SourcesNextUses.clear();
-    NextUses.resize(IR->GetSSACount(), 0);
+    // resize() alone leaves stale next-use entries from earlier blocks (the
+    // SSA count doesn't change between calls). Today that is benign only by
+    // accident — dead defs are the sole readers of stale entries, and a
+    // stale 0 means "spill me first", which is the right answer for a dead
+    // def anyway. Zero explicitly so the "0 = no later use in this block"
+    // invariant is real rather than accidental.
+    NextUses.assign(IR->GetSSACount(), 0);
 
     // IP relative to the end of the block.
     uint32_t IP = 1;
@@ -504,7 +510,10 @@ inline bool KillMove(IROp_Header* LastOp, IROp_Header* IROp, Ref LastNode, Ref C
       IROp->Size = OpSize::i32Bit;
       return true;
     } else if (IROp->Size == OpSize::i32Bit) {
-      return Op == OP_OR || Op == OP_XOR || Op == OP_AND || Op == OP_SUB || Op == OP_LSHL || Op == OP_LSHR || Op == OP_ASHR;
+      // Any op whose low 32 result bits depend only on the low 32 input bits
+      // may absorb the 32-bit mov. OP_ADD qualifies for the same reason
+      // OP_SUB does: carries propagate upward only.
+      return Op == OP_OR || Op == OP_XOR || Op == OP_AND || Op == OP_ADD || Op == OP_SUB || Op == OP_LSHL || Op == OP_LSHR || Op == OP_ASHR;
     }
   }
 

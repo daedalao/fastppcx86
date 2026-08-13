@@ -60,10 +60,11 @@ enum PPC64HelperIndex : uint32_t {
   PPC64_HELPER_F64Atan,
   PPC64_HELPER_F64FYL2X,
   PPC64_HELPER_F64Scale,
-  // Deliberately NO F64F2XM1 entry — F64F2XM1Impl diverges from the
-  // upstream F64F2XM1Handler slot (expm1(x*ln2) vs exp2(src)-1.0, off by
-  // >1 ULP on 44.6% of inputs); reusing that Pointers slot re-breaks
-  // D9_F0_02_F64. Its call site keeps LoadConstant for now.
+  // No F64F2XM1 entry HERE — it was appended later (S3.7-C5, below) to keep
+  // table offsets stable. The still-true half of the old note: it MUST NOT
+  // reuse the upstream Pointers.F64F2XM1Handler slot — F64F2XM1Impl diverges
+  // from it (expm1(x*ln2) vs exp2(src)-1.0, off by >1 ULP on 44.6% of
+  // inputs); reusing that Pointers slot re-breaks D9_F0_02_F64.
   PPC64_HELPER_VAESImc,
   PPC64_HELPER_VAESKeyGenAssist,
   PPC64_HELPER_VAESEnc,
@@ -91,6 +92,12 @@ enum PPC64HelperIndex : uint32_t {
   // (F64F2XM1Impl in VectorOps.cpp) with different semantics from
   // F64F2XM1Handler; the helper table entry points at the local impl.
   PPC64_HELPER_F64F2XM1,
+  // Appended (same S3.7-C5 rule): the F16C f16x4<->f32x4 paths previously
+  // bctrl'd through a bare LoadConstant of the host function address — the
+  // exact serialized-block stale-pointer hazard the F64F2XM1 entry above was
+  // added to fix. Table-resolved now.
+  PPC64_HELPER_F16x4ToF32x4,
+  PPC64_HELPER_F32x4ToF16x4,
   PPC64_HELPER_MAX,
 };
 
@@ -134,6 +141,29 @@ enum PPC64VConstIndex : uint32_t {
   PPC64_VCONST_PACK_DW_LO_I32, // vperm control: pack each dw's low i32 to LE-low
   PPC64_VCONST_LANE0_MASK_F32, // {~0u,0,0,0} in guest byte order: selects LE elem0 for xxsel
   PPC64_VCONST_F64_2P31,       // splat f64(2^31)   -- f64->i32 overflow bound (CVTPD2DQ)
+  // CRC-32C via vpmsumd Barrett reduction (DEF_OP(CRC32), ALUOps.cpp). Both
+  // live in dw0 with dw1 zero so vpmsumd's unused doubleword product
+  // vanishes. Derived and verified symbolically (200k random vectors per
+  // SrcSize against a bitwise reference) in unittests/GuestCrypto/crc32_derive.py:
+  //   CRC32C_MU = reflect64(floor(x^96 / P) - x^64), P = 0x11EDC6F41
+  //   CRC32C_P  = reflect33(P)
+  PPC64_VCONST_CRC32C_MU,
+  PPC64_VCONST_CRC32C_P,
+  // VAddP (phaddw/phaddd/phaddb-class) vperm controls: even/odd element
+  // selectors over [VL:VU], per element size, for the 128-bit and MMX (64-bit
+  // RegSize) layouts. Values copied verbatim from the old inline builds in
+  // DEF_OP(VAddP) — entry [+0] is what went to r1-16, [+1] to r1-8.
+  PPC64_VCONST_ADDP_EVEN_B,  PPC64_VCONST_ADDP_ODD_B,
+  PPC64_VCONST_ADDP_EVEN_H,  PPC64_VCONST_ADDP_ODD_H,
+  PPC64_VCONST_ADDP_EVEN_W,  PPC64_VCONST_ADDP_ODD_W,
+  PPC64_VCONST_ADDP_EVEN_B64, PPC64_VCONST_ADDP_ODD_B64,
+  PPC64_VCONST_ADDP_EVEN_H64, PPC64_VCONST_ADDP_ODD_H64,
+  PPC64_VCONST_ADDP_EVEN_W64, PPC64_VCONST_ADDP_ODD_W64,
+  // VUMulH/VSMulH i16: vperm control interleaving the high halfwords of the
+  // vmulo/vmule pair back into element order. Shared by both signednesses.
+  PPC64_VCONST_MULH_HI_I16,
+  // Splat f64(1.0) — numerator for VFRecp/VFRSqrt i64 xvdivdp paths.
+  PPC64_VCONST_F64_ONE,
   PPC64_VCONST_MAX,
 };
 
@@ -258,6 +288,98 @@ private:
   PPC64Emitter::Label* JumpTarget(IR::OrderedNodeWrapper Node) {
     auto Block = IR->GetOp<IR::IROp_CodeBlock>(Node);
     return &JumpTargets[Block->ID];
+  }
+
+  // -------------------------------------------------------------------------
+  // Spin-loop SMT priority hints (FEX_DISABLESPINLOOPHINT kill switch).
+  // AnalyzeSpinLoops (JIT.cpp) fills these per compile; DEF_OP(CondJump)/
+  // DEF_OP(Jump) consult them per emitted edge via EmitSpinEdgeHint.
+  // Edges are keyed (from CodeBlock ID << 32) | to CodeBlock ID. Plain
+  // vectors + linear scan: a compile unit rarely carries more than one spin
+  // loop, so these hold a handful of entries at most.
+  // -------------------------------------------------------------------------
+  bool SpinLoopHintEnabled {};
+  fextl::vector<uint64_t> SpinBackedges;     // edges that re-enter a spin loop
+  fextl::vector<uint64_t> SpinRestoreEdges;  // edges that leave a spin loop
+  uint32_t CurrentBlockID {UINT32_MAX};      // IROp_CodeBlock::ID being emitted
+
+  // Fallthrough elision (FEX_NOFALLTHROUGH kill switch): the CodeBlock ID of
+  // the block emitted immediately after the current one, or UINT32_MAX when
+  // there is none or falling into it would be unsound. DEF_OP(Jump)/
+  // DEF_OP(CondJump) skip their trailing `b` when the edge targets this
+  // block. CompileCode's block loop maintains it, and only ever sets it for a
+  // non-EntryPoint successor: EntryPoint blocks emit an out-of-band prologue
+  // (InlineJITBlockHeader store, suspend poke, spill-frame stdu) BEFORE their
+  // intra-unit JumpTarget label binds, and intra-unit edges must land after
+  // that prologue — falling into it would run the stdu on an already-live
+  // frame. A fallthrough target is by construction forward/unbound, so the
+  // backward-edge suspend poke in the jump handlers is never skipped by this.
+  uint32_t FallthroughBlockID {UINT32_MAX};
+
+  // -------------------------------------------------------------------------
+  // 32-bit tail-mask elision (FEX_ZEXTOPT=0 kill switch).
+  //
+  // Every i32 GPR ALU handler canonicalizes its result with
+  // rldicl(Dst,Dst,0,32) so that any observer — SRA writeback via a coalesced
+  // StoreRegister, spill slots, signal-frame state reconstruction — sees the
+  // guest's zero-extended 32-bit value. The LZMA-loop audit (2026-08-13)
+  // measured those masks at 15% of emitted instructions, many provably dead.
+  //
+  // Elide32MaskSet[def ID] means the def's tail mask may be skipped. The
+  // prepass (Compute32MaskElision) sets it only under ALL of:
+  //   1. the def has exactly one IR use (OrderedNode::GetUses() == 1),
+  //   2. that use is the IMMEDIATELY NEXT op in the same block (so the
+  //      unmasked value cannot reach a spill, a block boundary, or an
+  //      SRA-coalesced StoreRegister — the value dies at the next op), and
+  //   3. the consumer's emitted encoding reads only the low 32 bits of that
+  //      operand position, as a static ISA fact (word compares, word shifts,
+  //      mullw/mulli-mod-2^32, narrow stores). See the table in
+  //      Compute32MaskElision for the per-op verification notes.
+  // Rule 2 is what keeps signal observation sound: a synchronous fault in a
+  // LATER guest instruction can never observe this def as architectural
+  // state, because the def is dead before any later instruction begins.
+  // Spill/Fill are IR ops, so an RA-inserted spill between def and use breaks
+  // the "immediately next" test and conservatively keeps the mask.
+  // -------------------------------------------------------------------------
+  fextl::vector<bool> Elide32MaskSet;
+  void Compute32MaskElision();
+
+  // Tail-mask emission for i32 GPR results: rldicl unless provably dead.
+  void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      return;
+    }
+    rldicl(Dst, Dst, 0, 32);
+  }
+
+  static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
+    return (static_cast<uint64_t>(From) << 32) | To;
+  }
+
+  void AnalyzeSpinLoops();
+
+  // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.
+  // Called immediately before the branch instruction so the hint executes
+  // exactly when the edge is taken.
+  void EmitSpinEdgeHint(IR::OrderedNodeWrapper Target) {
+    if (SpinBackedges.empty() && SpinRestoreEdges.empty()) {
+      return;
+    }
+    const auto To = IR->GetOp<IR::IROp_CodeBlock>(Target)->ID;
+    const auto Key = SpinEdgeKey(CurrentBlockID, To);
+    for (const auto Edge : SpinBackedges) {
+      if (Edge == Key) {
+        smt_very_low_priority();
+        return;
+      }
+    }
+    for (const auto Edge : SpinRestoreEdges) {
+      if (Edge == Key) {
+        smt_medium_priority();
+        return;
+      }
+    }
   }
 
   // Block linking: one pending jump thunk per linkable constant-jump exit,
@@ -505,8 +627,23 @@ private:
                    IR::OrderedNodeWrapper Src1, IR::OrderedNodeWrapper Src2,
                    uint8_t CRField = 0);
 
-  // Project XER.SO/OV/CA -> CR1.LT/GT/EQ non-destructively. Used to make
-  // C/V flags branch-testable after an x86 *WithFlags op. Clobbers TMP1, TMP2.
+  // True when ProjectXERToCR1() emits the ISA 3.0 single-instruction `mcrxrx`
+  // form (POWER9+) rather than the POWER8 mfxer/rotlwi/mtocrf fallback. The
+  // two produce DIFFERENT CR1 layouts, so this one predicate must drive both
+  // the emitted sequence and every bit index read back out of CR1 — otherwise
+  // the sequence and the index can drift apart silently.
+  [[nodiscard]] bool ProjectXERUsesMcrxrx() const;
+
+  // PPC CR-bit index holding XER.OV after ProjectXERToCR1(): 4 (CR1.LT) on the
+  // mcrxrx layout, 5 (CR1.GT) on the pre-3.0 layout. XER.CA is CR1.EQ (bit 6)
+  // in both, so C-consuming conditions need no equivalent accessor.
+  [[nodiscard]] uint32_t XEROVBitIndex() const;
+
+  // Project XER's carry/overflow state into CR1 non-destructively (XER itself
+  // is unchanged). Used to make C/V flags branch-testable after an x86
+  // *WithFlags op. Read the OV bit index from XEROVBitIndex(), never a
+  // literal. Clobbers TMP1/TMP2 on the pre-3.0 path; the ISA 3.0 path clobbers
+  // no GPRs, but callers may assume the larger clobber set unconditionally.
   void ProjectXERToCR1();
 
   // Write a 4-bit NZCV literal (bit3=N, bit2=Z, bit1=C, bit0=V) into our
@@ -714,6 +851,51 @@ private:
   FEXCore::Core::DebugData*   DebugData {};
 
   // -----------------------------------------------------------------------
+  // AES lowering helpers (VectorOps.cpp)
+  //
+  // The POWER8 cipher instructions read the AES state big-endian while a guest
+  // XMM is held with guest byte 0 at BE byte element 15, so every AES round is
+  // bracketed by a byte reversal. EmitAESLoadMask materializes the {15..0}
+  // vperm mask into VTMP1 - statelessly on a cold call (4 instructions, no
+  // memory, no cross-host-call register trust; see the vs14-vs31 dw1 hazard
+  // note in PPC64Emitter.h), or with a single xxlor from the VTMP3_VSX (vs12)
+  // park when AESMaskCached says a preceding AES-family op in this block
+  // already built it.
+  //
+  // AESMaskCached is EMISSION-TIME bookkeeping only. The invariant that makes
+  // a hit sound: between the op that parked the mask and the op that reuses
+  // it, no other host instruction was emitted at all. CompileCode enforces
+  // this by invalidating on every non-AES-family op and at every block bind;
+  // the AES handlers' Op_Unhandled bail paths invalidate explicitly since
+  // the loop-level check can't see them.
+  //
+  // ALL OF THE ABOVE IS THE POWER8 (ISA 2.07) ARM. When
+  // HostFeatures.SupportsISA30 is set the handlers take an xxbrq arm instead:
+  // one instruction per reversal, no mask, no vs12 park. EmitAESLoadMask is
+  // the only writer of AESMaskCached and only the POWER8 arm calls it, so on
+  // an ISA 3.0 host the flag stays false forever and the (still-running)
+  // CompileCode invalidation is a harmless no-op. Nothing needs to change
+  // there if a new AES-family op is added to the ISA 3.0 arm only.
+  // -----------------------------------------------------------------------
+  void EmitAESLoadMask();
+  bool AESMaskCached = false;
+  void InvalidateAESCache() { AESMaskCached = false; }
+
+  // Shared SHA-256 four-round emitter for VSha256H (returns ABCD half) and
+  // VSha256H2 (returns EFGH half). Fully inline: vshasigmaw ST=1 for both
+  // big-Sigma functions, vsel-form Ch/Maj, vsldoi lane rotations. Borrows two
+  // dynamic VRs (excluded from Dst/sources) for compute space; see the
+  // borrow-protocol comment at the definition (VectorOps.cpp).
+  void EmitSha256Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR EFGH,
+                         PPC64Emitter::VR WK, bool ReturnABCD);
+
+  // Shared SHA-1 four-round emitter for VSha1C/M/P (Choose/Majority/Parity).
+  // Same structure and borrow protocol as EmitSha256Rounds4.
+  enum class Sha1Fn { Choose, Majority, Parity };
+  void EmitSha1Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR E,
+                       PPC64Emitter::VR WK, Sha1Fn Fn);
+
+  // -----------------------------------------------------------------------
   // Op handler declarations (filled in by the separate *.cpp files)
   // -----------------------------------------------------------------------
 #define DEF_OP(x) void Op_##x(IR::IROp_Header const* IROp, IR::Ref Node)
@@ -735,6 +917,11 @@ private:
   DEF_OP(VMaddPairwise16);
   DEF_OP(VExtractSignBits);
   DEF_OP(VAnyNonZero);
+
+  // PPC64LE-only fused byte-reversed memory ops (MemoryOps.cpp) — the MOVBE
+  // lowering. Same JITDispatch:false / hand-registered mechanism as above.
+  DEF_OP(LoadMemRev);
+  DEF_OP(StoreMemRev);
 
   // -----------------------------------------------------------------------
   // x87 stack bookkeeping ops (X87Ops.cpp).

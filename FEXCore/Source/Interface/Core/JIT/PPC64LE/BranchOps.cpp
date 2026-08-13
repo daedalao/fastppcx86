@@ -457,6 +457,14 @@ DEF_OP(Jump) {
   if (Target->bound) {
     EmitSuspendInterruptCheck();
   }
+  // Spin-loop SMT priority hint for this edge, if AnalyzeSpinLoops marked it.
+  EmitSpinEdgeHint(Op->TargetBlock);
+  // Fallthrough elision: the target is the next emitted block (necessarily
+  // forward/unbound, so the suspend poke above did not run and must not).
+  // See FallthroughBlockID in JITClass.h; EndBlock after this op is a no-op.
+  if (IR->GetOp<IR::IROp_CodeBlock>(Op->TargetBlock)->ID == FallthroughBlockID) {
+    return;
+  }
   b(Target);
 }
 
@@ -532,6 +540,32 @@ DEF_OP(CondJump) {
     // Shift to the equivalent CR7 bit positions (BI in 28..31).
     CC = {CC.BO, static_cast<uint8_t>(CC.BI + 28)};
   }
+  const uint32_t TrueID = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock)->ID;
+  const uint32_t FalseID = IR->GetOp<IR::IROp_CodeBlock>(Op->FalseBlock)->ID;
+
+  // Fallthrough elision (see FallthroughBlockID in JITClass.h). A fallthrough
+  // target is by construction the next emitted block: forward, unbound, so
+  // the backward-edge suspend poke never applies to an elided leg.
+  //
+  // TrueBlock is the fallthrough: flip the legs. Take the bc on CC (not the
+  // inversion) over the false leg, and fall into TrueBlock. The false leg
+  // keeps its own poke/hint discipline. (TrueID == FalseID degenerates to
+  // the generic shape below; both cannot be elided.)
+  if (TrueID == FallthroughBlockID && FalseID != TrueID) {
+    Label TakeFall;
+    bc(CC, &TakeFall);
+    auto FalseTarget = JumpTarget(Op->FalseBlock);
+    if (FalseTarget->bound) {
+      EmitSuspendInterruptCheck();
+    }
+    EmitSpinEdgeHint(Op->FalseBlock);
+    b(FalseTarget);
+    Bind(&TakeFall);
+    // Hint after the bind so it executes exactly when the true edge is taken.
+    EmitSpinEdgeHint(Op->TrueBlock);
+    return;
+  }
+
   Label Skip;
   bc(InvertCond(CC), &Skip);
   // Backward edges (bound labels) must pass a deferred-signal drain point;
@@ -541,12 +575,22 @@ DEF_OP(CondJump) {
   if (TrueTarget->bound) {
     EmitSuspendInterruptCheck();
   }
+  // Spin-loop SMT priority hints, per edge (see AnalyzeSpinLoops). Emitted
+  // inside each leg so the hint executes exactly when that edge is taken.
+  EmitSpinEdgeHint(Op->TrueBlock);
   b(TrueTarget);
   Bind(&Skip);
+  // FalseBlock is the fallthrough: the bc's skip label lands directly on the
+  // next block's body.
+  if (FalseID == FallthroughBlockID) {
+    EmitSpinEdgeHint(Op->FalseBlock);
+    return;
+  }
   auto FalseTarget = JumpTarget(Op->FalseBlock);
   if (FalseTarget->bound) {
     EmitSuspendInterruptCheck();
   }
+  EmitSpinEdgeHint(Op->FalseBlock);
   b(FalseTarget);
 }
 

@@ -268,6 +268,27 @@ static inline __uint128_t GetArmFPR(void* ucontext, uint32_t id) {
   return result;
 }
 
+// AVX-high bank capture: read low-bank VSX register vsN (N < 32) out of the
+// signal frame. The kernel splits vs0-31 across two areas (arch/powerpc/
+// kernel/signal_64.c setup_sigcontext): doubleword 0 is the FPR half in
+// fp_regs[N]; doubleword 1 lives in the VSX region that FOLLOWS the 34
+// vector entries at v_regs (`v_regs += ELF_NVRREG` (34), then
+// copy_vsx_to_user of 32 u64s). Both are host-LE u64s. The JIT keeps guest
+// YMM_hi values in the VR convention — dw0 = guest HIGH qword, dw1 = guest
+// LOW qword — so the SpillSRA caller maps DW1 -> avx_high[i][0] (low) and
+// DW0 -> avx_high[i][1] (high). Valid mid-host-call too: the bank registers
+// f16-f31 are ELFv2 callee-saved.
+static inline uint64_t GetPPCVSXLowBankDW0(void* ucontext, uint32_t n) {
+  uint64_t v;
+  memcpy(&v, &GetMContext(ucontext)->fp_regs[n], sizeof(v));
+  return v;
+}
+static inline uint64_t GetPPCVSXLowBankDW1(void* ucontext, uint32_t n) {
+  const auto* mctx = GetMContext(ucontext);
+  const uint64_t* vsx = reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(mctx->v_regs) + 34 * 16);
+  return vsx[n];
+}
+
 static inline uint32_t GetProtectFlags(void* ucontext) {
   // DSISR bit 25 (0x02000000) indicates a store-caused fault (write).
   const uint64_t dsisr = GetMContext(ucontext)->gp_regs[PPC_PT_DSISR];

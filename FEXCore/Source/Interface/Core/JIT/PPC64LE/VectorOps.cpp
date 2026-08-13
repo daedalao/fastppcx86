@@ -410,19 +410,12 @@ DEF_OP(VFRecp) {
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
-    // 1.0 / Src per lane, via stack roundtrip (POWER8 has no xvredp).
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    LoadConstant(TMP2, 0x3FF0000000000000ULL); // 1.0
-    std(TMP2, -24, r1);
-    lfd(f0, -24, r1);
-    lfd(f1, 0, TMP1);   // lane 0
-    fdiv(f1, f0, f1);
-    stfd(f1, 0, TMP1);
-    lfd(f1, 8, TMP1);   // lane 1
-    fdiv(f1, f0, f1);
-    stfd(f1, 8, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // 1.0 / Src per lane. The old comment claimed POWER8 lacks xvredp - it
+    // does exist (ISA 2.06) but is an ESTIMATE; the precise-divide semantic
+    // wanted here is xvdivdp, same operation the old per-lane fdiv
+    // stack-roundtrip computed, minus the spill and two store-hit-loads.
+    EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_F64_ONE, TMP1, TMP2);
+    xvdivdp(Dst, VTMP1, Src);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -492,20 +485,11 @@ DEF_OP(VFRSqrt) {
     return;
   }
   if (ElemSz == IR::OpSize::i64Bit) {
-    // 1.0 / sqrt(x) per lane via xvsqrtdp + per-lane fdiv (no xvrsqrtedp).
-    xvsqrtdp(VTMP1, Src);
-    addi(TMP1, r1, -16);
-    stvx(VTMP1, r(0), TMP1);
-    LoadConstant(TMP2, 0x3FF0000000000000ULL);
-    std(TMP2, -24, r1);
-    lfd(f0, -24, r1);
-    lfd(f1, 0, TMP1);
-    fdiv(f1, f0, f1);
-    stfd(f1, 0, TMP1);
-    lfd(f1, 8, TMP1);
-    fdiv(f1, f0, f1);
-    stfd(f1, 8, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // 1.0 / sqrt(x) per lane: precise sqrt then precise vector divide,
+    // replacing the per-lane fdiv stack roundtrip.
+    xvsqrtdp(VTMP2, Src);
+    EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_F64_ONE, TMP1, TMP2);
+    xvdivdp(Dst, VTMP1, VTMP2);
     return;
   }
   Op_Unhandled(IROp, Node);
@@ -1412,7 +1396,13 @@ DEF_OP(VSRSHR) {
       }
       LoadConstant(TMP2, (uint64_t)Round);
       add  (TMP1, TMP1, TMP2);
-      sradi(TMP1, TMP1, N);
+      // NOT sradi: PPC arithmetic shifts write XER.CA, the canonical guest CF
+      // (see DEF_OP(Ashr)'s block comment), and PSIGN/rounding-shift guests
+      // preserve EFLAGS. srdi (rldicl, no XER) is exact here: the value is
+      // 64-bit sign-extended and only the low sz*8 bits are stored, so the
+      // logical/arithmetic difference lives entirely in discarded bits
+      // (sz*8 + N <= 64 always: sz*8 <= 32, N < sz*8).
+      srdi(TMP1, TMP1, N);
       switch (sz) {
       case 1: stb(TMP1, Off, r1); break;
       case 2: sth(TMP1, Off, r1); break;
@@ -1499,8 +1489,11 @@ DEF_OP(VSQSHL) {
     }
     b(&Done);
     Bind(&Saturate);
-    // sign = TMP1 >>a 63 → 0 (pos) or -1 (neg). sat = sign XOR SatPos.
-    sradi(TMP2, TMP1, 63);
+    // sign = 0 (pos) or -1 (neg); sat = sign XOR SatPos. NOT sradi — it
+    // writes XER.CA (guest CF; see DEF_OP(Ashr)). rldicl isolates the sign
+    // bit and neg splats it; neither touches XER.
+    rldicl(TMP2, TMP1, 1, 63);
+    neg(TMP2, TMP2);
     LoadConstant(TMP4, SatPos);
     xor_(TMP2, TMP2, TMP4);
     switch (sz) {
@@ -1754,65 +1747,32 @@ DEF_OP(VAddP) {
   // 128-bit result. The 64-bit case differs because both operands' meaningful
   // data lives in their low 64 bits (phys[8..15] of each register).
   const auto RegSz = IROp->Size;
-  uint64_t even_lo, even_hi, odd_lo, odd_hi;
+  // Perm controls now live in the vconst pool (12 variants: even/odd x
+  // 3 element sizes x 128-bit/MMX layouts, byte values unchanged from the
+  // inline builds this replaces — see the pool initializer). Each control
+  // load is 3 instructions with no store-queue traffic, versus a
+  // LoadConstant+std+std+lvx store-hit-load per constant per emission.
+  PPC64VConstIndex EvenIdx, OddIdx;
   if (RegSz == IR::OpSize::i64Bit) {
-    // High half of result is don't-care; set its perm bytes to 0 (vperm picks
-    // VL.phys[0] which for MMX is zero/stale either way, but using ctrl==0
-    // also works and avoids surprises).
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      // even LE bytes [0,2,4,6] of VL,VU → result LE bytes [0..7]
-      // result phys[15..8]: VL.phys[15], VL.phys[13], VL.phys[11], VL.phys[9],
-      //                     VU.phys[15], VU.phys[13], VU.phys[11], VU.phys[9]
-      even_lo = 0x191B1D1F090B0D0FULL; even_hi = 0;
-      odd_lo  = 0x181A1C1E080A0C0EULL; odd_hi  = 0;
-      break;
-    case IR::OpSize::i16Bit:
-      // result phys[8..15] = [1A,1B,1E,1F,0A,0B,0E,0F]
-      even_lo = 0x1A1B1E1F0A0B0E0FULL; even_hi = 0;
-      odd_lo  = 0x18191C1D08090C0DULL; odd_hi  = 0;
-      break;
-    case IR::OpSize::i32Bit:
-      // result phys[8..15] = [1C,1D,1E,1F,0C,0D,0E,0F]
-      even_lo = 0x1C1D1E1F0C0D0E0FULL; even_hi = 0;
-      odd_lo  = 0x18191A1B08090A0BULL; odd_hi  = 0;
-      break;
-    default:
-      Op_Unhandled(IROp, Node);
-      return;
+    case IR::OpSize::i8Bit:  EvenIdx = PPC64_VCONST_ADDP_EVEN_B64; OddIdx = PPC64_VCONST_ADDP_ODD_B64; break;
+    case IR::OpSize::i16Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_H64; OddIdx = PPC64_VCONST_ADDP_ODD_H64; break;
+    case IR::OpSize::i32Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_W64; OddIdx = PPC64_VCONST_ADDP_ODD_W64; break;
+    default: Op_Unhandled(IROp, Node); return;
     }
   } else {
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      even_lo = 0x01030507090B0D0FULL; even_hi = 0x11131517191B1D1FULL;
-      odd_lo  = 0x00020406080A0C0EULL; odd_hi  = 0x10121416181A1C1EULL;
-      break;
-    case IR::OpSize::i16Bit:
-      even_lo = 0x020306070A0B0E0FULL; even_hi = 0x121316171A1B1E1FULL;
-      odd_lo  = 0x0001040508090C0DULL; odd_hi  = 0x1011141518191C1DULL;
-      break;
-    case IR::OpSize::i32Bit:
-      even_lo = 0x040506070C0D0E0FULL; even_hi = 0x141516171C1D1E1FULL;
-      odd_lo  = 0x0001020308090A0BULL; odd_hi  = 0x1011121318191A1BULL;
-      break;
-    default:
-      Op_Unhandled(IROp, Node);
-      return;
+    case IR::OpSize::i8Bit:  EvenIdx = PPC64_VCONST_ADDP_EVEN_B; OddIdx = PPC64_VCONST_ADDP_ODD_B; break;
+    case IR::OpSize::i16Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_H; OddIdx = PPC64_VCONST_ADDP_ODD_H; break;
+    case IR::OpSize::i32Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_W; OddIdx = PPC64_VCONST_ADDP_ODD_W; break;
+    default: Op_Unhandled(IROp, Node); return;
     }
   }
 
   // VTMP1/VTMP2 (VR30/VR31) are never in the allocator pool so safe as scratch.
-  // Build even-element vector in VTMP2.
-  LoadConstant(TMP1, even_lo); std(TMP1, -16, r1);
-  LoadConstant(TMP1, even_hi); std(TMP1, -8,  r1);
-  addi(TMP2, r1, -16);
-  lvx(VTMP1, r(0), TMP2);
+  EmitLoadPPC64VConst(VTMP1, EvenIdx, TMP1, TMP2);
   vperm(VTMP2, VL, VU, VTMP1);
-
-  // Build odd-element vector in Dst.
-  LoadConstant(TMP1, odd_lo); std(TMP1, -16, r1);
-  LoadConstant(TMP1, odd_hi); std(TMP1, -8,  r1);
-  lvx(VTMP1, r(0), TMP2);      // TMP2 still = r1-16
+  EmitLoadPPC64VConst(VTMP1, OddIdx, TMP1, TMP2);
   vperm(Dst, VL, VU, VTMP1);
 
   // Add element-wise (PPC reads all inputs before writing, so Dst==VL/VU is safe).
@@ -2007,20 +1967,16 @@ DEF_OP(VUnZip) {
     //   result.LE_elt[0..N/2-1]   = VL.LE_elt[0,2,...]
     //   result.LE_elt[N/2..N-1]   = VU.LE_elt[0,2,...]
     // Build via vperm with a 16-byte ctrl whose phys[0..7] is don't-care (0).
-    uint64_t lo;
+    // The even-gather controls are byte-identical to VAddP's MMX even
+    // selectors — reuse those pool entries instead of an inline build.
+    PPC64VConstIndex Idx;
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      lo = 0x191B1D1F090B0D0FULL; break; // VU.even, VL.even — bytes
-    case IR::OpSize::i16Bit:
-      lo = 0x1A1B1E1F0A0B0E0FULL; break; // halves
-    case IR::OpSize::i32Bit:
-      lo = 0x1C1D1E1F0C0D0E0FULL; break; // words (single VL[0] + single VU[0])
+    case IR::OpSize::i8Bit:  Idx = PPC64_VCONST_ADDP_EVEN_B64; break;
+    case IR::OpSize::i16Bit: Idx = PPC64_VCONST_ADDP_EVEN_H64; break;
+    case IR::OpSize::i32Bit: Idx = PPC64_VCONST_ADDP_EVEN_W64; break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    LoadConstant(TMP1, lo); std(TMP1, -16, r1);
-    li(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(VTMP1, r(0), TMP3);
+    EmitLoadPPC64VConst(VTMP1, Idx, TMP1, TMP2);
     vperm(Dst, VL, VU, VTMP1);
     return;
   }
@@ -2043,20 +1999,15 @@ DEF_OP(VUnZip2) {
 
   if (RegSz == IR::OpSize::i64Bit) {
     // MMX odd-gather: result low 64 = [VL.LE_elt[1,3,...], VU.LE_elt[1,3,...]].
-    uint64_t lo;
+    // Byte-identical to VAddP's MMX odd selectors — reuse the pool entries.
+    PPC64VConstIndex Idx;
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      lo = 0x181A1C1E080A0C0EULL; break;
-    case IR::OpSize::i16Bit:
-      lo = 0x18191C1D08090C0DULL; break;
-    case IR::OpSize::i32Bit:
-      lo = 0x18191A1B08090A0BULL; break;
+    case IR::OpSize::i8Bit:  Idx = PPC64_VCONST_ADDP_ODD_B64; break;
+    case IR::OpSize::i16Bit: Idx = PPC64_VCONST_ADDP_ODD_H64; break;
+    case IR::OpSize::i32Bit: Idx = PPC64_VCONST_ADDP_ODD_W64; break;
     default: Op_Unhandled(IROp, Node); return;
     }
-    LoadConstant(TMP1, lo); std(TMP1, -16, r1);
-    li(TMP2, 0); std(TMP2, -8, r1);
-    addi(TMP3, r1, -16);
-    lvx(VTMP1, r(0), TMP3);
+    EmitLoadPPC64VConst(VTMP1, Idx, TMP1, TMP2);
     vperm(Dst, VL, VU, VTMP1);
     return;
   }
@@ -2628,7 +2579,11 @@ DEF_OP(VAnyNonZero) {
   const auto Src = GetVReg(Op->Vector);
   vspltisb(VTMP1, 0);
   vcmpequb_(VTMP2, Src, VTMP1);
-  mfcr(TMP1);
+  // mfocrf reads only CR6 (FXM 0x02); mfcr serializes all eight CR fields on
+  // POWER8. Bits outside the addressed field are undefined but the rlwinm
+  // masks to the single CR6 bit we consume - same argument as the CRC-area
+  // flag extraction in ALUOps.cpp.
+  mfocrf(TMP1, 0x02);
   rlwinm(TMP1, TMP1, 25, 31, 31);
   xori(Dst, TMP1, 1);
 }
@@ -2642,9 +2597,7 @@ DEF_OP(VUMulH) {
   if (ElemSz != IR::OpSize::i16Bit) { Op_Unhandled(IROp, Node); return; }
   vmulouh(VTMP1, V1, V2);
   vmuleuh(VTMP2, V1, V2);
-  LoadConstant(TMP1, 0x181908091C1D0C0DULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1011000114150405ULL); std(TMP1,  -8, r1);
-  addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
+  EmitLoadPPC64VConst(Dst, PPC64_VCONST_MULH_HI_I16, TMP1, TMP2);
   vperm(Dst, VTMP1, VTMP2, Dst);
 }
 
@@ -2657,9 +2610,7 @@ DEF_OP(VSMulH) {
   if (ElemSz != IR::OpSize::i16Bit) { Op_Unhandled(IROp, Node); return; }
   vmulosh(VTMP1, V1, V2);
   vmulesh(VTMP2, V1, V2);
-  LoadConstant(TMP1, 0x181908091C1D0C0DULL); std(TMP1, -16, r1);
-  LoadConstant(TMP1, 0x1011000114150405ULL); std(TMP1,  -8, r1);
-  addi(TMP2, r1, -16); li(TMP3, 0); lvx(Dst, TMP2, TMP3);
+  EmitLoadPPC64VConst(Dst, PPC64_VCONST_MULH_HI_I16, TMP1, TMP2);
   vperm(Dst, VTMP1, VTMP2, Dst);
 }
 
@@ -4716,33 +4667,26 @@ DEF_OP(Vector_FToF) {
   const uint32_t Conv = (IR::OpSizeToSize(DstSz) << 8) | IR::OpSizeToSize(SrcSz);
 
   if (Conv == 0x0804) {
-    // f32 → f64 packed.  Source has 4 f32 lanes; we promote elements 0,1 into
-    // a 2-lane f64 result.  Spill source at -16, write f64 results at -32..-17.
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    lfs(f0, 0, TMP1);                 // f32 elem 0 → f64 in f0 (lfs auto-promotes)
-    stfd(f0, -32, r1);
-    lfs(f0, 4, TMP1);                 // f32 elem 1
-    stfd(f0, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // f32 -> f64 packed (CVTPS2PD low): promote guest elements 0,1. Guest f32
+    // element k sits at BE word (3-k); xvcvspdp converts BE words 0 and 2
+    // into dw0 and dw1. vmrglw(Src,Src) = [w2,w2,w3,w3] puts f32 e1 at w0 and
+    // e0 at w2, so the convert lands e1 in dw0 (guest f64 e1) and e0 in dw1
+    // (guest f64 e0) - exactly the target layout. Two instructions replace a
+    // spill + two lfs/stfd round trips (two store-hit-loads).
+    vmrglw(VTMP1, Src, Src);
+    xvcvspdp(Dst, VTMP1);
     return;
   }
   if (Conv == 0x0408) {
-    // f64 → f32 packed.  Source 2 f64 lanes → 2 f32 lanes in low half;
-    // upper half zeroed (matches CVTPD2PS).
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    lfd(f0, 0, TMP1);
-    frsp(f0, f0);
-    stfs(f0, -32, r1);
-    lfd(f0, 8, TMP1);
-    frsp(f0, f0);
-    stfs(f0, -28, r1);
-    li(TMP3, 0);
-    std(TMP3, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // f64 -> f32 packed (CVTPD2PS): narrow both f64s into the low half,
+    // upper half zeroed. xvcvdpsp leaves the results at BE words 0 and 2;
+    // the vmrghw-with-shifted-self trick packs [w0:w2] into one doubleword,
+    // and the final xxpermdi pairs it with VZERO's dw0 (the ABI-preserved
+    // half). Rounding: xvcvdpsp honours FPSCR.RN exactly as frsp did.
+    xvcvdpsp(VTMP1, Src);
+    xxsldwi(VTMP2, VTMP1, VTMP1, 2);
+    vmrghw(VTMP1, VTMP1, VTMP2);         // dw0 = cvt(e1) : cvt(e0)
+    xxpermdi(AsVSX(Dst), VZERO_VSX, AsVSX(VTMP1), 0b00);
     return;
   }
   if (Conv == 0x0402 || Conv == 0x0204) {
@@ -4759,9 +4703,10 @@ DEF_OP(Vector_FToF) {
     SpillForABICall(TMP1);
     addi(r3, r1, PostSpill(CryptoSlotA));
     addi(r4, r1, PostSpill(CryptoSlotA));
-    LoadConstant(r(12), SrcIsF16
-                          ? reinterpret_cast<uint64_t>(&PPC64_F16x4ToF32x4)
-                          : reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16x4));
+    // Table-resolved (S3.7-C5): a bare LoadConstant of the host address here
+    // is the serialized-block stale-pointer hazard — a cached block replayed
+    // in a new process would bctrl into the old ASLR layout.
+    EmitLoadPPC64Helper(r(12), SrcIsF16 ? PPC64_HELPER_F16x4ToF32x4 : PPC64_HELPER_F32x4ToF16x4);
     std(r2, PostSpill(24), r1);
     mtctr(r(12)); bctrl();
     ld(r2, PostSpill(24), r1);
@@ -4784,15 +4729,11 @@ DEF_OP(VFCVTL2) {
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
   if (Op->Header.ElementSize == IR::OpSize::i64Bit) {
-    addi(TMP1, r1, -16);
-    stvx(Src, r(0), TMP1);
-    // f32 elem 2 at byte offset 8, f32 elem 3 at offset 12.
-    lfs(f0, 8, TMP1);
-    stfd(f0, -32, r1);
-    lfs(f0, 12, TMP1);
-    stfd(f0, -24, r1);
-    addi(TMP2, r1, -32);
-    lvx(Dst, r(0), TMP2);
+    // Promote guest f32 elements 2,3 (CVTPS2PD upper). Elements 2,3 sit at BE
+    // words 1,0; vmrghw(Src,Src) = [w0,w0,w1,w1] positions e3 at w0 and e2 at
+    // w2, exactly where xvcvspdp reads. Mirror of the Conv 0x0804 path.
+    vmrghw(VTMP1, Src, Src);
+    xvcvspdp(Dst, VTMP1);
     return;
   }
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
@@ -4829,19 +4770,15 @@ DEF_OP(VFCVTN2) {
   const auto VL  = GetVReg(Op->VectorLower);
   const auto VU  = GetVReg(Op->VectorUpper);
   if (Op->Header.ElementSize == IR::OpSize::i32Bit) {
-    // Spill VL at -32 (becomes result base), spill VU at -16 (source f64s).
-    addi(TMP1, r1, -32);
-    stvx(VL, r(0), TMP1);
-    addi(TMP2, r1, -16);
-    stvx(VU, r(0), TMP2);
-    // Narrow VU's two f64s into upper half of -32 buffer (offsets 8, 12).
-    lfd(f0, 0, TMP2);
-    frsp(f0, f0);
-    stfs(f0, 8, TMP1);
-    lfd(f0, 8, TMP2);
-    frsp(f0, f0);
-    stfs(f0, 12, TMP1);
-    lvx(Dst, r(0), TMP1);
+    // Narrow VU's two f64s into guest f32 elements 2,3; elements 0,1 come
+    // from VL. Same [w0:w2] packing trick as the Conv 0x0408 path, but the
+    // packed doubleword lands in dw0 (guest upper half) and the closing
+    // xxpermdi takes dw1 from VL. All sources are consumed before Dst is
+    // written, so Dst may alias VL or VU.
+    xvcvdpsp(VTMP1, VU);
+    xxsldwi(VTMP2, VTMP1, VTMP1, 2);
+    vmrghw(VTMP1, VTMP1, VTMP2);         // dw0 = cvt(e1) : cvt(e0)
+    xxpermdi(AsVSX(Dst), AsVSX(VTMP1), AsVSX(VL), 0b01);
     return;
   }
   if (Op->Header.ElementSize == IR::OpSize::i16Bit) {
@@ -5360,6 +5297,8 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
   [::FEXCore::CPU::PPC64_HELPER_VPCMPESTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPESTRX),
   [::FEXCore::CPU::PPC64_HELPER_VPCMPISTRX]       = reinterpret_cast<uint64_t>(&PPC64_VPCMPISTRX),
   [::FEXCore::CPU::PPC64_HELPER_F64F2XM1]         = reinterpret_cast<uint64_t>(F64F2XM1Impl),
+  [::FEXCore::CPU::PPC64_HELPER_F16x4ToF32x4]     = reinterpret_cast<uint64_t>(&PPC64_F16x4ToF32x4),
+  [::FEXCore::CPU::PPC64_HELPER_F32x4ToF16x4]     = reinterpret_cast<uint64_t>(&PPC64_F32x4ToF16x4),
   },
   // 128-bit constant pool. Each entry is written the way the inline
   // LoadConstant/std/std/lvx sequences it replaces wrote it: the first
@@ -5385,6 +5324,40 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     // `xxsel(Dst, Vec1, Result, MASK)` implements SSE scalar-insert merges.
     [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 0] = 0x00000000FFFFFFFFULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 1] = 0x0000000000000000ULL,
+    // CRC-32C Barrett constants: value in dw0 (entry [+1]), dw1 zero.
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_MU + 0]     = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_MU + 1]     = 0xA434F61C6F5389F8ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 0]      = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 1]      = 0x0000000105EC76F1ULL,
+    // VAddP vperm controls (values verbatim from the old inline builds).
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B + 0]   = 0x01030507090B0D0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B + 1]   = 0x11131517191B1D1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B + 0]    = 0x00020406080A0C0EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B + 1]    = 0x10121416181A1C1EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H + 0]   = 0x020306070A0B0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H + 1]   = 0x121316171A1B1E1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H + 0]    = 0x0001040508090C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H + 1]    = 0x1011141518191C1DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W + 0]   = 0x040506070C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W + 1]   = 0x141516171C1D1E1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W + 0]    = 0x0001020308090A0BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W + 1]    = 0x1011121318191A1BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B64 + 0] = 0x191B1D1F090B0D0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B64 + 0]  = 0x181A1C1E080A0C0EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H64 + 0] = 0x1A1B1E1F0A0B0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H64 + 0]  = 0x18191C1D08090C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W64 + 0] = 0x1C1D1E1F0C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 0]  = 0x18191A1B08090A0BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_MULH_HI_I16 + 0]   = 0x181908091C1D0C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_MULH_HI_I16 + 1]   = 0x1011000114150405ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_ONE + 0]       = 0x3FF0000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_F64_ONE + 1]       = 0x3FF0000000000000ULL,
   },
 };
 } // namespace
@@ -5411,258 +5384,666 @@ uint64_t* GetPPC64HelperTable() {
 //   [r1+64]  Slot C — reserved (e.g. 3rd vector input for SHA1C)
 //   [r1+80..95]  pad)
 
+// ===========================================================================
+// AES-NI, lowered to the POWER8 (ISA 2.07) hardware cipher instructions.
+//
+// These used to bridge to scalar C helpers (PPC64_VAESEnc et al.) through the
+// FABI mini-frame. That cost a stack frame, two stvx, a FULL dynamic-VR
+// SpillForABICall/FillForABICall pair and an indirect call PER GUEST
+// INSTRUCTION, on top of a byte-at-a-time software round - measured at ~49% of
+// all Steam CPU during a download (PPC64_VAESDec + AES_InvMixColumns). The
+// sequences below are 6-7 instructions, touch no memory, and are not calls, so
+// they also stop acting as register-allocator barriers.
+//
+// TWO THINGS MAKE THIS WORK (see also the crypto block in CodeEmitter's
+// Emitter.h and the vs14-vs31 hazard note in PPC64Emitter.h):
+//
+//  1. BYTE ORDER. The hardware reads the AES state big-endian (state byte 0 at
+//     BE byte element 0); a guest XMM lives here with guest byte 0 at BE
+//     element 15. AES state is a byte ARRAY, so unlike a 128-bit integer the
+//     two images do not coincide and the difference cannot be absorbed
+//     algebraically - reversal maps state index i -> 15-i, i.e.
+//     (row,col) -> (3-row,3-col), which flips ShiftRows' direction and changes
+//     MixColumns' circulant. Hence a vperm on the way in and on the way out.
+//
+//  2. THE EQUIVALENT-INVERSE-CIPHER MISMATCH. vncipher applies InvMixColumns
+//     after its VRB xor, x86 AESDEC applies it before. InvMixColumns is
+//     GF(2)-linear so InvMixColumns(0) == 0: feeding VRB=0 and xoring the round
+//     key separately is exact. This is what makes the software InvMixColumns
+//     unnecessary rather than merely faster.
+//
+// Register discipline, uniform across all five: VTMP1 is a rotating scratch
+// holding either the reverse mask or zero (both copied in with one xxlor from
+// the RA-free pinned low-bank slots), VTMP2 carries the state. Dst is written
+// only by the final instruction, after every source has been read, so Dst may
+// safely alias State and/or Key - the Dst==Src aliasing case that has bitten
+// this backend before is correct by construction here.
+// ===========================================================================
+
+// STATELESS byte-reverse bracketing. This deliberately trusts NO vector
+// register contents from before the current guest instruction.
+//
+// An earlier revision pinned the reverse mask in vs15 (beside VZERO_VSX in the
+// "RA-free, callee-saved" low VSX bank) and copied it in with one xxlor. That
+// design was built on a false premise, found the hard way when Steam's 32-bit
+// manifest decryption produced garbage for exactly the >=64-byte inputs (the
+// AESNI-routed ones) while every isolated KAT passed:
+//
+//   ELFv2 preserves only the FPR HALF (dw0) of vs14-vs31 across calls - the
+//   vector half is volatile. Worse, POWER ISA scalar FP loads leave dw1 of
+//   the target VSR UNDEFINED, so any host callee that stfd/lfd-restores
+//   f14/f15 in its epilogue (glibc has eight such sites) hands back a
+//   half-poisoned register. Any lowering that reads the full 128 bits of a
+//   "pinned" vs14-vs31 value after an arbitrary host call is wrong by
+//   construction. The same hazard applies to VZERO_VSX consumers that read
+//   its vector half, and to the AVX-high bank (vs16-31) across host calls.
+//
+// Materializing the mask is 4 instructions, no memory access:
+//   li r0,0 (also preserves the backend's r0==0 index invariant),
+//   vspltisb {15,...,15}, lvsl@EA=0 {0,...,15}, subtract -> {15,...,0}.
+// The mask is then parked in VTMP3_VSX (vs12) across the cipher instruction -
+// legal because it is never live across a host call within a single lowering -
+// and pulled back for the outbound reversal.
+
+// ---------------------------------------------------------------------------
+// ISA 3.0 (POWER9) ARM.
+//
+// xxbrq reverses all 16 bytes of a VSR in ONE instruction, which is exactly
+// the G-image <-> AES-state-image bridge the mask+vperm above is emulating.
+// With it the whole mask apparatus disappears: no {15..0} materialization, no
+// vs12 park, no AESMaskCached bookkeeping, and no lvsl scratch clobber. The
+// key-folding structure is unchanged - revKey is just xxbrq instead of vperm,
+// and still feeds vcipher/vcipherlast/vncipherlast directly.
+//
+// Every AES handler below is written as two obviously parallel arms selected
+// on CTX->HostFeatures.SupportsISA30 (the JIT-layer spelling of the gate;
+// PPC64Emitter.cpp says EmitterCTX->HostFeatures.SupportsISA30 for the same
+// field - LoadUnalignedV128 is the canonical example). Emitting xxbrq on
+// POWER8 is a SIGILL, so the gate is load-bearing, and with it OFF the
+// POWER8 arm is byte-for-byte what it was before this change.
+//
+// AESMaskCached is untouched by the ISA 3.0 arm: EmitAESLoadMask is the only
+// writer of that flag and only the POWER8 arm calls it, so on an ISA 3.0 host
+// the flag is false for the life of the process and the vs12 park is never
+// created OR consumed. Nothing in the ISA 3.0 arm reads VTMP3_VSX.
+//
+// Instruction counts per guest op (POWER8 hot / POWER8 cold / ISA 3.0):
+//   VAESEnc, VAESEncLast, VAESDecLast   5 / 8 / 4
+//   VAESDec                             6 / 9 / 5
+//   VAESImc                             7 / 10 / 5
+// The ISA 3.0 arm also drops the r0 write and the VTMP2 cold-path clobber.
+// ---------------------------------------------------------------------------
+
+// VTMP1 <- {15,...,0} byte-reverse mask. Cold: 4-instruction register-only
+// materialization, then parked in VTMP3_VSX (vs12) and AESMaskCached set so
+// consecutive AES-family ops in the block pay a single xxlor instead.
+// Clobbers VTMP2 on the cold path (lvsl scratch) - callers load state after.
+// POWER8 (ISA 2.07) arm only - never called when SupportsISA30 is set.
+void PPC64JITCore::EmitAESLoadMask() {
+  if (AESMaskCached) {
+    xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+    return;
+  }
+  li(r(0), 0);
+  vspltisb(VTMP1, 15);
+  lvsl(VTMP2, r(0), r(0));
+  vsububm(VTMP1, VTMP1, VTMP2);
+  xxlor(VTMP3_VSX, AsVSX(VTMP1), AsVSX(VTMP1));
+  AESMaskCached = true;
+}
+
+// AESIMC: out = InvMixColumns(src).
+// vcipherlast(S,0) = ShiftRows(SubBytes(S)); vncipher's leading
+// InvShiftRows/InvSubBytes then cancel those exactly, leaving InvMixColumns.
 DEF_OP(VAESImc) {
+  // Same width guard as the four round ops. VAESIMC is 128-bit-only in
+  // practice, but this handler is on the AES-family allowlist in
+  // CompileCode's mask-cache invalidation switch, so a bail through
+  // Op_Unhandled (a host call) must kill the vs12 park explicitly.
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op  = IROp->C<IR::IROp_VAESImc>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);
-  const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
-  const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; };
 
-  stdu(r1, -CryptoMiniFrameSize, r1);
-  mflr(r(0)); std(r(0), 16, r1);
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, Src);
+    vxor(VTMP1, VTMP1, VTMP1); // stateless zero - never read VZERO's vector half
+    vcipherlast(VTMP2, VTMP2, VTMP1);
+    vncipher(VTMP2, VTMP2, VTMP1);
+    xxbrq(Dst, VTMP2);
+    return;
+  }
 
-  // Stage Src to slot A BEFORE SpillForABICall (the spill clobbers VRs we're
-  // not using, but we must commit live SRA-allocated regs ourselves).
-  LoadConstant(TMP1, CryptoSlotA);
-  stvx(Src, r1, TMP1);
-
-  SpillForABICall(TMP1);
-
-
-  // r3 = &dstbuf (slot A reused), r4 = &srcbuf (slot A) — same buffer is fine,
-  // helper copies src→local before writing.
-  addi(r3, r1, PostSpill(CryptoSlotA));
-  addi(r4, r1, PostSpill(CryptoSlotA));
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VAESImc);
-  std(r2, PostSpill(24), r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, PostSpill(24), r1);
-
-
-  FillForABICall();
-
-  LoadConstant(TMP1, CryptoSlotA);
-  lvx(Dst, r1, TMP1);
-
-  ld(r(0), 16, r1); mtlr(r(0));
-  addi(r1, r1, CryptoMiniFrameSize);
-  li(r(0), 0);
+  EmitAESLoadMask();
+  vperm(VTMP2, Src, Src, VTMP1);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
+  vcipherlast(VTMP2, VTMP2, VTMP1);
+  vncipher(VTMP2, VTMP2, VTMP1);
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
-// Common emitter for the 3-VR-arg AES round ops (Enc/EncLast/Dec/DecLast).
-// Slot A: State→dst.  Slot B: Key.  ZeroReg is unused (helpers operate on
-// State directly; the ARM "aese with ZeroReg" pattern does state^0 = state).
-// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
-#define EMIT_AES_ROUND(HelperIdx, StateReg, KeyReg, DstReg)                  \
-  do {                                                                       \
-    const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
-    const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
-    stdu(r1, -CryptoMiniFrameSize, r1);                                      \
-    mflr(r(0)); std(r(0), 16, r1);                                            \
-    LoadConstant(TMP1, CryptoSlotA); stvx((StateReg), r1, TMP1);             \
-    LoadConstant(TMP1, CryptoSlotB); stvx((KeyReg),   r1, TMP1);             \
-    SpillForABICall(TMP1);                                                   \
-    addi(r3, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r4, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
-    std(r2, PostSpill(24), r1);                                              \
-    mtctr(r(12)); bctrl();                                                   \
-    ld(r2, PostSpill(24), r1);                                               \
-    FillForABICall();                                                        \
-    LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
-    ld(r(0), 16, r1); mtlr(r(0));                                             \
-    addi(r1, r1, CryptoMiniFrameSize);                                       \
-    li(r(0), 0);                                                             \
-  } while (0)
+// The four round ops, with two fusions over the naive bracketed form:
+//
+//  * MASK REUSE: EmitAESLoadMask parks the byte-reverse mask in vs12; runs of
+//    adjacent AES ops (every real-world AES code shape - key schedules, CBC
+//    interleaves, round chains) rebuild it with one xxlor instead of four
+//    instructions. CompileCode invalidates the park on any other op.
+//
+//  * KEY FOLDING: vcipher/vcipherlast/vncipherlast apply their B operand xor
+//    at the same point x86 applies the round key, so feeding them the
+//    byte-REVERSED key computes the whole x86 op in one instruction - the
+//    separate zero operand and trailing vxor disappear. AESDEC alone cannot
+//    fold: vncipher xors B BEFORE InvMixColumns (equivalent inverse cipher),
+//    x86 after, so it keeps the zero-operand + explicit key xor form. The
+//    InvMixColumns(0) == 0 linearity argument makes that exact - see the
+//    block comment above DEF_OP(VAESImc).
+//
+// Aliasing: every source is fully consumed before Dst is written (the final
+// vperm/vxor reads its sources in the same instruction), so Dst may alias
+// State, Key, or both. The SSE forms alias Dst==State on every instruction.
 
 DEF_OP(VAESEnc) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEnc>();
-  EMIT_AES_ROUND(PPC64_HELPER_VAESEnc, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  const auto Dst = GetVReg(Node);
+  const auto State = GetVReg(Op->State);
+  const auto Key = GetVReg(Op->Key);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);          // revState
+    xxbrq(VTMP1, Key);            // revKey
+    vcipher(VTMP2, VTMP2, VTMP1); // rev(MixColumns(ShiftRows(SubBytes(s))) ^ k)
+    xxbrq(Dst, VTMP2);
+    return;
+  }
+
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);   // revState
+  vperm(VTMP1, Key, Key, VTMP1);       // revKey (self-overwrite of mask is fine)
+  vcipher(VTMP2, VTMP2, VTMP1);        // rev(MixColumns(ShiftRows(SubBytes(s))) ^ k)
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
 DEF_OP(VAESEncLast) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESEncLast>();
-  EMIT_AES_ROUND(PPC64_HELPER_VAESEncLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  const auto Dst = GetVReg(Node);
+  const auto State = GetVReg(Op->State);
+  const auto Key = GetVReg(Op->Key);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    xxbrq(VTMP1, Key);
+    vcipherlast(VTMP2, VTMP2, VTMP1); // rev(ShiftRows(SubBytes(s)) ^ k)
+    xxbrq(Dst, VTMP2);
+    return;
+  }
+
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
+  vperm(VTMP1, Key, Key, VTMP1);
+  vcipherlast(VTMP2, VTMP2, VTMP1);    // rev(ShiftRows(SubBytes(s)) ^ k)
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
+// AESDEC(A,K) = InvMixColumns(InvSubBytes(InvShiftRows(A))) ^ K.
+// vncipher(A,0) = InvMixColumns(InvSubBytes(InvShiftRows(A)) ^ 0), and
+// InvMixColumns is GF(2)-linear so InvMixColumns(0) == 0 - the two agree
+// exactly once the key xor is pulled out. This identity is the whole reason
+// the old scalar AES_InvMixColumns helper is gone.
 DEF_OP(VAESDec) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDec>();
-  EMIT_AES_ROUND(PPC64_HELPER_VAESDec, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
+  const auto Dst = GetVReg(Node);
+  const auto State = GetVReg(Op->State);
+  const auto Key = GetVReg(Op->Key);
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    vxor(VTMP1, VTMP1, VTMP1); // stateless zero - never read VZERO's vector half
+    vncipher(VTMP2, VTMP2, VTMP1);
+    xxbrq(VTMP2, VTMP2);
+    vxor(Dst, VTMP2, Key);     // Key read in the same insn that writes Dst
+    return;
+  }
+
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
+  vncipher(VTMP2, VTMP2, VTMP1);
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(VTMP2, VTMP2, VTMP2, VTMP1);
+  vxor(Dst, VTMP2, Key);
 }
 
 DEF_OP(VAESDecLast) {
-  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op = IROp->C<IR::IROp_VAESDecLast>();
-  EMIT_AES_ROUND(PPC64_HELPER_VAESDecLast, GetVReg(Op->State), GetVReg(Op->Key), GetVReg(Node));
-}
-#undef EMIT_AES_ROUND
+  const auto Dst = GetVReg(Node);
+  const auto State = GetVReg(Op->State);
+  const auto Key = GetVReg(Op->Key);
 
+  if (CTX->HostFeatures.SupportsISA30) {
+    xxbrq(VTMP2, State);
+    xxbrq(VTMP1, Key);
+    vncipherlast(VTMP2, VTMP2, VTMP1); // rev(InvSubBytes(InvShiftRows(s)) ^ k) - xor is after, folds
+    xxbrq(Dst, VTMP2);
+    return;
+  }
+
+  EmitAESLoadMask();
+  vperm(VTMP2, State, State, VTMP1);
+  vperm(VTMP1, Key, Key, VTMP1);
+  vncipherlast(VTMP2, VTMP2, VTMP1);   // rev(InvSubBytes(InvShiftRows(s)) ^ k) - xor is after, folds
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
+  vperm(Dst, VTMP2, VTMP2, VTMP1);
+}
+
+// AESKEYGENASSIST: x86 takes Src=[X3,X2,X1,X0] (32-bit lanes) and produces
+//   out[0..31]   = SubWord(X1)                                 (LE bytes 0..3)
+//   out[32..63]  = RotWord(SubWord(X1)) XOR RCON               (LE bytes 4..7)
+//   out[64..95]  = SubWord(X3)                                 (LE bytes 8..11)
+//   out[96..127] = RotWord(SubWord(X3)) XOR RCON               (LE bytes 12..15)
+// SubWord is the AES SBox per byte; RotWord takes a 4-byte LE word
+// [a,b,c,d] -> [b,c,d,a].
+//
+// vsbox is the forward SBox per byte, so - being bytewise - it needs no byte
+// reversal, unlike the round ops above. One vperm then reshuffles the SBoxed
+// bytes straight into the x86 layout (its mask already folds in this
+// backend's LE-byte = phys-byte(15-i) mapping), and a vxor injects RCON.
+//
+// Unlike the AES rounds this still needs a real 16-byte constant, so it takes
+// the one memory bounce here - through STATE+JITScratch, NOT an r1-relative
+// red-zone slot. The red zone is nominally 288B under ELFv2, but an
+// r1-relative scratch has been observed to fault on tight clone-allocated
+// stacks whose mapping ended early (see the block comment on
+// StoreFPRSized in PPC64Emitter.cpp). KeyGenAssist runs once per key
+// schedule, so the store-to-load-forward stall is irrelevant here.
 DEF_OP(VAESKeyGenAssist) {
+  if (IROp->Size != IR::OpSize::i128Bit) { Op_Unhandled(IROp, Node); return; }
   const auto Op  = IROp->C<IR::IROp_VAESKeyGenAssist>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Src);
-  const uint64_t RCON = static_cast<uint64_t>(Op->RCON);
-  const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
-  const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; };
-  // KeyGenTBLSwizzle and ZeroReg are unused — the helper computes the x86
-  // result directly. They remain valid IR sources (so RA keeps the live
-  // ranges sound), but no host instruction reads them here.
+  const uint64_t RCON = static_cast<uint64_t>(Op->RCON) & 0xFFu;
+  // KeyGenTBLSwizzle and ZeroReg remain valid IR sources so RA keeps the live
+  // ranges sound, but no host instruction reads them on this path.
 
-  stdu(r1, -CryptoMiniFrameSize, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-  LoadConstant(TMP1, CryptoSlotA); stvx(Src, r1, TMP1);
+  constexpr int32_t kScratchOff = offsetof(::FEXCore::Core::CpuStateFrame, JITScratch);
+  static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
+                "JITScratch offset must fit in int16 for addi-based addressing");
 
-  SpillForABICall(TMP1);
+  // VTMP1 = SubBytes(Src), bytewise so order-agnostic.
+  vsbox(VTMP1, Src);
 
+  // Gather mask, in PPC physical-byte order:
+  //   phys[0..15] = [3,0,1,2, 0,1,2,3, 11,8,9,10, 8,9,10,11]
+  // Stored little-endian: mem byte M lands at phys byte (15-M), so
+  //   mem[0..7]  = phys[15..8] = [11,10,9,8,10,9,8,11] = 0x0B08090A08090A0B
+  //   mem[8..15] = phys[7..0]  = [3,2,1,0,2,1,0,3]     = 0x0300010200010203
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  LoadConstant(TMP1, 0x0B08090A08090A0BULL); std(TMP1, 0, TMP3);
+  LoadConstant(TMP1, 0x0300010200010203ULL); std(TMP1, 8, TMP3);
+  li(TMP1, 0);
+  lvx(VTMP2, TMP3, TMP1);
+  vperm(VTMP1, VTMP1, VTMP1, VTMP2);
 
-  addi(r3, r1, PostSpill(CryptoSlotA));
-  addi(r4, r1, PostSpill(CryptoSlotA));
-  LoadConstant(r5, RCON);
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VAESKeyGenAssist);
-  std(r2, PostSpill(24), r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, PostSpill(24), r1);
-
-
-  FillForABICall();
-
-  LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
-  ld(r(0), 16, r1); mtlr(r(0));
-  addi(r1, r1, CryptoMiniFrameSize);
-  li(r(0), 0);
+  if (RCON != 0) {
+    // RCON lands at LE bytes 4 and 12, i.e. phys bytes 11 and 3. In each
+    // doubleword that is mem byte 4, so both halves are the same value.
+    const uint64_t RconWord = RCON << 32;
+    LoadConstant(TMP1, RconWord);
+    std(TMP1, 0, TMP3);
+    std(TMP1, 8, TMP3);
+    li(TMP1, 0);
+    lvx(VTMP2, TMP3, TMP1);
+    vxor(Dst, VTMP1, VTMP2);
+  } else if (Dst != VTMP1) {
+    vmr(Dst, VTMP1);
+  }
 }
 
 // VSha1H: rotate-left 30 of element 0 (32-bit), upper lanes zeroed.
 // Trivial enough that we could inline-emit it, but we already have a helper
 // and consistency with the rest of the SHA path is more readable.
+// VSha1H: rotate-left-30 of guest element 0, upper lanes zeroed. Pure lane
+// arithmetic — vrlw rotates every 32-bit lane (the upper lanes' rotated
+// garbage is masked off), then the pooled lane0 mask isolates element 0.
+// Replaces a full FABI mini-frame + spill/fill + bctrl with 6 inline
+// instructions and no memory traffic beyond the pool lvx.
 DEF_OP(VSha1H) {
   const auto Op  = IROp->C<IR::IROp_VSha1H>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Src);
-  const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
-  const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; };
 
-  stdu(r1, -CryptoMiniFrameSize, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-  LoadConstant(TMP1, CryptoSlotA); stvx(Src, r1, TMP1);
-
-  SpillForABICall(TMP1);
-
-
-  addi(r3, r1, PostSpill(CryptoSlotA));
-  addi(r4, r1, PostSpill(CryptoSlotA));
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_VSha1H);
-  std(r2, PostSpill(24), r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, PostSpill(24), r1);
-
-
-  FillForABICall();
-
-  LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
-  ld(r(0), 16, r1); mtlr(r(0));
-  addi(r1, r1, CryptoMiniFrameSize);
-  li(r(0), 0);
+  vspltisw(VTMP2, 15);
+  vadduwm(VTMP2, VTMP2, VTMP2);        // splat 30 (vspltisw imm caps at 15)
+  vrlw(VTMP1, Src, VTMP2);
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  vand(Dst, VTMP1, VTMP2);
 }
 
-// SHA1 / SHA256 round-step ops. POWER8 has no hardware SHA-NI, so each
-// primitive routes through a software helper in JIT.cpp (PPC64_VSha*) via
-// the same FABI mini-frame used for AES/PCLMUL. The helpers implement the
-// ARMv8 SHA1*/SHA256* instructions exactly (FIPS-180-4 primitives), since
-// the IR ops mirror that semantic — the x86 SHA-NI dispatcher already
-// pre-shuffles inputs to the ARM lane layout (see Crypto.cpp).
+// SHA1 / SHA256 round-step ops. POWER8 has no SHA-NI-equivalent round
+// instructions, but everything below is now emitted inline (vshasigmaw for
+// the SHA-256 Sigmas, plain VMX rotate/select/add for the rest). The
+// EMIT_SHA_3ARG/2ARG FABI macros that used to bridge these to the PPC64_VSha*
+// software helpers are gone; the helpers remain in JIT.cpp as reference
+// implementations reachable only through their (now-unused) table slots.
+// The IR ops mirror the ARMv8 SHA1*/SHA256* semantics (FIPS-180-4), since
+// the x86 SHA-NI dispatcher pre-shuffles inputs to the ARM lane layout
+// (see Crypto.cpp).
 
-// 3-VR-arg SHA round-step emitter: A/B/C → slots, helper(dst=A, A, B, C).
-// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
-#define EMIT_SHA_3ARG(HelperIdx, Src1Reg, Src2Reg, Src3Reg, DstReg)           \
-  do {                                                                       \
-    const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
-    const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
-    stdu(r1, -CryptoMiniFrameSize, r1);                                      \
-    mflr(r(0)); std(r(0), 16, r1);                                            \
-    LoadConstant(TMP1, CryptoSlotA); stvx((Src1Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotC); stvx((Src3Reg), r1, TMP1);              \
-    SpillForABICall(TMP1);                                                   \
-    addi(r3, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r4, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    addi(r6, r1, PostSpill(CryptoSlotC));                                    \
-    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
-    std(r2, PostSpill(24), r1);                                              \
-    mtctr(r(12)); bctrl();                                                   \
-    ld(r2, PostSpill(24), r1);                                               \
-    FillForABICall();                                                        \
-    LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
-    ld(r(0), 16, r1); mtlr(r(0));                                             \
-    addi(r1, r1, CryptoMiniFrameSize);                                       \
-    li(r(0), 0);                                                             \
-  } while (0)
+// ===========================================================================
+// SHA-1 four-round step (VSha1C/M/P), fully inline. Ground truth is the
+// retired helper's Sha1Hash (JIT.cpp): VA=[A,B,C,D] guest lanes 0-3, E scalar
+// in Src2 lane 0, WK=[W+K 0..3]. Per round:
+//   T = ROL(A,5) + f(B,C,D) + E + WK[i]
+//   E=D; D=C; C=ROL(B,30); B=A; A=T
+// f per flavor, on the lane rotations A1=[B,C,D,A], A2=[C,D,A,B], A3=[D,A,B,C]
+// (lane 0 = B / C / D respectively):
+//   Choose  (B&C)|(~B&D)      = vsel(A3, A2, A1)
+//   Majority (two-of-three)   = (C^D) ? B : C = vsel(A2, A1, vxor(A2,A3))
+//   Parity                    = A1 ^ A2 ^ A3
+// The state update is the neat part: [T,A,B,C] via vsel(A3, T, LANE0_MASK),
+// then ONE vrlw against the per-lane rotate vector {0,0,30,0} applies the
+// ROL(B,30) to lane 2 alone. The next round's E is old D = A3 lane 0, free.
+// Same two-dyn-VR borrow protocol as EmitSha256Rounds4.
+void PPC64JITCore::EmitSha1Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR E,
+                                   PPC64Emitter::VR WK, Sha1Fn Fn) {
+  using namespace PPC64Emitter;
+  constexpr auto S_VA  = VSXR{2};
+  constexpr auto S_E   = VSXR{3};
+  constexpr auto S_WK  = VSXR{4};
+  constexpr auto S_M0  = VSXR{5};
+  constexpr auto S_SHV = VSXR{6};
+  constexpr auto S_A3  = VSXR{7};
+  constexpr auto S_B1  = VSXR{8};
+  constexpr auto S_B2  = VSXR{9};
 
-// 2-VR-arg SHA emitter: A/B → slots, helper(dst=A, A, B).
-// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
-#define EMIT_SHA_2ARG(HelperIdx, Src1Reg, Src2Reg, DstReg)                    \
-  do {                                                                       \
-    const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
-    const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
-    stdu(r1, -CryptoMiniFrameSize, r1);                                      \
-    mflr(r(0)); std(r(0), 16, r1);                                            \
-    LoadConstant(TMP1, CryptoSlotA); stvx((Src1Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
-    SpillForABICall(TMP1);                                                   \
-    addi(r3, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r4, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
-    std(r2, PostSpill(24), r1);                                              \
-    mtctr(r(12)); bctrl();                                                   \
-    ld(r2, PostSpill(24), r1);                                               \
-    FillForABICall();                                                        \
-    LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
-    ld(r(0), 16, r1); mtlr(r(0));                                             \
-    addi(r1, r1, CryptoMiniFrameSize);                                       \
-    li(r(0), 0);                                                             \
-  } while (0)
+  VR Borrow[2] = {VR{0}, VR{0}};
+  for (uint32_t idx = 16, found = 0; idx <= 29 && found < 2; ++idx) {
+    if (idx == Dst.idx || idx == ABCD.idx || idx == E.idx || idx == WK.idx) continue;
+    Borrow[found++] = VR{idx};
+  }
+  const VR B1 = Borrow[0], B2 = Borrow[1];
+
+  xxlor(S_B1, AsVSX(B1), AsVSX(B1));
+  xxlor(S_B2, AsVSX(B2), AsVSX(B2));
+  EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  xxlor(S_M0, AsVSX(VTMP1), AsVSX(VTMP1));
+  // Per-lane rotate vector {0,0,30,0}: splat 30, mask to lane 2 (the lane0
+  // mask rotated by two guest lanes).
+  vspltisw(VTMP2, 15);
+  vadduwm(VTMP2, VTMP2, VTMP2);
+  vsldoi(VTMP1, VTMP1, VTMP1, 8);      // lane0 mask -> lane2 mask
+  vand(VTMP1, VTMP2, VTMP1);
+  xxlor(S_SHV, AsVSX(VTMP1), AsVSX(VTMP1));
+  xxlor(S_VA, AsVSX(ABCD), AsVSX(ABCD));
+  xxlor(S_E, AsVSX(E), AsVSX(E));
+  xxlor(S_WK, AsVSX(WK), AsVSX(WK));
+
+  for (int i = 0; i < 4; ++i) {
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);     // VA = [A,B,C,D]
+    vsldoi(B1, VTMP2, VTMP2, 12);        // A1 = [B,C,D,A]
+    vsldoi(B2, VTMP2, VTMP2, 8);         // A2 = [C,D,A,B]
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);      // A3 = [D,A,B,C]
+    xxlor(S_A3, AsVSX(VTMP1), AsVSX(VTMP1));
+    switch (Fn) {
+    case Sha1Fn::Choose:
+      vsel(B1, VTMP1, B2, B1);           // B ? C : D
+      break;
+    case Sha1Fn::Majority:
+      vxor(VTMP2, B2, VTMP1);            // C^D  (VA dead past here)
+      vsel(B1, B2, B1, VTMP2);           // (C^D) ? B : C
+      break;
+    case Sha1Fn::Parity:
+      vxor(B1, B1, B2);
+      vxor(B1, B1, VTMP1);
+      break;
+    }
+    // T = f + ROL(A,5) + E + WK[i], accumulated in B1 (lane 0).
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);
+    vspltisw(B2, 5);
+    vrlw(VTMP2, VTMP2, B2);              // ROL(A,5) in lane 0
+    vadduwm(B1, B1, VTMP2);
+    xxlor(AsVSX(VTMP2), S_E, S_E);
+    vadduwm(B1, B1, VTMP2);
+    xxlor(AsVSX(VTMP2), S_WK, S_WK);
+    if (i) vsldoi(VTMP2, VTMP2, VTMP2, 4 * (4 - i));  // WK[i] -> lane 0
+    vadduwm(B1, B1, VTMP2);              // T
+
+    // E' = old D (A3 lane 0); VA' = vrlw(vsel(A3, T, mask0), {0,0,30,0}).
+    xxlor(S_E, S_A3, S_A3);
+    xxlor(AsVSX(VTMP1), S_A3, S_A3);     // [D,A,B,C]
+    xxlor(AsVSX(VTMP2), S_M0, S_M0);
+    vsel(VTMP1, VTMP1, B1, VTMP2);       // [T,A,B,C]
+    xxlor(AsVSX(VTMP2), S_SHV, S_SHV);
+    vrlw(VTMP1, VTMP1, VTMP2);           // [T,A,ROL(B,30),C]
+    xxlor(S_VA, AsVSX(VTMP1), AsVSX(VTMP1));
+  }
+
+  xxlor(AsVSX(VTMP1), S_VA, S_VA);
+  xxlor(AsVSX(B1), S_B1, S_B1);
+  xxlor(AsVSX(B2), S_B2, S_B2);
+  vmr(Dst, VTMP1);
+}
 
 DEF_OP(VSha1C) {
   const auto Op = IROp->C<IR::IROp_VSha1C>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1C, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Choose);
 }
 DEF_OP(VSha1M) {
   const auto Op = IROp->C<IR::IROp_VSha1M>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1M, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Majority);
 }
 DEF_OP(VSha1P) {
   const auto Op = IROp->C<IR::IROp_VSha1P>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1P, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
-}
-DEF_OP(VSha1SU1) {
-  const auto Op = IROp->C<IR::IROp_VSha1SU1>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha1SU1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
-}
-DEF_OP(VSha256H) {
-  const auto Op = IROp->C<IR::IROp_VSha256H>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
-}
-DEF_OP(VSha256H2) {
-  const auto Op = IROp->C<IR::IROp_VSha256H2>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H2, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
-}
-DEF_OP(VSha256U0) {
-  const auto Op = IROp->C<IR::IROp_VSha256U0>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U0, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
-}
-DEF_OP(VSha256U1) {
-  const auto Op = IROp->C<IR::IROp_VSha256U1>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha256U1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Parity);
 }
 
-#undef EMIT_SHA_3ARG
-#undef EMIT_SHA_2ARG
+// SHA1SU1(Vd, Vn): T[k] = Vd[k] ^ Vn[k+1] (Vn term zero for k=3), then
+// r[k] = ROL(T[k],1) with the lane-3 recurrence r[3] = ROL(T[3]^r[0], 1).
+// Rotate distributes over XOR, so the recurrence folds to one correction:
+// r = ROL(T,1);  r[3] ^= ROL(T[0], 2). Dst is usable as scratch once both
+// sources are consumed.
+DEF_OP(VSha1SU1) {
+  const auto Op = IROp->C<IR::IROp_VSha1SU1>();
+  const auto Dst = GetVReg(Node);
+  const auto Vd  = GetVReg(Op->Src1);
+  const auto Vn  = GetVReg(Op->Src2);
+
+  vxor(VTMP1, VTMP1, VTMP1);
+  vsldoi(VTMP1, VTMP1, Vn, 12);        // [Vn1,Vn2,Vn3,0] (guest lanes)
+  vxor(VTMP1, Vd, VTMP1);              // T
+  vspltisw(VTMP2, 1);
+  vrlw(VTMP2, VTMP1, VTMP2);           // ROL(T,1) — both sources now dead
+  vspltisw(Dst, 2);
+  vrlw(VTMP1, VTMP1, Dst);             // ROL(T,2)
+  vxor(Dst, Dst, Dst);
+  vsldoi(VTMP1, VTMP1, Dst, 12);       // [0,0,0,ROL(T0,2)] at guest lane 3
+  vxor(Dst, VTMP2, VTMP1);
+}
+// ===========================================================================
+// SHA256RNDS2 (VSha256H / VSha256H2), fully inline via POWER8 vshasigmaw ST=1.
+//
+// Ground truth is the retired FABI helper's Sha256Round4 (JIT.cpp): four
+// FIPS-180 rounds over VA=[A,B,C,D], VE=[E,F,G,H] (guest lane 0 = A / E),
+// WK=[W+K 0..3]. Per round:
+//   T1 = H + BigSigma1(E) + Ch(E,F,G) + WK[i]
+//   T2 = BigSigma0(A) + Maj(A,B,C)
+//   VE' = [D+T1, E, F, G]     VA' = [T1+T2, A, B, C]
+// Everything vectorizes with lane 0 carrying the live value (other lanes
+// compute garbage that the final vsel discards):
+//   BigSigma:  vshasigmaw ST=1 (SIX=0xF -> Sigma1, SIX=0 -> Sigma0), lane-wise.
+//   Ch(E,F,G): vsel(V2, V1, VE) with V1/V2 the lane rotations of VE.
+//   Maj(A,B,C) = (B^C) ? A : B = vsel(A1, VA, vxor(A1,A2)).
+//   State insert: vsel(rotated_state, new_value, LANE0_MASK).
+// LANE ORDER NOTE: guest lane k sits at BE word (3-k), so a guest
+// "lane k <- lane k+1" rotation is vsldoi by 12, k+2 by 8, k+3 by 4 —
+// mirrored from the BE-intuitive values. Derived and checked by hand; the
+// GuestCrypto sha_test full-message vectors are the enforcement.
+//
+// REGISTER BUDGET: the backend owns only VTMP1/VTMP2 in VMX, and every VMX op
+// here (vsel/vsldoi/vshasigmaw/vadduwm) physically cannot address the VSX low
+// bank. So the emitter BORROWS two dynamic VRs (never Dst or a source): their
+// values are parked in the RA-free low VSX bank via xxlor and restored at the
+// end. This is call-free, memory-free (registers only), and async signals
+// restore the full file via sigreturn, so the borrow window is sound — the
+// same trust model as VTMP3_VSX's "not live across a host call" rule.
+// Round state parks in vs2-vs8; all op-local, per the vs14-vs31 hazard note
+// (nothing here survives, or needs to survive, a host call).
+void PPC64JITCore::EmitSha256Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR EFGH,
+                                     PPC64Emitter::VR WK, bool ReturnABCD) {
+  using namespace PPC64Emitter;
+  constexpr auto S_VA   = VSXR{2};
+  constexpr auto S_VE   = VSXR{3};
+  constexpr auto S_WK   = VSXR{4};
+  constexpr auto S_MASK = VSXR{5};
+  constexpr auto S_HV   = VSXR{6};
+  constexpr auto S_B1   = VSXR{7};
+  constexpr auto S_B2   = VSXR{8};
+
+  // Borrow two dynamic-pool VRs distinct from Dst and every source. v16-v29
+  // are RA-owned in both guest modes; saving/restoring makes any choice safe.
+  VR Borrow[2] = {VR{0}, VR{0}};
+  for (uint32_t idx = 16, found = 0; idx <= 29 && found < 2; ++idx) {
+    if (idx == Dst.idx || idx == ABCD.idx || idx == EFGH.idx || idx == WK.idx) continue;
+    Borrow[found++] = VR{idx};
+  }
+  const VR B1 = Borrow[0], B2 = Borrow[1];
+
+  xxlor(S_B1, AsVSX(B1), AsVSX(B1));
+  xxlor(S_B2, AsVSX(B2), AsVSX(B2));
+  EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  xxlor(S_MASK, AsVSX(VTMP1), AsVSX(VTMP1));
+  xxlor(S_VA, AsVSX(ABCD), AsVSX(ABCD));
+  xxlor(S_VE, AsVSX(EFGH), AsVSX(EFGH));
+  xxlor(S_WK, AsVSX(WK), AsVSX(WK));
+
+  for (int i = 0; i < 4; ++i) {
+    // T1 = H + BigSigma1(E) + Ch(E,F,G) + WK[i], accumulated in B2 (lane 0).
+    xxlor(AsVSX(VTMP2), S_VE, S_VE);      // VE = [E,F,G,H]
+    vsldoi(B1, VTMP2, VTMP2, 12);         // V1 = [F,G,H,E]
+    vsldoi(B2, VTMP2, VTMP2, 8);          // V2 = [G,H,E,F]
+    vsel(B2, B2, B1, VTMP2);              // Ch: E ? F : G
+    vshasigmaw(B1, VTMP2, 1, 0xF);        // BigSigma1 per lane
+    vadduwm(B2, B2, B1);
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);       // Hv = [H,E,F,G]
+    xxlor(S_HV, AsVSX(VTMP1), AsVSX(VTMP1));
+    vadduwm(B2, B2, VTMP1);               // + H
+    xxlor(AsVSX(VTMP1), S_WK, S_WK);
+    if (i) vsldoi(VTMP1, VTMP1, VTMP1, 4 * (4 - i));  // WK[i] -> lane 0
+    vadduwm(B2, B2, VTMP1);               // T1
+
+    // T2 = BigSigma0(A) + Maj(A,B,C); then the two new lane-0 words.
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);      // VA = [A,B,C,D]
+    vsldoi(B1, VTMP2, VTMP2, 12);         // A1 = [B,C,D,A]
+    vsldoi(VTMP1, VTMP2, VTMP2, 8);       // A2 = [C,D,A,B]
+    vxor(VTMP1, B1, VTMP1);               // t = B^C (lane 0)
+    vsel(B1, B1, VTMP2, VTMP1);           // Maj: t ? A : B
+    vshasigmaw(VTMP1, VTMP2, 1, 0);       // BigSigma0 per lane
+    vadduwm(B1, B1, VTMP1);               // T2
+    vadduwm(B1, B1, B2);                  // newA = T1 + T2
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);       // Dv = [D,A,B,C]
+    vadduwm(B2, B2, VTMP1);               // newE = T1 + D
+
+    // Rotate the new words in through lane 0.
+    xxlor(AsVSX(VTMP2), S_MASK, S_MASK);
+    vsel(B1, VTMP1, B1, VTMP2);           // VA' = [newA, A, B, C]
+    xxlor(S_VA, AsVSX(B1), AsVSX(B1));
+    xxlor(AsVSX(VTMP1), S_HV, S_HV);
+    vsel(B2, VTMP1, B2, VTMP2);           // VE' = [newE, E, F, G]
+    xxlor(S_VE, AsVSX(B2), AsVSX(B2));
+  }
+
+  if (ReturnABCD) {
+    xxlor(AsVSX(VTMP1), S_VA, S_VA);
+  } else {
+    xxlor(AsVSX(VTMP1), S_VE, S_VE);
+  }
+  xxlor(AsVSX(B1), S_B1, S_B1);           // restore borrows
+  xxlor(AsVSX(B2), S_B2, S_B2);
+  vmr(Dst, VTMP1);
+}
+
+// SHA256H(Vd=ABCD tied, Vn=EFGH, Vm=W+K) -> post-step ABCD.
+DEF_OP(VSha256H) {
+  const auto Op = IROp->C<IR::IROp_VSha256H>();
+  EmitSha256Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), true);
+}
+// SHA256H2(Vd=EFGH tied, Vn=ABCD, Vm=W+K) -> post-step EFGH. Note the ARM
+// operand order: Src1 is the EFGH-tied register, Src2 is ABCD.
+DEF_OP(VSha256H2) {
+  const auto Op = IROp->C<IR::IROp_VSha256H2>();
+  EmitSha256Rounds4(GetVReg(Node), GetVReg(Op->Src2), GetVReg(Op->Src1), GetVReg(Op->Src3), false);
+}
+// VSha256U0(Vd, Vn): SHA-256 message schedule sigma0 helper (x86 SHA256MSG1).
+//   IR_result[i] = sigma0(T[i]),  T = [Vd[1], Vd[2], Vd[3], Vn[0]], then + Vd
+// POWER8 vshasigmaw with ST=0, SIX=0 is lane-wise sigma0, and was verified on
+// hardware to line up lane-for-lane with the IR input. No byte reversal: these
+// are 32-bit lane ops and the element convention already matches.
+DEF_OP(VSha256U0) {
+  const auto Op  = IROp->C<IR::IROp_VSha256U0>();
+  const auto Dst = GetVReg(Node);
+  const auto Vd  = GetVReg(Op->Src1);
+  const auto Vn  = GetVReg(Op->Src2);
+
+  // IR lane i lives at phys[12-4i..15-4i], so
+  //   T_phys[0..3]  = Vn_phys[12..15] (IR Vn[0])
+  //   T_phys[4..15] = Vd_phys[0..11]  (IR Vd[3..1])
+  // vsldoi(T, Vn, Vd, 12) = (Vn::Vd) << 12 bytes = Vn[12..15] :: Vd[0..11].
+  vsldoi(VTMP1, Vn, Vd, 12);
+  vshasigmaw(VTMP2, VTMP1, 0, 0);
+  vadduwm(Dst, VTMP2, Vd);
+}
+
+// VSha256U1(Vn, Vm): SHA-256 message schedule sigma1 helper (x86 SHA256MSG2).
+//   IR_result[0] = Vn[1] + sigma1(Vm[2])
+//   IR_result[1] = Vn[2] + sigma1(Vm[3])
+//   IR_result[2] = Vn[3] + sigma1(IR_result[0])   <- recurrence
+//   IR_result[3] = Vm[0] + sigma1(IR_result[1])   <- recurrence
+// The recurrence forces two passes: lanes 0,1 first, then lanes 2,3 from
+// those. With only VTMP1/VTMP2 available the partial has to be parked, so it
+// goes to STATE+JITScratch rather than an r1-relative red-zone slot (see the
+// note on VAESKeyGenAssist above).
+DEF_OP(VSha256U1) {
+  const auto Op  = IROp->C<IR::IROp_VSha256U1>();
+  const auto Dst = GetVReg(Node);
+  const auto Vn  = GetVReg(Op->Src1);
+  const auto Vm  = GetVReg(Op->Src2);
+
+  constexpr int32_t kScratchOff = offsetof(::FEXCore::Core::CpuStateFrame, JITScratch);
+  static_assert(kScratchOff >= -32768 && kScratchOff <= 32767,
+                "JITScratch offset must fit in int16 for addi-based addressing");
+
+  // Pass 1: partial lanes 0,1. sigma1 across Vm, then slide so
+  // sigma1(Vm[2,3]) land in IR lanes 0,1; slide Vn so Vn[1,2] land there too.
+  vshasigmaw(VTMP1, Vm, 0, 0xF);
+  vsldoi(VTMP2, VTMP1, VTMP1, 8);
+  vsldoi(VTMP1, Vn, Vn, 12);
+  vadduwm(VTMP1, VTMP2, VTMP1);
+
+  // Park the partial so VTMP1 can be reused as the sigma1 input.
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  li(TMP1, 0);
+  stvx(VTMP1, TMP3, TMP1);
+
+  // Pass 2: final lanes 2,3 = [Vn[3], Vm[0]] + sigma1(partial[0,1]).
+  vshasigmaw(VTMP1, VTMP1, 0, 0xF);
+  vsldoi(VTMP1, VTMP1, VTMP1, 8);
+  vsldoi(VTMP2, Vm, Vn, 12);
+  vadduwm(VTMP1, VTMP1, VTMP2);
+
+  // Reload the partial and merge: Dst hi half (phys[0..7] = IR lanes 2,3)
+  // from VTMP1, lo half (phys[8..15] = IR lanes 0,1) from the partial.
+  addi(TMP3, STATE, static_cast<int16_t>(kScratchOff));
+  li(TMP1, 0);
+  lvx(VTMP2, TMP3, TMP1);
+  xxpermdi(Dst, VTMP1, VTMP2, 0b01);
+}
+
 
 DEF_OP(PCLMUL) {
   const auto Op   = IROp->C<IR::IROp_PCLMUL>();
@@ -5670,40 +6051,47 @@ DEF_OP(PCLMUL) {
   const auto Src1 = GetVReg(Op->Src1);
   const auto Src2 = GetVReg(Op->Src2);
   const uint64_t Selector = static_cast<uint64_t>(Op->Selector);
-  const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
-  const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; };
 
   // Only 128-bit PCLMUL is supported here; VPCLMULQDQ on 256-bit operands
-  // would need two helper invocations, which we leave for later.
+  // would need two lowerings, which we leave for later (VAES/VPCLMULQDQ are
+  // advertised off - see HostFeatures.cpp).
   if (IROp->Size != IR::OpSize::i128Bit) {
     Op_Unhandled(IROp, Node);
     return;
   }
 
-  stdu(r1, -CryptoMiniFrameSize, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-  LoadConstant(TMP1, CryptoSlotA); stvx(Src1, r1, TMP1);
-  LoadConstant(TMP1, CryptoSlotB); stvx(Src2, r1, TMP1);
+  // PCLMULQDQ on POWER8, via vpmsumd. Replaces a helper whose body was a
+  // 64-iteration shift/xor bit loop plus the full FABI call sequence; this is
+  // three instructions and no memory traffic.
+  //
+  // vpmsumd is a multiply-SUM: it forms both doubleword carry-less products
+  // and xors them together,
+  //   vpmsumd(A,B) = clmul(A.dw0, B.dw0) ^ clmul(A.dw1, B.dw1)
+  // so a single product is isolated by zeroing the unused doubleword of BOTH
+  // operands - clmul(x,0) is 0, and the unwanted term drops out.
+  //
+  // Doubleword numbering: a guest XMM sits here with guest byte i at BE byte
+  // element 15-i, which puts guest qword k in BE doubleword (1-k).
+  //
+  // NO byte reversal is needed, unlike the AES ops above. That asymmetry is
+  // real: an AES state is a byte ARRAY (x86 pins state byte i to XMM byte i,
+  // POWER pins it to BE element i, so the images disagree), whereas a PCLMUL
+  // operand and result are 128-bit INTEGERS - and "guest byte i at BE element
+  // 15-i" is precisely what storing an integer big-endian in the register
+  // means. The vpmsumd result therefore already lands in guest layout.
+  const uint32_t Src1Dw = 1u - static_cast<uint32_t>(Selector & 1);
+  const uint32_t Src2Dw = 1u - static_cast<uint32_t>((Selector >> 4) & 1);
 
-  SpillForABICall(TMP1);
-
-
-  addi(r3, r1, PostSpill(CryptoSlotA));   // dst (reuses slot A)
-  addi(r4, r1, PostSpill(CryptoSlotA));   // src1
-  addi(r5, r1, PostSpill(CryptoSlotB));   // src2
-  LoadConstant(r6, Selector);
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_PCLMUL);
-  std(r2, PostSpill(24), r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, PostSpill(24), r1);
-
-
-  FillForABICall();
-
-  LoadConstant(TMP1, CryptoSlotA); lvx(Dst, r1, TMP1);
-  ld(r(0), 16, r1); mtlr(r(0));
-  addi(r1, r1, CryptoMiniFrameSize);
-  li(r(0), 0);
+  // XXPERMDI T,A,B,DM: T.dw0 = A.dw[DM>>1], T.dw1 = B.dw[DM&1].
+  // Pick the selected doubleword into dw0 and take dw1 from the pinned zero.
+  // Reading VZERO_VSX here is safe where the AES ops' old zero-copy was not:
+  // DM&1 == 0 selects VZERO's dw0, which aliases f14 - the half ELFv2
+  // actually preserves across host calls. Its dw1 (volatile, trashed by any
+  // callee's lfd f14 restore) is never read. Keep it that way.
+  xxpermdi(AsVSX(VTMP1), AsVSX(Src1), VZERO_VSX, Src1Dw << 1);
+  xxpermdi(AsVSX(VTMP2), AsVSX(Src2), VZERO_VSX, Src2Dw << 1);
+  // Both sources are dead by here, so Dst may alias either.
+  vpmsumd(Dst, VTMP1, VTMP2);
 }
 
 } // namespace FEXCore::CPU

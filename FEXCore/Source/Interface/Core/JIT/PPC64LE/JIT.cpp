@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -1045,6 +1046,25 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   // ABI correctness.
   mflr(TMP2); addi(r1, r1, -4096); std(TMP2, 0, r1);
 
+  // Volatile dynamic VRs are caller-saved around ABIPointers stubs (the stub's
+  // own Push/PopDynamicRegs run under an empty VR mask — see the
+  // DynVRSpillMask contract in PPC64Emitter.h). Save exactly the pool entries
+  // live across this IR op into this scratch frame at [r1+16..]; only [r1+0]
+  // (LR) is otherwise in use below. Must precede the source staging in the
+  // switch: it clobbers TMP3, which the VPCMPESTRX case loads afterwards.
+  SaveDynVRsToFrame(16);
+
+  // Restore mirror + the frame teardown every case below shares. The restore
+  // must happen while the frame is still live and must precede the per-case
+  // result moves (which target the just-restored pool registers).
+  auto FABIFrameLeave = [&]() {
+    RestoreDynVRsFromFrame(16);
+    ld(TMP2, 0, r1);
+    mtlr(TMP2);
+    addi(r1, r1, 4096);
+    li(r(0), 0);
+  };
+
   // Load ABIHandler into r0, Func into TMP4.
   // Both offsets are FallbackHandlerPointers base + Idx*sizeof(FallbackABIInfo) + (0|8) —
   // 8-byte aligned by construction and bounded well below INT16_MAX (see static_assert), so
@@ -1066,7 +1086,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects VTMP1 = source float/double vector (LE-element-0)
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1075,7 +1095,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects TMP2(r4) = sign-extended int16
     extsh(TMP2, GetReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1084,7 +1104,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     // Stub expects TMP2(r4) = sign-extended int32
     extsw(TMP2, GetReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1095,7 +1115,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   case FABI_F80_I16_F80_PTR: {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1105,7 +1125,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     vmr(VTMP2, GetVReg(IROp->Args[1]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(GetVReg(Node), VTMP1);
     break;
   }
@@ -1115,7 +1135,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   case FABI_I64_I16_F80_PTR: {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1124,7 +1144,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     vmr(VTMP2, GetVReg(IROp->Args[1]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1135,7 +1155,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     const auto DstHi = GetVReg(IROp->Args[2]);
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(DstLo, VTMP1);
     vmr(DstHi, VTMP2);
     break;
@@ -1147,7 +1167,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     const auto DstHi = GetVReg(IROp->Args[2]);
     vmr(VTMP1, GetVReg(IROp->Args[0]));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     vmr(DstLo, VTMP1);
     vmr(DstHi, VTMP2);
     break;
@@ -1162,7 +1182,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     li(TMP3, static_cast<int16_t>(Op->Control));
     mr(TMP1, GetReg(Op->RAX));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1174,7 +1194,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     vmr(VTMP2, GetVReg(Op->RHS));
     li(TMP1, static_cast<int16_t>(Op->Control));
     mtctr(r(0)); bctrl();
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     mr(GetReg(Node), TMP1);
     break;
   }
@@ -1185,7 +1205,7 @@ void PPC64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
     LOGMAN_MSG_A_FMT("Unhandled IR Fallback ABI: {} {}", FEXCore::IR::GetName(IROp->Op), ToUnderlying(Info.ABI));
 #endif
     // Still need to pop LR frame
-    ld(TMP2, 0, r1); mtlr(TMP2); addi(r1, r1, 4096); li(r(0), 0);
+    FABIFrameLeave();
     break;
   }
 }
@@ -1424,8 +1444,28 @@ PPC64Emitter::Cond PPC64JITCore::MapCC(IR::CondClass Cond) {
   case IR::CondClass::ULT: return CC_LT;  // after cmpldi
   case IR::CondClass::UGT: return CC_GT;  // after cmpldi
   case IR::CondClass::ULE: return CC_LE;  // after cmpldi
-  // Floating-point conditions on CR0 set by fcmpu: LT/GT/EQ have IEEE-ordered
-  // meaning, SO is set on unordered. FU/FNU test SO directly.
+  // Floating-point conditions on the compare field set by fcmpu / xscmpudp:
+  // LT/GT/EQ have IEEE-ordered meaning, SO is set on unordered. FU/FNU test
+  // SO directly.
+  //
+  // KNOWN DEFECT, UNREACHABLE, NOT FIXABLE HERE: FLU and FGE need unordered
+  // folded in (CC_LT is false on NaN when it must be true; CC_GE is true on
+  // NaN when it must be false — `ucomisd; jae` takes the x86-opposite
+  // branch). MapNZCVCC below carries the full four-condition derivation and
+  // the fix for its own copy of this defect.
+  //
+  // It cannot be repeated here. MapCC is `static` — it has no emitter — and
+  // its callers REBASE the returned BI onto whatever CR field they compared
+  // into (DEF_OP(Select) and DEF_OP(NZCVSelect) both do `CC.BI + 28` for
+  // cr7, and EmitCompare takes CRField as a parameter). A crnor/cror
+  // composite would have to be emitted by the caller, into a scratch CR bit,
+  // after the compare — i.e. this is a caller-side fix, not a table entry.
+  //
+  // Nothing reaches it today: X86ToArmFloatCond in
+  // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE
+  // and it is only called from FoldBranch's AXFLAG arm, disabled in
+  // 68217d849. Anyone re-enabling that arm must fix this site (caller-side),
+  // MapNZCVCC (already done), and the shared ULE -> SLE identity remap.
   case IR::CondClass::FLU:  return CC_LT;
   case IR::CondClass::FGE:  return CC_GE;
   case IR::CondClass::FLEU: return CC_LE;
@@ -1455,18 +1495,57 @@ PPC64Emitter::Cond PPC64JITCore::MapCC(IR::CondClass Cond) {
 }
 
 // -------------------------------------------------------------------------
-// ProjectXERToCR1: copy XER.SO/OV/CA into CR1.LT/GT/EQ without modifying XER.
-// CR1.LT (PPC bit 4) <- XER.SO
-// CR1.GT (PPC bit 5) <- XER.OV
-// CR1.EQ (PPC bit 6) <- XER.CA
-// CR1.SO (PPC bit 7) <- 0 (don't care)
+// ProjectXERToCR1: make XER's carry/overflow state branch-testable in CR1
+// without modifying XER. Two sequences, and they do NOT produce the same
+// layout — which is why the OV bit index comes from XEROVBitIndex() below
+// rather than being written out at each use site.
+//
+// ISA 3.0 path (POWER9+), one instruction, `mcrxrx 1`:
+//   CR1.LT (PPC bit 4) <- XER.OV
+//   CR1.GT (PPC bit 5) <- XER.OV32   (32-bit overflow — NOT the V we want)
+//   CR1.EQ (PPC bit 6) <- XER.CA
+//   CR1.SO (PPC bit 7) <- XER.CA32
+//
+// Pre-3.0 path (POWER8), three instructions, mfxer / rotlwi / mtocrf:
+//   CR1.LT (PPC bit 4) <- XER.SO
+//   CR1.GT (PPC bit 5) <- XER.OV
+//   CR1.EQ (PPC bit 6) <- XER.CA
+//   CR1.SO (PPC bit 7) <- 0 (don't care)
 // XER bits in mfspr-result GPR (LSB numbering): SO=31, OV=30, CA=29.
 // rotlwi by 28 maps SO 31->27 (PPC 4), OV 30->26 (PPC 5), CA 29->25 (PPC 6).
 // mtocrf with FXM=0x40 selects only CR1 (single-field form — uncracked where
-// multi-field mtcrf is microcoded; POWER9 UM §4.1.5.6). This is the hot path
-// for every C/V-consuming condition, so the form matters.
+// multi-field mtcrf is microcoded; POWER9 UM §4.1.5.6).
+//
+// Reading the two together: CA lands in CR1.EQ either way, so every C-
+// consuming condition is index-stable. OV moves bit 5 -> bit 4. XER.SO is
+// projected only by the pre-3.0 path and is read by nothing — no MapNZCVCC
+// case returns BI 4 and no composite reads bit 4 on that layout — so the ISA
+// 3.0 path losing SO costs nothing.
+//
+// Register contract: the pre-3.0 path clobbers TMP1/TMP2; the ISA 3.0 path
+// clobbers no GPRs at all. Callers may assume the pre-3.0 (larger) clobber
+// set unconditionally.
+//
+// This is the hot path for every C/V-consuming condition, so the form matters.
+// Measured on POWER9 DD2.2 (SMT=2, numactl node 0, median of 9): mcrxrx is
+// 28.6% faster on a dependent chain (9.08 -> 6.48 ns) and 43.5% faster on four
+// independent streams (1.34 -> 0.76 ns). See build-probes/opbench_xer.c, which
+// also checks the two layouts against ground truth before reporting timings.
 // -------------------------------------------------------------------------
+bool PPC64JITCore::ProjectXERUsesMcrxrx() const {
+  return EmitterCTX->HostFeatures.SupportsISA30;
+}
+
+uint32_t PPC64JITCore::XEROVBitIndex() const {
+  // CR1.LT on the mcrxrx layout, CR1.GT on the pre-3.0 layout.
+  return ProjectXERUsesMcrxrx() ? 4u : 5u;
+}
+
 void PPC64JITCore::ProjectXERToCR1() {
+  if (ProjectXERUsesMcrxrx()) {
+    mcrxrx(1);  // CR1: LT=OV, GT=OV32, EQ=CA, SO=CA32
+    return;
+  }
   mfspr(TMP1, 1);
   rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
   mtocrf(0x40, TMP2);
@@ -1480,10 +1559,19 @@ void PPC64JITCore::ProjectXERToCR1() {
 //
 // CR-bit indices used here (PPC numbering):
 //   CR0.LT=0, CR0.GT=1, CR0.EQ=2
-//   CR1.LT=4 (SO), CR1.GT=5 (OV/V), CR1.EQ=6 (CA/C)
+//   CR1.EQ=6 (CA/C)   — same on both ProjectXERToCR1 layouts
+//   CR1 V bit         — bit 4 (LT) on the ISA 3.0 mcrxrx layout,
+//                       bit 5 (GT) on the pre-3.0 mfxer/rotlwi/mtocrf layout.
+//                       Never hardcode it; use OVBit below, which is derived
+//                       from the same predicate that selects the sequence, so
+//                       the two cannot drift apart.
 //   CR3.LT=12, CR3.GT=13 (used as scratch for composites)
 // -------------------------------------------------------------------------
 PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
+  // Must match whatever ProjectXERToCR1() emits below — both come from
+  // ProjectXERUsesMcrxrx().
+  const uint32_t OVBit = XEROVBitIndex();
+
   switch (Cond) {
   // Z-only (CR0.EQ)
   case IR::CondClass::EQ:  return CC_EQ;       // Z=1
@@ -1495,8 +1583,8 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
   // C / V (need projection)
   case IR::CondClass::UGE: ProjectXERToCR1(); return {12, 6};  // C=1
   case IR::CondClass::ULT: ProjectXERToCR1(); return { 4, 6};  // C=0
-  case IR::CondClass::VS:  ProjectXERToCR1(); return {12, 5};  // V=1
-  case IR::CondClass::VC:  ProjectXERToCR1(); return { 4, 5};  // V=0
+  case IR::CondClass::VS:  ProjectXERToCR1(); return {12, OVBit};  // V=1
+  case IR::CondClass::VC:  ProjectXERToCR1(); return { 4, OVBit};  // V=0
 
   // UGT = C=1 AND Z=0 ; ULE = !UGT
   case IR::CondClass::UGT: ProjectXERToCR1();
@@ -1508,25 +1596,61 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
 
   // SLT = N!=V ; SGE = N==V
   case IR::CondClass::SLT: ProjectXERToCR1();
-                           crxor(12, 0, 5);    // CR3.LT = N XOR V
+                           crxor(12, 0, OVBit);  // CR3.LT = N XOR V
                            return {12, 12};
   case IR::CondClass::SGE: ProjectXERToCR1();
-                           crxor(12, 0, 5);
+                           crxor(12, 0, OVBit);
                            return { 4, 12};
 
   // SGT = (N==V) AND Z=0 ; SLE = !SGT
   case IR::CondClass::SGT: ProjectXERToCR1();
-                           crxor(12, 0, 5);    // CR3.LT = SLT (N XOR V)
-                           crnor(13, 12, 2);   // CR3.GT = NOT (SLT OR Z) = SGT
+                           crxor(12, 0, OVBit);  // CR3.LT = SLT (N XOR V)
+                           crnor(13, 12, 2);     // CR3.GT = NOT (SLT OR Z) = SGT
                            return {12, 13};
   case IR::CondClass::SLE: ProjectXERToCR1();
-                           crxor(12, 0, 5);
+                           crxor(12, 0, OVBit);
                            crnor(13, 12, 2);
                            return { 4, 13};
 
-  // FP conditions on CR0 set by fcmpu. Same as MapCC.
-  case IR::CondClass::FLU:  return CC_LT;
-  case IR::CondClass::FGE:  return CC_GE;
+  // FP conditions on CR0 set by fcmpu / xscmpudp.
+  //
+  // Unordered must be folded into FLU and FGE, and MUST NOT be folded into
+  // FLEU and FGT. Working the four out against the raw compare field, where
+  // NaN sets only SO and leaves LT/GT/EQ all clear:
+  //
+  //   FLU  ("less than or unordered", = Arm LT after fcmp, N!=V)
+  //        CC_LT = {12,0} = "CR0.LT set" -> FALSE on NaN.  WRONG.
+  //   FGE  ("greater or equal", = Arm GE after fcmp, N==V)
+  //        CC_GE = { 4,0} = "CR0.LT clear" -> TRUE on NaN.  WRONG.
+  //   FGT  CC_GT = {12,1} = "CR0.GT set"   -> FALSE on NaN.  Correct:
+  //        x86 `ja` after comiss must not take on unordered (CF=ZF=1).
+  //   FLEU CC_LE = { 4,1} = "CR0.GT clear" -> TRUE on NaN.  Correct:
+  //        "less-or-equal-or-unordered" is supposed to include unordered.
+  //
+  // So exactly FLU and FGE are wrong, and both in the direction that takes
+  // the x86-opposite branch on NaN: `ucomisd; jae` was taken on NaN, where
+  // x86 sets CF=1 on unordered and JAE must NOT take.
+  //
+  // Fix: in the packed-NZCV world V = XER.OV, and DEF_OP(FCmp) lifts the
+  // compare's SO into XER.OV precisely so this works. Project XER into CR1
+  // (CR1.GT = XER.OV = unordered) and fold it into the predicate with the
+  // same CR3.LT composite-scratch discipline the SLT/UGT/SGT cases above
+  // use. Ported from origin/power9 382d0eb60.
+  //
+  // Reachability in THIS tree: X86ToArmFloatCond in
+  // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE,
+  // and it is only called from FoldBranch's AXFLAG arm, which 68217d849
+  // disabled outright. So this is defense-in-depth today. Do NOT read it as
+  // clearance to re-enable that arm: our own analysis found a SECOND,
+  // independent defect there (the ULE -> SLE identity remap, a property of
+  // the shared mapping table rather than of this backend) which this hunk
+  // does not touch. See the block comment at that `return`.
+  case IR::CondClass::FLU:  ProjectXERToCR1();
+                            cror (12, 0, 5);   // CR3.LT =   LT OR UN
+                            return {12, 12};
+  case IR::CondClass::FGE:  ProjectXERToCR1();
+                            crnor(12, 0, 5);   // CR3.LT = !(LT OR UN)
+                            return {12, 12};
   case IR::CondClass::FLEU: return CC_LE;
   case IR::CondClass::FGT:  return CC_GT;
   // FU/FNU in NZCV context = integer overflow (XER.OV via CR1), NOT
@@ -1536,8 +1660,8 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
   // FU→VS / FNU→VC for in-file callers, but BranchOps.cpp::CondJump and
   // any other MapNZCVCC consumers (e.g. INTO at OpcodeDispatcher.cpp:4756)
   // need the correct projection here too.
-  case IR::CondClass::FU:   ProjectXERToCR1(); return {12, 5};   // V=1
-  case IR::CondClass::FNU:  ProjectXERToCR1(); return { 4, 5};   // V=0
+  case IR::CondClass::FU:   ProjectXERToCR1(); return {12, OVBit};   // V=1
+  case IR::CondClass::FNU:  ProjectXERToCR1(); return { 4, OVBit};   // V=0
   default:
     LOGMAN_MSG_A_FMT("MapNZCVCC: unsupported condition");
     return CC_EQ;
@@ -1556,20 +1680,25 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
                      Cond == IR::CondClass::FLEU || Cond == IR::CondClass::FGT ||
                      Cond == IR::CondClass::FU || Cond == IR::CondClass::FNU);
   if (IsFP) {
+    // Register-only compare. The old path spilled both vectors and reloaded
+    // element 0 via lfs/lfd — two guaranteed store-hit-load flushes on one of
+    // the hottest patterns in game code (every fused ucomiss/comiss + jcc).
+    // Element 0 of a guest XMM sits in doubleword 1 (f64) / BE word 3 (f32);
+    // xscmpudp compares doubleword 0, so position first. xscvspdp performs
+    // the same SP->DP promotion lfs did, so NaN/denormal ordering semantics
+    // are unchanged; both paths end in an unordered compare into CRField.
     auto V1 = GetVReg(Src1);
     auto V2 = GetVReg(Src2);
-    addi(TMP1, r1, -32);
-    stvx(V1, r(0), TMP1);
-    addi(TMP2, r1, -16);
-    stvx(V2, r(0), TMP2);
     if (Sz == IR::OpSize::i32Bit) {
-      lfs(PPC64Emitter::FPRegs::f0, -32, r1);
-      lfs(PPC64Emitter::FPRegs::f1, -16, r1);
+      xxsldwi(VTMP1, V1, V1, 3);         // BE w0 <- elem0 (BE w3)
+      xscvspdp(VTMP1, VTMP1);
+      xxsldwi(VTMP2, V2, V2, 3);
+      xscvspdp(VTMP2, VTMP2);
     } else {
-      lfd(PPC64Emitter::FPRegs::f0, -32, r1);
-      lfd(PPC64Emitter::FPRegs::f1, -16, r1);
+      xxpermdi(VTMP1, V1, V1, 0b10);     // dw0 <- dw1
+      xxpermdi(VTMP2, V2, V2, 0b10);
     }
-    fcmpu(cr(CRField), PPC64Emitter::FPRegs::f0, PPC64Emitter::FPRegs::f1);
+    xscmpudp(CRField, VTMP1, VTMP2);
     return;
   }
 
@@ -2000,14 +2129,23 @@ uint32_t PPC64EncodeBranch(int64_t Delta) {
 
 // Single atomic 4-byte instruction rewrite + icache maintenance. The store
 // is naturally atomic (4-byte aligned); atomic_ref documents the intent and
-// forbids tearing at the C++ level. __builtin___clear_cache lowers to
-// dcbst; sync; icbi; isync on ppc64le — icbi is broadcast on POWER9, so
-// remote harts stop fetching the stale word once this returns; instructions
-// already in a remote pipeline may still retire as the OLD word, which every
-// transition above tolerates (old word is always a correct-behaviour path).
+// forbids tearing at the C++ level. FlushICacheRange issues
+// dcbst; sync; icbi; sync; isync for the containing cache block — icbi is
+// broadcast on POWER9, so remote harts stop fetching the stale word once this
+// returns; instructions already in a remote pipeline may still retire as the
+// OLD word, which every transition above tolerates (old word is always a
+// correct-behaviour path).
+//
+// This used to call __builtin___clear_cache, which emits NO cache maintenance
+// on ppc64le with either compiler in this toolchain (see
+// FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h for the measurement). That made
+// the broadcast-icbi argument above vacuous, and on the DELINK direction —
+// PPC64DirectBlockDelinker / PPC64IndirectBlockDelinker below — a missed
+// invalidate can leave a remote hart fetching a live branch INTO a block that
+// is being invalidated. That is a correctness hazard, not a lost optimisation.
 void PPC64PatchInstruction(uintptr_t Address, uint32_t Word) {
   std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Address)).store(Word, std::memory_order_relaxed);
-  __builtin___clear_cache(reinterpret_cast<char*>(Address), reinterpret_cast<char*>(Address) + 4);
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Address), 4);
 }
 
 // Both delinkers run under the LookupCache WRITE lock (GuestToHostMap::Erase
@@ -2112,8 +2250,9 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
     // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
-    // between. __builtin___clear_cache orders nothing for REMOTE observers
-    // and runs after both stores anyway — without the hwsync a remote hart
+    // between. The icache maintenance inside PPC64PatchInstruction runs after
+    // BOTH stores, so its own `sync` cannot order one against the other —
+    // without the hwsync here a remote hart
     // can fetch the new bcl leg and still read a stale HostCode, branching
     // to garbage. Sequence: store HostCode; hwsync; store patch word;
     // icache maintenance. hwsync's cumulativity guarantees any hart that
@@ -2322,6 +2461,10 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // still serialize the (unread-when-unlinked, but stale) HostCode fields
   // and needs a walk ordered against every thread's compile activity.
   BlockLinkingEnabled = CTX->Config.BlockLinking() && !FEXCore::Config::Get_ENABLECODECACHINGWIP();
+
+  // Spin-loop SMT priority hints: pure nop-class emission, safe under every
+  // other feature combination, so only the explicit kill switch gates it.
+  SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
 
   // SMC interlocks: two fork features are only sound when every constant-target
   // exit re-probes the lookup path, which is exactly what a established direct
@@ -3020,6 +3163,347 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 #endif
 
 // -------------------------------------------------------------------------
+// AnalyzeSpinLoops: mark spin-loop backedges/exits for SMT priority hints
+//
+// A "spin loop" here is a tiny backward-branching region that only polls
+// memory and computes: <=3 blocks, <=64 IR ops, at least one memory load,
+// and no side effects beyond guest register/flag state and control flow.
+// No stores, no atomics, no syscalls -- a loop that writes shared state is
+// making progress and must not be deprioritized.
+//
+// For each detected region, the backedge gets `or r31,r31,r31` (SMT very-low
+// priority) and every edge leaving the region gets `or r2,r2,r2` (medium,
+// the default) so real work never runs deprioritized. Both are architectural
+// nops: misdetection cannot alter semantics, only dispatch priority. The
+// dispatcher loop top carries a medium-priority safety net for paths that
+// leave a spin region through a signal/suspend detour instead of a marked
+// edge (the kernel also restores medium on every syscall entry).
+//
+// Motivation: CP2077's redDispatcher work-steal spin was 25% of the whole
+// process's samples across 19 threads; its iteration-counted budget means
+// emulation slowness multiplies spin wall time, and on SMT the spin steals
+// dispatch bandwidth from the sibling thread (audio). See
+// cp2077-reddispatcher-spin-anatomy.
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// 32-bit tail-mask elision prepass. See the Elide32MaskSet block comment in
+// JITClass.h for the soundness argument (single use + immediately-next-op +
+// encoding reads only low 32 bits of that operand position).
+//
+// Per-consumer verification notes (all against the emitting handler, not
+// assumed from the ISA index):
+//  * CondJump, !FromNZCV, no VCmp fusion, Cond not TSTZ/TSTNZ, CompareSize
+//    i32: EmitCompare's i32 arm emits cmplw/cmplwi/cmpw/cmpwi exclusively —
+//    word compares read bits 32:63 only. TSTZ/TSTNZ excluded because the
+//    rldicl bit-extract can address a high bit.
+//  * Lshl/Lshr/Ashr at Size <= i32: value operand is read by
+//    rlwinm/slw/srw/extsw (low word only); the register shift count is
+//    pre-masked with rldicl(...,0,59) (low 5 bits).
+//  * Mul/UMul at Size <= i32: mullw reads low words; mulli's low-32 product
+//    depends only on the low 32 of RA (multiplication mod 2^32). The
+//    handler's own tail mask re-canonicalizes the polluted high half.
+//  * StoreMem, GPR class, Size <= i32: EmitStoreGPR emits stw/sth/stb for
+//    the value. Only the Value operand qualifies — Addr/Offset feed address
+//    arithmetic that reads all 64 bits.
+// -------------------------------------------------------------------------
+void PPC64JITCore::Compute32MaskElision() {
+  static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
+  static const bool ZExtOff = ZExtEnv && ZExtEnv[0] == '0';
+  Elide32MaskSet.assign(IR->GetSSACount(), false);
+  if (ZExtOff) {
+    return;
+  }
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    IR::Ref PrevNode = nullptr;
+    const IR::IROp_Header* PrevOp = nullptr;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      // Emission no-ops (Op_NoOp table entries) are transparent to the
+      // "immediately next op" adjacency test: they emit no host code and, as
+      // non-uses, cannot spill or observe the pending def. Without this the
+      // inline-constant node between a def and its compare-with-immediate
+      // consumer (the LZMA hot-loop shape) defeats every elision.
+      switch (IROp->Op) {
+      case IR::OP_DUMMY:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      // GuestOpcode markers only record (guest RIP, host PC) table entries —
+      // zero host instructions (see DEF_OP(GuestOpcode)). A marker between
+      // def and consumer relabels the guest boundary but adds nothing
+      // observable: async signals defer to drain points, and the window
+      // still contains no faulting host instruction (register-writing
+      // consumers cannot fault; faulting consumers like stores have no dest
+      // and are excluded for GPRFixed defs). Without this skip, the marker
+      // in front of every guest instruction defeats every cross-instruction
+      // elision — which is all of them.
+      case IR::OP_GUESTOPCODE: continue;
+      default: break;
+      }
+
+      const IR::Ref DefNode = PrevNode;
+      const IR::IROp_Header* DefOp = PrevOp;
+      PrevNode = CodeNode;
+      PrevOp = IROp;
+
+      if (!DefOp || !IR::GetHasDest(DefOp->Op)) {
+        continue;
+      }
+      // Two def shapes qualify: an i32-sized ALU op (its handler emits the
+      // rldicl tail via Mask32Tail — the 32-bit-guest idiom), or the 64-bit
+      // frontend's canonicalizing Bfe(#32,#0) itself (the whole op IS the
+      // mask; DEF_OP(Bfe) degenerates it to mr/nothing when elided).
+      bool DefIsMask = DefOp->Size == IR::OpSize::i32Bit;
+      if (!DefIsMask && DefOp->Op == IR::OP_BFE && DefOp->Size == IR::OpSize::i64Bit) {
+        auto B = DefOp->C<IR::IROp_Bfe>();
+        DefIsMask = B->Width == 32 && B->lsb == 0;
+      }
+      if (!DefIsMask) {
+        continue;
+      }
+      const IR::PhysicalRegister DefPR(DefNode);
+      const auto DefClass = DefPR.AsRegClass();
+      if (DefClass != IR::RegClass::GPR && DefClass != IR::RegClass::GPRFixed) {
+        continue;
+      }
+      if (DefNode->GetUses() != 1) {
+        continue;
+      }
+      const auto DefID = IR->GetID(DefNode);
+      // Post-RA, consumer args are usually immediate-encoded PhysicalRegisters
+      // (see GetReg(OrderedNodeWrapper)) — node identity is gone. Matching by
+      // register is exact here BECAUSE of the adjacency precondition: no host
+      // instruction is emitted between the def and this consumer, so the
+      // register still holds precisely the def's value. Node-ref args (e.g.
+      // wrappers to InlineConstant nodes) keep the ID comparison.
+      const auto IsDef = [&DefPR, DefID, this](IR::OrderedNodeWrapper Arg) {
+        if (Arg.IsInvalid()) {
+          return false;
+        }
+        if (Arg.IsImmediate()) {
+          return IR::PhysicalRegister(Arg).Raw == DefPR.Raw;
+        }
+        return IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
+      };
+
+      bool Elide = false;
+      switch (IROp->Op) {
+      case IR::OP_CONDJUMP: {
+        auto Op = IROp->C<IR::IROp_CondJump>();
+        if (!Op->FromNZCV && Op->VCmpElementSize == IR::OpSize::iInvalid &&
+            Op->Cond != IR::CondClass::TSTZ && Op->Cond != IR::CondClass::TSTNZ &&
+            Op->CompareSize == IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Cmp1) || IsDef(Op->Cmp2);
+        }
+        break;
+      }
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_MUL:
+      case IR::OP_UMUL: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_STOREMEM: {
+        auto Op = IROp->C<IR::IROp_StoreMem>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      case IR::OP_STOREMEMTSO: {
+        // Same narrow-store value path as StoreMem (GetReg(Op->Value) into
+        // stw/sth/stb); the lwsync release barrier reads no register.
+        auto Op = IROp->C<IR::IROp_StoreMemTSO>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      default: break;
+      }
+
+      // A GPRFixed def IS an architectural guest register (RA coalesced the
+      // write onto the SRA slot — this is the common case in hot loops). The
+      // single-use/next-op argument alone is not enough there: the SRA
+      // register would keep the unmasked value until something overwrites
+      // it, and a synchronous fault in a LATER guest instruction would
+      // present garbage high bits as architectural state. Sound iff the
+      // consumer overwrites the SAME fixed register in the very next op
+      // (the x86 read-modify-write chain shape, e.g. sub edi,X / shr edi,N)
+      // — the window between the two host instructions contains no
+      // observation point: async signals defer to drain points, and no
+      // faulting instruction sits between def and overwrite. Every table
+      // consumer with a dest writes it canonically or re-masks (rlwinm/
+      // slw/srw are low-32 by construction; mullw keeps its own tail mask
+      // unless ITS consumer also passed this same test — induction holds).
+      if (Elide && DefClass == IR::RegClass::GPRFixed) {
+        if (!IR::GetHasDest(IROp->Op)) {
+          Elide = false;
+        } else {
+          const IR::PhysicalRegister UsePR(CodeNode);
+          if (UsePR.Raw != DefPR.Raw) {
+            Elide = false;
+          }
+        }
+      }
+
+      if (Elide) {
+        Elide32MaskSet[DefID.Value] = true;
+      }
+    }
+  }
+}
+
+void PPC64JITCore::AnalyzeSpinLoops() {
+  struct BlockInfo {
+    uint32_t ID = UINT32_MAX;
+    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX};  // CodeBlock IDs
+    uint32_t OpCount = 0;
+    bool Clean = false;
+    bool HasPollLoad = false;
+  };
+
+  fextl::vector<BlockInfo> Blocks;
+  const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
+  Blocks.reserve(NumBlocks);
+  // CodeBlock ID -> layout index (IDs are dense 0..NumBlocks-1, same keying
+  // as JumpTargets).
+  fextl::vector<uint32_t> IdxOfID(NumBlocks, UINT32_MAX);
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    BlockInfo Info {};
+    Info.ID = BlockIROp->ID;
+    Info.Clean = true;
+
+    // The block's branch terminator. NOTE: it is not the final op in the
+    // code list -- every block carries a trailing EndBlock marker after the
+    // branch -- so capture it when the switch sees it.
+    const FEXCore::IR::IROp_Header* Term = nullptr;
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      ++Info.OpCount;
+      switch (IROp->Op) {
+      case IR::OP_LOADMEM:
+      case IR::OP_LOADMEMTSO:
+        Info.HasPollLoad = true;
+        break;
+      // Side-effecting ops that are still pure "this thread's guest state":
+      // register/flag/context writes and control flow. Anything else with
+      // side effects (stores, atomics, syscalls, cache ops, ...) disqualifies
+      // the block.
+      case IR::OP_STOREREGISTER:
+      case IR::OP_STORECONTEXT:
+      case IR::OP_STORENZCV:
+      case IR::OP_STOREPF:
+      case IR::OP_STOREAF:
+      case IR::OP_CONDJUMP:
+      case IR::OP_JUMP:
+        Term = IROp;
+        break;
+      case IR::OP_GUESTOPCODE:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      // Pseudo-ops that carry HasSideEffects only as an optimizer barrier;
+      // they emit no code (InlineConstant/InlineEntrypointOffset are folded
+      // into their consumers).
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+        break;
+      default:
+        if (IR::HasSideEffects(IROp->Op)) {
+          Info.Clean = false;
+        }
+        break;
+      }
+    }
+
+    if (Term != nullptr && Term->Op == IR::OP_CONDJUMP) {
+      auto Op = Term->C<IR::IROp_CondJump>();
+      Info.Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock)->ID;
+      Info.Targets[1] = IR->GetOp<IR::IROp_CodeBlock>(Op->FalseBlock)->ID;
+    } else if (Term != nullptr && Term->Op == IR::OP_JUMP) {
+      auto Op = Term->C<IR::IROp_Jump>();
+      Info.Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Op->TargetBlock)->ID;
+    } else {
+      // Region blocks must end in plain control flow (ExitFunction, Break,
+      // ... terminators leave the compile unit and can't be hint-tracked).
+      Info.Clean = false;
+    }
+
+    if (Info.ID < NumBlocks) {
+      IdxOfID[Info.ID] = static_cast<uint32_t>(Blocks.size());
+    }
+    Blocks.push_back(Info);
+  }
+
+  constexpr uint32_t MaxRegionBlocks = 3;
+  constexpr uint32_t MaxRegionOps = 64;
+
+  auto PushUnique = [](fextl::vector<uint64_t>& Vec, uint64_t Key) {
+    for (const auto V : Vec) {
+      if (V == Key) {
+        return;
+      }
+    }
+    Vec.push_back(Key);
+  };
+
+  for (uint32_t bi = 0; bi < Blocks.size(); ++bi) {
+    for (const uint32_t TargetID : Blocks[bi].Targets) {
+      if (TargetID == UINT32_MAX || TargetID >= NumBlocks) {
+        continue;
+      }
+      const uint32_t ti = IdxOfID[TargetID];
+      if (ti == UINT32_MAX || ti > bi) {
+        continue;  // forward edge
+      }
+      if (bi - ti + 1 > MaxRegionBlocks) {
+        continue;
+      }
+      // Validate the candidate region [ti, bi].
+      uint32_t TotalOps = 0;
+      bool Clean = true;
+      bool HasPollLoad = false;
+      for (uint32_t ri = ti; ri <= bi; ++ri) {
+        TotalOps += Blocks[ri].OpCount;
+        Clean &= Blocks[ri].Clean;
+        HasPollLoad |= Blocks[ri].HasPollLoad;
+      }
+      if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
+        continue;
+      }
+      PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      // Every edge from a region block to a block outside [ti, bi] restores
+      // medium priority.
+      for (uint32_t ri = ti; ri <= bi; ++ri) {
+        for (const uint32_t T : Blocks[ri].Targets) {
+          if (T == UINT32_MAX || T >= NumBlocks) {
+            continue;
+          }
+          const uint32_t tidx = IdxOfID[T];
+          if (tidx < ti || tidx > bi) {
+            PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+          }
+        }
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
 CPUBackend::CompiledCode PPC64JITCore::CompileCode(
@@ -3259,6 +3743,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     CallReturnEntryLabels.resize(NumBlocks, {});
   }
 
+  // Detect tiny memory-polling loops and mark their backedges/exit edges for
+  // SMT priority hints (see JITClass.h and DEF_OP(CondJump)/DEF_OP(Jump)).
+  SpinBackedges.clear();
+  SpinRestoreEdges.clear();
+  if (SpinLoopHintEnabled) {
+    AnalyzeSpinLoops();
+  }
+
   // Belt-and-suspenders: any pending forward-branch fixups left over from a
   // prior compilation (which would also be a bug) point into a buffer that
   // no longer exists; drop them.
@@ -3331,6 +3823,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     REGISTER_OP(VMADDPAIRWISE16,   VMaddPairwise16);
     REGISTER_OP(VEXTRACTSIGNBITS,  VExtractSignBits);
     REGISTER_OP(VANYNONZERO,       VAnyNonZero);
+    REGISTER_OP(LOADMEMREV,        LoadMemRev);
+    REGISTER_OP(STOREMEMREV,       StoreMemRev);
 
     // x87 stack-bookkeeping ops (X87Ops.cpp). These are NOT in the
     // auto-generated IRDefines_Dispatch.inc — IR.json marks them as JIT-not-
@@ -3423,8 +3917,99 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // Intra-block jumps skip the stdu because the calling block already has
   // the frame live; dispatcher hits run the stdu. Both paths balance at
   // ExitFunction's ResetStack.
+  //
+  // Per-op live-in masks for the dynamic FPR pool (bit i = RAFPR pool index
+  // i), keyed by node ID. Feeds DynVRSpillMask so helper calls save only the
+  // vector values actually live across them. Exact, not heuristic: RA is
+  // strictly block-local (every class starts each block with all registers
+  // available — RegisterAllocationPass.cpp Run()), so a backward
+  // physical-register scan per block sees every live range. The op's own dest
+  // is defensively INCLUDED (some handler shapes write the dest before the
+  // helper call; saving a possibly-garbage register is harmless, losing a
+  // written one is not). FEX_NO_ABI_LIVEMASK reverts to full saves for A/B.
+  static const bool DisableABILiveMask = getenv("FEX_NO_ABI_LIVEMASK") != nullptr;
+  fextl::vector<uint32_t> DynVRLiveIn;
+  if (!DisableABILiveMask) {
+    DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
+  }
+
+  Compute32MaskElision();
+
+  // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
+  // per block, in the exact order the loop below emits them. See the
+  // FallthroughBlockID comment in JITClass.h for why EntryPoint successors
+  // are never fallthrough candidates.
+  // Fallthrough elision measured a ~4.7% REGRESSION on a tight RMW microloop:
+  // removing the loop terminator branch shifts loop-top alignment, and POWER8
+  // fetch groups punish that more than the saved branch pays. Opt-in via
+  // FEX_FALLTHROUGH=1 until backward-branch-target alignment lands.
+  static const bool DisableFallthrough = getenv("FEX_FALLTHROUGH") == nullptr;
+  fextl::vector<std::pair<uint32_t, bool>> BlockEmissionOrder;
+  if (!DisableFallthrough) {
+    BlockEmissionOrder.reserve(IRView->GetHeader()->BlockCount);
+    for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
+      auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+      BlockEmissionOrder.emplace_back(BlockIROp->ID, BlockIROp->EntryPoint);
+    }
+  }
+  size_t BlockEmissionIdx = 0;
+
   for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    CurrentBlockID = BlockIROp->ID;
+
+    FallthroughBlockID = UINT32_MAX;
+    if (!DisableFallthrough) {
+      const size_t Next = BlockEmissionIdx + 1;
+      if (Next < BlockEmissionOrder.size() && !BlockEmissionOrder[Next].second) {
+        FallthroughBlockID = BlockEmissionOrder[Next].first;
+      }
+      ++BlockEmissionIdx;
+    }
+
+    if (!DynVRLiveIn.empty()) {
+      // Backward scan: Live holds the live-after set of the op under the
+      // cursor; live-before = (live-after − def) ∪ uses. Args of inline
+      // constants and other non-RA'd references carry an Invalid class byte
+      // and fall out of the RegClass::FPR test; a stray false positive would
+      // only add a redundant save, never lose one.
+      uint32_t Live = 0;
+      auto CodeBegin = IRView->at(BlockIROp->Begin);
+      auto CodeLast = IRView->at(BlockIROp->Last);
+      while (1) {
+        auto [CodeNode, IROp] = CodeLast();
+
+        uint32_t Def = 0;
+        if (IR::GetHasDest(IROp->Op)) {
+          const IR::PhysicalRegister PR(CodeNode);
+          if (PR.AsRegClass() == IR::RegClass::FPR) {
+            Def = 1u << PR.Reg;
+          }
+        }
+
+        uint32_t Use = 0;
+        const int NumArgs = IR::GetRAArgs(IROp->Op);
+        for (int i = 0; i < NumArgs; ++i) {
+          const auto Arg = IROp->Args[i];
+          if (Arg.IsInvalid()) {
+            continue;
+          }
+          const IR::PhysicalRegister PR =
+            Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
+          if (PR.AsRegClass() == IR::RegClass::FPR) {
+            Use |= 1u << PR.Reg;
+          }
+        }
+
+        Live = (Live & ~Def) | Use;
+        DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
+
+        if (CodeLast == CodeBegin) {
+          break;
+        }
+        --CodeLast;
+      }
+    }
 
     // Start of this IR block's out-of-band prologue (EntryPoint marker store,
     // suspend check, spill-frame stdu). Attributed to a synthetic bucket, not
@@ -3502,11 +4087,28 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // the cursor, so the prologue delta is complete here.
     Bind(JumpTarget(BlockNode));
 
+    // A block can be entered from anywhere; nothing about the previously
+    // emitted block's trailing register contents may be assumed here.
+    InvalidateAESCache();
+
     PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
       uint16_t Op = static_cast<uint16_t>(IROp->Op);
+
+      // AES mask-cache: only the AES-family handlers keep the vs12-parked
+      // byte-reverse mask alive (see EmitAESLoadMask). Any other op may
+      // clobber VTMP3_VSX or emit a host call, so the park dies here. The
+      // AES handlers' own Op_Unhandled bail paths invalidate explicitly.
+      switch (IROp->Op) {
+      case IR::OP_VAESENC:
+      case IR::OP_VAESENCLAST:
+      case IR::OP_VAESDEC:
+      case IR::OP_VAESDECLAST:
+      case IR::OP_VAESIMC: break;
+      default: InvalidateAESCache(); break;
+      }
 
       // Op-size profiler: the emitter cursor is the only ground truth for how
       // much host code a handler produced. Sampling it immediately either side
@@ -3519,11 +4121,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // the op that emitted it, which is what we want.)
       [[maybe_unused]] const size_t OpStart = GetOffset();
 
+      // Any helper call this op emits saves only the dynamic VRs live across
+      // it (DynVRSpillMask contract, PPC64Emitter.h). Reset right after the
+      // handler: everything emitted outside a per-op context (block-link
+      // thunks, deferred stubs at the CompileCode tail) must stay
+      // conservative.
+      if (!DynVRLiveIn.empty()) {
+        DynVRSpillMask = DynVRLiveIn[IRView->GetID(CodeNode).Value];
+      }
       if (Op <= static_cast<uint16_t>(IR::IROps::OP_LAST)) {
         (this->*OpHandlers[Op])(IROp, CodeNode);
       } else {
         Op_Unhandled(IROp, CodeNode);
       }
+      DynVRSpillMask = ~0u;
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
                           Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? static_cast<size_t>(Op) :
@@ -3681,9 +4292,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // block at a code-buffer offset whose underlying page was previously
   // executed as different host code. ARM64's CompileCode does the equivalent
   // via ClearICache (FEXCore/Source/Interface/Core/JIT/JIT.cpp:1123).
-  // __builtin___clear_cache lowers to dcbst/sync/icbi/isync on PPC64.
-  __builtin___clear_cache(reinterpret_cast<char*>(CodeData.BlockBegin),
-                          reinterpret_cast<char*>(CodeData.BlockBegin) + CodeSize);
+  //
+  // This was __builtin___clear_cache until 2026-08-13. On ppc64le that builtin
+  // emits nothing with gcc and an empty libgcc stub call with clang, i.e. this
+  // — the primary code-publication point of the whole backend — performed no
+  // cache maintenance at all. See FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(CodeData.BlockBegin), CodeSize);
 
   CodeBuffers.LatestOffset += CodeSize;
 

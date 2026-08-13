@@ -111,6 +111,26 @@ void PPC64EmitterBase::SpillStaticRegs(GPR tmp) {
     stvx(SRAFPR[i], STATE, tmp);
   }
 
+  // AVX-high bank -> State.avx_high[i]. Memory image must be byte-identical
+  // to a stvx of the same value (SpillSRA and the guest sigframe XSTATE
+  // builder read avx_high[] as ordinary LE 128-bit values): stxvx has that
+  // layout natively on ISA 3.0; pre-3.0 goes dword-swapped stxvd2x with an
+  // xxpermdi fix-up through VTMP3_VSX (op-local scratch, same idiom as
+  // StoreUnalignedV128's pre-3.0 path).
+  if (EmitterCTX->HostFeatures.SupportsAVX) {
+    for (size_t i = 0; i < SRAFPR.size(); ++i) {
+      int32_t off = static_cast<int32_t>(
+        offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[i][0]));
+      LoadImm32(tmp, static_cast<uint32_t>(off));
+      if (EmitterCTX->HostFeatures.SupportsISA30) {
+        stxvx(AVXHighBankReg(i), STATE, tmp);
+      } else {
+        xxpermdi(VTMP3_VSX, AVXHighBankReg(i), AVXHighBankReg(i), 2);
+        stxvd2x(VTMP3_VSX, STATE, tmp);
+      }
+    }
+  }
+
   // Save NZCV across the dispatcher / C++ slow paths. Pack CR0 + XER into the
   // ARM-style 32-bit NZCV layout (N=LSB31, Z=30, C=29, V=28) and store at
   // flags[RFLAG_NZCV_LOC..NZCV_3_LOC]. Mirrors DEF_OP(LoadNZCV) bit shuffles.
@@ -242,6 +262,24 @@ void PPC64EmitterBase::FillStaticRegs(FillMode Mode) {
       offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data[i][0]));
     LoadImm32(TMP1, static_cast<uint32_t>(xmm_off));
     lvx(SRAFPR[i], STATE, TMP1);
+  }
+
+  // State.avx_high[i] -> AVX-high bank. Mirror of the spill above; runs on
+  // every dispatcher entry, which is what makes context memory writes by
+  // non-JIT code (guest signal handlers via sigreturn, gdbserver, thread
+  // bring-up) reach the registers.
+  if (EmitterCTX->HostFeatures.SupportsAVX) {
+    for (size_t i = 0; i < SRAFPR.size(); ++i) {
+      int32_t off = static_cast<int32_t>(
+        offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[i][0]));
+      LoadImm32(TMP1, static_cast<uint32_t>(off));
+      if (EmitterCTX->HostFeatures.SupportsISA30) {
+        lxvx(AVXHighBankReg(i), STATE, TMP1);
+      } else {
+        lxvd2x(VTMP3_VSX, STATE, TMP1);
+        xxpermdi(AVXHighBankReg(i), VTMP3_VSX, VTMP3_VSX, 2);
+      }
+    }
   }
 
   // Restore NZCV across the dispatcher / C++ slow paths. Inverse of the
@@ -424,6 +462,9 @@ size_t PPC64EmitterBase::PushDynamicRegs(GPR tmp) {
     if (RAFPR[i].idx >= 20) {
       continue;  // v20-v31: ELFv2 callee-saved
     }
+    if (!(DynVRSpillMask & (1u << i))) {
+      continue;  // not live across this call (see DynVRSpillMask contract)
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(tmp, static_cast<uint32_t>(off));
     stvx(RAFPR[i], r1, tmp);
@@ -444,12 +485,52 @@ void PPC64EmitterBase::PopDynamicRegs() {
     if (RAFPR[i].idx >= 20) {
       continue;  // v20-v31: ELFv2 callee-saved, never spilled
     }
+    if (!(DynVRSpillMask & (1u << i))) {
+      continue;  // not spilled by PushDynamicRegs (mask unchanged in between)
+    }
     int32_t off = static_cast<int32_t>(FPRStart + i * 16);
     LoadImm32(TMP1, static_cast<uint32_t>(off));
     lvx(RAFPR[i], r1, TMP1);
   }
 
   addi(r1, r1, static_cast<int16_t>(SaveSize));
+}
+
+// FABI-callsite caller-save of the live volatile dynamic VRs. The FABI bridge
+// stubs (PPC64Dispatcher::GenerateABICall) are shared across every callsite,
+// so they cannot know which dynamic VRs are live — their Push/PopDynamicRegs
+// run under mask 0 and the two callsite emitters bracket the bctrl with this
+// pair instead, storing into the callsite's own scratch frame. Slots are
+// packed by SAVED register (k counts set mask bits, not pool indices) so the
+// save/restore loops must stay in lockstep — both iterate the same mask.
+void PPC64EmitterBase::SaveDynVRsToFrame(int32_t BaseOffset) {
+  const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
+  const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
+
+  int32_t off = BaseOffset;
+  for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20 || !(DynVRSpillMask & (1u << i))) {
+      continue;
+    }
+    LoadImm32(TMP3, static_cast<uint32_t>(off));
+    stvx(RAFPR[i], r1, TMP3);
+    off += 16;
+  }
+}
+
+void PPC64EmitterBase::RestoreDynVRsFromFrame(int32_t BaseOffset) {
+  const bool Is64Bit = EmitterCTX->Config.Is64BitMode();
+  const auto RAFPR = Is64Bit ? std::span<const VR>(x64::RAFPR) : std::span<const VR>(x32::RAFPR);
+
+  int32_t off = BaseOffset;
+  for (size_t i = 0; i < RAFPR.size(); ++i) {
+    if (RAFPR[i].idx >= 20 || !(DynVRSpillMask & (1u << i))) {
+      continue;
+    }
+    LoadImm32(TMP3, static_cast<uint32_t>(off));
+    lvx(RAFPR[i], r1, TMP3);
+    off += 16;
+  }
 }
 
 // Unaligned 128-bit load/store.
@@ -466,9 +547,9 @@ void PPC64EmitterBase::PopDynamicRegs() {
 //     DOUBLEWORD-SWAPPED image (dword[0] = LE int mem[EA..7], dword[1] =
 //     LE int mem[EA+8..15]); xxpermdi DM=2 (T.dw0 = A.dw1, T.dw1 = B.dw0)
 //     swaps the halves — 2 instructions.
-// Register-contract change vs the bounce: these paths clobber NO TMP GPRs.
-// The store's pre-3.0 path clobbers one vector temp (VTMP2, or VTMP1 when
-// src==VTMP2); no current caller keeps VTMP1/VTMP2 live across these helpers.
+// Register-contract change vs the bounce: these paths clobber NO TMP GPRs
+// and NO VMX registers. The store's pre-3.0 path swaps through VTMP3_VSX
+// (vs12, the RA-invisible low bank) — it used to burn VTMP2/VTMP1.
 // Fault behaviour: si_addr/DAR precision for lxvx/stxvx across protected page
 // boundaries was measured good on the target (POWER9 DD2.2, Radix) in all
 // first/second/both-page patterns — see docs/POWER9_PORT_PLAN.md §2.1.
@@ -490,10 +571,12 @@ void PPC64EmitterBase::StoreUnalignedV128(VR src, GPR ea) {
     return;
   }
   // Pre-3.0 VSX fallback: stxvd2x writes the doubleword-swapped image, so
-  // swap into a scratch VR first (src must be preserved for the caller).
-  const VR VScratch = (src == VTMP2) ? VTMP1 : VTMP2;
-  xxpermdi(VScratch, src, src, 2);
-  stxvd2x(VScratch, ea, GPRegs::r0);
+  // swap into a scratch first (src must be preserved for the caller). The
+  // scratch is VTMP3_VSX from the RA-invisible low bank — both consumers
+  // (xxpermdi, stxvd2x) are VSX-form so they can encode it, and using it
+  // instead of VTMP1/VTMP2 means this path clobbers NO VMX register at all.
+  xxpermdi(VTMP3_VSX, toVSX(src), toVSX(src), 2);
+  stxvd2x(VTMP3_VSX, ea, GPRegs::r0);
 }
 
 // x86 sub-128-bit FPR memory ops (vmovd/vmovq/vmov{ss,sd}) write/read only
@@ -530,20 +613,21 @@ void PPC64EmitterBase::StoreFPRSized(VR src, GPR ea, uint32_t size) {
   // dword[1]. Nothing outside the `size` bytes is written, which is the
   // whole point of not using stvx here (hello_static __tls_init_tp SEGV).
   //
-  // src must be preserved for the caller, so permute into a vector scratch:
-  // VTMP2, or VTMP1 when src is VTMP2. Same scratch choice, and therefore
-  // the same clobber contract, as the pre-3.0 StoreUnalignedV128 path.
+  // src must be preserved for the caller, so permute into VTMP3_VSX (the
+  // RA-invisible low-bank scratch) — same choice, and therefore the same
+  // clobbers-no-VMX-register contract, as the pre-3.0 StoreUnalignedV128
+  // path. All three consumers here are VSX-form, which is what makes the
+  // low bank encodable at all.
   // stxsdx is ISA 2.06 and stxsiwx ISA 2.07, so both are POWER8-legal with
   // no feature gate — matching the ungated lxsdx/lxsiwzx on the load side.
   // `ea` sits in RA (where RA=0 would mean literal zero), so it must not be
   // r0; that is already the documented precondition for these helpers.
   if (size == 4 || size == 8) {
-    const VR VScratch = (src == VTMP2) ? VTMP1 : VTMP2;
-    xxpermdi(VScratch, src, src, 2);
+    xxpermdi(VTMP3_VSX, toVSX(src), toVSX(src), 2);
     if (size == 8) {
-      stxsdx(VScratch, ea, GPRegs::r0);
+      stxsdx(VTMP3_VSX, ea, GPRegs::r0);
     } else {
-      stxsiwx(VScratch, ea, GPRegs::r0);
+      stxsiwx(VTMP3_VSX, ea, GPRegs::r0);
     }
     return;
   }

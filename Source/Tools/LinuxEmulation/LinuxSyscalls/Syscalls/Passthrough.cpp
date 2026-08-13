@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/ThreadManager.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -25,6 +26,8 @@ $end_info$
 #include <sched.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -430,53 +433,166 @@ static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
   return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
 }
 
-// Phase C of SyscallObserver: futex wrapper. Same shape as the tgkill
-// wrapper -- bare passthrough for the syscall, observer for side effects.
-// OnFutexReturn tracks per-thread EAGAIN streaks and signals ThenYield
-// when a livelock pattern is detected (FEX_SYSCALLOBSERVE + FEX_FUTEXMITIGATE
-// both required). When neither knob is set, OnFutexReturn short-circuits
-// on a single bool load and returns JustReturn -- essentially free.
-static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
-                                    uint64_t uaddr, uint64_t futex_op, uint64_t val,
-                                    uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
-  uint64_t result =
-    SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
+// True when this thread has a signal that will ACTUALLY reach guest code on
+// the next drain. Filtering matters in both directions this predicate is
+// used: a deferred frame whose signal is guest-masked, SIG_IGN, or
+// default-ignore (a Wine process's SIGCHLD, typically) is parked or dropped
+// at drain time, never delivered — synthesizing an EINTR for it would
+// fabricate an interruption no real kernel produces, and suppressing a
+// restart for it would leak the same. See
+// SignalDelegator::ThreadHasDeliverableGuestSignal for the filter.
+static bool HasGuestDeliverableSignal(FEXCore::Core::CpuStateFrame* Frame) {
+  auto* TSO = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+  return FEX::HLE::_SyscallHandler->GetSignalDelegator()->ThreadHasDeliverableGuestSignal(TSO);
+}
 
+// Non-static: also the terminal stage of the x32 classic futex(240) handler
+// (x32/Thread.cpp), which converts its timespec32 and forwards here so both
+// bitnesses share the deferred-signal guard, restart logic and diagnostics.
+uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
+                              uint64_t uaddr, uint64_t futex_op, uint64_t val,
+                              uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
   // PPC64LE strips SA_RESTART from every host sigaction (SignalDelegator.cpp:
   // the deferred-signal queue drains on the -EINTR unwind of HandleSyscall).
-  // Consequence: FEX-INTERNAL async signals — thread-suspend pokes, code-
-  // invalidation IPIs — interrupt guest futex waits and leak a spurious EINTR
-  // the guest never asked for. Native x86 apps see EINTR only for signals they
-  // actually receive; Unity's semaphore wrapper logs "Failed to wait on a
-  // semaphore (Interrupted system call)" and its render thread parks forever
-  // (Ziggurat wedges at init with a black window).
+  // Two consequences meet here, pulling in opposite directions:
   //
-  // Restart the wait when the interruption was internal-only: nothing queued
-  // for guest delivery (no deferred frame, no newly-pending signal) means the
-  // guest must not observe an interruption at all. Restart is restricted to
-  // shapes with no timeout-recalculation hazard:
-  //   FUTEX_WAIT with timeout==NULL      (infinite; sem_wait's shape)
-  //   FUTEX_WAIT_BITSET                  (absolute deadline; re-issue is exact)
-  // A guest-deliverable signal keeps the EINTR return — that unwind is what
-  // delivers it. Escape hatch: FEX_FUTEX_EINTR_PASSTHRU=1 restores the old
-  // always-surface behaviour.
-  {
-    constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)
-    const uint64_t cmd = futex_op & FUTEX_CMD_MASK_LOCAL;
-    // FUTEX_WAIT with a relative timeout is restarted by re-issuing the FULL
-    // timeout. That over-waits by up to one interval per internal interruption
-    // — acceptable imprecision, and strictly better than a spurious EINTR:
-    // Unity's sem_timedwait-based render-thread sync treats the EINTR as
-    // failure and parks the renderer permanently.
-    const bool Restartable = cmd == 0 /* FUTEX_WAIT */ || cmd == 9 /* FUTEX_WAIT_BITSET */;
-    static const bool Passthru = (getenv("FEX_FUTEX_EINTR_PASSTHRU") != nullptr);
-    if (!Passthru && Restartable) {
-      while (static_cast<int64_t>(result) == -EINTR) {
-        auto* TSO = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
-        if (!TSO->SignalInfo.DeferredSignalFrames.empty() ||
-            (~TSO->SignalInfo.CurrentSignalMask.Val & TSO->SignalInfo.PendingSignals) != 0) {
-          break; // real guest signal to deliver; EINTR is load-bearing
+  //  1. FEX-INTERNAL async signals — thread-suspend pokes, code-invalidation
+  //     IPIs — interrupt guest futex waits and leak a spurious EINTR the
+  //     guest never asked for. Native x86 apps see EINTR only for signals
+  //     they actually receive; Unity's semaphore wrapper logs "Failed to
+  //     wait on a semaphore (Interrupted system call)" and its render thread
+  //     parks forever (Ziggurat wedges at init with a black window). So
+  //     internal-only interruptions must be restarted, not surfaced.
+  //
+  //  2. A GUEST signal consumed while the thread was still in JIT code (or
+  //     early in the syscall body) sits in DeferredSignalFrames until the
+  //     drain sentinel fires at the next JIT dispatch. If the thread's next
+  //     act is an UNTIMED futex wait, the sentinel is never touched: the
+  //     thread sleeps forever holding the very signal whose handler would
+  //     have woken it. A real kernel delivers a pending unblocked signal
+  //     before or during the wait — never after an eternal sleep. Proven
+  //     deterministically by notes/tools/futex_stress.c 'sig' mode (native
+  //     clean, FEX 32- and 64-bit both wedge in seconds). So untimed waits
+  //     must never block with a deferred frame queued, and must recheck
+  //     periodically because a frame can be queued between any check and
+  //     the trap. The same black hole exists, UNADDRESSED, for every other
+  //     signal-wakeable untimed sleep: epoll_wait, ppoll, nanosleep, and
+  //     futex_waitv (plain passthrough below — Wine fsync waits ride it, so
+  //     any Proton config still on fsync rather than ntsync is exposed).
+  //
+  // Resolution, two tiers:
+  //
+  // ALWAYS (the entry check): never enter a signal-wakeable untimed wait
+  // with a deferred frame already queued — return -EINTR, whose unwind
+  // delivers the signal. This closes the proven black hole for the common
+  // case (the frame is queued while the thread is still in JIT). A residual
+  // race remains: a frame queued between this check and the trap still
+  // parks (window is a few hundred instructions vs. the entire preceding
+  // JIT block chain before the fix). 32-bit caveat: the guest-SA_RESTART
+  // restart loop is 64-bit-only (Syscalls.cpp), so a 32-bit raw-futex user
+  // whose handler has SA_RESTART sees an EINTR here that a native kernel
+  // would hide behind an automatic restart. glibc loops on EINTR and is
+  // unaffected. KNOWN-OPEN: extend guest SA_RESTART to 32-bit.
+  //
+  // DEFAULT-ON, FEX_FUTEX_RESCUE=0 disables (exact string "0" only):
+  // additionally wait in 100ms slices, rechecking the deferred queue at
+  // every boundary (closes the residual race), and after ~5s of no progress
+  // return a spurious wake (0) so the guest rechecks its predicate.
+  // FUTEX_WAIT is documented to wake spuriously and correct waiters
+  // tolerate it — but be honest about the converse: a waiter that treats
+  // wake-as-event without a predicate (reliable in practice on real Linux)
+  // will see the rescue as a FALSE EVENT every ~5s parked. Steady-state
+  // cost, also honest: each parked untimed waiter takes an hrtimer expiry +
+  // syscall re-issue per 100ms slice — ten kernel wakeups per second per
+  // parked thread, forever — plus the one guest-visible spurious wake per
+  // 5s. A 100-thread parked pool is ~1000 idle wakeups/s process-wide.
+  //
+  // WHY THIS TIER IS DEFAULT-ON (measured, 2026-08-13): with only the entry
+  // check, futex_stress 'sig' mode still wedges ~half its runs — the
+  // check-to-trap window is readily hit under signal storms, so
+  // entry-check-only leaves a reachable PERMANENT hang in the default
+  // config. The slicing trade-off cuts the other way and is bounded:
+  // between slice re-issues the thread is briefly not queued on the futex.
+  // Protocols that mutate the word before waking (all of glibc) are safe —
+  // the re-issue converts the missed wake to EAGAIN via the kernel's
+  // *uaddr==val re-compare. A pure FUTEX_WAKE nudge with NO word change
+  // landing in that microsecond gap is lost until the 5s spurious wake
+  // recovers it — bounded latency, vs. the unbounded hang the black hole
+  // causes. Bounded beats unbounded, so the default is ON; slicing and
+  // rescue are one inseparable knob (slicing without the rescue would turn
+  // that lost nudge into a permanent hang), FEX_FUTEX_RESCUE=0 disables
+  // both.
+  //
+  // PI waits (LOCK_PI, WAIT_REQUEUE_PI, LOCK_PI2) are excluded from both
+  // tiers' wait paths: the kernel auto-restarts them across signals
+  // (ERESTARTNOINTR), glibc treats an EINTR from them as fatal, and
+  // WAIT_REQUEUE_PI must not be re-issued after the requeue has happened.
+  // Their wake comes from FUTEX_UNLOCK_PI, not a signal, so the black hole
+  // needs the owner to be wedged too — KNOWN-OPEN, revisit if a PI-mutex
+  // guest wedges.
+  //
+  // Escape hatch: FEX_FUTEX_EINTR_PASSTHRU=1 restores always-surface EINTR.
+  constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)
+  const uint64_t cmd = futex_op & FUTEX_CMD_MASK_LOCAL;
+  const bool PlainWait = cmd == 0;   // FUTEX_WAIT: relative timeout or none
+  const bool BitsetWait = cmd == 9;  // FUTEX_WAIT_BITSET: absolute timeout or none
+  static const bool Passthru = (getenv("FEX_FUTEX_EINTR_PASSTHRU") != nullptr);
+  static const bool Rescue = [] {
+    const char* Env = getenv("FEX_FUTEX_RESCUE");
+    return !(Env && Env[0] == '0' && Env[1] == '\0');
+  }();
+
+  uint64_t result;
+  if ((PlainWait || BitsetWait) && HasGuestDeliverableSignal(Frame)) {
+    // Never enter a signal-wakeable sleep with a parked guest signal.
+    result = static_cast<uint64_t>(-EINTR);
+  } else if ((PlainWait || BitsetWait) && timeout == 0 && Rescue) {
+    int SlicesParked = 0;
+    for (;;) {
+      struct timespec Slice;
+      if (BitsetWait) {
+        // WAIT_BITSET takes an ABSOLUTE deadline on the op's clock.
+        clock_gettime((futex_op & 256) ? CLOCK_REALTIME : CLOCK_MONOTONIC, &Slice);
+        Slice.tv_nsec += 100000000;
+        if (Slice.tv_nsec >= 1000000000) {
+          Slice.tv_nsec -= 1000000000;
+          Slice.tv_sec += 1;
         }
+      } else {
+        Slice.tv_sec = 0;
+        Slice.tv_nsec = 100000000;
+      }
+      result = SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val,
+                                                       reinterpret_cast<uint64_t>(&Slice), uaddr2, val3);
+      const int64_t sr = static_cast<int64_t>(result);
+      if (sr == -ETIMEDOUT) {
+        // Slice deadline is synthesized; the guest asked for no timeout and
+        // must never see ETIMEDOUT. The kernel re-compares *uaddr==val on
+        // re-issue, so a wake that raced the boundary converts to EAGAIN.
+        if (HasGuestDeliverableSignal(Frame)) {
+          result = static_cast<uint64_t>(-EINTR);
+          break;
+        }
+        if (++SlicesParked >= 50) {
+          result = 0; // spurious wake: guest rechecks its predicate
+          break;
+        }
+        continue;
+      }
+      if (sr == -EINTR && !Passthru && !HasGuestDeliverableSignal(Frame)) {
+        continue; // FEX-internal interruption, invisible to the guest
+      }
+      break;
+    }
+  } else {
+    result = SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
+    // FUTEX_WAIT with a relative timeout is restarted by re-issuing the FULL
+    // timeout. That over-waits by up to one interval per internal
+    // interruption — acceptable imprecision, and strictly better than a
+    // spurious EINTR: Unity's sem_timedwait-based render-thread sync treats
+    // the EINTR as failure and parks the renderer permanently.
+    if (!Passthru && (PlainWait || BitsetWait)) {
+      while (static_cast<int64_t>(result) == -EINTR && !HasGuestDeliverableSignal(Frame)) {
         result = SyscallPassthrough6<SYSCALL_DEF(futex)>(Frame, uaddr, futex_op, val, timeout, uaddr2, val3);
       }
     }
@@ -514,19 +630,47 @@ static uint64_t WrappedFutexObserved(FEXCore::Core::CpuStateFrame* Frame,
   {
     static const bool trace_futex = (getenv("FEX_FUTEX_TRACE") != nullptr);
     if (trace_futex && access("/tmp/ftx_on", F_OK) == 0) {
+      // Own file, not stderr: guests (steamcmd) redirect or replace fd 2
+      // early, which silently ate the trace from exactly the process under
+      // investigation. Benign race on first use: a double open leaks one fd
+      // once per process.
+      // O_NOFOLLOW: predictable name in world-writable /tmp, refuse a
+      // planted symlink. A fork-without-exec child inherits this fd and
+      // keeps logging into the PARENT's pid-named file — separation holds
+      // only across exec.
+      static int trace_fd = -1;
+      if (trace_fd == -1) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/ftx.%d.log", static_cast<int>(::getpid()));
+        trace_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+        if (trace_fd == -1) {
+          trace_fd = -2; // failed once: never retry, never write
+        }
+      }
+      if (trace_fd >= 0) {
       static thread_local pid_t tls_tid = 0;
       if (tls_tid == 0) {
         tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
       }
+      // process_vm_readv, not a raw memcpy: a WAKE can succeed against a
+      // uaddr the guest has since unmapped, and a raw read of it would
+      // SIGSEGV the emulator from inside its own diagnostic.
       uint32_t cur = 0xdeadbeef;
       if (uaddr && signed_result != -EFAULT) {
-        memcpy(&cur, reinterpret_cast<const void*>(uaddr), sizeof(cur));
+        struct iovec local {&cur, sizeof(cur)};
+        struct iovec remote {reinterpret_cast<void*>(uaddr), sizeof(cur)};
+        if (::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) != sizeof(cur)) {
+          cur = 0xdeadbeef;
+        }
       }
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
       char buf[192];
-      int n = snprintf(buf, sizeof(buf), "[FTX] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
-                       static_cast<int>(tls_tid), (unsigned long)futex_op, (unsigned long)uaddr, (unsigned long)val,
-                       (unsigned long)timeout, (long)signed_result, cur);
-      [[maybe_unused]] auto _ = write(2, buf, n);
+      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
+                       (long)now.tv_sec, now.tv_nsec / 1000000, static_cast<int>(tls_tid), (unsigned long)futex_op,
+                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur);
+      [[maybe_unused]] auto _ = write(trace_fd, buf, n);
+      }
     }
   }
 
@@ -1108,7 +1252,7 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(setrlimit, SyscallPassthrough2<SYSCALL_DEF(setrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(settimeofday, SyscallPassthrough2<SYSCALL_DEF(settimeofday)>);
     REGISTER_SYSCALL_IMPL_X64(readahead, SyscallPassthrough3<SYSCALL_DEF(readahead)>);
-    REGISTER_SYSCALL_IMPL_X64(futex, WrappedFutexObserved);
+    REGISTER_SYSCALL_IMPL_X64(futex, ObservedFutexSyscall);
     REGISTER_SYSCALL_IMPL_X64(io_getevents, SyscallPassthrough5<SYSCALL_DEF(io_getevents)>);
     REGISTER_SYSCALL_IMPL_X64(semtimedop, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
     REGISTER_SYSCALL_IMPL_X64(timer_create, SyscallPassthrough3<SYSCALL_DEF(timer_create)>);
@@ -1198,7 +1342,7 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(mq_timedsend_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
     REGISTER_SYSCALL_IMPL_X32(mq_timedreceive_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedreceive)>);
     REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
-    REGISTER_SYSCALL_IMPL_X32(futex_time64, WrappedFutexObserved);
+    REGISTER_SYSCALL_IMPL_X32(futex_time64, ObservedFutexSyscall);
     REGISTER_SYSCALL_IMPL_X32(sched_rr_get_interval_time64, SyscallPassthrough2<SYSCALL_DEF(sched_rr_get_interval)>);
   }
 } // namespace x32

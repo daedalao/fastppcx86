@@ -53,6 +53,15 @@ struct SignalDelegatorConfig {
   // SRA index mapping.
   SRAIndexMapping SRAGPRMapping;
   SRAIndexMapping SRAFPRMapping;
+
+  // ppc64le AVX-high VSX bank (see AVXHIGH_BANK_FIRST in
+  // ArchHelpers/PPC64Emitter.h): when Count is nonzero, guest YMM_hi[i] lives
+  // in host VSX register vs(First+i) while the thread runs JIT code, and
+  // SpillSRA must capture those from the signal frame into State.avx_high[]
+  // exactly as it captures the SRA XMMs. Zero when AVX is not advertised (or
+  // on hosts without the bank).
+  uint16_t SRAAVXHighBankFirst {};
+  uint16_t SRAAVXHighBankCount {};
 };
 
 class SignalDelegator {

@@ -168,6 +168,15 @@ function(add_host_lib NAME GUEST_BITNESS)
   set_target_properties(${NAME}-host-${GUEST_BITNESS} PROPERTIES OUTPUT_NAME "${NAME}-host")
   set_target_properties(${NAME}-host-${GUEST_BITNESS} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/HostLibs_${GUEST_BITNESS}")
   target_include_directories(${NAME}-host-${GUEST_BITNESS} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen_${GUEST_BITNESS}/")
+  # For GUEST_BITNESS 32 on ppc64le, common/Host.h includes
+  # <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h> for the low-32 trampoline's
+  # I-cache publication. Stated explicitly rather than relying on the FEX
+  # executable target below to propagate FEXCore's PUBLIC include dirs.
+  # The include is confined to that one configuration inside Host.h: leaving it
+  # unconditional at the top of the file broke every out-of-tree consumer of
+  # ThunkLibs/include, which is a public include root with no other FEXCore
+  # dependency and no way to know it had acquired one.
+  target_include_directories(${NAME}-host-${GUEST_BITNESS} PRIVATE "${FEX_PROJECT_SOURCE_DIR}/FEXCore/include/")
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE dl)
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE lib${NAME}-${GUEST_BITNESS}-deps)
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE FEX)

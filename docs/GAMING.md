@@ -150,18 +150,49 @@ AVX left on.
 
 `FEX_SMCLAZYLINK=1`: see the lazy recipe above.
 
-`FEX_LOCKONLYTSO=1` restricts ordering work: the emulator normally emits acquire/release sequences around every guest
-load and store to preserve x86's memory ordering on a weakly-ordered host. This restricts that to
-instructions actually carrying a `LOCK` prefix, plus ranges explicitly forced by Mono detection.
-Plain loads become cheap loads. **This is a real correctness tradeoff, not free speed:** guest code
-that relies on a non-`LOCK` volatile read being visible across threads can race under it. The
-glibc futex and lazy-symbol-resolution paths are understood to be safe, which is why it is usable
-at all; anything beyond that is your risk. It does nothing if `FEX_TSOENABLED=0`.
-
 `FEX_SPINLOOPCLAMP` / `FEX_SPINLOOPCLAMPAUTO=1` short-circuits recognized library spin-wait
 loops. No longer required for correctness anywhere in the census, but the automatic form was
 short-circuiting around 1017 library spin loops in Ziggurat, so it remains a measurable
 performance opt-in. Off by default; arm it per title.
+
+## Knobs that are known-unsound
+
+These are not in the list above and should not be treated as tuning. They make the emulator produce
+answers x86 says are impossible. They are documented because they exist and are fast, not because
+they are advisable.
+
+`FEX_LOCKONLYTSO=1` — **unsound. Measured, not theoretical.** The emulator normally emits
+acquire/release sequences around every guest load and store to preserve x86's memory ordering on a
+weakly-ordered host. This restricts that to instructions actually carrying a `LOCK` prefix, plus
+ranges explicitly forced by Mono detection; plain loads and stores lose their barriers entirely.
+
+The `MP` litmus shape — two stores on one thread, two loads on another — is *forbidden* on x86.
+Under FEX on POWER9, same guest binary, only the environment variable changed:
+
+| configuration | MP observations |
+|---|---|
+| default | **0** in 150,000 rounds (0/30000, 0/60000, 0/60000) |
+| `FEX_LOCKONLYTSO=1` | **659 / 30,000**, then **12 / 30,000**, then **51 / 30,000** |
+
+Every one of those is a guest-visible violation of the memory model FEX exists to emulate. The rate
+swings ~50x between repetitions, so the specific numbers mean nothing; zero-every-time versus
+nonzero-every-time is the result. It costs about 1.6x in speed to be correct here.
+
+A second, independent litmus shape agrees. `IRIW` — also forbidden on x86 — was observed **552
+times in 1,000,000 iterations** under `FEX_LOCKONLYTSO=1`, against **0 in 67,200,000 iterations**
+on the default config, with native `lwsync` and `hwsync` controls both at 0/200,000,000. Two
+different forbidden outcomes, two harnesses, same verdict.
+
+A sequential-consistency test does *not* detect this — `seqcst_discriminator.c` reads 0/60,000 both
+ways — because `LOCK` operations keep their full fence. It takes the MP or IRIW shape to see it.
+Reproduce with `powerpc64le-handbook/probes/atomics_litmus.c` (MP is the discriminator),
+`powerpc64le-handbook/probes/iriw.c`, and `powerpc64le-handbook/probes/seqcst_discriminator.c`.
+
+glibc futex and lazy-symbol-resolution are backed by `LOCK CMPXCHG` and therefore keep working,
+which is the only reason this option is usable at all — it is not a general reassurance. Anything
+in the guest doing its own lock-free or `volatile`-based cross-thread communication may silently
+compute wrong results rather than crash. Use it only where a wrong answer is acceptable. FEX prints
+a warning on startup when it is enabled. It does nothing if `FEX_TSOENABLED=0`.
 
 ### Per-application config files
 

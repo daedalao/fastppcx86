@@ -88,6 +88,21 @@ public:
 
   uint64_t RegisterGuestSigAltStack(FEX::HLE::ThreadStateObject* Thread, const stack_t* ss, stack_t* old_ss);
 
+  /**
+   * @brief True when the thread has a signal that will ACTUALLY reach guest
+   * code on the next drain: a deferred frame (or pending unblocked signal)
+   * that is not guest-masked, not SIG_IGN, and not default-ignore.
+   *
+   * The distinction matters because the defer path queues frames BEFORE any
+   * disposition or mask check — those are applied at drain time (masked →
+   * parked in PendingSignals, SIG_IGN / default-ignore → dropped). A raw
+   * "queue is non-empty" check therefore overcounts, and a caller using it
+   * to synthesize an EINTR would fabricate interruptions for signals a real
+   * kernel never lets interrupt a sleep (a SIG_IGN'd SIGCHLD, most
+   * commonly — Wine takes those constantly).
+   */
+  bool ThreadHasDeliverableGuestSignal(FEX::HLE::ThreadStateObject* Thread);
+
   uint64_t GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, int how, const uint64_t* set, uint64_t* oldset);
   uint64_t GuestSigPending(FEX::HLE::ThreadStateObject* Thread, uint64_t* set, size_t sigsetsize);
   uint64_t GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, uint64_t* set, size_t sigsetsize);

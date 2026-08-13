@@ -138,8 +138,8 @@ DEF_OP(Add) {
     add(Dst, S1, GetReg(Op->Src2));
   }
   if (IROp->Size == IR::OpSize::i32Bit) {
-    // Mask to 32 bits (zero-extend)
-    rldicl(Dst, Dst, 0, 32);
+    // Mask to 32 bits (zero-extend) — elided when provably dead, see Mask32Tail
+    Mask32Tail(Dst, Node);
   }
 }
 
@@ -185,7 +185,7 @@ DEF_OP(Sub) {
     auto S1 = GetReg(Op->Src1);
     subf(Dst, GetReg(Op->Src2), S1);  // subf RT,RA,RB → RT = RB - RA
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Neg) {
@@ -218,14 +218,14 @@ DEF_OP(Neg) {
     auto CC = MapNZCVCC(IntegerNZCVCond(Op->Cond));
     iselcc(Dst, CC, TMP4, Src);
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Not) {
   auto Op  = IROp->C<IR::IROp_Not>();
   auto Dst = GetReg(Node);
   not_(Dst, GetReg(Op->Src));
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Mul) {
@@ -247,7 +247,7 @@ DEF_OP(Mul) {
       mulld(Dst, S1, S2);
   }
   // mullw/mulli sign-extend the 32-bit product into bits 0..31.
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(UMul) {
@@ -259,7 +259,7 @@ DEF_OP(UMul) {
     mullw(Dst, S1, S2);
   else
     mulld(Dst, S1, S2);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(UMull) {
@@ -401,8 +401,22 @@ DEF_OP(Div) {
     }
     if (Is16) extsh(TMP4, Divisor);
     else      extsw(TMP4, Divisor);
-    divd(Quotient, TMP1, TMP4);
-    mulld(TMP3, Quotient, TMP4);
+    if (LongDiv && !Is16) {
+      // True 64/32 EDX:EAX composition — needs the doubleword divide.
+      divd(Quotient, TMP1, TMP4);
+      mulld(TMP3, Quotient, TMP4);
+    } else {
+      // Dividend fits in signed 32 bits (16-bit composition, or an i32 whose
+      // Upper the post-RA merge proved a sign-extension): word divide, which
+      // POWER8 completes in roughly half divd's worst case — and a negative
+      // sign-extended dividend has 64 significant bits, denying divd any
+      // magnitude early-out. TMP1 holds the exact sign-extended dividend and
+      // mullw the exact 32x32 signed product, so the 64-bit subf remainder
+      // is exact; the masks below keep only the low 32 either way. divw's
+      // undefined-on-overflow/zero cases match divd's (PPC never traps).
+      divw(Quotient, TMP1, TMP4);
+      mullw(TMP3, Quotient, TMP4);
+    }
     subf(Remainder, TMP3, TMP1);
     rldicl(Quotient,  Quotient,  0, 32);
     rldicl(Remainder, Remainder, 0, 32);
@@ -498,8 +512,20 @@ DEF_OP(UDiv) {
       rldicl(TMP1, Lower, 0, MaskBits);
     }
     rldicl(TMP4, Divisor, 0, MaskBits);
-    divdu(Quotient, TMP1, TMP4);
-    mulld(TMP3, Quotient, TMP4);
+    if (LongDiv && IROp->Size != IR::OpSize::i16Bit) {
+      // True 64/32 EDX:EAX composition — needs the doubleword divide.
+      divdu(Quotient, TMP1, TMP4);
+      mulld(TMP3, Quotient, TMP4);
+    } else {
+      // Dividend fits in 32 bits (16-bit composition, or an i32 whose Upper
+      // the post-RA merge proved zero): word divide. divwu's worst-case
+      // latency on POWER8 is roughly half divdu's, and a zero-extended
+      // 32-bit value gives divdu no early-out to compensate. mullw's low 32
+      // product bits match mulld's for any signedness, and only the low 32
+      // of Quotient/Remainder survive the masks below.
+      divwu(Quotient, TMP1, TMP4);
+      mullw(TMP3, Quotient, TMP4);
+    }
     subf(Remainder, TMP3, TMP1);
     rldicl(Quotient,  Quotient,  0, 32);
     rldicl(Remainder, Remainder, 0, 32);
@@ -591,7 +617,7 @@ DEF_OP(Or) {
   } else {
     or_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(And) {
@@ -607,7 +633,7 @@ DEF_OP(And) {
   } else {
     and_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Xor) {
@@ -627,7 +653,7 @@ DEF_OP(Xor) {
   } else {
     xor_(Dst, S1, GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Andn) {
@@ -641,7 +667,7 @@ DEF_OP(Andn) {
   } else {
     andc(Dst, GetReg(Op->Src1), GetReg(Op->Src2));
   }
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Orlshl) {
@@ -651,7 +677,7 @@ DEF_OP(Orlshl) {
   auto S2  = GetReg(Op->Src2);
   sldi(TMP4, S2, Op->BitShift);
   or_(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Orlshr) {
@@ -661,7 +687,7 @@ DEF_OP(Orlshr) {
   auto S2  = GetReg(Op->Src2);
   srdi(TMP4, S2, Op->BitShift);
   or_(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(Ornror) {
@@ -674,7 +700,7 @@ DEF_OP(Ornror) {
   uint32_t sh = (64 - Op->BitShift) & 63;
   rldicl(TMP4, S2, sh, 0);   // TMP4 = ROR(S2, BitShift)
   orc(Dst, S1, TMP4);         // Dst = S1 | NOT(TMP4)
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 // XorShift / XornShift / AndShift: Honor the IR ShiftType field. Earlier
@@ -734,7 +760,7 @@ DEF_OP(XorShift) {
       break;
   }
   xor_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(XornShift) {
@@ -786,7 +812,7 @@ DEF_OP(XornShift) {
   }
   not_(TMP4, TMP4);
   xor_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(AndShift) {
@@ -837,7 +863,7 @@ DEF_OP(AndShift) {
       break;
   }
   and_(Dst, GetReg(Op->Src1), TMP4);
-  if (Is32) rldicl(Dst, Dst, 0, 32);
+  if (Is32) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(AndWithFlags) {
@@ -1347,6 +1373,17 @@ DEF_OP(Bfe) {
   auto Src = GetReg(Op->Src);
   uint32_t width  = Op->Width;
   uint32_t lsb    = Op->lsb;
+  // The 64-bit-mode frontend canonicalizes every 32-bit guest result with
+  // Bfe(#32, #0) — THIS op is the tail mask in that idiom. When the prepass
+  // proved the mask dead (see Elide32MaskSet in JITClass.h), the whole op
+  // degenerates to a register copy, or to nothing when RA coalesced Dst==Src.
+  if (width == 32 && lsb == 0 && IROp->Size > IR::OpSize::i32Bit) {
+    const auto ID = IR->GetID(Node).Value;
+    if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      if (Dst != Src) mr(Dst, Src);
+      return;
+    }
+  }
   if (IROp->Size <= IR::OpSize::i32Bit) {
     // rlwinm RA, RS, SH, MB, ME where:
     // We want bits [lsb, lsb+width-1] of Src in low bits of Dst.
@@ -1586,60 +1623,62 @@ DEF_OP(PDep) {
 }
 
 DEF_OP(PExt) {
-  // Parallel bits extract. Iterate set bits of mask LSB-first; for each, append
-  // that input bit to Dest at position OutPos (held on the stack to free a TMP).
+  // Parallel bits extract, branchless (Hacker's Delight 7-4 "compress right").
+  // Rounds s = 1,2,4,8,16(,32) each shift every kept bit right past the mask
+  // zeros below it, guided by a parallel-suffix XOR of the zero counts.
+  // Straight-line, ~100 (i32) / ~130 (i64) instructions, and — the point —
+  // NO compares: x86 PEXT is architecturally flag-transparent, and CR0 holds
+  // the packed NZCV, so the old per-set-bit loop had to save/restore CR0
+  // around its cmpdi spine (and once corrupted it; see pext_pdep_flags.asm).
+  // Cost is also independent of mask density where the loop paid ~10
+  // instructions and two branches PER SET BIT (a 32-bit Morton mask: ~320
+  // instructions + 64 branches, versus ~100 with no branch at all).
   auto Op       = IROp->C<IR::IROp_PExt>();
   auto Dest     = GetReg(Node);
   auto OrigIn   = GetReg(Op->Input);
   auto OrigMask = GetReg(Op->Mask);
 
-  GPR InputSnap = TMP1, Mask = TMP2, LowBit = TMP3, Scratch = TMP4;
-  PPC64Emitter::Label NextBit, Done, NoSet;
+  // Register plan: x compresses in place in Dest; m = TMP1, mk = TMP2,
+  // mp/t = TMP3, mv = TMP4. Dest may alias either source, so m is copied
+  // out first and x is formed from OrigIn & m (never read again after).
+  const bool Is32 = IROp->Size == IR::OpSize::i32Bit;
+  if (Is32) {
+    // Confine the mask to the low word up front: a stale mask bit >= 32
+    // would pull an input bit into a low result position. x = in & m is
+    // then confined by construction, upper input bits included.
+    rldicl(TMP1, OrigMask, 0, 32);
+  } else {
+    mr(TMP1, OrigMask);
+  }
+  and_(Dest, OrigIn, TMP1);            // x  = input & mask
+  nor(TMP2, TMP1, TMP1);               // mk = ~m ...
+  sldi(TMP2, TMP2, 1);                 //   ... << 1: zeros below each bit
 
-  // Snapshot inputs before clobbering Dest (Dest may alias either source).
-  mr(InputSnap, OrigIn);
-  mr(Mask, OrigMask);
-  li(Dest, 0);
-  // x86 BMI2 PEXT preserves flags per Intel SDM.  Save CR0 (the canonical
-  // packed-NZCV scratch) to a red-zone slot and restore at op end.
-  // mfocrf 0x80: only the CR0 nibble is defined pre-3.0C; the sole consumer
-  // is the mtocrf(0x80) restore, which reads only that nibble.
-  mfocrf(Scratch, 0x80);
-  std(Scratch, -16, r1);
-  cmpdi(Mask, 0);
-  bc(CC_EQ, &Done);
-
-  // Stack slot for OutPos counter.
-  addi(r1, r1, -16);
-  li(Scratch, 0);
-  std(Scratch, 0, r1);
-
-  Bind(&NextBit);
-  neg(LowBit, Mask);
-  and_(LowBit, LowBit, Mask);          // LowBit = isolated low set bit
-  and_(Scratch, LowBit, InputSnap);    // input bit at that position
-  cmpdi(Scratch, 0);
-  bc(CC_EQ, &NoSet);
-  ld(Scratch, 0, r1);                  // OutPos
-  li(LowBit, 1);                       // (recompute LowBit later)
-  sld(LowBit, LowBit, Scratch);
-  or_(Dest, Dest, LowBit);
-  neg(LowBit, Mask);                   // recompute isolated low bit for clear
-  and_(LowBit, LowBit, Mask);
-  Bind(&NoSet);
-  andc(Mask, Mask, LowBit);            // strip processed bit
-  ld(Scratch, 0, r1);
-  addi(Scratch, Scratch, 1);
-  std(Scratch, 0, r1);
-  cmpdi(Mask, 0);
-  bc(CC_NE, &NextBit);
-  addi(r1, r1, 16);
-
-  Bind(&Done);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dest, Dest, 0, 32);
-  // Restore CR0 so the packed-NZCV scratch held there pre-PExt survives.
-  ld(Scratch, -16, r1);
-  mtocrf(0x80, Scratch);
+  // 5 rounds move any 32-bit distance; the 6th (s=32) only matters for the
+  // 64-bit form. Same for the mp suffix-XOR width.
+  const uint32_t Rounds = Is32 ? 5 : 6;
+  const uint32_t PrefixTop = Is32 ? 16 : 32;
+  for (uint32_t Round = 0; Round < Rounds; ++Round) {
+    const uint32_t s = 1u << Round;
+    // mp = parallel-suffix XOR of mk: parity of mk below each bit position.
+    sldi(TMP3, TMP2, 1);
+    xor_(TMP3, TMP3, TMP2);
+    for (uint32_t Sh = 2; Sh <= PrefixTop; Sh <<= 1) {
+      sldi(TMP4, TMP3, Sh);
+      xor_(TMP3, TMP3, TMP4);
+    }
+    and_(TMP4, TMP3, TMP1);            // mv = mp & m: bits moving this round
+    andc(TMP2, TMP2, TMP3);            // mk &= ~mp (mp dead; TMP3 becomes t)
+    xor_(TMP1, TMP1, TMP4);            // m ^= mv ...
+    and_(TMP3, Dest, TMP4);            // t = x & mv
+    xor_(Dest, Dest, TMP3);            // x ^= t ...
+    srdi(TMP3, TMP3, s);
+    or_(Dest, Dest, TMP3);             // ... x |= t >> s
+    srdi(TMP4, TMP4, s);
+    or_(TMP1, TMP1, TMP4);             // ... m |= mv >> s
+  }
+  // Result is exactly popcount(mask) low bits; for i32 that is <= 32 and x
+  // stayed confined to the low word throughout, so no final mask is needed.
 }
 
 // =========================================================================
@@ -2037,19 +2076,25 @@ DEF_OP(AdcWithFlags) {
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
   adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
-  rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may be the same register as S1 and/or S2 — DFCE's
+  // store-elimination lets the RA coalesce the SRA destination onto a source,
+  // so `adc eax,eax` arrives with Dst==S1==S2. Every source-derived flag bit
+  // must therefore come from the zx32 copies in TMP1/TMP2 BEFORE Dst is
+  // written. Reading S1/S2 after the Dst write computed OF from the result —
+  // (Dst^Dst)-shaped, always 0 — and broke `seto` after `adc` (2026-08-12
+  // differential probe; falsely pinned on the DFCE Remove arm at first).
+  // OF = (S1[31] == S2[31]) AND (S1[31] != Sum[31]); Sum[31] == Dst[31].
+  xor_(TMP2, TMP2, TMP1);                   // S1^S2
+  xor_(TMP1, TMP3, TMP1);                   // Sum^S1
+  andc(TMP1, TMP1, TMP2);                   // (Sum^S1) & ~(S1^S2): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);               // OF -> LSB (kept in TMP2)
 
   // CA = bit-32 of TMP3 = x86_CF_out, stored directly (CFInverted=false).
   rldicl(TMP4, TMP3, 32, 63);
 
-  // OF = (S1[31] == S2[31]) AND (S1[31] != Dst[31]).
-  rldicl(TMP1, S1,  33, 63);
-  rldicl(TMP2, S2,  33, 63);
-  rldicl(TMP3, Dst, 33, 63);
-  xor_(TMP2, TMP2, TMP1);
-  xor_(TMP3, TMP3, TMP1);
-  andc(TMP3, TMP3, TMP2);
+  rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
   // Patch XER: new CA = TMP4's LSB, new OV = TMP3's LSB.
   //
@@ -2073,7 +2118,7 @@ DEF_OP(AdcWithFlags) {
   // discarded — the same guarantee the sldi/or_ pair relied on.
   mfspr(TMP1, 1);
   rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
@@ -2101,25 +2146,26 @@ DEF_OP(SbbWithFlags) {
   rldicl(TMP1, S1, 0, 32);
   rldicl(TMP2, S2, 0, 32);
   subfe(TMP3, TMP2, TMP1);                 // TMP3 = TMP1 + ~TMP2 + CA_in
-  rldicl(Dst, TMP3, 0, 32);
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may alias S1/S2 (see AdcWithFlags) — derive OF from
+  // the zx32 copies BEFORE Dst is written.
+  // OF for SBB: (S1[31] != S2[31]) AND (S1[31] != Diff[31]); Diff[31] == Dst[31].
+  xor_(TMP2, TMP2, TMP1);                  // S1^S2
+  xor_(TMP1, TMP3, TMP1);                  // S1^Diff
+  and_(TMP1, TMP1, TMP2);                  // (S1^S2) AND (S1^Diff): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);              // OF -> LSB (kept in TMP2)
 
   // CF (CFInverted-stored) = NOT(bit 32 of TMP3).
   rldicl(TMP4, TMP3, 32, 63);              // bit 32 of TMP3 in LSB
   xori(TMP4, TMP4, 1);                      // invert LSB
 
-  // OF for SBB: (S1[31] != S2[31]) AND (S1[31] != Dst[31]).
-  rldicl(TMP1, S1,  33, 63);
-  rldicl(TMP2, S2,  33, 63);
-  rldicl(TMP3, Dst, 33, 63);
-  xor_(TMP2, TMP2, TMP1);                  // S1^S2
-  xor_(TMP3, TMP3, TMP1);                  // S1^Dst
-  and_(TMP3, TMP3, TMP2);                  // (S1^S2) AND (S1^Dst) = OF
+  rldicl(Dst, TMP3, 0, 32);
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
   // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
   rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP3, 30, 1, 1);   // OV <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
@@ -2174,24 +2220,27 @@ DEF_OP(AdcZeroWithFlags) {
   // i32Bit (and smaller): manual 32-bit add and patch XER.
   rldicl(TMP1, Src, 0, 32);                  // zx32(Src)
   add(TMP3, TMP1, TMP4);                     // TMP3 = zx32(Src) + x86_CF (≤ 33-bit)
-  rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
-  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);
+
+  // ALIAS HAZARD: Dst may alias Src (see AdcWithFlags) — derive OF from the
+  // zx32 copy and the sum BEFORE Dst is written.
+  // OF for ADC-with-zero (carry ∈ {0,1}, sign-bit always 0):
+  // OF = !Src[31] AND Sum[31]; Sum[31] == Dst[31].
+  rldicl(TMP4, TMP3, 33, 63);                 // Sum[31] (TMP4's carry consumed by add)
+  rldicl(TMP1, TMP1, 33, 63);                 // Src[31] from the zx copy
+  xori(TMP1, TMP1, 1);                        // !Src[31]
+  and_(TMP4, TMP4, TMP1);                     // OF in LSB
 
   // CA = bit-32 of TMP3 = x86_CF_out, stored DIRECT (CFInverted=false) to match
   // the dispatcher's `CFInverted = false` after this op — same convention as
   // the 64-bit path above and AdcWithFlags' i32 path.
-  rldicl(TMP3, TMP3, 32, 63);
+  rldicl(TMP2, TMP3, 32, 63);
 
-  // OF for ADC-with-zero (TMP4 ∈ {0,1}, sign-bit always 0):
-  // OF = !Src[31] AND Dst[31]
-  rldicl(TMP1, Src, 33, 63);
-  xori(TMP1, TMP1, 1);                        // !Src[31]
-  rldicl(TMP4, Dst, 33, 63);                  // Dst[31]
-  and_(TMP4, TMP4, TMP1);                     // OF in LSB
+  rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
+  EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
   // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
+  rlwimi(TMP1, TMP2, 29, 2, 2);   // CA <- TMP2 LSB
   rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
   mtspr(1, TMP1);
 }
@@ -3049,7 +3098,7 @@ DEF_OP(AddShift) {
     sldi(TMP4, S2, Op->ShiftAmount);
   }
   add(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(SubShift) {
@@ -3059,7 +3108,7 @@ DEF_OP(SubShift) {
   auto S2  = GetReg(Op->Src2);
   sldi(TMP4, S2, Op->ShiftAmount);
   subf(Dst, TMP4, S1);  // S1 - TMP4
-  if (IROp->Size == IR::OpSize::i32Bit) rldicl(Dst, Dst, 0, 32);
+  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 // =========================================================================
@@ -3234,11 +3283,69 @@ DEF_OP(XGetBV) {
 }
 
 // =========================================================================
-// RDRAND: POWER8 has no `darn`. Call out to PPC64_RDRAND() (defined in
-// JIT.cpp) which returns a 64-bit value in r3.
-// The IR op produces a single GPR; CF=valid is fabricated upstream.
+// RDRAND / RDSEED.
+//
+// ISA 3.0 (POWER9) arm: `darn` is a true hardware entropy source. L=1 gives
+// the 64-bit conditioned stream (x86 RDRAND), L=2 the 64-bit unconditioned
+// one (x86 RDSEED) -- the IR carries the distinction in GetReseeded, which
+// the POWER8 arm below has no way to honour. darn signals "not ready" by
+// delivering all-ones and the ISA requires software to retry, so retry once;
+// that matches x86, where RDRAND may spuriously report CF=0 but is required
+// to make forward progress.
+//
+// ISA 2.07 arm: POWER8 has no darn. Call out to PPC64_RDRAND() (defined in
+// JIT.cpp), an xorshift64* PRNG seeded from the time base, which returns a
+// 64-bit value in r3 and cannot fail. Left EXACTLY as it was -- byte-for-byte
+// identical codegen with the gate off, including the r0 = 0 re-establishment
+// the backend's indexed addressing invariant depends on.
+//
+// The IR op produces a single GPR. Validity is carried separately, in
+// RFLAG_ZF_RAW_LOC: RDRANDOp in OpcodeDispatcher.cpp reads that slot straight
+// back as the INVERTED CF, so the contract is
+//   0 = success (x86 CF=1, "random value is valid")
+//   1 = failure (x86 CF=0, "not ready")
+// and BOTH arms must write it before returning.
+//
+// NOT REACHABLE BY DEFAULT: HostFeatures.cpp never sets SupportsRAND on
+// ppc64le (only the ARM64 and x86 host branches do), so RDRANDOp emits
+// UnimplementedOp and this DEF_OP is dead -- unless a user forces the
+// feature on with the ENABLE_DISABLE_OPTION knob (FEX_ENABLERNG).
 // =========================================================================
 DEF_OP(RDRAND) {
+  const int32_t zf_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, State.flags[FEXCore::X86State::RFLAG_ZF_RAW_LOC]));
+
+  if (CTX->HostFeatures.SupportsISA30) {
+    const auto Op = IROp->C<IR::IROp_RDRAND>();
+    auto Dst = GetReg(Node);
+    // L=1 conditioned (RDRAND) / L=2 unconditioned (RDSEED).
+    const uint8_t L = Op->GetReseeded ? 2u : 1u;
+
+    // darn; if it delivered all-ones ("not ready"), try once more. Either way
+    // CR0.EQ ends up set iff the value we are keeping is all-ones -- i.e. iff
+    // the draw failed. That is exactly the predicate RFLAG_ZF_RAW_LOC wants,
+    // which is why the recompare on the retry path is worth its one slot.
+    //
+    // This clobbers CR0. That is safe here for the same reason the POWER8 arm
+    // is safe: that arm makes an indirect call, which clobbers CR0 too, and
+    // x86 RDRAND/RDSEED write every arithmetic flag anyway.
+    PPC64Emitter::Label Done {};
+    darn(Dst, L);
+    cmpdi(cr(0), Dst, -1);
+    bc(CC_NE, &Done);        // not all-ones -> success, skip the retry
+    darn(Dst, L);            // retry once
+    cmpdi(cr(0), Dst, -1);   // re-establish CR0.EQ for the merged path
+    Bind(&Done);
+
+    // ZF_RAW_LOC = 1 iff both attempts delivered all-ones. CR0.EQ is PPC CR
+    // bit 2 and holds exactly that on both edges into Done.
+    li(TMP1, 1);
+    li(TMP2, 0);
+    isel(TMP1, TMP1, TMP2, 2);
+    stb(TMP1, static_cast<int16_t>(zf_off), STATE);
+    return;
+  }
+
   const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
   // Mini-frame layout (32 bytes):
   //   [r1+ 0] back chain
@@ -3269,6 +3376,11 @@ DEF_OP(RDRAND) {
   li(r(0), 0);
 
   mr(GetReg(Node), TMP1);
+
+  // The PRNG cannot fail, so ZF_RAW_LOC = 0 (x86 CF=1, "valid") always. TMP1
+  // is free again now that the result has been moved into Dst.
+  li(TMP1, 0);
+  stb(TMP1, static_cast<int16_t>(zf_off), STATE);
 }
 
 // =========================================================================
@@ -3280,13 +3392,32 @@ DEF_OP(TelemetrySetValue) { /* nop */ }
 // Rounding mode
 // =========================================================================
 DEF_OP(GetRoundingMode) {
-  // Read FPSCR RN field (bits [62:63])
+  // Read FPSCR RN field (bits [62:63]) and map it into the IR's x86 RC order.
+  //
+  // PPC FPSCR RN: 0=near, 1=trunc, 2=up, 3=down
+  // x86 / IR RC:  0=near, 1=down,  2=up, 3=trunc
+  //
+  // The map {0,1,2,3} -> {0,3,2,1} is an involution, so this is the exact same
+  // packed-nibble constant 0x1230 that SetRoundingMode below uses for the
+  // forward direction — read that comment for the derivation. Returning raw RN
+  // here (the previous behaviour) swapped down <-> trunc on every readback.
+  //
+  // andi. would clobber CR0; every instruction here is Rc-free so NZCV state
+  // survives for the flag-sensitive paths that may sit between this and a
+  // downstream Jcc.
   auto Dst = GetReg(Node);
   mffs(f(0));   // f0 = FPSCR
   mffprd(Dst, f(0));
-  // andi. would clobber CR0; Rc-free rldicl preserves NZCV state for the
-  // flag-sensitive paths that may sit between this and a downstream Jcc.
-  rldicl(Dst, Dst, 0, 62);  // extract RN bits
+  rldicl(Dst, Dst, 0, 62);   // Dst = raw RN (0-3)
+  sldi(TMP2, Dst, 2);        // TMP2 = RN * 4 (nibble shift amount)
+  li(TMP1, 0x1230);          // packed PPC RN -> x86 RC map (self-inverse)
+  srd(TMP1, TMP1, TMP2);     // 64-bit shift; shift amount is 0-12
+  rldicl(Dst, TMP1, 0, 62);  // x86 RC in bits 0-1
+  // Deliberate divergence from ARM64's GetRoundingMode, which also reports FTZ
+  // in bit 2 (FPCR.FZ). POWER has no scalar flush-to-zero control — VSCR.NJ is
+  // VMX-only and ignored by VSX — so there is no host state to report, and
+  // SetRoundingMode below drops guest FTZ on the same grounds. The final
+  // rldicl leaves bit 2 clear. Do not "fix" this by synthesising a value.
 }
 
 DEF_OP(SetRoundingMode) {
@@ -4033,57 +4164,84 @@ DEF_OP(FCmp) {
 // =========================================================================
 extern "C" uint64_t PPC64_CRC32(uint64_t Acc, uint64_t Val, uint64_t Bytes);
 
+// SSE4.2 crc32 (CRC-32C, reflected, no init/final inversion), fully inline
+// via vpmsumd Barrett reduction. Replaces a bit-at-a-time helper (8 dependent
+// ALU ops per byte - up to 512 for crc32q) behind a full FABI spill/fill.
+//
+// Math (derived and verified over 200k random vectors per SrcSize in
+// unittests/GuestCrypto/crc32_derive.py - do NOT edit constants without re-running it):
+// with Q = (crc ^ val) masked to N bytes, A = reflect(Q), P = 0x11EDC6F41:
+//   crc' = reflect32( (A * x^32) mod P )   [ ^ (crc >> 8N) when N < 4 ]
+// Barrett with mu = floor(x^96/P) = x^64 + mu', all in the reflected domain
+// so no runtime bit-reversal is ever needed:
+//   t1  = clmul(Q, reflect64(mu'))                        [vpmsumd #1]
+//   q_r = ((t1.low64 << 1) & maskN) ^ Q                   [GPR: sldi/rldicl/xor]
+//   t2  = clmul(q_r, reflect33(P))                        [vpmsumd #2]
+//   crc' = N==8 ? t2.dw0 & 0xFFFFFFFF : (t2.low64 >> 8N) & 0xFFFFFFFF
+// The <<1 is the reflected-clmul off-by-one; it cannot be folded into the
+// constant (its top bit is set), so it rides the GPR bounce that the masking
+// needs anyway. Operands sit in dw0 with dw1 zeroed (vpmsumd sums both
+// doubleword products); the zero comes from VZERO_VSX's dw0, the half that
+// is genuinely preserved across host calls.
 DEF_OP(CRC32) {
   auto Op = IROp->C<IR::IROp_CRC32>();
-  const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
   const auto SrcSize = Op->SrcSize;
-  const auto Src1 = GetReg(Op->Src1);
-  const auto Src2 = GetReg(Op->Src2);
+  const auto Src1 = GetReg(Op->Src1);   // accumulator (32-bit meaningful)
+  const auto Src2 = GetReg(Op->Src2);   // value
   const auto Dst  = GetReg(Node);
 
-  // Mini-frame (48 bytes):
-  //   [r1+ 0]  back chain
-  //   [r1+ 8]  TOC save
-  //   [r1+16]  LR save
-  //   [r1+24]  Acc arg
-  //   [r1+32]  Val arg
-  //   [r1+40]  result
-  stdu(r1, -48, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-
-  // Stage args from SRA-resident regs BEFORE SpillForABICall clobbers them.
-  std(Src1, 24, r1);
-  std(Src2, 32, r1);
-
-  SpillForABICall(TMP1);
-
-  ld(r3, 24 + kABISpill, r1);                                 // Acc
-  ld(r4, 32 + kABISpill, r1);                                 // Val
-  // r5 = byte count from SrcSize.
+  uint32_t N;
   switch (SrcSize) {
-  case IR::OpSize::i8Bit:  li(r5, 1); break;
-  case IR::OpSize::i16Bit: li(r5, 2); break;
-  case IR::OpSize::i32Bit: li(r5, 4); break;
-  case IR::OpSize::i64Bit: li(r5, 8); break;
-  default:                 li(r5, 4); break;            // matches i32 fallthrough
+  case IR::OpSize::i8Bit:  N = 1; break;
+  case IR::OpSize::i16Bit: N = 2; break;
+  case IR::OpSize::i64Bit: N = 8; break;
+  case IR::OpSize::i32Bit:
+  default:                 N = 4; break;
+  }
+  const uint32_t Bits = 8 * N;
+
+  // TMP1 = Q = (crc ^ val) masked to the source width. The accumulator's
+  // upper 32 bits are not architecturally meaningful - mask them away.
+  if (N == 8) {
+    rldicl(TMP1, Src1, 0, 32);
+    xor_(TMP1, TMP1, Src2);
+  } else {
+    xor_(TMP1, Src1, Src2);
+    rldicl(TMP1, TMP1, 0, 64 - Bits);
   }
 
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_CRC32);
-  std(r2, 8 + kABISpill, r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, 8 + kABISpill, r1);
+  mtvsrd(VTMP1, TMP1);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), VZERO_VSX, 0b00);   // dw1 <- 0
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_CRC32C_MU, TMP3, TMP4);
+  vpmsumd(VTMP1, VTMP1, VTMP2);
 
-  std(r3, 40 + kABISpill, r1);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), AsVSX(VTMP1), 0b10); // dw0 <- low dw
+  mfvsrd(TMP2, VTMP1);
+  sldi(TMP2, TMP2, 1);
+  if (N < 8) rldicl(TMP2, TMP2, 0, 64 - Bits);
+  xor_(TMP2, TMP2, TMP1);                                   // q_r
 
-  FillForABICall();
+  mtvsrd(VTMP1, TMP2);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), VZERO_VSX, 0b00);
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_CRC32C_P, TMP3, TMP4);
+  vpmsumd(VTMP1, VTMP1, VTMP2);
 
-  ld(r(0), 16, r1); mtlr(r(0));
-  ld(TMP1, 40, r1);
-  addi(r1, r1, 48);
-  li(r(0), 0);
-
-  // CRC32 result is 32-bit; the IR's DestSize is i32, so zero-extend.
-  rldicl(Dst, TMP1, 0, 32);
+  if (N == 8) {
+    mfvsrd(TMP1, VTMP1);                    // dw0 = product bits 64..127
+    // Tail term impossible (crc >> 64 == 0); result = low 32 of dw0.
+    rldicl(Dst, TMP1, 0, 32);
+  } else {
+    xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), AsVSX(VTMP1), 0b10);
+    mfvsrd(TMP1, VTMP1);                    // low 64 of product
+    if (N < 4) {
+      // (crc32 >> 8N), read from Src1 BEFORE Dst is written - Dst may alias.
+      rldicl(TMP2, Src1, 64 - Bits, 32 + Bits);
+      rldicl(Dst, TMP1, 64 - Bits, 32);     // (t2 >> 8N) & 0xFFFFFFFF
+      xor_(Dst, Dst, TMP2);
+    } else {
+      rldicl(Dst, TMP1, 64 - Bits, 32);
+    }
+  }
 }
 
 } // namespace FEXCore::CPU

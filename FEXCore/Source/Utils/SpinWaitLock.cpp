@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include <FEXCore/Utils/SpinWaitLock.h>
 
+#ifdef ARCHITECTURE_ppc64le
+#include <sys/platform/ppc.h>
+#endif
+
 namespace FEXCore::Utils::SpinWaitLock {
 #ifdef ARCHITECTURE_arm64
 constexpr uint64_t NanosecondsInSecond = 1'000'000'000ULL;
@@ -23,5 +27,14 @@ static uint64_t CalculateCyclesPerNanosecond() {
 
 uint64_t CycleCounterFrequency = GetCycleCounterFrequency();
 uint64_t CyclesPerNanosecond = CalculateCyclesPerNanosecond();
+#endif
+
+#ifdef ARCHITECTURE_ppc64le
+uint64_t GetTimebaseFrequency() {
+  // Thread-safe magic-static; __ppc_get_timebase_freq reads AT_HWCAP auxv,
+  // no syscall after the first call.
+  static const uint64_t Freq = __ppc_get_timebase_freq();
+  return Freq;
+}
 #endif
 } // namespace FEXCore::Utils::SpinWaitLock

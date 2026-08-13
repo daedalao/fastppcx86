@@ -15,6 +15,83 @@ namespace FEXCore::CPU {
 // Context load/store (accessing CpuStateFrame fields)
 // =========================================================================
 
+// AVX-high bank interception (see AVXHIGH_BANK_FIRST in PPC64Emitter.h):
+// when AVX is advertised, State.avx_high[i] lives in vs(16+i) while the
+// thread is inside JIT code, and every context access to those slots must be
+// a register move — a memory access here would read/write the stale shadow.
+// Returns the bank slot for a context offset, or -1 when the offset is
+// outside avx_high (or the feature is off). Full aligned 16-byte slots only:
+// the AVX_128 frontend never accesses partial high halves, and anything else
+// would break bank<->memory coherence, so it is a hard error.
+static int AVXHighBankSlot(const FEXCore::Context::ContextImpl* CTX, int32_t Offset, uint32_t Size) {
+  if (!CTX->HostFeatures.SupportsAVX) {
+    return -1;
+  }
+  constexpr int32_t Base = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[0][0]));
+  constexpr int32_t End  = Base + 16 * 16;
+  if (Offset < Base || Offset >= End) {
+    return -1;
+  }
+  // Unexpected shapes assert in debug builds; in release they fall back to
+  // the memory path (stale vs the bank — wrong, but bounded and loud in any
+  // assertions-enabled ctest run rather than emitting a garbage permute).
+  LOGMAN_THROW_A_FMT(Size == 16 && ((Offset - Base) & 15) == 0,
+                     "AVX-high context access must be a full aligned 16B slot: offset {} size {}", Offset, Size);
+  if (Size != 16 || ((Offset - Base) & 15) != 0) {
+    return -1;
+  }
+  return (Offset - Base) / 16;
+}
+
+// GPR-granular variant: the frontend's StoreContextHelper rewrites 128-bit
+// FPR-zero context stores (vzeroupper / VEX.128 upper-clear) into GPR-class
+// qword stores, so 8-byte GPR accesses into avx_high are real traffic and
+// must hit the bank, not the stale memory shadow. Returns the slot for an
+// aligned qword access, or -1 outside the range; QwIdx gets 0 for the guest
+// LOW qword of the slot (memory offset +0) and 1 for the HIGH qword (+8).
+static int AVXHighBankQwordSlot(const FEXCore::Context::ContextImpl* CTX, int32_t Offset, uint32_t Size, unsigned* QwIdx) {
+  if (!CTX->HostFeatures.SupportsAVX) {
+    return -1;
+  }
+  constexpr int32_t Base = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[0][0]));
+  constexpr int32_t End  = Base + 16 * 16;
+  if (Offset < Base || Offset >= End) {
+    return -1;
+  }
+  LOGMAN_THROW_A_FMT(Size == 8 && ((Offset - Base) & 7) == 0,
+                     "AVX-high GPR context access must be an aligned qword: offset {} size {}", Offset, Size);
+  if (Size != 8 || ((Offset - Base) & 7) != 0) {
+    return -1;  // same release-fallback contract as AVXHighBankSlot
+  }
+  *QwIdx = (static_cast<uint32_t>(Offset - Base) >> 3) & 1;
+  return (Offset - Base) / 16;
+}
+
+// Move one qword between a GPR and an AVX-high bank slot. Register layout
+// follows the VR convention (dw0 = guest HIGH qword, dw1 = guest LOW qword);
+// vs0 (= f0, the op-local scratch FPR) stages the value. xxpermdi DM
+// semantics: T.dw0 = (DM&2) ? A.dw1 : A.dw0;  T.dw1 = (DM&1) ? B.dw1 : B.dw0.
+static void AVXHighBankStoreQword(FEXCore::CPU::PPC64JITCore* self, int Slot, unsigned QwIdx, GPR Src) {
+  self->mtfprd(FPR{0}, Src);  // vs0.dw0 = Src
+  if (QwIdx == 0) {
+    // guest low qword -> bank dw1: T.dw0 = bank.dw0, T.dw1 = vs0.dw0
+    self->xxpermdi(AVXHighBankReg(Slot), AVXHighBankReg(Slot), VSXR{0}, 0);
+  } else {
+    // guest high qword -> bank dw0: T.dw0 = vs0.dw0, T.dw1 = bank.dw1
+    self->xxpermdi(AVXHighBankReg(Slot), VSXR{0}, AVXHighBankReg(Slot), 1);
+  }
+}
+
+static void AVXHighBankLoadQword(FEXCore::CPU::PPC64JITCore* self, int Slot, unsigned QwIdx, GPR Dst) {
+  if (QwIdx == 0) {
+    // guest low qword = bank dw1 -> vs0.dw0
+    self->xxpermdi(VSXR{0}, AVXHighBankReg(Slot), AVXHighBankReg(Slot), 2);
+  } else {
+    self->xxpermdi(VSXR{0}, AVXHighBankReg(Slot), AVXHighBankReg(Slot), 0);
+  }
+  self->mffprd(Dst, FPR{0});
+}
+
 DEF_OP(LoadContext) {
   auto Op    = IROp->C<IR::IROp_LoadContext>();
   auto Dst   = Node;
@@ -22,6 +99,10 @@ DEF_OP(LoadContext) {
 
   if (IsFPR(Dst)) {
     auto VDst = GetVReg(Dst);
+    if (const int Slot = AVXHighBankSlot(CTX, Offset, IR::OpSizeToSize(IROp->Size)); Slot >= 0) {
+      xxlor(AsVSX(VDst), AVXHighBankReg(Slot), AVXHighBankReg(Slot));
+      return;
+    }
     // Compute EA = STATE + Offset into TMP4, then dispatch on size. Using
     // raw lvx ignores Op->Size and reads 16B even for x86 vmovd m32 / vmovq
     // m64, corrupting upper-lane state from neighbouring CpuStateFrame
@@ -37,6 +118,11 @@ DEF_OP(LoadContext) {
   }
 
   auto GDst = GetReg(Dst);
+  unsigned BankQw;
+  if (const int Slot = AVXHighBankQwordSlot(CTX, Offset, IR::OpSizeToSize(IROp->Size), &BankQw); Slot >= 0) {
+    AVXHighBankLoadQword(this, Slot, BankQw, GDst);
+    return;
+  }
   // Choose load instruction based on size
   switch (IR::OpSizeToSize(IROp->Size)) {
   case 1:
@@ -70,6 +156,14 @@ DEF_OP(LoadContextPair) {
   int32_t Stride = static_cast<int32_t>(IR::OpSizeToSize(IROp->Size));
 
   if (IsFPR(D1.AsRegClass())) {
+    if (const int Slot = AVXHighBankSlot(CTX, Offset, static_cast<uint32_t>(Stride)); Slot >= 0) {
+      // A pair over avx_high covers two adjacent bank slots.
+      const int Slot2 = AVXHighBankSlot(CTX, Offset + Stride, static_cast<uint32_t>(Stride));
+      LOGMAN_THROW_A_FMT(Slot2 == Slot + 1, "LoadContextPair straddles the AVX-high bank boundary");
+      xxlor(AsVSX(GetVReg(D1)), AVXHighBankReg(Slot), AVXHighBankReg(Slot));
+      xxlor(AsVSX(GetVReg(D2)), AVXHighBankReg(Slot2), AVXHighBankReg(Slot2));
+      return;
+    }
     // Same fix as LoadContext: dispatch on Stride, not always lvx 16B.
     if (Offset >= -32768 && Offset <= 32767) {
       addi(TMP4, STATE, static_cast<int16_t>(Offset));
@@ -89,6 +183,14 @@ DEF_OP(LoadContextPair) {
   } else {
     auto R1 = GetReg(D1);
     auto R2 = GetReg(D2);
+    unsigned Qw1, Qw2;
+    if (const int S1 = AVXHighBankQwordSlot(CTX, Offset, static_cast<uint32_t>(Stride), &Qw1); S1 >= 0) {
+      const int S2 = AVXHighBankQwordSlot(CTX, Offset + Stride, static_cast<uint32_t>(Stride), &Qw2);
+      LOGMAN_THROW_A_FMT(S2 >= 0, "LoadContextPair half-in-range on avx_high");
+      AVXHighBankLoadQword(this, S1, Qw1, R1);
+      AVXHighBankLoadQword(this, S2, Qw2, R2);
+      return;
+    }
     switch (Stride) {
     case 4:
       if (Offset >= -32768 && Offset + 4 <= 32767) {
@@ -126,6 +228,10 @@ DEF_OP(StoreContext) {
   // operands and intermittently misroutes a GPR-class store into the FPR path.
   if (Op->Class == IR::RegClass::FPR || Op->Class == IR::RegClass::FPRFixed) {
     auto VSrc = GetVReg(Op->Value);
+    if (const int Slot = AVXHighBankSlot(CTX, Offset, IR::OpSizeToSize(IROp->Size)); Slot >= 0) {
+      xxlor(AVXHighBankReg(Slot), AsVSX(VSrc), AsVSX(VSrc));
+      return;
+    }
     if (Offset >= -32768 && Offset <= 32767) {
       addi(TMP4, STATE, static_cast<int16_t>(Offset));
     } else {
@@ -154,6 +260,11 @@ DEF_OP(StoreContext) {
     }
   } else {
     GSrc = GetReg(Op->Value);
+  }
+  unsigned BankQw;
+  if (const int Slot = AVXHighBankQwordSlot(CTX, Offset, IR::OpSizeToSize(IROp->Size), &BankQw); Slot >= 0) {
+    AVXHighBankStoreQword(this, Slot, BankQw, GSrc);
+    return;
   }
   switch (IR::OpSizeToSize(IROp->Size)) {
   case 1:
@@ -197,6 +308,13 @@ DEF_OP(StoreContextPair) {
   // FPR-class garbage there); other sites get GPR-class garbage and
   // take the correct path.
   if (Op->Class == IR::RegClass::FPR || Op->Class == IR::RegClass::FPRFixed) {
+    if (const int Slot = AVXHighBankSlot(CTX, Offset, static_cast<uint32_t>(Stride)); Slot >= 0) {
+      const int Slot2 = AVXHighBankSlot(CTX, Offset + Stride, static_cast<uint32_t>(Stride));
+      LOGMAN_THROW_A_FMT(Slot2 == Slot + 1, "StoreContextPair straddles the AVX-high bank boundary");
+      xxlor(AVXHighBankReg(Slot), AsVSX(GetVReg(Op->Value1)), AsVSX(GetVReg(Op->Value1)));
+      xxlor(AVXHighBankReg(Slot2), AsVSX(GetVReg(Op->Value2)), AsVSX(GetVReg(Op->Value2)));
+      return;
+    }
     if (Offset >= -32768 && Offset <= 32767) {
       addi(TMP4, STATE, static_cast<int16_t>(Offset));
     } else {
@@ -229,6 +347,22 @@ DEF_OP(StoreContextPair) {
     };
     auto R1 = ResolveSrc(Op->Value1, TMP3);
     auto R2 = ResolveSrc(Op->Value2, TMP4);
+    // The frontend rewrites 128-bit FPR-zero context stores into exactly this
+    // shape (GPR pair, InlineZero) — including for avx_high slots (vzeroupper
+    // and VEX.128 upper-clears). Those must hit the bank.
+    unsigned Qw1, Qw2;
+    if (const int S1 = AVXHighBankQwordSlot(CTX, Offset, static_cast<uint32_t>(Stride), &Qw1); S1 >= 0) {
+      const int S2 = AVXHighBankQwordSlot(CTX, Offset + Stride, static_cast<uint32_t>(Stride), &Qw2);
+      LOGMAN_THROW_A_FMT(S2 >= 0, "StoreContextPair half-in-range on avx_high");
+      if (R1.idx == r0.idx && R2.idx == r0.idx && S2 == S1) {
+        // Whole-slot zero: single xxlxor instead of two merges.
+        xxlxor(AVXHighBankReg(S1), AVXHighBankReg(S1), AVXHighBankReg(S1));
+      } else {
+        AVXHighBankStoreQword(this, S1, Qw1, R1);
+        AVXHighBankStoreQword(this, S2, Qw2, R2);
+      }
+      return;
+    }
     switch (Stride) {
     case 4:
       if (Offset >= -32768 && Offset + 4 <= 32767) {
@@ -399,6 +533,43 @@ DEF_OP(FillRegister) {
       break;
     default: break;
     }
+  }
+}
+
+// PPC64LE-only fused byte-reversed memory ops — the MOVBE lowering.
+// EA = (Addr|0) + r0; Addr sits in the RA slot where 0 would mean literal
+// zero, but GetReg can never hand back r0 (it is not in any allocation
+// pool), and r0 == 0 is the backend invariant for RB. Op->TSO carries the
+// frontend's IsTSOEnabled(GPR) decision for this access; the barriers must
+// mirror LoadMemTSO (acquire: lwsync AFTER the load) and StoreMemTSO
+// (release: lwsync BEFORE the store) exactly.
+DEF_OP(LoadMemRev) {
+  auto Op = IROp->C<IR::IROp_LoadMemRev>();
+  auto Dst = GetReg(Node);
+  auto Addr = GetReg(Op->Addr);
+  switch (IROp->Size) {
+  case IR::OpSize::i16Bit: lhbrx(Dst, Addr, r0); break;
+  case IR::OpSize::i32Bit: lwbrx(Dst, Addr, r0); break;
+  case IR::OpSize::i64Bit: ldbrx(Dst, Addr, r0); break;
+  default: LOGMAN_MSG_A_FMT("LoadMemRev: unsupported size {}", IROp->Size); break;
+  }
+  if (Op->TSO) {
+    lwsync();
+  }
+}
+
+DEF_OP(StoreMemRev) {
+  auto Op = IROp->C<IR::IROp_StoreMemRev>();
+  auto Addr = GetReg(Op->Addr);
+  auto Value = GetReg(Op->Value);
+  if (Op->TSO) {
+    lwsync();
+  }
+  switch (IROp->Size) {
+  case IR::OpSize::i16Bit: sthbrx(Value, Addr, r0); break;
+  case IR::OpSize::i32Bit: stwbrx(Value, Addr, r0); break;
+  case IR::OpSize::i64Bit: stdbrx(Value, Addr, r0); break;
+  default: LOGMAN_MSG_A_FMT("StoreMemRev: unsupported size {}", IROp->Size); break;
   }
 }
 
@@ -873,9 +1044,12 @@ DEF_OP(LoadMemTSO) {
   // load is the plainest correct load-acquire on POWER, and it is the simpler of
   // two valid constructs. It replaced a self-compare / never-taken-branch /
   // `isync` sequence — also a documented and valid load-acquire, and cheaper,
-  // which is why the port originally chose it. `LockOnlyTSO` exists in the config
-  // precisely because per-load acquire cost "cumulatively dominates runtime in
-  // libc / pthread tight loops", so the cheap construct had a real motivation.
+  // which is why the port originally chose it. Per-load acquire cost is real —
+  // it "cumulatively dominates runtime in libc / pthread tight loops" — so the
+  // cheap construct had a real motivation. `LockOnlyTSO` also exists in the
+  // config for that reason, but it is NOT an alternative to getting this right:
+  // it is measurably unsound (see the block at the end of this function), and
+  // must not be treated as a way to buy back the cost of a barrier here.
   //
   // HONEST STATUS OF THE EVIDENCE, because an earlier version of this comment
   // overstated it twice and the corrections matter more than the conclusion:
@@ -900,11 +1074,39 @@ DEF_OP(LoadMemTSO) {
   //      library gap is closed. That decides whether either construct matters.
   //   2. Get a recipe-compliant benchmark (SMT2, node-pinned) for the cost of
   //      `lwsync` per guest load. If it is significant and neither construct
-  //      affects correctness, the cheap one should come back — or `LockOnlyTSO`
-  //      becomes the better lever than either.
+  //      affects correctness, the cheap one should come back.
   //   3. Do not accept a zero-event run as proof of anything: at these rates 15
   //      trials cannot establish a zero, and 30 only rules out a true rate above
   //      about 10%.
+  //
+  // `LockOnlyTSO` IS NOT A CANDIDATE ANSWER TO (2). An earlier version of this
+  // comment said it "becomes the better lever than either". That was wrong, and
+  // the correction is not a matter of taste — it is measured. `FEX_LOCKONLYTSO=1`
+  // drops the barrier emitted here from every non-`LOCK` guest load and store,
+  // and that produces memory-ordering outcomes x86 forbids:
+  //
+  //   [MEASURED] AC922, same guest binary, only the env var changed
+  //   (powerpc64le-handbook/probes/atomics_litmus.c — the MP shape is the
+  //   discriminator; run via atomics_litmus_x86 under FEX):
+  //
+  //     default            MP  0 / 150000 rounds total (0/30000, 0/60000, 0/60000)
+  //     FEX_LOCKONLYTSO=1  MP  659 / 30000, then 12 / 30000, then 51 / 30000
+  //
+  //   MP is architecturally forbidden on x86 (no store-store or load-load
+  //   reordering visible to another processor), so every one of those is a guest-
+  //   visible violation of the memory model FEX claims to emulate. The rate swings
+  //   ~50x between repetitions, so no particular number means anything; 0/150000
+  //   against nonzero-every-time is the result.
+  //
+  //   powerpc64le-handbook/probes/seqcst_discriminator.c does NOT catch it —
+  //   0/60000 both ways [MEASURED] — because `LOCK` operations keep their full
+  //   fence. It is exactly the plain loads and stores that lose ordering, which
+  //   is why a seq_cst-shaped test passing is not evidence of anything here.
+  //
+  // It buys roughly 1.6x. It is a knowingly-unsound speed/correctness trade for a
+  // single-threaded-ish workload the user is prepared to have corrupt itself, not
+  // an engineering answer to barrier cost. Fixing the cost properly means a
+  // cheaper *correct* lowering, not deleting the barrier.
   if (Op->Class == IR::RegClass::FPR) {
     LoadFPRSized(GetVReg(Dst), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
     lwsync();
@@ -1860,6 +2062,26 @@ DEF_OP(ContextClear) {
       stbx(r0, STATE, TMP1);
     }
     Pos += 1;
+  }
+
+  // AVX-high bank: any cleared avx_high slot must ALSO be zeroed in its bank
+  // register — the memory wipe above only updates the (stale-while-in-JIT)
+  // shadow. Partial slot coverage cannot be expressed against the bank; the
+  // frontend clears whole 16-byte high halves, so assert it.
+  if (CTX->HostFeatures.SupportsAVX) {
+    constexpr int32_t Base = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.avx_high[0][0]));
+    for (int i = 0; i < 16; ++i) {
+      const int32_t SlotBegin = Base + i * 16;
+      const int32_t SlotEnd   = SlotBegin + 16;
+      const int32_t IsBegin   = std::max(SlotBegin, Offset);
+      const int32_t IsEnd     = std::min(SlotEnd, Offset + Length);
+      if (IsBegin >= IsEnd) {
+        continue;
+      }
+      LOGMAN_THROW_A_FMT(IsBegin == SlotBegin && IsEnd == SlotEnd,
+                         "ContextClear partially covers avx_high[{}]", i);
+      xxlxor(AVXHighBankReg(i), AVXHighBankReg(i), AVXHighBankReg(i));
+    }
   }
 }
 

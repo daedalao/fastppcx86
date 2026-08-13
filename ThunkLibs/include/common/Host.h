@@ -5,6 +5,7 @@ $end_info$
 */
 
 #pragma once
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +59,27 @@ __attribute__((weak)) void MoveGuestStack(uintptr_t NewAddress);
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef __powerpc64__
+// This is the ONLY thing in the ThunkLibs consumer include tree that reaches
+// into FEXCore's, and it is deliberately confined to the one configuration
+// that uses it: MakeLow32HostTrampoline below writes four instruction words at
+// run time and must publish them to the fetch stream, which on ppc64le needs
+// the real dcbst/sync/icbi/sync/isync sequence rather than
+// __builtin___clear_cache (that builtin performs no cache maintenance here --
+// see the header for the measurement).
+//
+// It was briefly at the top of this file instead, which broke every
+// out-of-tree consumer of ThunkLibs/include: none of them pass
+// -I<fex>/FEXCore/include, and none of them build 32-bit thunks either, so
+// they were paying for a declaration they never instantiate. Anything that
+// does build a 32-bit ppc64le thunk genuinely needs FEXCore, so it fails here
+// with an instruction rather than a bare "file not found".
+#if !__has_include(<FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>)
+#error "32-bit ppc64le thunks need FEXCore's headers: add -I<fex-source>/FEXCore/include"
+#endif
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
+#endif
 
 // Address ranges of the low-4GB trampoline pools allocated by
 // MakeLow32HostTrampoline below. Kept separately from that function's own
@@ -162,7 +184,10 @@ inline void* MakeLow32HostTrampoline(void* Target) {
   Insns[2] = 0x7C0C0378; // mr    r12, r0   (or r12, r0, r0)
   Insns[3] = 0x4E800420; // bctr
   memcpy(Tramp + 16, &Target, 8);
-  __builtin___clear_cache(reinterpret_cast<char*>(Tramp), reinterpret_cast<char*>(Tramp + 16));
+  // Only the four instruction words need I-cache publication; the literal at
+  // +16 is read by `ld`, i.e. through the data path. Not
+  // __builtin___clear_cache: it emits no cache maintenance on ppc64le.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Tramp, 16);
   Cache.emplace(Target, Tramp);
   return Tramp;
 #else

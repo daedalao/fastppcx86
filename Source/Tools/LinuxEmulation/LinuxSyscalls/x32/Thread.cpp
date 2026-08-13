@@ -219,8 +219,12 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
         timeout_ptr = &tp64;
       }
 
-      uint64_t Result = syscall(SYSCALL_DEF(futex), uaddr, futex_op, val, timeout_ptr, uaddr2, val3);
-      SYSCALL_ERRNO();
+      // Terminal stage shared with x64 futex / x32 futex_time64: deferred-
+      // signal guard, sliced untimed waits, internal-EINTR restart,
+      // diagnostics. Result is already -errno encoded.
+      return FEX::HLE::ObservedFutexSyscall(Frame, reinterpret_cast<uint64_t>(uaddr), static_cast<uint64_t>(futex_op),
+                                            static_cast<uint64_t>(val), reinterpret_cast<uint64_t>(timeout_ptr),
+                                            reinterpret_cast<uint64_t>(uaddr2), static_cast<uint64_t>(val3));
     });
 
   REGISTER_SYSCALL_IMPL_X32(

@@ -15,6 +15,7 @@
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 
 #include <FEXHeaderUtils/Filesystem.h>
 
@@ -1299,8 +1300,9 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   // dispatcher can fetch whatever the I-cache last held for those lines — the
   // exact hazard the JIT's own Finalise (JIT/PPC64LE/JIT.cpp) flushes for after
   // every compile. ARM64 needs the equivalent maintenance for the same reason.
-  __builtin___clear_cache(reinterpret_cast<char*>(CodeBufferRange.data()),
-                          reinterpret_cast<char*>(CodeBufferRange.data()) + CodeBufferRange.size_bytes());
+  // (Was __builtin___clear_cache, which emits no cache maintenance at all on
+  // ppc64le — see FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h.)
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(CodeBufferRange.data(), CodeBufferRange.size_bytes());
 
   // B1: structural check of the guest -> host block mapping, before anything is
   // registered as an executable entry point. Deliberately NOT gated on
@@ -1657,6 +1659,20 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, const fextl::
     ResetValidationState();
     return;
   }
+
+  // ApplyCodeRelocations re-emits real host instruction words in place
+  // (LoadConstantFixed), and CodeBufferRangeRef spans the validation context's
+  // live PROT_EXEC code buffer. Today nothing branches into it — this path
+  // compiles a reference copy only so the bytes can be compared — so this flush
+  // is defensive rather than load-bearing, and it is on a debug-gated
+  // (EnableCodeCacheValidation) path where its cost is irrelevant.
+  //
+  // It is here so the rule holds without exception: every in-place rewrite of
+  // host instructions in this tree publishes the range it rewrote. The
+  // exception is what the reader has to notice, and the two sibling call sites
+  // of ApplyCodeRelocations both flush. An unexplained asymmetry here is how
+  // the next person concludes the flush is optional.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(CodeBufferRangeRef.data(), CodeBufferRangeRef.size_bytes());
 
   const size_t RefSize = CodeBufferRangeRef.size_bytes();
   const size_t CachedSize = CachedCode.size_bytes();

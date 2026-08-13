@@ -8,6 +8,7 @@
 
 #include <FEXCore/Utils/LogManager.h>
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -80,14 +81,6 @@ static constexpr Cond InvertCond(Cond c) {
 }
 
 // ---------------------------------------------------------------------------
-// Relocation entry: a position in the code buffer that needs patching
-// ---------------------------------------------------------------------------
-struct PendingBranch {
-  int64_t patch_offset;  // byte offset in code buffer of the instruction
-  Label*  target;
-};
-
-// ---------------------------------------------------------------------------
 // Emitter class
 // ---------------------------------------------------------------------------
 class Emitter {
@@ -136,6 +129,17 @@ public:
   }
 
   void nop() { Emit32(0x60000000u); }  // ori r0, r0, 0
+
+  // POWER SMT thread-priority hints: architecturally nop-class `or rx,rx,rx`
+  // forms that adjust the hardware thread's dispatch priority (PPR). Problem
+  // state may set very-low/low/medium-low/medium; if a level is not permitted
+  // the instruction executes as a plain nop, so these are always safe to emit.
+  void smt_very_low_priority() { Emit32(0x7FFFFB78u); }  // or r31,r31,r31 (HMT_very_low)
+  // Unused: the spin-hint machinery drops straight to very_low and returns to
+  // medium. Kept as the reserved middle tier for waits that shouldn't yield
+  // that hard (e.g. short bounded spins).
+  void smt_low_priority()      { Emit32(0x7C210B78u); }  // or r1,r1,r1    (HMT_low)
+  void smt_medium_priority()   { Emit32(0x7C421378u); }  // or r2,r2,r2    (HMT_medium, default)
 
   // =========================================================================
   // Integer ALU
@@ -340,19 +344,10 @@ public:
     EmitX(31, rs.idx, ra.idx, sh, 824, 1);
   }
 
-  // sradi RA, RS, SH  (shift right algebraic doubleword immediate, XO 413)
-  // Encoding is special: SH field spans 5 bits plus 1 extra bit at bit position 30
+  // sradi RA, RS, SH  (shift right algebraic doubleword immediate, XS-form)
+  // XS-form: 9-bit XO=413 at bits [21:29], the 6th SH bit at bit 30, Rc at 31.
   void sradi(GPR ra, GPR rs, uint32_t sh) {
     assert(sh < 64);
-    // Format: op=31 | RS | RA | sh(low5) | XO=413 | sh(bit5) | Rc=0
-    // XO=413 occupies bits [21:29] but the extra SH bit is at bit 30
-    // Standard XO encoding would put XO in bits [22:30], but sradi is different:
-    // It's at bits [21:29] = 413 >> 1 and the extra sh bit is at bit 30 (= 413 & 1)
-    // Let me look at the exact encoding:
-    // sradi: primary opcode 31, bits[21:30]=0b1100111010 = 826, Rc at bit 31
-    // Wait, sradi XO is 413 but in the 10-bit XO field it's:
-    // XO field bits [21:30]: 413 = 0b110011101 (9 bits) but the top bit is the extra SH bit
-    // Actually: bits[21:29] = 413 (for sradi), bits[30] = sh>>5, bit[31]=Rc
     uint32_t sh_low = sh & 0x1F;
     uint32_t sh_high = (sh >> 5) & 1;
     Emit32((31u << 26) | (rs.idx << 21) | (ra.idx << 16) | (sh_low << 11) |
@@ -627,6 +622,27 @@ public:
     Emit32((31u << 26) | (rs.idx << 21) | (1u << 20) | (fxm << 12) | (144u << 1));
   }
 
+  // mcrxrx BF  (move XER overflow/carry state into a CR field — X-form,
+  // opcode 31, XO 576; Power ISA 3.0, i.e. POWER9 and later ONLY. A POWER8
+  // takes an illegal-instruction interrupt, so every emitter of this must be
+  // gated on HostFeatures.SupportsISA30.)
+  //   CR[BF].LT = XER.OV     CR[BF].GT = XER.OV32
+  //   CR[BF].EQ = XER.CA     CR[BF].SO = XER.CA32
+  // XER itself is left unchanged (unlike the obsolete `mcrxr`, which cleared
+  // the bits it moved).
+  // CAUTION: this is NOT the bit layout of the mfxer/rotlwi/mtocrf idiom it
+  // replaces (LT=SO, GT=OV, EQ=CA). CA stays in EQ, but OV moves from GT to
+  // LT and SO is not projected at all — a consumer that keeps reading GT for
+  // "overflow" silently gets OV32, which is wrong for every 64-bit op.
+  // CAUTION: gas assembles `mcrxrx` at -mcpu=power8 with no diagnostic, so the
+  // assembler accepting it is not evidence about ISA level.
+  // Verified against powerpc64le-linux-gnu-as: mcrxrx 1 = 0x7C800480,
+  // mcrxrx 0 = 0x7C000480, mcrxrx 7 = 0x7F800480.
+  void mcrxrx(uint32_t bf) {
+    assert(bf < 8 && "mcrxrx BF is a 3-bit CR field index");
+    Emit32((31u << 26) | (bf << 23) | (576u << 1));
+  }
+
   // mtcr RS = mtcrf 0xFF, RS
   void mtcr(GPR rs) { mtcrf(0xFF, rs); }
 
@@ -795,6 +811,13 @@ public:
            (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/ | ((t >> 5) & 1u) /*TX*/);
   }
 
+  // XX3-form with a BF (CR field) target instead of a T register (the VSX
+  // scalar compares). No TX bit; AX/BX as usual.
+  void EmitXX3BF(uint32_t bf, uint32_t a, uint32_t b, uint32_t xo) {
+    Emit32((60u << 26) | ((bf & 7u) << 23) | ((a & 31u) << 16) | ((b & 31u) << 11) | ((xo & 0xFFu) << 3) |
+           (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/);
+  }
+
   // VR n is vs(32+n), so every extension bit comes out 1 and this is
   // bit-identical to the previous hardcoded 0x7.
   void EmitXX3(uint32_t vrt, uint32_t vra, uint32_t vrb, uint32_t xo) {
@@ -898,6 +921,9 @@ public:
   // Bitwise VSX (XO = 144..168).  These overlap with vand/vxor but operate on 128-bit
   // VSX values directly without going through AltiVec.
   void xxlor  (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 146); }
+  // Full-VSX xxlor: the register move that crosses the vs0-31 / vs32-63
+  // boundary (VMX-form vmr cannot address the low bank at all).
+  void xxlor  (VSXR t, VSXR a, VSXR b) { EmitXX3VSX(t.idx, a.idx, b.idx, 146); }
   void xxlxor (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 154); }
   void xxland (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 130); }
   void xxlandc(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 138); }
@@ -916,6 +942,30 @@ public:
     Emit32((60u << 26) | (vrt << 21) | (vrb << 11) | ((xo & 0x1FFu) << 2) |
            (1u << 1) /*BX*/ | 1u /*TX*/);
   }
+  // xxbrq XT, XB — vector byte-reverse quadword. ISA 3.0 (POWER9) ONLY:
+  // emitting this on POWER8 is a SIGILL, so every call site must be gated on
+  // HostFeatures.SupportsISA30 with a 2.07 fallback arm (see
+  // PPC64EmitterBase::LoadUnalignedV128 for the canonical pattern).
+  //
+  // Reverses all 16 bytes of a VSR in one instruction — the single-instruction
+  // bridge between this backend's guest-XMM image (guest byte 0 at BE byte
+  // element 15) and the BE-byte-numbered raw image the AES cipher instructions
+  // want. Replaces a materialized {15..0} mask + vperm.
+  //
+  // XX2-form, but bits BE 11..15 are the byte-reverse WIDTH selector (UIM),
+  // not part of the opcode: 31 = quadword. EmitXX2 zeroes that field, so this
+  // sets it explicitly rather than reusing EmitXX2.
+  //
+  // Encoding verified against `llvm-mc -triple=powerpc64le --show-encoding`
+  // (VR n is vs(32+n), so BX/TX are always 1 here):
+  //   xxbrq 32, 33  ->  0xf01f0f6f   (xxbrq v0, v1)
+  //   xxbrq 34, 35  ->  0xf05f1f6f   (xxbrq v2, v3)
+  //   xxbrq 63, 63  ->  0xf3ffff6f   (xxbrq v31, v31)
+  void xxbrq(VR t, VR b) {
+    Emit32((60u << 26) | (t.idx << 21) | (31u << 16) | (b.idx << 11) |
+           ((475u & 0x1FFu) << 2) | (1u << 1) /*BX*/ | 1u /*TX*/);
+  }
+
   // XO field values for XX2 are taken straight from gas-emitted bytes (the
   // ISA-listed numbers in some books include extra bits and don't match the
   // 9-bit XO field at BE 21..29 directly).
@@ -932,6 +982,13 @@ public:
   void xscvsxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 376); } // i64→f64
   void xscvuxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 360); } // u64→f64
   void xscvspdp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 329); } // f32→f64 scalar
+
+  // VSX scalar FP compare, unordered/ordered, targeting a CR field (XX3-form
+  // with BF instead of a T register; opcode 60, XO 35/43, ISA 2.06). Compares
+  // doubleword 0 of each operand. Encoding verified against llvm-mc:
+  // xscmpudp 7,34,35 == 0xf382191e; xscmpodp XO=43.
+  void xscmpudp(uint32_t bf, VR a, VR b) { EmitXX3BF(bf, a.idx + 32, b.idx + 32, 35); }
+  void xscmpodp(uint32_t bf, VR a, VR b) { EmitXX3BF(bf, a.idx + 32, b.idx + 32, 43); }
   void xscvdpsp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 265); } // f64→f32 scalar
   // Scalar / vector unary FP (sqrt / abs / neg)
   void xssqrtsp(VR t, VR b)  { EmitXX2(t.idx, b.idx,  11); }
@@ -1132,6 +1189,17 @@ public:
   // dword[0] as an 8-byte LE integer at EA and dword[1] at EA+8 (so the value
   // must be doubleword-swapped BEFORE the store to match stxvx/stvx layout).
   void stxvd2x(VR vrs, GPR ra, GPR rb) { EmitX(31, vrs.idx, ra.idx, rb.idx, 972, 1); }
+  // VSXR overloads of the indexed loads/stores: the TX/SX bit (the slot EmitX
+  // calls `rc`) is DERIVED from bit 5 of the register number instead of
+  // hardcoded, which is what makes the FPR-aliased low half (vs0-vs31)
+  // reachable — same scheme as EmitXX3VSX. The full-vector lxvd2x/lxvx loads
+  // define BOTH doublewords on all ISA levels, so they are safe to overload;
+  // the SCALAR loads below stay VR-only (their dword[1]-undefined caveats on
+  // pre-3.0 hardware make a blind low-bank overload a trap).
+  void stxvd2x(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 972, (vss.idx >> 5) & 1u); }
+  void lxvd2x (VSXR vst, GPR ra, GPR rb) { EmitX(31, vst.idx & 31u, ra.idx, rb.idx, 844, (vst.idx >> 5) & 1u); }
+  void lxvx   (VSXR vst, GPR ra, GPR rb) { EmitX(31, vst.idx & 31u, ra.idx, rb.idx, 268, (vst.idx >> 5) & 1u); }
+  void stxvx  (VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 396, (vss.idx >> 5) & 1u); }
 
   // Scalar loads into dword[0].  CAUTION: ISA 3.0 defines dword[1] ← 0 for
   // all four, but on ISA 2.06/2.07 hardware (POWER7/POWER8) lxsdx/lxsiwzx
@@ -1149,11 +1217,13 @@ public:
   // stxsdx XS,RA,RB — ISA 2.06 — p.504, XO=716. Stores dword[0] as an 8-byte
   // LE integer at EA.  dword[1] is not read.
   void stxsdx(VR vrs, GPR ra, GPR rb)   { EmitX(31, vrs.idx, ra.idx, rb.idx, 716, 1); }
+  void stxsdx(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 716, (vss.idx >> 5) & 1u); }
   // stxsiwx XS,RA,RB — ISA 2.07 (POWER8+) — p.506, XO=140. Stores word
   // element 1 of VSR[XS] (bits 32:63, i.e. the LOW word of dword[0]) as a
   // 4-byte LE integer at EA.  This is the half lxsiwzx fills, so a value
   // round-trips through lxsiwzx/stxsiwx unchanged.
   void stxsiwx(VR vrs, GPR ra, GPR rb)  { EmitX(31, vrs.idx, ra.idx, rb.idx, 140, 1); }
+  void stxsiwx(VSXR vss, GPR ra, GPR rb) { EmitX(31, vss.idx & 31u, ra.idx, rb.idx, 140, (vss.idx >> 5) & 1u); }
 
   // lxsibzx XT,RA,RB — **ISA 3.0 (POWER9)** — p.486, XO=781. dword[0] =
   // zero-extended byte at EA; dword[1] = 0 (architectural, v3.0 instruction).
@@ -1234,12 +1304,12 @@ public:
   void vaddsbs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 768);  }
   void vaddshs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 832);  }
   void vaddsws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 896);  }
-  void vsububs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1536); }  // check XO
+  void vsububs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1536); }
   void vsubsbs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1792); }
   void vsubshs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1856); }
   void vsubsws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1920); }
-  void vsubuhs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1600); }  // check XO
-  void vsubuws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1664); }  // check XO
+  void vsubuhs(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1600); }
+  void vsubuws(VR vrt, VR vra, VR vrb)  { EmitVX(vrt.idx, vra.idx, vrb.idx, 1664); }
 
   // Average (unsigned): vavgub XO=1026, vavguh XO=1090, vavguw XO=1154
   void vavgub(VR vrt, VR vra, VR vrb)   { EmitVX(vrt.idx, vra.idx, vrb.idx, 1026); }
@@ -1401,8 +1471,35 @@ public:
 
   // POWER8 ISA 2.07 crypto (AES + carry-less polynomial multiply + perm-xor).
   // VX-form except vpermxor which is VA-form. vsbox takes only VRA (VRB=0).
-  // x86 mappings: vcipher = AESENC round, vcipherlast = AESENCLAST,
-  // vncipher = AESDEC, vncipherlast = AESDECLAST, vsbox = AES InvSubBytes.
+  //
+  // BYTE ORDER: these read the AES state in BIG-ENDIAN order (state byte 0 ==
+  // BE byte element 0). This backend holds a guest XMM in the opposite image -
+  // guest byte 0 lands at BE element 15, see LoadUnalignedV128 - so callers
+  // must byte-reverse in and out. EmitAESLoadMask + explicit vperms (JITClass.h)
+  // wrap that; they materialize the reverse mask per-use, deliberately NOT
+  // from a pinned register - see the vs14-vs31 dw1-volatility hazard note in
+  // PPC64Emitter.h.
+  //
+  // x86 mappings, forward direction, exact:
+  //   vcipher(A,K)      == AESENC(A,K)       (FIPS-197 round, then ^K)
+  //   vcipherlast(A,K)  == AESENCLAST(A,K)
+  //   vncipherlast(A,K) == AESDECLAST(A,K)
+  //
+  // vncipher is NOT AESDEC. It implements the EQUIVALENT INVERSE CIPHER, which
+  // applies InvMixColumns AFTER the VRB xor rather than before:
+  //   vncipher(A,B) = InvMixColumns( InvSubBytes(InvShiftRows(A)) ^ B )
+  //   AESDEC(A,K)   = InvMixColumns( InvSubBytes(InvShiftRows(A)) ) ^ K
+  // Assuming they are the same op is what forced the old scalar software
+  // InvMixColumns helper. They reconcile for free: InvMixColumns is linear over
+  // GF(2), so InvMixColumns(0) == 0 and therefore
+  //   AESDEC(A,K) == vncipher(A, 0) ^ K
+  // i.e. pass a zero VRB and xor the round key yourself. Likewise
+  //   AESIMC(S)   == vncipher(vcipherlast(S, 0), 0)
+  // because vcipherlast(S,0) = ShiftRows(SubBytes(S)) and vncipher's leading
+  // InvShiftRows/InvSubBytes then cancel it, leaving pure InvMixColumns.
+  //
+  // vsbox is plain SubBytes. Being bytewise it is the one AES primitive that
+  // commutes with the byte reversal, so it needs no vperm bracketing.
   void vcipher    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1288); }
   void vcipherlast(VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1289); }
   void vncipher   (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1352); }
@@ -1413,6 +1510,19 @@ public:
   void vpmsumw    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1160); }
   void vpmsumd    (VR vrt, VR vra, VR vrb)            { EmitVX(vrt.idx, vra.idx, vrb.idx, 1224); }
   void vpermxor   (VR vrt, VR vra, VR vrb, VR vrc)    { EmitVA(vrt.idx, vra.idx, vrb.idx, vrc.idx, 45); }
+
+  // SHA-256 / SHA-512 sigma. VX-form, but the VRB field is not a register: it
+  // carries ST (1 bit) and SIX (4 bits) as VRB = (ST << 4) | SIX.
+  //   vshasigmaw ST=0 SIX=0    -> lane-wise sigma0 (x86 SHA256MSG1 helper)
+  //   vshasigmaw ST=0 SIX=0xF  -> lane-wise sigma1 (x86 SHA256MSG2 helper)
+  // These are lane-wise on 32-bit elements and need no byte reversal, since
+  // the JIT's element convention already matches (IR lane i at phys[12-4i]).
+  void vshasigmaw(VR vrt, VR vra, uint32_t st, uint32_t six) {
+    EmitVX(vrt.idx, vra.idx, ((st & 1u) << 4) | (six & 0xFu), 1666);
+  }
+  void vshasigmad(VR vrt, VR vra, uint32_t st, uint32_t six) {
+    EmitVX(vrt.idx, vra.idx, ((st & 1u) << 4) | (six & 0xFu), 1730);
+  }
 
   // mfvscr / mtvscr
   // VX-form XO occupies all 11 low bits and there is no Rc, so the XO value is
@@ -1439,25 +1549,23 @@ public:
   // Branches (B-form and I-form and XL-form)
   // =========================================================================
 
-  // Unconditional branch (I-form): b target, relative offset
+  // Unconditional branch (I-form): b target, relative offset.
+  // Range guards use LOGMAN, not assert: NDEBUG builds must still refuse to
+  // emit a truncated LI field, which would branch into an unrelated block
+  // (same rationale as EmitM's field guards).
   void b(int32_t offset) {
-    assert((offset & 3) == 0 && "Branch target must be 4-byte aligned");
-    assert(offset >= -(1<<25) && offset < (1<<25) && "Branch offset too large");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "b: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "b: LI offset {:#x} out of 24-bit signed range", offset);
     uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
     Emit32((18u << 26) | (li << 2) | 0u);  // AA=0, LK=0
   }
 
   // Branch with link (bl)
   void bl(int32_t offset) {
-    assert((offset & 3) == 0);
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bl: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "bl: LI offset {:#x} out of 24-bit signed range", offset);
     uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
     Emit32((18u << 26) | (li << 2) | 1u);  // AA=0, LK=1
-  }
-
-  // Branch to address (absolute)
-  void ba(uint64_t target) {
-    int64_t offset = static_cast<int64_t>(target) - static_cast<int64_t>(reinterpret_cast<uintptr_t>(Buffer + Offset));
-    b(static_cast<int32_t>(offset));
   }
 
   // Branch relative using label
@@ -1486,8 +1594,8 @@ public:
   // Silent masking here means out-of-range forward branches land in random
   // nearby blocks; assert so we catch JIT block growths past the limit.
   void bc(uint32_t bo, uint32_t bi, int32_t offset) {
-    assert((offset & 3) == 0);
-    assert(offset >= -32768 && offset <= 32764 && "bc offset out of 14-bit signed range");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bc: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "bc: BD offset {:#x} out of 14-bit signed range", offset);
     uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 0u);
   }
@@ -1498,8 +1606,8 @@ public:
   // exact encoding the CPU's link-stack predictor does *not* push, per
   // POWER ISA; GCC emits it for PIC prologues for the same reason).
   void bcl(uint32_t bo, uint32_t bi, int32_t offset) {
-    assert((offset & 3) == 0);
-    assert(offset >= -32768 && offset <= 32764 && "bcl offset out of 14-bit signed range");
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "bcl: branch target must be 4-byte aligned");
+    LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "bcl: BD offset {:#x} out of 14-bit signed range", offset);
     uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
     Emit32((16u << 26) | (bo << 21) | (bi << 16) | (bd << 2) | 1u);
   }
@@ -1538,7 +1646,7 @@ public:
   // blrl: branch to link register and link
   void blrl() { Emit32((19u << 26) | (20u << 21) | (0u << 16) | (16u << 1) | 1u); }
 
-  // bcl (conditional branch and link to count/cond register)
+  // bclr: conditional branch to link register (XL-form, LK=0 — no link)
   void bclr(uint32_t bo, uint32_t bi) {
     Emit32((19u << 26) | (bo << 21) | (bi << 16) | (16u << 1) | 0u);
   }
@@ -1575,6 +1683,31 @@ public:
 
   // mftb RT (move from time base lower: SPR 268)
   void mftb(GPR rt) { mfspr(rt, 268); }
+
+  // darn RT, L — Deliver A Random Number. ISA 3.0 (POWER9) ONLY: emitting
+  // this on POWER8 is a SIGILL, so every call site must be gated on
+  // HostFeatures.SupportsISA30 with a 2.07 fallback arm (see
+  // PPC64EmitterBase::LoadUnalignedV128 for the canonical pattern).
+  //
+  //   L=0: 32-bit conditioned
+  //   L=1: 64-bit conditioned      (x86 RDRAND)
+  //   L=2: 64-bit unconditioned    (x86 RDSEED)
+  //
+  // On failure darn delivers all-ones (0xFFFF_FFFF_FFFF_FFFF for L=1/2,
+  // 0xFFFF_FFFF for L=0). The ISA requires software to retry; a single
+  // all-ones result is indistinguishable from a legitimate all-ones draw,
+  // which is why x86's CF=0 "not ready" convention maps onto it cleanly.
+  //
+  // L occupies BE bits 14-15, i.e. LSB bits 16-17 -- NOT the full 5-bit
+  // field the surrounding X-form instructions use there.
+  //
+  // Encoding verified against `llvm-mc -triple=powerpc64le --show-encoding`:
+  //   darn 3, 0  -> 0x7c6005e6      darn 3, 1  -> 0x7c6105e6
+  //   darn 3, 2  -> 0x7c6205e6      darn 5, 1  -> 0x7ca105e6
+  //   darn 31, 2 -> 0x7fe205e6
+  void darn(GPR rt, uint8_t l = 1) {
+    Emit32((31u << 26) | (rt.idx << 21) | ((static_cast<uint32_t>(l) & 0x3u) << 16) | (755u << 1));
+  }
 
   // =========================================================================
   // Memory barriers
@@ -1707,6 +1840,30 @@ public:
       clrldi(rt, rt, 32);
       return;
     }
+    // Two-instruction patterns for values wider than 32 bits, which would
+    // otherwise pay the 4-5 instruction general sequence below.
+    //
+    // Shifted 16-bit immediate: imm == (int16 v) << tz. Common for
+    // power-of-two and page/segment-granular constants (e.g. 0x1_0000_0000).
+    {
+      const unsigned tz = std::countr_zero(imm);
+      const int64_t v = static_cast<int64_t>(imm) >> tz;
+      if (v >= -32768 && v <= 32767 && (static_cast<uint64_t>(v) << tz) == imm) {
+        li(rt, static_cast<int16_t>(v));
+        sldi(rt, rt, tz);
+        return;
+      }
+    }
+    // Contiguous ones mask (e.g. 0xFFFF_FFFF_0000_0000): rotate a -1 into
+    // place. rldic RA,RS,SH,MB with RS=-1 leaves ones exactly at BE bits
+    // MB..63-SH, i.e. LE bits (63-MB) down to SH.
+    if (std::popcount(imm) + std::countl_zero(imm) + std::countr_zero(imm) == 64) {
+      const unsigned lo = std::countr_zero(imm);
+      const unsigned hi = 63 - std::countl_zero(imm);
+      li(rt, -1);
+      rldic(rt, rt, lo, 63 - hi);
+      return;
+    }
     // Full 64-bit load: lis + ori + sldi 32 + oris + ori
     uint32_t hi = static_cast<uint32_t>(imm >> 32);
     uint32_t lo = static_cast<uint32_t>(imm);
@@ -1764,14 +1921,14 @@ public:
     memcpy(&insn, Buffer + patch_offset, 4);
     uint32_t opcode = insn >> 26;
     int32_t offset = static_cast<int32_t>(target_offset) - static_cast<int32_t>(patch_offset);
-    assert((offset & 3) == 0);
+    LOGMAN_THROW_A_FMT((offset & 3) == 0, "PatchBranchAt: misaligned branch offset");
 
     if (opcode == 18) {  // unconditional branch
-      assert(offset >= -(1 << 25) && offset < (1 << 25) && "b: LI offset out of 24-bit signed range");
+      LOGMAN_THROW_A_FMT(offset >= -(1 << 25) && offset < (1 << 25), "PatchBranchAt: b LI offset {:#x} out of 24-bit signed range", offset);
       uint32_t li = (static_cast<uint32_t>(offset >> 2)) & 0x00FFFFFFu;
       insn = (insn & 0xFC000003u) | (li << 2);
     } else if (opcode == 16) {  // conditional branch
-      assert(offset >= -32768 && offset <= 32764 && "bc: BD offset out of 14-bit signed range");
+      LOGMAN_THROW_A_FMT(offset >= -32768 && offset <= 32764, "PatchBranchAt: bc BD offset {:#x} out of 14-bit signed range", offset);
       uint32_t bd = (static_cast<uint32_t>(offset >> 2)) & 0x3FFFu;
       insn = (insn & 0xFFFF0003u) | (bd << 2);
     }

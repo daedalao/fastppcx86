@@ -45,8 +45,8 @@ constexpr auto VTMP2 = VR{31};
 
 // Third vector temporary, taken from the FPR-aliased half of the VSX file
 // (vs0-vs31) instead of the VMX pool, so it costs the register allocator
-// nothing. vs12 == f12, which this backend never names (only f0, f1, f2, f13
-// and f16 appear anywhere in the JIT).
+// nothing. vs12 == f12, which this backend never names (only f0, f1 and f2
+// appear as FPRs anywhere in the JIT — see CodeEmitter Registers.h FPRegs).
 //
 // TWO RULES, both different from VTMP1/VTMP2:
 //
@@ -79,6 +79,61 @@ constexpr auto VTMP3_VSX = VSXR{12};
 // burning an xxlxor + a vector temp per op (the scalar-load zero-merge in
 // LoadFPRSized was ~one xxlxor per guest movss/movsd before this existed).
 constexpr auto VZERO_VSX = VSXR{14};
+//
+// HAZARD, learned the hard way (Steam 32-bit manifest decryption, 2026-08-12):
+// ELFv2 preserves only the FPR half (dw0) of vs14-vs31 across calls; the
+// vector half is volatile, and a host callee's scalar `lfd f14` epilogue
+// restore leaves dw1 UNDEFINED per the ISA (glibc alone has eight such
+// sites for f14/f15). Consequences, binding on all backend code:
+//   * VZERO_VSX guarantees ONLY dw0 == 0 after an arbitrary host call.
+//     Consumers must not read its full 128 bits across one (xxpermdi
+//     selecting B.dw0 is fine; a full-width xxlor copy is not).
+//   * Do NOT pin any full-width vector constant in vs14-vs31. An AES
+//     byte-reverse mask briefly lived in vs15 on this theory and produced
+//     garbage AES for any guest code path that had made the wrong host call
+//     first. Materialize such constants per-use (see EmitAESLoadMask:
+//     vspltisb + lvsl@0 + vsububm, 4 instructions, no memory).
+//   * The AVX-high bank below has the same exposure for YMM highs whenever
+//     host calls occur without a SpillStaticRegs sync - audit before
+//     enabling AVX by default.
+
+// -------------------------------------------------------------------------
+// AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).
+//
+// Active ONLY when HostFeatures.SupportsAVX (default OFF on this tree).
+// The AVX_128 frontend splits YMM into two 128-bit halves; the low half is
+// SRA (v0-15) and the high half historically lived in State.avx_high[]
+// context MEMORY — every VEX-encoded op paid a load/store round trip. The
+// FPR-aliased low VSX bank is idle from vs16 up, and f16-f31 are ELFv2
+// callee-saved, so the halves live in registers instead:
+//
+//  * In-register layout matches the VR convention exactly (dw0 = guest high
+//    qword, dw1 = guest low qword) — moves between the bank and VRs are a
+//    single full-VSX xxlor, and the memory image written by the spill path
+//    below is byte-identical to a stvx of the same value.
+//  * Host C calls preserve the bank by ABI (callee-saved), so
+//    SpillForABICall needs nothing; only SpillStaticRegs/FillStaticRegs
+//    sync bank <-> State.avx_high[] (gated on SupportsAVX) so context
+//    memory is authoritative whenever the thread is outside JIT code.
+//  * Mid-JIT signals: the host-side SpillSRA reads the bank straight out of
+//    the mcontext (fp_regs dw0 + the VSX-dw1 area) — see
+//    MContext_ppc64le.h. Because the bank is callee-saved this is valid
+//    even for signals landing inside a host helper call.
+//  * VSX-form instructions only (same rule as VTMP3_VSX/VZERO_VSX);
+//    PushCalleeSavedRegisters already saves/restores f14-f31 on dispatcher
+//    entry, protecting the host caller's values.
+//
+// Both guest modes bank SRAFPR.size() entries (16 in x64, 8 in x32).
+constexpr uint32_t AVXHIGH_BANK_FIRST = 16;
+constexpr VSXR AVXHighBankReg(size_t i) {
+  return VSXR{static_cast<uint32_t>(AVXHIGH_BANK_FIRST + i)};
+}
+
+// A VMX register's name in the full 64-entry VSX file (VR n == vs(32+n)),
+// for the VSX-form ops that move values between the banks.
+constexpr VSXR AsVSX(VR v) {
+  return VSXR{32u + v.idx};
+}
 
 // -------------------------------------------------------------------------
 // ELFv2 volatility boundaries, plus the compile-time checks that keep each
@@ -334,6 +389,40 @@ public:
   size_t PushDynamicRegs(GPR tmp);
   void   PopDynamicRegs();
 
+  // Which dynamic-pool FPRs Push/PopDynamicRegs (and the FABI callsite
+  // caller-save helpers below) actually store, as a bitmask of RAFPR POOL
+  // INDICES (bit i = RAFPR[i], NOT VR numbers). The effective saved set is
+  // always additionally intersected with the ELFv2-volatile subset
+  // (RAFPRVolatile, idx < 20) — callee-saved pool entries are never stored
+  // regardless of this mask.
+  //
+  // Contract:
+  //   * ~0u (default) = save every volatile pool entry. Anything that emits
+  //     Push/Pop outside a per-IR-op context (dispatcher stubs, CompileCode
+  //     tail thunks) runs under this default and stays conservative.
+  //   * CompileCode sets it per IR op to the RA live-in set ∪ dest before
+  //     dispatching the op handler and resets it to ~0u right after, so any
+  //     SpillForABICall/FillForABICall pair emitted inside a handler saves
+  //     only vector values that are actually live across the call.
+  //   * GenerateABICall (FABI bridge stubs) emits under mask 0: the volatile
+  //     dynamic VRs are CALLER-saved at the two FABI callsite emitters
+  //     (JIT.cpp Op_Unhandled, X87Ops.cpp EmitFABICall) via the helpers
+  //     below, because only the callsite knows the live set at emit time.
+  //     Every new path that branches into an ABIPointers stub MUST emit the
+  //     caller-save pair.
+  //
+  // Frame layout is deliberately unaffected — masked-out registers keep
+  // their (unwritten) slots, so kDynFPRStart/kDynRegSaveSize arithmetic and
+  // every consumer of those constants stay valid.
+  uint32_t DynVRSpillMask = ~0u;
+
+  // FABI-callsite caller-save pair: store/reload the DynVRSpillMask-selected
+  // volatile dynamic VRs at [r1 + BaseOffset + k*16] (16-byte aligned slots,
+  // one per SAVED register, densely packed). Clobbers TMP3. Worst case needs
+  // BaseOffset + 12*16 bytes of frame (x32's full volatile set).
+  void SaveDynVRsToFrame(int32_t BaseOffset);
+  void RestoreDynVRsFromFrame(int32_t BaseOffset);
+
   // Spill/fill everything before/after a C ABI call (clobbers r3-r12, v0-v19).
   void SpillForABICall(GPR tmp, bool FPRs = true);
   void FillForABICall(bool FPRs = true);
@@ -347,18 +436,20 @@ public:
   // else lxvd2x/stxvd2x + xxpermdi (2 insns, ISA 2.06). CLOBBER CONTRACT
   // (superset across paths — callers must assume all of it): TMP1, TMP2, TMP3
   // (historical bounce contract, kept so callsites stay conservative), plus
-  // VTMP2 (or VTMP1 when src==VTMP2) on the pre-3.0 store path. `ea` must not
-  // be r0 (RA=0 encodes literal zero).
+  // VTMP3_VSX (vs12, RA-invisible low bank) on the pre-3.0 store path. No
+  // VMX register (VTMP1/VTMP2 included) is clobbered on any path. `ea` must
+  // not be r0 (RA=0 encodes literal zero).
   void LoadUnalignedV128(VR dst, GPR ea);
   void StoreUnalignedV128(VR src, GPR ea);
 
   // Size-correct FPR memory ops (x86 movd/movq/movdqu semantics): for size <16
   // the load zero-extends the upper bits of dst, and the store writes only the
   // low `size` bytes to *ea. Sizes accepted: 1, 2, 4, 8, 16 (load also 10).
-  // Same superset clobber contract as above: TMP1..TMP3, plus VTMP2 (or VTMP1
-  // on aliasing) on the pre-3.0 scalar-load, scalar-store and V128 store
-  // paths. Sizes 4/8 take a register-only path on both load and store and
-  // clobber no TMP GPR at all, but callers must keep assuming the superset.
+  // Same superset clobber contract as above: TMP1..TMP3 plus VTMP3_VSX; no
+  // VMX register is clobbered on any path (the pre-3.0 scalar/V128 store swap
+  // goes through VTMP3_VSX, the pre-3.0 scalar load merges against VZERO_VSX).
+  // Sizes 4/8 take a register-only path on both load and store and clobber no
+  // TMP GPR at all, but callers must keep assuming the superset.
   void LoadFPRSized(VR dst, GPR ea, uint32_t size);
   void StoreFPRSized(VR src, GPR ea, uint32_t size);
 

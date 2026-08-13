@@ -15,6 +15,7 @@ $end_info$
 #include "ELFCodeLoader.h"
 #include "VDSO_Emulation.h"
 #include "LinuxSyscalls/GdbServer.h"
+#include "LinuxSyscalls/HostOwnedRanges.h"
 #include "LinuxSyscalls/LinuxAllocator.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/Utils/Threads.h"
@@ -568,6 +569,14 @@ int main(int argc, char** argv, char** const envp) {
 
   auto SignalDelegation = FEX::HLE::CreateSignalDelegator(CTX.get(), Program.ProgramName, SupportsAVX);
   auto ThunkHandler = FEX::HLE::CreateThunkHandler();
+
+  // Record everything host-private that exists right now, BEFORE any guest
+  // memory is mapped (the guest ELF goes down in Loader.MapMemory() below).
+  // From here on a guest MAP_FIXED/munmap/mprotect/mremap that would destroy
+  // FEX's own image is refused instead of executed. See
+  // LinuxSyscalls/HostOwnedRanges.h for why this is a ppc64le-specific
+  // necessity.
+  FEX::HLE::HostOwnedRanges::SnapshotSelf();
 
   auto SyscallHandler = Loader.Is64BitMode() ?
                           FEX::HLE::x64::CreateHandler(CTX.get(), SignalDelegation.get(), ThunkHandler.get()) :

@@ -537,6 +537,21 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
     }
   }
 
+#ifdef ARCHITECTURE_ppc64le
+  // AVX-high VSX bank: guest YMM_hi[i] lives in host vs(First+i) while the
+  // thread runs JIT code (Count is zero unless AVX is advertised). Capture
+  // into State.avx_high so the guest sigframe XSTATE and any State readers
+  // see current high halves. Register layout is the VR convention: dw1 =
+  // guest LOW qword -> avx_high[i][0], dw0 = guest HIGH -> [i][1]. The bank
+  // is ELFv2 callee-saved, so the frame values are valid even when the
+  // signal landed inside a host helper call.
+  for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
+    const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
+    Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
+    Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+  }
+#endif
+
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
@@ -1118,6 +1133,56 @@ static bool IsAsyncSignal(const siginfo_t* Info, int Signal) {
 
   // Everything else is async and can be deferred.
   return true;
+}
+
+bool SignalDelegator::ThreadHasDeliverableGuestSignal(FEX::HLE::ThreadStateObject* ThreadObject) {
+  // Mirrors the drain-time filtering in HandleGuestSignal: a frame that is
+  // guest-masked gets parked in PendingSignals instead of delivered, and a
+  // SIG_IGN / default-ignore disposition gets dropped. Only what survives
+  // those filters can interrupt a sleep on a real kernel.
+  //
+  // Runs on the owning thread from the syscall path. The thread's own signal
+  // handler can append a frame concurrently, but DeferredSignalFrames never
+  // reallocates (capacity is pre-reserved, enforced at the emplace site), so
+  // indexed iteration over a snapshotted size is safe; a frame appended after
+  // the snapshot is caught by the caller's next check.
+  const uint64_t GuestMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+  const auto Deliverable = [&](int Signal) {
+    if (Signal < 1 || Signal > MAX_SIGNALS) {
+      return false;
+    }
+    if (GuestMask & (1ULL << (Signal - 1))) {
+      return false;
+    }
+    const SignalHandler& Handler = HostHandlers[Signal];
+    const auto GuestHandler = Handler.GuestAction.sigaction_handler.handler;
+    if (GuestHandler == SIG_IGN) {
+      return false;
+    }
+    if (GuestHandler == SIG_DFL && Handler.DefaultBehaviour == DEFAULT_IGNORE) {
+      return false;
+    }
+    // Real handler, or default-terminate: both reach the guest on drain.
+    return true;
+  };
+
+  const auto& Frames = ThreadObject->SignalInfo.DeferredSignalFrames;
+  const size_t Count = Frames.size();
+  for (size_t i = 0; i < Count; ++i) {
+    if (Deliverable(Frames[i].Signal)) {
+      return true;
+    }
+  }
+
+  uint64_t Pending = ThreadObject->SignalInfo.PendingSignals & ~GuestMask;
+  while (Pending) {
+    const int Signal = __builtin_ctzll(Pending) + 1;
+    Pending &= Pending - 1;
+    if (Deliverable(Signal)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint64_t SignalDelegator::GetNewSigMask(int Signal) const {
