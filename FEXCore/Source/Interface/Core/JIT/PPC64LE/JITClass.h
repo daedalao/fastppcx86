@@ -141,6 +141,14 @@ enum PPC64VConstIndex : uint32_t {
   PPC64_VCONST_PACK_DW_LO_I32, // vperm control: pack each dw's low i32 to LE-low
   PPC64_VCONST_LANE0_MASK_F32, // {~0u,0,0,0} in guest byte order: selects LE elem0 for xxsel
   PPC64_VCONST_F64_2P31,       // splat f64(2^31)   -- f64->i32 overflow bound (CVTPD2DQ)
+  // CRC-32C via vpmsumd Barrett reduction (DEF_OP(CRC32), ALUOps.cpp). Both
+  // live in dw0 with dw1 zero so vpmsumd's unused doubleword product
+  // vanishes. Derived and verified symbolically (200k random vectors per
+  // SrcSize against a bitwise reference) in unittests/GuestCrypto/crc32_derive.py:
+  //   CRC32C_MU = reflect64(floor(x^96 / P) - x^64), P = 0x11EDC6F41
+  //   CRC32C_P  = reflect33(P)
+  PPC64_VCONST_CRC32C_MU,
+  PPC64_VCONST_CRC32C_P,
   PPC64_VCONST_MAX,
 };
 

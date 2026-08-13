@@ -4071,57 +4071,84 @@ DEF_OP(FCmp) {
 // =========================================================================
 extern "C" uint64_t PPC64_CRC32(uint64_t Acc, uint64_t Val, uint64_t Bytes);
 
+// SSE4.2 crc32 (CRC-32C, reflected, no init/final inversion), fully inline
+// via vpmsumd Barrett reduction. Replaces a bit-at-a-time helper (8 dependent
+// ALU ops per byte - up to 512 for crc32q) behind a full FABI spill/fill.
+//
+// Math (derived and verified over 200k random vectors per SrcSize in
+// unittests/GuestCrypto/crc32_derive.py - do NOT edit constants without re-running it):
+// with Q = (crc ^ val) masked to N bytes, A = reflect(Q), P = 0x11EDC6F41:
+//   crc' = reflect32( (A * x^32) mod P )   [ ^ (crc >> 8N) when N < 4 ]
+// Barrett with mu = floor(x^96/P) = x^64 + mu', all in the reflected domain
+// so no runtime bit-reversal is ever needed:
+//   t1  = clmul(Q, reflect64(mu'))                        [vpmsumd #1]
+//   q_r = ((t1.low64 << 1) & maskN) ^ Q                   [GPR: sldi/rldicl/xor]
+//   t2  = clmul(q_r, reflect33(P))                        [vpmsumd #2]
+//   crc' = N==8 ? t2.dw0 & 0xFFFFFFFF : (t2.low64 >> 8N) & 0xFFFFFFFF
+// The <<1 is the reflected-clmul off-by-one; it cannot be folded into the
+// constant (its top bit is set), so it rides the GPR bounce that the masking
+// needs anyway. Operands sit in dw0 with dw1 zeroed (vpmsumd sums both
+// doubleword products); the zero comes from VZERO_VSX's dw0, the half that
+// is genuinely preserved across host calls.
 DEF_OP(CRC32) {
   auto Op = IROp->C<IR::IROp_CRC32>();
-  const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
   const auto SrcSize = Op->SrcSize;
-  const auto Src1 = GetReg(Op->Src1);
-  const auto Src2 = GetReg(Op->Src2);
+  const auto Src1 = GetReg(Op->Src1);   // accumulator (32-bit meaningful)
+  const auto Src2 = GetReg(Op->Src2);   // value
   const auto Dst  = GetReg(Node);
 
-  // Mini-frame (48 bytes):
-  //   [r1+ 0]  back chain
-  //   [r1+ 8]  TOC save
-  //   [r1+16]  LR save
-  //   [r1+24]  Acc arg
-  //   [r1+32]  Val arg
-  //   [r1+40]  result
-  stdu(r1, -48, r1);
-  mflr(r(0)); std(r(0), 16, r1);
-
-  // Stage args from SRA-resident regs BEFORE SpillForABICall clobbers them.
-  std(Src1, 24, r1);
-  std(Src2, 32, r1);
-
-  SpillForABICall(TMP1);
-
-  ld(r3, 24 + kABISpill, r1);                                 // Acc
-  ld(r4, 32 + kABISpill, r1);                                 // Val
-  // r5 = byte count from SrcSize.
+  uint32_t N;
   switch (SrcSize) {
-  case IR::OpSize::i8Bit:  li(r5, 1); break;
-  case IR::OpSize::i16Bit: li(r5, 2); break;
-  case IR::OpSize::i32Bit: li(r5, 4); break;
-  case IR::OpSize::i64Bit: li(r5, 8); break;
-  default:                 li(r5, 4); break;            // matches i32 fallthrough
+  case IR::OpSize::i8Bit:  N = 1; break;
+  case IR::OpSize::i16Bit: N = 2; break;
+  case IR::OpSize::i64Bit: N = 8; break;
+  case IR::OpSize::i32Bit:
+  default:                 N = 4; break;
+  }
+  const uint32_t Bits = 8 * N;
+
+  // TMP1 = Q = (crc ^ val) masked to the source width. The accumulator's
+  // upper 32 bits are not architecturally meaningful - mask them away.
+  if (N == 8) {
+    rldicl(TMP1, Src1, 0, 32);
+    xor_(TMP1, TMP1, Src2);
+  } else {
+    xor_(TMP1, Src1, Src2);
+    rldicl(TMP1, TMP1, 0, 64 - Bits);
   }
 
-  EmitLoadPPC64Helper(r(12), PPC64_HELPER_CRC32);
-  std(r2, 8 + kABISpill, r1);
-  mtctr(r(12)); bctrl();
-  ld(r2, 8 + kABISpill, r1);
+  mtvsrd(VTMP1, TMP1);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), VZERO_VSX, 0b00);   // dw1 <- 0
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_CRC32C_MU, TMP3, TMP4);
+  vpmsumd(VTMP1, VTMP1, VTMP2);
 
-  std(r3, 40 + kABISpill, r1);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), AsVSX(VTMP1), 0b10); // dw0 <- low dw
+  mfvsrd(TMP2, VTMP1);
+  sldi(TMP2, TMP2, 1);
+  if (N < 8) rldicl(TMP2, TMP2, 0, 64 - Bits);
+  xor_(TMP2, TMP2, TMP1);                                   // q_r
 
-  FillForABICall();
+  mtvsrd(VTMP1, TMP2);
+  xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), VZERO_VSX, 0b00);
+  EmitLoadPPC64VConst(VTMP2, PPC64_VCONST_CRC32C_P, TMP3, TMP4);
+  vpmsumd(VTMP1, VTMP1, VTMP2);
 
-  ld(r(0), 16, r1); mtlr(r(0));
-  ld(TMP1, 40, r1);
-  addi(r1, r1, 48);
-  li(r(0), 0);
-
-  // CRC32 result is 32-bit; the IR's DestSize is i32, so zero-extend.
-  rldicl(Dst, TMP1, 0, 32);
+  if (N == 8) {
+    mfvsrd(TMP1, VTMP1);                    // dw0 = product bits 64..127
+    // Tail term impossible (crc >> 64 == 0); result = low 32 of dw0.
+    rldicl(Dst, TMP1, 0, 32);
+  } else {
+    xxpermdi(AsVSX(VTMP1), AsVSX(VTMP1), AsVSX(VTMP1), 0b10);
+    mfvsrd(TMP1, VTMP1);                    // low 64 of product
+    if (N < 4) {
+      // (crc32 >> 8N), read from Src1 BEFORE Dst is written - Dst may alias.
+      rldicl(TMP2, Src1, 64 - Bits, 32 + Bits);
+      rldicl(Dst, TMP1, 64 - Bits, 32);     // (t2 >> 8N) & 0xFFFFFFFF
+      xor_(Dst, Dst, TMP2);
+    } else {
+      rldicl(Dst, TMP1, 64 - Bits, 32);
+    }
+  }
 }
 
 } // namespace FEXCore::CPU

@@ -5396,6 +5396,11 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     // `xxsel(Dst, Vec1, Result, MASK)` implements SSE scalar-insert merges.
     [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 0] = 0x00000000FFFFFFFFULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_LANE0_MASK_F32 + 1] = 0x0000000000000000ULL,
+    // CRC-32C Barrett constants: value in dw0 (entry [+1]), dw1 zero.
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_MU + 0]     = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_MU + 1]     = 0xA434F61C6F5389F8ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 0]      = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 1]      = 0x0000000105EC76F1ULL,
   },
 };
 } // namespace
