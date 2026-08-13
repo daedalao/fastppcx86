@@ -79,30 +79,23 @@ constexpr auto VTMP3_VSX = VSXR{12};
 // burning an xxlxor + a vector temp per op (the scalar-load zero-merge in
 // LoadFPRSized was ~one xxlxor per guest movss/movsd before this existed).
 constexpr auto VZERO_VSX = VSXR{14};
-
-// Pinned AES byte-reverse permute mask {15,14,...,1,0}, in the same RA-free
-// FPR-aliased half of the VSX file. vs15 == f15: the last free slot below the
-// AVX-high bank (which starts at vs16), and never otherwise named.
 //
-// WHY IT EXISTS: the POWER8 crypto ops (vcipher/vncipher/vpmsum*) read the AES
-// state in big-endian byte order, while a guest XMM sits in this backend's
-// registers in the opposite image - guest byte 0 lands at BE byte element 15
-// (see LoadUnalignedV128 / LoadFPRSized). The two conventions differ by a full
-// 128-bit byte reversal, and it cannot be algebraically absorbed: reversal maps
-// AES state index i -> 15-i, i.e. (row,col) -> (3-row,3-col), which changes
-// ShiftRows' shift direction and MixColumns' circulant. So every AES/PCLMUL
-// lowering brackets the crypto op with a pair of vperms against this mask.
-//
-// POWER9 could use a single xxbrq, but this tree targets POWER8, where the only
-// byte-granular permute is VMX-form vperm - and vperm cannot encode vs0-vs31.
-// Hence the mask is PARKED here (RA-free) and copied into a VMX temp with one
-// xxlor at each use, rather than burning a v0-v31 register the allocator wants.
-//
-// Same rules as VZERO_VSX: VSX-form instructions only, never written by the
-// backend after dispatcher entry. f15 is non-volatile under ELFv2 §2.2 and is
-// covered by the f14-f31 block that Push/PopCalleeSavedRegisters already saves,
-// so it survives host C++ calls and signal delivery without re-materialisation.
-constexpr auto AES_REVMASK_VSX = VSXR{15};
+// HAZARD, learned the hard way (Steam 32-bit manifest decryption, 2026-08-12):
+// ELFv2 preserves only the FPR half (dw0) of vs14-vs31 across calls; the
+// vector half is volatile, and a host callee's scalar `lfd f14` epilogue
+// restore leaves dw1 UNDEFINED per the ISA (glibc alone has eight such
+// sites for f14/f15). Consequences, binding on all backend code:
+//   * VZERO_VSX guarantees ONLY dw0 == 0 after an arbitrary host call.
+//     Consumers must not read its full 128 bits across one (xxpermdi
+//     selecting B.dw0 is fine; a full-width xxlor copy is not).
+//   * Do NOT pin any full-width vector constant in vs14-vs31. An AES
+//     byte-reverse mask briefly lived in vs15 on this theory and produced
+//     garbage AES for any guest code path that had made the wrong host call
+//     first. Materialize such constants per-use (see EmitAESStateIn:
+//     vspltisb + lvsl@0 + vsububm, 4 instructions, no memory).
+//   * The AVX-high bank below has the same exposure for YMM highs whenever
+//     host calls occur without a SpillStaticRegs sync - audit before
+//     enabling AVX by default.
 
 // -------------------------------------------------------------------------
 // AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).

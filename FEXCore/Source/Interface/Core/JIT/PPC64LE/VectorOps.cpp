@@ -5431,7 +5431,7 @@ uint64_t* GetPPC64HelperTable() {
 // they also stop acting as register-allocator barriers.
 //
 // TWO THINGS MAKE THIS WORK (see also the crypto block in CodeEmitter's
-// Emitter.h and AES_REVMASK_VSX in PPC64Emitter.h):
+// Emitter.h and the vs14-vs31 hazard note in PPC64Emitter.h):
 //
 //  1. BYTE ORDER. The hardware reads the AES state big-endian (state byte 0 at
 //     BE byte element 0); a guest XMM lives here with guest byte 0 at BE
@@ -5455,15 +5455,44 @@ uint64_t* GetPPC64HelperTable() {
 // this backend before is correct by construction here.
 // ===========================================================================
 
-// VTMP1 <- {15,...,0}; VTMP2 <- byte-reversed Src. Leaves the mask dead.
+// STATELESS byte-reverse bracketing. This deliberately trusts NO vector
+// register contents from before the current guest instruction.
+//
+// An earlier revision pinned the reverse mask in vs15 (beside VZERO_VSX in the
+// "RA-free, callee-saved" low VSX bank) and copied it in with one xxlor. That
+// design was built on a false premise, found the hard way when Steam's 32-bit
+// manifest decryption produced garbage for exactly the >=64-byte inputs (the
+// AESNI-routed ones) while every isolated KAT passed:
+//
+//   ELFv2 preserves only the FPR HALF (dw0) of vs14-vs31 across calls - the
+//   vector half is volatile. Worse, POWER ISA scalar FP loads leave dw1 of
+//   the target VSR UNDEFINED, so any host callee that stfd/lfd-restores
+//   f14/f15 in its epilogue (glibc has eight such sites) hands back a
+//   half-poisoned register. Any lowering that reads the full 128 bits of a
+//   "pinned" vs14-vs31 value after an arbitrary host call is wrong by
+//   construction. The same hazard applies to VZERO_VSX consumers that read
+//   its vector half, and to the AVX-high bank (vs16-31) across host calls.
+//
+// Materializing the mask is 4 instructions, no memory access:
+//   li r0,0 (also preserves the backend's r0==0 index invariant),
+//   vspltisb {15,...,15}, lvsl@EA=0 {0,...,15}, subtract -> {15,...,0}.
+// The mask is then parked in VTMP3_VSX (vs12) across the cipher instruction -
+// legal because it is never live across a host call within a single lowering -
+// and pulled back for the outbound reversal.
+
+// VTMP1 <- {15,...,0}; VTMP2 <- byte-reversed Src; VTMP3_VSX <- parked mask.
 void PPC64JITCore::EmitAESStateIn(PPC64Emitter::VR Src) {
-  xxlor(AsVSX(VTMP1), AES_REVMASK_VSX, AES_REVMASK_VSX);
+  li(r(0), 0);
+  vspltisb(VTMP1, 15);
+  lvsl(VTMP2, r(0), r(0));
+  vsububm(VTMP1, VTMP1, VTMP2);
   vperm(VTMP2, Src, Src, VTMP1);
+  xxlor(VTMP3_VSX, AsVSX(VTMP1), AsVSX(VTMP1));
 }
 
-// Undo EmitAESStateIn's reversal, landing the result in Dst.
+// Undo EmitAESStateIn's reversal (mask from VTMP3_VSX), landing in Dst.
 void PPC64JITCore::EmitAESStateOut(PPC64Emitter::VR Dst) {
-  xxlor(AsVSX(VTMP1), AES_REVMASK_VSX, AES_REVMASK_VSX);
+  xxlor(AsVSX(VTMP1), VTMP3_VSX, VTMP3_VSX);
   vperm(Dst, VTMP2, VTMP2, VTMP1);
 }
 
@@ -5476,7 +5505,7 @@ DEF_OP(VAESImc) {
   const auto Src = GetVReg(Op->Vector);
 
   EmitAESStateIn(Src);
-  xxlor(AsVSX(VTMP1), VZERO_VSX, VZERO_VSX);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vcipherlast(VTMP2, VTMP2, VTMP1);
   vncipher(VTMP2, VTMP2, VTMP1);
   EmitAESStateOut(Dst);
@@ -5502,7 +5531,7 @@ DEF_OP(VAESEnc) {
   const auto Key = GetVReg(Op->Key);
 
   EmitAESStateIn(State);
-  xxlor(AsVSX(VTMP1), VZERO_VSX, VZERO_VSX);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vcipher(VTMP2, VTMP2, VTMP1);       // MixColumns(ShiftRows(SubBytes(state)))
   EmitAESStateOut(VTMP2);
   vxor(Dst, VTMP2, Key);
@@ -5516,7 +5545,7 @@ DEF_OP(VAESEncLast) {
   const auto Key = GetVReg(Op->Key);
 
   EmitAESStateIn(State);
-  xxlor(AsVSX(VTMP1), VZERO_VSX, VZERO_VSX);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vcipherlast(VTMP2, VTMP2, VTMP1);   // ShiftRows(SubBytes(state)), no mixing
   EmitAESStateOut(VTMP2);
   vxor(Dst, VTMP2, Key);
@@ -5535,7 +5564,7 @@ DEF_OP(VAESDec) {
   const auto Key = GetVReg(Op->Key);
 
   EmitAESStateIn(State);
-  xxlor(AsVSX(VTMP1), VZERO_VSX, VZERO_VSX);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vncipher(VTMP2, VTMP2, VTMP1);
   EmitAESStateOut(VTMP2);
   vxor(Dst, VTMP2, Key);
@@ -5549,7 +5578,7 @@ DEF_OP(VAESDecLast) {
   const auto Key = GetVReg(Op->Key);
 
   EmitAESStateIn(State);
-  xxlor(AsVSX(VTMP1), VZERO_VSX, VZERO_VSX);
+  vxor(VTMP1, VTMP1, VTMP1);   // stateless zero - never read VZERO's vector half
   vncipherlast(VTMP2, VTMP2, VTMP1);  // InvSubBytes(InvShiftRows(state))
   EmitAESStateOut(VTMP2);
   vxor(Dst, VTMP2, Key);
@@ -5841,6 +5870,10 @@ DEF_OP(PCLMUL) {
 
   // XXPERMDI T,A,B,DM: T.dw0 = A.dw[DM>>1], T.dw1 = B.dw[DM&1].
   // Pick the selected doubleword into dw0 and take dw1 from the pinned zero.
+  // Reading VZERO_VSX here is safe where the AES ops' old zero-copy was not:
+  // DM&1 == 0 selects VZERO's dw0, which aliases f14 - the half ELFv2
+  // actually preserves across host calls. Its dw1 (volatile, trashed by any
+  // callee's lfd f14 restore) is never read. Keep it that way.
   xxpermdi(AsVSX(VTMP1), AsVSX(Src1), VZERO_VSX, Src1Dw << 1);
   xxpermdi(AsVSX(VTMP2), AsVSX(Src2), VZERO_VSX, Src2Dw << 1);
   // Both sources are dead by here, so Dst may alias either.
