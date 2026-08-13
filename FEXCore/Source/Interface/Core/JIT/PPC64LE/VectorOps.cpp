@@ -5495,6 +5495,11 @@ void PPC64JITCore::EmitAESLoadMask() {
 // vcipherlast(S,0) = ShiftRows(SubBytes(S)); vncipher's leading
 // InvShiftRows/InvSubBytes then cancel those exactly, leaving InvMixColumns.
 DEF_OP(VAESImc) {
+  // Same width guard as the four round ops. VAESIMC is 128-bit-only in
+  // practice, but this handler is on the AES-family allowlist in
+  // CompileCode's mask-cache invalidation switch, so a bail through
+  // Op_Unhandled (a host call) must kill the vs12 park explicitly.
+  if (IROp->Size != IR::OpSize::i128Bit) { InvalidateAESCache(); Op_Unhandled(IROp, Node); return; }
   const auto Op  = IROp->C<IR::IROp_VAESImc>();
   const auto Dst = GetVReg(Node);
   const auto Src = GetVReg(Op->Vector);

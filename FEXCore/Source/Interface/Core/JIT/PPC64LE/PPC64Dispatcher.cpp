@@ -165,7 +165,7 @@ void PPC64Dispatcher::EmitDispatcher() {
   // Consumers may therefore only rely on VZERO's dw0 being zero after any
   // host call; nothing may read its full 128 bits across one. A pinned
   // full-width vector constant in vs14-vs31 is not implementable this way -
-  // materialize such constants per-use instead (see EmitAESStateIn).
+  // materialize such constants per-use instead (see EmitAESLoadMask).
   xxlxor(VZERO_VSX, VZERO_VSX, VZERO_VSX);
 
   // STATE (r27) = Frame* (r3)

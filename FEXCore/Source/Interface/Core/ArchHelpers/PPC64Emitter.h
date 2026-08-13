@@ -91,7 +91,7 @@ constexpr auto VZERO_VSX = VSXR{14};
 //   * Do NOT pin any full-width vector constant in vs14-vs31. An AES
 //     byte-reverse mask briefly lived in vs15 on this theory and produced
 //     garbage AES for any guest code path that had made the wrong host call
-//     first. Materialize such constants per-use (see EmitAESStateIn:
+//     first. Materialize such constants per-use (see EmitAESLoadMask:
 //     vspltisb + lvsl@0 + vsububm, 4 instructions, no memory).
 //   * The AVX-high bank below has the same exposure for YMM highs whenever
 //     host calls occur without a SpillStaticRegs sync - audit before

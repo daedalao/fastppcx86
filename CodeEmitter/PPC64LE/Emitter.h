@@ -1454,7 +1454,7 @@ public:
   // BYTE ORDER: these read the AES state in BIG-ENDIAN order (state byte 0 ==
   // BE byte element 0). This backend holds a guest XMM in the opposite image -
   // guest byte 0 lands at BE element 15, see LoadUnalignedV128 - so callers
-  // must byte-reverse in and out. EmitAESStateIn/EmitAESStateOut (JITClass.h)
+  // must byte-reverse in and out. EmitAESLoadMask + explicit vperms (JITClass.h)
   // wrap that; they materialize the reverse mask per-use, deliberately NOT
   // from a pinned register - see the vs14-vs31 dw1-volatility hazard note in
   // PPC64Emitter.h.
