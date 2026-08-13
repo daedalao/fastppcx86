@@ -1575,20 +1575,25 @@ void PPC64JITCore::EmitCompare(IR::CondClass Cond, IR::OpSize Sz,
                      Cond == IR::CondClass::FLEU || Cond == IR::CondClass::FGT ||
                      Cond == IR::CondClass::FU || Cond == IR::CondClass::FNU);
   if (IsFP) {
+    // Register-only compare. The old path spilled both vectors and reloaded
+    // element 0 via lfs/lfd — two guaranteed store-hit-load flushes on one of
+    // the hottest patterns in game code (every fused ucomiss/comiss + jcc).
+    // Element 0 of a guest XMM sits in doubleword 1 (f64) / BE word 3 (f32);
+    // xscmpudp compares doubleword 0, so position first. xscvspdp performs
+    // the same SP->DP promotion lfs did, so NaN/denormal ordering semantics
+    // are unchanged; both paths end in an unordered compare into CRField.
     auto V1 = GetVReg(Src1);
     auto V2 = GetVReg(Src2);
-    addi(TMP1, r1, -32);
-    stvx(V1, r(0), TMP1);
-    addi(TMP2, r1, -16);
-    stvx(V2, r(0), TMP2);
     if (Sz == IR::OpSize::i32Bit) {
-      lfs(PPC64Emitter::FPRegs::f0, -32, r1);
-      lfs(PPC64Emitter::FPRegs::f1, -16, r1);
+      xxsldwi(VTMP1, V1, V1, 3);         // BE w0 <- elem0 (BE w3)
+      xscvspdp(VTMP1, VTMP1);
+      xxsldwi(VTMP2, V2, V2, 3);
+      xscvspdp(VTMP2, VTMP2);
     } else {
-      lfd(PPC64Emitter::FPRegs::f0, -32, r1);
-      lfd(PPC64Emitter::FPRegs::f1, -16, r1);
+      xxpermdi(VTMP1, V1, V1, 0b10);     // dw0 <- dw1
+      xxpermdi(VTMP2, V2, V2, 0b10);
     }
-    fcmpu(cr(CRField), PPC64Emitter::FPRegs::f0, PPC64Emitter::FPRegs::f1);
+    xscmpudp(CRField, VTMP1, VTMP2);
     return;
   }
 

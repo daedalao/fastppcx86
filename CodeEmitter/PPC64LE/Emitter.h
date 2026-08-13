@@ -790,6 +790,13 @@ public:
            (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/ | ((t >> 5) & 1u) /*TX*/);
   }
 
+  // XX3-form with a BF (CR field) target instead of a T register (the VSX
+  // scalar compares). No TX bit; AX/BX as usual.
+  void EmitXX3BF(uint32_t bf, uint32_t a, uint32_t b, uint32_t xo) {
+    Emit32((60u << 26) | ((bf & 7u) << 23) | ((a & 31u) << 16) | ((b & 31u) << 11) | ((xo & 0xFFu) << 3) |
+           (((a >> 5) & 1u) << 2) /*AX*/ | (((b >> 5) & 1u) << 1) /*BX*/);
+  }
+
   // VR n is vs(32+n), so every extension bit comes out 1 and this is
   // bit-identical to the previous hardcoded 0x7.
   void EmitXX3(uint32_t vrt, uint32_t vra, uint32_t vrb, uint32_t xo) {
@@ -930,6 +937,13 @@ public:
   void xscvsxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 376); } // i64→f64
   void xscvuxddp (VR t, VR b) { EmitXX2(t.idx, b.idx, 360); } // u64→f64
   void xscvspdp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 329); } // f32→f64 scalar
+
+  // VSX scalar FP compare, unordered/ordered, targeting a CR field (XX3-form
+  // with BF instead of a T register; opcode 60, XO 35/43, ISA 2.06). Compares
+  // doubleword 0 of each operand. Encoding verified against llvm-mc:
+  // xscmpudp 7,34,35 == 0xf382191e; xscmpodp XO=43.
+  void xscmpudp(uint32_t bf, VR a, VR b) { EmitXX3BF(bf, a.idx + 32, b.idx + 32, 35); }
+  void xscmpodp(uint32_t bf, VR a, VR b) { EmitXX3BF(bf, a.idx + 32, b.idx + 32, 43); }
   void xscvdpsp  (VR t, VR b) { EmitXX2(t.idx, b.idx, 265); } // f64→f32 scalar
   // Scalar / vector unary FP (sqrt / abs / neg)
   void xssqrtsp(VR t, VR b)  { EmitXX2(t.idx, b.idx,  11); }
