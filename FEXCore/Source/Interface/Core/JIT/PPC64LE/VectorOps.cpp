@@ -1396,7 +1396,13 @@ DEF_OP(VSRSHR) {
       }
       LoadConstant(TMP2, (uint64_t)Round);
       add  (TMP1, TMP1, TMP2);
-      sradi(TMP1, TMP1, N);
+      // NOT sradi: PPC arithmetic shifts write XER.CA, the canonical guest CF
+      // (see DEF_OP(Ashr)'s block comment), and PSIGN/rounding-shift guests
+      // preserve EFLAGS. srdi (rldicl, no XER) is exact here: the value is
+      // 64-bit sign-extended and only the low sz*8 bits are stored, so the
+      // logical/arithmetic difference lives entirely in discarded bits
+      // (sz*8 + N <= 64 always: sz*8 <= 32, N < sz*8).
+      srdi(TMP1, TMP1, N);
       switch (sz) {
       case 1: stb(TMP1, Off, r1); break;
       case 2: sth(TMP1, Off, r1); break;
@@ -1483,8 +1489,11 @@ DEF_OP(VSQSHL) {
     }
     b(&Done);
     Bind(&Saturate);
-    // sign = TMP1 >>a 63 → 0 (pos) or -1 (neg). sat = sign XOR SatPos.
-    sradi(TMP2, TMP1, 63);
+    // sign = 0 (pos) or -1 (neg); sat = sign XOR SatPos. NOT sradi — it
+    // writes XER.CA (guest CF; see DEF_OP(Ashr)). rldicl isolates the sign
+    // bit and neg splats it; neither touches XER.
+    rldicl(TMP2, TMP1, 1, 63);
+    neg(TMP2, TMP2);
     LoadConstant(TMP4, SatPos);
     xor_(TMP2, TMP2, TMP4);
     switch (sz) {

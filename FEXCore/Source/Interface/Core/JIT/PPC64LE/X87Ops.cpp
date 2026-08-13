@@ -826,18 +826,25 @@ DEF_OP(F80CVTTo) {
   vsldoi(VTMP1, Src, Src, 8);
   mfvsrd(TMP1, VTMP1);
 
-  // TMP2 = sign bit moved from bit 63 to bit 15.
-  srdi(TMP2, TMP1, 48);
-  andi_(TMP2, TMP2, 0x8000);
+  // FLAG DISCIPLINE: this op is reached from FXSAVE (and FST m80), which
+  // preserve guest EFLAGS - and guest flags live in CR0 (packed NZCV) and
+  // XER.CA between IR ops. So: no record forms (andi_), no default-cr0
+  // compares, no CA writers (subfic) anywhere in this lowering. Compares go
+  // to cr1, which carries no cross-op guest state (ProjectXERToCR1
+  // re-projects per use).
+
+  // TMP2 = sign bit moved from bit 63 to bit 15 (no andi_ - it writes CR0).
+  srdi(TMP2, TMP1, 63);
+  sldi(TMP2, TMP2, 15);
 
   rldicl(TMP3, TMP1, 12, 53); // TMP3 = biased 11-bit exponent (bits 62:52)
   rldicl(TMP4, TMP1, 0, 12);  // TMP4 = 52-bit fraction (bits 51:0)
 
   Label ZeroOrDenormal, Normal, Merge, Done;
-  cmpdi(TMP3, 0);
-  bc(CC_EQ, &ZeroOrDenormal);
-  cmpdi(TMP3, 0x7ff);
-  bc(CC_NE, &Normal);
+  cmpdi(cr(1), TMP3, 0);
+  bc({12, 6}, &ZeroOrDenormal);   // beq cr1
+  cmpdi(cr(1), TMP3, 0x7ff);
+  bc({4, 6}, &Normal);            // bne cr1
 
   // Inf/NaN: exponent saturates; mantissa path below preserves the payload
   // (f64 quiet bit 51 lands on f80 quiet bit 62 after the <<11).
@@ -857,15 +864,18 @@ DEF_OP(F80CVTTo) {
   b(&Done);
 
   Bind(&ZeroOrDenormal);
-  cmpdi(TMP4, 0);
-  bc(CC_EQ, &Done); // ±0: mantissa 0, exponent 0, sign already in TMP2.
+  cmpdi(cr(1), TMP4, 0);
+  bc({12, 6}, &Done); // beq cr1 - ±0: mantissa 0, exponent 0, sign in TMP2.
   // Denormal: value = fraction × 2^-1074. Normalise the fraction to bit 63;
   // the result is always a normal f80 (its exponent range is far wider).
   //   mantissa = fraction << n            (n = clz, ≥ 12 since fraction < 2^52)
   //   exponent = 16383 + 63 - 1074 - n = 15372 - n
   cntlzd(TMP3, TMP4);
   sld(TMP4, TMP4, TMP3);
-  subfic(TMP3, TMP3, 15372);
+  // NOT subfic (writes XER.CA = guest CF): TMP1 (the raw f64 bits) is dead
+  // on this branch, so borrow it for the minuend.
+  li(TMP1, 15372);
+  subf(TMP3, TMP3, TMP1);
   or_(TMP2, TMP2, TMP3);
 
   Bind(&Done);
