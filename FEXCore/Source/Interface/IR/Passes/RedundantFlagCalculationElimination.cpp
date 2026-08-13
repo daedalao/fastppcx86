@@ -542,6 +542,13 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
     //     Arm's own GE is N==V, which excludes unordered -- CC_GE is not
     //     that. See MapNZCVCC in JIT/PPC64LE/JIT.cpp.
     //
+    //     STATUS: half-fixed. MapNZCVCC now folds XER.OV (unordered) into
+    //     both FGE and FLU via ProjectXERToCR1 + crnor/cror, so the packed-
+    //     NZCV path is correct. MapCC still returns bare CC_GE / CC_LT and
+    //     CANNOT be fixed in the table (it is static, and callers rebase its
+    //     BI onto arbitrary CR fields) -- that one needs a caller-side
+    //     composite. Defect 2 below is untouched.
+    //
     //  2. SLE -> SLE (the identity remap) is wrong independent of the
     //     backend. x86 `jle` after comiss is ZF || (SF!=OF); comiss forces
     //     SF=OF=0, and AXFLAG sets Z_x86 = Z|V, so it means "equal or

@@ -1443,8 +1443,28 @@ PPC64Emitter::Cond PPC64JITCore::MapCC(IR::CondClass Cond) {
   case IR::CondClass::ULT: return CC_LT;  // after cmpldi
   case IR::CondClass::UGT: return CC_GT;  // after cmpldi
   case IR::CondClass::ULE: return CC_LE;  // after cmpldi
-  // Floating-point conditions on CR0 set by fcmpu: LT/GT/EQ have IEEE-ordered
-  // meaning, SO is set on unordered. FU/FNU test SO directly.
+  // Floating-point conditions on the compare field set by fcmpu / xscmpudp:
+  // LT/GT/EQ have IEEE-ordered meaning, SO is set on unordered. FU/FNU test
+  // SO directly.
+  //
+  // KNOWN DEFECT, UNREACHABLE, NOT FIXABLE HERE: FLU and FGE need unordered
+  // folded in (CC_LT is false on NaN when it must be true; CC_GE is true on
+  // NaN when it must be false — `ucomisd; jae` takes the x86-opposite
+  // branch). MapNZCVCC below carries the full four-condition derivation and
+  // the fix for its own copy of this defect.
+  //
+  // It cannot be repeated here. MapCC is `static` — it has no emitter — and
+  // its callers REBASE the returned BI onto whatever CR field they compared
+  // into (DEF_OP(Select) and DEF_OP(NZCVSelect) both do `CC.BI + 28` for
+  // cr7, and EmitCompare takes CRField as a parameter). A crnor/cror
+  // composite would have to be emitted by the caller, into a scratch CR bit,
+  // after the compare — i.e. this is a caller-side fix, not a table entry.
+  //
+  // Nothing reaches it today: X86ToArmFloatCond in
+  // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE
+  // and it is only called from FoldBranch's AXFLAG arm, disabled in
+  // 68217d849. Anyone re-enabling that arm must fix this site (caller-side),
+  // MapNZCVCC (already done), and the shared ULE -> SLE identity remap.
   case IR::CondClass::FLU:  return CC_LT;
   case IR::CondClass::FGE:  return CC_GE;
   case IR::CondClass::FLEU: return CC_LE;
@@ -1543,9 +1563,45 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
                            crnor(13, 12, 2);
                            return { 4, 13};
 
-  // FP conditions on CR0 set by fcmpu. Same as MapCC.
-  case IR::CondClass::FLU:  return CC_LT;
-  case IR::CondClass::FGE:  return CC_GE;
+  // FP conditions on CR0 set by fcmpu / xscmpudp.
+  //
+  // Unordered must be folded into FLU and FGE, and MUST NOT be folded into
+  // FLEU and FGT. Working the four out against the raw compare field, where
+  // NaN sets only SO and leaves LT/GT/EQ all clear:
+  //
+  //   FLU  ("less than or unordered", = Arm LT after fcmp, N!=V)
+  //        CC_LT = {12,0} = "CR0.LT set" -> FALSE on NaN.  WRONG.
+  //   FGE  ("greater or equal", = Arm GE after fcmp, N==V)
+  //        CC_GE = { 4,0} = "CR0.LT clear" -> TRUE on NaN.  WRONG.
+  //   FGT  CC_GT = {12,1} = "CR0.GT set"   -> FALSE on NaN.  Correct:
+  //        x86 `ja` after comiss must not take on unordered (CF=ZF=1).
+  //   FLEU CC_LE = { 4,1} = "CR0.GT clear" -> TRUE on NaN.  Correct:
+  //        "less-or-equal-or-unordered" is supposed to include unordered.
+  //
+  // So exactly FLU and FGE are wrong, and both in the direction that takes
+  // the x86-opposite branch on NaN: `ucomisd; jae` was taken on NaN, where
+  // x86 sets CF=1 on unordered and JAE must NOT take.
+  //
+  // Fix: in the packed-NZCV world V = XER.OV, and DEF_OP(FCmp) lifts the
+  // compare's SO into XER.OV precisely so this works. Project XER into CR1
+  // (CR1.GT = XER.OV = unordered) and fold it into the predicate with the
+  // same CR3.LT composite-scratch discipline the SLT/UGT/SGT cases above
+  // use. Ported from origin/power9 382d0eb60.
+  //
+  // Reachability in THIS tree: X86ToArmFloatCond in
+  // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE,
+  // and it is only called from FoldBranch's AXFLAG arm, which 68217d849
+  // disabled outright. So this is defense-in-depth today. Do NOT read it as
+  // clearance to re-enable that arm: our own analysis found a SECOND,
+  // independent defect there (the ULE -> SLE identity remap, a property of
+  // the shared mapping table rather than of this backend) which this hunk
+  // does not touch. See the block comment at that `return`.
+  case IR::CondClass::FLU:  ProjectXERToCR1();
+                            cror (12, 0, 5);   // CR3.LT =   LT OR UN
+                            return {12, 12};
+  case IR::CondClass::FGE:  ProjectXERToCR1();
+                            crnor(12, 0, 5);   // CR3.LT = !(LT OR UN)
+                            return {12, 12};
   case IR::CondClass::FLEU: return CC_LE;
   case IR::CondClass::FGT:  return CC_GT;
   // FU/FNU in NZCV context = integer overflow (XER.OV via CR1), NOT
