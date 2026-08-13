@@ -481,7 +481,9 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     // sit in the guest Xlib request buffer. Without the sync the host
     // connection hits BadDrawable on GLXGetDrawableAttributes (Grimrock
     // bootstrap, serials ~28/30) whenever the per-call sync in
-    // GuestToHostDisplay is not covering for it (FEX_X11_SYNC_FIRST_ONLY=1).
+    // GuestToHostDisplay is not covering for it — which is the DEFAULT since
+    // the 2026-08-13 first-only flip (per-call is opt-in
+    // FEX_X11_SYNC_EVERY_CALL=1).
   } else if (name_sv == "glXMakeCurrent") {
     return (VoidFn)fexfn_impl_libGL_glXMakeCurrent;
   } else if (name_sv == "glXMakeContextCurrent") {
