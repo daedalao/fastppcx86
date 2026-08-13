@@ -149,6 +149,16 @@ enum PPC64VConstIndex : uint32_t {
   //   CRC32C_P  = reflect33(P)
   PPC64_VCONST_CRC32C_MU,
   PPC64_VCONST_CRC32C_P,
+  // VAddP (phaddw/phaddd/phaddb-class) vperm controls: even/odd element
+  // selectors over [VL:VU], per element size, for the 128-bit and MMX (64-bit
+  // RegSize) layouts. Values copied verbatim from the old inline builds in
+  // DEF_OP(VAddP) — entry [+0] is what went to r1-16, [+1] to r1-8.
+  PPC64_VCONST_ADDP_EVEN_B,  PPC64_VCONST_ADDP_ODD_B,
+  PPC64_VCONST_ADDP_EVEN_H,  PPC64_VCONST_ADDP_ODD_H,
+  PPC64_VCONST_ADDP_EVEN_W,  PPC64_VCONST_ADDP_ODD_W,
+  PPC64_VCONST_ADDP_EVEN_B64, PPC64_VCONST_ADDP_ODD_B64,
+  PPC64_VCONST_ADDP_EVEN_H64, PPC64_VCONST_ADDP_ODD_H64,
+  PPC64_VCONST_ADDP_EVEN_W64, PPC64_VCONST_ADDP_ODD_W64,
   PPC64_VCONST_MAX,
 };
 

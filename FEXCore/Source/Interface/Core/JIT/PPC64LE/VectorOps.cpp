@@ -1754,65 +1754,32 @@ DEF_OP(VAddP) {
   // 128-bit result. The 64-bit case differs because both operands' meaningful
   // data lives in their low 64 bits (phys[8..15] of each register).
   const auto RegSz = IROp->Size;
-  uint64_t even_lo, even_hi, odd_lo, odd_hi;
+  // Perm controls now live in the vconst pool (12 variants: even/odd x
+  // 3 element sizes x 128-bit/MMX layouts, byte values unchanged from the
+  // inline builds this replaces — see the pool initializer). Each control
+  // load is 3 instructions with no store-queue traffic, versus a
+  // LoadConstant+std+std+lvx store-hit-load per constant per emission.
+  PPC64VConstIndex EvenIdx, OddIdx;
   if (RegSz == IR::OpSize::i64Bit) {
-    // High half of result is don't-care; set its perm bytes to 0 (vperm picks
-    // VL.phys[0] which for MMX is zero/stale either way, but using ctrl==0
-    // also works and avoids surprises).
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      // even LE bytes [0,2,4,6] of VL,VU → result LE bytes [0..7]
-      // result phys[15..8]: VL.phys[15], VL.phys[13], VL.phys[11], VL.phys[9],
-      //                     VU.phys[15], VU.phys[13], VU.phys[11], VU.phys[9]
-      even_lo = 0x191B1D1F090B0D0FULL; even_hi = 0;
-      odd_lo  = 0x181A1C1E080A0C0EULL; odd_hi  = 0;
-      break;
-    case IR::OpSize::i16Bit:
-      // result phys[8..15] = [1A,1B,1E,1F,0A,0B,0E,0F]
-      even_lo = 0x1A1B1E1F0A0B0E0FULL; even_hi = 0;
-      odd_lo  = 0x18191C1D08090C0DULL; odd_hi  = 0;
-      break;
-    case IR::OpSize::i32Bit:
-      // result phys[8..15] = [1C,1D,1E,1F,0C,0D,0E,0F]
-      even_lo = 0x1C1D1E1F0C0D0E0FULL; even_hi = 0;
-      odd_lo  = 0x18191A1B08090A0BULL; odd_hi  = 0;
-      break;
-    default:
-      Op_Unhandled(IROp, Node);
-      return;
+    case IR::OpSize::i8Bit:  EvenIdx = PPC64_VCONST_ADDP_EVEN_B64; OddIdx = PPC64_VCONST_ADDP_ODD_B64; break;
+    case IR::OpSize::i16Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_H64; OddIdx = PPC64_VCONST_ADDP_ODD_H64; break;
+    case IR::OpSize::i32Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_W64; OddIdx = PPC64_VCONST_ADDP_ODD_W64; break;
+    default: Op_Unhandled(IROp, Node); return;
     }
   } else {
     switch (ElemSz) {
-    case IR::OpSize::i8Bit:
-      even_lo = 0x01030507090B0D0FULL; even_hi = 0x11131517191B1D1FULL;
-      odd_lo  = 0x00020406080A0C0EULL; odd_hi  = 0x10121416181A1C1EULL;
-      break;
-    case IR::OpSize::i16Bit:
-      even_lo = 0x020306070A0B0E0FULL; even_hi = 0x121316171A1B1E1FULL;
-      odd_lo  = 0x0001040508090C0DULL; odd_hi  = 0x1011141518191C1DULL;
-      break;
-    case IR::OpSize::i32Bit:
-      even_lo = 0x040506070C0D0E0FULL; even_hi = 0x141516171C1D1E1FULL;
-      odd_lo  = 0x0001020308090A0BULL; odd_hi  = 0x1011121318191A1BULL;
-      break;
-    default:
-      Op_Unhandled(IROp, Node);
-      return;
+    case IR::OpSize::i8Bit:  EvenIdx = PPC64_VCONST_ADDP_EVEN_B; OddIdx = PPC64_VCONST_ADDP_ODD_B; break;
+    case IR::OpSize::i16Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_H; OddIdx = PPC64_VCONST_ADDP_ODD_H; break;
+    case IR::OpSize::i32Bit: EvenIdx = PPC64_VCONST_ADDP_EVEN_W; OddIdx = PPC64_VCONST_ADDP_ODD_W; break;
+    default: Op_Unhandled(IROp, Node); return;
     }
   }
 
   // VTMP1/VTMP2 (VR30/VR31) are never in the allocator pool so safe as scratch.
-  // Build even-element vector in VTMP2.
-  LoadConstant(TMP1, even_lo); std(TMP1, -16, r1);
-  LoadConstant(TMP1, even_hi); std(TMP1, -8,  r1);
-  addi(TMP2, r1, -16);
-  lvx(VTMP1, r(0), TMP2);
+  EmitLoadPPC64VConst(VTMP1, EvenIdx, TMP1, TMP2);
   vperm(VTMP2, VL, VU, VTMP1);
-
-  // Build odd-element vector in Dst.
-  LoadConstant(TMP1, odd_lo); std(TMP1, -16, r1);
-  LoadConstant(TMP1, odd_hi); std(TMP1, -8,  r1);
-  lvx(VTMP1, r(0), TMP2);      // TMP2 still = r1-16
+  EmitLoadPPC64VConst(VTMP1, OddIdx, TMP1, TMP2);
   vperm(Dst, VL, VU, VTMP1);
 
   // Add element-wise (PPC reads all inputs before writing, so Dst==VL/VU is safe).
@@ -5386,6 +5353,31 @@ static const ::FEXCore::CPU::PPC64RuntimeTables PPC64Tables = {
     [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_MU + 1]     = 0xA434F61C6F5389F8ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 0]      = 0x0000000000000000ULL,
     [2 * ::FEXCore::CPU::PPC64_VCONST_CRC32C_P + 1]      = 0x0000000105EC76F1ULL,
+    // VAddP vperm controls (values verbatim from the old inline builds).
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B + 0]   = 0x01030507090B0D0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B + 1]   = 0x11131517191B1D1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B + 0]    = 0x00020406080A0C0EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B + 1]    = 0x10121416181A1C1EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H + 0]   = 0x020306070A0B0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H + 1]   = 0x121316171A1B1E1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H + 0]    = 0x0001040508090C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H + 1]    = 0x1011141518191C1DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W + 0]   = 0x040506070C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W + 1]   = 0x141516171C1D1E1FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W + 0]    = 0x0001020308090A0BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W + 1]    = 0x1011121318191A1BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B64 + 0] = 0x191B1D1F090B0D0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_B64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B64 + 0]  = 0x181A1C1E080A0C0EULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_B64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H64 + 0] = 0x1A1B1E1F0A0B0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_H64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H64 + 0]  = 0x18191C1D08090C0DULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_H64 + 1]  = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W64 + 0] = 0x1C1D1E1F0C0D0E0FULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_EVEN_W64 + 1] = 0x0000000000000000ULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 0]  = 0x18191A1B08090A0BULL,
+    [2 * ::FEXCore::CPU::PPC64_VCONST_ADDP_ODD_W64 + 1]  = 0x0000000000000000ULL,
   },
 };
 } // namespace
