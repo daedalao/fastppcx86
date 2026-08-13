@@ -3184,7 +3184,8 @@ void PPC64JITCore::Compute32MaskElision() {
         continue;
       }
       const IR::PhysicalRegister DefPR(DefNode);
-      if (DefPR.AsRegClass() != IR::RegClass::GPR) {
+      const auto DefClass = DefPR.AsRegClass();
+      if (DefClass != IR::RegClass::GPR && DefClass != IR::RegClass::GPRFixed) {
         continue;
       }
       if (DefNode->GetUses() != 1) {
@@ -3229,6 +3230,31 @@ void PPC64JITCore::Compute32MaskElision() {
         break;
       }
       default: break;
+      }
+
+      // A GPRFixed def IS an architectural guest register (RA coalesced the
+      // write onto the SRA slot — this is the common case in hot loops). The
+      // single-use/next-op argument alone is not enough there: the SRA
+      // register would keep the unmasked value until something overwrites
+      // it, and a synchronous fault in a LATER guest instruction would
+      // present garbage high bits as architectural state. Sound iff the
+      // consumer overwrites the SAME fixed register in the very next op
+      // (the x86 read-modify-write chain shape, e.g. sub edi,X / shr edi,N)
+      // — the window between the two host instructions contains no
+      // observation point: async signals defer to drain points, and no
+      // faulting instruction sits between def and overwrite. Every table
+      // consumer with a dest writes it canonically or re-masks (rlwinm/
+      // slw/srw are low-32 by construction; mullw keeps its own tail mask
+      // unless ITS consumer also passed this same test — induction holds).
+      if (Elide && DefClass == IR::RegClass::GPRFixed) {
+        if (!IR::GetHasDest(IROp->Op)) {
+          Elide = false;
+        } else {
+          const IR::PhysicalRegister UsePR(CodeNode);
+          if (UsePR.Raw != DefPR.Raw) {
+            Elide = false;
+          }
+        }
       }
 
       if (Elide) {
