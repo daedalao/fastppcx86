@@ -718,8 +718,15 @@
           "path instead of LoadMemTSO.  Designed for weakly-ordered hosts",
           "(PPC64LE) where the per-load acquire dance is microarchitecturally",
           "cheap but cumulatively dominates runtime in libc / pthread tight",
-          "loops.  Risk: real concurrent code using non-LOCK volatile reads",
-          "may race -- glibc futex / PLT lazy resolve are normally safe.",
+          "loops.",
+          "UNSOUND, and measured so: the MP litmus shape (forbidden on x86)",
+          "fired 659, 12 and 51 times per 30000 rounds with this enabled and",
+          "0 times in 150000 rounds with it disabled, same guest binary.",
+          "Only LOCK ops keep TSO; plain loads and stores lose their",
+          "barriers, so lock-free or volatile-based guest code can silently",
+          "compute wrong results.  glibc futex / PLT lazy resolve are backed",
+          "by LOCK CMPXCHG and stay correct, which is the limit of what is",
+          "safe here.  FEX warns once at startup when this is enabled.",
           "Inert (no effect) when TSOEnabled is false."
         ]
       },

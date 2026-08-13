@@ -15,6 +15,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/fextl/set.h>
@@ -81,7 +82,12 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
   // PPC64LE thread pointer and is preserved across PLT stubs (kernel +
   // ABI invariant), so this is robust.
   //
-  // Layout (12 insns = 48 bytes of code, then 32 bytes of InstanceInfo):
+  // Layout (10 insns = 40 bytes of code, then 32 bytes of InstanceInfo; the
+  // whole template section measures 84 bytes including its trailing pad, which
+  // is what __stop - __start yields and therefore the per-instance stride).
+  // The offset list below was always right; the "12 insns = 48 bytes" summary
+  // this line used to carry was not, and MakeHostTrampolineForGuestFunction's
+  // cache-line reasoning depends on the real number.
   //   +0:  mflr r0
   //   +4:  bl 1f
   //   +8:  [label1] mflr r12
@@ -478,6 +484,36 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
   memcpy(HostTrampoline, (void*)&HostToGuestTrampolineTemplate, HostToGuestTrampolineSize);
   GetInstanceInfo(HostTrampoline) = TrampolineInstanceInfo {
     .HostPacker = HostPacker, .CallCallback = (uintptr_t)&ThunkHandler_impl::CallCallback, .GuestUnpacker = GuestUnpacker, .GuestTarget = GuestTarget};
+
+  // Publish the instance to the fetch stream. These are HOST instructions --
+  // the pointer below is handed to host libraries (libGL, libvulkan, ...) which
+  // call it directly as a host function -- and they arrived here through
+  // memcpy, i.e. as data stores into a PROT_EXEC mapping. On ppc64le the
+  // I-cache is not coherent with the D-cache, so without this the host can
+  // fetch whatever the I-cache last held for these lines.
+  //
+  // This is not hypothetical arithmetic. HostToGuestTrampolineSize is 84 bytes
+  // on ppc64le (measured: __stop - __start of the template section in the
+  // linked binary is 0x54) against a 128-byte cache block, so consecutive
+  // instances SHARE a block: executing instance N pulls in the still-zero
+  // bytes at the address instance N+1 is written to later, and the callback
+  // dispatch into N+1 then fetches them -- presenting as SIGILL. This is the
+  // path DXVK's thunks take.
+  //
+  // The flush covers the whole instance: code (offsets 0..39, ten
+  // instructions) plus the TrampolineInstanceInfo tail at +40..+71 and the
+  // section's trailing pad. The tail is read through the data path by
+  // `ld r12, 0(r11)` and needs no invalidation of its own, but including it
+  // keeps this correct if the layout ever changes, and the sequence's leading
+  // `sync` doubles as the barrier that publishes those fields before anything
+  // can execute the trampoline. FlushICacheRange aligns down to a block
+  // boundary, so the block shared with instance N-1 is covered too.
+  //
+  // The symmetric low-32 trampoline pool in ThunkLibs/include/common/Host.h
+  // does the same thing. This site had never had any cache-maintenance call
+  // -- not even a __builtin___clear_cache -- which is exactly why an audit
+  // that searched for that builtin could not see it.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(HostTrampoline, HostToGuestTrampolineSize);
 
   ThunkHandler->GuestcallToHostTrampoline[gci] = HostTrampoline;
   return HostTrampoline;

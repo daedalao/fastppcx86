@@ -31,6 +31,7 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 
@@ -109,8 +110,9 @@ PPC64Dispatcher::PPC64Dispatcher(FEXCore::Context::ContextImpl* CTX)
   // CPU may execute stale bytes the I-cache happened to fetch on the same
   // physical line. mprotect(PROT_EXEC) typically (but not contractually) does
   // this, so we still issue it explicitly to match ARM64 behaviour.
-  __builtin___clear_cache(static_cast<char*>(Mem),
-                          static_cast<char*>(Mem) + DISPATCHER_CODE_SIZE);
+  // (EmitDispatcher already flushes the range it actually emitted, so this is
+  // belt-and-braces over the whole 64KiB buffer — 512 blocks, once per process.)
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Mem, DISPATCHER_CODE_SIZE);
 
   // Make the buffer read-only+executable after generation
   mprotect(Mem, DISPATCHER_CODE_SIZE, PROT_READ | PROT_EXEC);
@@ -1047,12 +1049,13 @@ void PPC64Dispatcher::EmitDispatcher() {
     }
   }
 
-  // Flush instruction cache for entire generated region
+  // Flush instruction cache for entire generated region. This was one of three
+  // copy-pasted inline-asm blocks; it is now the shared helper, which also adds
+  // the "memory" clobber the copy here was missing and strides by the auxv
+  // cache-block size instead of a hardcoded 32.
   uint8_t* Start = reinterpret_cast<uint8_t*>(DispatcherBegin);
-  uint8_t* End   = GetCursorAddress<uint8_t*>();
-  for (uint8_t* p = Start; p < End; p += 32) {
-    asm volatile("dcbst 0,%0; sync; icbi 0,%0; isync" :: "r"(p));
-  }
+  uint8_t* End = GetCursorAddress<uint8_t*>();
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Start, static_cast<size_t>(End - Start));
 }
 
 // ============================================================

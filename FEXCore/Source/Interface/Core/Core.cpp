@@ -490,6 +490,34 @@ bool ContextImpl::InitCore() {
     Config.NeedsPendingInterruptFaultCheck = true;
   }
 
+  // One-shot warning: LockOnlyTSO is a knowingly-unsound option. It is not a
+  // tuning knob with a theoretical risk — the MP litmus shape fires under it
+  // and never fires without it, on the same guest binary. Emitted once here
+  // rather than at the per-instruction consumption site below (which runs
+  // inside the block compiler) so the cost is a single line per process.
+  //
+  // Written straight to stderr, NOT through LogMan. FEX_SILENTLOG defaults to
+  // 1, and on that path FEXInterpreter uninstalls the LogMan message handler
+  // outright (Source/Tools/FEXInterpreter/FEXInterpreter.cpp:107-109) — a
+  // LogMan::Msg::EFmt here is dropped on the floor in the default
+  // configuration, which is precisely the configuration a user enabling this
+  // knob is in. A warning nobody sees is not a warning. Three lines, once per
+  // process, and only when the user explicitly asked for unsound lowering.
+  if (Config.LockOnlyTSO() && Config.TSOEnabled()) {
+    static constexpr std::string_view LockOnlyTSOWarning =
+      "FEX: FEX_LOCKONLYTSO=1 is UNSOUND. Only LOCK-prefixed guest operations keep TSO\n"
+      "     ordering; plain loads and stores lose their barriers, so the guest can observe\n"
+      "     memory orderings x86 forbids.\n"
+      "     Measured on this port, same guest binary: the MP litmus shape fired 659, 12 and\n"
+      "     51 times per 30000 rounds with it on, and 0 times in 150000 rounds with it off.\n"
+      "     IRIW agrees: 552/1000000 on, 0/67200000 off. A seq_cst-shaped test does NOT\n"
+      "     catch it. See docs/GAMING.md and powerpc64le-handbook/probes/atomics_litmus.c.\n"
+      "     Use only where a wrong answer is acceptable.\n";
+    // write(2) rather than fwrite: no locale, no buffering, nothing to flush,
+    // and no interleaving with a guest that has its own stdio state.
+    [[maybe_unused]] const auto Written = ::write(STDERR_FILENO, LockOnlyTSOWarning.data(), LockOnlyTSOWarning.size());
+  }
+
   return true;
 }
 
@@ -938,11 +966,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             // bc never; isync` dance that ARM64 sidesteps via single-insn
             // LDAR.  Inert when global TSOEnabled is false (TSO already off).
             //
-            // Pitfall: real concurrent guest code that relies on x86's
-            // "every load is acquire" contract may race -- particularly
-            // glibc futex / PLT lazy resolution.  LOCK CMPXCHG is the
-            // primitive backing those, so LOCK-only TSO should keep them
-            // correct.  Tune-at-own-risk.
+            // UNSOUND, and this is measured, not a caveat.  Guest code that
+            // relies on x86's "every load is acquire / every store is release"
+            // contract DOES race under this: the MP litmus shape fired 659, 12
+            // and 51 times per 30000 rounds with the option on and 0 times in
+            // 150000 rounds with it off, same guest binary
+            // (powerpc64le-handbook/probes/atomics_litmus.c).  MP is
+            // architecturally forbidden on x86, so those are guest-visible
+            // violations of the model this emulator claims to provide.
+            // seqcst_discriminator.c does not catch it (0/60000 both ways):
+            // LOCK ops keep their fences, so only plain accesses are affected.
+            // glibc futex / PLT lazy resolution happen to be backed by LOCK
+            // CMPXCHG and so stay correct -- that is why this is usable at all,
+            // and it is the limit of what is safe, not a general reassurance.
+            // A one-shot warning is emitted in InitCore.
             if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_LOCK) {
               ForceTSO = IR::ForceTSOMode::ForceEnabled;
             } else {

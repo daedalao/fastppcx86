@@ -138,14 +138,18 @@
 //
 // SYNCHRONISATION PROTOCOL (copied, not invented)
 // -----------------------------------------------
-// After the store, the exact sequence the PPC64LE dispatcher already uses when
-// it publishes freshly-emitted host code (JIT/PPC64LE/PPC64Dispatcher.cpp:941)
-// is issued for the patched word's cache block:
+// After the store, the same sequence the PPC64LE dispatcher uses when it
+// publishes freshly-emitted host code is issued for the patched word's cache
+// block, via the one shared helper
+// (FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h):
 //
-//     dcbst 0,p ; sync ; icbi 0,p ; isync
+//     dcbst 0,p ; sync ; icbi 0,p ; sync ; isync
 //
-// (which is also what __builtin___clear_cache lowers to on PPC64, i.e. what
-// PPC64JITCore::CompileCode does for a whole block at JIT.cpp:2893).  POWER8
+// This comment previously claimed the sequence "is also what
+// __builtin___clear_cache lowers to on PPC64".  That was false: on this
+// toolchain the builtin emits no cache maintenance at all (gcc: nothing;
+// clang: a call to an empty libgcc stub), which is why every builtin call site
+// in the tree now routes through the helper instead.  POWER8
 // has split, non-coherent I/D caches; dcbst pushes the store out of the
 // D-cache, sync orders it before the icbi, icbi (a broadcast operation)
 // invalidates the I-cache block on all processors, and isync flushes this
@@ -286,6 +290,7 @@
 // word the emitter itself produced via LoadImm64Fixed.
 // ===========================================================================
 
+#include <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h>
 #include <FEXCore/fextl/vector.h>
 
 #include <cstdint>
@@ -587,12 +592,13 @@ inline SiteMatch ClassifyRIPSite(uint64_t HostAddr, uint64_t OldRIP, uint64_t Ne
 /**
  * @brief Publish one patched host instruction word.
  *
- * Single-copy-atomic 4-byte store, then the tree's existing code-publication
- * sequence for the containing cache block (PPC64Dispatcher.cpp:941).
+ * Single-copy-atomic 4-byte store, then the tree's one code-publication
+ * sequence for the containing cache block
+ * (FEXCore::ArchHelpers::PPC64::FlushICacheRange).
  */
 inline void ApplyWordPatch(const WordPatch& Patch) {
   __atomic_store_n(Patch.Address, Patch.Value, __ATOMIC_RELAXED);
-  asm volatile("dcbst 0,%0; sync; icbi 0,%0; isync" ::"r"(Patch.Address) : "memory");
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(Patch.Address, 4);
 }
 
 #endif // ARCHITECTURE_ppc64le

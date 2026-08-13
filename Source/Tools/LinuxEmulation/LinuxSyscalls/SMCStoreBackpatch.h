@@ -51,7 +51,8 @@
 //   - a thread that sees the new branch runs the stub.
 // The patch is therefore a pure optimisation hint with no correctness-
 // critical visibility deadline.  We still issue the tree's standard
-// dcbst/sync/icbi/isync (copied verbatim from PPC64Dispatcher.cpp:941) on the
+// dcbst/sync/icbi/sync/isync (FEXCore::ArchHelpers::PPC64::FlushICacheRange,
+// the one publication helper shared with the dispatcher and the JIT) on the
 // patched word so the patching thread and, in practice, its neighbours pick
 // it up promptly.
 //

@@ -168,6 +168,11 @@ function(add_host_lib NAME GUEST_BITNESS)
   set_target_properties(${NAME}-host-${GUEST_BITNESS} PROPERTIES OUTPUT_NAME "${NAME}-host")
   set_target_properties(${NAME}-host-${GUEST_BITNESS} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/HostLibs_${GUEST_BITNESS}")
   target_include_directories(${NAME}-host-${GUEST_BITNESS} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen_${GUEST_BITNESS}/")
+  # common/Host.h includes <FEXCore/Utils/ArchHelpers/PPC64CacheFlush.h> for the
+  # low-32 trampoline's I-cache publication. Stated explicitly rather than
+  # relying on the FEX executable target below to propagate FEXCore's PUBLIC
+  # include dirs.
+  target_include_directories(${NAME}-host-${GUEST_BITNESS} PRIVATE "${FEX_PROJECT_SOURCE_DIR}/FEXCore/include/")
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE dl)
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE lib${NAME}-${GUEST_BITNESS}-deps)
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE FEX)
