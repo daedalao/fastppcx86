@@ -112,6 +112,17 @@ static PFN_vkVoidFunction GuestThunkForCustomHostImpl(std::string_view name) {
 }
 #endif
 
+// FEX_VK_PROCADDR_TRACE=1 logs every successfully linked vkGet*ProcAddr
+// resolution. That fires once per name per dispatch-table build, and clients
+// like DXVK build a full table per instance AND per device — hundreds of
+// stderr lines per startup — so it is opt-in diagnostics, not default output.
+// The "Unknown Vulkan function" warning below stays unconditional: it flags a
+// coverage gap, not normal operation.
+static bool VkProcAddrTrace() {
+  static const bool Enabled = getenv("FEX_VK_PROCADDR_TRACE") != nullptr;
+  return Enabled;
+}
+
 static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {
   auto It = HostPtrInvokers.find(name);
   if (It == HostPtrInvokers.end()) {
@@ -128,7 +139,9 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
     }
     return nullptr;
   }
-  fprintf(stderr, "Linking address %p to host invoker %#zx\n", func, It->second);
+  if (VkProcAddrTrace()) {
+    fprintf(stderr, "Linking address %p to host invoker %#zx\n", func, It->second);
+  }
   LinkAddressToFunction((uintptr_t)func, It->second);
   return func;
 }

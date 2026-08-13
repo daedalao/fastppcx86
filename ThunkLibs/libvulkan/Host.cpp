@@ -218,6 +218,47 @@ static void DoSetupWithInstance(VkInstance instance) {
 
 #define FEXFN_IMPL(fn) fexfn_impl_libvulkan_##fn
 
+// Cached proc-addr resolution for the custom impls below (the allocator-
+// nulling wrappers and friends). They used to re-resolve their driver pointer
+// through vkGet{Device,Instance}ProcAddr on EVERY call to stay multi-device-
+// tolerant; radv's GDPA is a hash walk (~100-200ns) and the call rate is
+// resource-churn rate, which open-world streaming keeps permanently nonzero.
+// Each expansion site instead keeps one {owner, PFN} pair: the unique lambda
+// type per expansion gives every wrapper its own statics. Owner mismatch
+// re-resolves under the lock, which preserves multi-device correctness.
+//
+// Invariants / deliberate choices:
+// - std::mutex, NOT a lock-free {atomic owner, atomic PFN} pair: Vk handles
+//   are freed and reused, so a torn read could pair a stale owner with a new
+//   PFN (ABA) and pass the equality check. The uncontended lock is cheaper
+//   than the GDPA hash walk these sites used to pay, and none of them are
+//   draw-rate.
+// - Accepted staleness: destroying an owner and creating a new one at the
+//   SAME handle value returns the old resolution (same class of staleness as
+//   the vkCreateDevice-time preloads above, which cache per-device pointers
+//   for the life of the process). Per-entry-point pointers for one ICD do not
+//   differ per device object in practice.
+// - A null resolution is NOT cached (matches the old per-call behavior for
+//   absent extensions: resolve again next call, crash only if actually
+//   invoked through null).
+// - The fexldr_ptr_* slot for the wrapped function is no longer written; it
+//   keeps its dlsym/init-time value. No code outside these wrappers reads the
+//   affected slots (verified 2026-08-13).
+#define LDR_PTR_CACHED_IMPL(fn, owner, OwnerType, gpa)                    \
+  [](OwnerType Owner_) {                                                  \
+    static std::mutex CacheMutex;                                         \
+    static OwnerType CachedOwner = VK_NULL_HANDLE;                        \
+    static decltype(LDR_PTR(fn)) CachedFn = nullptr;                      \
+    std::lock_guard Lock {CacheMutex};                                    \
+    if (CachedOwner != Owner_ || !CachedFn) {                             \
+      CachedFn = reinterpret_cast<decltype(LDR_PTR(fn))>(LDR_PTR(gpa)(Owner_, #fn)); \
+      CachedOwner = Owner_;                                               \
+    }                                                                     \
+    return CachedFn;                                                      \
+  }(owner)
+#define LDR_DEVICE_PTR_CACHED(fn, dev) LDR_PTR_CACHED_IMPL(fn, dev, VkDevice, vkGetDeviceProcAddr)
+#define LDR_INSTANCE_PTR_CACHED(fn, inst) LDR_PTR_CACHED_IMPL(fn, inst, VkInstance, vkGetInstanceProcAddr)
+
 static X11Manager x11_manager;
 
 static void fexfn_impl_libvulkan_Vulkan_SetGuestXGetVisualInfo(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
@@ -296,8 +337,7 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 
 static VkResult
 FEXFN_IMPL(vkCreateShaderModule)(VkDevice a_0, const VkShaderModuleCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkShaderModule* a_3) {
-  (void*&)LDR_PTR(vkCreateShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateShaderModule");
-  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateShaderModule, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkBool32
@@ -456,8 +496,7 @@ static void ForgetPlacedAllocation(VkDeviceMemory Memory);
 #endif
 
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
-  (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
-  auto Ret = LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+  auto Ret = LDR_DEVICE_PTR_CACHED(vkAllocateMemory, a_0)(a_0, a_1, nullptr, a_3);
 #ifdef IS_32BIT_THUNK
   if (Ret == VK_SUCCESS) {
     // A VK_WHOLE_SIZE vkMapMemory has to be given a placed reservation covering
@@ -472,21 +511,18 @@ static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkA
 #ifdef IS_32BIT_THUNK
   ForgetPlacedAllocation(a_1);
 #endif
-  (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
-  LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkFreeMemory, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDebugReportCallbackEXT)(VkInstance a_0, guest_layout<const VkDebugReportCallbackCreateInfoEXT*> a_1,
                                                            const VkAllocationCallbacks* a_2, VkDebugReportCallbackEXT* a_3) {
   auto overridden_callback = host_layout<VkDebugReportCallbackCreateInfoEXT> {*a_1.get_pointer()}.data;
   overridden_callback.pfnCallback = DummyVkDebugReportCallback;
-  (void*&)LDR_PTR(vkCreateDebugReportCallbackEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDebugReportCallbackEXT");
-  return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateDebugReportCallbackEXT, a_0)(a_0, &overridden_callback, nullptr, a_3);
 }
 
 static void FEXFN_IMPL(vkDestroyDebugReportCallbackEXT)(VkInstance a_0, VkDebugReportCallbackEXT a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDebugReportCallbackEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyDebugReportCallbackEXT");
-  LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, nullptr);
+  LDR_INSTANCE_PTR_CACHED(vkDestroyDebugReportCallbackEXT, a_0)(a_0, a_1, nullptr);
 }
 
 extern "C" VkBool32 DummyVkDebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -498,8 +534,7 @@ static VkResult FEXFN_IMPL(vkCreateDebugUtilsMessengerEXT)(VkInstance_T* a_0, gu
                                                            const VkAllocationCallbacks* a_2, VkDebugUtilsMessengerEXT* a_3) {
   auto overridden_callback = host_layout<VkDebugUtilsMessengerCreateInfoEXT> {*a_1.get_pointer()}.data;
   overridden_callback.pfnUserCallback = DummyVkDebugUtilsMessengerCallback;
-  (void*&)LDR_PTR(vkCreateDebugUtilsMessengerEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDebugUtilsMessengerEXT");
-  return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateDebugUtilsMessengerEXT, a_0)(a_0, &overridden_callback, nullptr, a_3);
 }
 
 // VkAllocationCallbacks embeds five guest function pointers (pfnAllocation,
@@ -512,49 +547,39 @@ static VkResult FEXFN_IMPL(vkCreateDebugUtilsMessengerEXT)(VkInstance_T* a_0, gu
 // the existing vkCreateShaderModule / vkAllocateMemory pattern.
 
 static VkResult FEXFN_IMPL(vkCreateBuffer)(VkDevice a_0, const VkBufferCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkBuffer* a_3) {
-  (void*&)LDR_PTR(vkCreateBuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateBuffer");
-  return LDR_PTR(vkCreateBuffer)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateBuffer, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyBuffer)(VkDevice a_0, VkBuffer a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyBuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyBuffer");
-  LDR_PTR(vkDestroyBuffer)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyBuffer, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateBufferView)(VkDevice a_0, const VkBufferViewCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkBufferView* a_3) {
-  (void*&)LDR_PTR(vkCreateBufferView) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateBufferView");
-  return LDR_PTR(vkCreateBufferView)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateBufferView, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyBufferView)(VkDevice a_0, VkBufferView a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyBufferView) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyBufferView");
-  LDR_PTR(vkDestroyBufferView)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyBufferView, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateImage)(VkDevice a_0, const VkImageCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkImage* a_3) {
-  (void*&)LDR_PTR(vkCreateImage) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateImage");
-  return LDR_PTR(vkCreateImage)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateImage, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyImage)(VkDevice a_0, VkImage a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyImage) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyImage");
-  LDR_PTR(vkDestroyImage)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyImage, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateImageView)(VkDevice a_0, const VkImageViewCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkImageView* a_3) {
-  (void*&)LDR_PTR(vkCreateImageView) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateImageView");
-  return LDR_PTR(vkCreateImageView)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateImageView, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyImageView)(VkDevice a_0, VkImageView a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyImageView) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyImageView");
-  LDR_PTR(vkDestroyImageView)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyImageView, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreatePipelineCache)(VkDevice a_0, const VkPipelineCacheCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                   VkPipelineCache* a_3) {
-  (void*&)LDR_PTR(vkCreatePipelineCache) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePipelineCache");
-  return LDR_PTR(vkCreatePipelineCache)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreatePipelineCache, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyPipelineCache)(VkDevice a_0, VkPipelineCache a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPipelineCache) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPipelineCache");
-  LDR_PTR(vkDestroyPipelineCache)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyPipelineCache, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice a_0, VkPipelineCache a_1, uint32_t a_2, const VkGraphicsPipelineCreateInfo* a_3,
@@ -571,150 +596,121 @@ static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice a_0, VkPipelineCa
     fprintf(stderr, "\n");
     fflush(stderr);
   }
-  (void*&)LDR_PTR(vkCreateGraphicsPipelines) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateGraphicsPipelines");
-  return LDR_PTR(vkCreateGraphicsPipelines)(a_0, a_1, a_2, a_3, nullptr, a_5);
+  return LDR_DEVICE_PTR_CACHED(vkCreateGraphicsPipelines, a_0)(a_0, a_1, a_2, a_3, nullptr, a_5);
 }
 
 #ifndef IS_32BIT_THUNK
 static VkResult FEXFN_IMPL(vkCreateComputePipelines)(VkDevice a_0, VkPipelineCache a_1, uint32_t a_2, const VkComputePipelineCreateInfo* a_3,
                                                     const VkAllocationCallbacks* a_4, VkPipeline* a_5) {
-  (void*&)LDR_PTR(vkCreateComputePipelines) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateComputePipelines");
-  return LDR_PTR(vkCreateComputePipelines)(a_0, a_1, a_2, a_3, nullptr, a_5);
+  return LDR_DEVICE_PTR_CACHED(vkCreateComputePipelines, a_0)(a_0, a_1, a_2, a_3, nullptr, a_5);
 }
 #endif
 
 static void FEXFN_IMPL(vkDestroyPipeline)(VkDevice a_0, VkPipeline a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPipeline) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPipeline");
-  LDR_PTR(vkDestroyPipeline)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyPipeline, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreatePipelineLayout)(VkDevice a_0, const VkPipelineLayoutCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                   VkPipelineLayout* a_3) {
-  (void*&)LDR_PTR(vkCreatePipelineLayout) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePipelineLayout");
-  return LDR_PTR(vkCreatePipelineLayout)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreatePipelineLayout, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyPipelineLayout)(VkDevice a_0, VkPipelineLayout a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPipelineLayout) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPipelineLayout");
-  LDR_PTR(vkDestroyPipelineLayout)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyPipelineLayout, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateSampler)(VkDevice a_0, const VkSamplerCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkSampler* a_3) {
-  (void*&)LDR_PTR(vkCreateSampler) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSampler");
-  return LDR_PTR(vkCreateSampler)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateSampler, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroySampler)(VkDevice a_0, VkSampler a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySampler) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySampler");
-  LDR_PTR(vkDestroySampler)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroySampler, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDescriptorSetLayout)(VkDevice a_0, const VkDescriptorSetLayoutCreateInfo* a_1,
                                                        const VkAllocationCallbacks* a_2, VkDescriptorSetLayout* a_3) {
-  (void*&)LDR_PTR(vkCreateDescriptorSetLayout) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorSetLayout");
-  return LDR_PTR(vkCreateDescriptorSetLayout)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateDescriptorSetLayout, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyDescriptorSetLayout)(VkDevice a_0, VkDescriptorSetLayout a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDescriptorSetLayout) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorSetLayout");
-  LDR_PTR(vkDestroyDescriptorSetLayout)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyDescriptorSetLayout, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDescriptorPool)(VkDevice a_0, const VkDescriptorPoolCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                   VkDescriptorPool* a_3) {
-  (void*&)LDR_PTR(vkCreateDescriptorPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorPool");
-  return LDR_PTR(vkCreateDescriptorPool)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateDescriptorPool, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyDescriptorPool)(VkDevice a_0, VkDescriptorPool a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDescriptorPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorPool");
-  LDR_PTR(vkDestroyDescriptorPool)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyDescriptorPool, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateSemaphore)(VkDevice a_0, const VkSemaphoreCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkSemaphore* a_3) {
-  (void*&)LDR_PTR(vkCreateSemaphore) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSemaphore");
-  return LDR_PTR(vkCreateSemaphore)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateSemaphore, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroySemaphore)(VkDevice a_0, VkSemaphore a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySemaphore) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySemaphore");
-  LDR_PTR(vkDestroySemaphore)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroySemaphore, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateFence)(VkDevice a_0, const VkFenceCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkFence* a_3) {
-  (void*&)LDR_PTR(vkCreateFence) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateFence");
-  return LDR_PTR(vkCreateFence)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateFence, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyFence)(VkDevice a_0, VkFence a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyFence) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyFence");
-  LDR_PTR(vkDestroyFence)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyFence, a_0)(a_0, a_1, nullptr);
 }
 
 #ifndef IS_32BIT_THUNK
 static VkResult FEXFN_IMPL(vkCreateEvent)(VkDevice a_0, const VkEventCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkEvent* a_3) {
-  (void*&)LDR_PTR(vkCreateEvent) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateEvent");
-  return LDR_PTR(vkCreateEvent)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateEvent, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyEvent)(VkDevice a_0, VkEvent a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyEvent) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyEvent");
-  LDR_PTR(vkDestroyEvent)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyEvent, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateQueryPool)(VkDevice a_0, const VkQueryPoolCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkQueryPool* a_3) {
-  (void*&)LDR_PTR(vkCreateQueryPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateQueryPool");
-  return LDR_PTR(vkCreateQueryPool)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateQueryPool, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyQueryPool)(VkDevice a_0, VkQueryPool a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyQueryPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyQueryPool");
-  LDR_PTR(vkDestroyQueryPool)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyQueryPool, a_0)(a_0, a_1, nullptr);
 }
 #endif
 
 static VkResult FEXFN_IMPL(vkCreateFramebuffer)(VkDevice a_0, const VkFramebufferCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                VkFramebuffer* a_3) {
-  (void*&)LDR_PTR(vkCreateFramebuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateFramebuffer");
-  return LDR_PTR(vkCreateFramebuffer)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateFramebuffer, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyFramebuffer)(VkDevice a_0, VkFramebuffer a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyFramebuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyFramebuffer");
-  LDR_PTR(vkDestroyFramebuffer)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyFramebuffer, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateRenderPass)(VkDevice a_0, const VkRenderPassCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                               VkRenderPass* a_3) {
-  (void*&)LDR_PTR(vkCreateRenderPass) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateRenderPass");
-  return LDR_PTR(vkCreateRenderPass)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateRenderPass, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyRenderPass)(VkDevice a_0, VkRenderPass a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyRenderPass) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyRenderPass");
-  LDR_PTR(vkDestroyRenderPass)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyRenderPass, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateRenderPass2)(VkDevice a_0, const VkRenderPassCreateInfo2* a_1, const VkAllocationCallbacks* a_2,
                                                VkRenderPass* a_3) {
-  (void*&)LDR_PTR(vkCreateRenderPass2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateRenderPass2");
-  return LDR_PTR(vkCreateRenderPass2)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateRenderPass2, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkResult FEXFN_IMPL(vkCreateRenderPass2KHR)(VkDevice a_0, const VkRenderPassCreateInfo2* a_1, const VkAllocationCallbacks* a_2,
                                                   VkRenderPass* a_3) {
-  (void*&)LDR_PTR(vkCreateRenderPass2KHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateRenderPass2KHR");
-  return LDR_PTR(vkCreateRenderPass2KHR)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateRenderPass2KHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkResult FEXFN_IMPL(vkCreateCommandPool)(VkDevice a_0, const VkCommandPoolCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                VkCommandPool* a_3) {
-  (void*&)LDR_PTR(vkCreateCommandPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateCommandPool");
-  return LDR_PTR(vkCreateCommandPool)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateCommandPool, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyCommandPool)(VkDevice a_0, VkCommandPool a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyCommandPool) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyCommandPool");
-  LDR_PTR(vkDestroyCommandPool)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyCommandPool, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateSwapchainKHR)(VkDevice a_0, const VkSwapchainCreateInfoKHR* a_1, const VkAllocationCallbacks* a_2,
                                                 VkSwapchainKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateSwapchainKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSwapchainKHR");
-  return LDR_PTR(vkCreateSwapchainKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateSwapchainKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroySwapchainKHR)(VkDevice a_0, VkSwapchainKHR a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySwapchainKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySwapchainKHR");
-  LDR_PTR(vkDestroySwapchainKHR)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroySwapchainKHR, a_0)(a_0, a_1, nullptr);
 }
 
 // Follow-up wrappers covering instance/device shutdown plus surface creation
@@ -723,23 +719,19 @@ static void FEXFN_IMPL(vkDestroySwapchainKHR)(VkDevice a_0, VkSwapchainKHR a_1, 
 // Same nullptr-pAllocator rationale as the block above.
 
 static void FEXFN_IMPL(vkDestroyInstance)(VkInstance a_0, const VkAllocationCallbacks* a_1) {
-  (void*&)LDR_PTR(vkDestroyInstance) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyInstance");
-  LDR_PTR(vkDestroyInstance)(a_0, nullptr);
+  LDR_INSTANCE_PTR_CACHED(vkDestroyInstance, a_0)(a_0, nullptr);
 }
 
 static void FEXFN_IMPL(vkDestroyDevice)(VkDevice a_0, const VkAllocationCallbacks* a_1) {
-  (void*&)LDR_PTR(vkDestroyDevice) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDevice");
-  LDR_PTR(vkDestroyDevice)(a_0, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyDevice, a_0)(a_0, nullptr);
 }
 
 static void FEXFN_IMPL(vkDestroyShaderModule)(VkDevice a_0, VkShaderModule a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyShaderModule");
-  LDR_PTR(vkDestroyShaderModule)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyShaderModule, a_0)(a_0, a_1, nullptr);
 }
 
 static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a_0, VkSurfaceKHR a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroySurfaceKHR");
-  LDR_PTR(vkDestroySurfaceKHR)(a_0, a_1, nullptr);
+  LDR_INSTANCE_PTR_CACHED(vkDestroySurfaceKHR, a_0)(a_0, a_1, nullptr);
 }
 
 // WSI surface creators (vkCreateXlib/Xcb/WaylandSurfaceKHR).
@@ -766,45 +758,37 @@ static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a_0, VkSurfaceKHR a_1, co
 // SurfaceEXT.  Defined unconditionally so 32-bit and 64-bit thunks both work.
 static VkResult FEXFN_IMPL(vkCreateXlibSurfaceKHR)(VkInstance a_0, const VkXlibSurfaceCreateInfoKHR* a_1,
                                                    const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateXlibSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateXlibSurfaceKHR");
-  return LDR_PTR(vkCreateXlibSurfaceKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateXlibSurfaceKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkResult FEXFN_IMPL(vkCreateXcbSurfaceKHR)(VkInstance a_0, const VkXcbSurfaceCreateInfoKHR* a_1,
                                                   const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateXcbSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateXcbSurfaceKHR");
-  return LDR_PTR(vkCreateXcbSurfaceKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateXcbSurfaceKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkResult FEXFN_IMPL(vkCreateWaylandSurfaceKHR)(VkInstance a_0, const VkWaylandSurfaceCreateInfoKHR* a_1,
                                                       const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateWaylandSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateWaylandSurfaceKHR");
-  return LDR_PTR(vkCreateWaylandSurfaceKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateWaylandSurfaceKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplate)(VkDevice a_0, const VkDescriptorUpdateTemplateCreateInfo* a_1,
                                                              const VkAllocationCallbacks* a_2, VkDescriptorUpdateTemplate* a_3) {
-  (void*&)LDR_PTR(vkCreateDescriptorUpdateTemplate) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorUpdateTemplate");
-  return LDR_PTR(vkCreateDescriptorUpdateTemplate)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateDescriptorUpdateTemplate, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplate)(VkDevice a_0, VkDescriptorUpdateTemplate a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDescriptorUpdateTemplate) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorUpdateTemplate");
-  LDR_PTR(vkDestroyDescriptorUpdateTemplate)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyDescriptorUpdateTemplate, a_0)(a_0, a_1, nullptr);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplateKHR)(VkDevice a_0, const VkDescriptorUpdateTemplateCreateInfo* a_1,
                                                                 const VkAllocationCallbacks* a_2, VkDescriptorUpdateTemplate* a_3) {
-  (void*&)LDR_PTR(vkCreateDescriptorUpdateTemplateKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateDescriptorUpdateTemplateKHR");
-  return LDR_PTR(vkCreateDescriptorUpdateTemplateKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateDescriptorUpdateTemplateKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplateKHR)(VkDevice a_0, VkDescriptorUpdateTemplate a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDescriptorUpdateTemplateKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyDescriptorUpdateTemplateKHR");
-  LDR_PTR(vkDestroyDescriptorUpdateTemplateKHR)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyDescriptorUpdateTemplateKHR, a_0)(a_0, a_1, nullptr);
 }
 
 static void FEXFN_IMPL(vkDestroyDebugUtilsMessengerEXT)(VkInstance a_0, VkDebugUtilsMessengerEXT a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyDebugUtilsMessengerEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyDebugUtilsMessengerEXT");
-  LDR_PTR(vkDestroyDebugUtilsMessengerEXT)(a_0, a_1, nullptr);
+  LDR_INSTANCE_PTR_CACHED(vkDestroyDebugUtilsMessengerEXT, a_0)(a_0, a_1, nullptr);
 }
 
 // Architecture-independent: these only drop the allocation callbacks (FEX does
@@ -819,35 +803,28 @@ static VkResult FEXFN_IMPL(vkCreateDisplayModeKHR)(VkPhysicalDevice a_0, VkDispl
 }
 static VkResult FEXFN_IMPL(vkCreateDisplayPlaneSurfaceKHR)(VkInstance a_0, const VkDisplaySurfaceCreateInfoKHR* a_1,
                                                            const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateDisplayPlaneSurfaceKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDisplayPlaneSurfaceKHR");
-  return LDR_PTR(vkCreateDisplayPlaneSurfaceKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateDisplayPlaneSurfaceKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 static VkResult FEXFN_IMPL(vkCreateHeadlessSurfaceEXT)(VkInstance a_0, const VkHeadlessSurfaceCreateInfoEXT* a_1,
                                                        const VkAllocationCallbacks* a_2, VkSurfaceKHR* a_3) {
-  (void*&)LDR_PTR(vkCreateHeadlessSurfaceEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateHeadlessSurfaceEXT");
-  return LDR_PTR(vkCreateHeadlessSurfaceEXT)(a_0, a_1, nullptr, a_3);
+  return LDR_INSTANCE_PTR_CACHED(vkCreateHeadlessSurfaceEXT, a_0)(a_0, a_1, nullptr, a_3);
 }
 static VkResult FEXFN_IMPL(vkCreatePrivateDataSlotEXT)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1,
                                                        const VkAllocationCallbacks* a_2, VkPrivateDataSlot* a_3) {
-  (void*&)LDR_PTR(vkCreatePrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlotEXT");
-  return LDR_PTR(vkCreatePrivateDataSlotEXT)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreatePrivateDataSlotEXT, a_0)(a_0, a_1, nullptr, a_3);
 }
 static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversionKHR)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
                                                               const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
-  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversionKHR");
-  return LDR_PTR(vkCreateSamplerYcbcrConversionKHR)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateSamplerYcbcrConversionKHR, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyPrivateDataSlotEXT)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPrivateDataSlotEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlotEXT");
-  LDR_PTR(vkDestroyPrivateDataSlotEXT)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyPrivateDataSlotEXT, a_0)(a_0, a_1, nullptr);
 }
 static void FEXFN_IMPL(vkDestroySamplerYcbcrConversionKHR)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversionKHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversionKHR");
-  LDR_PTR(vkDestroySamplerYcbcrConversionKHR)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroySamplerYcbcrConversionKHR, a_0)(a_0, a_1, nullptr);
 }
 static void FEXFN_IMPL(vkDestroyValidationCacheEXT)(VkDevice a_0, VkValidationCacheEXT a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyValidationCacheEXT");
-  LDR_PTR(vkDestroyValidationCacheEXT)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyValidationCacheEXT, a_0)(a_0, a_1, nullptr);
 }
 
 #ifndef IS_32BIT_THUNK
@@ -856,30 +833,25 @@ static void FEXFN_IMPL(vkDestroyValidationCacheEXT)(VkDevice a_0, VkValidationCa
 
 static VkResult FEXFN_IMPL(vkCreatePrivateDataSlot)(VkDevice a_0, const VkPrivateDataSlotCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                                     VkPrivateDataSlot* a_3) {
-  (void*&)LDR_PTR(vkCreatePrivateDataSlot) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreatePrivateDataSlot");
-  return LDR_PTR(vkCreatePrivateDataSlot)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreatePrivateDataSlot, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroyPrivateDataSlot)(VkDevice a_0, VkPrivateDataSlot a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroyPrivateDataSlot) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyPrivateDataSlot");
-  LDR_PTR(vkDestroyPrivateDataSlot)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroyPrivateDataSlot, a_0)(a_0, a_1, nullptr);
 }
 
 
 static VkResult FEXFN_IMPL(vkCreateSamplerYcbcrConversion)(VkDevice a_0, const VkSamplerYcbcrConversionCreateInfo* a_1,
                                                            const VkAllocationCallbacks* a_2, VkSamplerYcbcrConversion* a_3) {
-  (void*&)LDR_PTR(vkCreateSamplerYcbcrConversion) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSamplerYcbcrConversion");
-  return LDR_PTR(vkCreateSamplerYcbcrConversion)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateSamplerYcbcrConversion, a_0)(a_0, a_1, nullptr, a_3);
 }
 static void FEXFN_IMPL(vkDestroySamplerYcbcrConversion)(VkDevice a_0, VkSamplerYcbcrConversion a_1, const VkAllocationCallbacks* a_2) {
-  (void*&)LDR_PTR(vkDestroySamplerYcbcrConversion) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroySamplerYcbcrConversion");
-  LDR_PTR(vkDestroySamplerYcbcrConversion)(a_0, a_1, nullptr);
+  LDR_DEVICE_PTR_CACHED(vkDestroySamplerYcbcrConversion, a_0)(a_0, a_1, nullptr);
 }
 
 
 static VkResult FEXFN_IMPL(vkCreateValidationCacheEXT)(VkDevice a_0, const VkValidationCacheCreateInfoEXT* a_1,
                                                        const VkAllocationCallbacks* a_2, VkValidationCacheEXT* a_3) {
-  (void*&)LDR_PTR(vkCreateValidationCacheEXT) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateValidationCacheEXT");
-  return LDR_PTR(vkCreateValidationCacheEXT)(a_0, a_1, nullptr, a_3);
+  return LDR_DEVICE_PTR_CACHED(vkCreateValidationCacheEXT, a_0)(a_0, a_1, nullptr, a_3);
 }
 #endif
 
@@ -5142,16 +5114,14 @@ VkResult fexfn_impl_libvulkan_vkEnumerateDeviceExtensionProperties(VkPhysicalDev
 void fexfn_impl_libvulkan_vkGetImageSparseMemoryRequirements(VkDevice a_0, VkImage a_1, uint32_t* a_2,
                                                              guest_layout<VkSparseImageMemoryRequirements*> a_3) {
   PlainArrayQuery(a_2, a_3, [&](VkSparseImageMemoryRequirements* out) {
-    (void*&)LDR_PTR(vkGetImageSparseMemoryRequirements) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageSparseMemoryRequirements");
-    LDR_PTR(vkGetImageSparseMemoryRequirements)(a_0, a_1, a_2, out);
+    LDR_DEVICE_PTR_CACHED(vkGetImageSparseMemoryRequirements, a_0)(a_0, a_1, a_2, out);
   });
 }
 
 void fexfn_impl_libvulkan_vkGetImageSparseMemoryRequirements2(VkDevice a_0, const VkImageSparseMemoryRequirementsInfo2* a_1, uint32_t* a_2,
                                                               guest_layout<VkSparseImageMemoryRequirements2*> a_3) {
   RepackedArrayQuery(a_2, a_3, [&](VkSparseImageMemoryRequirements2* out) {
-    (void*&)LDR_PTR(vkGetImageSparseMemoryRequirements2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageSparseMemoryRequirements2");
-    LDR_PTR(vkGetImageSparseMemoryRequirements2)(a_0, a_1, a_2, out);
+    LDR_DEVICE_PTR_CACHED(vkGetImageSparseMemoryRequirements2, a_0)(a_0, a_1, a_2, out);
   });
 }
 
