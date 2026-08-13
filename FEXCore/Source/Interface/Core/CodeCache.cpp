@@ -1660,6 +1660,20 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, const fextl::
     return;
   }
 
+  // ApplyCodeRelocations re-emits real host instruction words in place
+  // (LoadConstantFixed), and CodeBufferRangeRef spans the validation context's
+  // live PROT_EXEC code buffer. Today nothing branches into it — this path
+  // compiles a reference copy only so the bytes can be compared — so this flush
+  // is defensive rather than load-bearing, and it is on a debug-gated
+  // (EnableCodeCacheValidation) path where its cost is irrelevant.
+  //
+  // It is here so the rule holds without exception: every in-place rewrite of
+  // host instructions in this tree publishes the range it rewrote. The
+  // exception is what the reader has to notice, and the two sibling call sites
+  // of ApplyCodeRelocations both flush. An unexplained asymmetry here is how
+  // the next person concludes the flush is optional.
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(CodeBufferRangeRef.data(), CodeBufferRangeRef.size_bytes());
+
   const size_t RefSize = CodeBufferRangeRef.size_bytes();
   const size_t CachedSize = CachedCode.size_bytes();
   const size_t CommonSize = std::min(RefSize, CachedSize);
