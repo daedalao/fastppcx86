@@ -1663,6 +1663,31 @@ public:
   // mftb RT (move from time base lower: SPR 268)
   void mftb(GPR rt) { mfspr(rt, 268); }
 
+  // darn RT, L — Deliver A Random Number. ISA 3.0 (POWER9) ONLY: emitting
+  // this on POWER8 is a SIGILL, so every call site must be gated on
+  // HostFeatures.SupportsISA30 with a 2.07 fallback arm (see
+  // PPC64EmitterBase::LoadUnalignedV128 for the canonical pattern).
+  //
+  //   L=0: 32-bit conditioned
+  //   L=1: 64-bit conditioned      (x86 RDRAND)
+  //   L=2: 64-bit unconditioned    (x86 RDSEED)
+  //
+  // On failure darn delivers all-ones (0xFFFF_FFFF_FFFF_FFFF for L=1/2,
+  // 0xFFFF_FFFF for L=0). The ISA requires software to retry; a single
+  // all-ones result is indistinguishable from a legitimate all-ones draw,
+  // which is why x86's CF=0 "not ready" convention maps onto it cleanly.
+  //
+  // L occupies BE bits 14-15, i.e. LSB bits 16-17 -- NOT the full 5-bit
+  // field the surrounding X-form instructions use there.
+  //
+  // Encoding verified against `llvm-mc -triple=powerpc64le --show-encoding`:
+  //   darn 3, 0  -> 0x7c6005e6      darn 3, 1  -> 0x7c6105e6
+  //   darn 3, 2  -> 0x7c6205e6      darn 5, 1  -> 0x7ca105e6
+  //   darn 31, 2 -> 0x7fe205e6
+  void darn(GPR rt, uint8_t l = 1) {
+    Emit32((31u << 26) | (rt.idx << 21) | ((static_cast<uint32_t>(l) & 0x3u) << 16) | (755u << 1));
+  }
+
   // =========================================================================
   // Memory barriers
   // =========================================================================

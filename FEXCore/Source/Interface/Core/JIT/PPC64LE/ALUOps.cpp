@@ -3272,11 +3272,56 @@ DEF_OP(XGetBV) {
 }
 
 // =========================================================================
-// RDRAND: POWER8 has no `darn`. Call out to PPC64_RDRAND() (defined in
-// JIT.cpp) which returns a 64-bit value in r3.
-// The IR op produces a single GPR; CF=valid is fabricated upstream.
+// RDRAND / RDSEED.
+//
+// ISA 3.0 (POWER9) arm: `darn` is a true hardware entropy source. L=1 gives
+// the 64-bit conditioned stream (x86 RDRAND), L=2 the 64-bit unconditioned
+// one (x86 RDSEED) -- the IR carries the distinction in GetReseeded, which
+// the POWER8 arm below has no way to honour. darn signals "not ready" by
+// delivering all-ones and the ISA requires software to retry, so retry once;
+// that matches x86, where RDRAND may spuriously report CF=0 but is required
+// to make forward progress.
+//
+// ISA 2.07 arm: POWER8 has no darn. Call out to PPC64_RDRAND() (defined in
+// JIT.cpp), an xorshift64* PRNG seeded from the time base, which returns a
+// 64-bit value in r3 and cannot fail. Left EXACTLY as it was -- byte-for-byte
+// identical codegen with the gate off, including the r0 = 0 re-establishment
+// the backend's indexed addressing invariant depends on.
+//
+// The IR op produces a single GPR. Validity is carried separately, in
+// RFLAG_ZF_RAW_LOC, which RDRANDOp in OpcodeDispatcher.cpp reads back as the
+// inverted CF -- neither arm writes it today; see the follow-up commit.
+//
+// NOT REACHABLE BY DEFAULT: HostFeatures.cpp never sets SupportsRAND on
+// ppc64le (only the ARM64 and x86 host branches do), so RDRANDOp emits
+// UnimplementedOp and this DEF_OP is dead -- unless a user forces the
+// feature on with the ENABLE_DISABLE_OPTION knob (FEX_ENABLERNG).
 // =========================================================================
 DEF_OP(RDRAND) {
+  if (CTX->HostFeatures.SupportsISA30) {
+    const auto Op = IROp->C<IR::IROp_RDRAND>();
+    auto Dst = GetReg(Node);
+    // L=1 conditioned (RDRAND) / L=2 unconditioned (RDSEED).
+    const uint8_t L = Op->GetReseeded ? 2u : 1u;
+
+    // darn; if it delivered all-ones ("not ready"), try once more. Either way
+    // CR0.EQ ends up set iff the value we are keeping is all-ones -- i.e. iff
+    // the draw failed. That is exactly the predicate RFLAG_ZF_RAW_LOC wants,
+    // which is why the recompare on the retry path is worth its one slot.
+    //
+    // This clobbers CR0. That is safe here for the same reason the POWER8 arm
+    // is safe: that arm makes an indirect call, which clobbers CR0 too, and
+    // x86 RDRAND/RDSEED write every arithmetic flag anyway.
+    PPC64Emitter::Label Done {};
+    darn(Dst, L);
+    cmpdi(cr(0), Dst, -1);
+    bc(CC_NE, &Done);        // not all-ones -> success, skip the retry
+    darn(Dst, L);            // retry once
+    cmpdi(cr(0), Dst, -1);   // re-establish CR0.EQ for the merged path
+    Bind(&Done);
+    return;
+  }
+
   const int kABISpill = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize);
   // Mini-frame layout (32 bytes):
   //   [r1+ 0] back chain
