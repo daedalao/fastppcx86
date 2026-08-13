@@ -1098,7 +1098,7 @@ namespace {
 
     case FEX::HLE::x64::SYSCALL_x64_futex: {
       // Same shape restriction the internal-EINTR restart uses
-      // (Passthrough.cpp WrappedFutexObserved): only the wait commands, whose
+      // (Passthrough.cpp ObservedFutexSyscall): only the wait commands, whose
       // re-issue is either exact (WAIT_BITSET carries an absolute deadline) or
       // over-waits by at most one interval (WAIT with a relative timeout).
       constexpr uint64_t FUTEX_CMD_MASK_LOCAL = ~uint64_t(128 | 256); // ~(PRIVATE_FLAG|CLOCK_REALTIME)

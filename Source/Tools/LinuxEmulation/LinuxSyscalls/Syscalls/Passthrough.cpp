@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/ThreadManager.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -432,20 +433,17 @@ static uint64_t WrappedTgkillObserved(FEXCore::Core::CpuStateFrame* Frame,
   return SyscallPassthrough3<SYSCALL_DEF(tgkill)>(Frame, tgid, tid, sig);
 }
 
-// Phase C of SyscallObserver: futex wrapper. Same shape as the tgkill
-// wrapper -- bare passthrough for the syscall, observer for side effects.
-// OnFutexReturn tracks per-thread EAGAIN streaks and signals ThenYield
-// when a livelock pattern is detected (FEX_SYSCALLOBSERVE + FEX_FUTEXMITIGATE
-// both required). When neither knob is set, OnFutexReturn short-circuits
-// on a single bool load and returns JustReturn -- essentially free.
-// True when this thread has a guest-visible signal to deliver: a deferred
-// frame (consumed by the host handler while the thread was in JIT code or a
-// syscall body, parked until the drain sentinel fires) or a newly-pending
-// unblocked signal.
+// True when this thread has a signal that will ACTUALLY reach guest code on
+// the next drain. Filtering matters in both directions this predicate is
+// used: a deferred frame whose signal is guest-masked, SIG_IGN, or
+// default-ignore (a Wine process's SIGCHLD, typically) is parked or dropped
+// at drain time, never delivered — synthesizing an EINTR for it would
+// fabricate an interruption no real kernel produces, and suppressing a
+// restart for it would leak the same. See
+// SignalDelegator::ThreadHasDeliverableGuestSignal for the filter.
 static bool HasGuestDeliverableSignal(FEXCore::Core::CpuStateFrame* Frame) {
   auto* TSO = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
-  return !TSO->SignalInfo.DeferredSignalFrames.empty() ||
-         (~TSO->SignalInfo.CurrentSignalMask.Val & TSO->SignalInfo.PendingSignals) != 0;
+  return FEX::HLE::_SyscallHandler->GetSignalDelegator()->ThreadHasDeliverableGuestSignal(TSO);
 }
 
 // Non-static: also the terminal stage of the x32 classic futex(240) handler
@@ -474,10 +472,13 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
   //     have woken it. A real kernel delivers a pending unblocked signal
   //     before or during the wait — never after an eternal sleep. Proven
   //     deterministically by notes/tools/futex_stress.c 'sig' mode (native
-  //     clean, FEX 32- and 64-bit both wedge in seconds), and the anatomy
-  //     of the steamcmd CM login wedge. So untimed waits must never block
-  //     with a deferred frame queued, and must recheck periodically because
-  //     a frame can be queued between any check and the trap.
+  //     clean, FEX 32- and 64-bit both wedge in seconds). So untimed waits
+  //     must never block with a deferred frame queued, and must recheck
+  //     periodically because a frame can be queued between any check and
+  //     the trap. The same black hole exists, UNADDRESSED, for every other
+  //     signal-wakeable untimed sleep: epoll_wait, ppoll, nanosleep, and
+  //     futex_waitv (plain passthrough below — Wine fsync waits ride it, so
+  //     any Proton config still on fsync rather than ntsync is exposed).
   //
   // Resolution, two tiers:
   //
@@ -493,11 +494,18 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
   // would hide behind an automatic restart. glibc loops on EINTR and is
   // unaffected. KNOWN-OPEN: extend guest SA_RESTART to 32-bit.
   //
-  // OPT-IN (FEX_FUTEX_RESCUE=1): additionally wait in 100ms slices,
-  // rechecking the deferred queue at every boundary (closes the residual
-  // race), and after ~5s of no progress return a spurious wake (0) so the
-  // guest rechecks its predicate — FUTEX_WAIT is documented to wake
-  // spuriously, correct waiters must tolerate it.
+  // DEFAULT-ON, FEX_FUTEX_RESCUE=0 disables (exact string "0" only):
+  // additionally wait in 100ms slices, rechecking the deferred queue at
+  // every boundary (closes the residual race), and after ~5s of no progress
+  // return a spurious wake (0) so the guest rechecks its predicate.
+  // FUTEX_WAIT is documented to wake spuriously and correct waiters
+  // tolerate it — but be honest about the converse: a waiter that treats
+  // wake-as-event without a predicate (reliable in practice on real Linux)
+  // will see the rescue as a FALSE EVENT every ~5s parked. Steady-state
+  // cost, also honest: each parked untimed waiter takes an hrtimer expiry +
+  // syscall re-issue per 100ms slice — ten kernel wakeups per second per
+  // parked thread, forever — plus the one guest-visible spurious wake per
+  // 5s. A 100-thread parked pool is ~1000 idle wakeups/s process-wide.
   //
   // WHY THIS TIER IS DEFAULT-ON (measured, 2026-08-13): with only the entry
   // check, futex_stress 'sig' mode still wedges ~half its runs — the
@@ -626,12 +634,20 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       // early, which silently ate the trace from exactly the process under
       // investigation. Benign race on first use: a double open leaks one fd
       // once per process.
+      // O_NOFOLLOW: predictable name in world-writable /tmp, refuse a
+      // planted symlink. A fork-without-exec child inherits this fd and
+      // keeps logging into the PARENT's pid-named file — separation holds
+      // only across exec.
       static int trace_fd = -1;
       if (trace_fd == -1) {
         char path[64];
         snprintf(path, sizeof(path), "/tmp/ftx.%d.log", static_cast<int>(::getpid()));
-        trace_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+        trace_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+        if (trace_fd == -1) {
+          trace_fd = -2; // failed once: never retry, never write
+        }
       }
+      if (trace_fd >= 0) {
       static thread_local pid_t tls_tid = 0;
       if (tls_tid == 0) {
         tls_tid = static_cast<pid_t>(::syscall(SYS_gettid));
@@ -654,6 +670,7 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
                        (long)now.tv_sec, now.tv_nsec / 1000000, static_cast<int>(tls_tid), (unsigned long)futex_op,
                        (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur);
       [[maybe_unused]] auto _ = write(trace_fd, buf, n);
+      }
     }
   }
 

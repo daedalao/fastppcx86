@@ -1135,6 +1135,56 @@ static bool IsAsyncSignal(const siginfo_t* Info, int Signal) {
   return true;
 }
 
+bool SignalDelegator::ThreadHasDeliverableGuestSignal(FEX::HLE::ThreadStateObject* ThreadObject) {
+  // Mirrors the drain-time filtering in HandleGuestSignal: a frame that is
+  // guest-masked gets parked in PendingSignals instead of delivered, and a
+  // SIG_IGN / default-ignore disposition gets dropped. Only what survives
+  // those filters can interrupt a sleep on a real kernel.
+  //
+  // Runs on the owning thread from the syscall path. The thread's own signal
+  // handler can append a frame concurrently, but DeferredSignalFrames never
+  // reallocates (capacity is pre-reserved, enforced at the emplace site), so
+  // indexed iteration over a snapshotted size is safe; a frame appended after
+  // the snapshot is caught by the caller's next check.
+  const uint64_t GuestMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+  const auto Deliverable = [&](int Signal) {
+    if (Signal < 1 || Signal > MAX_SIGNALS) {
+      return false;
+    }
+    if (GuestMask & (1ULL << (Signal - 1))) {
+      return false;
+    }
+    const SignalHandler& Handler = HostHandlers[Signal];
+    const auto GuestHandler = Handler.GuestAction.sigaction_handler.handler;
+    if (GuestHandler == SIG_IGN) {
+      return false;
+    }
+    if (GuestHandler == SIG_DFL && Handler.DefaultBehaviour == DEFAULT_IGNORE) {
+      return false;
+    }
+    // Real handler, or default-terminate: both reach the guest on drain.
+    return true;
+  };
+
+  const auto& Frames = ThreadObject->SignalInfo.DeferredSignalFrames;
+  const size_t Count = Frames.size();
+  for (size_t i = 0; i < Count; ++i) {
+    if (Deliverable(Frames[i].Signal)) {
+      return true;
+    }
+  }
+
+  uint64_t Pending = ThreadObject->SignalInfo.PendingSignals & ~GuestMask;
+  while (Pending) {
+    const int Signal = __builtin_ctzll(Pending) + 1;
+    Pending &= Pending - 1;
+    if (Deliverable(Signal)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t SignalDelegator::GetNewSigMask(int Signal) const {
   const SignalHandler& Handler = HostHandlers[Signal];
   // Set up a new mask based on this signals signal mask
