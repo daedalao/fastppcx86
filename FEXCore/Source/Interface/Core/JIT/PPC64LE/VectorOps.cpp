@@ -5686,88 +5686,259 @@ DEF_OP(VSha1H) {
   vand(Dst, VTMP1, VTMP2);
 }
 
-// SHA1 / SHA256 round-step ops. POWER8 has no hardware SHA-NI, so each
-// primitive routes through a software helper in JIT.cpp (PPC64_VSha*) via
-// the same FABI mini-frame used for AES/PCLMUL. The helpers implement the
-// ARMv8 SHA1*/SHA256* instructions exactly (FIPS-180-4 primitives), since
-// the IR ops mirror that semantic — the x86 SHA-NI dispatcher already
-// pre-shuffles inputs to the ARM lane layout (see Crypto.cpp).
+// SHA1 / SHA256 round-step ops. POWER8 has no SHA-NI-equivalent round
+// instructions, but everything below is now emitted inline (vshasigmaw for
+// the SHA-256 Sigmas, plain VMX rotate/select/add for the rest). The
+// EMIT_SHA_3ARG/2ARG FABI macros that used to bridge these to the PPC64_VSha*
+// software helpers are gone; the helpers remain in JIT.cpp as reference
+// implementations reachable only through their (now-unused) table slots.
+// The IR ops mirror the ARMv8 SHA1*/SHA256* semantics (FIPS-180-4), since
+// the x86 SHA-NI dispatcher pre-shuffles inputs to the ARM lane layout
+// (see Crypto.cpp).
 
-// 3-VR-arg SHA round-step emitter: A/B/C → slots, helper(dst=A, A, B, C).
-// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
-#define EMIT_SHA_3ARG(HelperIdx, Src1Reg, Src2Reg, Src3Reg, DstReg)           \
-  do {                                                                       \
-    const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
-    const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
-    stdu(r1, -CryptoMiniFrameSize, r1);                                      \
-    mflr(r(0)); std(r(0), 16, r1);                                            \
-    LoadConstant(TMP1, CryptoSlotA); stvx((Src1Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotC); stvx((Src3Reg), r1, TMP1);              \
-    SpillForABICall(TMP1);                                                   \
-    addi(r3, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r4, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    addi(r6, r1, PostSpill(CryptoSlotC));                                    \
-    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
-    std(r2, PostSpill(24), r1);                                              \
-    mtctr(r(12)); bctrl();                                                   \
-    ld(r2, PostSpill(24), r1);                                               \
-    FillForABICall();                                                        \
-    LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
-    ld(r(0), 16, r1); mtlr(r(0));                                             \
-    addi(r1, r1, CryptoMiniFrameSize);                                       \
-    li(r(0), 0);                                                             \
-  } while (0)
+// ===========================================================================
+// SHA-1 four-round step (VSha1C/M/P), fully inline. Ground truth is the
+// retired helper's Sha1Hash (JIT.cpp): VA=[A,B,C,D] guest lanes 0-3, E scalar
+// in Src2 lane 0, WK=[W+K 0..3]. Per round:
+//   T = ROL(A,5) + f(B,C,D) + E + WK[i]
+//   E=D; D=C; C=ROL(B,30); B=A; A=T
+// f per flavor, on the lane rotations A1=[B,C,D,A], A2=[C,D,A,B], A3=[D,A,B,C]
+// (lane 0 = B / C / D respectively):
+//   Choose  (B&C)|(~B&D)      = vsel(A3, A2, A1)
+//   Majority (two-of-three)   = (C^D) ? B : C = vsel(A2, A1, vxor(A2,A3))
+//   Parity                    = A1 ^ A2 ^ A3
+// The state update is the neat part: [T,A,B,C] via vsel(A3, T, LANE0_MASK),
+// then ONE vrlw against the per-lane rotate vector {0,0,30,0} applies the
+// ROL(B,30) to lane 2 alone. The next round's E is old D = A3 lane 0, free.
+// Same two-dyn-VR borrow protocol as EmitSha256Rounds4.
+void PPC64JITCore::EmitSha1Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR E,
+                                   PPC64Emitter::VR WK, Sha1Fn Fn) {
+  using namespace PPC64Emitter;
+  constexpr auto S_VA  = VSXR{2};
+  constexpr auto S_E   = VSXR{3};
+  constexpr auto S_WK  = VSXR{4};
+  constexpr auto S_M0  = VSXR{5};
+  constexpr auto S_SHV = VSXR{6};
+  constexpr auto S_A3  = VSXR{7};
+  constexpr auto S_B1  = VSXR{8};
+  constexpr auto S_B2  = VSXR{9};
 
-// 2-VR-arg SHA emitter: A/B → slots, helper(dst=A, A, B).
-// HelperIdx: PPC64_HELPER_* enumerator naming the target helper.
-#define EMIT_SHA_2ARG(HelperIdx, Src1Reg, Src2Reg, DstReg)                    \
-  do {                                                                       \
-    const int CryptoSpillSaveSize = CTX->Config.Is64BitMode() ? static_cast<int>(x64::kDynRegSaveSize) : static_cast<int>(x32::kDynRegSaveSize); \
-    const auto PostSpill = [&](int Off) { return Off + CryptoSpillSaveSize; }; \
-    stdu(r1, -CryptoMiniFrameSize, r1);                                      \
-    mflr(r(0)); std(r(0), 16, r1);                                            \
-    LoadConstant(TMP1, CryptoSlotA); stvx((Src1Reg), r1, TMP1);              \
-    LoadConstant(TMP1, CryptoSlotB); stvx((Src2Reg), r1, TMP1);              \
-    SpillForABICall(TMP1);                                                   \
-    addi(r3, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r4, r1, PostSpill(CryptoSlotA));                                    \
-    addi(r5, r1, PostSpill(CryptoSlotB));                                    \
-    EmitLoadPPC64Helper(r(12), (HelperIdx));                                 \
-    std(r2, PostSpill(24), r1);                                              \
-    mtctr(r(12)); bctrl();                                                   \
-    ld(r2, PostSpill(24), r1);                                               \
-    FillForABICall();                                                        \
-    LoadConstant(TMP1, CryptoSlotA); lvx((DstReg), r1, TMP1);                \
-    ld(r(0), 16, r1); mtlr(r(0));                                             \
-    addi(r1, r1, CryptoMiniFrameSize);                                       \
-    li(r(0), 0);                                                             \
-  } while (0)
+  VR Borrow[2] = {VR{0}, VR{0}};
+  for (uint32_t idx = 16, found = 0; idx <= 29 && found < 2; ++idx) {
+    if (idx == Dst.idx || idx == ABCD.idx || idx == E.idx || idx == WK.idx) continue;
+    Borrow[found++] = VR{idx};
+  }
+  const VR B1 = Borrow[0], B2 = Borrow[1];
+
+  xxlor(S_B1, AsVSX(B1), AsVSX(B1));
+  xxlor(S_B2, AsVSX(B2), AsVSX(B2));
+  EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  xxlor(S_M0, AsVSX(VTMP1), AsVSX(VTMP1));
+  // Per-lane rotate vector {0,0,30,0}: splat 30, mask to lane 2 (the lane0
+  // mask rotated by two guest lanes).
+  vspltisw(VTMP2, 15);
+  vadduwm(VTMP2, VTMP2, VTMP2);
+  vsldoi(VTMP1, VTMP1, VTMP1, 8);      // lane0 mask -> lane2 mask
+  vand(VTMP1, VTMP2, VTMP1);
+  xxlor(S_SHV, AsVSX(VTMP1), AsVSX(VTMP1));
+  xxlor(S_VA, AsVSX(ABCD), AsVSX(ABCD));
+  xxlor(S_E, AsVSX(E), AsVSX(E));
+  xxlor(S_WK, AsVSX(WK), AsVSX(WK));
+
+  for (int i = 0; i < 4; ++i) {
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);     // VA = [A,B,C,D]
+    vsldoi(B1, VTMP2, VTMP2, 12);        // A1 = [B,C,D,A]
+    vsldoi(B2, VTMP2, VTMP2, 8);         // A2 = [C,D,A,B]
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);      // A3 = [D,A,B,C]
+    xxlor(S_A3, AsVSX(VTMP1), AsVSX(VTMP1));
+    switch (Fn) {
+    case Sha1Fn::Choose:
+      vsel(B1, VTMP1, B2, B1);           // B ? C : D
+      break;
+    case Sha1Fn::Majority:
+      vxor(VTMP2, B2, VTMP1);            // C^D  (VA dead past here)
+      vsel(B1, B2, B1, VTMP2);           // (C^D) ? B : C
+      break;
+    case Sha1Fn::Parity:
+      vxor(B1, B1, B2);
+      vxor(B1, B1, VTMP1);
+      break;
+    }
+    // T = f + ROL(A,5) + E + WK[i], accumulated in B1 (lane 0).
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);
+    vspltisw(B2, 5);
+    vrlw(VTMP2, VTMP2, B2);              // ROL(A,5) in lane 0
+    vadduwm(B1, B1, VTMP2);
+    xxlor(AsVSX(VTMP2), S_E, S_E);
+    vadduwm(B1, B1, VTMP2);
+    xxlor(AsVSX(VTMP2), S_WK, S_WK);
+    if (i) vsldoi(VTMP2, VTMP2, VTMP2, 4 * (4 - i));  // WK[i] -> lane 0
+    vadduwm(B1, B1, VTMP2);              // T
+
+    // E' = old D (A3 lane 0); VA' = vrlw(vsel(A3, T, mask0), {0,0,30,0}).
+    xxlor(S_E, S_A3, S_A3);
+    xxlor(AsVSX(VTMP1), S_A3, S_A3);     // [D,A,B,C]
+    xxlor(AsVSX(VTMP2), S_M0, S_M0);
+    vsel(VTMP1, VTMP1, B1, VTMP2);       // [T,A,B,C]
+    xxlor(AsVSX(VTMP2), S_SHV, S_SHV);
+    vrlw(VTMP1, VTMP1, VTMP2);           // [T,A,ROL(B,30),C]
+    xxlor(S_VA, AsVSX(VTMP1), AsVSX(VTMP1));
+  }
+
+  xxlor(AsVSX(VTMP1), S_VA, S_VA);
+  xxlor(AsVSX(B1), S_B1, S_B1);
+  xxlor(AsVSX(B2), S_B2, S_B2);
+  vmr(Dst, VTMP1);
+}
 
 DEF_OP(VSha1C) {
   const auto Op = IROp->C<IR::IROp_VSha1C>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1C, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Choose);
 }
 DEF_OP(VSha1M) {
   const auto Op = IROp->C<IR::IROp_VSha1M>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1M, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Majority);
 }
 DEF_OP(VSha1P) {
   const auto Op = IROp->C<IR::IROp_VSha1P>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha1P, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha1Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), Sha1Fn::Parity);
 }
+
+// SHA1SU1(Vd, Vn): T[k] = Vd[k] ^ Vn[k+1] (Vn term zero for k=3), then
+// r[k] = ROL(T[k],1) with the lane-3 recurrence r[3] = ROL(T[3]^r[0], 1).
+// Rotate distributes over XOR, so the recurrence folds to one correction:
+// r = ROL(T,1);  r[3] ^= ROL(T[0], 2). Dst is usable as scratch once both
+// sources are consumed.
 DEF_OP(VSha1SU1) {
   const auto Op = IROp->C<IR::IROp_VSha1SU1>();
-  EMIT_SHA_2ARG(PPC64_HELPER_VSha1SU1, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Node));
+  const auto Dst = GetVReg(Node);
+  const auto Vd  = GetVReg(Op->Src1);
+  const auto Vn  = GetVReg(Op->Src2);
+
+  vxor(VTMP1, VTMP1, VTMP1);
+  vsldoi(VTMP1, VTMP1, Vn, 12);        // [Vn1,Vn2,Vn3,0] (guest lanes)
+  vxor(VTMP1, Vd, VTMP1);              // T
+  vspltisw(VTMP2, 1);
+  vrlw(VTMP2, VTMP1, VTMP2);           // ROL(T,1) — both sources now dead
+  vspltisw(Dst, 2);
+  vrlw(VTMP1, VTMP1, Dst);             // ROL(T,2)
+  vxor(Dst, Dst, Dst);
+  vsldoi(VTMP1, VTMP1, Dst, 12);       // [0,0,0,ROL(T0,2)] at guest lane 3
+  vxor(Dst, VTMP2, VTMP1);
 }
+// ===========================================================================
+// SHA256RNDS2 (VSha256H / VSha256H2), fully inline via POWER8 vshasigmaw ST=1.
+//
+// Ground truth is the retired FABI helper's Sha256Round4 (JIT.cpp): four
+// FIPS-180 rounds over VA=[A,B,C,D], VE=[E,F,G,H] (guest lane 0 = A / E),
+// WK=[W+K 0..3]. Per round:
+//   T1 = H + BigSigma1(E) + Ch(E,F,G) + WK[i]
+//   T2 = BigSigma0(A) + Maj(A,B,C)
+//   VE' = [D+T1, E, F, G]     VA' = [T1+T2, A, B, C]
+// Everything vectorizes with lane 0 carrying the live value (other lanes
+// compute garbage that the final vsel discards):
+//   BigSigma:  vshasigmaw ST=1 (SIX=0xF -> Sigma1, SIX=0 -> Sigma0), lane-wise.
+//   Ch(E,F,G): vsel(V2, V1, VE) with V1/V2 the lane rotations of VE.
+//   Maj(A,B,C) = (B^C) ? A : B = vsel(A1, VA, vxor(A1,A2)).
+//   State insert: vsel(rotated_state, new_value, LANE0_MASK).
+// LANE ORDER NOTE: guest lane k sits at BE word (3-k), so a guest
+// "lane k <- lane k+1" rotation is vsldoi by 12, k+2 by 8, k+3 by 4 —
+// mirrored from the BE-intuitive values. Derived and checked by hand; the
+// GuestCrypto sha_test full-message vectors are the enforcement.
+//
+// REGISTER BUDGET: the backend owns only VTMP1/VTMP2 in VMX, and every VMX op
+// here (vsel/vsldoi/vshasigmaw/vadduwm) physically cannot address the VSX low
+// bank. So the emitter BORROWS two dynamic VRs (never Dst or a source): their
+// values are parked in the RA-free low VSX bank via xxlor and restored at the
+// end. This is call-free, memory-free (registers only), and async signals
+// restore the full file via sigreturn, so the borrow window is sound — the
+// same trust model as VTMP3_VSX's "not live across a host call" rule.
+// Round state parks in vs2-vs8; all op-local, per the vs14-vs31 hazard note
+// (nothing here survives, or needs to survive, a host call).
+void PPC64JITCore::EmitSha256Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR EFGH,
+                                     PPC64Emitter::VR WK, bool ReturnABCD) {
+  using namespace PPC64Emitter;
+  constexpr auto S_VA   = VSXR{2};
+  constexpr auto S_VE   = VSXR{3};
+  constexpr auto S_WK   = VSXR{4};
+  constexpr auto S_MASK = VSXR{5};
+  constexpr auto S_HV   = VSXR{6};
+  constexpr auto S_B1   = VSXR{7};
+  constexpr auto S_B2   = VSXR{8};
+
+  // Borrow two dynamic-pool VRs distinct from Dst and every source. v16-v29
+  // are RA-owned in both guest modes; saving/restoring makes any choice safe.
+  VR Borrow[2] = {VR{0}, VR{0}};
+  for (uint32_t idx = 16, found = 0; idx <= 29 && found < 2; ++idx) {
+    if (idx == Dst.idx || idx == ABCD.idx || idx == EFGH.idx || idx == WK.idx) continue;
+    Borrow[found++] = VR{idx};
+  }
+  const VR B1 = Borrow[0], B2 = Borrow[1];
+
+  xxlor(S_B1, AsVSX(B1), AsVSX(B1));
+  xxlor(S_B2, AsVSX(B2), AsVSX(B2));
+  EmitLoadPPC64VConst(VTMP1, PPC64_VCONST_LANE0_MASK_F32, TMP1, TMP2);
+  xxlor(S_MASK, AsVSX(VTMP1), AsVSX(VTMP1));
+  xxlor(S_VA, AsVSX(ABCD), AsVSX(ABCD));
+  xxlor(S_VE, AsVSX(EFGH), AsVSX(EFGH));
+  xxlor(S_WK, AsVSX(WK), AsVSX(WK));
+
+  for (int i = 0; i < 4; ++i) {
+    // T1 = H + BigSigma1(E) + Ch(E,F,G) + WK[i], accumulated in B2 (lane 0).
+    xxlor(AsVSX(VTMP2), S_VE, S_VE);      // VE = [E,F,G,H]
+    vsldoi(B1, VTMP2, VTMP2, 12);         // V1 = [F,G,H,E]
+    vsldoi(B2, VTMP2, VTMP2, 8);          // V2 = [G,H,E,F]
+    vsel(B2, B2, B1, VTMP2);              // Ch: E ? F : G
+    vshasigmaw(B1, VTMP2, 1, 0xF);        // BigSigma1 per lane
+    vadduwm(B2, B2, B1);
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);       // Hv = [H,E,F,G]
+    xxlor(S_HV, AsVSX(VTMP1), AsVSX(VTMP1));
+    vadduwm(B2, B2, VTMP1);               // + H
+    xxlor(AsVSX(VTMP1), S_WK, S_WK);
+    if (i) vsldoi(VTMP1, VTMP1, VTMP1, 4 * (4 - i));  // WK[i] -> lane 0
+    vadduwm(B2, B2, VTMP1);               // T1
+
+    // T2 = BigSigma0(A) + Maj(A,B,C); then the two new lane-0 words.
+    xxlor(AsVSX(VTMP2), S_VA, S_VA);      // VA = [A,B,C,D]
+    vsldoi(B1, VTMP2, VTMP2, 12);         // A1 = [B,C,D,A]
+    vsldoi(VTMP1, VTMP2, VTMP2, 8);       // A2 = [C,D,A,B]
+    vxor(VTMP1, B1, VTMP1);               // t = B^C (lane 0)
+    vsel(B1, B1, VTMP2, VTMP1);           // Maj: t ? A : B
+    vshasigmaw(VTMP1, VTMP2, 1, 0);       // BigSigma0 per lane
+    vadduwm(B1, B1, VTMP1);               // T2
+    vadduwm(B1, B1, B2);                  // newA = T1 + T2
+    vsldoi(VTMP1, VTMP2, VTMP2, 4);       // Dv = [D,A,B,C]
+    vadduwm(B2, B2, VTMP1);               // newE = T1 + D
+
+    // Rotate the new words in through lane 0.
+    xxlor(AsVSX(VTMP2), S_MASK, S_MASK);
+    vsel(B1, VTMP1, B1, VTMP2);           // VA' = [newA, A, B, C]
+    xxlor(S_VA, AsVSX(B1), AsVSX(B1));
+    xxlor(AsVSX(VTMP1), S_HV, S_HV);
+    vsel(B2, VTMP1, B2, VTMP2);           // VE' = [newE, E, F, G]
+    xxlor(S_VE, AsVSX(B2), AsVSX(B2));
+  }
+
+  if (ReturnABCD) {
+    xxlor(AsVSX(VTMP1), S_VA, S_VA);
+  } else {
+    xxlor(AsVSX(VTMP1), S_VE, S_VE);
+  }
+  xxlor(AsVSX(B1), S_B1, S_B1);           // restore borrows
+  xxlor(AsVSX(B2), S_B2, S_B2);
+  vmr(Dst, VTMP1);
+}
+
+// SHA256H(Vd=ABCD tied, Vn=EFGH, Vm=W+K) -> post-step ABCD.
 DEF_OP(VSha256H) {
   const auto Op = IROp->C<IR::IROp_VSha256H>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha256Rounds4(GetVReg(Node), GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), true);
 }
+// SHA256H2(Vd=EFGH tied, Vn=ABCD, Vm=W+K) -> post-step EFGH. Note the ARM
+// operand order: Src1 is the EFGH-tied register, Src2 is ABCD.
 DEF_OP(VSha256H2) {
   const auto Op = IROp->C<IR::IROp_VSha256H2>();
-  EMIT_SHA_3ARG(PPC64_HELPER_VSha256H2, GetVReg(Op->Src1), GetVReg(Op->Src2), GetVReg(Op->Src3), GetVReg(Node));
+  EmitSha256Rounds4(GetVReg(Node), GetVReg(Op->Src2), GetVReg(Op->Src1), GetVReg(Op->Src3), false);
 }
 // VSha256U0(Vd, Vn): SHA-256 message schedule sigma0 helper (x86 SHA256MSG1).
 //   IR_result[i] = sigma0(T[i]),  T = [Vd[1], Vd[2], Vd[3], Vn[0]], then + Vd
@@ -5834,8 +6005,6 @@ DEF_OP(VSha256U1) {
   xxpermdi(Dst, VTMP1, VTMP2, 0b01);
 }
 
-#undef EMIT_SHA_3ARG
-#undef EMIT_SHA_2ARG
 
 DEF_OP(PCLMUL) {
   const auto Op   = IROp->C<IR::IROp_PCLMUL>();

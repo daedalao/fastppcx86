@@ -785,6 +785,20 @@ private:
   bool AESMaskCached = false;
   void InvalidateAESCache() { AESMaskCached = false; }
 
+  // Shared SHA-256 four-round emitter for VSha256H (returns ABCD half) and
+  // VSha256H2 (returns EFGH half). Fully inline: vshasigmaw ST=1 for both
+  // big-Sigma functions, vsel-form Ch/Maj, vsldoi lane rotations. Borrows two
+  // dynamic VRs (excluded from Dst/sources) for compute space; see the
+  // borrow-protocol comment at the definition (VectorOps.cpp).
+  void EmitSha256Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR EFGH,
+                         PPC64Emitter::VR WK, bool ReturnABCD);
+
+  // Shared SHA-1 four-round emitter for VSha1C/M/P (Choose/Majority/Parity).
+  // Same structure and borrow protocol as EmitSha256Rounds4.
+  enum class Sha1Fn { Choose, Majority, Parity };
+  void EmitSha1Rounds4(PPC64Emitter::VR Dst, PPC64Emitter::VR ABCD, PPC64Emitter::VR E,
+                       PPC64Emitter::VR WK, Sha1Fn Fn);
+
   // -----------------------------------------------------------------------
   // Op handler declarations (filled in by the separate *.cpp files)
   // -----------------------------------------------------------------------
