@@ -1174,7 +1174,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   auto SpillForFABICall = [&]() {
     this->SpillForABICall(TMP1);
     if (PartialFill) {
-      ArmInSyscallSentinel();
+      ArmInSyscallSentinel(kInFABISentinel);
     }
   };
 

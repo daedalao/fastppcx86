@@ -799,11 +799,11 @@ void PPC64EmitterBase::FillForABICall(bool FPRs) {
   li(GPRegs::r0, 0);
 }
 
-void PPC64EmitterBase::ArmInSyscallSentinel() {
+void PPC64EmitterBase::ArmInSyscallSentinel(uint64_t Sentinel) {
   // Contract in PPC64Emitter.h (kInSyscallSentinel + the declaration): emit
   // only after the crossing's SpillForABICall, pair with
   // FillForABICallChecked. 0x100FFFF fits LoadImm32's lis+ori.
-  LoadConstant(TMP1, kInSyscallSentinel);
+  LoadConstant(TMP1, Sentinel);
   const int32_t isi_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
   std(TMP1, static_cast<int16_t>(isi_off), STATE);

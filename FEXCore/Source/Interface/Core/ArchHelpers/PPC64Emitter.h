@@ -373,6 +373,16 @@ static constexpr uint32_t CALLER_FPR_MASK = 0x000FFFFFu;  // bits 0..19
 //                 copies of SRA r14+ are stale and a full refill is required.
 static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
 
+// FABI-crossing variant: bit 25 instead of bit 24, identical low mask and
+// identical uint16 death-by-truncation. The distinct bit lets the signal
+// delegator DEFER async signals landing mid-FABI-crossing (F80 softfloat
+// helpers never block, so deferral always drains) without deferring
+// syscall crossings, where a thread may be parked in a blocking host
+// syscall that needs immediate delivery. Bits 16..23 stay zero for the
+// GdbServer raw-mask reason documented above; bit 25 is equally inert
+// there (> r23).
+static constexpr uint64_t kInFABISentinel = 0x0200'FFFFull;
+
 // -------------------------------------------------------------------------
 // PPC64Emitter: shared utility class for JIT + Dispatcher
 // -------------------------------------------------------------------------
@@ -482,7 +492,7 @@ public:
   // elidable). 64-bit guests only: the 32-bit lwz zero-extension invariant
   // forbids partial GPR fills (asserted in FillStaticRegs). Clobbers TMP1 and
   // CR0 before the NZCV restore rebuilds CR0 from the frame.
-  void ArmInSyscallSentinel();
+  void ArmInSyscallSentinel(uint64_t Sentinel = kInSyscallSentinel);
   void FillForABICallChecked();
 
   // Ensure code is aligned to 16-byte boundary (fill with nops).
