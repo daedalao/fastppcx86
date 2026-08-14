@@ -724,9 +724,14 @@ DEF_OP(Syscall) {
   // Saved into this op's OWN mini-frame rather than via PushDynamicRegs:
   // that helper would pay a second stdu and a second 96-byte linkage
   // reservation on top of the one already reserved here, and would save the
-  // non-volatile half of the pool for nothing. The loop is driven off
-  // RAFPRVolatile so there is still exactly one list; the static_asserts in
-  // ArchHelpers/PPC64Emitter.h are what keep that list in step with RAFPR.
+  // non-volatile half of the pool for nothing. The save/restore pair is the
+  // FABI-callsite helper (SaveDynVRsToFrame/RestoreDynVRsFromFrame), which
+  // honours DynVRSpillMask — CompileCode sets it to this op's RA live-in ∪
+  // dest before dispatch, so only vector SSA values actually live across the
+  // bctrl are stored (most syscalls touch none). The save area stays sized
+  // for the full volatile set; the helper packs saved regs densely from
+  // kFPRSaveOff and both loops iterate the same unchanged mask, so they
+  // cannot fall out of lockstep.
   //
   // The dynamic GPR pool needs no equivalent: RA is r24-r26/r30-r31 (x64) and
   // r16-r26/r30-r31 (x32), all ELFv2 callee-saved. Asserted in the header.
@@ -745,12 +750,11 @@ DEF_OP(Syscall) {
 
   stdu(r1, static_cast<int16_t>(-FrameSize), r1);
 
-  // Save the volatile dynamic FPRs. r1 is 16-byte aligned per ELFv2 and every
-  // offset is a multiple of 16, so stvx's address masking is a no-op.
-  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
-    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
-    stvx(RAFPRVolatile[i], r1, TMP1);
-  }
+  // Save the live volatile dynamic FPRs (DynVRSpillMask-selected; clobbers
+  // TMP3, which nothing here holds live yet). r1 is 16-byte aligned per ELFv2
+  // and every offset is a multiple of 16, so stvx's address masking is a
+  // no-op.
+  SaveDynVRsToFrame(kFPRSaveOff);
 
   // Fill SyscallArguments from the IR op's source nodes.
   // After SpillStaticRegs the physical SRA registers still hold the live values.
@@ -805,12 +809,10 @@ DEF_OP(Syscall) {
   // everything that follows.
   mr(GetReg(Node), r3);
 
-  // Restore the volatile dynamic FPRs. Deliberately after both consumers of
-  // r3 above, because the loop uses TMP1 (= r3) to form the index.
-  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
-    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
-    lvx(RAFPRVolatile[i], r1, TMP1);
-  }
+  // Restore the saved dynamic FPRs under the same (unchanged) DynVRSpillMask.
+  // Clobbers TMP3 (= r5, dead since the bctrl); kept after both consumers of
+  // r3 above anyway so the ordering stays obviously safe.
+  RestoreDynVRsFromFrame(kFPRSaveOff);
 
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
   addi(r1, r1, FrameSize);
