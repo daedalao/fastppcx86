@@ -4105,6 +4105,17 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
 
+    // `xor edx,edx; div r/m` — the ubiquitous idiom (libstdc++ hashtable
+    // modulo among others). When the register cache forwards RDX's zero here,
+    // drop Upper so backends emit a plain divide instead of the long-division
+    // sequence. The post-RA merge catches the strictly-adjacent case only;
+    // this catches it at SSA level regardless of scheduling. IsValueConstant
+    // is PatchSite-safe (SMC-patchable constants report non-constant).
+    uint64_t UpperConst;
+    if (IsValueConstant(WrapNode(Src2), &UpperConst) && UpperConst == 0) {
+      Src2 = Invalid();
+    }
+
     _UDiv(Size, Src1, Src2, Divisor, Quotient, Remainder);
 
     if (Size == OpSize::i32Bit) {
@@ -4147,6 +4158,20 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
   } else {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
+
+    // `cqo/cdq; idiv` — Upper is the sign-extension of Lower, so this is a
+    // plain signed divide. Mirror of the RA post-merge IsSignext check, done
+    // at SSA level where the cqo's Sbfe is directly visible regardless of
+    // instruction scheduling between the cqo and the idiv.
+    {
+      auto Hdr = GetOpHeader(WrapNode(Src2));
+      if (Hdr->Op == OP_SBFE) {
+        auto Sbfe = Hdr->C<IR::IROp_Sbfe>();
+        if (Sbfe->Width == 1 && Sbfe->lsb == (IR::OpSizeAsBits(Size) - 1) && Sbfe->Src == WrapNode(Src1)) {
+          Src2 = Invalid();
+        }
+      }
+    }
 
     _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
 
