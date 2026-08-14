@@ -356,6 +356,8 @@ uint64_t ComputeCodeCacheConfigId() {
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr));
+      const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
+      Hasher.Add(static_cast<uint64_t>(SpinEnv && SpinEnv[0] == '1'));
     }
 
     // The scope option itself, because it decides whether the process runs as a

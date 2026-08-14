@@ -526,6 +526,16 @@ DEF_OP(CondJump) {
     cmpldi(cr(7), TMP1, 0);             // cr7 = (TMP1 == 0)
     // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
     CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
+  } else if (IsSpinCollapseBranch(Node)) {
+    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): this is the
+    // spin backedge `old != 1` of a matched counted-decrement pair whose Sub
+    // now retires K budget per iteration. Exit exactly when the batched
+    // decrement lands on 0, i.e. keep spinning iff old >u K. Unsigned
+    // compare: the budget is a canonicalized zero-extended value. cr7, no Rc.
+    cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+    // BO=12 (branch if set), BI=29 (cr7.GT): TrueBlock (the backedge) taken
+    // while old >u K.
+    CC = {12, 29};
   } else {
     // Route the compare through cr(7) so we don't disturb CR0 / XER.
     // CR0 carries packed-NZCV N/Z bits filled by FillStaticRegs at block

@@ -146,6 +146,22 @@ DEF_OP(Add) {
 DEF_OP(Sub) {
   auto Op  = IROp->C<IR::IROp_Sub>();
   auto Dst = GetReg(Node);
+
+  // FEX_SPINCOLLAPSE batched budget decrement (contract at kSpinCollapseK,
+  // JITClass.h; matcher in AnalyzeSpinLoops). new = (old >u K) ? old-K : 0 —
+  // exact 0 on the budget-exhausted exit, K-granular descent otherwise.
+  // cmpldi targets cr7 (CR0 = packed NZCV) and nothing here touches XER.
+  if (IsSpinCollapseSub(Node)) {
+    auto S1 = GetReg(Op->Src1);
+    cmpldi(cr(7), S1, kSpinCollapseK);
+    addi(TMP1, S1, -static_cast<int16_t>(kSpinCollapseK));
+    li(TMP2, 0);
+    // cr7.GT = CR bit 29: old >u K selects old-K, else 0.
+    isel(Dst, TMP1, TMP2, 29);
+    if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
+    return;
+  }
+
   uint64_t C1, C2;
   bool S1Inline = IsInlineConstant(Op->Src1, &C1);
   bool S2Inline = IsInlineConstant(Op->Src2, &C2);

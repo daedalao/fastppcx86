@@ -2466,6 +2466,14 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // other feature combination, so only the explicit kill switch gates it.
   SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
 
+  // FEX_SPINCOLLAPSE=1: batched budget decrement for counted spin loops
+  // (opt-in while the per-app exposure is gathered; see the contract at
+  // kSpinCollapseK in JITClass.h). Hashed into the code-cache config id.
+  {
+    const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
+    SpinCollapseEnabled = SpinEnv && SpinEnv[0] == '1';
+  }
+
   // SMC interlocks: two fork features are only sound when every constant-target
   // exit re-probes the lookup path, which is exactly what a established direct
   // link bypasses.
@@ -3494,7 +3502,14 @@ void PPC64JITCore::AnalyzeSpinLoops() {
     uint32_t OpCount = 0;
     bool Clean = false;
     bool HasPollLoad = false;
+    IR::Ref Node = nullptr;  // for the SpinCollapse pattern re-walk
   };
+
+  // SpinCollapse marks are per-compile; reset before any region matching so
+  // a block that stops qualifying can never inherit a stale mark. Bounds
+  // checks in the accessors cover compiles where this function never runs.
+  SpinCollapseSubs.assign(IR->GetSSACount(), false);
+  SpinCollapseBranches.assign(IR->GetSSACount(), false);
 
   fextl::vector<BlockInfo> Blocks;
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
@@ -3508,6 +3523,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
     BlockInfo Info {};
     Info.ID = BlockIROp->ID;
     Info.Clean = true;
+    Info.Node = BlockNode;
 
     // The block's branch terminator. NOTE: it is not the final op in the
     // code list -- every block carries a trailing EndBlock marker after the
@@ -3606,17 +3622,98 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
         continue;
       }
-      PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      if (SpinLoopHintEnabled) {
+        PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      }
+
+      // FEX_SPINCOLLAPSE: within a validated spin region, match the fused
+      // counted-decrement shape in the backedge block and mark its Sub +
+      // CondJump for batched emission (contract at kSpinCollapseK,
+      // JITClass.h). Post-RA, consumer args are immediate-encoded
+      // PhysicalRegisters — all value linkage is matched by register, the
+      // mask-elision lesson.
+      if (SpinCollapseEnabled) {
+        IR::Ref SubNode = nullptr;
+        const IR::IROp_Header* SubHdr = nullptr;
+        IR::PhysicalRegister SubSrcPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister SubDstPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister CopySrcPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister CopyDstPR = IR::PhysicalRegister::Invalid();
+        IR::Ref BranchNode = nullptr;
+        const IR::IROp_Header* BranchHdr = nullptr;
+        uint32_t SubCount = 0;
+        bool StoreOfSubSeen = false;
+
+        const auto ArgPR = [this](IR::OrderedNodeWrapper Arg) {
+          return Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IR->GetNode(Arg));
+        };
+
+        for (auto [CodeNode, IROp] : IR->GetCode(Blocks[bi].Node)) {
+          switch (IROp->Op) {
+          case IR::OP_SUB: {
+            ++SubCount;
+            auto SOp = IROp->C<IR::IROp_Sub>();
+            uint64_t C = 0;
+            if ((IROp->Size == IR::OpSize::i32Bit || IROp->Size == IR::OpSize::i64Bit) && IsInlineConstant(SOp->Src2, &C) && C == 1) {
+              SubNode = CodeNode;
+              SubHdr = IROp;
+              SubSrcPR = ArgPR(SOp->Src1);
+              SubDstPR = IR::PhysicalRegister(CodeNode);
+            }
+            break;
+          }
+          case IR::OP_COPY: {
+            auto COp = IROp->C<IR::IROp_Copy>();
+            CopySrcPR = ArgPR(COp->Source);
+            CopyDstPR = IR::PhysicalRegister(CodeNode);
+            break;
+          }
+          case IR::OP_STOREREGISTER: {
+            auto ROp = IROp->C<IR::IROp_StoreRegister>();
+            if (SubNode && ArgPR(ROp->Value).Raw == SubDstPR.Raw) {
+              StoreOfSubSeen = true;
+            }
+            break;
+          }
+          case IR::OP_CONDJUMP: {
+            BranchNode = CodeNode;
+            BranchHdr = IROp;
+            break;
+          }
+          default: break;
+          }
+        }
+
+        if (SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
+          auto JOp = BranchHdr->C<IR::IROp_CondJump>();
+          uint64_t JC = 0;
+          const bool ShapeOK = JOp->VCmpElementSize == IR::OpSize::iInvalid && !JOp->FromNZCV &&
+                               JOp->Cond == IR::CondClass::NEQ && IsInlineConstant(JOp->Cmp2, &JC) && JC == 1 &&
+                               JOp->CompareSize == SubHdr->Size &&
+                               IR->GetOp<IR::IROp_CodeBlock>(JOp->TrueBlock)->ID == TargetID;
+          if (ShapeOK) {
+            const auto Cmp1PR = ArgPR(JOp->Cmp1);
+            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
+                                (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
+            if (Linked) {
+              SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
+              SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
+            }
+          }
+        }
+      }
       // Every edge from a region block to a block outside [ti, bi] restores
       // medium priority.
-      for (uint32_t ri = ti; ri <= bi; ++ri) {
-        for (const uint32_t T : Blocks[ri].Targets) {
-          if (T == UINT32_MAX || T >= NumBlocks) {
-            continue;
-          }
-          const uint32_t tidx = IdxOfID[T];
-          if (tidx < ti || tidx > bi) {
-            PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+      if (SpinLoopHintEnabled) {
+        for (uint32_t ri = ti; ri <= bi; ++ri) {
+          for (const uint32_t T : Blocks[ri].Targets) {
+            if (T == UINT32_MAX || T >= NumBlocks) {
+              continue;
+            }
+            const uint32_t tidx = IdxOfID[T];
+            if (tidx < ti || tidx > bi) {
+              PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+            }
           }
         }
       }
@@ -3866,9 +3963,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   // Detect tiny memory-polling loops and mark their backedges/exit edges for
   // SMT priority hints (see JITClass.h and DEF_OP(CondJump)/DEF_OP(Jump)).
+  // The same region walk feeds the FEX_SPINCOLLAPSE matcher; each consumer
+  // is gated individually inside.
   SpinBackedges.clear();
   SpinRestoreEdges.clear();
-  if (SpinLoopHintEnabled) {
+  if (SpinLoopHintEnabled || SpinCollapseEnabled) {
     AnalyzeSpinLoops();
   }
 

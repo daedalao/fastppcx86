@@ -388,6 +388,51 @@ private:
 
   void AnalyzeSpinLoops();
 
+  // -------------------------------------------------------------------------
+  // FEX_SPINCOLLAPSE=1 (opt-in): batched budget decrement for counted
+  // spin-poll loops — the RED4 redDispatcher shape (guest RIP 0x37fff37530a0
+  // measured at 43% of process CPU driving / up to 50% of flythrough samples
+  // under FEX_HWTSO; see notes/openworld-perf-review + the spin anatomy notes).
+  //
+  // Shape (post-pass IR, verified against a live dump of `dec ecx; jnz`):
+  // CompareBranchFusion has already rewritten the flag-consuming jnz into a
+  // VALUE compare, so no flags are consumed anywhere in the pattern:
+  //   poll block:     LoadMemTSO work; SubWithFlags(work,0); CondJump(work,#0,
+  //                   NEQ) -> found-exit
+  //   backedge block: %new = Sub(%old, #1); Copy(%old); StoreRegister(%new);
+  //                   CondJump(%old, #1, NEQ) -> backedge (else budget-exit)
+  //
+  // Rewrite (emission-time, nodes marked by the matcher in AnalyzeSpinLoops):
+  //   Sub:      new = (old >u K) ? old - K : 0        (cmpldi cr7 + isel)
+  //   CondJump: backedge taken iff old >u K           (cmpldi cr7 + bc GT)
+  // Exit state is exact: the loop still leaves the budget register at 0 on
+  // the budget-exhausted exit, and the found-exit still leaves via the poll
+  // compare. Each iteration retires K budget instead of 1, cutting spin WALL
+  // time ~K× so worker threads PARK sooner (park is cheap under ntsync).
+  //
+  // Legality: coarsened polling is indistinguishable from scheduling delay
+  // under TSO. No flags are consumed (fusion shape, see above). KNOWN
+  // semantic coarsening, why this ships opt-in/per-app: on the FOUND exit the
+  // budget register holds a K-granular value instead of the exact iteration
+  // count (engines reload the budget per episode; code that consumed the
+  // leftover count would misbehave). Both emissions derive only from their
+  // own operands — no state is carried between op handlers (the AES
+  // mask-cache rule).
+  // -------------------------------------------------------------------------
+  static constexpr uint16_t kSpinCollapseK = 32;
+  bool SpinCollapseEnabled {};
+  fextl::vector<bool> SpinCollapseSubs;
+  fextl::vector<bool> SpinCollapseBranches;
+
+  bool IsSpinCollapseSub(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseSubs.size() && SpinCollapseSubs[ID];
+  }
+  bool IsSpinCollapseBranch(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseBranches.size() && SpinCollapseBranches[ID];
+  }
+
   // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.
   // Called immediately before the branch instruction so the hint executes
   // exactly when the edge is taken.
