@@ -26,6 +26,11 @@ if (NOT MINGW)
   add_subdirectory(LinuxEmulation/)
 
   add_subdirectory(FEXInterpreter/)
+  add_subdirectory(Wow64Probe/)
+  if (CMAKE_POSITION_INDEPENDENT_CODE)
+    # C-ABI embedding library (Wine-facing). Needs a PIC-configured tree.
+    add_subdirectory(FexBridge/)
+  endif()
   add_subdirectory(pidof/)
   if (BUILD_TESTING)
     add_subdirectory(TestHarnessRunner/)
