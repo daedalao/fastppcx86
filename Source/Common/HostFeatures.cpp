@@ -757,6 +757,21 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     // lowering genuinely clobbers (larx/stcx./cmp).
     HostFeatures.SupportsFlagTransparentSelect = true;
 
+    // FlagM is named for ARM FEAT_FlagM, but the frontend uses it purely as
+    // "the backend has cheap direct NZCV manipulation ops": it gates
+    // _CarryInvert over the LoadNZCV/xor/StoreNZCV GPR round-trip
+    // (OpcodeDispatcher.h RectifyCarryInvert), and _RmifNZCV/_CondSubNZCV
+    // paths for ADCX/ADOX, small-size flag inserts, and RDRAND CF. This
+    // backend implements all four ops (ALUOps.cpp DEF_OP(CarryInvert) skips
+    // XER entirely; DEF_OP(RmifNZCV)/CondSubNZCV/CondAddNZCV likewise avoid
+    // the serializing mtspr XER where possible), so claim it. Without it,
+    // every rectify emits a ~14-insn pack/unpack with two mfxer + one mtxer —
+    // measured 70% of glibc __sin's samples in flag-dense FP code; flipping
+    // this halved a 64-bit-div microbench and cut a sin-heavy loop 29%
+    // (railbench, 2026-08-14). FlagM2 (AXFlag) stays FALSE: its shared-code
+    // arm has a known-wrong path and needs its own validation first.
+    HostFeatures.SupportsFlagM = true;
+
     // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
     if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
       HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);
