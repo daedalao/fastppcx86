@@ -2262,64 +2262,71 @@ DEF_OP(AdcZeroWithFlags) {
 }
 
 DEF_OP(AdcNZCV) {
-  // Identical to AdcWithFlags except no architectural Dst writeback —
-  // we use TMP4 as a scratch result for CR0 / sign extraction.
+  // Identical to AdcWithFlags except no architectural Dst writeback — the
+  // result lands in a TMP purely for CR0 / carry / overflow extraction.
+  //
+  // CARRY POLARITY: DIRECT, in and out, exactly like DEF_OP(AdcWithFlags).
+  // The only producer of AdcNZCV is DeadFlagCalculationElimination's
+  // ReplacementNoWrite arm rewriting AdcWithFlags -> AdcNZCV when the SSA
+  // value is unused but the flag write is live, and CalculateFlags_ADC
+  // (OpcodeDispatcher/Flags.cpp) brackets that op with
+  // RectifyCarryInvert(false) before and CFInverted=false after — stored
+  // XER.CA == x86_CF on entry, and every downstream carry consumer was
+  // compiled expecting a DIRECT CA on exit. The rewrite changes the opcode
+  // tag only, never the carry convention.
+  //
+  // HISTORY (2026-08-13): both size paths here used to assume the INVERTED
+  // convention — the i64 path bracketed addeo_ with subfe/addic CA-flip
+  // pairs (carry-in and carry-out both wrong), and the i32 path materialised
+  // -(!CA) as if it were -x86_CF and stored CA-out xori-inverted. Same
+  // never-executed-handler class as the DEF_OP(Adc) polarity bug documented
+  // above: with the NoWrite arm disabled nothing ever produced AdcNZCV, so
+  // the wrong polarity could not be observed. Pinned by
+  // unittests/ASM/FEX_bugs/dfce_nowrite_adc_sbb.asm.
   auto Op = IROp->C<IR::IROp_AdcNZCV>();
   auto S1 = GetReg(Op->Src1);
   auto S2 = GetReg(Op->Src2);
 
   if (IROp->Size == IR::OpSize::i64Bit) {
-    // CFInverted=true: pre-flip XER.CA so addeo_ sees x86_CF; post-flip CA-out.
-    // Each flip is the subfe/addic pair documented at DEF_OP(CarryInvert):
-    // subfe TMP1,r0,r0 leaves 0 when CA=1 and -1 when CA=0 (and preserves CA),
-    // then addic TMP1,TMP1,1 sets CA from that value's carry-out — 0 and 1
-    // respectively — so CA is inverted in two non-serializing instructions
-    // instead of an mfspr/xoris/mtspr round trip.
-    //
-    // Critically for the POST-flip: neither subfe nor addic writes OV, SO or
-    // CR0, so the overflow and N/Z that addeo_ just produced pass through
-    // untouched. TMP1 was already this path's only scratch.
-    subfe(TMP1, r0, r0);
-    addic(TMP1, TMP1, 1);
+    // addeo_ consumes CA-in and writes CA-out in the DIRECT convention this
+    // op's producer establishes (see above) — no flips, mirroring
+    // DEF_OP(AdcWithFlags)'s i64 path with TMP3 as the discard destination.
     addeo_(TMP3, S1, S2);
-    subfe(TMP1, r0, r0);
-    addic(TMP1, TMP1, 1);
     return;
   }
 
-  // i32Bit: materialise x86_CF, compute manually, store !bit-32 as CFInverted CA.
-  // subfe(TMP4, r0, r0) = ~r0 + r0 + CA = all-ones + CA => 0 for CA=1, -1 for
-  // CA=0, i.e. -(!CA) = -x86_CF under CFInverted=true. XER survives it (its
-  // carry-out equals its carry-in, OE=Rc=0), which matters because the stored
-  // CA must still be readable... it is not read again here, but the XER tail
-  // below reads XER for the sticky SO, and CR0 must stay clean until
-  // EmitTestNZSetCR. Adding x86_CF then becomes subtracting -x86_CF.
-  subfe(TMP4, r0, r0);                      // TMP4 = -x86_CF
+  // i32Bit: mirror DEF_OP(AdcWithFlags)'s i32 path minus the Dst writeback.
+  // adde injects XER.CA (= x86_CF, direct) as the third addend. Both addends
+  // are zero-extended 32-bit values so the sum is < 2^33 and adde's own
+  // CA-out is always 0 — harmless, the XER patch below rewrites CA and OV
+  // wholesale and only reads XER for the sticky SO.
+  rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
+  rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
+  adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
 
-  rldicl(TMP1, S1, 0, 32);
-  rldicl(TMP2, S2, 0, 32);
-  add(TMP3, TMP1, TMP2);
-  subf(TMP3, TMP4, TMP3);                   // TMP3 = sum + x86_CF (33-bit)
-  rldicl(TMP4, TMP3, 0, 32);                 // TMP4 = low-32 result
-  EmitTestNZSetCR(TMP4, IR::OpSize::i32Bit);
+  // OF = (S1[31] == S2[31]) AND (S1[31] != Sum[31]); Sum[31] == TMP3[31].
+  // Derived from the zx32 copies, same formula and ordering as AdcWithFlags
+  // (no Dst here, so no alias hazard — kept in the same shape regardless).
+  xor_(TMP2, TMP2, TMP1);                   // S1^S2
+  xor_(TMP1, TMP3, TMP1);                   // Sum^S1
+  andc(TMP1, TMP1, TMP2);                   // (Sum^S1) & ~(S1^S2): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);               // OF -> LSB (kept in TMP2)
 
-  // CFInverted CA = !(bit-32 of TMP3).
-  rldicl(TMP3, TMP3, 32, 63);
-  xori(TMP3, TMP3, 1);
+  // CA-out = bit-32 of the 33-bit sum, stored DIRECT (CFInverted=false),
+  // matching AdcWithFlags' i32 path and the dispatcher's post-op convention.
+  rldicl(TMP4, TMP3, 32, 63);
 
-  // OF = (S1[31] == S2[31]) AND (S1[31] != Result[31]).
-  rldicl(TMP1, S1,   33, 63);
-  rldicl(TMP2, S2,   33, 63);
-  rldicl(TMP4, TMP4, 33, 63);
-  xor_(TMP2, TMP2, TMP1);
-  xor_(TMP4, TMP4, TMP1);
-  andc(TMP4, TMP4, TMP2);                   // OF
+  // N/Z from the low 32 bits of the sum. EmitTestNZSetCR's i32 case is
+  // extsw_, which only reads the low word — the 33-bit TMP3 needs no
+  // pre-truncation (AdcWithFlags truncates into Dst because Dst must carry
+  // the zero-extended VALUE; there is no Dst here).
+  EmitTestNZSetCR(TMP3, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
-  // Patch XER: CA = TMP3 LSB (= !x86_CF_out), OV = TMP4 LSB.
+  // Patch XER: CA <- TMP4 LSB (direct x86_CF_out), OV <- TMP2 LSB.
   // rlwimi SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
-  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
