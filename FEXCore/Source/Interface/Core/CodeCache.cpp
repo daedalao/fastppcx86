@@ -356,6 +356,11 @@ uint64_t ComputeCodeCacheConfigId() {
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr));
+      // DFCE ReplacementNoWrite arm (RedundantFlagCalculationElimination.cpp):
+      // presence-DISABLED, 64-bit-guest-only; rewrites value-dead flag ops to
+      // their flags-only forms pre-RA, so it changes emitted block bytes.
+      // (IS64BIT_MODE itself is hashed above.)
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
       // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
       // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");

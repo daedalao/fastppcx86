@@ -19,6 +19,8 @@ $end_info$
 #include <FEXCore/fextl/deque.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <cstdlib>
+
 // Flag bit flags
 #define FLAG_V (1U << 0)
 #define FLAG_C (1U << 1)
@@ -155,6 +157,7 @@ public:
 
 private:
   FEX_CONFIG_OPT(DisableDFCEStoreElim, DISABLEDFCESTOREELIM);
+  FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
 
 public:
   // Stateless, and shared with CompareBranchFusion via IROpWritesNZCV below.
@@ -600,6 +603,11 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
 bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG) {
   uint32_t FlagsRead = FLAG_ALL;
 
+  // Presence-check kill switch for the ReplacementNoWrite arm below (raw
+  // getenv, resolved once per process — the convention for codegen-affecting
+  // env toggles, e.g. FEX_NO_THUNK_PARTIAL_FILL). See the use site comment.
+  static const bool NoWriteArmDisabled = getenv("FEX_NO_DFCE_NOWRITE") != nullptr;
+
   // Reverse iteration is not yet working with the iterators
   auto BlockIROp = CurrentIR.GetOp<IR::IROp_CodeBlock>(Block);
 
@@ -677,17 +685,48 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
           } else if (Info.Replacement()) {
             IROp->Op = Info.Replacement();
           }
+        } else if (Info.ReplacementNoWrite() && CodeNode->GetUses() == 0 && Is64BitMode() && !NoWriteArmDisabled) {
+          // ReplacementNoWrite: the value is SSA-dead but some written flag is
+          // still live, so demote to the flags-only form (SubWithFlags ->
+          // SubNZCV, AddWithFlags -> AddNZCV, AndWithFlags -> TestNZ,
+          // Adc/SbbWithFlags -> Adc/SbbNZCV). This kills the dead value def
+          // that otherwise occupies a register through compare-dense blocks
+          // (CMP/TEST feed their result only to StorePF; once a dead StorePF
+          // is removed above, the value has zero uses).
+          //
+          // 64-BIT GUESTS ONLY (as of 2026-08-13). History: disabled on all
+          // hosts from 2026-05-11 (8774c7dda) because with it enabled, 32-bit
+          // i686 guests corrupt — glibc's dynamic linker walks linked-list
+          // maps and `_dl_sort_maps_dfs` trips its internal "rpo_head == rpo"
+          // assertion. ARM64 reaches the same code paths but doesn't fail.
+          // That ROOT CAUSE REMAINS OPEN: the i686 repro stays excluded
+          // (32-bit mode keeps the arm off, byte-for-byte the old behaviour),
+          // and the enabled sibling Replacement arm above performs the same
+          // in-place pre-RA opcode rewrite, so if the mechanism is a
+          // rewrite/RA interaction the sibling may share it. Note the
+          // 2026-05-11 commit message also recorded the disable as gaining a
+          // handful of 64-bit ASM tests at the time; several backend defects
+          // of that era have since been fixed (CondJump TSTZ/TSTNZ cr7
+          // routing in that same commit, the CR0/NZCV VectorOps clobber
+          // eb1a4c858, the AdcWithFlags i32 OF-aliasing), and one more was
+          // found by inspection while enabling this arm: DEF_OP(AdcNZCV) had
+          // both carry polarities inverted and had never executed, since this
+          // arm is its only producer (fixed alongside this enable; same class
+          // as the DEF_OP(Adc) polarity bug).
+          //
+          // Kill switch (presence check, tree convention for raw codegen env
+          // toggles): FEX_NO_DFCE_NOWRITE=1 disables the arm even for 64-bit
+          // guests. It changes emitted code, so it is hashed into the code
+          // cache config id (CodeCache.cpp).
+          //
+          // Cross-block gating tests for exactly this shape:
+          // unittests/ASM/FEX_bugs/dfce_nowrite_*.asm,
+          // dfce_crossblock_*.asm, dfce_flags_across_ret.asm.
+          //
+          // TODO(ppc64le): root-cause the i686 corruption, then either fix
+          // the backend or drop the 64-bit gate.
+          IROp->Op = Info.ReplacementNoWrite();
         }
-        // NOTE: the upstream pass also has a `ReplacementNoWrite` branch that
-        // changes ops like AddWithFlags → AddNZCV when the value has no SSA
-        // users but the flag write is still needed. On PPC64LE this corrupts
-        // 32-bit i686 guests: glibc's dynamic linker walks linked-list maps,
-        // and after this transformation `_dl_sort_maps_dfs` trips an internal
-        // "rpo_head == rpo" assertion. ARM64 reaches the same code paths but
-        // doesn't fail; the backend interaction is still being investigated.
-        // For now: skip the no-write replacement. The packed ASM suite still
-        // passes for 64-bit guest mode (5885/5931, no regression).
-        // TODO(ppc64le): root-cause and either fix the backend or re-enable.
 
         // If we don't care about the sign or carry, we can optimize testnz.
         // Carry is inverted between testz and testnz so we check that too. Note
