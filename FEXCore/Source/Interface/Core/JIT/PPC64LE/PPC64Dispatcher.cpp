@@ -1173,9 +1173,12 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   // which also used TMP1 as its scratch).
   auto SpillForFABICall = [&]() {
     this->SpillForABICall(TMP1);
-    if (PartialFill) {
-      ArmInSyscallSentinel(kInFABISentinel);
-    }
+    // Arm on BOTH bitnesses: the sentinel is not only the partial-fill
+    // gate, it is the signal delegator's defer marker for FABI crossings
+    // (kInFABISentinel bit 25) — 32-bit guests need the deferral just as
+    // much (the signal-storm x87 corruption reproduced on .32 until this
+    // armed unconditionally). The partial REFILL stays 64-bit-only below.
+    ArmInSyscallSentinel(kInFABISentinel);
   };
 
   // Every stub's refill + (gated) sentinel check/disarm. Clobbers TMP1 and
@@ -1184,9 +1187,15 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   // VTMPs are untouched by the check).
   auto FillForFABICall = [&]() {
     if (PartialFill) {
-      FillForABICallChecked();
+      FillForABICallChecked(); // disarms as its final step
     } else {
       this->FillForABICall();
+      // The plain fill never touches the sentinel; disarm explicitly or a
+      // stale 0x200FFFF outlives the crossing and poisons every
+      // InSyscallInfo consumer (RestoreFrame redirect suppression, the
+      // defer gate itself). TMP1 is free after the fill; r0 was re-zeroed.
+      li(TMP1, 0);
+      std(TMP1, static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)), STATE);
     }
   };
 
