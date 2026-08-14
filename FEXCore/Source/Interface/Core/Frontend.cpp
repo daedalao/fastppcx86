@@ -29,6 +29,11 @@ $end_info$
 #include <optional>
 #include <string_view>
 
+// process_vm_readv for the fault-safe guest-stack dump on the
+// invalid-instruction diagnostic path below.
+#include <sys/uio.h>
+#include <unistd.h>
+
 // Debug RIP tracing from the PPC64LE dispatcher. These are defined in
 // PPC64Dispatcher.cpp and only maintained by the emitted dispatcher in
 // assertions builds, so both the arch and the assertions guard are required —
@@ -1694,13 +1699,27 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
                                 S.gregs[8], S.gregs[9], S.gregs[10], S.gregs[11]);
               LogMan::Msg::EFmt("  gregs: R12={:X} R13={:X} R14={:X} R15={:X}",
                                 r12_val, r13_val, r14_val, r15_val);
-              // Print what is on the guest stack at [RSP-8..RSP+64]
+              // Print what is on the guest stack at [RSP-8..RSP+64]. RSP is
+              // untrusted here — this path fires exactly when the guest is
+              // corrupted, so it is often unmapped, and a raw dereference
+              // replaces the diagnosable guest fault with a host SIGSEGV in
+              // the frontend (the same misdelivery class the compile-byte
+              // log above was cured of). Read each slot via process_vm_readv
+              // — kernel-mediated, returns a short count instead of faulting
+              // — the same mechanism the tripwire probe dump uses in
+              // SignalDelegator.cpp. Per-slot calls so a stack that
+              // straddles a mapping edge still dumps its readable slots.
               if (rsp_val >= 0x1000) {
                 for (int _si = -1; _si <= 8; ++_si) {
                   uint64_t addr = rsp_val + (uint64_t)(_si * 8);
-                  if (addr < 0x1000) continue;
-                  uint64_t val = *reinterpret_cast<const uint64_t*>(addr);
-                  LogMan::Msg::EFmt("  [RSP{:+d}]={:X}", _si * 8, val);
+                  uint64_t val = 0;
+                  struct iovec local {&val, sizeof(val)};
+                  struct iovec remote {reinterpret_cast<void*>(addr), sizeof(val)};
+                  if (process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == sizeof(val)) {
+                    LogMan::Msg::EFmt("  [RSP{:+d}]={:X}", _si * 8, val);
+                  } else {
+                    LogMan::Msg::EFmt("  [RSP{:+d}]=<unreadable>", _si * 8);
+                  }
                 }
               }
             }
