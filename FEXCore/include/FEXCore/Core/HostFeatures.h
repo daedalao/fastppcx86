@@ -67,6 +67,17 @@ struct HostFeatures {
   // sides of a measurement differ in exactly one thing.
   bool SupportsVCmpFlagBranch {};
 
+  // The backend lowers the Select-class ImplicitFlagClobber ops — Select,
+  // VFMinScalarInsert/VFMaxScalarInsert, MaskGenerateFromBitWidth — without
+  // writing any host flag state, so the frontend's SaveNZCV may skip the
+  // save/restore round-trip for them. ImplicitFlagClobber in IR.json models
+  // the ARM64 lowerings (csel/fcmp/bit-mask sequences that trash host NZCV);
+  // a backend whose guest-NZCV storage survives these ops sets this instead
+  // of un-marking the ops, keeping the IR metadata host-neutral. Like
+  // SupportsVCmpFlagBranch this is a *backend capability* flag, not a CPU
+  // feature, and is false everywhere but PPC64LE.
+  bool SupportsFlagTransparentSelect {};
+
   // Float exception behaviour
   bool SupportsAFP {};
   bool SupportsFloatExceptions {};

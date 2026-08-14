@@ -741,6 +741,22 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     // to lower a vector-compare CondJump. Left false everywhere else.
     HostFeatures.SupportsVCmpFlagBranch = true;
 
+    // Guest NZCV lives in CR0+XER on this backend (DEF_OP(LoadNZCV/StoreNZCV)
+    // in JIT/PPC64LE/ALUOps.cpp), and the three Select-class lowerings the
+    // frontend brackets with SaveNZCV touch neither:
+    //  - DEF_OP(Select): every arm compares into cr7 and selects via isel
+    //    (ALUOps.cpp; CompareBranchFusion already relies on this transparency).
+    //  - DEF_OP(VFMinScalarInsert/VFMaxScalarInsert): non-record vcmpgtfp /
+    //    xvcmpgtdp + vsel/xxsel + permutes, no CR or XER write (VectorOps.cpp).
+    //  - DEF_OP(MaskGenerateFromBitWidth): li/neg/rldicl/srd, all OE=0/Rc=0
+    //    (ALUOps.cpp).
+    // Skipping the save avoids a 13-insn LoadNZCV/StoreNZCV round-trip whose
+    // StoreNZCV half ends in mtspr XER — execution-serializing on POWER8 —
+    // whenever flags are live across a cvttss2si clamp, minss/maxss, SHLD/SHRD
+    // or BEXTR, or when such an op trails a block exit. CAS stays marked: its
+    // lowering genuinely clobbers (larx/stcx./cmp).
+    HostFeatures.SupportsFlagTransparentSelect = true;
+
     // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
     if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
       HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);

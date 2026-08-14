@@ -1400,10 +1400,24 @@ protected:
     switch (Op) {
     case OP_VFMINSCALARINSERT:
     case OP_VFMAXSCALARINSERT:
-      /* On AFP platforms, becomes fmin/fmax and preserves NZCV. Otherwise
-       * becomes fcmp and clobbers.
+      /* On AFP platforms, becomes fmin/fmax and preserves NZCV. On
+       * flag-transparent-select backends, becomes non-record vector
+       * compare + select and preserves NZCV. Otherwise becomes fcmp and
+       * clobbers.
        */
-      if (CTX->HostFeatures.SupportsAFP) {
+      if (CTX->HostFeatures.SupportsAFP || CTX->HostFeatures.SupportsFlagTransparentSelect) {
+        return;
+      }
+      break;
+
+    case OP_SELECT:
+    case OP_MASKGENERATEFROMBITWIDTH:
+      /* On flag-transparent-select backends these lower without writing any
+       * host flag state (see the flag's definition in HostFeatures.h), so
+       * guest NZCV survives in place. Otherwise csel/bit-mask sequences
+       * clobber host NZCV and the save is required.
+       */
+      if (CTX->HostFeatures.SupportsFlagTransparentSelect) {
         return;
       }
       break;
