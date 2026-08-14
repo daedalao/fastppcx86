@@ -3761,13 +3761,51 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                   if (RNode == SubNode || RNode == BranchNode || RNode == CopyNode) {
                     continue;
                   }
-                  const uint8_t NumArgs = IR::GetArgs(ROp->Op);
-                  for (uint8_t a = 0; a < NumArgs; a++) {
-                    const auto PR = ArgPR(ROp->Args[a]);
+                  // Only VALUE args may be interpreted as registers: block
+                  // references (branch targets) and InlineConstant nodes have
+                  // no RA assignment, and PhysicalRegister() over them reads
+                  // garbage that randomly aliases real registers (the v3
+                  // guard rejected its own repro through a branch-target
+                  // arg). CondJump contributes exactly Cmp1/Cmp2; pure
+                  // control/structure ops contribute nothing.
+                  IR::OrderedNodeWrapper ValueArgs[2] = {};
+                  uint8_t NumCheck = 0;
+                  switch (ROp->Op) {
+                  case IR::OP_CONDJUMP: {
+                    auto J2 = ROp->C<IR::IROp_CondJump>();
+                    ValueArgs[NumCheck++] = J2->Cmp1;
+                    ValueArgs[NumCheck++] = J2->Cmp2;
+                    break;
+                  }
+                  case IR::OP_JUMP:
+                  case IR::OP_BEGINBLOCK:
+                  case IR::OP_ENDBLOCK:
+                  case IR::OP_GUESTOPCODE:
+                  case IR::OP_INLINECONSTANT:
+                  case IR::OP_INLINEENTRYPOINTOFFSET:
+                    break;
+                  default: {
+                    const uint8_t NumArgs = IR::GetArgs(ROp->Op);
+                    for (uint8_t a = 0; a < NumArgs && NumCheck < 2; a++) {
+                      ValueArgs[NumCheck++] = ROp->Args[a];
+                    }
+                    // Ops with more than two args in a spin region are
+                    // exotic; treat them as foreign rather than under-check.
+                    if (IR::GetArgs(ROp->Op) > 2) {
+                      ForeignReader = true;
+                    }
+                    break;
+                  }
+                  }
+                  uint64_t Scratch;
+                  for (uint8_t a = 0; a < NumCheck && !ForeignReader; a++) {
+                    if (ValueArgs[a].IsInvalid() || IsInlineConstant(ValueArgs[a], &Scratch)) {
+                      continue;
+                    }
+                    const auto PR = ArgPR(ValueArgs[a]);
                     if (PR.Raw == SubSrcPR.Raw || PR.Raw == CopyDstPR.Raw ||
                         (PR.Raw == SubDstPR.Raw && RNode != StoreNode)) {
                       ForeignReader = true;
-                      break;
                     }
                   }
                   if (ForeignReader) {
