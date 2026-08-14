@@ -4151,18 +4151,24 @@ DEF_OP(FCmp) {
   auto S2 = GetVReg(Op->Scalar2);
   const auto ESize = Op->ElementSize;
 
-  addi(TMP1, r1, -32);
-  stvx(S1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(S2, r(0), TMP2);
+  // Register-only compare, same staging as EmitCompare's fused-FP path
+  // (JIT.cpp): the old stvx x2 + lfs/lfd x2 bounce cost two guaranteed
+  // store-hit-load flushes per compare — measured 33% of countersunk's
+  // hydro-conditioning phase inside std::__adjust_heap's float compares.
+  // Element 0 of a guest XMM sits in doubleword 1 (f64) / BE word 3 (f32);
+  // xscmpudp compares doubleword 0, so position first. xscvspdp performs
+  // the same SP->DP promotion lfs did, so NaN/denormal ordering semantics
+  // are unchanged; both paths end in an unordered compare into CR0.
   if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
-    lfs(f1, -16, r1);
+    xxsldwi(VTMP1, S1, S1, 3);         // BE w0 <- elem0 (BE w3)
+    xscvspdp(VTMP1, VTMP1);
+    xxsldwi(VTMP2, S2, S2, 3);
+    xscvspdp(VTMP2, VTMP2);
   } else {
-    lfd(f0, -32, r1);
-    lfd(f1, -16, r1);
+    xxpermdi(VTMP1, S1, S1, 0b10);     // dw0 <- dw1
+    xxpermdi(VTMP2, S2, S2, 0b10);
   }
-  fcmpu(cr(0), f0, f1);
+  xscmpudp(0, VTMP1, VTMP2);
 
   // Lift CR0.SO and !CR0.LT into XER.OV/CA.
   // PPC bits (in 32-bit-low view): CR0.LT=0, CR0.SO=3; XER.OV=1, XER.CA=2.
