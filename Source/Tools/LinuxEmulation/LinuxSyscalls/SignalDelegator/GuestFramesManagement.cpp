@@ -379,6 +379,74 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
       const auto modulo_i = (i + CurrentOffset) % 8;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
     }
+  } else {
+    // ---- Handler general-purpose register writeback (EIP unchanged) --------
+    // ia32 semantics: a signal handler may mutate the interrupted context's
+    // integer registers through the frame's `struct sigcontext` (the classic
+    // non-RT frame embeds it by value right after the signal number, so a
+    // `void handler(int, struct sigcontext)` edits the live frame), and those
+    // edits MUST persist across sigreturn even when the handler leaves EIP
+    // alone (how GC/JIT/green-thread runtimes fix up a thread from a signal).
+    // The block above only republished the GPRs when EIP *also* changed, so a
+    // handler that touched only e.g. EBX had its write silently dropped: in-JIT
+    // deliveries resumed mid-block straight from the restored host SRA register
+    // file, and in-syscall deliveries let the syscall op's tail FillStaticRegs
+    // reload the *unmodified* frame. This is the RestoreFrame_x64 writeback,
+    // ported. See tests/signal/greg_mutation.32.cpp.
+    //
+    // Detect any GPR edit against the pre-signal snapshot (Context->GuestState,
+    // which is exactly what SetupFrame_ia32 handed the handler) and, if found,
+    // republish all 8 GPRs into guest state. Compare through uint32_t on both
+    // sides -- the sigcontext fields are 32-bit while gregs is uint64_t -- and
+    // zero-extend on republish for the same reason the EIP-changed path above
+    // does. Scope is deliberately the integer file only: segment/EFLAGS/XMM/x87
+    // handler edits on the EIP-unchanged fast path remain a pre-existing gap
+    // and are intentionally left untouched here to keep the change minimal.
+#define DIFF_REG(x, y) (guest_uctx->sc.y != (uint32_t)Context->GuestState.gregs[FEXCore::X86State::REG_##x])
+    const bool GregsMutated = DIFF_REG(RDI, di) || DIFF_REG(RSI, si) || DIFF_REG(RBP, bp) || DIFF_REG(RBX, bx) || DIFF_REG(RDX, dx) ||
+                              DIFF_REG(RAX, ax) || DIFF_REG(RCX, cx) || DIFF_REG(RSP, sp);
+#undef DIFF_REG
+
+    if (GregsMutated) {
+#define COPY_REG(x, y) Frame->State.gregs[FEXCore::X86State::REG_##x] = (uint32_t)guest_uctx->sc.y;
+      COPY_REG(RDI, di);
+      COPY_REG(RSI, si);
+      COPY_REG(RBP, bp);
+      COPY_REG(RBX, bx);
+      COPY_REG(RDX, dx);
+      COPY_REG(RAX, ax);
+      COPY_REG(RCX, cx);
+      COPY_REG(RSP, sp);
+#undef COPY_REG
+
+      // Whether the State writeback above is enough depends on how execution
+      // resumes:
+      //   * outside-JIT delivery (blocked in a host syscall, or parked in the
+      //     dispatcher): a full FillStaticRegs is already pending before the
+      //     guest reads these registers -- the JIT syscall op's tail reload, or
+      //     the next block-entry fill -- so State is authoritative. No redirect.
+      //   * in-JIT delivery inside a host-call-crossing window
+      //     (InSyscallInfo != 0 — DEF_OP(Syscall)/DEF_OP(Thunk)/the FABI
+      //     stubs): same -- the crossing's tail refill is conditional on the
+      //     kInSyscallSentinel bit-24 tripwire, and THIS delivery killed it
+      //     (the uint16_t ContextBackup stash truncates bit 24), so the tail
+      //     provably reloads the full GPR file from State. No redirect
+      //     (redirecting here would re-enter the block at the crossing RIP and
+      //     re-run the syscall/host call).
+      //   * in-JIT delivery in plain compute (InSyscallInfo == 0): resume is
+      //     mid-block from the restored host SRA registers with no intervening
+      //     fill, so the State writeback alone would be invisible. Route resume
+      //     through the dispatcher's FillSRA entry instead. EIP is unchanged and
+      //     in-JIT deliveries reconstruct State.rip to the exact interrupted
+      //     instruction, so re-entry resumes precisely there with State reloaded.
+      const bool InJIT = (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) != 0;
+      if (InJIT && Context->InSyscallInfo == 0) {
+        Frame->InSyscallInfo = Context->InSyscallInfo;
+        ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+        ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
+        ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+      }
+    }
   }
 }
 
@@ -457,6 +525,48 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
       // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
       const auto modulo_i = (i + CurrentOffset) % 8;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
+    }
+  } else {
+    // ---- Handler general-purpose register writeback (EIP unchanged) --------
+    // Same as the RestoreFrame_ia32 writeback above (see the full rationale
+    // there), through this frame flavor's ucontext: an SA_SIGINFO handler
+    // mutates uc_mcontext.gregs[] and those edits MUST persist across
+    // rt_sigreturn even when EIP is untouched. Only the eight sigcontext GPRs
+    // participate -- FEX_REG_UESP is the legacy sp_at_signal slot, which the
+    // kernel ignores on sigreturn (it restores ESP from gregs[REG_ESP]), and
+    // the EIP-changed path above ignores it the same way. See
+    // tests/signal/greg_mutation.32.cpp.
+#define DIFF_REG(x) \
+  (guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x] != (uint32_t)Context->GuestState.gregs[FEXCore::X86State::REG_##x])
+    const bool GregsMutated = DIFF_REG(RDI) || DIFF_REG(RSI) || DIFF_REG(RBP) || DIFF_REG(RBX) || DIFF_REG(RDX) || DIFF_REG(RAX) ||
+                              DIFF_REG(RCX) || DIFF_REG(RSP);
+#undef DIFF_REG
+
+    if (GregsMutated) {
+#define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = (uint32_t)guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x];
+      COPY_REG(RDI);
+      COPY_REG(RSI);
+      COPY_REG(RBP);
+      COPY_REG(RBX);
+      COPY_REG(RDX);
+      COPY_REG(RAX);
+      COPY_REG(RCX);
+      COPY_REG(RSP);
+#undef COPY_REG
+
+      // Redirect-vs-no-redirect decision, identical to RestoreFrame_x64 and
+      // RestoreFrame_ia32: outside-JIT and in-crossing (InSyscallInfo != 0)
+      // deliveries already have a full State reload pending before the guest
+      // reads these registers; only plain-compute in-JIT deliveries resume
+      // mid-block from the restored host SRA and need resume routed through
+      // the dispatcher's FillSRA entry to make the writeback visible.
+      const bool InJIT = (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) != 0;
+      if (InJIT && Context->InSyscallInfo == 0) {
+        Frame->InSyscallInfo = Context->InSyscallInfo;
+        ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+        ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
+        ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+      }
     }
   }
 }
