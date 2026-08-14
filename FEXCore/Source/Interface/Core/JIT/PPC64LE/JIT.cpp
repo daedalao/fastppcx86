@@ -3683,6 +3683,8 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         IR::PhysicalRegister CopyDstPR = IR::PhysicalRegister::Invalid();
         IR::Ref BranchNode = nullptr;
         const IR::IROp_Header* BranchHdr = nullptr;
+        IR::Ref CopyNode = nullptr;
+        IR::Ref StoreNode = nullptr;
         uint32_t SubCount = 0;
         bool StoreOfSubSeen = false;
 
@@ -3708,12 +3710,14 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             auto COp = IROp->C<IR::IROp_Copy>();
             CopySrcPR = ArgPR(COp->Source);
             CopyDstPR = IR::PhysicalRegister(CodeNode);
+            CopyNode = CodeNode;
             break;
           }
           case IR::OP_STOREREGISTER: {
             auto ROp = IROp->C<IR::IROp_StoreRegister>();
             if (SubNode && ArgPR(ROp->Value).Raw == SubDstPR.Raw) {
               StoreOfSubSeen = true;
+              StoreNode = CodeNode;
             }
             break;
           }
@@ -3737,31 +3741,55 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             const auto Cmp1PR = ArgPR(JOp->Cmp1);
             const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
                                 (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
-            // Final scan-shape discriminator: an index-addressed scan
-            // (`movzbl (%rdi,%rcx),%eax; dec %rcx; jnz`) has no Add in the
-            // region and still leaves a LIVE count on the found exit — the
-            // budget register addresses the load. A stationary poll never
-            // feeds its budget into a load address; reject the region if any
-            // load in it does.
-            bool BudgetAddressesLoad = false;
+            // Complete budget-liveness guard. Inside the region the ONLY
+            // permitted readers of the budget register are the decrement
+            // itself, the Copy staging the pre-decrement value, and the
+            // backedge compare; the only permitted reader of the decrement's
+            // RESULT is the StoreRegister writing it back; the staged copy
+            // may be read only by the branch. Anything else consuming any of
+            // the three (an index-addressed scan's load, a bound check, a
+            // shift amount, an exit-path length computation...) observes the
+            // coarsened K-step descent and breaks — the v2 load-only version
+            // of this guard still let CP2077's bootstrap crash. Conservative
+            // by physical register: an unrelated live range that happens to
+            // share the register rejects the region, costing only the
+            // elision.
+            bool ForeignReader = false;
             if (Linked) {
-              for (uint32_t ri = ti; ri <= bi && !BudgetAddressesLoad; ++ri) {
-                for (auto [LNode, LOp] : IR->GetCode(Blocks[ri].Node)) {
-                  if (LOp->Op != IR::OP_LOADMEM && LOp->Op != IR::OP_LOADMEMTSO) {
+              for (uint32_t ri = ti; ri <= bi && !ForeignReader; ++ri) {
+                for (auto [RNode, ROp] : IR->GetCode(Blocks[ri].Node)) {
+                  if (RNode == SubNode || RNode == BranchNode || RNode == CopyNode) {
                     continue;
                   }
-                  auto MOp = LOp->C<IR::IROp_LoadMem>();
-                  if (ArgPR(MOp->Addr).Raw == SubSrcPR.Raw ||
-                      (!MOp->Offset.IsInvalid() && ArgPR(MOp->Offset).Raw == SubSrcPR.Raw)) {
-                    BudgetAddressesLoad = true;
+                  const uint8_t NumArgs = IR::GetArgs(ROp->Op);
+                  for (uint8_t a = 0; a < NumArgs; a++) {
+                    const auto PR = ArgPR(ROp->Args[a]);
+                    if (PR.Raw == SubSrcPR.Raw || PR.Raw == CopyDstPR.Raw ||
+                        (PR.Raw == SubDstPR.Raw && RNode != StoreNode)) {
+                      ForeignReader = true;
+                      break;
+                    }
+                  }
+                  if (ForeignReader) {
                     break;
                   }
                 }
               }
             }
-            if (Linked && !BudgetAddressesLoad) {
+            if (Linked && !ForeignReader) {
               SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
               SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
+              // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop so a
+              // misbehaving title can be attributed to a guest RIP without a
+              // debugger (compile-time event, low volume).
+              static const bool Trace = [] {
+                const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
+                return T && T[0] == '1';
+              }();
+              if (Trace) {
+                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u\n",
+                        IR->GetHeader()->OriginalRIP, TargetID);
+              }
             }
           }
         }
