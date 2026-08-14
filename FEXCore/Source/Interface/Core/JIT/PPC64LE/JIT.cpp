@@ -3768,7 +3768,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                   // guard rejected its own repro through a branch-target
                   // arg). CondJump contributes exactly Cmp1/Cmp2; pure
                   // control/structure ops contribute nothing.
-                  IR::OrderedNodeWrapper ValueArgs[2] = {};
+                  IR::OrderedNodeWrapper ValueArgs[2] = {IR::OrderedNodeWrapper::WrapOffset(0), IR::OrderedNodeWrapper::WrapOffset(0)};
                   uint8_t NumCheck = 0;
                   switch (ROp->Op) {
                   case IR::OP_CONDJUMP: {
@@ -3797,14 +3797,22 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                     break;
                   }
                   }
+                  // Live-range scoping: the budget lives in an SRA register
+                  // and is meaningful REGION-wide; the Sub result and the
+                  // staged Copy are block-local scratch whose physical
+                  // registers (r0/r1 pool) are recycled by RA in every other
+                  // block — checking those region-wide false-rejects almost
+                  // every real loop (the repro's poll-address temp shares r0
+                  // with the Sub result). Scope them to the backedge block.
                   uint64_t Scratch;
                   for (uint8_t a = 0; a < NumCheck && !ForeignReader; a++) {
                     if (ValueArgs[a].IsInvalid() || IsInlineConstant(ValueArgs[a], &Scratch)) {
                       continue;
                     }
                     const auto PR = ArgPR(ValueArgs[a]);
-                    if (PR.Raw == SubSrcPR.Raw || PR.Raw == CopyDstPR.Raw ||
-                        (PR.Raw == SubDstPR.Raw && RNode != StoreNode)) {
+                    if (PR.Raw == SubSrcPR.Raw) {
+                      ForeignReader = true;
+                    } else if (ri == bi && (PR.Raw == CopyDstPR.Raw || (PR.Raw == SubDstPR.Raw && RNode != StoreNode))) {
                       ForeignReader = true;
                     }
                   }
