@@ -2471,7 +2471,13 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // kSpinCollapseK in JITClass.h). Hashed into the code-cache config id.
   {
     const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
-    SpinCollapseEnabled = SpinEnv && SpinEnv[0] == '1';
+    SpinCollapseEnabled = SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0';
+    if (SpinCollapseEnabled) {
+      const long V = strtol(SpinEnv, nullptr, 10);
+      if (V >= 2 && V <= 1024) {
+        kSpinCollapseK = static_cast<uint16_t>(V);
+      }
+    }
   }
 
   // SMC interlocks: two fork features are only sound when every constant-target

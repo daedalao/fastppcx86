@@ -419,7 +419,16 @@ private:
   // own operands — no state is carried between op handlers (the AES
   // mask-cache rule).
   // -------------------------------------------------------------------------
-  static constexpr uint16_t kSpinCollapseK = 32;
+  // K corrects the EMULATION INFLATION of a spin iteration, it does not
+  // minimize spinning: the engine tuned its budget for native iteration
+  // cost, and measurement shows the budget is load-bearing (CP2077
+  // flythrough, K=32 under HWTSO: threads parked in ~1-2us and paid a wake
+  // round trip per task batch — fps fell BELOW plain HWTSO). Emulated
+  // iterations run ~6x native with TSO barriers, ~2-3x under FEX_HWTSO, so
+  // K in that range restores the intended spin duration. FEX_SPINCOLLAPSE=1
+  // uses the default; FEX_SPINCOLLAPSE=<2..1024> overrides K for tuning.
+  static constexpr uint16_t kSpinCollapseKDefault = 8;
+  uint16_t kSpinCollapseK = kSpinCollapseKDefault;
   bool SpinCollapseEnabled {};
   fextl::vector<bool> SpinCollapseSubs;
   fextl::vector<bool> SpinCollapseBranches;

@@ -356,8 +356,15 @@ uint64_t ComputeCodeCacheConfigId() {
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr));
+      // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
+      // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
-      Hasher.Add(static_cast<uint64_t>(SpinEnv && SpinEnv[0] == '1'));
+      uint64_t SpinK = 0;
+      if (SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0') {
+        const long V = strtol(SpinEnv, nullptr, 10);
+        SpinK = (V >= 2 && V <= 1024) ? static_cast<uint64_t>(V) : 8;
+      }
+      Hasher.Add(SpinK);
     }
 
     // The scope option itself, because it decides whether the process runs as a
