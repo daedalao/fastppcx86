@@ -1047,7 +1047,13 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   DispatcherEnd = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
-  // Generate ABI bridge stubs for all FallbackABI types
+  // Generate ABI bridge stubs for all FallbackABI types. Bounds are exported
+  // separately (FABIStubsBegin/End): these live past DispatcherEnd, and the
+  // signal delegator's async-defer gate must treat them as in-JIT windows —
+  // an immediate delivery here interrupts a host-call crossing whose
+  // in-flight x87-pass state exists only in registers (the 2026-08-13
+  // signal-storm x87 corruption; see FEXCore/Core/SignalDelegator.h).
+  FABIStubsBegin = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   {
     constexpr std::array<FallbackABI, FABI_UNKNOWN> ABIS {{
       FABI_F80_I16_F32_PTR,
@@ -1073,6 +1079,7 @@ void PPC64Dispatcher::EmitDispatcher() {
       ABIPointers[ABI] = GenerateABICall(ABI);
     }
   }
+  FABIStubsEnd = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
   // Flush instruction cache for entire generated region. This was one of three
   // copy-pasted inline-asm blocks; it is now the shared helper, which also adds
@@ -1595,6 +1602,8 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
   return FEXCore::SignalDelegatorConfig {
     .DispatcherBegin = DispatcherBegin,
     .DispatcherEnd   = DispatcherEnd,
+    .FABIStubsBegin  = FABIStubsBegin,
+    .FABIStubsEnd    = FABIStubsEnd,
 
     .AbsoluteLoopTopAddress        = DispatcherLoopTopAddress,
     .AbsoluteLoopTopAddressFillSRA = DispatcherLoopTopFillSRAAddress,

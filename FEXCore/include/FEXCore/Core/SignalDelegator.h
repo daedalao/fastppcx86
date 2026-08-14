@@ -29,6 +29,15 @@ struct SignalDelegatorConfig {
   uint64_t DispatcherBegin;
   uint64_t DispatcherEnd;
 
+  // FABI bridge stubs (PPC64LE GenerateABICall): emitted into the dispatcher
+  // blob AFTER DispatcherEnd is captured, so they need their own bounds. An
+  // async signal landing here is mid-host-call-crossing with in-flight
+  // x87-pass state living only in registers; delivery MUST defer to the next
+  // block boundary like any other in-JIT window, or a guest handler round
+  // trip desyncs the x87 stack (the 2026-08-13 signal-storm x87 corruption).
+  uint64_t FABIStubsBegin {};
+  uint64_t FABIStubsEnd {};
+
   // Dispatcher entrypoint.
   uint64_t AbsoluteLoopTopAddress {};
   uint64_t AbsoluteLoopTopAddressFillSRA {};

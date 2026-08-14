@@ -233,6 +233,13 @@ private:
     return Address >= Config.DispatcherBegin && Address < Config.DispatcherEnd;
   }
 
+  // The FABI bridge stubs are emitted past DispatcherEnd (see the config
+  // struct comment). A PC here is a host-call crossing in flight: async
+  // signals must defer exactly as for JIT-buffer PCs.
+  bool IsAddressInFABIStubs(uint64_t Address) const {
+    return Address >= Config.FABIStubsBegin && Address < Config.FABIStubsEnd;
+  }
+
   /*
    * Signal frames on 32-bit architecture needs to match exactly how the kernel generates the frame.
    * This is because large parts of the signal frame definition is part of the UAPI.

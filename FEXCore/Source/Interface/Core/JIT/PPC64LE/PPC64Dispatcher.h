@@ -72,6 +72,8 @@ private:
   // Code range of the dispatcher (for IsAddressInDispatcher)
   uint64_t DispatcherBegin {};
   uint64_t DispatcherEnd   {};
+  uint64_t FABIStubsBegin  {};
+  uint64_t FABIStubsEnd    {};
 
   // Dispatcher loop top: entered with SRA already filled.
   uint64_t DispatcherLoopTopAddress {};

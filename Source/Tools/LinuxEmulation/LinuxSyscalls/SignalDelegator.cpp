@@ -1271,7 +1271,8 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   // then block entry), so a deferred signal always drains at a boundary
   // where the register state is coherent.
   const uint64_t DeferPc = ArchHelpers::Context::GetPc(UContext);
-  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, DeferPc) || IsAddressInDispatcher(DeferPc);
+  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, DeferPc) || IsAddressInDispatcher(DeferPc) ||
+                              IsAddressInFABIStubs(DeferPc);
   const bool MustDeferAsync = MustDeferSignal || InJIT_ForDefer;
   SIGTRACE("GUEST sig=%d code=%d pc=0x%lx rip=0x%lx defer=%d injit=%d q=%zu", Signal, SigInfo.si_code,
            ArchHelpers::Context::GetPc(UContext), (unsigned long)Thread->CurrentFrame->State.rip, MustDeferSignal ? 1 : 0,
