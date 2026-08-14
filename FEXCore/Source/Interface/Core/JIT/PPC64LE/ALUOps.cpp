@@ -2695,7 +2695,13 @@ DEF_OP(Parity) {
 //   bit 0 = V (XER.OV), bit 1 = C (XER.CA), bit 2 = Z (CR0.EQ), bit 3 = N (CR0.LT).
 DEF_OP(RmifNZCV) {
   auto Op   = IROp->C<IR::IROp_RmifNZCV>();
-  auto Src  = GetReg(Op->Src);
+  // IR.json declares Src Inline:"Zero" — a constant-zero Src arrives as an
+  // OP_INLINECONSTANT with no RA assignment, so a plain GetReg reads a stale
+  // register byte. GetZeroableReg maps that case to r0 (pinned 0 by the JIT
+  // invariant; a normal register operand in rldicl/mr below). Found via
+  // gcc-target asm-flag-6 at MAXINST=1: STC's RMIF read the PREVIOUS block's
+  // setcc result register instead of 0, flipping CF cross-block.
+  auto Src  = GetZeroableReg(Op->Src);
   uint8_t Rotate = Op->Rotate & 63;
   uint8_t Mask   = Op->Mask & 0xF;
   if (Mask == 0) return;
@@ -2829,7 +2835,9 @@ DEF_OP(CondAddNZCV) {
   // Taken: NZCV from Src1+Src2.
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
-  GPR S1 = GetReg(Op->Src1);
+  // Src1 is Inline:"Zero" in IR.json — inline-zero has no RA assignment, so
+  // plain GetReg reads garbage; GetZeroableReg maps it to r0 (pinned 0).
+  GPR S1 = GetZeroableReg(Op->Src1);
   if (IROp->Size == IR::OpSize::i32Bit) {
     sldi(TMP1, S1, 32);
     if (S2Inline) LoadConstant(TMP2, Const << 32);
@@ -2873,7 +2881,9 @@ DEF_OP(CondSubNZCV) {
   // Taken: NZCV from Src1 - Src2.
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
-  GPR S1 = GetReg(Op->Src1);
+  // Src1 is Inline:"Zero" in IR.json — inline-zero has no RA assignment, so
+  // plain GetReg reads garbage; GetZeroableReg maps it to r0 (pinned 0).
+  GPR S1 = GetZeroableReg(Op->Src1);
   if (IROp->Size == IR::OpSize::i32Bit) {
     sldi(TMP1, S1, 32);
     if (S2Inline) LoadConstant(TMP2, Const << 32);

@@ -992,8 +992,12 @@ DEF_OP(StoreMemPair) {
 
   if (Op->Class == IR::RegClass::GPR) {
     GPR Base = ComputeOffsetAddrInto(*this, Addr, Offset, TMP1);
-    auto S1 = GetReg(Op->Value1);
-    auto S2 = GetReg(Op->Value2);
+    // Value1/Value2 are Inline:"Zero" in IR.json — an inline-zero operand has
+    // no RA assignment and plain GetReg reads a stale register byte (same
+    // class as the RmifNZCV STC bug). No current producer passes GPR inline
+    // zeros here, but the IR contract permits it; map them to r0 (pinned 0).
+    auto S1 = GetZeroableReg(Op->Value1);
+    auto S2 = GetZeroableReg(Op->Value2);
     // D-form, same reasoning as LoadMemPair.
     const int16_t S = static_cast<int16_t>(Stride);
     switch (IROp->Size) {
@@ -1442,7 +1446,10 @@ DEF_OP(MemSet) {
   if (Op->Prefix.IsInvalid()) {
     Base = AddrIn;
   } else {
-    GPR Prefix = GetReg(Op->Prefix);
+    // Prefix is Inline:"Zero" in IR.json — an inlined zero segment base has no
+    // RA assignment, so plain GetReg reads a stale register byte and the fill
+    // address gets a garbage offset. GetZeroableReg maps it to r0 (pinned 0).
+    GPR Prefix = GetZeroableReg(Op->Prefix);
     add(TMP1, Prefix, AddrIn);
     Base = TMP1;
   }
