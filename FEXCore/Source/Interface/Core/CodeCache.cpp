@@ -311,6 +311,10 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(SPLITLOCKINLINECONTAINED);
     HASH_OPT(KERNELUNALIGNEDATOMICBACKPATCHING);
     HASH_OPT(VOLATILEMETADATA);
+    // The DFCE toggles change emitted flag code wholesale (and DISABLEDFCE
+    // also disables the pipeline's only dead-code elimination).
+    HASH_OPT(DISABLEDFCE);
+    HASH_OPT(DISABLEDFCESTOREELIM);
     HASH_STR_OPT(EXTENDEDVOLATILEMETADATA);
 
     // SMC. SMCSemanticPatch in particular changes constant materialisation
