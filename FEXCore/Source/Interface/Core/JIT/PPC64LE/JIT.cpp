@@ -3559,6 +3559,22 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       case IR::OP_INLINECONSTANT:
       case IR::OP_INLINEENTRYPOINTOFFSET:
         break;
+      // Flag-producing ALU ops: HasSideEffects=true in IR.json because they
+      // write NZCV/PF, but on this backend that is register/CR/XER state
+      // only (verified lowering-by-lowering for the TSO pair-elision
+      // whitelist) — exactly the "this thread's guest state" the region
+      // definition allows. Without these the canonical poll shape
+      // (LoadMemTSO + SubWithFlags(test) + CondJump) rejects its own region:
+      // the production redDispatcher spin was never getting hints OR
+      // collapse until this list existed.
+      case IR::OP_SUBWITHFLAGS:
+      case IR::OP_ADDWITHFLAGS:
+      case IR::OP_SUBNZCV:
+      case IR::OP_ADDNZCV:
+      case IR::OP_TESTNZ:
+      case IR::OP_TESTZ:
+      case IR::OP_ANDWITHFLAGS:
+        break;
       default:
         if (IR::HasSideEffects(IROp->Op)) {
           Info.Clean = false;
