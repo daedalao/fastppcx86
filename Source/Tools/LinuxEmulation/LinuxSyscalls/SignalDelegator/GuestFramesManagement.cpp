@@ -620,8 +620,16 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
   // Store where the host context lives in the guest stack.
   *(uint64_t*)HostStackLocation = (uint64_t)ContextBackup;
 
-  // We have extended float information
-  guest_uctx->uc_flags = FEXCore::x86_64::UC_FP_XSTATE | FEXCore::x86_64::UC_SIGCONTEXT_SS | FEXCore::x86_64::UC_STRICT_RESTORE_SS;
+  // Advertise UC_FP_XSTATE only when the fpstate area actually carries the
+  // extended xstate blob. Without AVX, the frame allocation above reserved a
+  // plain _libc_fpstate (no xstate header at all) and SetXStateInfo below
+  // writes magic1 = 0 / extended_size = 0 -- a real kernel never sets
+  // UC_FP_XSTATE for such a frame, and applications that trust uc_flags over
+  // sw_reserved.magic1 would read garbage past the fpstate.
+  guest_uctx->uc_flags = FEXCore::x86_64::UC_SIGCONTEXT_SS | FEXCore::x86_64::UC_STRICT_RESTORE_SS;
+  if (SupportsAVX) {
+    guest_uctx->uc_flags |= FEXCore::x86_64::UC_FP_XSTATE;
+  }
 
   // Pointer to where the fpreg memory is
   guest_uctx->uc_mcontext.fpregs = reinterpret_cast<FEXCore::x86_64::_libc_fpstate*>(FPStateLocation);
@@ -901,8 +909,12 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
   ContextBackup->UContextLocation = SigFrameLocation;
   ContextBackup->SigInfoLocation = 0; // Part of frame.
 
-  // We have extended float information
-  guest_uctx->uc.uc_flags = FEXCore::x86::UC_FP_XSTATE;
+  // Advertise UC_FP_XSTATE only when the fpstate area actually carries the
+  // extended xstate blob -- same rationale as SetupFrame_x64: without AVX the
+  // allocation above is a plain _libc_fpstate and SetXStateInfo writes
+  // magic1 = 0, so claiming extended state here would lie to applications
+  // that trust uc_flags over sw_reserved.magic1.
+  guest_uctx->uc.uc_flags = SupportsAVX ? FEXCore::x86::UC_FP_XSTATE : 0;
   guest_uctx->uc.uc_link = 0;
 
   // Pointer to where the fpreg memory is
