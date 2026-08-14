@@ -3649,6 +3649,32 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       // PhysicalRegisters — all value linkage is matched by register, the
       // mask-elision lesson.
       if (SpinCollapseEnabled) {
+        // Stationary-poll gate. The counted-decrement match below cannot by
+        // itself distinguish the redDispatcher spin (polls ONE address every
+        // iteration; the leftover budget is dead on the found exit) from a
+        // strlen/memchr-class scan (advances a pointer each iteration; the
+        // leftover count is LIVE — it becomes a length). Collapsing a scan
+        // corrupts that length: CP2077 SIGSEGV'd 7s into bootstrap when the
+        // v1 matcher collapsed loader scans. A scan must increment something,
+        // so require the whole region to contain NO OP_ADD and no integer
+        // Sub other than the budget decrement; the poll address must come
+        // from a fixed base (EntrypointOffset / SRA register), which this
+        // enforces indirectly.
+        bool RegionStationary = true;
+        uint32_t RegionSubCount = 0;
+        for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
+          for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
+            if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
+              RegionStationary = false;
+              break;
+            }
+            if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
+              RegionStationary = false;
+              break;
+            }
+          }
+        }
+
         IR::Ref SubNode = nullptr;
         const IR::IROp_Header* SubHdr = nullptr;
         IR::PhysicalRegister SubSrcPR = IR::PhysicalRegister::Invalid();
@@ -3700,7 +3726,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
           }
         }
 
-        if (SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
+        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
           auto JOp = BranchHdr->C<IR::IROp_CondJump>();
           uint64_t JC = 0;
           const bool ShapeOK = JOp->VCmpElementSize == IR::OpSize::iInvalid && !JOp->FromNZCV &&
@@ -3711,7 +3737,29 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             const auto Cmp1PR = ArgPR(JOp->Cmp1);
             const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
                                 (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
+            // Final scan-shape discriminator: an index-addressed scan
+            // (`movzbl (%rdi,%rcx),%eax; dec %rcx; jnz`) has no Add in the
+            // region and still leaves a LIVE count on the found exit — the
+            // budget register addresses the load. A stationary poll never
+            // feeds its budget into a load address; reject the region if any
+            // load in it does.
+            bool BudgetAddressesLoad = false;
             if (Linked) {
+              for (uint32_t ri = ti; ri <= bi && !BudgetAddressesLoad; ++ri) {
+                for (auto [LNode, LOp] : IR->GetCode(Blocks[ri].Node)) {
+                  if (LOp->Op != IR::OP_LOADMEM && LOp->Op != IR::OP_LOADMEMTSO) {
+                    continue;
+                  }
+                  auto MOp = LOp->C<IR::IROp_LoadMem>();
+                  if (ArgPR(MOp->Addr).Raw == SubSrcPR.Raw ||
+                      (!MOp->Offset.IsInvalid() && ArgPR(MOp->Offset).Raw == SubSrcPR.Raw)) {
+                    BudgetAddressesLoad = true;
+                    break;
+                  }
+                }
+              }
+            }
+            if (Linked && !BudgetAddressesLoad) {
               SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
               SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
             }
