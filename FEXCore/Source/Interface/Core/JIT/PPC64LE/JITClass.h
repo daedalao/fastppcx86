@@ -964,6 +964,12 @@ private:
   bool AESMaskCached = false;
   void InvalidateAESCache() { AESMaskCached = false; }
 
+  // Emit-time "CR1 currently mirrors XER" flag for the ProjectXERToCR1 cache.
+  // Lifecycle owned by CompileCode: reset at block entry, cleared after every
+  // op not on the verified no-XER/CR1-write allowlist (see the post-handler
+  // switch in CompileCode and the rationale in ProjectXERToCR1).
+  bool XERProjectionValid = false;
+
   // Shared SHA-256 four-round emitter for VSha256H (returns ABCD half) and
   // VSha256H2 (returns EFGH half). Fully inline: vshasigmaw ST=1 for both
   // big-Sigma functions, vsel-form Ch/Maj, vsldoi lane rotations. Borrows two

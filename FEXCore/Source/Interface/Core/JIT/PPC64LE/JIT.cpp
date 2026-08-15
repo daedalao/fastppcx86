@@ -1542,13 +1542,25 @@ uint32_t PPC64JITCore::XEROVBitIndex() const {
 }
 
 void PPC64JITCore::ProjectXERToCR1() {
-  if (ProjectXERUsesMcrxrx()) {
-    mcrxrx(1);  // CR1: LT=OV, GT=OV32, EQ=CA, SO=CA32
+  // Emit-time projection cache: consecutive C/V-consuming conditions within a
+  // block (setcc pairs, float-compare consumers — profiled at 2x projections
+  // per FCmp consumer in countersunk's hydro heap code and visible in W3's
+  // in-world flag traffic) re-project identical XER state. The flag is
+  // maintained by CompileCode: reset at block entry, and cleared AFTER every
+  // op whose handler is not on the no-XER/CR1-write allowlist — post-handler
+  // (not pre) because an op may project and THEN write XER inside one handler
+  // (CondAdd/CondSubNZCV's addco_/subfco_ after MapNZCVCC).
+  if (XERProjectionValid) {
     return;
   }
-  mfspr(TMP1, 1);
-  rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
-  mtocrf(0x40, TMP2);
+  if (ProjectXERUsesMcrxrx()) {
+    mcrxrx(1);  // CR1: LT=OV, GT=OV32, EQ=CA, SO=CA32
+  } else {
+    mfspr(TMP1, 1);
+    rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
+    mtocrf(0x40, TMP2);
+  }
+  XERProjectionValid = true;
 }
 
 // -------------------------------------------------------------------------
@@ -4455,6 +4467,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // A block can be entered from anywhere; nothing about the previously
     // emitted block's trailing register contents may be assumed here.
     InvalidateAESCache();
+    XERProjectionValid = false;
 
     PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
@@ -4500,6 +4513,24 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         Op_Unhandled(IROp, CodeNode);
       }
       DynVRSpillMask = ~0u;
+
+      // XER->CR1 projection cache lifecycle (see ProjectXERToCR1): cleared
+      // AFTER the handler — an op may project then write XER within one
+      // handler (CondAdd/CondSubNZCV), so a pre-dispatch clear would leave a
+      // stale projection visible to an allowlisted successor. The allowlist
+      // is ops verified to write neither XER nor any CR field: the NZCVSelect
+      // family (MapNZCVCC writes CR3 composites and CR1 only via the
+      // projection itself), plain register moves, and constants.
+      switch (IROp->Op) {
+      case IR::OP_NZCVSELECT:
+      case IR::OP_NZCVSELECTV:
+      case IR::OP_NZCVSELECTINCREMENT:
+      case IR::OP_STOREREGISTER:
+      case IR::OP_LOADREGISTER:
+      case IR::OP_CONSTANT:
+      case IR::OP_INLINECONSTANT: break;
+      default: XERProjectionValid = false; break;
+      }
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
                           Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? static_cast<size_t>(Op) :
