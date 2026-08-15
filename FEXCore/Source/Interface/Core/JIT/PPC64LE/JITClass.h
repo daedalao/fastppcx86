@@ -432,6 +432,12 @@ private:
   bool SpinCollapseEnabled {};
   fextl::vector<bool> SpinCollapseSubs;
   fextl::vector<bool> SpinCollapseBranches;
+  // Backedges matched from the SGT-0 idiom (`test old,old; jg`) rather than
+  // NEQ-1 (`dec; jne`). Their batched compare must be SIGNED: a negative
+  // value must exit the loop as the original SGT would, where the unsigned
+  // `old >u K` reads it as huge and would spin forever (the NEQ shape only
+  // ever coarsens — its worst case is exiting early).
+  fextl::vector<bool> SpinCollapseBranchSigned;
 
   bool IsSpinCollapseSub(IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
@@ -440,6 +446,10 @@ private:
   bool IsSpinCollapseBranch(IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     return ID < SpinCollapseBranches.size() && SpinCollapseBranches[ID];
+  }
+  bool IsSpinCollapseBranchSigned(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseBranchSigned.size() && SpinCollapseBranchSigned[ID];
   }
 
   // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.

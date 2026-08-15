@@ -3546,6 +3546,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
   // checks in the accessors cover compiles where this function never runs.
   SpinCollapseSubs.assign(IR->GetSSACount(), false);
   SpinCollapseBranches.assign(IR->GetSSACount(), false);
+  SpinCollapseBranchSigned.assign(IR->GetSSACount(), false);
 
   fextl::vector<BlockInfo> Blocks;
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
@@ -3769,8 +3770,20 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
           auto JOp = BranchHdr->C<IR::IROp_CondJump>();
           uint64_t JC = 0;
+          // Two counted-decrement backedge idioms, identical batched form
+          // (keep spinning iff old > K, consuming min(old, K) per iteration):
+          //   NEQ-1 : `dec ecx; jne`            — branch on old != 1
+          //   SGT-0 : `mov eax,ecx; dec ecx; test eax,eax; jg`
+          //           — branch on old >s 0. This is CP2077's redDispatcher
+          //           worker loop (the 40-50%-of-profile block); the v1
+          //           matcher only knew NEQ-1 and walked straight past it.
+          // SGT needs the SIGNED batched compare (see
+          // SpinCollapseBranchSigned in JITClass.h).
+          const bool CondIsInline = IsInlineConstant(JOp->Cmp2, &JC);
+          const bool ShapeNEQ = JOp->Cond == IR::CondClass::NEQ && CondIsInline && JC == 1;
+          const bool ShapeSGT = JOp->Cond == IR::CondClass::SGT && CondIsInline && JC == 0;
           const bool ShapeOK = JOp->VCmpElementSize == IR::OpSize::iInvalid && !JOp->FromNZCV &&
-                               JOp->Cond == IR::CondClass::NEQ && IsInlineConstant(JOp->Cmp2, &JC) && JC == 1 &&
+                               (ShapeNEQ || ShapeSGT) &&
                                JOp->CompareSize == SubHdr->Size &&
                                IR->GetOp<IR::IROp_CodeBlock>(JOp->TrueBlock)->ID == TargetID;
           if (ShapeOK) {
@@ -3861,6 +3874,9 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             if (Linked && !ForeignReader) {
               SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
               SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
+              if (ShapeSGT) {
+                SpinCollapseBranchSigned[IR->GetID(BranchNode).Value] = true;
+              }
               // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop so a
               // misbehaving title can be attributed to a guest RIP without a
               // debugger (compile-time event, low volume).

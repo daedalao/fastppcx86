@@ -527,14 +527,22 @@ DEF_OP(CondJump) {
     // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
     CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
   } else if (IsSpinCollapseBranch(Node)) {
-    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): this is the
-    // spin backedge `old != 1` of a matched counted-decrement pair whose Sub
-    // now retires K budget per iteration. Exit exactly when the batched
-    // decrement lands on 0, i.e. keep spinning iff old >u K. Unsigned
-    // compare: the budget is a canonicalized zero-extended value. cr7, no Rc.
-    cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): the spin
+    // backedge of a matched counted-decrement pair whose Sub now retires K
+    // budget per iteration. Exit exactly when the batched decrement lands on
+    // 0, i.e. keep spinning iff old > K. Compare signedness follows the
+    // matched idiom: NEQ-1 (`dec; jne`) budgets are canonicalized
+    // zero-extended values — unsigned cmpldi, worst case is exiting early;
+    // SGT-0 (`test; jg` — CP2077's redDispatcher worker loop) must use the
+    // SIGNED cmpdi so a negative value exits like the original branch would,
+    // where `>u K` would read it as huge and spin forever. cr7, no Rc.
+    if (IsSpinCollapseBranchSigned(Node)) {
+      cmpdi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+    } else {
+      cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+    }
     // BO=12 (branch if set), BI=29 (cr7.GT): TrueBlock (the backedge) taken
-    // while old >u K.
+    // while old > K.
     CC = {12, 29};
   } else {
     // Route the compare through cr(7) so we don't disturb CR0 / XER.
