@@ -2651,12 +2651,55 @@ DEF_OP(MaskGenerateFromBitWidth) {
 // =========================================================================
 // NZCV flag manipulation ops
 // These track the x86 EFLAGS through the CpuStateFrame flags array.
-// The ARM64 backend uses a dedicated NZCV register; we use CR0.
-// For now these are all no-ops or simple mappings.
+// The ARM64 backend uses a dedicated NZCV register; we use CR0 for N/Z and
+// XER.CA/OV for C/V. Every op the frontend can emit needs a real lowering:
+// SetSmallNZV sat here as a "handled by context" nop and became live — and
+// wrong — the day SupportsFlagM turned on.
 // =========================================================================
 
 // InvalidateFlags is handled purely in IR passes; no JIT op handler needed.
-DEF_OP(SetSmallNZV)       { /* nop — handled by context */ }
+DEF_OP(SetSmallNZV) {
+  // SETF8/SETF16 contract (IR.json): Src holds a small result whose bits are
+  // valid up to and including bit <sz> (the frontend computes 8/16-bit INC/DEC
+  // at i32Bit):
+  //   N = Src<sz-1>   Z = (Src<sz-1:0> == 0)   V = Src<sz> ^ Src<sz-1>
+  //   C preserved.
+  // This was a nop stub — unreachable dead code until SupportsFlagM went on
+  // (5c91fdb86): the frontend only emits SetSmallNZV on FlagM backends, so
+  // every 8/16-bit INC/DEC left N/Z stale from the previous CR0 writer.
+  // Steam's CEF processes died on the resulting branches within seconds of
+  // client start (2026-08-14 early-exit).
+  //
+  // N/Z: record-form sign-extend — extsb./extsh. sets CR0 by comparing the
+  // sign-extended result with zero, so LT = sign = N and EQ = small==0 = Z.
+  // CR0.GT/SO are don't-care in the NZCV domain: CondAdd/CondSubNZCV's
+  // addco_/subfco_ already leave them arbitrary, and MapNZCVCC reads only
+  // LT/EQ plus the CR1 XER projection for C/V.
+  //
+  // V: isolate (Src<sz> ^ Src<sz-1>), place it at bit 62, and addo it to
+  // itself: 2^62 + 2^62 signed-overflows into the sign bit exactly when the
+  // bit is set, so XER.OV = V with no mfspr/mtspr round-trip (mtspr XER is
+  // execution-serializing on POWER8) and no CA or CR0 write. OV32 ends up 0,
+  // which is fine: both XER->CR1 projection layouts read OV, never OV32
+  // (XEROVBitIndex). XER.SO goes sticky when V=1, matching every other OE
+  // user; nothing reads XER.SO (see ProjectXERToCR1 block comment).
+  auto Op        = IROp->C<IR::IROp_SetSmallNZV>();
+  auto Src       = GetReg(Op->Src);
+  const unsigned SignBit = (IROp->Size == IR::OpSize::i8Bit) ? 7 : 15;
+
+  if (IROp->Size == IR::OpSize::i8Bit) {
+    extsb_(TMP1, Src);
+  } else {
+    extsh_(TMP1, Src);
+  }
+
+  srdi(TMP2, Src, SignBit);        // bit1:0 = Src<sz:sz-1>
+  srdi(TMP3, TMP2, 1);             // bit0   = Src<sz>
+  xor_(TMP2, TMP2, TMP3);          // bit0   = V (upper bits garbage)
+  rldicl(TMP2, TMP2, 0, 63);       // isolate bit 0
+  sldi(TMP2, TMP2, 62);
+  addo(TMP2, TMP2, TMP2);          // XER.OV = V; CA and CR0 untouched
+}
 // CarryInvert is implemented below alongside LoadNZCV/StoreNZCV.
 DEF_OP(AXFlag) {
   // ARM AXFLAG: converts ARM FCMP-format NZCV into x86-EFLAGS-mapped NZCV.
