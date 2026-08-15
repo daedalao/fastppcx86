@@ -388,6 +388,11 @@ private:
 
   void AnalyzeSpinLoops();
 
+  // FEX_SPINHINT_ANYLOOP=1: drop the stationary-poll requirement on the SMT
+  // priority hint, restoring the pre-fix behaviour where any load-carrying
+  // backedge was hinted. Bisect switch only — the default is the gated form.
+  bool SpinHintAnyLoop {};
+
   // -------------------------------------------------------------------------
   // FEX_SPINCOLLAPSE=1 (opt-in): batched budget decrement for counted
   // spin-poll loops — the RED4 redDispatcher shape (guest RIP 0x37fff37530a0

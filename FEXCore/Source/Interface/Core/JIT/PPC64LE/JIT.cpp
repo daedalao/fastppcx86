@@ -2495,6 +2495,13 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // Spin-loop SMT priority hints: pure nop-class emission, safe under every
   // other feature combination, so only the explicit kill switch gates it.
   SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
+  // Field bisect switch for the stationary-poll requirement added to the hint
+  // (see AnalyzeSpinLoops): FEX_SPINHINT_ANYLOOP=1 restores the old behaviour
+  // of hinting every load-carrying backedge, for A/B against a regression.
+  {
+    const char* AnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
+    SpinHintAnyLoop = AnyEnv && AnyEnv[0] == '1';
+  }
 
   // FEX_SPINCOLLAPSE=1: batched budget decrement for counted spin loops
   // (opt-in while the per-app exposure is gathered; see the contract at
@@ -3675,7 +3682,48 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
         continue;
       }
-      if (SpinLoopHintEnabled) {
+      // Stationary-poll gate, required by BOTH consumers below.
+      //
+      // For the collapse it separates the redDispatcher spin (polls ONE
+      // address every iteration; the leftover budget is dead on the found
+      // exit) from a strlen/memchr-class scan (advances a pointer each
+      // iteration; the leftover count is LIVE — it becomes a length).
+      // Collapsing a scan corrupts that length: CP2077 SIGSEGV'd 7s into
+      // bootstrap when the v1 matcher collapsed loader scans.
+      //
+      // For the SMT hint it separates "spinning" from "working", and getting
+      // that wrong is expensive rather than merely wasteful: the backedge
+      // hint is `or 31,31,31`, VERY LOW thread priority. The structural
+      // tests above (a load, a backedge, no side effects) are equally true of
+      // every hash, strlen, and memcpy-shaped loop, so those were all being
+      // told to yield the core while doing real work. Measured on CP2077's
+      // FNV-1a string hash (the 3.6%-of-profile block once the worker spin
+      // was collapsed): 67.7 MB/s hinted vs 170.6 MB/s unhinted with a busy
+      // SMT sibling, and 193 MB/s unhinted alone — a 2.5x loss on a loop that
+      // was never a spin. A scan must increment something, so require the
+      // whole region to contain NO OP_ADD and no integer Sub other than the
+      // counted decrement; a genuine poll re-reads a fixed base
+      // (EntrypointOffset / SRA register), which this enforces indirectly.
+      //
+      // False negatives are cheap here (a spin that also increments simply
+      // keeps normal priority); false positives cost 2.5x. Gate accordingly.
+      bool RegionStationary = true;
+      uint32_t RegionSubCount = 0;
+      for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
+        for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
+          if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
+            RegionStationary = false;
+            break;
+          }
+          if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
+            RegionStationary = false;
+            break;
+          }
+        }
+      }
+
+      const bool RegionHinted = SpinLoopHintEnabled && (RegionStationary || SpinHintAnyLoop);
+      if (RegionHinted) {
         PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
       }
 
@@ -3686,31 +3734,6 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       // PhysicalRegisters — all value linkage is matched by register, the
       // mask-elision lesson.
       if (SpinCollapseEnabled) {
-        // Stationary-poll gate. The counted-decrement match below cannot by
-        // itself distinguish the redDispatcher spin (polls ONE address every
-        // iteration; the leftover budget is dead on the found exit) from a
-        // strlen/memchr-class scan (advances a pointer each iteration; the
-        // leftover count is LIVE — it becomes a length). Collapsing a scan
-        // corrupts that length: CP2077 SIGSEGV'd 7s into bootstrap when the
-        // v1 matcher collapsed loader scans. A scan must increment something,
-        // so require the whole region to contain NO OP_ADD and no integer
-        // Sub other than the budget decrement; the poll address must come
-        // from a fixed base (EntrypointOffset / SRA register), which this
-        // enforces indirectly.
-        bool RegionStationary = true;
-        uint32_t RegionSubCount = 0;
-        for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
-          for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
-            if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
-              RegionStationary = false;
-              break;
-            }
-            if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
-              RegionStationary = false;
-              break;
-            }
-          }
-        }
 
         IR::Ref SubNode = nullptr;
         const IR::IROp_Header* SubHdr = nullptr;
@@ -3966,8 +3989,10 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         }
       }
       // Every edge from a region block to a block outside [ti, bi] restores
-      // medium priority.
-      if (SpinLoopHintEnabled) {
+      // medium priority — but only where a backedge hint actually lowered it.
+      // Emitting restores for an unhinted region would be pure padding, and
+      // worse, would raise the priority of a thread this region never lowered.
+      if (RegionHinted) {
         for (uint32_t ri = ti; ri <= bi; ++ri) {
           for (const uint32_t T : Blocks[ri].Targets) {
             if (T == UINT32_MAX || T >= NumBlocks) {
