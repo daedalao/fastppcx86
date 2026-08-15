@@ -242,6 +242,25 @@ public:
     return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
   }
 
+  // Side-effect-free "is somebody holding this exclusively?" query, for
+  // assertions of the form "my caller must already hold this write-locked".
+  //
+  // Those assertions used to be written as `try_lock() == false`, which is a
+  // trap: LOGMAN_THROW_A_FMT expands to `(void)(pred)` when assertions are
+  // compiled out, so the predicate is still *evaluated* and a violating caller
+  // silently acquires the lock and never releases it. The contract violation
+  // then surfaces as an unattributable hang at the next lock_shared() rather
+  // than as a diagnostic. Observed while embedding FEXCore without the Linux
+  // frontend: a caller of InvalidateCodeBuffersCodeRange that had not taken
+  // GetCodeInvalidationMutex() deadlocked inside ExitFunctionLink, in a
+  // Release build, with no message at all.
+  //
+  // This cannot distinguish "held by me" from "held by another thread"; it is
+  // only meaningful for the single-owner assertion described above.
+  bool is_write_owned() const {
+    return (std::atomic_ref<uint32_t>(const_cast<uint32_t&>(Futex)).load(std::memory_order_relaxed) & WRITE_OWNED_BIT) != 0;
+  }
+
   // Can race with other threads trying to lock shared!
   bool try_lock_shared() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
