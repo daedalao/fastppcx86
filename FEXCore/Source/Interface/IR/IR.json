@@ -3300,6 +3300,19 @@
         "HasSideEffects": true,
         "X87": true
       },
+      "GPR = F80CmpValueX86 FPR:$X80Src": {
+        "Desc": [
+          "Fused FCOMI/FUCOMI compare: value at the top of the stack vs $X80Src,",
+          "producing the final x86-COMIS flag state plus raw PF as the GPR result —",
+          "exactly FCmpX86's contract, which the x87 stack pass lowers this to 1:1",
+          "against the resolved stack top. Emitted only under reduced-precision x87",
+          "on HostFeatures.SupportsFCmpX86 backends; always consumed by the stack",
+          "pass and must never reach a backend."
+        ],
+        "DestSize": "OpSize::i64Bit",
+        "HasSideEffects": true,
+        "X87": true
+      },
       "GPR = F80Cmp FPR:$X80Src1, FPR:$X80Src2": {
         "Desc": ["Does a scalar unordered compare and stores the flags in to a GPR",
                  "Ordering flag result is true if either float input is NaN"

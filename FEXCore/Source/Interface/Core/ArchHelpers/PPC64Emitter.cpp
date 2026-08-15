@@ -294,15 +294,16 @@ void PPC64EmitterBase::FillStaticRegs(FillMode Mode) {
   rlwinm(TMP3, TMP2, 31, 2, 2);              // Z → LSB29 (CR0.EQ)
   or_(TMP1, TMP1, TMP3);
   mtocrf(0x80, TMP1);                         // CR0 ← bits 31..28 of TMP1 (single-field form)
-  // Build XER: clear OV+CA, OR in C @ LSB29 (no shift) + V @ LSB30 (rotl 2).
-  mfspr(TMP1, 1);
-  LoadImm32(TMP3, 0x60000000u);
-  andc(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, TMP2, 0, 2, 2);                // C → XER.CA @ LSB29
-  or_(TMP1, TMP1, TMP3);
-  rlwinm(TMP3, TMP2, 2, 1, 1);                // V → XER.OV @ LSB30
-  or_(TMP1, TMP1, TMP3);
-  mtspr(1, TMP1);
+  // XER: both bits fully written, so generate them arithmetically (addic for
+  // CA, sldi-62 + addo for OV — PPC64Emitter.h helper block). This runs on
+  // EVERY dispatcher->JIT entry, and the old mfspr + mask/or + mtspr paid a
+  // serializing XER write each time. The from-bit helpers read no zero
+  // register, which matters here: r0 is NOT the JIT zero in this routine
+  // (see the r0 NOTE below).
+  rlwinm(TMP1, TMP2, 3, 31, 31);              // C (LSB29 = PPC 2) → 0/1 at LSB 0
+  SetCAFromBit(TMP1, TMP3);
+  rlwinm(TMP1, TMP2, 4, 31, 31);              // V (LSB28 = PPC 3) → 0/1 at LSB 0
+  SetOVFromBit(TMP1, TMP3);
 
   // NOTE: this routine deliberately does NOT touch r0. ExitFunctionLinker
   // smuggles the resolved host-code pointer through r0 across FillStaticRegs

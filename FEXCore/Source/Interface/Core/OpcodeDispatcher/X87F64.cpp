@@ -364,6 +364,16 @@ void OpDispatchBuilder::FCOMIF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpD
 
     _F80CmpValue(b);
     ConvertNZCVToX87();
+  } else if (CTX->HostFeatures.SupportsFCmpX86) {
+    // Fused path, mirroring Comiss (OpcodeDispatcher.h): one op produces the
+    // final post-AXFLAG x86 flag state (carry stored inverted) and returns raw
+    // PF for the register cache; the x87 stack pass lowers it to FCmpX86
+    // against the resolved stack top. No AF write — FCOMI leaves AF undefined,
+    // matching the split path's ComissFlags(InvalidateAF=true).
+    HandleNZCVWrite();
+    Ref PFRaw = _F80CmpValueX86(b);
+    SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(PFRaw);
+    CFInverted = true;
   } else {
     HandleNZCVWrite();
     _F80CmpValue(b);

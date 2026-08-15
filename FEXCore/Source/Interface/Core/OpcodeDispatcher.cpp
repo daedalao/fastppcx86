@@ -5439,6 +5439,16 @@ void OpDispatchBuilder::RDRANDOp(OpcodeArgs) {
 
   StoreResultGPR(Op, _RDRAND(Reseed));
 
+  // RDRAND is a host-flag writer: the backend leaves validity in the host NZCV
+  // (IR.json's "sets Z", AArch64's MRS-from-RNDR PSTATE = 0b0100 on failure).
+  // Any NZCV the frontend is holding in a GPR is therefore both stale and dead
+  // -- x86 RDRAND/RDSEED overwrite every arithmetic flag -- so drop it without
+  // writeback. Otherwise the read below returns _Bfe(CachedNZCV, Z) and the
+  // guest's CF comes from the previous flag writer instead of the draw
+  // (`sahf; rdrand eax` is enough to hit it). Same discipline as the REP CMPS
+  // loop's _CondSubNZCV.
+  HandleNZCVWrite();
+
   // If the rng number is valid then NZCV is 0b0000, otherwise NZCV is 0b0100
   auto CF_inv = GetRFLAG(X86State::RFLAG_ZF_RAW_LOC);
 

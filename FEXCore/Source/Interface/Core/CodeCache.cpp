@@ -290,6 +290,14 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(MAXINST);
     HASH_OPT(O0);
     HASH_OPT(SINGLESTEP);
+    // HOSTFEATURES is load-bearing on ppc64le beyond CPUID: host detection
+    // hardcodes SupportsAVX off (Source/Common/HostFeatures.cpp), so
+    // FEX_HOSTFEATURES=enableavx is the ONLY way it flips — and it changes
+    // emitted block bytes, not just what the guest sees. SpillStaticRegs /
+    // FillStaticRegs emit the AVX-high VSX bank sync only when it is set, and
+    // the context load/store lowerings redirect avx_high[] accesses into that
+    // register bank (JIT/PPC64LE/MemoryOps.cpp). Code cached with it on is
+    // unsound in a session with it off, and vice versa.
     HASH_OPT(HOSTFEATURES);
     HASH_OPT(FORCESVEWIDTH);
     HASH_OPT(X87REDUCEDPRECISION);
@@ -367,6 +375,10 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // XER arithmetic-write kill switch (PPC64Emitter.h XERArithDisabled):
+      // presence-DISABLED; flips every CA/OV write helper between the addic/
+      // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOXERARITH") != nullptr));
       // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
       // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
