@@ -354,6 +354,8 @@ uint64_t ComputeCodeCacheConfigId() {
     // presence-enabled and NO_THUNK_PARTIAL_FILL presence-disabled — mirror,
     // don't normalize.
     {
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOCONSTCACHE") != nullptr));
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSPLATFUSION") != nullptr));
       const char* ZExtEnv = getenv("FEX_ZEXTOPT");
       Hasher.Add(static_cast<uint64_t>(!(ZExtEnv && ZExtEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_FALLTHROUGH") != nullptr));

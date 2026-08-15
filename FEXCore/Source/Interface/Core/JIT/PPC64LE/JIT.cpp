@@ -4476,6 +4476,9 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // FMA handler can skip its splat. Same-block pairs only by construction.
     SplatCandidateLoads.clear();
     SplatFormLoadNodes.clear();
+    // Field kill switch (hashed into the code-cache config id).
+    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
+    if (!DisableSplatFusion)
     for (auto [CandNode, CandIROp] : IRView->GetCode(BlockNode)) {
       switch (CandIROp->Op) {
       case IR::OP_VFMLASCALARINSERT:
@@ -4573,9 +4576,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // else invalidates. Reset at block entry alongside the AES cache.
       switch (IROp->Op) {
       case IR::OP_CONSTANT: {
+        // Field kill switch (hashed into the code-cache config id).
+        static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
         auto COp = IROp->C<IR::IROp_Constant>();
         const auto PR = IR::PhysicalRegister(CodeNode);
-        if (COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+        if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
           LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
         } else {
           LastConstantCache.Valid = false;
