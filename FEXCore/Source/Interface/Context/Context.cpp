@@ -85,7 +85,7 @@ bool FEXCore::Context::ContextImpl::GuestRangeOverlapsCompiledCode(FEXCore::Core
 // the design, the PPC64LE exit-structure analysis, and the soundness argument.
 bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
 #ifdef ARCHITECTURE_ppc64le
-  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.is_write_owned(), "CodeInvalidationMutex needs to be unique_locked here");
 
   if (!Config.SMCSemanticPatch()) {
     *Reason = "flag-off";

@@ -817,7 +817,20 @@ DEF_OP(Syscall) {
   ld(r2, 24, r1);      // restore TOC
 
   // HandleSyscall returns the new guest RAX value in r3.
-  {
+  //
+  // ...but ONLY for the Linux ABIs. OS_GENERIC ("no JIT-side argument
+  // handling, spill/fill all regs") is the ABI a Wine CPU-DLL-shaped embedder
+  // selects, and there the handler owns the whole register file: it writes
+  // gregs[] in the frame directly and its C return value is meaningless.
+  // Upstream FEX expresses this as IR SyscallFlags::NORETURNEDRESULT, which
+  // this fork's Syscall IR op does not carry; the OSABI is fixed for the
+  // process, so testing it here is equivalent and needs no IR change.
+  //
+  // Measured before the fix: an OS_GENERIC handler that set gregs[RAX] had its
+  // value overwritten by this store on the way out (probe T2c).
+  const bool GenericABI = CTX->SyscallHandler && CTX->SyscallHandler->GetOSABI() == FEXCore::HLE::SyscallOSABI::OS_GENERIC;
+
+  if (!GenericABI) {
     const int32_t rax_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame,
                State.gregs[FEXCore::X86State::REG_RAX]));
@@ -864,7 +877,18 @@ DEF_OP(Syscall) {
   // Thread.cpp:103 `TM.CreateThread(0, 0, &Frame->State, ...)` hands the
   // parent's whole CPUState to a new guest thread — and a partial spill would
   // hand them a stale RSI/RDI/R8-R15.
-  if (CTX->Config.Is64BitMode()) {
+  //
+  // NOT applied to OS_GENERIC either, and this one is a correctness bound, not
+  // a tuning choice. The sentinel proves "no *signal* republished the frame".
+  // It says nothing about the handler itself having rewritten gregs[], which
+  // for OS_GENERIC is the handler's whole job: BTCpuSetContext, NtContinue,
+  // KiUserExceptionDispatcher and APC delivery all resume the guest with a
+  // register file the host just wrote. Measured before this fix (probe T2c):
+  // of 15 handler-written GPRs, only the five in ELFv2-volatile SRA slots
+  // (RAX/RCX/RDX/RBX/RBP) reached the guest; RSI, RDI and R8-R15 were silently
+  // dropped. Linux guests are unaffected — their handlers never write gregs[]
+  // except RAX, which is what the elision was designed around.
+  if (CTX->Config.Is64BitMode() && !GenericABI) {
     const int32_t isi_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
     PPC64Emitter::Label SentinelIntact;
