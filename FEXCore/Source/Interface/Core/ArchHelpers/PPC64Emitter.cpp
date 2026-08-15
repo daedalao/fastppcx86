@@ -767,20 +767,26 @@ void PPC64EmitterBase::LoadFPRSized(VR dst, GPR ea, uint32_t size) {
 void PPC64EmitterBase::SpillForABICall(GPR tmp, bool FPRs) {
   SpillStaticRegs(tmp);
   PushDynamicRegs(tmp);
-  // NB. Do NOT set InSyscallInfo=0xFFFF here. That marker means "we are
-  // currently in a JIT-emitted Syscall op" and only DEF_OP(Syscall) is
-  // allowed to raise it (ARM64 parity: `JIT/BranchOps.cpp:278`, plus
-  // ARM64's DEF_OP(ProcessorID) which is a real getcpu syscall at
-  // `JIT/MiscOps.cpp:260`; ppc64le's DEF_OP(ProcessorID) does `li r,0`
-  // and needs no marker). SpillForABICall serves every host-C-call site
-  // in the backend (thunks, CPUID, atomic helpers, AES/SHA/CRC32
-  // helpers, x87 fallbacks) and thunks in particular RE-ENTER the guest
-  // via CallbackPtr -- with the marker set, callback code runs with
-  // SpillSRA IgnoreMask=0xFFFF, so any signal arriving in the callback
-  // skips all 16 x86-64 SRA GPR spills. State.rip then gets a
-  // ContextBackup* interpreted as guest-stack, and the guest resumes
-  // with a garbage RIP. That was the 2026-07-31 Factorio crash
-  // (SIGTRACE showed isi=0xffff on every DELIVER; PC=0xaacb584c2489d700).
+  // NB. Do NOT set InSyscallInfo here — arming belongs at the CROSSING SITE,
+  // strictly after this helper returns (DEF_OP(Syscall), DEF_OP(Thunk), the
+  // FABI bridge stubs), never inside it. Two reasons, one historical and
+  // still load-bearing:
+  //  1. The marker's low bits claim "these SRA GPRs are already spilled";
+  //     raising it before SpillStaticRegs completes would let a signal
+  //     handler skip spilling registers whose frame copies are stale.
+  //  2. SpillForABICall serves every host-C-call site in the backend, and
+  //     some callees RE-ENTER the guest via CallbackPtr. Arming used to be
+  //     lethal there: callback guest code ran with SpillSRA
+  //     IgnoreMask=0xFFFF, so any signal arriving in the callback skipped
+  //     all 16 x86-64 SRA GPR spills; State.rip then got a ContextBackup*
+  //     interpreted as guest-stack and the guest resumed with a garbage RIP
+  //     — the 2026-07-31 Factorio crash (SIGTRACE showed isi=0xffff on
+  //     every DELIVER; PC=0xaacb584c2489d700). The dispatcher's CallbackPtr
+  //     entry now zeroes InSyscallInfo before any callback guest code runs
+  //     (PPC64Dispatcher.cpp), which is what makes arming across
+  //     guest-re-entering callees sound at all — but the discipline stands:
+  //     only a crossing that pairs the arm with a sentinel-checked refill
+  //     and a disarm may raise the marker.
 }
 
 void PPC64EmitterBase::FillForABICall(bool FPRs) {
@@ -791,6 +797,54 @@ void PPC64EmitterBase::FillForABICall(bool FPRs) {
   // instructions, so restore that invariant explicitly. Not a store to
   // InSyscallInfo any more.
   li(GPRegs::r0, 0);
+}
+
+void PPC64EmitterBase::ArmInSyscallSentinel(uint64_t Sentinel) {
+  // Contract in PPC64Emitter.h (kInSyscallSentinel + the declaration): emit
+  // only after the crossing's SpillForABICall, pair with
+  // FillForABICallChecked. 0x100FFFF fits LoadImm32's lis+ori.
+  LoadConstant(TMP1, Sentinel);
+  const int32_t isi_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  std(TMP1, static_cast<int16_t>(isi_off), STATE);
+}
+
+void PPC64EmitterBase::FillForABICallChecked() {
+  // 64-bit guests only — FillStaticRegs asserts this for the partial modes
+  // (the 32-bit lwz zero-extension invariant forbids skipping GPR fills).
+  PopDynamicRegs();
+
+  // Mirror of DEF_OP(Syscall)'s fill elision: SRA slots 6..15 live in
+  // r14..r23, which ELFv2 preserves across the bctrl, so when the sentinel
+  // survived — no signal delivery truncated it, no callback cleared it —
+  // those host registers still hold the exact values SpillStaticRegs
+  // published and the ten `ld`s are pure overhead. When any of those events
+  // republished the frame, the branch takes the complementary
+  // NonVolatileGPRsOnly fill first, making the pair a full refill.
+  const int32_t isi_off = static_cast<int32_t>(
+    offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  PPC64Emitter::Label SentinelIntact{};
+  ld(TMP1, static_cast<int16_t>(isi_off), STATE);
+  // TMP1 = InSyscallInfo >> 16, recording into CR0: EQ iff nothing above
+  // bit 15 survived, i.e. iff the frame was republished behind us. CR0 is
+  // dead here (host-call return); FillStaticRegs rebuilds it from the
+  // frame's packed NZCV below.
+  rldicl_(TMP1, TMP1, 48, 16);
+  // BO=4 (branch if false), BI=2 (CR0.EQ) — i.e. bne cr0.
+  bc({4, 2}, &SentinelIntact);
+  FillStaticRegs(FillMode::NonVolatileGPRsOnly);
+  Bind(&SentinelIntact);
+  FillStaticRegs(FillMode::SkipNonVolatileGPRs);
+
+  // Same tail as FillForABICall: restore the r0=0 zero-index invariant.
+  li(GPRegs::r0, 0);
+
+  // Disarm. From here on any signal treats this code as normal JIT and the
+  // full SRA spill path is correct again. Skipping the disarm would leave
+  // the mask claiming "spilled" over live SRA state — the Factorio failure
+  // class described at SpillForABICall.
+  li(TMP1, 0);
+  std(TMP1, static_cast<int16_t>(isi_off), STATE);
 }
 
 } // namespace FEXCore::CPU

@@ -67,9 +67,33 @@ DEF_OP(Constant) {
   // the ordinary value-dependent 1..5 instruction sequence. Untagged constants
   // (everything, with the flag off) take the unchanged path.
   // See Interface/Core/SMCSemanticPatch.h.
-  if (!TryInsertPatchableImmMove(Dst, Op->Constant, Op->PatchSite)) {
-    LoadConstant(Dst, Op->Constant);
+  if (Op->PatchSite != 0) {
+    if (!TryInsertPatchableImmMove(Dst, Op->Constant, Op->PatchSite)) {
+      LoadConstant(Dst, Op->Constant);
+    }
+    return;
   }
+
+  // Last-constant delta: clustered constants (rip-relative coefficient
+  // addresses in polynomial code load a fresh absolute address per use, all
+  // in the same few pages) become one addi off the previous constant's
+  // still-live register. Cache lifecycle (set/invalidate) lives in
+  // CompileCode's post-handler switch; validity here means the register
+  // provably still holds that value.
+  if (LastConstantCache.Valid) {
+    const int64_t Delta = static_cast<int64_t>(Op->Constant) - static_cast<int64_t>(LastConstantCache.Value);
+    const GPR Base = GeneralRegisters[LastConstantCache.Reg];
+    if (Delta >= -32768 && Delta <= 32767 && Base != r0 && Base != Dst) {
+      addi(Dst, Base, static_cast<int16_t>(Delta));
+      return;
+    }
+    if (Delta == 0 && Base != Dst) {
+      mr(Dst, Base);
+      return;
+    }
+  }
+
+  LoadConstant(Dst, Op->Constant);
 }
 
 DEF_OP(EntrypointOffset) {
@@ -146,6 +170,22 @@ DEF_OP(Add) {
 DEF_OP(Sub) {
   auto Op  = IROp->C<IR::IROp_Sub>();
   auto Dst = GetReg(Node);
+
+  // FEX_SPINCOLLAPSE batched budget decrement (contract at kSpinCollapseK,
+  // JITClass.h; matcher in AnalyzeSpinLoops). new = (old >u K) ? old-K : 0 —
+  // exact 0 on the budget-exhausted exit, K-granular descent otherwise.
+  // cmpldi targets cr7 (CR0 = packed NZCV) and nothing here touches XER.
+  if (IsSpinCollapseSub(Node)) {
+    auto S1 = GetReg(Op->Src1);
+    cmpldi(cr(7), S1, kSpinCollapseK);
+    addi(TMP1, S1, -static_cast<int16_t>(kSpinCollapseK));
+    li(TMP2, 0);
+    // cr7.GT = CR bit 29: old >u K selects old-K, else 0.
+    isel(Dst, TMP1, TMP2, 29);
+    if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
+    return;
+  }
+
   uint64_t C1, C2;
   bool S1Inline = IsInlineConstant(Op->Src1, &C1);
   bool S2Inline = IsInlineConstant(Op->Src2, &C2);
@@ -2246,64 +2286,71 @@ DEF_OP(AdcZeroWithFlags) {
 }
 
 DEF_OP(AdcNZCV) {
-  // Identical to AdcWithFlags except no architectural Dst writeback —
-  // we use TMP4 as a scratch result for CR0 / sign extraction.
+  // Identical to AdcWithFlags except no architectural Dst writeback — the
+  // result lands in a TMP purely for CR0 / carry / overflow extraction.
+  //
+  // CARRY POLARITY: DIRECT, in and out, exactly like DEF_OP(AdcWithFlags).
+  // The only producer of AdcNZCV is DeadFlagCalculationElimination's
+  // ReplacementNoWrite arm rewriting AdcWithFlags -> AdcNZCV when the SSA
+  // value is unused but the flag write is live, and CalculateFlags_ADC
+  // (OpcodeDispatcher/Flags.cpp) brackets that op with
+  // RectifyCarryInvert(false) before and CFInverted=false after — stored
+  // XER.CA == x86_CF on entry, and every downstream carry consumer was
+  // compiled expecting a DIRECT CA on exit. The rewrite changes the opcode
+  // tag only, never the carry convention.
+  //
+  // HISTORY (2026-08-13): both size paths here used to assume the INVERTED
+  // convention — the i64 path bracketed addeo_ with subfe/addic CA-flip
+  // pairs (carry-in and carry-out both wrong), and the i32 path materialised
+  // -(!CA) as if it were -x86_CF and stored CA-out xori-inverted. Same
+  // never-executed-handler class as the DEF_OP(Adc) polarity bug documented
+  // above: with the NoWrite arm disabled nothing ever produced AdcNZCV, so
+  // the wrong polarity could not be observed. Pinned by
+  // unittests/ASM/FEX_bugs/dfce_nowrite_adc_sbb.asm.
   auto Op = IROp->C<IR::IROp_AdcNZCV>();
   auto S1 = GetReg(Op->Src1);
   auto S2 = GetReg(Op->Src2);
 
   if (IROp->Size == IR::OpSize::i64Bit) {
-    // CFInverted=true: pre-flip XER.CA so addeo_ sees x86_CF; post-flip CA-out.
-    // Each flip is the subfe/addic pair documented at DEF_OP(CarryInvert):
-    // subfe TMP1,r0,r0 leaves 0 when CA=1 and -1 when CA=0 (and preserves CA),
-    // then addic TMP1,TMP1,1 sets CA from that value's carry-out — 0 and 1
-    // respectively — so CA is inverted in two non-serializing instructions
-    // instead of an mfspr/xoris/mtspr round trip.
-    //
-    // Critically for the POST-flip: neither subfe nor addic writes OV, SO or
-    // CR0, so the overflow and N/Z that addeo_ just produced pass through
-    // untouched. TMP1 was already this path's only scratch.
-    subfe(TMP1, r0, r0);
-    addic(TMP1, TMP1, 1);
+    // addeo_ consumes CA-in and writes CA-out in the DIRECT convention this
+    // op's producer establishes (see above) — no flips, mirroring
+    // DEF_OP(AdcWithFlags)'s i64 path with TMP3 as the discard destination.
     addeo_(TMP3, S1, S2);
-    subfe(TMP1, r0, r0);
-    addic(TMP1, TMP1, 1);
     return;
   }
 
-  // i32Bit: materialise x86_CF, compute manually, store !bit-32 as CFInverted CA.
-  // subfe(TMP4, r0, r0) = ~r0 + r0 + CA = all-ones + CA => 0 for CA=1, -1 for
-  // CA=0, i.e. -(!CA) = -x86_CF under CFInverted=true. XER survives it (its
-  // carry-out equals its carry-in, OE=Rc=0), which matters because the stored
-  // CA must still be readable... it is not read again here, but the XER tail
-  // below reads XER for the sticky SO, and CR0 must stay clean until
-  // EmitTestNZSetCR. Adding x86_CF then becomes subtracting -x86_CF.
-  subfe(TMP4, r0, r0);                      // TMP4 = -x86_CF
+  // i32Bit: mirror DEF_OP(AdcWithFlags)'s i32 path minus the Dst writeback.
+  // adde injects XER.CA (= x86_CF, direct) as the third addend. Both addends
+  // are zero-extended 32-bit values so the sum is < 2^33 and adde's own
+  // CA-out is always 0 — harmless, the XER patch below rewrites CA and OV
+  // wholesale and only reads XER for the sticky SO.
+  rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
+  rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
+  adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
 
-  rldicl(TMP1, S1, 0, 32);
-  rldicl(TMP2, S2, 0, 32);
-  add(TMP3, TMP1, TMP2);
-  subf(TMP3, TMP4, TMP3);                   // TMP3 = sum + x86_CF (33-bit)
-  rldicl(TMP4, TMP3, 0, 32);                 // TMP4 = low-32 result
-  EmitTestNZSetCR(TMP4, IR::OpSize::i32Bit);
+  // OF = (S1[31] == S2[31]) AND (S1[31] != Sum[31]); Sum[31] == TMP3[31].
+  // Derived from the zx32 copies, same formula and ordering as AdcWithFlags
+  // (no Dst here, so no alias hazard — kept in the same shape regardless).
+  xor_(TMP2, TMP2, TMP1);                   // S1^S2
+  xor_(TMP1, TMP3, TMP1);                   // Sum^S1
+  andc(TMP1, TMP1, TMP2);                   // (Sum^S1) & ~(S1^S2): OF at bit 31
+  rldicl(TMP2, TMP1, 33, 63);               // OF -> LSB (kept in TMP2)
 
-  // CFInverted CA = !(bit-32 of TMP3).
-  rldicl(TMP3, TMP3, 32, 63);
-  xori(TMP3, TMP3, 1);
+  // CA-out = bit-32 of the 33-bit sum, stored DIRECT (CFInverted=false),
+  // matching AdcWithFlags' i32 path and the dispatcher's post-op convention.
+  rldicl(TMP4, TMP3, 32, 63);
 
-  // OF = (S1[31] == S2[31]) AND (S1[31] != Result[31]).
-  rldicl(TMP1, S1,   33, 63);
-  rldicl(TMP2, S2,   33, 63);
-  rldicl(TMP4, TMP4, 33, 63);
-  xor_(TMP2, TMP2, TMP1);
-  xor_(TMP4, TMP4, TMP1);
-  andc(TMP4, TMP4, TMP2);                   // OF
+  // N/Z from the low 32 bits of the sum. EmitTestNZSetCR's i32 case is
+  // extsw_, which only reads the low word — the 33-bit TMP3 needs no
+  // pre-truncation (AdcWithFlags truncates into Dst because Dst must carry
+  // the zero-extended VALUE; there is no Dst here).
+  EmitTestNZSetCR(TMP3, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
-  // Patch XER: CA = TMP3 LSB (= !x86_CF_out), OV = TMP4 LSB.
+  // Patch XER: CA <- TMP4 LSB (direct x86_CF_out), OV <- TMP2 LSB.
   // rlwimi SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
   mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
-  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
+  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
+  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
   mtspr(1, TMP1);
 }
 
@@ -2604,12 +2651,55 @@ DEF_OP(MaskGenerateFromBitWidth) {
 // =========================================================================
 // NZCV flag manipulation ops
 // These track the x86 EFLAGS through the CpuStateFrame flags array.
-// The ARM64 backend uses a dedicated NZCV register; we use CR0.
-// For now these are all no-ops or simple mappings.
+// The ARM64 backend uses a dedicated NZCV register; we use CR0 for N/Z and
+// XER.CA/OV for C/V. Every op the frontend can emit needs a real lowering:
+// SetSmallNZV sat here as a "handled by context" nop and became live — and
+// wrong — the day SupportsFlagM turned on.
 // =========================================================================
 
 // InvalidateFlags is handled purely in IR passes; no JIT op handler needed.
-DEF_OP(SetSmallNZV)       { /* nop — handled by context */ }
+DEF_OP(SetSmallNZV) {
+  // SETF8/SETF16 contract (IR.json): Src holds a small result whose bits are
+  // valid up to and including bit <sz> (the frontend computes 8/16-bit INC/DEC
+  // at i32Bit):
+  //   N = Src<sz-1>   Z = (Src<sz-1:0> == 0)   V = Src<sz> ^ Src<sz-1>
+  //   C preserved.
+  // This was a nop stub — unreachable dead code until SupportsFlagM went on
+  // (5c91fdb86): the frontend only emits SetSmallNZV on FlagM backends, so
+  // every 8/16-bit INC/DEC left N/Z stale from the previous CR0 writer.
+  // Steam's CEF processes died on the resulting branches within seconds of
+  // client start (2026-08-14 early-exit).
+  //
+  // N/Z: record-form sign-extend — extsb./extsh. sets CR0 by comparing the
+  // sign-extended result with zero, so LT = sign = N and EQ = small==0 = Z.
+  // CR0.GT/SO are don't-care in the NZCV domain: CondAdd/CondSubNZCV's
+  // addco_/subfco_ already leave them arbitrary, and MapNZCVCC reads only
+  // LT/EQ plus the CR1 XER projection for C/V.
+  //
+  // V: isolate (Src<sz> ^ Src<sz-1>), place it at bit 62, and addo it to
+  // itself: 2^62 + 2^62 signed-overflows into the sign bit exactly when the
+  // bit is set, so XER.OV = V with no mfspr/mtspr round-trip (mtspr XER is
+  // execution-serializing on POWER8) and no CA or CR0 write. OV32 ends up 0,
+  // which is fine: both XER->CR1 projection layouts read OV, never OV32
+  // (XEROVBitIndex). XER.SO goes sticky when V=1, matching every other OE
+  // user; nothing reads XER.SO (see ProjectXERToCR1 block comment).
+  auto Op        = IROp->C<IR::IROp_SetSmallNZV>();
+  auto Src       = GetReg(Op->Src);
+  const unsigned SignBit = (IROp->Size == IR::OpSize::i8Bit) ? 7 : 15;
+
+  if (IROp->Size == IR::OpSize::i8Bit) {
+    extsb_(TMP1, Src);
+  } else {
+    extsh_(TMP1, Src);
+  }
+
+  srdi(TMP2, Src, SignBit);        // bit1:0 = Src<sz:sz-1>
+  srdi(TMP3, TMP2, 1);             // bit0   = Src<sz>
+  xor_(TMP2, TMP2, TMP3);          // bit0   = V (upper bits garbage)
+  rldicl(TMP2, TMP2, 0, 63);       // isolate bit 0
+  sldi(TMP2, TMP2, 62);
+  addo(TMP2, TMP2, TMP2);          // XER.OV = V; CA and CR0 untouched
+}
 // CarryInvert is implemented below alongside LoadNZCV/StoreNZCV.
 DEF_OP(AXFlag) {
   // ARM AXFLAG: converts ARM FCMP-format NZCV into x86-EFLAGS-mapped NZCV.
@@ -2672,7 +2762,13 @@ DEF_OP(Parity) {
 //   bit 0 = V (XER.OV), bit 1 = C (XER.CA), bit 2 = Z (CR0.EQ), bit 3 = N (CR0.LT).
 DEF_OP(RmifNZCV) {
   auto Op   = IROp->C<IR::IROp_RmifNZCV>();
-  auto Src  = GetReg(Op->Src);
+  // IR.json declares Src Inline:"Zero" — a constant-zero Src arrives as an
+  // OP_INLINECONSTANT with no RA assignment, so a plain GetReg reads a stale
+  // register byte. GetZeroableReg maps that case to r0 (pinned 0 by the JIT
+  // invariant; a normal register operand in rldicl/mr below). Found via
+  // gcc-target asm-flag-6 at MAXINST=1: STC's RMIF read the PREVIOUS block's
+  // setcc result register instead of 0, flipping CF cross-block.
+  auto Src  = GetZeroableReg(Op->Src);
   uint8_t Rotate = Op->Rotate & 63;
   uint8_t Mask   = Op->Mask & 0xF;
   if (Mask == 0) return;
@@ -2806,7 +2902,9 @@ DEF_OP(CondAddNZCV) {
   // Taken: NZCV from Src1+Src2.
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
-  GPR S1 = GetReg(Op->Src1);
+  // Src1 is Inline:"Zero" in IR.json — inline-zero has no RA assignment, so
+  // plain GetReg reads garbage; GetZeroableReg maps it to r0 (pinned 0).
+  GPR S1 = GetZeroableReg(Op->Src1);
   if (IROp->Size == IR::OpSize::i32Bit) {
     sldi(TMP1, S1, 32);
     if (S2Inline) LoadConstant(TMP2, Const << 32);
@@ -2850,7 +2948,9 @@ DEF_OP(CondSubNZCV) {
   // Taken: NZCV from Src1 - Src2.
   uint64_t Const;
   bool S2Inline = IsInlineConstant(Op->Src2, &Const);
-  GPR S1 = GetReg(Op->Src1);
+  // Src1 is Inline:"Zero" in IR.json — inline-zero has no RA assignment, so
+  // plain GetReg reads garbage; GetZeroableReg maps it to r0 (pinned 0).
+  GPR S1 = GetZeroableReg(Op->Src1);
   if (IROp->Size == IR::OpSize::i32Bit) {
     sldi(TMP1, S1, 32);
     if (S2Inline) LoadConstant(TMP2, Const << 32);
@@ -4003,39 +4103,37 @@ DEF_OP(Float_ToGPR_ZS) {
   const auto SrcES = Op->SrcElementSize;
   const auto DstES = IROp->Size;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec, r(0), TMP1);
+  // Register-only path (was: stvx + lfs/lfd for the value AND std + lfs/lfd
+  // for the bound — two store-hit-load stalls per conversion; profiled in
+  // countersunk noise grid-indexing, (int)floor(x) everywhere). Position
+  // elem0 into dw0; f32 promotes to f64 exactly (xscvspdp, same as lfs did),
+  // so the bound compare always runs in the f64 domain with the f64 bound
+  // encodings — identical values to the old source-precision compare since
+  // 2^31/2^63 and all f32 inputs are exact in f64.
   if (SrcES == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
+    xxsldwi(VTMP1, Vec, Vec, 3);     // BE w0 <- elem0 (BE w3)
+    xscvspdp(VTMP1, VTMP1);
   } else {
-    lfd(f0, -32, r1);
+    xxpermdi(VTMP1, Vec, Vec, 0b10); // dw0 <- dw1
   }
 
-  // Materialise bound = 2^(DstWidth-1) in source precision, compare via
-  // fcmpu(cr(1), ...).  See helper-block comment above for derivation.
-  uint64_t Bound;
-  if (SrcES == IR::OpSize::i32Bit) {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x4F000000ULL          // 2^31 f32
-                                          : 0x5F000000ULL;         // 2^63 f32
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfs(f1, -16, r1);
-  } else {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
-                                          : 0x43E0000000000000ULL; // 2^63 f64
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfd(f1, -16, r1);
-  }
-  fcmpu(cr(1), f0, f1);
+  const uint64_t Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
+                                                       : 0x43E0000000000000ULL; // 2^63 f64
+  LoadConstant(TMP1, Bound);
+  mtvsrd(VTMP2, TMP1);               // bound in dw0
+  xscmpudp(1, VTMP1, VTMP2);         // cr1, same LT/EQ/GT/UN layout as fcmpu
 
+  // xscvdpsx{ws,ds} truncate toward zero and saturate exactly like
+  // fctiwz/fctidz (NaN -> most-negative, +ovf -> INT_MAX), so the sentinel
+  // fixup below is unchanged. The ws form leaves its word-1 result with
+  // word 0 undefined; mfvsrd + clrldi keeps only the defined low 32.
   if (DstES == IR::OpSize::i32Bit) {
-    fctiwz(f0, f0);
-    mffprd(Dst, f0);
+    xscvdpsxws(VTMP1, VTMP1);
+    mfvsrd(Dst, VTMP1);
     clrldi(Dst, Dst, 32);  // zero-extend to GPR (high half is undefined per ISA)
   } else {
-    fctidz(f0, f0);
-    mffprd(Dst, f0);
+    xscvdpsxds(VTMP1, VTMP1);
+    mfvsrd(Dst, VTMP1);
   }
 
   // If CR1.LT set (Src < bound, ordered), POWER's result is x86-correct.
@@ -4118,18 +4216,24 @@ DEF_OP(FCmp) {
   auto S2 = GetVReg(Op->Scalar2);
   const auto ESize = Op->ElementSize;
 
-  addi(TMP1, r1, -32);
-  stvx(S1, r(0), TMP1);
-  addi(TMP2, r1, -16);
-  stvx(S2, r(0), TMP2);
+  // Register-only compare, same staging as EmitCompare's fused-FP path
+  // (JIT.cpp): the old stvx x2 + lfs/lfd x2 bounce cost two guaranteed
+  // store-hit-load flushes per compare — measured 33% of countersunk's
+  // hydro-conditioning phase inside std::__adjust_heap's float compares.
+  // Element 0 of a guest XMM sits in doubleword 1 (f64) / BE word 3 (f32);
+  // xscmpudp compares doubleword 0, so position first. xscvspdp performs
+  // the same SP->DP promotion lfs did, so NaN/denormal ordering semantics
+  // are unchanged; both paths end in an unordered compare into CR0.
   if (ESize == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
-    lfs(f1, -16, r1);
+    xxsldwi(VTMP1, S1, S1, 3);         // BE w0 <- elem0 (BE w3)
+    xscvspdp(VTMP1, VTMP1);
+    xxsldwi(VTMP2, S2, S2, 3);
+    xscvspdp(VTMP2, VTMP2);
   } else {
-    lfd(f0, -32, r1);
-    lfd(f1, -16, r1);
+    xxpermdi(VTMP1, S1, S1, 0b10);     // dw0 <- dw1
+    xxpermdi(VTMP2, S2, S2, 0b10);
   }
-  fcmpu(cr(0), f0, f1);
+  xscmpudp(0, VTMP1, VTMP2);
 
   // Lift CR0.SO and !CR0.LT into XER.OV/CA.
   // PPC bits (in 32-bit-low view): CR0.LT=0, CR0.SO=3; XER.OV=1, XER.CA=2.
@@ -4152,6 +4256,59 @@ DEF_OP(FCmp) {
   rlwimi(TMP4, TMP1, 2, 1, 1);     // OV <- CR0.SO
   rlwimi(TMP4, TMP3, 29, 2, 2);    // CA <- !CR0.LT
   mtspr(1, TMP4);                  // write XER
+}
+
+// FCmpX86: fused FCmp + AXFLAG + raw-PF. Produces the final x86-COMIS flag
+// state in one pass from the compare's CR field:
+//   CR0.LT = 0 (SF=0)     CR0.EQ = EQ|UN (ZF)    CR0.GT = CR0.SO = 0
+//   XER.CA = !(LT|UN)     -- x86 CF = LT|UN, stored INVERTED (CFInverted=true)
+//   XER.OV = 0 (OF=0)
+//   Dst    = !UN          -- raw PF (inverted representation), 0/1
+// Replaces the split path's CR->XER lift + CR1-projection/isel for PF +
+// DEF_OP(AXFlag)'s second full XER RMW: one mfocrf, one XER RMW, no
+// projection. Emitted only when HostFeatures.SupportsFCmpX86 (set for this
+// backend in Common/HostFeatures.cpp).
+DEF_OP(FCmpX86) {
+  auto Op = IROp->C<IR::IROp_FCmpX86>();
+  auto S1 = GetVReg(Op->Scalar1);
+  auto S2 = GetVReg(Op->Scalar2);
+  auto Dst = GetReg(Node);
+  const auto ESize = Op->ElementSize;
+
+  // Register-only staging, identical to DEF_OP(FCmp)/EmitCompare's FP path:
+  // guest elem0 is dw1 (f64) / BE w3 (f32); xscmpudp compares dw0. xscvspdp
+  // performs the same SP->DP promotion lfs did, preserving NaN semantics.
+  if (ESize == IR::OpSize::i32Bit) {
+    xxsldwi(VTMP1, S1, S1, 3);
+    xscvspdp(VTMP1, VTMP1);
+    xxsldwi(VTMP2, S2, S2, 3);
+    xscvspdp(VTMP2, VTMP2);
+  } else {
+    xxpermdi(VTMP1, S1, S1, 0b10);
+    xxpermdi(VTMP2, S2, S2, 0b10);
+  }
+  xscmpudp(0, VTMP1, VTMP2);
+
+  // CR0 nibble via mfocrf 0x80: LT=PPC 0, GT=PPC 1, EQ=PPC 2, UN(SO)=PPC 3.
+  // rlwinm ROTL32 by SH sends PPC bit q to (q - SH) mod 32.
+  mfocrf(TMP1, 0x80);
+  rlwinm(TMP2, TMP1, 1, 2, 2);    // UN: PPC 3 -> PPC 2
+  rlwinm(TMP3, TMP1, 0, 2, 2);    // EQ isolated at PPC 2
+  or_(TMP3, TMP3, TMP2);          // ZF = EQ|UN at PPC 2 (only bit set)
+  mtocrf(0x80, TMP3);             // CR0 = {LT=0, GT=0, EQ=ZF, SO=0}
+
+  // Raw PF = !UN as 0/1 at LSB 0. Computed before TMP reuse below.
+  rlwinm(Dst, TMP1, 4, 31, 31);   // UN: PPC 3 -> PPC 31 (LSB 0)
+  xori(Dst, Dst, 1);
+
+  // XER.CA = !(LT|UN), XER.OV = 0 — single read-modify-write.
+  rlwinm(TMP4, TMP1, 30, 2, 2);   // LT: PPC 0 -> PPC 2
+  or_(TMP4, TMP4, TMP2);          // (LT|UN) at PPC 2
+  xoris(TMP4, TMP4, 0x2000);      // !(LT|UN) at PPC 2 (0x2000 << 16 = LSB 29)
+  mfspr(TMP2, 1);
+  rlwinm(TMP2, TMP2, 0, 3, 0);    // wrap-mask keeps PPC 3..31,0 — clears OV(1)+CA(2)
+  or_(TMP2, TMP2, TMP4);
+  mtspr(1, TMP2);
 }
 
 // =========================================================================

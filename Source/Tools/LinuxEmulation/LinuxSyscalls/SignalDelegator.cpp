@@ -814,6 +814,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   } else {
     // The interrupted context can still be mid-syscall even though the host
     // PC is outside the JIT: DEF_OP(Syscall) sets Frame->InSyscallInfo=0xFFFF
+    // (and, since the partial-refill port, DEF_OP(Thunk) and the FABI bridge
+    // stubs arm the same field around their host calls — see
+    // kInSyscallSentinel in FEXCore ArchHelpers/PPC64Emitter.h)
     // before bctrl'ing into C, so a thread blocked in e.g. sigsuspend carries
     // the in-syscall spill mask while it waits. The guest handler we are about
     // to dispatch runs fresh JIT blocks; if the stale mask is left set, any
@@ -1268,7 +1271,16 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   // then block entry), so a deferred signal always drains at a boundary
   // where the register state is coherent.
   const uint64_t DeferPc = ArchHelpers::Context::GetPc(UContext);
-  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, DeferPc) || IsAddressInDispatcher(DeferPc);
+  // Bit 25 = kInFABISentinel: the thread is inside an F80/vector FABI
+  // helper crossing (arming site: the GenerateABICall stubs). The helper
+  // never blocks, and the interrupted JIT block holds in-flight x87-pass
+  // state in registers that a guest-handler round trip would desync, so
+  // these deliveries must defer to the next block boundary regardless of
+  // which generated-code region the PC happens to be in (dispatcher-blob
+  // stubs, old code-buffer chunks, or the helper's C code).
+  const bool InFABICrossing = (Thread->CurrentFrame->InSyscallInfo & 0x0200'0000ull) != 0;
+  const bool InJIT_ForDefer = CTX->IsAddressInCodeBuffer(Thread, DeferPc) || IsAddressInDispatcher(DeferPc) ||
+                              IsAddressInFABIStubs(DeferPc) || InFABICrossing;
   const bool MustDeferAsync = MustDeferSignal || InJIT_ForDefer;
   SIGTRACE("GUEST sig=%d code=%d pc=0x%lx rip=0x%lx defer=%d injit=%d q=%zu", Signal, SigInfo.si_code,
            ArchHelpers::Context::GetPc(UContext), (unsigned long)Thread->CurrentFrame->State.rip, MustDeferSignal ? 1 : 0,

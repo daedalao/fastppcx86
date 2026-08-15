@@ -59,30 +59,39 @@ struct X11Manager {
   std::unordered_map<_XDisplay*, _XDisplay*> displays;
   std::unordered_map<const _XDisplay*, _XDisplay*> displays_reverse;
 
-  // Per-call guest sync is currently the DEFAULT; FEX_X11_SYNC_FIRST_ONLY=1
-  // opts into syncing only on first mapping (plus the XID-taking entry
-  // points' explicit syncs) and enables the lock-free memo below.
+  // First-only guest sync is the DEFAULT (flipped 2026-08-13): the guest
+  // connection is synced only around the FIRST mapping of a display, plus the
+  // XID-taking entry points' explicit GuestSyncForHostDisplay calls below.
+  // This enables the lock-free memo in GuestToHostDisplay, which is the path
+  // every repeat Display-taking GL call now takes. FEX_X11_SYNC_EVERY_CALL=1
+  // is the triage knob: it restores the old per-call sync (a host->guest
+  // trampoline + guest X round trip under every glXSwapBuffers) — set it when
+  // bisecting a BadDrawable/BadMatch at GL bootstrap or mode change.
   //
-  // The first-only mode is measurably the right thing — the per-call sync is
-  // a host->guest trampoline + guest X round trip under every glXSwapBuffers.
-  //
-  // Grimrock used to break under it (GLXGetDrawableAttributes + GLXMakeCurrent
-  // BadDrawable at bootstrap) because its GLX entry points were reached
-  // through glXGetProcAddress, which bypasses the fexfn_impl_* wrappers
-  // entirely: libGL_Guest.cpp links the returned *host* address to the generic
-  // HostPtrInvokers entry, and the later guest call lands in
-  // GuestWrapperForHostFunction<Sig>::Call (Host.h), which branches straight
-  // at that address. So none of the impls' GuestSyncForHostDisplay calls ran.
-  // Fixed by returning the impls from fexfn_impl_libGL_glXGetProcAddress for
-  // the XID-taking entry points (libGL_Host.cpp). Any *new* custom_host_impl
-  // whose extra work matters must be listed there too, or it is dead code for
+  // Why the flip is safe: per-call sync was only ever the default as a shield
+  // for the Grimrock bootstrap breakage (GLXGetDrawableAttributes +
+  // GLXMakeCurrent BadDrawable), and that root cause is FIXED. It happened
+  // because Grimrock's GLX entry points were reached through
+  // glXGetProcAddress, which bypassed the fexfn_impl_* wrappers entirely:
+  // libGL_Guest.cpp linked the returned *host* address to the generic
+  // HostPtrInvokers entry, and the later guest call landed in
+  // GuestWrapperForHostFunction<Sig>::Call (Host.h), branching straight at
+  // that address — so none of the impls' GuestSyncForHostDisplay calls ran.
+  // fexfn_impl_libGL_glXGetProcAddress now returns the impls for the
+  // XID-taking entry points (libGL_Host.cpp), so their explicit syncs run on
+  // the procaddr path too. Any *new* custom_host_impl whose extra work
+  // matters must be listed there too, or it is dead code for
   // procaddr-resolving callers.
+  //
+  // Back-compat: FEX_X11_SYNC_FIRST_ONLY=1 (the old opt-in for what is now
+  // the default) is accepted and ignored. If both env vars are set,
+  // FEX_X11_SYNC_EVERY_CALL=1 wins — it is the explicit triage request.
   static bool SyncEveryCall() {
-    static const bool FirstOnly = [] {
-      const char* e = getenv("FEX_X11_SYNC_FIRST_ONLY");
+    static const bool EveryCall = [] {
+      const char* e = getenv("FEX_X11_SYNC_EVERY_CALL");
       return e && *e == '1';
     }();
-    return !FirstOnly;
+    return EveryCall;
   }
 
   _XDisplay* GuestToHostDisplay(_XDisplay* GuestDisplay) {

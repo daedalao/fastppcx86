@@ -179,7 +179,7 @@ private:
                    .IndexType = MemOffsetType::SXTX,
                    .IndexScale = OffsetScale,
                    .AddrSize = OpSize::i64Bit};
-    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, false, false, OpSize::i16Bit);
+    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, Features.SupportsTSODisp16, false, false, OpSize::i16Bit);
     IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, MemOffsetType::SXTX, A.IndexScale);
   }
 

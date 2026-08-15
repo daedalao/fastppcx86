@@ -353,11 +353,94 @@ private:
     rldicl(Dst, Dst, 0, 32);
   }
 
+  // -------------------------------------------------------------------------
+  // TSO load->store adjacent-barrier elision (FEX_TSOPAIRELIDE=0 kill switch).
+  //
+  // DEF_OP(LoadMemTSO) ends with a trailing lwsync (acquire) and
+  // DEF_OP(StoreMemTSO) begins with a leading lwsync (release). When the two
+  // ops are adjacent up to non-memory register ops, the two barriers are
+  // architecturally one: lwsync orders {Load->Load, Load->Store, Store->Store}
+  // across itself, which is exactly TSO's requirement set (x86 permits
+  // Store->Load reordering, so that direction never needs a barrier). The
+  // store's leading lwsync is therefore redundant iff an lwsync has been
+  // emitted since the LAST memory-access host instruction of any kind.
+  //
+  // TSOPairElideSet[store node ID] means DEF_OP(StoreMemTSO) may skip its
+  // leading lwsync. The prepass (ComputeTSOPairElision) walks each block in
+  // emission order and sets it only when every IR op between the LoadMemTSO
+  // and the StoreMemTSO is on an explicit whitelist of ops whose DEF_OP
+  // provably emits ZERO memory-access host instructions (see the per-op
+  // verification table in ComputeTSOPairElision). A too-small whitelist only
+  // costs missed elisions, never soundness. The full soundness argument lives
+  // at the elision site in DEF_OP(StoreMemTSO).
+  // -------------------------------------------------------------------------
+  fextl::vector<bool> TSOPairElideSet;
+  void ComputeTSOPairElision();
+
+  bool TSOStoreLeadingBarrierElided(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < TSOPairElideSet.size() && TSOPairElideSet[ID];
+  }
+
   static constexpr uint64_t SpinEdgeKey(uint32_t From, uint32_t To) {
     return (static_cast<uint64_t>(From) << 32) | To;
   }
 
   void AnalyzeSpinLoops();
+
+  // -------------------------------------------------------------------------
+  // FEX_SPINCOLLAPSE=1 (opt-in): batched budget decrement for counted
+  // spin-poll loops — the RED4 redDispatcher shape (guest RIP 0x37fff37530a0
+  // measured at 43% of process CPU driving / up to 50% of flythrough samples
+  // under FEX_HWTSO; see notes/openworld-perf-review + the spin anatomy notes).
+  //
+  // Shape (post-pass IR, verified against a live dump of `dec ecx; jnz`):
+  // CompareBranchFusion has already rewritten the flag-consuming jnz into a
+  // VALUE compare, so no flags are consumed anywhere in the pattern:
+  //   poll block:     LoadMemTSO work; SubWithFlags(work,0); CondJump(work,#0,
+  //                   NEQ) -> found-exit
+  //   backedge block: %new = Sub(%old, #1); Copy(%old); StoreRegister(%new);
+  //                   CondJump(%old, #1, NEQ) -> backedge (else budget-exit)
+  //
+  // Rewrite (emission-time, nodes marked by the matcher in AnalyzeSpinLoops):
+  //   Sub:      new = (old >u K) ? old - K : 0        (cmpldi cr7 + isel)
+  //   CondJump: backedge taken iff old >u K           (cmpldi cr7 + bc GT)
+  // Exit state is exact: the loop still leaves the budget register at 0 on
+  // the budget-exhausted exit, and the found-exit still leaves via the poll
+  // compare. Each iteration retires K budget instead of 1, cutting spin WALL
+  // time ~K× so worker threads PARK sooner (park is cheap under ntsync).
+  //
+  // Legality: coarsened polling is indistinguishable from scheduling delay
+  // under TSO. No flags are consumed (fusion shape, see above). KNOWN
+  // semantic coarsening, why this ships opt-in/per-app: on the FOUND exit the
+  // budget register holds a K-granular value instead of the exact iteration
+  // count (engines reload the budget per episode; code that consumed the
+  // leftover count would misbehave). Both emissions derive only from their
+  // own operands — no state is carried between op handlers (the AES
+  // mask-cache rule).
+  // -------------------------------------------------------------------------
+  // K corrects the EMULATION INFLATION of a spin iteration, it does not
+  // minimize spinning: the engine tuned its budget for native iteration
+  // cost, and measurement shows the budget is load-bearing (CP2077
+  // flythrough, K=32 under HWTSO: threads parked in ~1-2us and paid a wake
+  // round trip per task batch — fps fell BELOW plain HWTSO). Emulated
+  // iterations run ~6x native with TSO barriers, ~2-3x under FEX_HWTSO, so
+  // K in that range restores the intended spin duration. FEX_SPINCOLLAPSE=1
+  // uses the default; FEX_SPINCOLLAPSE=<2..1024> overrides K for tuning.
+  static constexpr uint16_t kSpinCollapseKDefault = 8;
+  uint16_t kSpinCollapseK = kSpinCollapseKDefault;
+  bool SpinCollapseEnabled {};
+  fextl::vector<bool> SpinCollapseSubs;
+  fextl::vector<bool> SpinCollapseBranches;
+
+  bool IsSpinCollapseSub(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseSubs.size() && SpinCollapseSubs[ID];
+  }
+  bool IsSpinCollapseBranch(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseBranches.size() && SpinCollapseBranches[ID];
+  }
 
   // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.
   // Called immediately before the branch instruction so the hint executes
@@ -880,6 +963,42 @@ private:
   void EmitAESLoadMask();
   bool AESMaskCached = false;
   void InvalidateAESCache() { AESMaskCached = false; }
+
+  // Emit-time "CR1 currently mirrors XER" flag for the ProjectXERToCR1 cache.
+  // Lifecycle owned by CompileCode: reset at block entry, cleared after every
+  // op not on the verified no-XER/CR1-write allowlist (see the post-handler
+  // switch in CompileCode and the rationale in ProjectXERToCR1).
+  bool XERProjectionValid = false;
+
+  // Emit-time last-constant cache for DEF_OP(Constant): when the previous
+  // materialized constant is still live in its (dynamic, callee-saved) RA
+  // register and the new value is within ±32K, emit one addi off it instead
+  // of a 2-5 insn LoadConstant. Targets clustered guest addresses (rip-
+  // relative coefficient loads in polynomial code: one lis+ori then addi per
+  // subsequent constant). Lifecycle owned by CompileCode's post-handler
+  // switch: set by non-PatchSite OP_CONSTANT with a dynamic-GPR dest,
+  // survives ONLY across the verified no-dynamic-GPR-write allowlist
+  // (FPR-class LoadMem, the scalar-FP insert family), reset at block entry.
+  struct {
+    uint64_t Value;
+    uint8_t Reg;      // GeneralRegisters[] index
+    bool Valid;
+  } LastConstantCache {};
+
+  // Load-and-splat fusion for FMA memory operands (both per-block, cleared at
+  // block entry). CompileCode's pre-pass fills SplatCandidateLoads with node
+  // IDs of single-use f64 FPR LoadMems whose lone consumer is an FMA-family
+  // scalar insert (Vector1/Vector2/Addend position — never Upper).
+  // DEF_OP(LoadMem) emits those via lxvdsx (value in BOTH doublewords) and
+  // records the node in SplatFormLoadNodes; the FMA handlers consult that to
+  // skip their own splat. Single-use SSA temps only, so splat form never
+  // reaches guest-architectural state (the hazard that convicted the
+  // ScalarSplatChain pass does not apply).
+  fextl::vector<uint32_t> SplatCandidateLoads;
+  fextl::vector<uint32_t> SplatFormLoadNodes;
+  static bool IdInVec(const fextl::vector<uint32_t>& V, uint32_t Id) {
+    return std::find(V.begin(), V.end(), Id) != V.end();
+  }
 
   // Shared SHA-256 four-round emitter for VSha256H (returns ABCD half) and
   // VSha256H2 (returns EFGH half). Fully inline: vshasigmaw ST=1 for both

@@ -69,6 +69,24 @@ function(AddTests Tests BinDirectory Bitness)
       set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_THUNKCONFIG=${CMAKE_SOURCE_DIR}/Data/CI/FEXLinuxTestsThunks.json")
     endif()
 
+    if(TEST_NAME STREQUAL "hwtso_litmus")
+      # Second leg of the memory-model gate: same binary under hardware TSO
+      # (PROT_SAO pages, no emitted barriers). On kernels without PROT_SAO the
+      # runtime falls back to barrier emulation, so this leg degrades to a
+      # duplicate of the default gate instead of a false failure.
+      add_test(NAME "${TEST_CASE}.hwtso.jit.flt"
+        COMMAND "python3" "${CMAKE_SOURCE_DIR}/Scripts/guest_test_runner.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Known_Failures"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Expected_Output"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Disabled_Tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Flake_Tests"
+        "${TEST_CASE}"
+        "guest"
+        "$<TARGET_FILE:FEX>"
+        "${BIN_PATH}")
+      set_property(TEST "${TEST_CASE}.hwtso.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_OUTPUTLOG=stderr;FEX_SILENTLOG=0;FEX_MAXINST=500;FEX_HWTSO=1")
+    endif()
+
     if (ARCHITECTURE_x86_64 AND NOT TEST_NAME STREQUAL "thunk_testlib")
       # Add host test case
       add_test(NAME "${TEST_CASE}.host.flt"

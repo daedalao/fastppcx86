@@ -339,6 +339,50 @@ static constexpr uint32_t CALLER_GPR_MASK =
 // Caller-saved VMX mask: v0-v19 (per PPC64LE ELFv2 ABI)
 static constexpr uint32_t CALLER_FPR_MASK = 0x000FFFFFu;  // bits 0..19
 
+// Value parked in CpuStateFrame::InSyscallInfo for the duration of a JIT
+// host-call crossing whose tail wants the sentinel-guarded partial SRA GPR
+// refill: DEF_OP(Syscall), DEF_OP(Thunk) (64-bit) and the FABI bridge stubs
+// (GenerateABICall, 64-bit, FEX_NO_THUNK_PARTIAL_FILL=1 kill switch for the
+// latter two).
+//
+//   bits 0..15  : the SpillSRA IgnoreMask. 0xFFFF = "all x64 SRA GPRs are
+//                 already spilled to the frame". This is the only part any
+//                 consumer outside the backend looks at (SignalDelegator.cpp
+//                 and SyscallsSMCTracking.cpp both mask with 0xFFFF). SpillSRA
+//                 tests bits by HOST register number, so 0xFFFF skips the SRA
+//                 members numbered r7-r15 and re-spills r16-r23 from the
+//                 ucontext — harmless, those are ELFv2 callee-saved and still
+//                 hold the frame's values throughout the armed window.
+//   bits 16..23 : deliberately ZERO. GdbServer.cpp passes the raw
+//                 InSyscallInfo into SpillSRA's `uint32_t IgnoreMask` with no
+//                 masking, and r16..r23 are SRA members — a sentinel bit in
+//                 this window would silently suppress their re-spill. Bit 24
+//                 is above every SRA register number (max r23) and therefore
+//                 inert in that path.
+//   bit  24     : the tripwire. ArchHelpers::Context::ContextBackup stores
+//                 InSyscallInfo as a *uint16_t* (MContext_ppc64le.h), so this
+//                 bit CANNOT survive a signal-delivery round trip: both
+//                 HandleDispatcherGuestSignal branches stash the (truncated)
+//                 value and zero the field, and RestoreThreadState reinstates
+//                 it truncated to 0xFFFF. The dispatcher's CallbackPtr entry
+//                 additionally zeroes the field outright before a host callee
+//                 re-enters guest code. Any value read back with no bit above
+//                 15 set therefore means "the guest state in the frame was
+//                 republished by somebody while we were inside the host call"
+//                 — the exact condition under which the callee-saved host
+//                 copies of SRA r14+ are stale and a full refill is required.
+static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
+
+// FABI-crossing variant: bit 25 instead of bit 24, identical low mask and
+// identical uint16 death-by-truncation. The distinct bit lets the signal
+// delegator DEFER async signals landing mid-FABI-crossing (F80 softfloat
+// helpers never block, so deferral always drains) without deferring
+// syscall crossings, where a thread may be parked in a blocking host
+// syscall that needs immediate delivery. Bits 16..23 stay zero for the
+// GdbServer raw-mask reason documented above; bit 25 is equally inert
+// there (> r23).
+static constexpr uint64_t kInFABISentinel = 0x0200'FFFFull;
+
 // -------------------------------------------------------------------------
 // PPC64Emitter: shared utility class for JIT + Dispatcher
 // -------------------------------------------------------------------------
@@ -426,6 +470,30 @@ public:
   // Spill/fill everything before/after a C ABI call (clobbers r3-r12, v0-v19).
   void SpillForABICall(GPR tmp, bool FPRs = true);
   void FillForABICall(bool FPRs = true);
+
+  // Sentinel-guarded partial-refill pair for host-call crossings (see
+  // kInSyscallSentinel above; DEF_OP(Syscall) carries the original inline
+  // copy of this scheme interleaved with its RAX handling).
+  //
+  // ArmInSyscallSentinel: store the sentinel to Frame->InSyscallInfo. MUST be
+  // emitted strictly AFTER the crossing's SRA spill completes (the mask's
+  // bits claim "already spilled"; raising it earlier would let a signal
+  // handler skip spilling registers whose frame copies are still stale) and
+  // never from inside SpillForABICall itself (see the NB there). Clobbers
+  // TMP1 only.
+  //
+  // FillForABICallChecked: PopDynamicRegs, then refill SRA — skipping the ten
+  // ELFv2-callee-saved GPR loads (r14-r23) when the sentinel survived, i.e.
+  // when provably nothing republished the frame during the call — then
+  // restore r0=0 and disarm the sentinel. The two FillMode halves are exact
+  // complements, so the sentinel-dead path is a full fill; XMM/PF/AF/NZCV
+  // restores run unconditionally in both paths (v0-v15 are ELFv2-volatile and
+  // the frame copy is also what signal delivery reads mid-call — never
+  // elidable). 64-bit guests only: the 32-bit lwz zero-extension invariant
+  // forbids partial GPR fills (asserted in FillStaticRegs). Clobbers TMP1 and
+  // CR0 before the NZCV restore rebuilds CR0 from the frame.
+  void ArmInSyscallSentinel(uint64_t Sentinel = kInSyscallSentinel);
+  void FillForABICallChecked();
 
   // Ensure code is aligned to 16-byte boundary (fill with nops).
   void Align16B();

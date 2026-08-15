@@ -1678,6 +1678,19 @@
                  "Ordering flag result is true if either float input is NaN"
                 ],
         "HasSideEffects": true
+      },
+
+      "GPR = FCmpX86 OpSize:$ElementSize, FPR:$Scalar1, FPR:$Scalar2": {
+        "Desc": ["Scalar unordered compare producing x86-COMIS flag state directly:",
+                 "the fused equivalent of FCmp followed by AXFLAG. Final NZCV (x86 layout,",
+                 "carry stored INVERTED per the CFInverted=true convention): N=0, Z=EQ|UN,",
+                 "C=!(LT|UN), V=0. Returns raw PF (= !unordered, the inverted PF",
+                 "representation) as a 0/1 GPR for the frontend to store through the",
+                 "register cache. Only emitted when HostFeatures.SupportsFCmpX86; backends",
+                 "with a real AXFLAG (FlagM2) keep the split ops and hardware fusion."
+                ],
+        "DestSize": "OpSize::i64Bit",
+        "HasSideEffects": true
       }
     },
     "VectorScalar": {

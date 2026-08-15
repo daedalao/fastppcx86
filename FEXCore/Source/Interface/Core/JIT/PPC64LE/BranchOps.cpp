@@ -5,6 +5,7 @@
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 
 #include <bit>
+#include <cstdlib>
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -200,12 +201,19 @@ DEF_OP(ExitFunction) {
   // NZCV and XER reach the target block / the miss-leg spill exactly as the
   // block left them (identical to the L1 probe below). r0 is rewritten (to 0)
   // only on the taken RET fast path, immediately before the bctr, preserving
-  // the X-form zero-index invariant. base is read per-op from
-  // Frame->Thread->CallRetStackBase — the code buffer is shared across threads
-  // so the bound cannot be an immediate — and [base, base+SIZE) is exactly the
-  // R/W region between the frontend's two guard pages, so the bounds checks
-  // never fault. Overflow (push) resets to empty and skips the store; empty
-  // (pop) skips the fast path; neither ever corrupts memory.
+  // the X-form zero-index invariant. The bounds are read per-op from the
+  // frame's callret_base/callret_end mirrors (CoreState.h) — the code buffer
+  // is shared across threads so they cannot be immediates, and the mirrors
+  // replace the former Frame->Thread->CallRetStackBase two-load pointer chase
+  // (+addis for base+SIZE) with one D-form ld off STATE; callret_end shares
+  // callret_sp's cache line for the pop. Both mirrors are set at thread
+  // creation next to callret_sp and never change (base is immutable until
+  // thread teardown). [base, base+SIZE) is exactly the R/W region between the
+  // frontend's two guard pages, so the bounds checks never fault. Overflow
+  // (push) resets to empty and skips the store; empty (pop) skips the fast
+  // path; neither ever corrupts memory. Threads without a frontend-allocated
+  // call-ret stack carry zero mirrors: pops read sp(0) >= end(0) -> empty,
+  // pushes see new sp(-16) < base(0) -> overflow reset, never storing.
   // ---------------------------------------------------------------------
   PPC64Emitter::Label ShadowRetReprobe{};
   const bool ShadowActive = ShadowRetStackEnabled &&
@@ -213,19 +221,14 @@ DEF_OP(ExitFunction) {
   if (ShadowActive) {
     const int16_t sp_off = static_cast<int16_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-    const int16_t thread_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, Thread));
     const int16_t base_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::InternalThreadState, CallRetStackBase));
-    // SIZE == 0x400000 == 0x40 << 16, materialised with a single addis.
-    static_assert(FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE == 0x400000,
-                  "shadow bounds addis assumes a 4 MiB call-ret stack");
+      offsetof(FEXCore::Core::CpuStateFrame, State.callret_base));
+    const int16_t end_off = static_cast<int16_t>(
+      offsetof(FEXCore::Core::CpuStateFrame, State.callret_end));
 
     if (Op->Hint == IR::BranchHint::Return) {
       ld(TMP2, sp_off, STATE);            // TMP2 = sp
-      ld(TMP3, thread_off, STATE);
-      ld(TMP3, base_off, TMP3);           // TMP3 = base
-      addis(TMP3, TMP3, 0x40);            // TMP3 = base + SIZE (empty / top guard)
+      ld(TMP3, end_off, STATE);           // TMP3 = base + SIZE (empty / top guard)
       cmpd(cr(7), TMP2, TMP3);
       bc({4, 28}, &ShadowRetReprobe);     // sp >= base+SIZE -> empty -> probe
       ld(TMP3, 0, TMP2);                  // TMP3 = guest_ret_rip (top slot)
@@ -268,15 +271,14 @@ DEF_OP(ExitFunction) {
         li(TMP2, 0);                      // no return block: push a zero entry (never matches)
       }
       ld(TMP3, sp_off, STATE);            // TMP3 = sp
-      ld(TMP4, thread_off, STATE);
-      ld(TMP4, base_off, TMP4);           // TMP4 = base
+      ld(TMP4, base_off, STATE);          // TMP4 = base (frame mirror)
       addi(TMP3, TMP3, -16);              // TMP3 = new sp
       cmpd(cr(7), TMP3, TMP4);
       PPC64Emitter::Label l_do_push{}, l_push_done{};
       bc({4, 28}, &l_do_push);            // new sp >= base -> room to push
-      // Overflow: reset to empty (base+SIZE), skip the store, never write below
-      // the low guard page.
-      addis(TMP4, TMP4, 0x40);
+      // Overflow: reset to empty (base+SIZE, read from the end mirror), skip
+      // the store, never write below the low guard page.
+      ld(TMP4, end_off, STATE);
       std(TMP4, sp_off, STATE);
       b(&l_push_done);
       Bind(&l_do_push);
@@ -524,6 +526,16 @@ DEF_OP(CondJump) {
     cmpldi(cr(7), TMP1, 0);             // cr7 = (TMP1 == 0)
     // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
     CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
+  } else if (IsSpinCollapseBranch(Node)) {
+    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): this is the
+    // spin backedge `old != 1` of a matched counted-decrement pair whose Sub
+    // now retires K budget per iteration. Exit exactly when the batched
+    // decrement lands on 0, i.e. keep spinning iff old >u K. Unsigned
+    // compare: the budget is a canonicalized zero-extended value. cr7, no Rc.
+    cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+    // BO=12 (branch if set), BI=29 (cr7.GT): TrueBlock (the backedge) taken
+    // while old >u K.
+    CC = {12, 29};
   } else {
     // Route the compare through cr(7) so we don't disturb CR0 / XER.
     // CR0 carries packed-NZCV N/Z bits filled by FillStaticRegs at block
@@ -642,30 +654,13 @@ DEF_OP(Break) {
   bctr();
 }
 
-// Value parked in CpuStateFrame::InSyscallInfo for the duration of a
-// JIT-emitted Syscall op.
-//
-//   bits 0..15  : the SpillSRA IgnoreMask. 0xFFFF = "all 16 x64 SRA GPRs are
-//                 already spilled to the frame", exactly as before. This is
-//                 the only part any consumer outside this file looks at
-//                 (SignalDelegator.cpp:684 and SyscallsSMCTracking.cpp:151
-//                 both mask with 0xFFFF).
-//   bits 16..23 : deliberately ZERO. GdbServer.cpp:113 passes the raw
-//                 InSyscallInfo into SpillSRA's `uint32_t IgnoreMask` with no
-//                 masking, and SpillSRA tests `1U << SRAIdxMap` where
-//                 SRAIdxMap is the host register number — r16..r23 are SRA
-//                 members, so a sentinel bit in this window would silently
-//                 suppress their re-spill. Bit 24 is above every SRA register
-//                 number (max r23) and therefore inert in that path.
-//   bit  24     : the tripwire. ArchHelpers::Context::ContextBackup stores
-//                 InSyscallInfo as a *uint16_t* (MContext_ppc64le.h:77), so
-//                 this bit CANNOT survive a signal-delivery round trip:
-//                 HandleDispatcherGuestSignal zeroes the field, and
-//                 RestoreThreadState reinstates it truncated to 0xFFFF. Any
-//                 value read back with no bit above 15 set therefore means
-//                 "the guest state in the frame was republished by somebody
-//                 while we were inside the host call".
-static constexpr uint64_t kInSyscallSentinel = 0x0100'FFFFull;
+// kInSyscallSentinel — the value parked in CpuStateFrame::InSyscallInfo for
+// the duration of a JIT host-call crossing — lives in ArchHelpers/
+// PPC64Emitter.h with its full bit-layout rationale, now that DEF_OP(Thunk)
+// and the FABI bridge stubs (PPC64Dispatcher.cpp GenerateABICall) share it
+// with this op via ArmInSyscallSentinel/FillForABICallChecked. This op keeps
+// its original inline copy of the check because the elision interleaves with
+// the RAX result handling below.
 
 DEF_OP(Syscall) {
   auto Op = IROp->C<IR::IROp_Syscall>();
@@ -729,9 +724,14 @@ DEF_OP(Syscall) {
   // Saved into this op's OWN mini-frame rather than via PushDynamicRegs:
   // that helper would pay a second stdu and a second 96-byte linkage
   // reservation on top of the one already reserved here, and would save the
-  // non-volatile half of the pool for nothing. The loop is driven off
-  // RAFPRVolatile so there is still exactly one list; the static_asserts in
-  // ArchHelpers/PPC64Emitter.h are what keep that list in step with RAFPR.
+  // non-volatile half of the pool for nothing. The save/restore pair is the
+  // FABI-callsite helper (SaveDynVRsToFrame/RestoreDynVRsFromFrame), which
+  // honours DynVRSpillMask — CompileCode sets it to this op's RA live-in ∪
+  // dest before dispatch, so only vector SSA values actually live across the
+  // bctrl are stored (most syscalls touch none). The save area stays sized
+  // for the full volatile set; the helper packs saved regs densely from
+  // kFPRSaveOff and both loops iterate the same unchanged mask, so they
+  // cannot fall out of lockstep.
   //
   // The dynamic GPR pool needs no equivalent: RA is r24-r26/r30-r31 (x64) and
   // r16-r26/r30-r31 (x32), all ELFv2 callee-saved. Asserted in the header.
@@ -750,12 +750,11 @@ DEF_OP(Syscall) {
 
   stdu(r1, static_cast<int16_t>(-FrameSize), r1);
 
-  // Save the volatile dynamic FPRs. r1 is 16-byte aligned per ELFv2 and every
-  // offset is a multiple of 16, so stvx's address masking is a no-op.
-  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
-    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
-    stvx(RAFPRVolatile[i], r1, TMP1);
-  }
+  // Save the live volatile dynamic FPRs (DynVRSpillMask-selected; clobbers
+  // TMP3, which nothing here holds live yet). r1 is 16-byte aligned per ELFv2
+  // and every offset is a multiple of 16, so stvx's address masking is a
+  // no-op.
+  SaveDynVRsToFrame(kFPRSaveOff);
 
   // Fill SyscallArguments from the IR op's source nodes.
   // After SpillStaticRegs the physical SRA registers still hold the live values.
@@ -810,12 +809,10 @@ DEF_OP(Syscall) {
   // everything that follows.
   mr(GetReg(Node), r3);
 
-  // Restore the volatile dynamic FPRs. Deliberately after both consumers of
-  // r3 above, because the loop uses TMP1 (= r3) to form the index.
-  for (size_t i = 0; i < RAFPRVolatile.size(); ++i) {
-    LoadImm32(TMP1, static_cast<uint32_t>(kFPRSaveOff + i * 16));
-    lvx(RAFPRVolatile[i], r1, TMP1);
-  }
+  // Restore the saved dynamic FPRs under the same (unchanged) DynVRSpillMask.
+  // Clobbers TMP3 (= r5, dead since the bctrl); kept after both consumers of
+  // r3 above anyway so the ordering stays obviously safe.
+  RestoreDynVRsFromFrame(kFPRSaveOff);
 
   // Free the mini-frame, then reload SRA from STATE (picks up the RAX result).
   addi(r1, r1, FrameSize);
@@ -882,7 +879,32 @@ DEF_OP(Thunk) {
   // registers retain their values until PushDynamicRegs overwrites them).
   auto Op = IROp->C<IR::IROp_Thunk>();
 
+  // Sentinel-guarded partial SRA GPR refill, ported from DEF_OP(Syscall)'s
+  // fill elision above: the ELFv2 callee cannot touch r14-r23, so the ten
+  // non-volatile SRA GPR reloads after the bctrl are pure overhead unless
+  // something republished the frame during the call. The sentinel proves the
+  // negative: a guest-signal delivery truncates it through the uint16_t
+  // ContextBackup stash on either HandleDispatcherGuestSignal branch, and a
+  // host->guest callback (thunk callees DO re-enter the guest — X11 event
+  // handlers etc.) clears it at the dispatcher's CallbackPtr entry before any
+  // callback guest block runs. Both the arm and the checked fill live on
+  // PPC64EmitterBase (shared with the FABI bridge stubs); see
+  // kInSyscallSentinel in ArchHelpers/PPC64Emitter.h for the full contract.
+  // 64-bit guests only — the 32-bit lwz zero-extension invariant forbids
+  // partial fills (PPC64Emitter.cpp FillStaticRegs) — and 32-bit keeps
+  // today's unarmed full-fill path byte for byte. XMM/VR fills are NEVER
+  // elidable: v0-v15 are ELFv2-volatile and the frame copy is also what
+  // signal delivery reads mid-call.
+  static const bool NoPartialFill = getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr;
+  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill;
+
   SpillForABICall(TMP1);
+  if (PartialFill) {
+    // Strictly after the spill completes (the mask claims "already
+    // spilled"), strictly before the callee can run. Clobbers TMP1 only —
+    // the ArgPtr/relocation setup below uses r3/TMP2 after this point.
+    ArmInSyscallSentinel();
+  }
 
   // Set up the single argument: ArgPtr in r3
   mr(r3, GetReg(Op->ArgPtr));
@@ -906,7 +928,11 @@ DEF_OP(Thunk) {
   bctrl();
   ld(r2, 24, r1);      // restore TOC
 
-  FillForABICall();
+  if (PartialFill) {
+    FillForABICallChecked();
+  } else {
+    FillForABICall();
+  }
 }
 
 } // namespace FEXCore::CPU

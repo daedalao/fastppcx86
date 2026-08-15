@@ -530,6 +530,11 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
 
   ///< Only force enable SVE256 if SVE is already enabled and ForceSVEWidth is set to >= 256.
   Features->SupportsSVE256 = ForceSVEWidth && ForceSVEWidth >= 256;
+
+  // SupportsTSODisp16 (PPC64LE) is a strict widening of SupportsTSOImm9's TSO
+  // displacement folding; ride the LRCPC2 override so
+  // FEX_HOSTFEATURES=disablelrcpc2 disables TSO displacement folding wholesale.
+  Features->SupportsTSODisp16 &= Features->SupportsTSOImm9;
 }
 
 static void HandleErrata(FEXCore::HostFeatures* HostFeatures, uint64_t MIDR) {
@@ -736,6 +741,45 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     // to lower a vector-compare CondJump. Left false everywhere else.
     HostFeatures.SupportsVCmpFlagBranch = true;
 
+    // Guest NZCV lives in CR0+XER on this backend (DEF_OP(LoadNZCV/StoreNZCV)
+    // in JIT/PPC64LE/ALUOps.cpp), and the three Select-class lowerings the
+    // frontend brackets with SaveNZCV touch neither:
+    //  - DEF_OP(Select): every arm compares into cr7 and selects via isel
+    //    (ALUOps.cpp; CompareBranchFusion already relies on this transparency).
+    //  - DEF_OP(VFMinScalarInsert/VFMaxScalarInsert): non-record vcmpgtfp /
+    //    xvcmpgtdp + vsel/xxsel + permutes, no CR or XER write (VectorOps.cpp).
+    //  - DEF_OP(MaskGenerateFromBitWidth): li/neg/rldicl/srd, all OE=0/Rc=0
+    //    (ALUOps.cpp).
+    // Skipping the save avoids a 13-insn LoadNZCV/StoreNZCV round-trip whose
+    // StoreNZCV half ends in mtspr XER — execution-serializing on POWER8 —
+    // whenever flags are live across a cvttss2si clamp, minss/maxss, SHLD/SHRD
+    // or BEXTR, or when such an op trails a block exit. CAS stays marked: its
+    // lowering genuinely clobbers (larx/stcx./cmp).
+    HostFeatures.SupportsFlagTransparentSelect = true;
+
+    // FlagM is named for ARM FEAT_FlagM, but the frontend uses it purely as
+    // "the backend has cheap direct NZCV manipulation ops": it gates
+    // _CarryInvert over the LoadNZCV/xor/StoreNZCV GPR round-trip
+    // (OpcodeDispatcher.h RectifyCarryInvert), and _RmifNZCV/_CondSubNZCV
+    // paths for ADCX/ADOX, small-size flag inserts, and RDRAND CF. This
+    // backend implements all four ops (ALUOps.cpp DEF_OP(CarryInvert) skips
+    // XER entirely; DEF_OP(RmifNZCV)/CondSubNZCV/CondAddNZCV likewise avoid
+    // the serializing mtspr XER where possible), so claim it. Without it,
+    // every rectify emits a ~14-insn pack/unpack with two mfxer + one mtxer —
+    // measured 70% of glibc __sin's samples in flag-dense FP code; flipping
+    // this halved a 64-bit-div microbench and cut a sin-heavy loop 29%
+    // (railbench, 2026-08-14). FlagM2 (AXFlag) stays FALSE: its shared-code
+    // arm has a known-wrong path and needs its own validation first.
+    HostFeatures.SupportsFlagM = true;
+
+    // Fused COMIS lowering: the split FCmp+AXFLAG path costs ~24 insns here
+    // (CR->XER lift, a CR1 projection + isel for PF, then AXFlag's second
+    // full XER RMW — profiled as the dominant cost of float-comparator code:
+    // std::sort/heap over floats, countersunk hydro/rail). DEF_OP(FCmpX86)
+    // computes the final x86 flag layout plus raw PF straight from the
+    // xscmpudp CR field in one pass with a single XER write.
+    HostFeatures.SupportsFCmpX86 = true;
+
     // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
     if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
       HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);
@@ -747,6 +791,18 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     } else {
       HostFeatures.ICacheLineSize = 128;
     }
+
+    // TSO displacement folding. On ARM these bits track LRCPC2 because LDAPUR
+    // is the only acquire load with a displacement form (SIMM9). On POWER the
+    // barrier (lwsync) is a separate instruction from the access, so a TSO
+    // load/store may use any addressing form; leaving these off forces every
+    // displaced TSO access through an explicit IR Add (extra addi on the
+    // critical path plus an extra live SSA temp). SupportsTSOImm9 unlocks the
+    // frontend's ±256 fold; SupportsTSODisp16 widens it to the full ±32K
+    // D/DS-form displacement range the backend already handles.
+    // FEX_HOSTFEATURES=disablelrcpc2 turns both off for A/B (see OverrideFeatures).
+    HostFeatures.SupportsTSOImm9 = true;
+    HostFeatures.SupportsTSODisp16 = true;
   }
 #endif
 

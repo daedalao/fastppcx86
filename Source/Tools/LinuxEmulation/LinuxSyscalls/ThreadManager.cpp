@@ -378,6 +378,16 @@ FEX::HLE::ThreadStateObject* ThreadManager::CreateThread(uint64_t InitialRIP, ui
   ThreadStateObject->Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
   ::mprotect(ThreadStateObject->Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
   Frame->State.callret_sp = ThreadStateObject->GetCallRetStackInfo().DefaultLocation;
+  // Bound mirrors for the JIT's shadow CALL push / RET pop (see the
+  // callret_end comment in CoreState.h). These are the ONLY writers besides
+  // this thread's allocation above: CallRetStackBase is immutable until the
+  // munmap in the thread-destruction path, and the cache-rotation paths only
+  // VirtualDontNeed the contents. A CPUState inherited from the parent via
+  // CTX->CreateThread's memcpy carried the PARENT's mirrors until this point;
+  // these two stores are what make them this thread's own.
+  const uint64_t CallRetBase = reinterpret_cast<uint64_t>(ThreadStateObject->Thread->CallRetStackBase);
+  Frame->State.callret_base = CallRetBase;
+  Frame->State.callret_end = CallRetBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
 
   ThreadStateObject->Thread->FrontendPtr = ThreadStateObject;
   if (ProfileStats()) {

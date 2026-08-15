@@ -1400,10 +1400,24 @@ protected:
     switch (Op) {
     case OP_VFMINSCALARINSERT:
     case OP_VFMAXSCALARINSERT:
-      /* On AFP platforms, becomes fmin/fmax and preserves NZCV. Otherwise
-       * becomes fcmp and clobbers.
+      /* On AFP platforms, becomes fmin/fmax and preserves NZCV. On
+       * flag-transparent-select backends, becomes non-record vector
+       * compare + select and preserves NZCV. Otherwise becomes fcmp and
+       * clobbers.
        */
-      if (CTX->HostFeatures.SupportsAFP) {
+      if (CTX->HostFeatures.SupportsAFP || CTX->HostFeatures.SupportsFlagTransparentSelect) {
+        return;
+      }
+      break;
+
+    case OP_SELECT:
+    case OP_MASKGENERATEFROMBITWIDTH:
+      /* On flag-transparent-select backends these lower without writing any
+       * host flag state (see the flag's definition in HostFeatures.h), so
+       * guest NZCV survives in place. Otherwise csel/bit-mask sequences
+       * clobber host NZCV and the save is required.
+       */
+      if (CTX->HostFeatures.SupportsFlagTransparentSelect) {
         return;
       }
       break;
@@ -1653,9 +1667,12 @@ private:
     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation())) && !Operand.IsGPR();
   }
 
+  // RSP-addressed accesses skip TSO barriers on the assumption that the stack
+  // is thread-private. NonTSORBP (per-app opt-in, default off) extends the same
+  // exemption to RBP for titles that keep frame pointers — same soundness class.
   [[nodiscard]]
-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
+  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
+    return Access == MemoryAccessType::DEFAULT && (Reg == X86State::REG_RSP || (NonTSORBP && Reg == X86State::REG_RBP));
   }
 
   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
@@ -2262,6 +2279,22 @@ private:
 
   // Compares two floats and sets flags for a COMISS instruction
   void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2, bool InvalidateAF = false) {
+    if (CTX->HostFeatures.SupportsFCmpX86) {
+      // Fused path: one op produces the final x86 flag layout (the exact
+      // post-AXFLAG state, carry stored inverted) and returns raw PF for us
+      // to store through the register cache — replacing FCmp + the PF
+      // NZCVSelect + AXFlag. AF handling matches ComissFlags: raw PF is 0/1
+      // so PF[4]=0 and zeroing the AF byte zeroes AF.
+      HandleNZCVWrite();
+      Ref PFRaw = _FCmpX86(ElementSize, Src1, Src2);
+      SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(PFRaw);
+      if (!InvalidateAF) {
+        SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
+      }
+      CFInverted = true;
+      return;
+    }
+
     // First, set flags according to Arm FCMP.
     HandleNZCVWrite();
     _FCmp(ElementSize, Src1, Src2);
@@ -2547,6 +2580,9 @@ private:
 
   bool Multiblock {};
   bool Is64BitMode {};
+  // Cached once at construction from Config.NonTSORBP; consulted per decoded
+  // memory operand in IsNonTSOReg so no config read happens per decode.
+  bool NonTSORBP {};
   uint64_t Entry {};
 
   // Vector-scan fusion lookahead window, see SetDecodeWindow.
@@ -2612,7 +2648,8 @@ private:
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
+    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, CTX->HostFeatures.SupportsTSODisp16,
+                                     AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
       return _LoadMemTSO(Class, Size, B.Base, B.Index, Align, B.IndexType, B.IndexScale);
@@ -2675,7 +2712,8 @@ private:
 
   Ref _StoreMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, Ref Value, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
+    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, CTX->HostFeatures.SupportsTSODisp16,
+                                     AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
       return _StoreMemTSO(Class, Size, Value, B.Base, B.Index, Align, B.IndexType, B.IndexScale);

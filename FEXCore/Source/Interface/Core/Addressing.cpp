@@ -51,8 +51,8 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
   return Tmp ?: IREmit->Constant(0);
 }
 
-AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9, bool AtomicTSO,
-                              bool Vector, IR::OpSize AccessSize) {
+AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9,
+                              bool HostSupportsTSODisp16, bool AtomicTSO, bool Vector, IR::OpSize AccessSize) {
   const auto Is32Bit = GPRSize == OpSize::i32Bit;
   const auto GPRSizeMatchesAddrSize = A.AddrSize == GPRSize;
   const auto OffsetIndexToLargeFor32Bit = Is32Bit && (A.Offset <= -16384 || A.Offset >= 16384);
@@ -90,12 +90,18 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
   //   Just DMB + previous
   // * FEAT_LRCPC3 (Unsupported by FEXCore currently):
   //   LDAPUR/STLUR: [Reg + [-256,255]]
+  //
+  // TSO GPR on PPC64LE (HostSupportsTSODisp16):
+  // * The barrier (lwsync) is a separate instruction from the access, so any
+  //   addressing form is legal; the backend folds ±32K into D/DS-form.
 
   const auto AccessSizeAsImm = OpSizeToSize(AccessSize);
   const bool OffsetIsSIMM9 = A.Offset && A.Offset >= -256 && A.Offset <= 255;
+  const bool OffsetIsSIMM16 = A.Offset && A.Offset >= -32768 && A.Offset <= 32767;
   const bool OffsetIsUnsignedScaled = A.Offset > 0 && (A.Offset & (AccessSizeAsImm - 1)) == 0 && (A.Offset / AccessSizeAsImm) <= 4095;
 
-  if ((AtomicTSO && !Vector && HostSupportsTSOImm9 && OffsetIsSIMM9) || (!AtomicTSO && (OffsetIsSIMM9 || OffsetIsUnsignedScaled))) {
+  if ((AtomicTSO && !Vector && ((HostSupportsTSOImm9 && OffsetIsSIMM9) || (HostSupportsTSODisp16 && OffsetIsSIMM16))) ||
+      (!AtomicTSO && (OffsetIsSIMM9 || OffsetIsUnsignedScaled))) {
     // Peel off the offset
     AddressMode B = A;
     B.Offset = 0;

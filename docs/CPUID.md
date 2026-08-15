@@ -25,6 +25,8 @@
     * 1 - x86_64
     * 2 - AArch64
     * 3-15: **Reserved**
+    * No value is assigned to PPC64LE, so this fork reports 0 (Unknown). A guest
+      cannot currently identify a POWER host from this leaf.
   * Bits EAX[15:4] - **Reserved**
   * Bits EAX[31:16] - Maximum subleaf input value for CPUID function 4000_0001h
 * EBX - **Reserved** - Read as zero

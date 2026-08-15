@@ -35,6 +35,7 @@
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
 
@@ -967,6 +968,30 @@ void PPC64Dispatcher::EmitDispatcher() {
     stw(TMP1, ref_off, STATE);
   }
 
+  // A host thunk callee is re-entering guest execution. If the JIT crossing
+  // that made the host call armed the InSyscallInfo sentinel (DEF_OP(Thunk)/
+  // the FABI stubs — see kInSyscallSentinel in ArchHelpers/PPC64Emitter.h),
+  // it MUST die here, for two independent reasons:
+  //  1. The callback's guest blocks run with live SRA in host registers; a
+  //     signal during them must spill everything. A surviving mask would
+  //     make SpillSRA skip the r7-r15 spills over LIVE state — stale frame
+  //     RSP/RIP, the 2026-07-31 Factorio crash class recorded at
+  //     SpillForABICall's NB comment.
+  //  2. The callback republishes guest state in the frame (its blocks spill
+  //     to it continuously), so the interrupted crossing's conditional
+  //     refill must take the full path when it eventually resumes — which is
+  //     exactly what a dead sentinel tells it.
+  // Unconditional store: when nothing armed it, the field is already 0 and
+  // this is an idempotent 2-instruction cost on an already-expensive rare
+  // path. DEF_OP(Syscall) never crosses a callback, so its inline copy of
+  // the scheme is unaffected.
+  {
+    int32_t isi_off = static_cast<int32_t>(
+      offsetof(CpuStateFrame, InSyscallInfo));
+    li(TMP1, 0);
+    std(TMP1, static_cast<int16_t>(isi_off), STATE);
+  }
+
   // Push ThunkCallbackRet onto the guest stack so the guest callback's ret
   // lands on the 0F3E trampoline, which triggers CallbackReturn IR op.
   // Mirrors the ARM64 dispatcher.
@@ -1022,7 +1047,13 @@ void PPC64Dispatcher::EmitDispatcher() {
 
   DispatcherEnd = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
-  // Generate ABI bridge stubs for all FallbackABI types
+  // Generate ABI bridge stubs for all FallbackABI types. Bounds are exported
+  // separately (FABIStubsBegin/End): these live past DispatcherEnd, and the
+  // signal delegator's async-defer gate must treat them as in-JIT windows —
+  // an immediate delivery here interrupts a host-call crossing whose
+  // in-flight x87-pass state exists only in registers (the 2026-08-13
+  // signal-storm x87 corruption; see FEXCore/Core/SignalDelegator.h).
+  FABIStubsBegin = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
   {
     constexpr std::array<FallbackABI, FABI_UNKNOWN> ABIS {{
       FABI_F80_I16_F32_PTR,
@@ -1048,6 +1079,7 @@ void PPC64Dispatcher::EmitDispatcher() {
       ABIPointers[ABI] = GenerateABICall(ABI);
     }
   }
+  FABIStubsEnd = reinterpret_cast<uint64_t>(GetCursorAddress<uint8_t*>());
 
   // Flush instruction cache for entire generated region. This was one of three
   // copy-pasted inline-asm blocks; it is now the shared helper, which also adds
@@ -1115,9 +1147,57 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   const int16_t FCW_off = static_cast<int16_t>(
     offsetof(FEXCore::Core::CPUState, FCW));
 
+  // Sentinel-guarded partial SRA GPR refill for the FABI crossings, sharing
+  // DEF_OP(Thunk)'s scheme and kill switch (see kInSyscallSentinel in
+  // ArchHelpers/PPC64Emitter.h and the port rationale at DEF_OP(Thunk)).
+  // The FABI helpers are pure compute — none re-enters the guest — and the
+  // entire armed window here runs OUTSIDE the thread's code buffer (stub +
+  // helper), so in-JIT signal delivery never even consults the mask during
+  // it; the sentinel purely decides full-vs-partial refill, dying via the
+  // uint16_t ContextBackup truncation whenever a guest handler ran during
+  // the call. 64-bit only (lwz zero-extension invariant); 32-bit stubs keep
+  // today's full-fill emission byte for byte. Orthogonal to the
+  // DynVRSpillMask contract above: arming is a single STATE store and the
+  // checked fill preserves FillForABICall's PopDynamicRegs-then-fill order,
+  // so the caller-save pair at the two FABI callsite emitters is untouched.
+  static const bool NoPartialFill = getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr;
+  const bool PartialFill = Is64Bit && !NoPartialFill;
+
   // ----------------------------------------------------------------
   // Helpers emitted inline
   // ----------------------------------------------------------------
+
+  // Every stub's spill + (gated) sentinel arm. The arm clobbers TMP1 only —
+  // each case's stub arguments live in TMP2/TMP3 and the Func pointer in
+  // TMP4, all preserved (same clobber set the bare SpillForABICall had,
+  // which also used TMP1 as its scratch).
+  auto SpillForFABICall = [&]() {
+    this->SpillForABICall(TMP1);
+    // Arm on BOTH bitnesses: the sentinel is not only the partial-fill
+    // gate, it is the signal delegator's defer marker for FABI crossings
+    // (kInFABISentinel bit 25) — 32-bit guests need the deferral just as
+    // much (the signal-storm x87 corruption reproduced on .32 until this
+    // armed unconditionally). The partial REFILL stays 64-bit-only below.
+    ArmInSyscallSentinel(kInFABISentinel);
+  };
+
+  // Every stub's refill + (gated) sentinel check/disarm. Clobbers TMP1 and
+  // CR0 exactly as the result-move helpers below already tolerate (integer
+  // results are stashed to the mini-frame before this runs; f1/f2 and the
+  // VTMPs are untouched by the check).
+  auto FillForFABICall = [&]() {
+    if (PartialFill) {
+      FillForABICallChecked(); // disarms as its final step
+    } else {
+      this->FillForABICall();
+      // The plain fill never touches the sentinel; disarm explicitly or a
+      // stale 0x200FFFF outlives the crossing and poisons every
+      // InSyscallInfo consumer (RestoreFrame redirect suppression, the
+      // defer gate itself). TMP1 is free after the fill; r0 was re-zeroed.
+      li(TMP1, 0);
+      std(TMP1, static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo)), STATE);
+    }
+  };
 
   // Allocate mini-frame and save LR.
   //
@@ -1218,27 +1298,27 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
   // Save VR{2} to VTMP1 then restore all regs (VR{2} is in SRAFPR, clobbered by FillStaticRegs)
   auto FillVec1Result = [&]() {
     vmr(VTMP1, VR{2});
-    FillForABICall();
+    FillForFABICall();
   };
 
   // Save VR{2}+VR{3} to VTMP1+VTMP2 then restore all regs
   auto FillVec2Result = [&]() {
     vmr(VTMP1, VR{2});
     vmr(VTMP2, VR{3});
-    FillForABICall();
+    FillForFABICall();
   };
 
   // Save integer result r3 to mini-frame +24 slot (= [r1+328] post-spill),
   // restore regs, load back to TMP1.
   auto FillIntResult = [&]() {
     std(r3, static_cast<int16_t>(kSpill + 24), r1);
-    FillForABICall();
+    FillForFABICall();
     ld(TMP1, 24, r1);
   };
 
   // f1 result: restore regs, then stfs+lvx to put float in VTMP1
   auto FillF32Result = [&]() {
-    FillForABICall();    // r1 = mini_r1; f1 survives (FPR file not touched)
+    FillForFABICall();    // r1 = mini_r1; f1 survives (FPR file not touched)
     stfs(f(1), 32, r1);
     addi(TMP1, r1, 32);
     lvx(VTMP1, r(0), TMP1);
@@ -1246,7 +1326,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
 
   // f1 result: restore regs, then stfd+lvx to put double in VTMP1
   auto FillF64Result = [&]() {
-    FillForABICall();
+    FillForFABICall();
     stfd(f(1), 32, r1);
     addi(TMP1, r1, 32);
     lvx(VTMP1, r(0), TMP1);
@@ -1254,7 +1334,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
 
   // f1+f2 HFA result: restore regs, put both doubles into VTMP1/VTMP2
   auto FillF64x2Result = [&]() {
-    FillForABICall();
+    FillForFABICall();
     stfd(f(1), 32, r1);
     addi(TMP1, r1, 32);
     lvx(VTMP1, r(0), TMP1);
@@ -1274,7 +1354,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // GPR sequence), arg3 ptr (Frame)→r5.
     EmitMiniFrameEnter();
     EmitExtractF32FromVTMP1();   // f1 = float, before spill
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_And_Frame_r5();      // r3=FCW, r5=Frame*; f1 already set
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1288,7 +1368,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // PPC64LE ELFv2: r3=FCW, f1=src(double), r5=Frame* (r4 skipped).
     EmitMiniFrameEnter();
     EmitExtractF64FromVTMP1();   // f1 = double, before spill
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_And_Frame_r5();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1302,7 +1382,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: VectorRegType handle(uint16_t FCW, int16/32_t src, CpuStateFrame*)
     // r3=FCW, r4=src(in TMP2=r4, survives spill), r5=Frame*  → ret VR{2}
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);       // TMP2=r4 unchanged; TMP1=r3 clobbered
+    SpillForFABICall();       // TMP2=r4 unchanged; TMP1=r3 clobbered
     EmitFCW_And_Frame_r5();      // r3=FCW, r5=Frame*; r4=src already set by JIT
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1315,7 +1395,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: float handle(uint16_t FCW, VectorRegType src, CpuStateFrame*)
     // r3=FCW, v2=src(VTMP1), r4=Frame*  → ret f1
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX1_Frame_r7();     // r3=FCW, v2=VTMP1, r4=Frame*
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1328,7 +1408,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: double handle(uint16_t FCW, VectorRegType src, CpuStateFrame*)
     // r3=FCW, v2=src(VTMP1), r4=Frame*  → ret f1
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX1_Frame_r7();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1343,7 +1423,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // f1=src(from VTMP1), r4=Frame* (r3 skipped by double arg)  → ret f1
     EmitMiniFrameEnter();
     EmitExtractF64FromVTMP1();   // f1 = double, before spill
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     mr(r4, STATE);               // r4=Frame*; f1 already set
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1358,7 +1438,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     EmitMiniFrameEnter();
     EmitExtractF64FromVTMP1();   // f1 = double 1
     EmitExtractF64FromVTMP2();   // f2 = double 2
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     mr(r5, STATE);
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1373,7 +1453,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: int16/32/64_t handle(uint16_t FCW, VectorRegType src, CpuStateFrame*)
     // r3=FCW, v2=src(VTMP1), r4=Frame*  → ret r3
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX1_Frame_r7();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1386,7 +1466,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: uint64_t handle(uint16_t FCW, VectorRegType s1, VectorRegType s2, CpuStateFrame*)
     // r3=FCW, v2=VTMP1, v3=VTMP2, r4=Frame*  → ret r3
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX2_Frame_r9();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1399,7 +1479,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: VectorRegType handle(uint16_t FCW, VectorRegType src, CpuStateFrame*)
     // r3=FCW, v2=VTMP1, r4=Frame*  → ret VR{2}
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX1_Frame_r7();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1412,7 +1492,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: VectorRegType handle(uint16_t FCW, VectorRegType s1, VectorRegType s2, CpuStateFrame*)
     // r3=FCW, v2=VTMP1, v3=VTMP2, r4=Frame*  → ret VR{2}
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX2_Frame_r9();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1425,7 +1505,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // C sig: VectorRegPairType handle(uint16_t FCW, VectorRegType src, CpuStateFrame*)
     // r3=FCW, v2=VTMP1, r4=Frame*  → HVA ret: VR{2}+VR{3}
     EmitMiniFrameEnter();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFCW_VMX1_Frame_r7();
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1440,7 +1520,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     // sequence), Frame* → slot 1 = r4. (Same arg layout as FABI_F64_F64_PTR.)
     EmitMiniFrameEnter();
     EmitExtractF64FromVTMP1();
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     mr(r4, STATE);              // r4 = Frame* (r3 skipped by double arg)
     EmitFuncToR12();
     mtctr(TMP4); bctrl();
@@ -1464,7 +1544,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
                                  // upper half; we don't use it before reload)
     std(TMP3, 48+8, r1);         // save Control to mini-frame +56 (overlaps
                                  // buf2 upper half; safe — no buf2 use here)
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     EmitFuncToR12();
     ld(r3, static_cast<int16_t>(kSpill + 24), r1);       // RAX
     ld(r4, static_cast<int16_t>(kSpill + 40), r1);       // RDX (mini-frame +40)
@@ -1484,7 +1564,7 @@ uint64_t PPC64Dispatcher::GenerateABICall(FallbackABI ABI) {
     //   slot 2-3=LHS(v2,r5-r6), slot 4-5=RHS(v3,r7-r8). No Frame* arg.
     EmitMiniFrameEnter();        // TMP4(Func) stays live in r6
     std(r3, 24, r1);             // save Control to [mini_r1+24]
-    SpillForABICall(TMP1);
+    SpillForFABICall();
     vmr(VR{2}, VTMP1);           // v2 = LHS
     vmr(VR{3}, VTMP2);           // v3 = RHS
     ld(r3, static_cast<int16_t>(kSpill + 24), r1);       // Control
@@ -1531,6 +1611,8 @@ FEXCore::SignalDelegatorConfig PPC64Dispatcher::MakeSignalDelegatorConfig() cons
   return FEXCore::SignalDelegatorConfig {
     .DispatcherBegin = DispatcherBegin,
     .DispatcherEnd   = DispatcherEnd,
+    .FABIStubsBegin  = FABIStubsBegin,
+    .FABIStubsEnd    = FABIStubsEnd,
 
     .AbsoluteLoopTopAddress        = DispatcherLoopTopAddress,
     .AbsoluteLoopTopAddressFillSRA = DispatcherLoopTopFillSRAAddress,

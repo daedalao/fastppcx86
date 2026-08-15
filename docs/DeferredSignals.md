@@ -1,5 +1,10 @@
 # Deferred signals and why FEX needs them
 
+> **Note.** The worked examples below are upstream's and are written in ARM64
+> assembly. This fork has no ARM64 backend; it implements the same mechanism on
+> PPC64LE. Read the ARM64 listings as illustrations of the scheme, not as code
+> in this tree.
+
 FastPPCx86 has locations in its code which are effectively "uninterruptible". In the sense that if the guest application receives a signal during an
 "uninterruptible" code section, then FEX is likely to hang or crash in spurious and terrible ways.
 

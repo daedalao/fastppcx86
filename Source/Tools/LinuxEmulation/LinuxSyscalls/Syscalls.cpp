@@ -73,6 +73,32 @@ namespace FEX::HLE {
 class SignalDelegator;
 SyscallHandler* _SyscallHandler {};
 
+namespace HardwareTSO {
+  bool Live = false;
+
+  bool ProbeAndEnable() {
+    // Acceptance is meaningful on powerpc: arch_validate_prot explicitly
+    // rejects PROT_SAO when the CPU/MMU cannot honor it (radix, missing
+    // CPU_FTR_SAO), so a successful SAO mapping implies SAO semantics.
+    // Ordering itself was proven separately (notes/tools/sao_litmus.c).
+    void* Probe =
+      ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (Probe == MAP_FAILED) {
+      fprintf(stderr,
+              "FEX: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
+              "Falling back to atomic/barrier TSO emulation.\n",
+              errno);
+      return false;
+    }
+    // Touch the page so a pathological accept-then-fault setup dies here, at
+    // startup, instead of inside the guest.
+    *static_cast<volatile uint32_t*>(Probe) = 1;
+    ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+    Live = true;
+    return true;
+  }
+} // namespace HardwareTSO
+
 // 2026-08-03 diagnostic: FEX_TRACE_CLONE=1 logs the guest-visible clone
 // return value alongside child-thread bring-up, so we can correlate a
 // crashing probe run's fault with the sequence of clone returns that

@@ -1,98 +1,182 @@
-# Tagged version (release) process
+# Release process
 
-**Inherited document.** This describes the upstream project's monthly release machinery — PPA,
-website, rootfs bucket — none of which FastPPCx86 operates. Kept for reference; it does not
-describe how this fork ships.
+How FastPPCx86 ships. This fork does not use upstream FEX's monthly cadence, PPA,
+website or rootfs bucket; none of that machinery is operated here. Releases are
+cut when there is something worth shipping.
 
-A tagged version happens near the start of each month.
+## Branch model
 
-The tagged versioning is `FEX-<YYMM>` with the month being the current month.
+`daedalao-wt` is the working branch. Every change lands there first.
 
-If a tagged version was being done on `Sun, 02 Jan 2022` then the FEX version would be FEX-2201
+`main` is the deployment branch. It receives a merge from `daedalao-wt` at
+release time and nothing else. `packaging/archpower/PKGBUILD` clones `main`, so
+merging to `main` is what makes a change reach anyone building the package.
 
-There are multiple locations that need to be updated during a release
-* Github tagged release
-* Github releases page
-* fex-emu.com blog post
-* https://launchpad.net/~fex-emu/+archive/ubuntu/fex Ubuntu PPA
-* @FEX_Emu twitter account
+The GitHub remote is `https://github.com/daedalao/fastppcx86.git`, called
+`fastppcx86` in the maintainer's checkout. Substitute your own remote name in
+the commands below.
 
-* Optional: Update the rootfs images
+## Version and tag
 
-## Github Steps
-* Check out the commit that will be the branch
+Tags are dated snapshots: `fastppcx86-YYYYMMDD`, for example
+`fastppcx86-20260813`. Package versions are independent: the PKGBUILD derives
+`pkgver` from the commit count and short hash (`r14884.211e31a`) and does not
+read tags.
 
-  $ git checkout upstream/main
+## 1. Pre-flight on daedalao-wt
 
-* Make local main branch be the selected commit
+Run from a clean checkout of `daedalao-wt`.
 
-  $ git branch -D main
-  $ git checkout -b main
+```sh
+git status --short                 # must be empty
+ctest --test-dir build             # compare against the known-good baseline
+```
 
-* Run the release script
+Refresh the generated source outline, which is derived from `$info$` tags in the
+sources and drifts as files are added or removed:
 
-  $ Scripts/generate_release.sh
+```sh
+Scripts/generate_doc_outline.sh > docs/SourceOutline.md
+git commit docs/SourceOutline.md -m "docs: regenerate SourceOutline"
+```
 
-* Push the branches upstream
-  * This requires administrative push rights
-  * Both the tag and the main branch needs to be committed
+Confirm the tree still builds with the packaging configuration, not just your
+development one. The two differ: the package builds thunks from source with the
+ArchPOWER cross packages, at `TUNE_CPU=none`, with LTO off.
 
-  $ git push upstream $CURRENT
-  $ git push upstream main
+## 2. Merge to main
 
-## Launchpad PPA steps
-Follow the steps in: https://github.com/FEX-Emu/FEX-ppa/blob/main/README.md
-* Requires PPA GPG key signing access
-* Wait the 20-30 minutes for Ubuntu PPA to build and publish the binaries
+```sh
+git checkout main
+git pull fastppcx86 main
+git merge --no-ff daedalao-wt -m "release: merge daedalao-wt for <TAG>"
+git push fastppcx86 main
+```
 
-## Github releases page Steps
-* Requires administrative rights
-* Go to https://github.com/FEX-Emu/FEX/releases
-* Click Draft a new release
-* Copy and paste the tagged changelog in to the draft release markdown
-  * This was generated from the generate_release.sh script
-* Clean the markdown to a desired level of combining and ordering
-  * Fairly trivial cleanups, it's more just a developer focused changelog
-* Click publish release
+Use `--no-ff` so the release point stays visible in the history.
 
-## fex-emu.com blog post steps
-* clone https://github.com/FEX-Emu/fex-emu.com
-* Copy the previous post from the _posts/ folder to a new markdown file
-  * Ensure correct date format in filename
-* Copy github release pages markdown in to this
-* Easy to forget areas:
-  * Title text section
-  * See Release notes top section, links to github release tag
-  * See detailed changelog at the bottom, linking to github raw revision comparison
-* Short blurb in the top paragraph if desired
-* push new md file to the repo. Either in direct push or PR
-* Jekyll will automatically regenerate the website with a github action
-* Verify that the post shows up on the site at fex-emu.com
+If `main` carries commits that are not on `daedalao-wt` (it has before), resolve
+the merge on `main` and then merge `main` back into `daedalao-wt` so the two do
+not keep diverging.
 
-## @FEX_Emu twitter account steps
-* Requires @FEX_Emu twitter account access
-* Create a tweet with some small blurb/sizzle text about some relevant changes in this tagged version
-* Link to the fex-emu.com blog post about the change
+## 3. Tag
 
-## RootFS image updating
-* This doesn't typically need to be done on a monthly basis
-* This lives in https://github.com/FEX-Emu/RootFS
+```sh
+TAG=fastppcx86-$(date +%Y%m%d)
+git tag -a "$TAG" -m "$TAG"
+git push fastppcx86 "$TAG"
+```
 
-* Follow the Build_Data file's information for how to generate an image using `build_image.py`
-  * This gives a squashfs image for the rootfs
-* Use FEXRootFSFetcher <image.sqsh> to generate the xxhash for the image
-* Update `https://rootfs.fex-emu.com/file/fex-rootfs/RootFS_links.json` with the new rootfs image and hash
-  * This currently lives in a private FEX-Emu backblaze bucket with cloudflare servicing it.
-  * Never publicly give the direct backblaze link to the file. Will cause BW costs to skyrocket
-  * Always pass through cloudflare
+## 4. Update the PKGBUILD pin
 
-* Upload new image to Backblaze using the b2 upload tool
-  * b2 upload-file <bucketname> <image.sqsh> <Image folder name>/<image.sqsh>
+The PKGBUILD tracks `main` by branch, so it picks up the merge automatically.
+The committed `pkgver` is metadata only (`pkgver()` recomputes it at build
+time), but `.SRCINFO` should not ship stale:
 
-* Upload the new RootFS_links.json
-  * Lives in the root of the bucket
-  * b2 upload-file <bucketname> RootFS_links.json RootFS_links.json
+```sh
+cd packaging/archpower
+# Set pkgver= to the value a fresh checkout produces:
+#   printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+makepkg --printsrcinfo > .SRCINFO
+git commit PKGBUILD .SRCINFO -m "packaging: refresh version metadata for <TAG>"
+```
 
-* Once uploaded it should propagate immediately
-* Might be worth thinking about the coherency problem of updating the hash versus image independently if overwriting an image
-  * Need to be careful about it to not break anyone in the process of downloading an image
+Reset `pkgrel=1` whenever `pkgver` changes. Bump `pkgrel` instead, leaving
+`pkgver` alone, when only the packaging changed.
+
+Regenerate `.SRCINFO` with the default `FASTPPCX86_GIT_URL` so no machine-local
+path is baked in.
+
+## 5. Build and check the package
+
+On an Arch POWER host, from a clean checkout of `main`:
+
+```sh
+cd packaging/archpower
+makepkg -s
+```
+
+To include the 32-bit guest stubs, point at a multilib x86 RootFS:
+
+```sh
+FASTPPCX86_X86_ROOTFS=$HOME/.local/share/fex-emu/RootFS/ArchLinux makepkg -s
+```
+
+Then inspect without installing:
+
+```sh
+namcap fastppcx86-*.pkg.tar.zst
+pacman -Qlp fastppcx86-*.pkg.tar.zst
+```
+
+Check that the package contains the thunks:
+
+```sh
+pacman -Qlp fastppcx86-*.pkg.tar.zst | grep -E 'HostThunks|GuestThunks'
+```
+
+`usr/lib/fex-emu/HostThunks/` and `usr/share/fex-emu/GuestThunks/` must both be
+populated. If `GuestThunks/` is empty the guest stubs did not build and 32-bit
+and 64-bit titles alike will fall back to emulated libraries.
+
+Smoke-test the built package before releasing it: install it, register binfmt
+(`systemctl restart systemd-binfmt`), and launch one known-good title.
+
+## 6. Create the GitHub release
+
+```sh
+gh release create "$TAG" \
+  --repo daedalao/fastppcx86 \
+  --title "$TAG" \
+  --generate-notes
+```
+
+`--generate-notes` builds the changelog from merged pull requests. For a
+commit-level changelog instead:
+
+```sh
+Scripts/generate_changelog.sh <previous-tag> "$TAG"
+```
+
+Note that `Scripts/generate_release.sh` is upstream's monthly-tag script. It
+assumes the `FEX-YYMM` scheme and pushes to upstream remotes; it is not used
+here.
+
+## 7. Optional: guest-thunks tarball
+
+Users who build the package without `FASTPPCX86_X86_ROOTFS` get no 32-bit guest
+stubs, because the i686 multilib sysroot is not in the Arch POWER repos.
+Attaching prebuilt stubs to the release lets them drop the files in instead.
+
+Only worth doing when the ThunkLibs interface changed since the last release. The
+stubs encode guest data layout generated by thunkgen, so a stub built against a
+different interface revision will not match the host thunk it pairs with. If
+`ThunkLibs/` is untouched since the previous tag, the previous tarball is still
+valid and this step can be skipped:
+
+```sh
+git diff --stat <previous-tag>..HEAD -- ThunkLibs/
+```
+
+From a build tree that had both bitnesses enabled:
+
+```sh
+tar -czf fastppcx86-guest-thunks-$TAG.tar.gz \
+  -C build --transform 's|^Guest_32|GuestThunks_32|;s|^Guest|GuestThunks|' \
+  Guest Guest_32
+gh release upload "$TAG" fastppcx86-guest-thunks-$TAG.tar.gz \
+  --repo daedalao/fastppcx86
+```
+
+The two directories unpack to the names FEX expects. Installation is a copy into
+the configured `ThunkGuestLibs` directory, which defaults to
+`/usr/share/fex-emu/GuestThunks` (and `GuestThunks_32`):
+
+```sh
+sudo tar -xzf fastppcx86-guest-thunks-$TAG.tar.gz -C /usr/share/fex-emu/
+```
+
+## Post-release
+
+Merge `main` back into `daedalao-wt` if the release commit changed anything on
+`main`, so the working branch starts from the released state.

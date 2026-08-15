@@ -1542,13 +1542,25 @@ uint32_t PPC64JITCore::XEROVBitIndex() const {
 }
 
 void PPC64JITCore::ProjectXERToCR1() {
-  if (ProjectXERUsesMcrxrx()) {
-    mcrxrx(1);  // CR1: LT=OV, GT=OV32, EQ=CA, SO=CA32
+  // Emit-time projection cache: consecutive C/V-consuming conditions within a
+  // block (setcc pairs, float-compare consumers — profiled at 2x projections
+  // per FCmp consumer in countersunk's hydro heap code and visible in W3's
+  // in-world flag traffic) re-project identical XER state. The flag is
+  // maintained by CompileCode: reset at block entry, and cleared AFTER every
+  // op whose handler is not on the no-XER/CR1-write allowlist — post-handler
+  // (not pre) because an op may project and THEN write XER inside one handler
+  // (CondAdd/CondSubNZCV's addco_/subfco_ after MapNZCVCC).
+  if (XERProjectionValid) {
     return;
   }
-  mfspr(TMP1, 1);
-  rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
-  mtocrf(0x40, TMP2);
+  if (ProjectXERUsesMcrxrx()) {
+    mcrxrx(1);  // CR1: LT=OV, GT=OV32, EQ=CA, SO=CA32
+  } else {
+    mfspr(TMP1, 1);
+    rlwinm(TMP2, TMP1, 28, 0, 31);  // rotlwi 28
+    mtocrf(0x40, TMP2);
+  }
+  XERProjectionValid = true;
 }
 
 // -------------------------------------------------------------------------
@@ -2466,6 +2478,20 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // other feature combination, so only the explicit kill switch gates it.
   SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
 
+  // FEX_SPINCOLLAPSE=1: batched budget decrement for counted spin loops
+  // (opt-in while the per-app exposure is gathered; see the contract at
+  // kSpinCollapseK in JITClass.h). Hashed into the code-cache config id.
+  {
+    const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
+    SpinCollapseEnabled = SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0';
+    if (SpinCollapseEnabled) {
+      const long V = strtol(SpinEnv, nullptr, 10);
+      if (V >= 2 && V <= 1024) {
+        kSpinCollapseK = static_cast<uint16_t>(V);
+      }
+    }
+  }
+
   // SMC interlocks: two fork features are only sound when every constant-target
   // exit re-probes the lookup path, which is exactly what a established direct
   // link bypasses.
@@ -3366,6 +3392,127 @@ void PPC64JITCore::Compute32MaskElision() {
   }
 }
 
+// -------------------------------------------------------------------------
+// TSO load->store adjacent-barrier elision prepass. See the TSOPairElideSet
+// block comment in JITClass.h for the mechanism and DEF_OP(StoreMemTSO) for
+// the full soundness argument at the elision site.
+//
+// Walk each block in emission order tracking Fresh = "an lwsync has been
+// emitted since the last memory-access host instruction". LoadMemTSO sets it
+// (both its FPR and GPR legs end with an unconditional trailing lwsync and
+// have no other exit); a StoreMemTSO reached with Fresh set is recorded and
+// clears it (the store itself is a post-barrier memory access, so a following
+// StoreMemTSO still needs its own release barrier for Store->Store order).
+// EVERY op not on the whitelist below clears Fresh — including Spill/Fill
+// (RA-inserted spills are IR ops and appear in this same stream), all other
+// memory ops, and every op nobody has verified.
+//
+// Whitelist verification notes — an op may appear here ONLY if its DEF_OP
+// emits zero memory-access host instructions, checked against the emitting
+// handler (not assumed from the op's name). Branch/label-free is NOT required
+// (lwsync orders memory accesses in program order on the executing hart;
+// non-memory instructions between the barrier and the store are irrelevant),
+// but none of the listed handlers binds a label an external edge can enter
+// through — IR jumps only target block heads, so no path can reach the store
+// without executing the load's trailing lwsync first.
+//  * Emission no-ops, dispatch-table Op_NoOp entries (emit zero bytes):
+//    Dummy, IRHeader, CodeBlock, BeginBlock, EndBlock, InvalidateFlags,
+//    InlineConstant, InlineEntrypointOffset.
+//  * DEF_OP'd no-ops: GuestOpcode (DebugData table entry only, zero host
+//    instructions), SetSmallNZV / TelemetrySetValue / WFET (empty bodies).
+//  * Constant: TryInsertPatchableImmMove -> LoadConstantFixed
+//    (lis/ori/sldi/oris/ori) or LoadConstant -> LoadImm64 (li/lis/ori/sldi/
+//    rldic/oris family). EntrypointOffset: InsertEntrypointRIPMove ->
+//    LoadConstant or InsertGuestRIPMove -> LoadConstantFixed. All immediate
+//    builders, no memory.
+//  * Copy: mr only. Bfe/Sbfe: rlwinm/rldicl/extsb/extsh/extsw/neg/sldi/or_/mr.
+//  * Add/Sub/Neg/Not/Or/And/Xor/Andn: addi/addis/add/subf/neg/isel/nor/
+//    ori/oris/or/and/xor/xori/xoris/andc (+ LoadConstant, + rldicl tail).
+//  * Lshl/Lshr/Ashr: rlwinm/sldi/srdi/rldicl/slw/srw/sld/srd/extsw/li/subf/
+//    neg/or_ — the XER-safe shift lowerings, register-only by construction.
+//  * AddWithFlags/SubWithFlags/AddNZCV/SubNZCV: sldi/LoadConstant/addco_/
+//    subfco_/srdi (CR0/XER writes are register state, not memory).
+//  * TestNZ/TestZ/AndWithFlags: andi_/and__/addco/extsb_/extsh_/extsw_/cmpdi
+//    (+ LoadConstant).
+// Deliberately NOT whitelisted despite looking pure: Div/UDiv, Rev, Rbit,
+// PDep, ShiftFlags, RotateFlags — their handlers stash through r1 (std/ld
+// red-zone slots or stdbrx/stwbrx bounce buffers), which are memory accesses.
+// LoadMemRev/StoreMemRev (TSO=1) carry the same barriers as the ops handled
+// here but are left out of v1: they conservatively clear Fresh like any other
+// memory op (missed elision only).
+// -------------------------------------------------------------------------
+void PPC64JITCore::ComputeTSOPairElision() {
+  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+  static const bool PairOff = PairEnv && PairEnv[0] == '0';
+  TSOPairElideSet.assign(IR->GetSSACount(), false);
+  if (PairOff) {
+    return;
+  }
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    // Reset per block: a block can be entered from anywhere, so nothing about
+    // the previously emitted block's trailing barrier state may be assumed.
+    bool Fresh = false;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      switch (IROp->Op) {
+      case IR::OP_LOADMEMTSO:
+        Fresh = true;
+        break;
+
+      case IR::OP_STOREMEMTSO:
+        if (Fresh) {
+          TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
+        }
+        Fresh = false;
+        break;
+
+      // Whitelist — see the verification table above.
+      case IR::OP_DUMMY:
+      case IR::OP_IRHEADER:
+      case IR::OP_CODEBLOCK:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      case IR::OP_GUESTOPCODE:
+      case IR::OP_SETSMALLNZV:
+      case IR::OP_TELEMETRYSETVALUE:
+      case IR::OP_WFET:
+      case IR::OP_CONSTANT:
+      case IR::OP_ENTRYPOINTOFFSET:
+      case IR::OP_COPY:
+      case IR::OP_BFE:
+      case IR::OP_SBFE:
+      case IR::OP_ADD:
+      case IR::OP_SUB:
+      case IR::OP_NEG:
+      case IR::OP_NOT:
+      case IR::OP_OR:
+      case IR::OP_AND:
+      case IR::OP_XOR:
+      case IR::OP_ANDN:
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR:
+      case IR::OP_ADDWITHFLAGS:
+      case IR::OP_SUBWITHFLAGS:
+      case IR::OP_ADDNZCV:
+      case IR::OP_SUBNZCV:
+      case IR::OP_TESTNZ:
+      case IR::OP_TESTZ:
+      case IR::OP_ANDWITHFLAGS:
+        break;
+
+      default:
+        Fresh = false;
+        break;
+      }
+    }
+  }
+}
+
 void PPC64JITCore::AnalyzeSpinLoops() {
   struct BlockInfo {
     uint32_t ID = UINT32_MAX;
@@ -3373,7 +3520,14 @@ void PPC64JITCore::AnalyzeSpinLoops() {
     uint32_t OpCount = 0;
     bool Clean = false;
     bool HasPollLoad = false;
+    IR::Ref Node = nullptr;  // for the SpinCollapse pattern re-walk
   };
+
+  // SpinCollapse marks are per-compile; reset before any region matching so
+  // a block that stops qualifying can never inherit a stale mark. Bounds
+  // checks in the accessors cover compiles where this function never runs.
+  SpinCollapseSubs.assign(IR->GetSSACount(), false);
+  SpinCollapseBranches.assign(IR->GetSSACount(), false);
 
   fextl::vector<BlockInfo> Blocks;
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
@@ -3387,6 +3541,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
     BlockInfo Info {};
     Info.ID = BlockIROp->ID;
     Info.Clean = true;
+    Info.Node = BlockNode;
 
     // The block's branch terminator. NOTE: it is not the final op in the
     // code list -- every block carries a trailing EndBlock marker after the
@@ -3421,6 +3576,22 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       // into their consumers).
       case IR::OP_INLINECONSTANT:
       case IR::OP_INLINEENTRYPOINTOFFSET:
+        break;
+      // Flag-producing ALU ops: HasSideEffects=true in IR.json because they
+      // write NZCV/PF, but on this backend that is register/CR/XER state
+      // only (verified lowering-by-lowering for the TSO pair-elision
+      // whitelist) — exactly the "this thread's guest state" the region
+      // definition allows. Without these the canonical poll shape
+      // (LoadMemTSO + SubWithFlags(test) + CondJump) rejects its own region:
+      // the production redDispatcher spin was never getting hints OR
+      // collapse until this list existed.
+      case IR::OP_SUBWITHFLAGS:
+      case IR::OP_ADDWITHFLAGS:
+      case IR::OP_SUBNZCV:
+      case IR::OP_ADDNZCV:
+      case IR::OP_TESTNZ:
+      case IR::OP_TESTZ:
+      case IR::OP_ANDWITHFLAGS:
         break;
       default:
         if (IR::HasSideEffects(IROp->Op)) {
@@ -3485,17 +3656,220 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
         continue;
       }
-      PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      if (SpinLoopHintEnabled) {
+        PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
+      }
+
+      // FEX_SPINCOLLAPSE: within a validated spin region, match the fused
+      // counted-decrement shape in the backedge block and mark its Sub +
+      // CondJump for batched emission (contract at kSpinCollapseK,
+      // JITClass.h). Post-RA, consumer args are immediate-encoded
+      // PhysicalRegisters — all value linkage is matched by register, the
+      // mask-elision lesson.
+      if (SpinCollapseEnabled) {
+        // Stationary-poll gate. The counted-decrement match below cannot by
+        // itself distinguish the redDispatcher spin (polls ONE address every
+        // iteration; the leftover budget is dead on the found exit) from a
+        // strlen/memchr-class scan (advances a pointer each iteration; the
+        // leftover count is LIVE — it becomes a length). Collapsing a scan
+        // corrupts that length: CP2077 SIGSEGV'd 7s into bootstrap when the
+        // v1 matcher collapsed loader scans. A scan must increment something,
+        // so require the whole region to contain NO OP_ADD and no integer
+        // Sub other than the budget decrement; the poll address must come
+        // from a fixed base (EntrypointOffset / SRA register), which this
+        // enforces indirectly.
+        bool RegionStationary = true;
+        uint32_t RegionSubCount = 0;
+        for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
+          for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
+            if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
+              RegionStationary = false;
+              break;
+            }
+            if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
+              RegionStationary = false;
+              break;
+            }
+          }
+        }
+
+        IR::Ref SubNode = nullptr;
+        const IR::IROp_Header* SubHdr = nullptr;
+        IR::PhysicalRegister SubSrcPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister SubDstPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister CopySrcPR = IR::PhysicalRegister::Invalid();
+        IR::PhysicalRegister CopyDstPR = IR::PhysicalRegister::Invalid();
+        IR::Ref BranchNode = nullptr;
+        const IR::IROp_Header* BranchHdr = nullptr;
+        IR::Ref CopyNode = nullptr;
+        IR::Ref StoreNode = nullptr;
+        uint32_t SubCount = 0;
+        bool StoreOfSubSeen = false;
+
+        const auto ArgPR = [this](IR::OrderedNodeWrapper Arg) {
+          return Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IR->GetNode(Arg));
+        };
+
+        for (auto [CodeNode, IROp] : IR->GetCode(Blocks[bi].Node)) {
+          switch (IROp->Op) {
+          case IR::OP_SUB: {
+            ++SubCount;
+            auto SOp = IROp->C<IR::IROp_Sub>();
+            uint64_t C = 0;
+            if ((IROp->Size == IR::OpSize::i32Bit || IROp->Size == IR::OpSize::i64Bit) && IsInlineConstant(SOp->Src2, &C) && C == 1) {
+              SubNode = CodeNode;
+              SubHdr = IROp;
+              SubSrcPR = ArgPR(SOp->Src1);
+              SubDstPR = IR::PhysicalRegister(CodeNode);
+            }
+            break;
+          }
+          case IR::OP_COPY: {
+            auto COp = IROp->C<IR::IROp_Copy>();
+            CopySrcPR = ArgPR(COp->Source);
+            CopyDstPR = IR::PhysicalRegister(CodeNode);
+            CopyNode = CodeNode;
+            break;
+          }
+          case IR::OP_STOREREGISTER: {
+            auto ROp = IROp->C<IR::IROp_StoreRegister>();
+            if (SubNode && ArgPR(ROp->Value).Raw == SubDstPR.Raw) {
+              StoreOfSubSeen = true;
+              StoreNode = CodeNode;
+            }
+            break;
+          }
+          case IR::OP_CONDJUMP: {
+            BranchNode = CodeNode;
+            BranchHdr = IROp;
+            break;
+          }
+          default: break;
+          }
+        }
+
+        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
+          auto JOp = BranchHdr->C<IR::IROp_CondJump>();
+          uint64_t JC = 0;
+          const bool ShapeOK = JOp->VCmpElementSize == IR::OpSize::iInvalid && !JOp->FromNZCV &&
+                               JOp->Cond == IR::CondClass::NEQ && IsInlineConstant(JOp->Cmp2, &JC) && JC == 1 &&
+                               JOp->CompareSize == SubHdr->Size &&
+                               IR->GetOp<IR::IROp_CodeBlock>(JOp->TrueBlock)->ID == TargetID;
+          if (ShapeOK) {
+            const auto Cmp1PR = ArgPR(JOp->Cmp1);
+            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
+                                (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
+            // Complete budget-liveness guard. Inside the region the ONLY
+            // permitted readers of the budget register are the decrement
+            // itself, the Copy staging the pre-decrement value, and the
+            // backedge compare; the only permitted reader of the decrement's
+            // RESULT is the StoreRegister writing it back; the staged copy
+            // may be read only by the branch. Anything else consuming any of
+            // the three (an index-addressed scan's load, a bound check, a
+            // shift amount, an exit-path length computation...) observes the
+            // coarsened K-step descent and breaks — the v2 load-only version
+            // of this guard still let CP2077's bootstrap crash. Conservative
+            // by physical register: an unrelated live range that happens to
+            // share the register rejects the region, costing only the
+            // elision.
+            bool ForeignReader = false;
+            if (Linked) {
+              for (uint32_t ri = ti; ri <= bi && !ForeignReader; ++ri) {
+                for (auto [RNode, ROp] : IR->GetCode(Blocks[ri].Node)) {
+                  if (RNode == SubNode || RNode == BranchNode || RNode == CopyNode) {
+                    continue;
+                  }
+                  // Only VALUE args may be interpreted as registers: block
+                  // references (branch targets) and InlineConstant nodes have
+                  // no RA assignment, and PhysicalRegister() over them reads
+                  // garbage that randomly aliases real registers (the v3
+                  // guard rejected its own repro through a branch-target
+                  // arg). CondJump contributes exactly Cmp1/Cmp2; pure
+                  // control/structure ops contribute nothing.
+                  IR::OrderedNodeWrapper ValueArgs[2] = {IR::OrderedNodeWrapper::WrapOffset(0), IR::OrderedNodeWrapper::WrapOffset(0)};
+                  uint8_t NumCheck = 0;
+                  switch (ROp->Op) {
+                  case IR::OP_CONDJUMP: {
+                    auto J2 = ROp->C<IR::IROp_CondJump>();
+                    ValueArgs[NumCheck++] = J2->Cmp1;
+                    ValueArgs[NumCheck++] = J2->Cmp2;
+                    break;
+                  }
+                  case IR::OP_JUMP:
+                  case IR::OP_BEGINBLOCK:
+                  case IR::OP_ENDBLOCK:
+                  case IR::OP_GUESTOPCODE:
+                  case IR::OP_INLINECONSTANT:
+                  case IR::OP_INLINEENTRYPOINTOFFSET:
+                    break;
+                  default: {
+                    const uint8_t NumArgs = IR::GetArgs(ROp->Op);
+                    for (uint8_t a = 0; a < NumArgs && NumCheck < 2; a++) {
+                      ValueArgs[NumCheck++] = ROp->Args[a];
+                    }
+                    // Ops with more than two args in a spin region are
+                    // exotic; treat them as foreign rather than under-check.
+                    if (IR::GetArgs(ROp->Op) > 2) {
+                      ForeignReader = true;
+                    }
+                    break;
+                  }
+                  }
+                  // Live-range scoping: the budget lives in an SRA register
+                  // and is meaningful REGION-wide; the Sub result and the
+                  // staged Copy are block-local scratch whose physical
+                  // registers (r0/r1 pool) are recycled by RA in every other
+                  // block — checking those region-wide false-rejects almost
+                  // every real loop (the repro's poll-address temp shares r0
+                  // with the Sub result). Scope them to the backedge block.
+                  uint64_t Scratch;
+                  for (uint8_t a = 0; a < NumCheck && !ForeignReader; a++) {
+                    if (ValueArgs[a].IsInvalid() || IsInlineConstant(ValueArgs[a], &Scratch)) {
+                      continue;
+                    }
+                    const auto PR = ArgPR(ValueArgs[a]);
+                    if (PR.Raw == SubSrcPR.Raw) {
+                      ForeignReader = true;
+                    } else if (ri == bi && (PR.Raw == CopyDstPR.Raw || (PR.Raw == SubDstPR.Raw && RNode != StoreNode))) {
+                      ForeignReader = true;
+                    }
+                  }
+                  if (ForeignReader) {
+                    break;
+                  }
+                }
+              }
+            }
+            if (Linked && !ForeignReader) {
+              SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
+              SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
+              // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop so a
+              // misbehaving title can be attributed to a guest RIP without a
+              // debugger (compile-time event, low volume).
+              static const bool Trace = [] {
+                const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
+                return T && T[0] == '1';
+              }();
+              if (Trace) {
+                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u\n",
+                        IR->GetHeader()->OriginalRIP, TargetID);
+              }
+            }
+          }
+        }
+      }
       // Every edge from a region block to a block outside [ti, bi] restores
       // medium priority.
-      for (uint32_t ri = ti; ri <= bi; ++ri) {
-        for (const uint32_t T : Blocks[ri].Targets) {
-          if (T == UINT32_MAX || T >= NumBlocks) {
-            continue;
-          }
-          const uint32_t tidx = IdxOfID[T];
-          if (tidx < ti || tidx > bi) {
-            PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+      if (SpinLoopHintEnabled) {
+        for (uint32_t ri = ti; ri <= bi; ++ri) {
+          for (const uint32_t T : Blocks[ri].Targets) {
+            if (T == UINT32_MAX || T >= NumBlocks) {
+              continue;
+            }
+            const uint32_t tidx = IdxOfID[T];
+            if (tidx < ti || tidx > bi) {
+              PushUnique(SpinRestoreEdges, SpinEdgeKey(Blocks[ri].ID, T));
+            }
           }
         }
       }
@@ -3745,9 +4119,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
 
   // Detect tiny memory-polling loops and mark their backedges/exit edges for
   // SMT priority hints (see JITClass.h and DEF_OP(CondJump)/DEF_OP(Jump)).
+  // The same region walk feeds the FEX_SPINCOLLAPSE matcher; each consumer
+  // is gated individually inside.
   SpinBackedges.clear();
   SpinRestoreEdges.clear();
-  if (SpinLoopHintEnabled) {
+  if (SpinLoopHintEnabled || SpinCollapseEnabled) {
     AnalyzeSpinLoops();
   }
 
@@ -3934,6 +4310,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   }
 
   Compute32MaskElision();
+  ComputeTSOPairElision();
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
@@ -4090,6 +4467,44 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // A block can be entered from anywhere; nothing about the previously
     // emitted block's trailing register contents may be assumed here.
     InvalidateAESCache();
+    XERProjectionValid = false;
+    LastConstantCache.Valid = false;
+
+    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
+    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
+    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
+    // FMA handler can skip its splat. Same-block pairs only by construction.
+    SplatCandidateLoads.clear();
+    SplatFormLoadNodes.clear();
+    // Field kill switch (hashed into the code-cache config id).
+    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
+    if (!DisableSplatFusion)
+    for (auto [CandNode, CandIROp] : IRView->GetCode(BlockNode)) {
+      switch (CandIROp->Op) {
+      case IR::OP_VFMLASCALARINSERT:
+      case IR::OP_VFMLSSCALARINSERT:
+      case IR::OP_VFNMLASCALARINSERT:
+      case IR::OP_VFNMLSSCALARINSERT: {
+        auto FOp = CandIROp->C<IR::IROp_VFMLAScalarInsert>();
+        if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
+          break;
+        }
+        for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
+          if (Arg.IsImmediate() || Arg == FOp->Upper) {
+            continue;
+          }
+          auto DefNode = IRView->GetNode(Arg);
+          auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
+          if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
+              DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
+            SplatCandidateLoads.push_back(Arg.ID().Value);
+          }
+        }
+        break;
+      }
+      default: break;
+      }
+    }
 
     PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
@@ -4135,6 +4550,64 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         Op_Unhandled(IROp, CodeNode);
       }
       DynVRSpillMask = ~0u;
+
+      // XER->CR1 projection cache lifecycle (see ProjectXERToCR1): cleared
+      // AFTER the handler — an op may project then write XER within one
+      // handler (CondAdd/CondSubNZCV), so a pre-dispatch clear would leave a
+      // stale projection visible to an allowlisted successor. The allowlist
+      // is ops verified to write neither XER nor any CR field: the NZCVSelect
+      // family (MapNZCVCC writes CR3 composites and CR1 only via the
+      // projection itself), plain register moves, and constants.
+      switch (IROp->Op) {
+      case IR::OP_NZCVSELECT:
+      case IR::OP_NZCVSELECTV:
+      case IR::OP_NZCVSELECTINCREMENT:
+      case IR::OP_STOREREGISTER:
+      case IR::OP_LOADREGISTER:
+      case IR::OP_CONSTANT:
+      case IR::OP_INLINECONSTANT: break;
+      default: XERProjectionValid = false; break;
+      }
+
+      // Last-constant cache lifecycle (see LastConstantCache in JITClass.h).
+      // Set by materialized constants; survives only across ops verified to
+      // write no dynamic GPR (FPR-class loads and the scalar-FP inserts —
+      // their GPR usage is TMP1-4/r0 only, never RA registers); everything
+      // else invalidates. Reset at block entry alongside the AES cache.
+      switch (IROp->Op) {
+      case IR::OP_CONSTANT: {
+        // Field kill switch (hashed into the code-cache config id).
+        static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
+        auto COp = IROp->C<IR::IROp_Constant>();
+        const auto PR = IR::PhysicalRegister(CodeNode);
+        if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+          LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+        } else {
+          LastConstantCache.Valid = false;
+        }
+        break;
+      }
+      case IR::OP_LOADMEM:
+      case IR::OP_LOADMEMTSO:
+        // FPR-class loads leave dynamic GPRs untouched; GPR-class loads
+        // write an RA register and must invalidate.
+        if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
+          LastConstantCache.Valid = false;
+        }
+        break;
+      case IR::OP_VFADDSCALARINSERT:
+      case IR::OP_VFSUBSCALARINSERT:
+      case IR::OP_VFMULSCALARINSERT:
+      case IR::OP_VFDIVSCALARINSERT:
+      case IR::OP_VFMINSCALARINSERT:
+      case IR::OP_VFMAXSCALARINSERT:
+      case IR::OP_VFMLASCALARINSERT:
+      case IR::OP_VFMLSSCALARINSERT:
+      case IR::OP_VFNMLASCALARINSERT:
+      case IR::OP_VFNMLSSCALARINSERT:
+      case IR::OP_LOADNAMEDVECTORCONSTANT: break;
+      default: LastConstantCache.Valid = false; break;
+      }
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
                           Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? static_cast<size_t>(Op) :
