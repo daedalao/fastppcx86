@@ -65,6 +65,7 @@ $end_info$
 #include <system_error>
 #include <syscall.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -75,6 +76,32 @@ SyscallHandler* _SyscallHandler {};
 
 namespace HardwareTSO {
   bool Live = false;
+  bool Strict = false;
+
+  void OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd) {
+    // A character device's driver may override the page cache-control
+    // attribute and drop SAO; x86 gives no TSO guarantee for WC memory, so
+    // that refusal is legitimate. Anything else is ordinary guest memory
+    // running with neither hardware ordering nor emitted barriers.
+    bool DeviceMapping = false;
+    if (fd >= 0) {
+      struct stat Buf;
+      if (::fstat(fd, &Buf) == 0 && (S_ISCHR(Buf.st_mode) || S_ISBLK(Buf.st_mode))) {
+        DeviceMapping = true;
+      }
+    }
+
+    fprintf(stderr, "FEX: HWTSO: %s(addr=%p len=%zx fd=%d) refused PROT_SAO; %s — this range is not hardware-TSO%s\n", Site, Addr, Length,
+            fd, "mapped WITHOUT it", DeviceMapping ? " (device mapping: expected, x86 makes no TSO promise for WC memory)" : "");
+
+    if (Strict && !DeviceMapping) {
+      ERROR_AND_DIE_FMT(
+        "FEX_HWTSO_STRICT: {}(addr={}, len={:#x}) refused PROT_SAO on ORDINARY memory. "
+        "The JIT emits no barriers under FEX_HWTSO, so accesses through this range have no ordering at all. "
+        "Re-run without FEX_HWTSO (or without FEX_HWTSO_STRICT to continue unsound).",
+        Site, Addr, Length);
+    }
+  }
 
   bool ProbeAndEnable() {
     // Acceptance is meaningful on powerpc: arch_validate_prot explicitly
@@ -95,6 +122,13 @@ namespace HardwareTSO {
     *static_cast<volatile uint32_t*>(Probe) = 1;
     ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
     Live = true;
+    {
+      const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
+      Strict = StrictEnv && StrictEnv[0] == '1';
+      if (Strict) {
+        fprintf(stderr, "FEX: HWTSO_STRICT: a refused-SAO range on ordinary memory will abort.\n");
+      }
+    }
     return true;
   }
 } // namespace HardwareTSO

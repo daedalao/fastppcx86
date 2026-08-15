@@ -1609,8 +1609,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       if (FEX::HLE::HasSyscallError(Result) && HostProt != prot) {
         Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
         if (!FEX::HLE::HasSyscallError(Result)) {
-          fprintf(stderr, "FEX: HWTSO: mmap(addr=%p len=%zx prot=%x flags=%x fd=%d) refused PROT_SAO; mapped WITHOUT it — this range is not hardware-TSO\n",
-                  addr, length, prot, flags, fd);
+          HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
         }
       }
       if (FEX::HLE::HasSyscallError(Result)) {
@@ -1642,8 +1641,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
         // success here is a documented ordering hole and must be loud.
         Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
         if (Result != ~0ULL) {
-          fprintf(stderr, "FEX: HWTSO: mmap(addr=%p len=%zx prot=%x flags=%x fd=%d) refused PROT_SAO; mapped WITHOUT it — this range is not hardware-TSO\n",
-                  addr, length, prot, flags, fd);
+          HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
         }
       }
       if (Result == ~0ULL) {
@@ -1909,8 +1907,7 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     if (Result == -1 && HostProt != prot) {
       Result = ::mprotect(addr, len, prot);
       if (Result != -1) {
-        fprintf(stderr, "FEX: HWTSO: mprotect(addr=%p len=%zx prot=%x) refused PROT_SAO; applied WITHOUT it — this range is not hardware-TSO\n",
-                addr, len, prot);
+        HardwareTSO::OnRangeRefusedSAO("mprotect", addr, len, -1);
       }
     }
     if (Result == -1) {
@@ -2087,8 +2084,9 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
     if (HardwareTSO::Live) {
       const int ShmProt = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE) | ((shmflg & SHM_EXEC) ? PROT_EXEC : 0);
       if (::mprotect(reinterpret_cast<void*>(Result), Length, HardwareTSO::ApplyGuestProt(ShmProt)) == -1) {
-        fprintf(stderr, "FEX: HWTSO: shmat(shmid=%d) attached at %lx len=%lx but PROT_SAO was refused (errno=%d) — this segment is not hardware-TSO\n",
-                shmid, Result, Length, errno);
+        // SysV shm is guest-shared memory by definition — the single most
+        // ordering-sensitive thing a guest can map, and never a device.
+        HardwareTSO::OnRangeRefusedSAO("shmat", reinterpret_cast<void*>(Result), Length, -1);
       }
     }
 
