@@ -292,6 +292,17 @@ constexpr FlagInfo ClassifyConst(IROps Op) {
       .CanEliminate = true,
     });
 
+  case OP_FCMPX86:
+    // Fused FCmp+AXFLAG: writes final x86-layout NZCV from its float inputs.
+    // PF rides out through the op's GPR result (a normal SSA def consumed by
+    // a StoreRegister the pass tracks separately), so NOT eliminable here —
+    // deleting the node would orphan that use even when the NZCV write is
+    // dead.
+    return FlagInfo::Pack({
+      .Write = FLAG_NZCV,
+      .CanEliminate = false,
+    });
+
   case OP_CMPPAIRZ:
     return FlagInfo::Pack({
       .Write = FLAG_Z,

@@ -36,6 +36,10 @@ struct HostFeatures {
   bool SupportsFCMA {};
   bool SupportsFlagM {};
   bool SupportsFlagM2 {};
+  // Backend implements the fused FCmpX86 op (FCmp+AXFLAG+PF in one lowering).
+  // Set only by backends where the split path is expensive (PPC64LE: two
+  // serializing XER round-trips plus a CR1 projection per float compare).
+  bool SupportsFCmpX86 {};
   bool SupportsRPRES {};
   bool SupportsPreserveAllABI {};
   bool SupportsAES256 {};

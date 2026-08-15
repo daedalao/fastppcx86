@@ -2279,6 +2279,22 @@ private:
 
   // Compares two floats and sets flags for a COMISS instruction
   void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2, bool InvalidateAF = false) {
+    if (CTX->HostFeatures.SupportsFCmpX86) {
+      // Fused path: one op produces the final x86 flag layout (the exact
+      // post-AXFLAG state, carry stored inverted) and returns raw PF for us
+      // to store through the register cache — replacing FCmp + the PF
+      // NZCVSelect + AXFlag. AF handling matches ComissFlags: raw PF is 0/1
+      // so PF[4]=0 and zeroing the AF byte zeroes AF.
+      HandleNZCVWrite();
+      Ref PFRaw = _FCmpX86(ElementSize, Src1, Src2);
+      SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(PFRaw);
+      if (!InvalidateAF) {
+        SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
+      }
+      CFInverted = true;
+      return;
+    }
+
     // First, set flags according to Arm FCMP.
     HandleNZCVWrite();
     _FCmp(ElementSize, Src1, Src2);

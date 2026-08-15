@@ -772,6 +772,14 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
     // arm has a known-wrong path and needs its own validation first.
     HostFeatures.SupportsFlagM = true;
 
+    // Fused COMIS lowering: the split FCmp+AXFLAG path costs ~24 insns here
+    // (CR->XER lift, a CR1 projection + isel for PF, then AXFlag's second
+    // full XER RMW — profiled as the dominant cost of float-comparator code:
+    // std::sort/heap over floats, countersunk hydro/rail). DEF_OP(FCmpX86)
+    // computes the final x86 flag layout plus raw PF straight from the
+    // xscmpudp CR field in one pass with a single XER write.
+    HostFeatures.SupportsFCmpX86 = true;
+
     // Prefer what the kernel reports over any constant. AT_*CACHEBSIZE is authoritative and cheap.
     if (const unsigned long DCache = getauxval(AT_DCACHEBSIZE); DCache) {
       HostFeatures.DCacheLineSize = static_cast<uint32_t>(DCache);

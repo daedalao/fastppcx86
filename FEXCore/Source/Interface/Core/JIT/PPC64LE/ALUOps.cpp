@@ -4193,6 +4193,59 @@ DEF_OP(FCmp) {
   mtspr(1, TMP4);                  // write XER
 }
 
+// FCmpX86: fused FCmp + AXFLAG + raw-PF. Produces the final x86-COMIS flag
+// state in one pass from the compare's CR field:
+//   CR0.LT = 0 (SF=0)     CR0.EQ = EQ|UN (ZF)    CR0.GT = CR0.SO = 0
+//   XER.CA = !(LT|UN)     -- x86 CF = LT|UN, stored INVERTED (CFInverted=true)
+//   XER.OV = 0 (OF=0)
+//   Dst    = !UN          -- raw PF (inverted representation), 0/1
+// Replaces the split path's CR->XER lift + CR1-projection/isel for PF +
+// DEF_OP(AXFlag)'s second full XER RMW: one mfocrf, one XER RMW, no
+// projection. Emitted only when HostFeatures.SupportsFCmpX86 (set for this
+// backend in Common/HostFeatures.cpp).
+DEF_OP(FCmpX86) {
+  auto Op = IROp->C<IR::IROp_FCmpX86>();
+  auto S1 = GetVReg(Op->Scalar1);
+  auto S2 = GetVReg(Op->Scalar2);
+  auto Dst = GetReg(Node);
+  const auto ESize = Op->ElementSize;
+
+  // Register-only staging, identical to DEF_OP(FCmp)/EmitCompare's FP path:
+  // guest elem0 is dw1 (f64) / BE w3 (f32); xscmpudp compares dw0. xscvspdp
+  // performs the same SP->DP promotion lfs did, preserving NaN semantics.
+  if (ESize == IR::OpSize::i32Bit) {
+    xxsldwi(VTMP1, S1, S1, 3);
+    xscvspdp(VTMP1, VTMP1);
+    xxsldwi(VTMP2, S2, S2, 3);
+    xscvspdp(VTMP2, VTMP2);
+  } else {
+    xxpermdi(VTMP1, S1, S1, 0b10);
+    xxpermdi(VTMP2, S2, S2, 0b10);
+  }
+  xscmpudp(0, VTMP1, VTMP2);
+
+  // CR0 nibble via mfocrf 0x80: LT=PPC 0, GT=PPC 1, EQ=PPC 2, UN(SO)=PPC 3.
+  // rlwinm ROTL32 by SH sends PPC bit q to (q - SH) mod 32.
+  mfocrf(TMP1, 0x80);
+  rlwinm(TMP2, TMP1, 1, 2, 2);    // UN: PPC 3 -> PPC 2
+  rlwinm(TMP3, TMP1, 0, 2, 2);    // EQ isolated at PPC 2
+  or_(TMP3, TMP3, TMP2);          // ZF = EQ|UN at PPC 2 (only bit set)
+  mtocrf(0x80, TMP3);             // CR0 = {LT=0, GT=0, EQ=ZF, SO=0}
+
+  // Raw PF = !UN as 0/1 at LSB 0. Computed before TMP reuse below.
+  rlwinm(Dst, TMP1, 4, 31, 31);   // UN: PPC 3 -> PPC 31 (LSB 0)
+  xori(Dst, Dst, 1);
+
+  // XER.CA = !(LT|UN), XER.OV = 0 — single read-modify-write.
+  rlwinm(TMP4, TMP1, 30, 2, 2);   // LT: PPC 0 -> PPC 2
+  or_(TMP4, TMP4, TMP2);          // (LT|UN) at PPC 2
+  xoris(TMP4, TMP4, 0x2000);      // !(LT|UN) at PPC 2 (0x2000 << 16 = LSB 29)
+  mfspr(TMP2, 1);
+  rlwinm(TMP2, TMP2, 0, 3, 0);    // wrap-mask keeps PPC 3..31,0 — clears OV(1)+CA(2)
+  or_(TMP2, TMP2, TMP4);
+  mtspr(1, TMP2);
+}
+
 // =========================================================================
 // CRC32: SSE4.2 crc32 instruction. POWER8 has no crc32c hardware (POWER10
 // adds vpmsumd-based variants); we route through a software CRC-32C
