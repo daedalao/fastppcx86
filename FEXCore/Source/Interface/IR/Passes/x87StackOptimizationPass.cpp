@@ -1147,6 +1147,22 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         break;
       }
 
+      case OP_F80CMPVALUEX86: {
+        // Fused FCOMI/FUCOMI (X87F64.cpp): the dispatcher only emits this
+        // under reduced precision on SupportsFCmpX86 backends, so the lowering
+        // is unconditionally the fused compare — the FCmpX86 GPR result (raw
+        // PF) takes over this node's uses, and its NZCV side effect is the
+        // complete post-AXFLAG flag state.
+        LOGMAN_THROW_A_FMT(ReducedPrecisionMode, "F80CmpValueX86 is only emitted under reduced-precision x87");
+        const auto* Op = IROp->C<IROp_F80CmpValueX86>();
+        const auto& Value = CurrentIR.GetNode(Op->X80Src);
+        auto StackNode = LoadStackValue();
+
+        Ref CmpNode = IREmit->_FCmpX86(OpSize::i64Bit, StackNode, Value);
+        IREmit->ReplaceUsesWithAfter(CodeNode, CmpNode, CodeNode);
+        break;
+      }
+
       case OP_SYNCSTACKTOSLOW: {
         // This synchronizes stack values but doesn't necessarily moves us off the FastPath!
         Ref NewTop = SynchronizeStackValues();
