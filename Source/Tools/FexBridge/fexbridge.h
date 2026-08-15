@@ -78,13 +78,21 @@ extern "C" {
 #define FEXBRIDGE_SASSERT(cond, name) _Static_assert(cond, #name)
 #endif
 
-/* 1 -> 2: added fexbridge_{set,get}_{gs,fs}_base (64-bit segment bases). */
-#define FEXBRIDGE_ABI_VERSION 2u
+/* 1 -> 2: added fexbridge_{set,get}_{gs,fs}_base (64-bit segment bases).
+   2 -> 3: a guest jump to unfetchable memory (unmapped or PROT_NONE) now
+           returns FEXBRIDGE_RUN_FAULT with Rip at the bad address, instead
+           of taking a raw host SIGSEGV inside the frontend decoder with the
+           code-invalidation lock held.  No surface change; the run result
+           gained a source.                                                */
+#define FEXBRIDGE_ABI_VERSION 3u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
 #define FEXBRIDGE_RUN_HLT 1    /* guest executed HLT */
-#define FEXBRIDGE_RUN_FAULT 2  /* host fault in JIT code, unwound by fexbridge_fault_unwind */
+#define FEXBRIDGE_RUN_FAULT 2  /* host fault in JIT code, unwound by
+                                  fexbridge_fault_unwind; or a guest jump to
+                                  unfetchable memory (Rip = the bad address,
+                                  register file from CPUState between blocks) */
 #define FEXBRIDGE_RUN_ERROR (-1)
 
 /* ---- trap callback results --------------------------------------------- */

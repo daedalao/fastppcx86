@@ -43,6 +43,7 @@ $end_info$
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -106,11 +107,32 @@ struct BridgeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return std::nullopt;
   }
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    // The caller owns the address space; every mapped page it points the
-    // guest at is executable as far as the emulator is concerned. NX
-    // enforcement, if wanted, belongs to the caller's fault handling.
-    return {0, UINT64_MAX, true};
+  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
+    // The caller owns the address space, so mapped-and-readable is the only
+    // honest definition of "fetchable" available here.  The old
+    // {0, UINT64_MAX} answer made the frontend decoder blind-read any guest
+    // jump target and take a REAL host SIGSEGV inside CompileCode -- with
+    // the shared CodeInvalidationMutex held, where no signal handler can
+    // safely unwind (this is how a Wine guest calling a wild pointer died
+    // illegibly).  A page-granular readability probe routes an unfetchable
+    // target through the frontend's own machinery instead:
+    // CheckRangeExecutable sees Size == 0, CompileCode emits NoExecOp, and
+    // fexbridge_run classifies that exit as FEXBRIDGE_RUN_FAULT with rip at
+    // the bad address.
+    //
+    // process_vm_readv respects page protections (mincore/msync would call
+    // a PROT_NONE guard page readable), and one syscall per compiled block
+    // page is noise against the compile itself.  NX stays unenforced:
+    // readable data is still "executable", exactly as before.
+    const uint64_t PageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    const uint64_t Page = Address & ~(PageSize - 1);
+    uint8_t Probe;
+    struct iovec Local {&Probe, 1};
+    struct iovec Remote {reinterpret_cast<void*>(Page), 1};
+    if (process_vm_readv(getpid(), &Local, 1, &Remote, 1, 0) != 1) {
+      return {0, 0, true};
+    }
+    return {Page, PageSize, true};
   }
 };
 
@@ -473,7 +495,21 @@ int fexbridge_run(void* thread, void* ctx) {
       BT->Thread->CurrentFrame->State.rip = F.ExitRIP;
       Reason = FEXBRIDGE_RUN_EXITED;
     } else {
-      Reason = FEXBRIDGE_RUN_HLT;
+      // Both a guest HLT and a NoExec entry block (a jump to unfetchable
+      // memory, surfaced by QueryGuestExecutableRange above) leave through
+      // the dispatcher's silent SIGSEGV stub, but their Break definitions
+      // differ: HLT is TRAPNO_GP/si_code 0x80, NoExec is TRAPNO_PF/
+      // SEGV_ACCERR (OpcodeDispatcher.cpp).  Classify by the
+      // SynchronousFaultData the Break op populated; State.rip already
+      // points at the unfetchable address for the fault case.
+      auto& SFD = BT->Thread->CurrentFrame->SynchronousFaultData;
+      if (SFD.FaultToTopAndGeneratedException && SFD.Signal == FEXCore::Core::FAULT_SIGSEGV &&
+          SFD.TrapNo == FEXCore::X86State::X86_TRAPNO_PF) {
+        Reason = FEXBRIDGE_RUN_FAULT;
+      } else {
+        Reason = FEXBRIDGE_RUN_HLT;
+      }
+      SFD.FaultToTopAndGeneratedException = false;
     }
   } else {
     // fexbridge_fault_unwind landed here; guest state was reconstructed from
