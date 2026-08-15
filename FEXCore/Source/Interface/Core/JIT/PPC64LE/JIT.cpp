@@ -3724,6 +3724,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         IR::Ref StoreNode = nullptr;
         uint32_t SubCount = 0;
         bool StoreOfSubSeen = false;
+        bool CopyIsBfe32 = false;
 
         const auto ArgPR = [this](IR::OrderedNodeWrapper Arg) {
           return Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IR->GetNode(Arg));
@@ -3748,6 +3749,25 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             CopySrcPR = ArgPR(COp->Source);
             CopyDstPR = IR::PhysicalRegister(CodeNode);
             CopyNode = CodeNode;
+            CopyIsBfe32 = false;
+            break;
+          }
+          case IR::OP_BFE: {
+            // The OTHER staging form. `mov eax,ecx` ahead of a 32-bit
+            // decrement lowers to Bfe(#32,#0), not OP_COPY — a zero-extend,
+            // because the guest write is 32-bit. CP2077's worker loop stages
+            // its pre-decrement budget exactly this way, and a matcher that
+            // only knew OP_COPY left Cmp1 linked to nothing (live reject
+            // trace 2026-08-15, entry=0x37fff3c830a0). Only the full low-32
+            // field qualifies: a narrower or shifted extract is some other
+            // guest value, not the budget.
+            auto BOp = IROp->C<IR::IROp_Bfe>();
+            if (BOp->Width == 32 && BOp->lsb == 0) {
+              CopySrcPR = ArgPR(BOp->Src);
+              CopyDstPR = IR::PhysicalRegister(CodeNode);
+              CopyNode = CodeNode;
+              CopyIsBfe32 = true;
+            }
             break;
           }
           case IR::OP_STOREREGISTER: {
@@ -3780,7 +3800,17 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         int RejectCond = -1;
         int64_t RejectImm = -1;
 
-        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
+        // The decrement must genuinely update the guest's budget, not a
+        // throwaway temp. Two forms satisfy that, and only one of them emits
+        // a store: when the budget is SRA-resident, RA gives the Sub the same
+        // physical register for source and destination and the write-back IS
+        // the Sub (`addi r8,r8,-1`) — no StoreRegister exists anywhere in the
+        // block. Demanding the store rejected CP2077's worker loop for two
+        // sessions (live trace 2026-08-15: reason=no-store-of-sub, 9 threads,
+        // 41% of process samples), and would reject every other SRA-held
+        // budget the same way.
+        const bool WritesBack = SubNode && (StoreOfSubSeen || SubDstPR.Raw == SubSrcPR.Raw);
+        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && WritesBack) {
           auto JOp = BranchHdr->C<IR::IROp_CondJump>();
           uint64_t JC = 0;
           // Two counted-decrement backedge idioms, identical batched form
@@ -3801,8 +3831,13 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                                IR->GetOp<IR::IROp_CodeBlock>(JOp->TrueBlock)->ID == TargetID;
           if (ShapeOK) {
             const auto Cmp1PR = ArgPR(JOp->Cmp1);
-            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
-                                (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
+            // A Bfe-staged compare is only meaningful for a 32-bit budget:
+            // the staging truncates to the low 32 bits, so pairing it with a
+            // 64-bit decrement would batch against a different value than the
+            // guest branched on. ShapeOK already ties CompareSize to the Sub.
+            const bool StagingOK = CopyNode && Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw &&
+                                   (!CopyIsBfe32 || SubHdr->Size == IR::OpSize::i32Bit);
+            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw || StagingOK;
             // Complete budget-liveness guard. Inside the region the ONLY
             // permitted readers of the budget register are the decrement
             // itself, the Copy staging the pre-decrement value, and the
@@ -3822,6 +3857,21 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                 for (auto [RNode, ROp] : IR->GetCode(Blocks[ri].Node)) {
                   if (RNode == SubNode || RNode == BranchNode || RNode == CopyNode) {
                     continue;
+                  }
+                  // A second WRITER is as fatal as a foreign reader: the
+                  // collapse rewrites one def/use chain, so anything else
+                  // driving the budget (or the staged value the backedge
+                  // compares) would be handed a K-granular descent it never
+                  // agreed to. This is what keeps the relaxed write-back rule
+                  // above honest — in-place SRA form is only safe while the
+                  // Sub is the sole definition in the region.
+                  if (IR::GetHasDest(ROp->Op)) {
+                    const auto DefPR = IR::PhysicalRegister(RNode);
+                    if (!DefPR.IsInvalid() &&
+                        (DefPR.Raw == SubSrcPR.Raw || (ri == bi && !CopyDstPR.IsInvalid() && DefPR.Raw == CopyDstPR.Raw))) {
+                      ForeignReader = true;
+                      break;
+                    }
                   }
                   // Only VALUE args may be interpreted as registers: block
                   // references (branch targets) and InlineConstant nodes have
@@ -3908,7 +3958,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                    !SubNode          ? "no-sub1" :
                    !BranchNode       ? "no-branch" :
                    SubCount != 1     ? "multi-sub" :
-                                       "no-store-of-sub";
+                                       "no-writeback";
         }
         if (Reject && Trace) {
           fprintf(stderr, "SPINCOLLAPSE-REJECT: entry=0x%lx head-block=%u reason=%s cond=%d imm=%ld\n",

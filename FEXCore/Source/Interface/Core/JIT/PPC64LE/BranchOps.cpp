@@ -536,10 +536,26 @@ DEF_OP(CondJump) {
     // SGT-0 (`test; jg` — CP2077's redDispatcher worker loop) must use the
     // SIGNED cmpdi so a negative value exits like the original branch would,
     // where `>u K` would read it as huge and spin forever. cr7, no Rc.
+    // ★ The compare WIDTH must follow CompareSize, exactly as the generic
+    // EmitCompare path does. The SGT-0 idiom stages its pre-decrement value
+    // through a 32-bit ZERO-EXTEND (Bfe #32,#0 — `mov eax,ecx`), so a
+    // negative budget sits in the register as 0x00000000_FFFFFFFF: a 64-bit
+    // cmpdi reads that as +4294967295 > K and spins FOREVER, while the guest's
+    // own `jg` would have exited. cmpwi compares the low 32 bits signed and
+    // exits, matching the guest.
+    const bool Is32 = Op->CompareSize <= IR::OpSize::i32Bit;
     if (IsSpinCollapseBranchSigned(Node)) {
-      cmpdi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+      if (Is32) {
+        cmpwi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+      } else {
+        cmpdi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+      }
     } else {
-      cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+      if (Is32) {
+        cmplwi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+      } else {
+        cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+      }
     }
     // BO=12 (branch if set), BI=29 (cr7.GT): TrueBlock (the backedge) taken
     // while old > K.

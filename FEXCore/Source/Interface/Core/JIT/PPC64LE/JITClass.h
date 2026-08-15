@@ -402,6 +402,19 @@ private:
   //   backedge block: %new = Sub(%old, #1); Copy(%old); StoreRegister(%new);
   //                   CondJump(%old, #1, NEQ) -> backedge (else budget-exit)
   //
+  // Two spellings of that backedge block occur, and BOTH must be admitted —
+  // the second is CP2077's own worker loop, which the first-generation matcher
+  // walked past for two sessions (live reject trace 2026-08-15):
+  //   write-back: an explicit StoreRegister(%new), OR — when the budget is
+  //               SRA-resident — an in-place update, Sub dest PR == src PR
+  //               (`addi r8,r8,-1`), which emits no store at all.
+  //   staging:    Copy(%old) for a 64-bit budget, or Bfe(#32,#0, %old) for a
+  //               32-bit one (`mov eax,ecx` zero-extends). A Bfe-staged
+  //               compare is admitted only against an i32 decrement.
+  // Because the staged value may be zero-extended, the batched compare must
+  // follow CompareSize (cmpwi/cmplwi at i32) — a 64-bit signed compare would
+  // read a negative budget as huge and spin forever. See BranchOps.
+  //
   // Rewrite (emission-time, nodes marked by the matcher in AnalyzeSpinLoops):
   //   Sub:      new = (old >u K) ? old - K : 0        (cmpldi cr7 + isel)
   //   CondJump: backedge taken iff old >u K           (cmpldi cr7 + bc GT)

@@ -177,7 +177,14 @@ DEF_OP(Sub) {
   // cmpldi targets cr7 (CR0 = packed NZCV) and nothing here touches XER.
   if (IsSpinCollapseSub(Node)) {
     auto S1 = GetReg(Op->Src1);
-    cmpldi(cr(7), S1, kSpinCollapseK);
+    // Width follows the op, as in EmitCompare: at i32Bit the budget register
+    // is a canonical zero-extended 32-bit value, and cmplwi states that
+    // directly rather than relying on the upper half being clean.
+    if (IROp->Size == IR::OpSize::i32Bit) {
+      cmplwi(cr(7), S1, kSpinCollapseK);
+    } else {
+      cmpldi(cr(7), S1, kSpinCollapseK);
+    }
     addi(TMP1, S1, -static_cast<int16_t>(kSpinCollapseK));
     li(TMP2, 0);
     // cr7.GT = CR bit 29: old >u K selects old-K, else 0.
