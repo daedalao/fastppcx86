@@ -379,6 +379,13 @@ uint64_t ComputeCodeCacheConfigId() {
       // presence-DISABLED; flips every CA/OV write helper between the addic/
       // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOXERARITH") != nullptr));
+      // Spin-loop SMT priority hints emit `or 31,31,31` / `or 2,2,2` into
+      // backedges and region exits, so both the feature switch and the
+      // stationary-poll bisect switch change emitted block bytes. Presence-'1'
+      // enabled for ANYLOOP, mirroring JIT.cpp's parse.
+      HASH_OPT(DISABLESPINLOOPHINT);
+      const char* HintAnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
+      Hasher.Add(static_cast<uint64_t>(HintAnyEnv && HintAnyEnv[0] == '1'));
       // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
       // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
