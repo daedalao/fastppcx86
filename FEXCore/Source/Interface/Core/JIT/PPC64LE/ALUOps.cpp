@@ -4036,39 +4036,37 @@ DEF_OP(Float_ToGPR_ZS) {
   const auto SrcES = Op->SrcElementSize;
   const auto DstES = IROp->Size;
 
-  addi(TMP1, r1, -32);
-  stvx(Vec, r(0), TMP1);
+  // Register-only path (was: stvx + lfs/lfd for the value AND std + lfs/lfd
+  // for the bound — two store-hit-load stalls per conversion; profiled in
+  // countersunk noise grid-indexing, (int)floor(x) everywhere). Position
+  // elem0 into dw0; f32 promotes to f64 exactly (xscvspdp, same as lfs did),
+  // so the bound compare always runs in the f64 domain with the f64 bound
+  // encodings — identical values to the old source-precision compare since
+  // 2^31/2^63 and all f32 inputs are exact in f64.
   if (SrcES == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
+    xxsldwi(VTMP1, Vec, Vec, 3);     // BE w0 <- elem0 (BE w3)
+    xscvspdp(VTMP1, VTMP1);
   } else {
-    lfd(f0, -32, r1);
+    xxpermdi(VTMP1, Vec, Vec, 0b10); // dw0 <- dw1
   }
 
-  // Materialise bound = 2^(DstWidth-1) in source precision, compare via
-  // fcmpu(cr(1), ...).  See helper-block comment above for derivation.
-  uint64_t Bound;
-  if (SrcES == IR::OpSize::i32Bit) {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x4F000000ULL          // 2^31 f32
-                                          : 0x5F000000ULL;         // 2^63 f32
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfs(f1, -16, r1);
-  } else {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
-                                          : 0x43E0000000000000ULL; // 2^63 f64
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfd(f1, -16, r1);
-  }
-  fcmpu(cr(1), f0, f1);
+  const uint64_t Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
+                                                       : 0x43E0000000000000ULL; // 2^63 f64
+  LoadConstant(TMP1, Bound);
+  mtvsrd(VTMP2, TMP1);               // bound in dw0
+  xscmpudp(1, VTMP1, VTMP2);         // cr1, same LT/EQ/GT/UN layout as fcmpu
 
+  // xscvdpsx{ws,ds} truncate toward zero and saturate exactly like
+  // fctiwz/fctidz (NaN -> most-negative, +ovf -> INT_MAX), so the sentinel
+  // fixup below is unchanged. The ws form leaves its word-1 result with
+  // word 0 undefined; mfvsrd + clrldi keeps only the defined low 32.
   if (DstES == IR::OpSize::i32Bit) {
-    fctiwz(f0, f0);
-    mffprd(Dst, f0);
+    xscvdpsxws(VTMP1, VTMP1);
+    mfvsrd(Dst, VTMP1);
     clrldi(Dst, Dst, 32);  // zero-extend to GPR (high half is undefined per ISA)
   } else {
-    fctidz(f0, f0);
-    mffprd(Dst, f0);
+    xscvdpsxds(VTMP1, VTMP1);
+    mfvsrd(Dst, VTMP1);
   }
 
   // If CR1.LT set (Src < bound, ordered), POWER's result is x86-correct.
