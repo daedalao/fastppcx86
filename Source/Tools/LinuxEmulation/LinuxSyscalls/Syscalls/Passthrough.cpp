@@ -1159,7 +1159,7 @@ namespace x64 {
       return (dir_ppc << 29) | (size_ppc << 16) | (type << 8) | nr;
     };
 
-    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
       // termios needs its payload marshalled, not just its command number
       // remapped. Guest x86 struct is 36 bytes; the buffer we hand `::ioctl`
       // on PowerPC must be glibc's own 60-byte `struct termios`, because the
@@ -1197,7 +1197,41 @@ namespace x64 {
       }
 
       cmd = RemapIoctlForPPC(cmd);
+
+      // ntsync WAIT_ANY/WAIT_ALL (type 'N' = 0x4E, nr 0x82/0x83) are
+      // signal-wakeable sleeps that wine parks worker threads in
+      // indefinitely — the same shape futex(2) grew an entry check for, on a
+      // path that never had one. A thread could park here holding the very
+      // signal whose handler would have woken it, which is the black hole
+      // described at the futex handler above; that comment lists the known
+      // uncovered sleeps (epoll_wait, ppoll, nanosleep, futex_waitv) and
+      // ntsync is not even on it, because ntsync arrived later.
+      //
+      // Observed as a DETERMINISTIC menu wedge in FreeInfantry under Proton:
+      // 21 threads parked as 14 futex / 5 ntsync / 2 nanosleep, one condvar
+      // polled 63 times in 71s and never signalled, and no runnable thread.
+      // PROTON_NO_NTSYNC=1 avoids it entirely, which is what localises it
+      // here rather than to the futex side.
+      //
+      // Retry on a FEX-internal EINTR mirrors the futex path, and is simpler
+      // here: ntsync's deadline is ABSOLUTE on CLOCK_MONOTONIC, so re-issuing
+      // cannot over-wait the way re-issuing a relative FUTEX_WAIT does.
+      // Slicing (the futex rescue tier) is NOT done: the deadline lives
+      // inside the guest's ntsync_wait_args, so shortening it means writing
+      // guest memory, and the entry check is what closes the proven case.
+      const uint32_t IoctlType = (cmd >> 8) & 0xFFu;
+      const uint32_t IoctlNr = cmd & 0xFFu;
+      const bool NtsyncWait = IoctlType == 0x4Eu && (IoctlNr == 0x82u || IoctlNr == 0x83u);
+      if (NtsyncWait && HasGuestDeliverableSignal(Frame)) {
+        return static_cast<uint64_t>(-EINTR);
+      }
+
       uint64_t Result = ::ioctl(fd, cmd, arg);
+      if (NtsyncWait) {
+        while (Result == static_cast<uint64_t>(-1) && errno == EINTR && !HasGuestDeliverableSignal(Frame)) {
+          Result = ::ioctl(fd, cmd, arg);
+        }
+      }
       SYSCALL_ERRNO();
     });
 #else
