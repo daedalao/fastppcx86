@@ -1460,11 +1460,17 @@ PPC64Emitter::Cond PPC64JITCore::MapCC(IR::CondClass Cond) {
   // cr7, and EmitCompare takes CRField as a parameter). A crnor/cror
   // composite would have to be emitted by the caller, into a scratch CR bit,
   // after the compare — i.e. this is a caller-side fix, not a table entry.
+  // Note that such a caller-side fix reads unordered straight out of the
+  // compare's own CR field (SO, at CRField*4 + 3) — NOT the XER projection
+  // MapNZCVCC uses, since these callers compare with fcmpu/xscmpudp into cr7
+  // and never lift SO into XER.OV.
   //
   // Nothing reaches it today: X86ToArmFloatCond in
   // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE
   // and it is only called from FoldBranch's AXFLAG arm, disabled in
-  // 68217d849. Anyone re-enabling that arm must fix this site (caller-side),
+  // 68217d849 — and since 61f785c2a the COMIS chain lowers to the fused
+  // DEF_OP(FCmpX86), which emits no AXFLAG for that arm to match in the first
+  // place. Anyone re-enabling that arm must fix this site (caller-side),
   // MapNZCVCC (already done), and the shared ULE -> SLE identity remap.
   case IR::CondClass::FLU:  return CC_LT;
   case IR::CondClass::FGE:  return CC_GE;
@@ -1645,23 +1651,35 @@ PPC64Emitter::Cond PPC64JITCore::MapNZCVCC(IR::CondClass Cond) {
   //
   // Fix: in the packed-NZCV world V = XER.OV, and DEF_OP(FCmp) lifts the
   // compare's SO into XER.OV precisely so this works. Project XER into CR1
-  // (CR1.GT = XER.OV = unordered) and fold it into the predicate with the
-  // same CR3.LT composite-scratch discipline the SLT/UGT/SGT cases above
-  // use. Ported from origin/power9 382d0eb60.
+  // and fold that bit into the predicate with the same CR3.LT
+  // composite-scratch discipline the SLT/UGT/SGT cases above use. The bit is
+  // OVBit, never a literal: XER.OV lands in CR1.GT (5) on the pre-3.0
+  // mfxer/rotlwi projection but in CR1.LT (4) on the ISA 3.0 mcrxrx one,
+  // where 5 is OV32 -- which DEF_OP(FCmp) does not write, so hardcoding 5
+  // folded a stale bit in on POWER9. Ported from origin/power9 382d0eb60,
+  // which predates the mcrxrx projection.
   //
   // Reachability in THIS tree: X86ToArmFloatCond in
   // RedundantFlagCalculationElimination.cpp is the only producer of FLU/FGE,
   // and it is only called from FoldBranch's AXFLAG arm, which 68217d849
-  // disabled outright. So this is defense-in-depth today. Do NOT read it as
-  // clearance to re-enable that arm: our own analysis found a SECOND,
+  // disabled outright. Since 61f785c2a there is a second layer: with
+  // SupportsFCmpX86 the COMIS chain lowers to the fused DEF_OP(FCmpX86) and
+  // emits no AXFLAG at all, so even a re-enabled arm would not see the
+  // pattern from that source. So this is defense-in-depth today. Do NOT read
+  // it as clearance to re-enable that arm: our own analysis found a SECOND,
   // independent defect there (the ULE -> SLE identity remap, a property of
   // the shared mapping table rather than of this backend) which this hunk
   // does not touch. See the block comment at that `return`.
+  //
+  // Note also that FCmpX86 is NOT a producer of the state read here: it
+  // leaves XER.OV = 0 and folds unordered into ZF, i.e. the x86 layout. These
+  // two cases decode the ARM-FCMP layout that DEF_OP(FCmp) produces, and only
+  // that.
   case IR::CondClass::FLU:  ProjectXERToCR1();
-                            cror (12, 0, 5);   // CR3.LT =   LT OR UN
+                            cror (12, 0, OVBit);   // CR3.LT =   LT OR UN
                             return {12, 12};
   case IR::CondClass::FGE:  ProjectXERToCR1();
-                            crnor(12, 0, 5);   // CR3.LT = !(LT OR UN)
+                            crnor(12, 0, OVBit);   // CR3.LT = !(LT OR UN)
                             return {12, 12};
   case IR::CondClass::FLEU: return CC_LE;
   case IR::CondClass::FGT:  return CC_GT;
