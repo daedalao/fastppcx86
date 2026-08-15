@@ -3399,12 +3399,31 @@ DEF_OP(XGetBV) {
 // identical codegen with the gate off, including the r0 = 0 re-establishment
 // the backend's indexed addressing invariant depends on.
 //
-// The IR op produces a single GPR. Validity is carried separately, in
-// RFLAG_ZF_RAW_LOC: RDRANDOp in OpcodeDispatcher.cpp reads that slot straight
-// back as the INVERTED CF, so the contract is
-//   0 = success (x86 CF=1, "random value is valid")
-//   1 = failure (x86 CF=0, "not ready")
-// and BOTH arms must write it before returning.
+// The IR op produces a single GPR. Validity is carried separately, in the
+// packed-NZCV Z flag -- which on this backend is CR0.EQ (DEF_OP(LoadNZCV)
+// below: N=CR0.LT, Z=CR0.EQ, C=XER.CA, V=XER.OV). The contract, matching
+// AArch64's MRS-from-RNDR (PSTATE = 0b0100 on failure) that IR.json is
+// written against, is
+//   Z = 0  success (x86 CF=1, "random value is valid")
+//   Z = 1  failure (x86 CF=0, "not ready")
+// and BOTH arms must leave CR0.EQ holding it before returning.
+//
+// NOT a byte in State.flags[]. RFLAG_ZF_RAW_LOC is an NZCV-class location
+// (OpcodeDispatcher.h FullNZCVMask), so RDRANDOp's
+// GetRFLAG(RFLAG_ZF_RAW_LOC) lowers to _NZCVSelect01(EQ), or to
+// _Bfe(LoadNZCV, 30) if the frontend has NZCV cached -- both read CR0.EQ, and
+// neither ever loads State.flags[RFLAG_ZF_RAW_LOC]. That byte is dead
+// storage: ReconstructCompactedEFLAGS (Core.cpp) skips it explicitly and
+// takes ZF out of the packed NZCV word at RFLAG_NZCV_LOC. Storing to it, as
+// this op used to, satisfied nothing. Both dispatcher arms consume the same
+// read -- !SupportsFlagM feeds SetCFInverted, SupportsFlagM feeds
+// _RmifNZCV(CF_inv, 63, 0xf) -- so this is arm-independent.
+//
+// Only Z has to be right. Both dispatcher arms then rewrite all four flags
+// (ZeroNZCV + SetCFInverted, or rmif with mask 0xf), so whatever N/C/V are
+// left as here is dead. The one op between the write and the read is the
+// StoreRegister for the result, which is on CompileCode's XER/CR-transparent
+// allowlist.
 //
 // NOT REACHABLE BY DEFAULT: HostFeatures.cpp never sets SupportsRAND on
 // ppc64le (only the ARM64 and x86 host branches do), so RDRANDOp emits
@@ -3412,9 +3431,6 @@ DEF_OP(XGetBV) {
 // feature on with the ENABLE_DISABLE_OPTION knob (FEX_ENABLERNG).
 // =========================================================================
 DEF_OP(RDRAND) {
-  const int32_t zf_off = static_cast<int32_t>(
-    offsetof(FEXCore::Core::CpuStateFrame, State.flags[FEXCore::X86State::RFLAG_ZF_RAW_LOC]));
-
   if (CTX->HostFeatures.SupportsISA30) {
     const auto Op = IROp->C<IR::IROp_RDRAND>();
     auto Dst = GetReg(Node);
@@ -3423,8 +3439,9 @@ DEF_OP(RDRAND) {
 
     // darn; if it delivered all-ones ("not ready"), try once more. Either way
     // CR0.EQ ends up set iff the value we are keeping is all-ones -- i.e. iff
-    // the draw failed. That is exactly the predicate RFLAG_ZF_RAW_LOC wants,
-    // which is why the recompare on the retry path is worth its one slot.
+    // the draw failed. CR0.EQ *is* the packed-NZCV Z the dispatcher reads
+    // back, so the recompare on the retry path is not bookkeeping: it is the
+    // whole flag result, and nothing needs to be emitted after Bind.
     //
     // This clobbers CR0. That is safe here for the same reason the POWER8 arm
     // is safe: that arm makes an indirect call, which clobbers CR0 too, and
@@ -3436,13 +3453,8 @@ DEF_OP(RDRAND) {
     darn(Dst, L);            // retry once
     cmpdi(cr(0), Dst, -1);   // re-establish CR0.EQ for the merged path
     Bind(&Done);
-
-    // ZF_RAW_LOC = 1 iff both attempts delivered all-ones. CR0.EQ is PPC CR
-    // bit 2 and holds exactly that on both edges into Done.
-    li(TMP1, 1);
-    li(TMP2, 0);
-    isel(TMP1, TMP1, TMP2, 2);
-    stb(TMP1, static_cast<int16_t>(zf_off), STATE);
+    // Z (CR0.EQ) = "both attempts delivered all-ones" = failure, on both edges
+    // into Done. That is the flag result; nothing further to emit.
     return;
   }
 
@@ -3477,10 +3489,11 @@ DEF_OP(RDRAND) {
 
   mr(GetReg(Node), TMP1);
 
-  // The PRNG cannot fail, so ZF_RAW_LOC = 0 (x86 CF=1, "valid") always. TMP1
-  // is free again now that the result has been moved into Dst.
-  li(TMP1, 0);
-  stb(TMP1, static_cast<int16_t>(zf_off), STATE);
+  // The helper call clobbered CR0, so Z is whatever the callee left behind.
+  // The PRNG cannot fail, so Z must read 0 (x86 CF=1, "valid") always. crclr
+  // is one instruction, writes only CR0.EQ, and touches no GPR and no XER --
+  // it cannot disturb the r0 == 0 invariant re-established just above.
+  crclr(2);
 }
 
 // =========================================================================
