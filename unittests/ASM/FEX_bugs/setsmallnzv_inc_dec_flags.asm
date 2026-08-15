@@ -47,11 +47,13 @@
   movzx r13, r11b
   shl r13, 3
   or r12, r13
-  shl rax, 4
-  or rax, r12
+  shl r15, 4
+  or r15, r12
 %endmacro
 
-xor rax, rax
+; r15 accumulates (leg 1 INCs AL, so RAX can't hold partial results while
+; legs run — the low byte would alias the leg-1 operand).
+xor r15, r15
 
 ; leg 1: 8-bit INC overflow into sign, CF=1 preserved
 mov al, 0x7F
@@ -94,5 +96,7 @@ mov bh, 0
 stc
 dec bh
 CAPTURE
+
+mov rax, r15
 
 hlt
