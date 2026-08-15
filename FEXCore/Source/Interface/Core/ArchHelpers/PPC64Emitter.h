@@ -95,8 +95,17 @@ constexpr auto VZERO_VSX = VSXR{14};
 //     first. Materialize such constants per-use (see EmitAESLoadMask:
 //     vspltisb + lvsl@0 + vsububm, 4 instructions, no memory).
 //   * The AVX-high bank below has the same exposure for YMM highs whenever
-//     host calls occur without a SpillStaticRegs sync - audit before
-//     enabling AVX by default.
+//     host calls occur without a SpillStaticRegs sync. AUDITED 2026-08-14:
+//     every `bctrl` emitted by this backend was walked (JIT/PPC64LE ALUOps,
+//     AtomicOps, BranchOps, VectorOps, X87Ops, JIT.cpp, PPC64Dispatcher) and
+//     all of them run behind SpillForABICall or a bare SpillStaticRegs, so
+//     the bank is in State.avx_high[] before any host code runs — including
+//     the two FABI callsites, which reach the host only through the bridge
+//     stubs' own SpillForFABICall/FillForFABICall pair (details in the bank
+//     comment below). SpillSRA's mcontext read was the one place the false
+//     "callee-saved" premise still governed behaviour; it is now gated on the
+//     crossing sentinel. What is left before AVX can be default-ON is
+//     re-measurement (the 2026-08-10 W3 -16% A/B), not this bank's safety.
 
 // -------------------------------------------------------------------------
 // AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).
@@ -106,20 +115,44 @@ constexpr auto VZERO_VSX = VSXR{14};
 // SRA (v0-15) and the high half historically lived in State.avx_high[]
 // context MEMORY — every VEX-encoded op paid a load/store round trip. The
 // FPR-aliased low VSX bank is idle from vs16 up, and f16-f31 are ELFv2
-// callee-saved, so the halves live in registers instead:
+// callee-saved in their FPR (dw0) half — enough to prefer them over the
+// volatile registers, NOT enough to skip the memory sync described below —
+// so the halves live in registers instead:
 //
 //  * In-register layout matches the VR convention exactly (dw0 = guest high
 //    qword, dw1 = guest low qword) — moves between the bank and VRs are a
 //    single full-VSX xxlor, and the memory image written by the spill path
 //    below is byte-identical to a stvx of the same value.
-//  * Host C calls preserve the bank by ABI (callee-saved), so
-//    SpillForABICall needs nothing; only SpillStaticRegs/FillStaticRegs
-//    sync bank <-> State.avx_high[] (gated on SupportsAVX) so context
-//    memory is authoritative whenever the thread is outside JIT code.
+//  * Host C calls do NOT preserve the bank. ELFv2 callee-saves only the FPR
+//    half (dw0) of f16-f31; dw1 — which carries the guest's LOW qword — is
+//    volatile, and a callee's `lfd f16` epilogue restore leaves it UNDEFINED
+//    (the HAZARD above; this is what corrupted Steam's AES manifest decrypt
+//    through vs15). The bank must therefore be in MEMORY across any host
+//    call, and it is: SpillStaticRegs/FillStaticRegs sync bank <->
+//    State.avx_high[] (gated on SupportsAVX), and SpillForABICall /
+//    FillForABICall are exactly those two plus Push/PopDynamicRegs. So every
+//    crossing in the backend carries the sync — DEF_OP(Syscall) (bare
+//    SpillStaticRegs), DEF_OP(Thunk), the inline helper callsites in
+//    ALUOps/AtomicOps/VectorOps/JIT.cpp, and the FABI bridge stubs
+//    (PPC64Dispatcher::GenerateABICall, whose SpillForFABICall /
+//    FillForFABICall bracket every `mtctr(TMP4); bctrl` into a softfloat
+//    helper). The two FABI CALLSITE emitters (JIT.cpp Op_Unhandled,
+//    X87Ops.cpp EmitFABICall) need nothing of their own — their `bctrl`
+//    enters the shared stub, which spills before it calls the helper and
+//    refills before it returns.
+//    Binding on new code: a host call that does NOT route through
+//    SpillForABICall/SpillStaticRegs must spill the bank itself. "f16-f31 are
+//    callee-saved" is not a licence to skip it — that reasoning is false for
+//    the half of the register the guest state lives in.
 //  * Mid-JIT signals: the host-side SpillSRA reads the bank straight out of
-//    the mcontext (fp_regs dw0 + the VSX-dw1 area) — see
-//    MContext_ppc64le.h. Because the bank is callee-saved this is valid
-//    even for signals landing inside a host helper call.
+//    the mcontext (fp_regs dw0 + the VSX-dw1 area) — see MContext_ppc64le.h.
+//    Valid only where the mcontext image IS the live bank, i.e. ordinary JIT
+//    code with no crossing armed. Inside/just after a host helper call the
+//    registers hold the callee's own dw0 and undefined dw1, so SpillSRA
+//    skips the capture whenever InSyscallInfo is armed (the same
+//    "already spilled, don't touch" rule its GPR loop applies per-register) —
+//    State.avx_high[] is authoritative there, published by the crossing's
+//    SpillStaticRegs before the sentinel was raised.
 //  * VSX-form instructions only (same rule as VTMP3_VSX/VZERO_VSX);
 //    PushCalleeSavedRegisters already saves/restores f14-f31 on dispatcher
 //    entry, protecting the host caller's values.

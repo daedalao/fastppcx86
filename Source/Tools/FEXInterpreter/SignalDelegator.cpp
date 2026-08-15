@@ -159,11 +159,16 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
 
 #ifdef ARCHITECTURE_ppc64le
   // AVX-high VSX bank capture — see the detailed note on the matching branch
-  // in LinuxEmulation's SignalDelegator::SpillSRA.
-  for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
-    const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
-    Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
-    Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+  // in LinuxEmulation's SignalDelegator::SpillSRA. Skipped while a host-call
+  // crossing is armed: the bank's dw1 half is ELFv2-volatile, so inside a
+  // host call the register file is garbage and State.avx_high[] (published by
+  // the crossing's SpillStaticRegs) is the authoritative copy.
+  if (IgnoreMask == 0) {
+    for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
+      const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
+      Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
+      Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+    }
   }
 #endif
 

@@ -542,13 +542,32 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
   // thread runs JIT code (Count is zero unless AVX is advertised). Capture
   // into State.avx_high so the guest sigframe XSTATE and any State readers
   // see current high halves. Register layout is the VR convention: dw1 =
-  // guest LOW qword -> avx_high[i][0], dw0 = guest HIGH -> [i][1]. The bank
-  // is ELFv2 callee-saved, so the frame values are valid even when the
-  // signal landed inside a host helper call.
-  for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
-    const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
-    Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
-    Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+  // guest LOW qword -> avx_high[i][0], dw0 = guest HIGH -> [i][1].
+  //
+  // Only when NO host-call crossing is armed. This used to be unconditional
+  // "the bank is ELFv2 callee-saved, so the frame values are valid even
+  // inside a host helper call" — which is false in the half that matters:
+  // ELFv2 preserves only the FPR half (dw0) of f16-f31, and a callee's
+  // `lfd f16` epilogue restore leaves dw1 (the guest's LOW qword) UNDEFINED.
+  // See the AVX-high bank + HAZARD comments in FEXCore ArchHelpers/
+  // PPC64Emitter.h. Every crossing (DEF_OP(Syscall), DEF_OP(Thunk), the FABI
+  // bridge stubs) publishes the bank to State.avx_high via SpillStaticRegs
+  // BEFORE arming InSyscallInfo, so a nonzero IgnoreMask means memory is
+  // already authoritative and re-capturing from the register file can only
+  // corrupt it. Same rule the GPR loop above applies per register; ppc64le
+  // arms all-or-nothing (low 16 bits = 0xFFFF).
+  //
+  // NB the SRA FPR (guest XMM low-128) loop above has the same structural
+  // exposure — v0-v15 are ELFv2-volatile, so in the post-bctrl window of an
+  // armed crossing it copies caller-clobbered registers over already-correct
+  // spilled state. Deliberately NOT changed here: unlike this bank it is live
+  // in the AVX-off configuration, so it needs its own measured/tested pass.
+  if (IgnoreMask == 0) {
+    for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
+      const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
+      Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
+      Thread->CurrentFrame->State.avx_high[i][1] = ArchHelpers::Context::GetPPCVSXLowBankDW0(ucontext, Reg);
+    }
   }
 #endif
 
