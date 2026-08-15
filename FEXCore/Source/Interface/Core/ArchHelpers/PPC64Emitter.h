@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 
 namespace FEXCore::Context { class ContextImpl; }
@@ -424,6 +425,116 @@ public:
   // These are called on entry/exit from the JIT dispatcher.
   void SpillStaticRegs(GPR tmp);
   void FillStaticRegs(FillMode Mode = FillMode::All);
+
+  // -----------------------------------------------------------------------
+  // XER.CA / XER.OV writes WITHOUT the serializing mtspr.
+  //
+  // mtspr XER is execution-serializing on POWER8 (the reason DEF_OP(CarryInvert)
+  // grew its subfe/addic form), yet the flag machinery accumulated ~15
+  // mfspr/modify/mtspr round-trips. These helpers generate the target bit with
+  // arithmetic instead:
+  //   CA = b   : addic(scratch, b, -1)      b=1: 1+(-1) carries; b=0: no carry
+  //   CA = 1   : subfc(scratch, r0, r0)     0-0 = no borrow = CA 1 (PPC rule)
+  //   CA = 0   : addic(scratch, b0, 0)      needs a known-zero register
+  //   OV = b   : sldi 62 + addo(x, x, x)    2^62+2^62 overflows iff bit set
+  //   OV = 0   : addo(scratch, b0, b0)      0+0 never overflows
+  //   CA=OV=0  : addco(scratch, b0, b0)
+  // None of these touch CR0, and each writes ONLY its named XER bit (addic:
+  // CA; addo: OV — plus sticky SO when it sets OV, which every existing OE
+  // user already does and nothing reads; see the ProjectXERToCR1 block
+  // comment). OV32 is left stale — both XER->CR1 projection layouts read OV,
+  // never OV32 (XEROVBitIndex).
+  //
+  // Register contract: `b` must be EXACTLY 0 or 1 (isolate with rldicl/rlwinm
+  // first). `zero` must be a register currently holding 0 — pass r0 only from
+  // JIT DEF_OP context where the r0=0 invariant holds; dispatcher-side callers
+  // (FillStaticRegs) must not pass r0 (ExitFunctionLinker smuggles a pointer
+  // through it) and instead use the from-bit forms, which read no zero reg.
+  // `scratch` is clobbered; it may alias `b`.
+  //
+  // FEX_NOXERARITH (presence-enabled kill switch, hashed into the code-cache
+  // config id) reverts every helper to the old mfspr/rlwimi/mtspr RMW shape.
+  // -----------------------------------------------------------------------
+  static bool XERArithDisabled() {
+    static const bool Disabled = getenv("FEX_NOXERARITH") != nullptr;
+    return Disabled;
+  }
+
+  // CA <- b (0/1). OV, CR0 preserved.
+  void SetCAFromBit(GPR b, GPR scratch) {
+    if (XERArithDisabled()) {
+      mfspr(scratch, 1);
+      rlwimi(scratch, b, 29, 2, 2);   // b LSB0 -> LSB29 (CA), other bits kept
+      mtspr(1, scratch);
+      return;
+    }
+    addic(scratch, b, -1);
+  }
+
+  // OV <- b (0/1). CA, CR0 preserved. Sets sticky SO when b=1 (harmless).
+  void SetOVFromBit(GPR b, GPR scratch) {
+    if (XERArithDisabled()) {
+      mfspr(scratch, 1);
+      rlwimi(scratch, b, 30, 1, 1);   // b LSB0 -> LSB30 (OV)
+      mtspr(1, scratch);
+      return;
+    }
+    sldi(scratch, b, 62);
+    addo(scratch, scratch, scratch);
+  }
+
+  // CA <- 0 and OV <- 0 in one instruction. CR0 preserved.
+  // `zero` must hold 0 (r0 from JIT context only — see contract above).
+  void ZeroCAOV(GPR zero, GPR scratch) {
+    if (XERArithDisabled()) {
+      mfspr(scratch, 1);
+      rlwinm(scratch, scratch, 0, 3, 0);  // wrap mask keeps 3..31,0: clears OV,CA
+      mtspr(1, scratch);
+      return;
+    }
+    addco(scratch, zero, zero);
+  }
+
+  // CA <- compile-time constant. OV, CR0 preserved.
+  // `zero` must hold 0 (r0 from JIT context only).
+  void SetCAConstant(bool CA, GPR zero, GPR scratch) {
+    if (XERArithDisabled()) {
+      mfspr(scratch, 1);
+      if (CA) {
+        oris(scratch, scratch, 0x2000);   // set LSB29
+      } else {
+        rlwinm(scratch, scratch, 0, 3, 1); // wrap mask keeps 3..31,0,1: clears CA
+      }
+      mtspr(1, scratch);
+      return;
+    }
+    if (CA) {
+      subfc(scratch, zero, zero);
+    } else {
+      addic(scratch, zero, 0);
+    }
+  }
+
+  // OV <- compile-time constant. CA, CR0 preserved.
+  // `zero` must hold 0 (r0 from JIT context only).
+  void SetOVConstant(bool OV, GPR zero, GPR scratch) {
+    if (XERArithDisabled()) {
+      mfspr(scratch, 1);
+      if (OV) {
+        oris(scratch, scratch, 0x4000);   // set LSB30
+      } else {
+        rlwinm(scratch, scratch, 0, 2, 0); // wrap mask keeps 2..31,0: clears OV
+      }
+      mtspr(1, scratch);
+      return;
+    }
+    if (OV) {
+      LoadConstant(scratch, 1ull << 62);
+      addo(scratch, scratch, scratch);
+    } else {
+      addo(scratch, zero, zero);
+    }
+  }
 
   // Push/pop all callee-saved registers per PPC64LE ELFv2 ABI.
   void PushCalleeSavedRegisters();

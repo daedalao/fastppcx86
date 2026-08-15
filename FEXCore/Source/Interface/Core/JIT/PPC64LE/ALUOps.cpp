@@ -2112,7 +2112,7 @@ DEF_OP(AdcWithFlags) {
   // Both addends are zero-extended 32-bit values, so the sum is at most
   // 2*(2^32 - 1) + 1 < 2^33: adde's own CA-out (the carry at bit 63) is always
   // 0. Clobbering XER.CA here is harmless regardless — the tail below rewrites
-  // CA and OV wholesale and only reads XER for the sticky SO.
+  // CA and OV wholesale (arithmetically; SO and the rest of XER untouched).
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
   adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
@@ -2136,30 +2136,13 @@ DEF_OP(AdcWithFlags) {
   rldicl(Dst, TMP3, 0, 32);                  // Dst = result low-32, zero-ext
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
-  // Patch XER: new CA = TMP4's LSB, new OV = TMP3's LSB.
-  //
-  // rlwimi does clear-and-set in one instruction, so the LoadConstant-mask /
-  // andc / sldi / or_ chain collapses. The canonical form used at every XER
-  // patch site in this file:
-  //
-  //   rlwimi RA, RS, SH, MB, ME
-  //     RA <- (ROTL32(RS, SH) & MASK(MB, ME)) | (RA & ~MASK(MB, ME))
-  //
-  // with PPC (MSB=0) bit numbering, where PPC bit p == LSB bit (31 - p) in
-  // the low word, and the mask lives entirely in bits 32..63 of the 64-bit
-  // register so mfspr's upper half is preserved exactly as andc preserved it.
-  // ROTL32 by SH moves a bit at PPC position q to position (q - SH) mod 32.
-  // The two inserts we need, both from an LSB-0 source bit (PPC 31):
-  //
-  //   CA at LSB 29 = PPC 2:  (31 - SH) mod 32 = 2  =>  SH = 29, MB = ME = 2
-  //   OV at LSB 30 = PPC 1:  (31 - SH) mod 32 = 1  =>  SH = 30, MB = ME = 1
-  //
-  // Single-bit masks, so whatever the source carries above its LSB is
-  // discarded — the same guarantee the sldi/or_ pair relied on.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
-  mtspr(1, TMP1);
+  // Write XER arithmetically from the LSB-0 bits: addic generates CA, the
+  // sldi-62/addo self-add generates OV, neither reads XER and neither is the
+  // serializing mtspr the old mfspr/rlwimi/mtspr patch paid. Idioms + kill
+  // switch documented at the PPC64Emitter.h helper block; every XER patch
+  // site in this file uses the same pair.
+  SetCAFromBit(TMP4, TMP1);       // CA <- TMP4 LSB (x86_CF_out, direct)
+  SetOVFromBit(TMP2, TMP1);       // OV <- TMP2 LSB (OF)
 }
 
 DEF_OP(SbbWithFlags) {
@@ -2202,11 +2185,9 @@ DEF_OP(SbbWithFlags) {
   rldicl(Dst, TMP3, 0, 32);
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
-  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
-  mtspr(1, TMP1);
+  // Arithmetic XER writes — see DEF_OP(AdcWithFlags) / PPC64Emitter.h.
+  SetCAFromBit(TMP4, TMP1);       // CA <- TMP4 LSB (CFInverted-stored)
+  SetOVFromBit(TMP2, TMP1);       // OV <- TMP2 LSB (OF)
 }
 
 DEF_OP(AdcZero) {
@@ -2278,11 +2259,9 @@ DEF_OP(AdcZeroWithFlags) {
   rldicl(Dst, TMP3, 0, 32);                  // Dst = low-32
   EmitTestNZSetCR(Dst, IR::OpSize::i32Bit);  // clobbers TMP1 (already consumed)
 
-  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP2, 29, 2, 2);   // CA <- TMP2 LSB
-  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
-  mtspr(1, TMP1);
+  // Arithmetic XER writes — see DEF_OP(AdcWithFlags) / PPC64Emitter.h.
+  SetCAFromBit(TMP2, TMP1);       // CA <- TMP2 LSB (direct x86_CF_out)
+  SetOVFromBit(TMP4, TMP1);       // OV <- TMP4 LSB (OF)
 }
 
 DEF_OP(AdcNZCV) {
@@ -2322,8 +2301,8 @@ DEF_OP(AdcNZCV) {
   // i32Bit: mirror DEF_OP(AdcWithFlags)'s i32 path minus the Dst writeback.
   // adde injects XER.CA (= x86_CF, direct) as the third addend. Both addends
   // are zero-extended 32-bit values so the sum is < 2^33 and adde's own
-  // CA-out is always 0 — harmless, the XER patch below rewrites CA and OV
-  // wholesale and only reads XER for the sticky SO.
+  // CA-out is always 0 — harmless, the tail below rewrites CA and OV
+  // wholesale (arithmetically; SO and the rest of XER untouched).
   rldicl(TMP1, S1, 0, 32);                  // zx32(S1)
   rldicl(TMP2, S2, 0, 32);                  // zx32(S2)
   adde(TMP3, TMP1, TMP2);                   // TMP3 = zx32(S1) + zx32(S2) + x86_CF (≤ 33-bit)
@@ -2346,12 +2325,9 @@ DEF_OP(AdcNZCV) {
   // the zero-extended VALUE; there is no Dst here).
   EmitTestNZSetCR(TMP3, IR::OpSize::i32Bit); // clobbers TMP1 (already consumed)
 
-  // Patch XER: CA <- TMP4 LSB (direct x86_CF_out), OV <- TMP2 LSB.
-  // rlwimi SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP4, 29, 2, 2);   // CA <- TMP4 LSB
-  rlwimi(TMP1, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
-  mtspr(1, TMP1);
+  // Arithmetic XER writes — see DEF_OP(AdcWithFlags) / PPC64Emitter.h.
+  SetCAFromBit(TMP4, TMP1);       // CA <- TMP4 LSB (direct x86_CF_out)
+  SetOVFromBit(TMP2, TMP1);       // OV <- TMP2 LSB (OF)
 }
 
 DEF_OP(SbbNZCV) {
@@ -2382,11 +2358,9 @@ DEF_OP(SbbNZCV) {
   xor_(TMP4, TMP4, TMP1);                  // S1^Result
   and_(TMP4, TMP4, TMP2);                  // (S1^S2) AND (S1^Result) = OF
 
-  // XER patch via rlwimi — SH/MB/ME derived in DEF_OP(AdcWithFlags) above.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
-  rlwimi(TMP1, TMP4, 30, 1, 1);   // OV <- TMP4 LSB
-  mtspr(1, TMP1);
+  // Arithmetic XER writes — see DEF_OP(AdcWithFlags) / PPC64Emitter.h.
+  SetCAFromBit(TMP3, TMP1);       // CA <- TMP3 LSB (CFInverted-stored)
+  SetOVFromBit(TMP4, TMP1);       // OV <- TMP4 LSB (OF)
 }
 
 // =========================================================================
@@ -2719,19 +2693,18 @@ DEF_OP(AXFlag) {
   // The IR's $V_inv parameter is FlagM2 fallback data we don't need here —
   // the conversion is fully derivable from current CR0/XER state.
 
-  // Read XER, isolate OV at LSB 29 (rotate-right-by-1 from LSB 30) and CA at LSB 29.
+  // Read XER once (the old OV/CA values are inputs), isolate OV and CA at
+  // LSB 29.
   mfspr(TMP1, 1);                        // TMP1 = XER (low 32)
   rlwinm(TMP4, TMP1, 31, 2, 2);          // TMP4 = OV at LSB 29 (PPC bit 2)
   rlwinm(TMP3, TMP1, 0, 2, 2);           // TMP3 = CA bit at LSB 29
 
-  // Compute new CA = old CA AND NOT old OV (both at LSB 29 now).
+  // Compute new CA = old CA AND NOT old OV (both at LSB 29 now), then write
+  // CA/OV arithmetically — no serializing mtspr (PPC64Emitter.h helper block).
   andc(TMP3, TMP3, TMP4);                // TMP3 = (CA & !OV) at LSB 29
-
-  // Clear old OV+CA in XER, OR in new CA, leave OV cleared.
-  LoadConstant(TMP2, 0x60000000ULL);     // mask: bits OV(30) | CA(29)
-  andc(TMP1, TMP1, TMP2);                // TMP1 = XER with OV+CA cleared
-  or_(TMP1, TMP1, TMP3);                 // TMP1 = XER with new CA
-  mtspr(1, TMP1);                        // write back XER
+  rlwinm(TMP3, TMP3, 3, 31, 31);         // -> 0/1 at LSB 0 (PPC 2 -> PPC 31)
+  SetCAFromBit(TMP3, TMP2);              // CA <- CA & !OV
+  SetOVConstant(false, r0, TMP2);        // OV <- 0
 
   // Read CR0 (mfocrf 0x80 — single-field form; the rlwinm mask keeps only
   // CR0.EQ at LSB 29, discarding the bits mfocrf leaves undefined pre-3.0C),
@@ -2820,27 +2793,17 @@ DEF_OP(RmifNZCV) {
   }
 
   // ---- C / V (XER.CA, XER.OV) ----
-  if (TouchC || TouchV) {
-    mfspr(TMP3, 1);
-    if (TouchC) {
-      // XER.CA at LSB 29. Rotated bit 1 → LSB 29 (rotate-left 28).
-      LoadConstant(TMP2, 0x20000000ULL);
-      andc(TMP3, TMP3, TMP2);
-      rldicl(TMP2, TMP1, 28, 32);
-      LoadConstant(TMP4, 0x20000000ULL);
-      and_(TMP2, TMP2, TMP4);
-      or_(TMP3, TMP3, TMP2);
-    }
-    if (TouchV) {
-      // XER.OV at LSB 30. Rotated bit 0 → LSB 30 (rotate-left 30).
-      LoadConstant(TMP2, 0x40000000ULL);
-      andc(TMP3, TMP3, TMP2);
-      rldicl(TMP2, TMP1, 30, 32);
-      LoadConstant(TMP4, 0x40000000ULL);
-      and_(TMP2, TMP2, TMP4);
-      or_(TMP3, TMP3, TMP2);
-    }
-    mtspr(1, TMP3);
+  // No XER round-trip: each helper writes ONLY its own bit (addic: CA;
+  // sldi+addo: OV), so a C-only insert (guest STC/CLC — the hottest RMIF
+  // shape) preserves OV for free and vice versa. Was mfspr + mask/merge +
+  // serializing mtspr.
+  if (TouchC) {
+    rldicl(TMP2, TMP1, 63, 63);   // rotated bit 1 -> 0/1 at LSB 0
+    SetCAFromBit(TMP2, TMP3);
+  }
+  if (TouchV) {
+    rldicl(TMP2, TMP1, 0, 63);    // rotated bit 0 -> 0/1 at LSB 0
+    SetOVFromBit(TMP2, TMP3);
   }
 }
 
@@ -2876,18 +2839,11 @@ void PPC64JITCore::SetNZCVConstant(uint8_t NZCV) {
   }
   mtocrf(0x80, TMP1);
 
-  // XER: clear OV+CA (LSB 30 + 29 = 0x60000000), OR in C/V bits.
-  mfspr(TMP1, 1);
-  LoadConstant(TMP2, 0x60000000ULL);
-  andc(TMP1, TMP1, TMP2);
-  uint32_t XERBits = 0;
-  if (NZCV & 0x2) XERBits |= 0x20000000u;  // C → LSB 29
-  if (NZCV & 0x1) XERBits |= 0x40000000u;  // V → LSB 30
-  if (XERBits) {
-    LoadConstant(TMP2, XERBits);
-    or_(TMP1, TMP1, TMP2);
-  }
-  mtspr(1, TMP1);
+  // XER: both constants known at emit time — generate them arithmetically,
+  // no round-trip (was mfspr + mask/or + serializing mtspr). r0 = 0 holds
+  // here (JIT DEF_OP context; only CondAdd/CondSubNZCV call this).
+  SetCAConstant((NZCV & 0x2) != 0, r0, TMP1);
+  SetOVConstant((NZCV & 0x1) != 0, r0, TMP2);
 }
 
 DEF_OP(CondAddNZCV) {
@@ -2914,13 +2870,10 @@ DEF_OP(CondAddNZCV) {
     if (S2Inline) {
       if (static_cast<int64_t>(Const) >= -32768 && static_cast<int64_t>(Const) <= 32767) {
         addic_(TMP3, S1, static_cast<int16_t>(Const));   // CA + CR0; OV unchanged from prior op
-        // addic. doesn't set OV; force OV=0 since false path is constant anyway —
-        // but the "taken" path with addic. + small const won't see signed overflow
-        // beyond the 64-bit boundary for typical glibc usage. To be safe: clear OV.
-        mfspr(TMP1, 1);
-        LoadConstant(TMP2, 0x40000000ULL);
-        andc(TMP1, TMP1, TMP2);
-        mtspr(1, TMP1);
+        // addic. doesn't set OV; force OV=0 (addic.+small-const can't overflow
+        // the 64-bit boundary in a way ccmn cares about). One addo, preserving
+        // the CA addic. just produced — was a full XER round-trip.
+        SetOVConstant(false, r0, TMP1);
       } else {
         LoadConstant(TMP4, Const);
         addco_(TMP3, S1, TMP4);
@@ -2999,24 +2952,19 @@ DEF_OP(ShiftFlags) {
 
   PPC64Emitter::Label noShift, done;
 
-  // Save CR + XER to a stack scratch slot before andi_ — `andi.` ALWAYS
-  // sets CR0 with a result-of-0 check, so taking the noShift branch
-  // would corrupt the preserved-flag invariant (CR0.EQ=1 leaking into
-  // ZF on the next PUSHF / LAHF, also CF leak from XER if the previous
-  // op left CA in a meaningful state). Restore on the noShift path.
-  // Active-shift path drops the save (it overwrites CR0+XER anyway).
-  addi(r1, r1, -16);
-  // Single-field CR0 save (was a full mfcr + mtcrf 0xff round-trip): the only
-  // CR writer between this save and the noShift restore is the andi_ below,
-  // which touches CR0 alone — so saving/restoring just field 0 is exact.
-  // mfocrf's non-field-0 bits are undefined pre-3.0C; the mtocrf(0x80)
-  // restore reads only bits 31:28, which are defined.
-  mfocrf(TMP4, 0x80); std(TMP4, 0, r1);
-  mfspr(TMP4, 1); std(TMP4, 8, r1);
+  // Save CR0 to a red-zone slot before andi_ — `andi.` ALWAYS sets CR0 with
+  // a result-of-0 check, so taking the noShift branch would corrupt the
+  // preserved-flag invariant (CR0.EQ=1 leaking into ZF on the next PUSHF /
+  // LAHF). Restore on the noShift path; the active path overwrites CR0
+  // anyway. XER needs NO save: nothing between here and the noShift restore
+  // writes it (andi. touches CR0 alone) — the old XER save/restore pair here
+  // was dead weight and cost a serializing mtspr on every count==0 shift.
+  // Single-field CR0 save (was a full mfcr + mtcrf 0xff round-trip); the
+  // -16(r1) red-zone slot mirrors DEF_OP(RotateFlags).
+  mfocrf(TMP4, 0x80); std(TMP4, -16, r1);
 
   andi_(TMP1, Src2, Mask);
   bc(CC_EQ, &noShift);
-  addi(r1, r1, 16);             // pop scratch on the active-shift path
 
   // CF: bit shifted out. LSL → bit (SizeBits - count) of Src1; LSR/ASR →
   // bit (count - 1). Compute via shift right + LSB extract — using rldicl
@@ -3050,15 +2998,9 @@ DEF_OP(ShiftFlags) {
     xor_(OFReg, OFReg, TMP4);
   }
 
-  // XER patch via rlwimi (clear-and-set in one instruction) — SH/MB/ME
-  // derived in DEF_OP(AdcWithFlags) above: CA sits at LSB 29 = PPC bit 2, so
-  // an LSB-0 source needs SH=29 with MB=ME=2; OV at LSB 30 = PPC bit 1 needs
-  // SH=30 with MB=ME=1. Single-bit masks discard everything above the
-  // source's LSB, exactly as the old sldi/or_ pair did.
-  mfspr(TMP4, 1);
-  rlwimi(TMP4, TMP3,  29, 2, 2);   // CA <- TMP3 LSB
-  rlwimi(TMP4, OFReg, 30, 1, 1);   // OV <- OFReg LSB
-  mtspr(1, TMP4);
+  // Arithmetic XER writes — see DEF_OP(AdcWithFlags) / PPC64Emitter.h.
+  SetCAFromBit(TMP3, TMP4);        // CA <- TMP3 LSB
+  SetOVFromBit(OFReg, TMP4);       // OV <- OFReg LSB
 
   // New raw PF = parity of low byte of Result. rldicl-only masking.
   rldicl(TMP2, Result, 0, 56);  // low 8 bits
@@ -3075,11 +3017,9 @@ DEF_OP(ShiftFlags) {
 
   b(&done);
   Bind(&noShift);
-  // Restore CR0 + XER to the values they held before the andi_ above
-  // (only CR0 was clobbered; see the save-site comment).
-  ld   (TMP4, 0, r1); mtocrf(0x80, TMP4);
-  ld   (TMP4, 8, r1); mtspr(1, TMP4);
-  addi (r1,   r1, 16);
+  // Restore CR0 to the value it held before the andi_ above (the only thing
+  // this path clobbered; XER was never touched — see the save-site comment).
+  ld(TMP4, -16, r1); mtocrf(0x80, TMP4);
   if (Dst != PFIn) mr(Dst, PFIn);
   Bind(&done);
 }
@@ -3143,13 +3083,11 @@ DEF_OP(RotateFlags) {
   // Invert CF for the CFInverted=true contract.
   xori(TMP3, TMP3, 1);
 
-  // Splat C → XER.CA (LSB 29 = PPC bit 2) and V → XER.OV (LSB 30 = PPC bit 1)
-  // without disturbing CR0. rlwimi clears and sets in one instruction; the
-  // SH/MB/ME derivation is written out in DEF_OP(AdcWithFlags) above.
-  mfspr(TMP4, 1);
-  rlwimi(TMP4, TMP3, 29, 2, 2);   // CA <- TMP3 LSB
-  rlwimi(TMP4, TMP2, 30, 1, 1);   // OV <- TMP2 LSB
-  mtspr(1, TMP4);
+  // Arithmetic XER writes (no CR0 disturbance either — addic/addo are
+  // non-record forms). See DEF_OP(AdcWithFlags) / PPC64Emitter.h. TMP4 is
+  // free here: its CR0 snapshot lives in the red-zone slot until noRotate.
+  SetCAFromBit(TMP3, TMP4);       // CA <- TMP3 LSB (CFInverted-stored)
+  SetOVFromBit(TMP2, TMP4);       // OV <- TMP2 LSB (OF)
 
   Bind(&noRotate);
   // Restore CR0 (packed-NZCV) saved before the andi_ above.
@@ -3947,13 +3885,12 @@ DEF_OP(StoreNZCV) {
   rlwimi(TMP1, Src, 31, 2, 2);   // Z → CR0.EQ
   mtocrf(0x80, TMP1);
 
-  // XER: rlwimi clears and sets each target bit in one instruction, so the
-  // LoadConstant-mask / andc / rlwinm / or_ chain collapses to two inserts
-  // with the SH/MB/ME values the old rlwinm extracts already used.
-  mfspr(TMP1, 1);
-  rlwimi(TMP1, Src, 0, 2, 2);    // C: Src LSB 29 → XER.CA LSB 29 (no rotate)
-  rlwimi(TMP1, Src, 2, 1, 1);    // V: Src LSB 28 (PPC 3) → XER.OV LSB 30 (PPC 1)
-  mtspr(1, TMP1);
+  // XER: both bits fully written, so generate them arithmetically — no XER
+  // read, no serializing mtspr (PPC64Emitter.h helper block).
+  rlwinm(TMP1, Src, 3, 31, 31);  // C: Src LSB 29 (PPC 2) → 0/1 at LSB 0
+  SetCAFromBit(TMP1, TMP2);
+  rlwinm(TMP1, Src, 4, 31, 31);  // V: Src LSB 28 (PPC 3) → 0/1 at LSB 0
+  SetOVFromBit(TMP1, TMP2);
 }
 
 DEF_OP(CarryInvert) {
@@ -4235,27 +4172,16 @@ DEF_OP(FCmp) {
   }
   xscmpudp(0, VTMP1, VTMP2);
 
-  // Lift CR0.SO and !CR0.LT into XER.OV/CA.
-  // PPC bits (in 32-bit-low view): CR0.LT=0, CR0.SO=3; XER.OV=1, XER.CA=2.
-  // mfocrf 0x80: both bits read (CR0.LT, CR0.SO) are inside the defined
-  // field-0 nibble; the rlwinm masks discard the undefined remainder.
+  // Lift CR0.SO and !CR0.LT into XER.OV/CA — arithmetically, both bits fully
+  // written, so no XER read and no serializing mtspr (PPC64Emitter.h helper
+  // block for the idioms). mfocrf 0x80: both bits read (CR0.LT, CR0.SO) are
+  // inside the defined field-0 nibble; the rlwinm masks discard the rest.
   mfocrf(TMP1, 0x80);
   rlwinm(TMP3, TMP1, 1, 31, 31);   // LT (PPC 0) → LSB 0
   xori(TMP3, TMP3, 1);             // !LT at LSB 0
-  // Insert both bits with rlwimi (clear-and-set in one instruction; SH/MB/ME
-  // derivation in DEF_OP(AdcWithFlags) above).
-  //   V: source CR0.SO is at PPC bit 3 of TMP1, target XER.OV is PPC bit 1.
-  //      ROTL32 by SH sends PPC q to (q - SH) mod 32, so 3 - SH ≡ 1 → SH = 2,
-  //      MB = ME = 1.
-  //   C: source !LT is at LSB 0 = PPC 31, target XER.CA is PPC bit 2, so
-  //      31 - SH ≡ 2 → SH = 29, MB = ME = 2.
-  // Both masks are a single bit, so the undefined bits mfocrf may have left
-  // in TMP1 outside CR0's nibble are discarded just as the old rlwinm masks
-  // discarded them.
-  mfspr(TMP4, 1);                  // read XER
-  rlwimi(TMP4, TMP1, 2, 1, 1);     // OV <- CR0.SO
-  rlwimi(TMP4, TMP3, 29, 2, 2);    // CA <- !CR0.LT
-  mtspr(1, TMP4);                  // write XER
+  SetCAFromBit(TMP3, TMP2);        // CA <- !CR0.LT
+  rlwinm(TMP3, TMP1, 4, 31, 31);   // SO (PPC 3) → LSB 0
+  SetOVFromBit(TMP3, TMP2);        // OV <- CR0.SO (unordered)
 }
 
 // FCmpX86: fused FCmp + AXFLAG + raw-PF. Produces the final x86-COMIS flag
@@ -4265,7 +4191,8 @@ DEF_OP(FCmp) {
 //   XER.OV = 0 (OF=0)
 //   Dst    = !UN          -- raw PF (inverted representation), 0/1
 // Replaces the split path's CR->XER lift + CR1-projection/isel for PF +
-// DEF_OP(AXFlag)'s second full XER RMW: one mfocrf, one XER RMW, no
+// DEF_OP(AXFlag)'s second full XER RMW: one mfocrf, arithmetic XER writes
+// (no XER read, no serializing mtspr — PPC64Emitter.h helper block), no
 // projection. Emitted only when HostFeatures.SupportsFCmpX86 (set for this
 // backend in Common/HostFeatures.cpp).
 DEF_OP(FCmpX86) {
@@ -4301,14 +4228,14 @@ DEF_OP(FCmpX86) {
   rlwinm(Dst, TMP1, 4, 31, 31);   // UN: PPC 3 -> PPC 31 (LSB 0)
   xori(Dst, Dst, 1);
 
-  // XER.CA = !(LT|UN), XER.OV = 0 — single read-modify-write.
-  rlwinm(TMP4, TMP1, 30, 2, 2);   // LT: PPC 0 -> PPC 2
-  or_(TMP4, TMP4, TMP2);          // (LT|UN) at PPC 2
-  xoris(TMP4, TMP4, 0x2000);      // !(LT|UN) at PPC 2 (0x2000 << 16 = LSB 29)
-  mfspr(TMP2, 1);
-  rlwinm(TMP2, TMP2, 0, 3, 0);    // wrap-mask keeps PPC 3..31,0 — clears OV(1)+CA(2)
-  or_(TMP2, TMP2, TMP4);
-  mtspr(1, TMP2);
+  // XER.CA = !(LT|UN), XER.OV = 0 — arithmetic writes, no XER read, no
+  // serializing mtspr (PPC64Emitter.h helper block).
+  rlwinm(TMP4, TMP1, 1, 31, 31);  // LT: PPC 0 -> LSB 0
+  rlwinm(TMP3, TMP1, 4, 31, 31);  // UN: PPC 3 -> LSB 0
+  or_(TMP4, TMP4, TMP3);          // (LT|UN) at LSB 0
+  xori(TMP4, TMP4, 1);            // !(LT|UN)
+  SetCAFromBit(TMP4, TMP3);       // CA (addic — OV untouched)
+  SetOVConstant(false, r0, TMP3); // OV = 0 (addo — CA untouched)
 }
 
 // =========================================================================

@@ -367,6 +367,10 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // XER arithmetic-write kill switch (PPC64Emitter.h XERArithDisabled):
+      // presence-DISABLED; flips every CA/OV write helper between the addic/
+      // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOXERARITH") != nullptr));
       // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
       // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
