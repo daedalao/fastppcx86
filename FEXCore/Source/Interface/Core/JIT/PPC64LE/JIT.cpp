@@ -3767,6 +3767,19 @@ void PPC64JITCore::AnalyzeSpinLoops() {
           }
         }
 
+        // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop, AND one line
+        // per validated spin region the collapse guards REFUSED, naming the
+        // guard — the CP2077 worker loop went unmatched for two sessions
+        // because there was no way to see which stage walked past it
+        // (compile-time events, low volume: only Clean+HasPollLoad regions).
+        static const bool Trace = [] {
+          const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
+          return T && T[0] == '1';
+        }();
+        const char* Reject = nullptr;
+        int RejectCond = -1;
+        int64_t RejectImm = -1;
+
         if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
           auto JOp = BranchHdr->C<IR::IROp_CondJump>();
           uint64_t JC = 0;
@@ -3877,19 +3890,29 @@ void PPC64JITCore::AnalyzeSpinLoops() {
               if (ShapeSGT) {
                 SpinCollapseBranchSigned[IR->GetID(BranchNode).Value] = true;
               }
-              // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop so a
-              // misbehaving title can be attributed to a guest RIP without a
-              // debugger (compile-time event, low volume).
-              static const bool Trace = [] {
-                const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
-                return T && T[0] == '1';
-              }();
               if (Trace) {
-                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u\n",
-                        IR->GetHeader()->OriginalRIP, TargetID);
+                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u%s\n",
+                        IR->GetHeader()->OriginalRIP, TargetID, ShapeSGT ? " (sgt0)" : "");
               }
+            } else {
+              Reject = !Linked ? "unlinked" : "foreign-reader";
             }
+          } else {
+            Reject = "shape";
+            RejectCond = static_cast<int>(JOp->Cond);
+            uint64_t Imm = 0;
+            RejectImm = IsInlineConstant(JOp->Cmp2, &Imm) ? static_cast<int64_t>(Imm) : -1;
           }
+        } else {
+          Reject = !RegionStationary ? "not-stationary" :
+                   !SubNode          ? "no-sub1" :
+                   !BranchNode       ? "no-branch" :
+                   SubCount != 1     ? "multi-sub" :
+                                       "no-store-of-sub";
+        }
+        if (Reject && Trace) {
+          fprintf(stderr, "SPINCOLLAPSE-REJECT: entry=0x%lx head-block=%u reason=%s cond=%d imm=%ld\n",
+                  IR->GetHeader()->OriginalRIP, TargetID, Reject, RejectCond, static_cast<long>(RejectImm));
         }
       }
       // Every edge from a region block to a block outside [ti, bi] restores
