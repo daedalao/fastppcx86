@@ -1232,6 +1232,52 @@ namespace x64 {
           Result = ::ioctl(fd, cmd, arg);
         }
       }
+
+      // Diagnostic: ntsync ioctl traffic, for chasing wedges where waiters
+      // park forever and nothing ever signals them. The futex trace cannot
+      // see this path at all — ntsync waits are ioctls, not futexes — which
+      // left a whole synchronisation backend uninstrumented while a
+      // FreeInfantry menu wedge was being blamed on deferred signals. What
+      // this answers that nothing else does: whether the SIGNALLING ioctls
+      // (event set, sem release, mutex unlock) are succeeding. A setter
+      // quietly failing with ENOTTY/EINVAL — a mistranslated command number,
+      // say — produces exactly the observed symptom, waiters waiting on a
+      // wake that was never actually issued.
+      //
+      // Same two-stage arming and own-file discipline as FEX_FUTEX_TRACE:
+      // FEX_NTSYNC_TRACE=1 then `touch /tmp/nts_on`, logging to
+      // /tmp/nts.<pid>.log because guests replace fd 2 early and ate the
+      // futex trace from exactly the process under investigation.
+      if (IoctlType == 0x4Eu) {
+        static const bool trace_ntsync = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        if (trace_ntsync && access("/tmp/nts_on", F_OK) == 0) {
+          static int nts_fd = -1;
+          if (nts_fd == -1) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/nts.%d.log", static_cast<int>(::getpid()));
+            nts_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+            if (nts_fd == -1) {
+              nts_fd = -2;
+            }
+          }
+          if (nts_fd >= 0) {
+            static thread_local pid_t nts_tid = 0;
+            if (nts_tid == 0) {
+              nts_tid = static_cast<pid_t>(::syscall(SYS_gettid));
+            }
+            struct timespec ts {};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const int64_t sr = static_cast<int64_t>(Result);
+            char line[192];
+            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
+                                   static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
+                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? errno : 0);
+            if (n > 0) {
+              [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
+            }
+          }
+        }
+      }
       SYSCALL_ERRNO();
     });
 #else
