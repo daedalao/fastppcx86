@@ -970,6 +970,36 @@ private:
   // switch in CompileCode and the rationale in ProjectXERToCR1).
   bool XERProjectionValid = false;
 
+  // Emit-time last-constant cache for DEF_OP(Constant): when the previous
+  // materialized constant is still live in its (dynamic, callee-saved) RA
+  // register and the new value is within ±32K, emit one addi off it instead
+  // of a 2-5 insn LoadConstant. Targets clustered guest addresses (rip-
+  // relative coefficient loads in polynomial code: one lis+ori then addi per
+  // subsequent constant). Lifecycle owned by CompileCode's post-handler
+  // switch: set by non-PatchSite OP_CONSTANT with a dynamic-GPR dest,
+  // survives ONLY across the verified no-dynamic-GPR-write allowlist
+  // (FPR-class LoadMem, the scalar-FP insert family), reset at block entry.
+  struct {
+    uint64_t Value;
+    uint8_t Reg;      // GeneralRegisters[] index
+    bool Valid;
+  } LastConstantCache {};
+
+  // Load-and-splat fusion for FMA memory operands (both per-block, cleared at
+  // block entry). CompileCode's pre-pass fills SplatCandidateLoads with node
+  // IDs of single-use f64 FPR LoadMems whose lone consumer is an FMA-family
+  // scalar insert (Vector1/Vector2/Addend position — never Upper).
+  // DEF_OP(LoadMem) emits those via lxvdsx (value in BOTH doublewords) and
+  // records the node in SplatFormLoadNodes; the FMA handlers consult that to
+  // skip their own splat. Single-use SSA temps only, so splat form never
+  // reaches guest-architectural state (the hazard that convicted the
+  // ScalarSplatChain pass does not apply).
+  fextl::vector<uint32_t> SplatCandidateLoads;
+  fextl::vector<uint32_t> SplatFormLoadNodes;
+  static bool IdInVec(const fextl::vector<uint32_t>& V, uint32_t Id) {
+    return std::find(V.begin(), V.end(), Id) != V.end();
+  }
+
   // Shared SHA-256 four-round emitter for VSha256H (returns ABCD half) and
   // VSha256H2 (returns EFGH half). Fully inline: vshasigmaw ST=1 for both
   // big-Sigma functions, vsel-form Ch/Maj, vsldoi lane rotations. Borrows two

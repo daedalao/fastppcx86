@@ -847,6 +847,17 @@ DEF_OP(LoadMem) {
   const MemAddrForm EAF = MakeAddrForm(*this, Addr, Off);
 
   if (Op->Class == IR::RegClass::FPR) {
+    // Load-and-splat fusion: CompileCode's pre-pass marked this node iff it
+    // is a single-use f64 load whose only consumer is an FMA-family scalar
+    // insert (see SplatCandidateLoads). lxvdsx puts the double in BOTH
+    // doublewords (1 insn, honors LE per-element — compilers' own idiom for
+    // vec_splats(*p)); the consumer skips its splat via SplatFormLoadNodes.
+    // Never guest-architectural: single use means no StoreRegister writeback.
+    if (IROp->Size == IR::OpSize::i64Bit && IdInVec(SplatCandidateLoads, IR->GetID(Node).Value)) {
+      lxvdsx(GetVReg(Dst), MaterializeAddr(*this, EAF), r0);
+      SplatFormLoadNodes.push_back(IR->GetID(Node).Value);
+      return;
+    }
     // Honour Op->Size so vmovd/vmovq don't read 16B and clobber upper lanes.
     LoadFPRSized(GetVReg(Dst), MaterializeAddr(*this, EAF), IR::OpSizeToSize(IROp->Size));
     return;

@@ -4468,6 +4468,40 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // emitted block's trailing register contents may be assumed here.
     InvalidateAESCache();
     XERProjectionValid = false;
+    LastConstantCache.Valid = false;
+
+    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
+    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
+    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
+    // FMA handler can skip its splat. Same-block pairs only by construction.
+    SplatCandidateLoads.clear();
+    SplatFormLoadNodes.clear();
+    for (auto [CandNode, CandIROp] : IRView->GetCode(BlockNode)) {
+      switch (CandIROp->Op) {
+      case IR::OP_VFMLASCALARINSERT:
+      case IR::OP_VFMLSSCALARINSERT:
+      case IR::OP_VFNMLASCALARINSERT:
+      case IR::OP_VFNMLSSCALARINSERT: {
+        auto FOp = CandIROp->C<IR::IROp_VFMLAScalarInsert>();
+        if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
+          break;
+        }
+        for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
+          if (Arg.IsImmediate() || Arg == FOp->Upper) {
+            continue;
+          }
+          auto DefNode = IRView->GetNode(Arg);
+          auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
+          if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
+              DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
+            SplatCandidateLoads.push_back(Arg.ID().Value);
+          }
+        }
+        break;
+      }
+      default: break;
+      }
+    }
 
     PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
 
@@ -4530,6 +4564,44 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       case IR::OP_CONSTANT:
       case IR::OP_INLINECONSTANT: break;
       default: XERProjectionValid = false; break;
+      }
+
+      // Last-constant cache lifecycle (see LastConstantCache in JITClass.h).
+      // Set by materialized constants; survives only across ops verified to
+      // write no dynamic GPR (FPR-class loads and the scalar-FP inserts —
+      // their GPR usage is TMP1-4/r0 only, never RA registers); everything
+      // else invalidates. Reset at block entry alongside the AES cache.
+      switch (IROp->Op) {
+      case IR::OP_CONSTANT: {
+        auto COp = IROp->C<IR::IROp_Constant>();
+        const auto PR = IR::PhysicalRegister(CodeNode);
+        if (COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+          LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+        } else {
+          LastConstantCache.Valid = false;
+        }
+        break;
+      }
+      case IR::OP_LOADMEM:
+      case IR::OP_LOADMEMTSO:
+        // FPR-class loads leave dynamic GPRs untouched; GPR-class loads
+        // write an RA register and must invalidate.
+        if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
+          LastConstantCache.Valid = false;
+        }
+        break;
+      case IR::OP_VFADDSCALARINSERT:
+      case IR::OP_VFSUBSCALARINSERT:
+      case IR::OP_VFMULSCALARINSERT:
+      case IR::OP_VFDIVSCALARINSERT:
+      case IR::OP_VFMINSCALARINSERT:
+      case IR::OP_VFMAXSCALARINSERT:
+      case IR::OP_VFMLASCALARINSERT:
+      case IR::OP_VFMLSSCALARINSERT:
+      case IR::OP_VFNMLASCALARINSERT:
+      case IR::OP_VFNMLSSCALARINSERT:
+      case IR::OP_LOADNAMEDVECTORCONSTANT: break;
+      default: LastConstantCache.Valid = false; break;
       }
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,

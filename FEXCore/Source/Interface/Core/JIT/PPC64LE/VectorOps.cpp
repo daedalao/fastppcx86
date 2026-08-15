@@ -4293,10 +4293,28 @@ DEF_OP(NAME) {                                                                 \
     xxsldwi(VTMP2, VTMP1, Upper, 3); /* {result.w3, Upper.w0..w2} */           \
     xxsldwi(Dst, VTMP2, VTMP2, 1);   /* rotate: result into BE word 3 */       \
   } else {                                                                     \
-    xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                         \
-    xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                           \
-    xxpermdi(VTMP3_VSX, toVSX(V2), toVSX(V2), 3);                              \
-    XVOP_D(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
+    /* Splat-form sources (lxvdsx loads, see SplatFormLoadNodes) already hold \
+     * the value in both doublewords: the accumulator still needs its copy    \
+     * into VTMP1 (the xv*a form is destructive) but drops the permute for a  \
+     * cheaper xxlor; multiplicands pass through with no copy at all. */      \
+    if (IdInVec(SplatFormLoadNodes, Op->Addend.ID().Value)) {                  \
+      xxlor(toVSX(VTMP1), toVSX(Add), toVSX(Add));                             \
+    } else {                                                                   \
+      xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                       \
+    }                                                                          \
+    PPC64Emitter::VSXR SrcA = toVSX(VTMP2);                                    \
+    if (IdInVec(SplatFormLoadNodes, Op->Vector1.ID().Value)) {                 \
+      SrcA = toVSX(V1);                                                        \
+    } else {                                                                   \
+      xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                         \
+    }                                                                          \
+    PPC64Emitter::VSXR SrcB = VTMP3_VSX;                                       \
+    if (IdInVec(SplatFormLoadNodes, Op->Vector2.ID().Value)) {                 \
+      SrcB = toVSX(V2);                                                        \
+    } else {                                                                   \
+      xxpermdi(VTMP3_VSX, toVSX(V2), toVSX(V2), 3);                            \
+    }                                                                          \
+    XVOP_D(toVSX(VTMP1), SrcA, SrcB);                                          \
     xxpermdi(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), 1);                       \
   }                                                                            \
 }

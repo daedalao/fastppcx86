@@ -67,9 +67,33 @@ DEF_OP(Constant) {
   // the ordinary value-dependent 1..5 instruction sequence. Untagged constants
   // (everything, with the flag off) take the unchanged path.
   // See Interface/Core/SMCSemanticPatch.h.
-  if (!TryInsertPatchableImmMove(Dst, Op->Constant, Op->PatchSite)) {
-    LoadConstant(Dst, Op->Constant);
+  if (Op->PatchSite != 0) {
+    if (!TryInsertPatchableImmMove(Dst, Op->Constant, Op->PatchSite)) {
+      LoadConstant(Dst, Op->Constant);
+    }
+    return;
   }
+
+  // Last-constant delta: clustered constants (rip-relative coefficient
+  // addresses in polynomial code load a fresh absolute address per use, all
+  // in the same few pages) become one addi off the previous constant's
+  // still-live register. Cache lifecycle (set/invalidate) lives in
+  // CompileCode's post-handler switch; validity here means the register
+  // provably still holds that value.
+  if (LastConstantCache.Valid) {
+    const int64_t Delta = static_cast<int64_t>(Op->Constant) - static_cast<int64_t>(LastConstantCache.Value);
+    const GPR Base = GeneralRegisters[LastConstantCache.Reg];
+    if (Delta >= -32768 && Delta <= 32767 && Base != r0 && Base != Dst) {
+      addi(Dst, Base, static_cast<int16_t>(Delta));
+      return;
+    }
+    if (Delta == 0 && Base != Dst) {
+      mr(Dst, Base);
+      return;
+    }
+  }
+
+  LoadConstant(Dst, Op->Constant);
 }
 
 DEF_OP(EntrypointOffset) {
