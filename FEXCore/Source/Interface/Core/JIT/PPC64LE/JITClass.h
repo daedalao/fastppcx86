@@ -445,7 +445,19 @@ private:
   // iterations run ~6x native with TSO barriers, ~2-3x under FEX_HWTSO, so
   // K in that range restores the intended spin duration. FEX_SPINCOLLAPSE=1
   // uses the default; FEX_SPINCOLLAPSE=<2..1024> overrides K for tuning.
-  static constexpr uint16_t kSpinCollapseKDefault = 8;
+  // 2026-08-15 in-game sweep (CP2077, driving, HWTSO=1, collapse firing on the
+  // real worker loop for the first time) — worker-loop share of process
+  // samples, and the player's read of frame pacing:
+  //   SMT4: K=8 22.8%   K=32 5.2% "good move"   K=64 1.7% "okay-ish"
+  //   SMT2: K=16 7-10% "okay"  K=32 4.7-6.5% BEST  K=64 2.0-2.8% pacing WORSE
+  // ★ Spin share falls monotonically with K, so it is the WRONG objective:
+  // too-large K exhausts the budget early, workers PARK, and the wake
+  // round-trip costs frame pacing in a way no block profile shows. K=32 was
+  // preferred at BOTH SMT levels, i.e. the optimum did not track available
+  // hardware threads — one constant looks defensible so far.
+  // ☞ Every verdict above is subjective (no MangoHud CSV was captured); p99
+  // frametime legs are owed before this default is trusted beyond opt-in use.
+  static constexpr uint16_t kSpinCollapseKDefault = 32;
   uint16_t kSpinCollapseK = kSpinCollapseKDefault;
   bool SpinCollapseEnabled {};
   fextl::vector<bool> SpinCollapseSubs;
