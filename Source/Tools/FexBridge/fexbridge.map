@@ -1,0 +1,9 @@
+/* Only the C ABI escapes. The statically absorbed FEXCore, fmt, allocator
+   and everything else stay local so nothing interposes on the host process
+   (Wine) that loads this library. */
+FEXBRIDGE_1.0 {
+  global:
+    fexbridge_*;
+  local:
+    *;
+};

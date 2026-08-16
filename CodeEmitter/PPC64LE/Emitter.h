@@ -928,6 +928,15 @@ public:
   void xxland (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 130); }
   void xxlandc(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 138); }
   void xxlnor (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 162); }
+  // The three ISA 2.07 (POWER8) complementing forms, each folding a
+  // two-instruction pattern into one: ~(a|b) already had xxlnor above, and
+  //   xxlorc  T = a | ~b      xxlnand T = ~(a & b)      xxleqv T = ~(a ^ b)
+  // cover the rest. Valid on ISA 3.0 too, so no feature gate. XO values
+  // continue the 8-step run 130/138/146/154/162 and were checked against
+  // `llvm-mc -triple=powerpc64le` (xxlorc 170, xxlnand 178, xxleqv 186).
+  void xxlorc (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 170); }
+  void xxlnand(VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 178); }
+  void xxleqv (VR t, VR a, VR b) { EmitXX3(t.idx, a.idx, b.idx, 186); }
   // xxspltw XT,XB,UIM — splat BE word UIM of XB across XT (XX2-form with the
   // 2-bit UIM in the low bits of the RA field). Encoding verified against gas
   // on op4k: `xxspltw vs34,vs35,2` == f0 42 1a 93 (LE), matching op=60,
@@ -1734,6 +1743,18 @@ public:
     Emit32((31u << 26) | (th << 21) | (ra.idx << 16) | (rb.idx << 11) | (278u << 1));
   }
 
+  // dcbtst (data cache block touch FOR STORE, opcode 31, XO 246).
+  //
+  // A SEPARATE OPCODE, not a TH encoding of dcbt: dcbt brings the block in for
+  // reading (shared), so a subsequent store still pays the read-for-ownership
+  // upgrade, while dcbtst asks for it in a state where the program may store
+  // to it. `dcbt RA,RB,16` is the extended mnemonic `dcbtt` (a non-transient
+  // LOAD touch), which is why using 16 as a "for store" hint is silently a
+  // load-side prefetch. Checked against `llvm-mc -triple=powerpc64le`.
+  void dcbtst(GPR ra, GPR rb, uint32_t th = 0) {
+    Emit32((31u << 26) | (th << 21) | (ra.idx << 16) | (rb.idx << 11) | (246u << 1));
+  }
+
   // dcbz (data cache block zero, opcode 31, XO 1014)
   void dcbz(GPR ra, GPR rb) { EmitX(31, 0, ra.idx, rb.idx, 1014, 0); }
 
@@ -1868,8 +1889,26 @@ public:
     uint32_t hi = static_cast<uint32_t>(imm >> 32);
     uint32_t lo = static_cast<uint32_t>(imm);
     if (hi) {
-      lis(rt, static_cast<int16_t>(hi >> 16));
-      if (hi & 0xFFFF) ori(rt, rt, static_cast<uint16_t>(hi & 0xFFFF));
+      // hi <= 0x7FFF collapses `lis rt,0` + `ori rt,rt,hi` into one `li`.
+      // Safe because li sign-extends and the following `sldi rt,rt,32` is
+      // `rldicr rt,rt,32,31`, which keeps only the LOW 32 bits of the
+      // pre-shift value -- so any sign extension above bit 31 is discarded
+      // anyway. The bound is 0x7FFF, not 0xFFFF: at 0x8000 and above li would
+      // sign-extend into bits 16-31, which DO survive the shift.
+      //
+      // This is not a corner case, it is the common case for 64-bit guests.
+      // Userspace addresses have top-16-bits <= 0x7FFF by construction:
+      // Proton PE images sit around 0x37ff_...., Linux PIE around 0x5555_....,
+      // and stacks at 0x7fff_..... So this takes the general sequence from 5
+      // instructions to 4 on effectively every guest RIP -- and that sequence
+      // is paid on every constant block exit and on the return address pushed
+      // by every guest CALL.
+      if (hi <= 0x7FFF) {
+        li(rt, static_cast<int16_t>(hi));
+      } else {
+        lis(rt, static_cast<int16_t>(hi >> 16));
+        if (hi & 0xFFFF) ori(rt, rt, static_cast<uint16_t>(hi & 0xFFFF));
+      }
     } else {
       li(rt, 0);
     }

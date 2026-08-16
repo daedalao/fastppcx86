@@ -1159,7 +1159,7 @@ namespace x64 {
       return (dir_ppc << 29) | (size_ppc << 16) | (type << 8) | nr;
     };
 
-    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame*, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
+    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t cmd, uint64_t arg) -> uint64_t {
       // termios needs its payload marshalled, not just its command number
       // remapped. Guest x86 struct is 36 bytes; the buffer we hand `::ioctl`
       // on PowerPC must be glibc's own 60-byte `struct termios`, because the
@@ -1197,7 +1197,87 @@ namespace x64 {
       }
 
       cmd = RemapIoctlForPPC(cmd);
+
+      // ntsync WAIT_ANY/WAIT_ALL (type 'N' = 0x4E, nr 0x82/0x83) are
+      // signal-wakeable sleeps that wine parks worker threads in
+      // indefinitely — the same shape futex(2) grew an entry check for, on a
+      // path that never had one. A thread could park here holding the very
+      // signal whose handler would have woken it, which is the black hole
+      // described at the futex handler above; that comment lists the known
+      // uncovered sleeps (epoll_wait, ppoll, nanosleep, futex_waitv) and
+      // ntsync is not even on it, because ntsync arrived later.
+      //
+      // Observed as a DETERMINISTIC menu wedge in FreeInfantry under Proton:
+      // 21 threads parked as 14 futex / 5 ntsync / 2 nanosleep, one condvar
+      // polled 63 times in 71s and never signalled, and no runnable thread.
+      // PROTON_NO_NTSYNC=1 avoids it entirely, which is what localises it
+      // here rather than to the futex side.
+      //
+      // Retry on a FEX-internal EINTR mirrors the futex path, and is simpler
+      // here: ntsync's deadline is ABSOLUTE on CLOCK_MONOTONIC, so re-issuing
+      // cannot over-wait the way re-issuing a relative FUTEX_WAIT does.
+      // Slicing (the futex rescue tier) is NOT done: the deadline lives
+      // inside the guest's ntsync_wait_args, so shortening it means writing
+      // guest memory, and the entry check is what closes the proven case.
+      const uint32_t IoctlType = (cmd >> 8) & 0xFFu;
+      const uint32_t IoctlNr = cmd & 0xFFu;
+      const bool NtsyncWait = IoctlType == 0x4Eu && (IoctlNr == 0x82u || IoctlNr == 0x83u);
+      if (NtsyncWait && HasGuestDeliverableSignal(Frame)) {
+        return static_cast<uint64_t>(-EINTR);
+      }
+
       uint64_t Result = ::ioctl(fd, cmd, arg);
+      if (NtsyncWait) {
+        while (Result == static_cast<uint64_t>(-1) && errno == EINTR && !HasGuestDeliverableSignal(Frame)) {
+          Result = ::ioctl(fd, cmd, arg);
+        }
+      }
+
+      // Diagnostic: ntsync ioctl traffic, for chasing wedges where waiters
+      // park forever and nothing ever signals them. The futex trace cannot
+      // see this path at all — ntsync waits are ioctls, not futexes — which
+      // left a whole synchronisation backend uninstrumented while a
+      // FreeInfantry menu wedge was being blamed on deferred signals. What
+      // this answers that nothing else does: whether the SIGNALLING ioctls
+      // (event set, sem release, mutex unlock) are succeeding. A setter
+      // quietly failing with ENOTTY/EINVAL — a mistranslated command number,
+      // say — produces exactly the observed symptom, waiters waiting on a
+      // wake that was never actually issued.
+      //
+      // Same two-stage arming and own-file discipline as FEX_FUTEX_TRACE:
+      // FEX_NTSYNC_TRACE=1 then `touch /tmp/nts_on`, logging to
+      // /tmp/nts.<pid>.log because guests replace fd 2 early and ate the
+      // futex trace from exactly the process under investigation.
+      if (IoctlType == 0x4Eu) {
+        static const bool trace_ntsync = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        if (trace_ntsync && access("/tmp/nts_on", F_OK) == 0) {
+          static int nts_fd = -1;
+          if (nts_fd == -1) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/nts.%d.log", static_cast<int>(::getpid()));
+            nts_fd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+            if (nts_fd == -1) {
+              nts_fd = -2;
+            }
+          }
+          if (nts_fd >= 0) {
+            static thread_local pid_t nts_tid = 0;
+            if (nts_tid == 0) {
+              nts_tid = static_cast<pid_t>(::syscall(SYS_gettid));
+            }
+            struct timespec ts {};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const int64_t sr = static_cast<int64_t>(Result);
+            char line[192];
+            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
+                                   static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
+                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? errno : 0);
+            if (n > 0) {
+              [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
+            }
+          }
+        }
+      }
       SYSCALL_ERRNO();
     });
 #else

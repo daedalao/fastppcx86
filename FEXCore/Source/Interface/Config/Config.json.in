@@ -891,6 +891,24 @@
           "cannot change program semantics -- worst case is a priority dip in a loop that was about to do real work."
         ]
       },
+      "SpinCollapse": {
+        "Type": "uint32",
+        "Default": "0",
+        "Desc": [
+          "PPC64LE JIT: batched budget decrement for counted spin-poll loops. 0 (default) disables the feature entirely;",
+          "1 enables it at the default K; 2..1024 enables it at that K; anything larger falls back to the default K.",
+          "K corrects the EMULATION INFLATION of a spin iteration rather than minimizing spinning: the engine tuned its budget for native",
+          "iteration cost, and an emulated iteration runs several times slower, so retiring K units per iteration restores the intended spin",
+          "duration and lets worker threads park on time.",
+          "MEASURED 2026-08-15, Cyberpunk 2077 benchmark scene under FEX_HWTSO=1, benchmark-scene frames only: p50 frametime 51.64 -> 32.66ms",
+          "(-36.8%), mean -37.5%, p99 ~156 -> 75ms (-52%), scene fps 17.43 -> 27.94 (+60.3%). Seven off laps against three K=32 laps with no",
+          "overlap on any metric; an off lap run between two K=32 laps landed on the historical off baseline, so drift is excluded. Pacing",
+          "improves MORE than the average, which is the opposite of the failure mode this was held opt-in for.",
+          "Still off by default: that is one title and one scene, and there is a KNOWN SEMANTIC COARSENING -- on the found-exit the budget",
+          "register holds a K-granular value instead of the exact iteration count, so guest code that consumed the leftover count would",
+          "misbehave. Set it per-title via AppConfig (see Data/AppConfig/Cyberpunk2077.exe.json)."
+        ]
+      },
       "DisableCmpBranchFusion": {
         "Type": "bool",
         "Default": "false",

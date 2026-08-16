@@ -388,6 +388,11 @@ private:
 
   void AnalyzeSpinLoops();
 
+  // FEX_SPINHINT_ANYLOOP=1: drop the stationary-poll requirement on the SMT
+  // priority hint, restoring the pre-fix behaviour where any load-carrying
+  // backedge was hinted. Bisect switch only — the default is the gated form.
+  bool SpinHintAnyLoop {};
+
   // -------------------------------------------------------------------------
   // FEX_SPINCOLLAPSE=1 (opt-in): batched budget decrement for counted
   // spin-poll loops — the RED4 redDispatcher shape (guest RIP 0x37fff37530a0
@@ -401,6 +406,19 @@ private:
   //                   NEQ) -> found-exit
   //   backedge block: %new = Sub(%old, #1); Copy(%old); StoreRegister(%new);
   //                   CondJump(%old, #1, NEQ) -> backedge (else budget-exit)
+  //
+  // Two spellings of that backedge block occur, and BOTH must be admitted —
+  // the second is CP2077's own worker loop, which the first-generation matcher
+  // walked past for two sessions (live reject trace 2026-08-15):
+  //   write-back: an explicit StoreRegister(%new), OR — when the budget is
+  //               SRA-resident — an in-place update, Sub dest PR == src PR
+  //               (`addi r8,r8,-1`), which emits no store at all.
+  //   staging:    Copy(%old) for a 64-bit budget, or Bfe(#32,#0, %old) for a
+  //               32-bit one (`mov eax,ecx` zero-extends). A Bfe-staged
+  //               compare is admitted only against an i32 decrement.
+  // Because the staged value may be zero-extended, the batched compare must
+  // follow CompareSize (cmpwi/cmplwi at i32) — a 64-bit signed compare would
+  // read a negative budget as huge and spin forever. See BranchOps.
   //
   // Rewrite (emission-time, nodes marked by the matcher in AnalyzeSpinLoops):
   //   Sub:      new = (old >u K) ? old - K : 0        (cmpldi cr7 + isel)
@@ -419,6 +437,13 @@ private:
   // own operands — no state is carried between op handlers (the AES
   // mask-cache rule).
   // -------------------------------------------------------------------------
+  // NOW A CONFIG OPTION, not a bare getenv (2026-08-15). SpinCollapse is
+  // reachable from AppConfig, which is the only per-title mechanism this port
+  // has — without that the largest measured win on the port could not be
+  // persisted for the title it was measured on. FEX_SPINCOLLAPSE still works
+  // unchanged; the option name generates that exact environment spelling.
+  // 0 = off, 1 = on at kSpinCollapseKDefault, 2..1024 = on at that K.
+  // -------------------------------------------------------------------------
   // K corrects the EMULATION INFLATION of a spin iteration, it does not
   // minimize spinning: the engine tuned its budget for native iteration
   // cost, and measurement shows the budget is load-bearing (CP2077
@@ -427,11 +452,74 @@ private:
   // iterations run ~6x native with TSO barriers, ~2-3x under FEX_HWTSO, so
   // K in that range restores the intended spin duration. FEX_SPINCOLLAPSE=1
   // uses the default; FEX_SPINCOLLAPSE=<2..1024> overrides K for tuning.
-  static constexpr uint16_t kSpinCollapseKDefault = 8;
+  // 2026-08-15 in-game sweep (CP2077, driving, HWTSO=1, collapse firing on the
+  // real worker loop for the first time) — worker-loop share of process
+  // samples, and the player's read of frame pacing:
+  //   SMT4: K=8 22.8%   K=32 5.2% "good move"   K=64 1.7% "okay-ish"
+  //   SMT2: K=16 7-10% "okay"  K=32 4.7-6.5% BEST  K=64 2.0-2.8% pacing WORSE
+  // ★ Spin share falls monotonically with K, so it is the WRONG objective:
+  // too-large K exhausts the budget early, workers PARK, and the wake
+  // round-trip costs frame pacing in a way no block profile shows. K=32 was
+  // preferred at BOTH SMT levels, i.e. the optimum did not track available
+  // hardware threads — one constant looks defensible so far.
+  // ☞ Every verdict above is subjective (no MangoHud CSV was captured); p99
+  // frametime legs are owed before this default is trusted beyond opt-in use.
+  static constexpr uint16_t kSpinCollapseKDefault = 32;
   uint16_t kSpinCollapseK = kSpinCollapseKDefault;
   bool SpinCollapseEnabled {};
   fextl::vector<bool> SpinCollapseSubs;
   fextl::vector<bool> SpinCollapseBranches;
+  // Backedges matched from the SGT-0 idiom (`test old,old; jg`) rather than
+  // NEQ-1 (`dec; jne`). Their batched compare must be SIGNED: a negative
+  // value must exit the loop as the original SGT would, where the unsigned
+  // `old >u K` reads it as huge and would spin forever (the NEQ shape only
+  // ever coarsens — its worst case is exiting early).
+  fextl::vector<bool> SpinCollapseBranchSigned;
+
+  // -------------------------------------------------------------------------
+  // FEX_MEMCPYDCBZ=1 (opt-in): cache-line store tier for the forward REP MOVSB
+  // fast path in DEF_OP(MemCpy). A copy loop normally moves THREE lines of
+  // traffic per line copied — read source, read-for-ownership the destination,
+  // write destination back — because a partial-line store must fetch the line
+  // it is about to overwrite. `dcbz` establishes the destination line in the
+  // cache as zeroes WITHOUT reading it, so a loop that dcbz's a whole line and
+  // then writes all of it pays only source-read + destination-write. That is
+  // the one non-temporal-store-shaped lever POWER8 has, and it is why glibc's
+  // own POWER memset is built on dcbz.
+  //
+  // TWO REASONS THIS IS OPT-IN RATHER THAN DEFAULT-ON, both structural:
+  //
+  //  1. CACHE-INHIBITED STORAGE. dcbz on caching-inhibited or write-through
+  //     memory raises an alignment interrupt instead of zeroing. DEF_OP(MemSet)
+  //     already accepts that exposure for `rep stosb`, but `rep movsb` reaches
+  //     strictly more memory: a guest memcpy into a Vulkan/GL mapping that the
+  //     host driver made uncached (see the vkMapMemory notes) would take a
+  //     SIGBUS it does not take today. Nothing visible in the JIT can tell the
+  //     two kinds of guest pointer apart.
+  //
+  //  2. FAULT GRANULARITY. Every other tier in that op guarantees that a fault
+  //     mid-copy leaves the destination holding a byte-exact PREFIX of the
+  //     copy. dcbz writes the destination line before the corresponding source
+  //     loads run, so a faulting load leaves up to one line of zeroes past the
+  //     prefix. FEX writes guest RCX/RSI/RDI back only at op end, so a handler
+  //     that fixes the fault and returns re-runs the whole copy and the zeroes
+  //     are overwritten; only a handler that *inspects* the partial
+  //     destination can tell, and it could already not trust RCX.
+  //     A second-order version of the same thing: when BOTH the source and the
+  //     destination are unmapped, the dcbz faults on the destination where the
+  //     load used to fault on the source, so si_addr changes. Same signal,
+  //     same faulting guest instruction.
+  //
+  // Hashed into the code-cache config id (CodeCache.cpp) — blocks compiled
+  // with the tier are not interchangeable with blocks compiled without it.
+  // -------------------------------------------------------------------------
+  bool MemCpyDcbzEnabled {};
+
+  // FEX_MEMSETDCBZ=0: kill-switch for the LONG-SHIPPING dcbz block-zero path
+  // in DEF_OP(MemSet). Default ON (unchanged behaviour) — this exists so the
+  // path can be A/B'd under FEX_HWTSO, where PROT_SAO makes dcbz
+  // disproportionately expensive (see the gate comment in MemoryOps.cpp).
+  bool MemSetDcbzEnabled {true};
 
   bool IsSpinCollapseSub(IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
@@ -440,6 +528,10 @@ private:
   bool IsSpinCollapseBranch(IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     return ID < SpinCollapseBranches.size() && SpinCollapseBranches[ID];
+  }
+  bool IsSpinCollapseBranchSigned(IR::Ref Node) {
+    const auto ID = IR->GetID(Node).Value;
+    return ID < SpinCollapseBranchSigned.size() && SpinCollapseBranchSigned[ID];
   }
 
   // Emit the priority hint (if any) for the edge CurrentBlockID -> Target.

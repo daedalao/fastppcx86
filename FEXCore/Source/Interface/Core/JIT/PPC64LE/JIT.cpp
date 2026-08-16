@@ -2495,19 +2495,45 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
   // Spin-loop SMT priority hints: pure nop-class emission, safe under every
   // other feature combination, so only the explicit kill switch gates it.
   SpinLoopHintEnabled = !FEXCore::Config::Get_DISABLESPINLOOPHINT();
-
-  // FEX_SPINCOLLAPSE=1: batched budget decrement for counted spin loops
-  // (opt-in while the per-app exposure is gathered; see the contract at
-  // kSpinCollapseK in JITClass.h). Hashed into the code-cache config id.
+  // Field bisect switch for the stationary-poll requirement added to the hint
+  // (see AnalyzeSpinLoops): FEX_SPINHINT_ANYLOOP=1 restores the old behaviour
+  // of hinting every load-carrying backedge, for A/B against a regression.
   {
-    const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
-    SpinCollapseEnabled = SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0';
-    if (SpinCollapseEnabled) {
-      const long V = strtol(SpinEnv, nullptr, 10);
-      if (V >= 2 && V <= 1024) {
-        kSpinCollapseK = static_cast<uint16_t>(V);
-      }
+    const char* AnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
+    SpinHintAnyLoop = AnyEnv && AnyEnv[0] == '1';
+  }
+
+  // Batched budget decrement for counted spin loops (contract at
+  // kSpinCollapseK in JITClass.h). A real config option rather than a bare
+  // getenv, so it is reachable from AppConfig -- which is the only per-title
+  // mechanism this port has, and the measured -36.8% p50 / -52% p99 on
+  // Cyberpunk 2077 was otherwise impossible to persist for that title.
+  // FEX_SPINCOLLAPSE keeps working: the option is named SpinCollapse, so the
+  // generated environment spelling is unchanged.
+  //   0 = off, 1 = on at the default K, 2..1024 = on at that K, >1024 = default K.
+  {
+    const uint32_t V = FEXCore::Config::Get_SPINCOLLAPSE()();
+    SpinCollapseEnabled = V != 0;
+    if (V >= 2 && V <= 1024) {
+      kSpinCollapseK = static_cast<uint16_t>(V);
     }
+  }
+
+  // FEX_MEMCPYDCBZ=1: dcbz cache-line store tier in the REP MOVSB fast path
+  // (contract at MemCpyDcbzEnabled in JITClass.h). Opt-in for the alignment-
+  // interrupt and fault-granularity reasons documented there. Hashed into the
+  // code-cache config id.
+  {
+    const char* DcbzEnv = getenv("FEX_MEMCPYDCBZ");
+    MemCpyDcbzEnabled = DcbzEnv && DcbzEnv[0] != '\0' && DcbzEnv[0] != '0';
+  }
+
+  // FEX_MEMSETDCBZ=0: turn OFF the long-shipping memset dcbz path (default on).
+  // Only an explicit "0" disables, so an unset/empty value keeps the shipped
+  // behaviour. Hashed into the code-cache config id.
+  {
+    const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
+    MemSetDcbzEnabled = !(SetDcbzEnv && SetDcbzEnv[0] == '0');
   }
 
   // SMC interlocks: two fork features are only sound when every constant-target
@@ -3546,6 +3572,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
   // checks in the accessors cover compiles where this function never runs.
   SpinCollapseSubs.assign(IR->GetSSACount(), false);
   SpinCollapseBranches.assign(IR->GetSSACount(), false);
+  SpinCollapseBranchSigned.assign(IR->GetSSACount(), false);
 
   fextl::vector<BlockInfo> Blocks;
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
@@ -3674,7 +3701,48 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       if (!Clean || !HasPollLoad || TotalOps > MaxRegionOps) {
         continue;
       }
-      if (SpinLoopHintEnabled) {
+      // Stationary-poll gate, required by BOTH consumers below.
+      //
+      // For the collapse it separates the redDispatcher spin (polls ONE
+      // address every iteration; the leftover budget is dead on the found
+      // exit) from a strlen/memchr-class scan (advances a pointer each
+      // iteration; the leftover count is LIVE — it becomes a length).
+      // Collapsing a scan corrupts that length: CP2077 SIGSEGV'd 7s into
+      // bootstrap when the v1 matcher collapsed loader scans.
+      //
+      // For the SMT hint it separates "spinning" from "working", and getting
+      // that wrong is expensive rather than merely wasteful: the backedge
+      // hint is `or 31,31,31`, VERY LOW thread priority. The structural
+      // tests above (a load, a backedge, no side effects) are equally true of
+      // every hash, strlen, and memcpy-shaped loop, so those were all being
+      // told to yield the core while doing real work. Measured on CP2077's
+      // FNV-1a string hash (the 3.6%-of-profile block once the worker spin
+      // was collapsed): 67.7 MB/s hinted vs 170.6 MB/s unhinted with a busy
+      // SMT sibling, and 193 MB/s unhinted alone — a 2.5x loss on a loop that
+      // was never a spin. A scan must increment something, so require the
+      // whole region to contain NO OP_ADD and no integer Sub other than the
+      // counted decrement; a genuine poll re-reads a fixed base
+      // (EntrypointOffset / SRA register), which this enforces indirectly.
+      //
+      // False negatives are cheap here (a spin that also increments simply
+      // keeps normal priority); false positives cost 2.5x. Gate accordingly.
+      bool RegionStationary = true;
+      uint32_t RegionSubCount = 0;
+      for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
+        for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
+          if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
+            RegionStationary = false;
+            break;
+          }
+          if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
+            RegionStationary = false;
+            break;
+          }
+        }
+      }
+
+      const bool RegionHinted = SpinLoopHintEnabled && (RegionStationary || SpinHintAnyLoop);
+      if (RegionHinted) {
         PushUnique(SpinBackedges, SpinEdgeKey(Blocks[bi].ID, TargetID));
       }
 
@@ -3685,31 +3753,6 @@ void PPC64JITCore::AnalyzeSpinLoops() {
       // PhysicalRegisters — all value linkage is matched by register, the
       // mask-elision lesson.
       if (SpinCollapseEnabled) {
-        // Stationary-poll gate. The counted-decrement match below cannot by
-        // itself distinguish the redDispatcher spin (polls ONE address every
-        // iteration; the leftover budget is dead on the found exit) from a
-        // strlen/memchr-class scan (advances a pointer each iteration; the
-        // leftover count is LIVE — it becomes a length). Collapsing a scan
-        // corrupts that length: CP2077 SIGSEGV'd 7s into bootstrap when the
-        // v1 matcher collapsed loader scans. A scan must increment something,
-        // so require the whole region to contain NO OP_ADD and no integer
-        // Sub other than the budget decrement; the poll address must come
-        // from a fixed base (EntrypointOffset / SRA register), which this
-        // enforces indirectly.
-        bool RegionStationary = true;
-        uint32_t RegionSubCount = 0;
-        for (uint32_t ri = ti; ri <= bi && RegionStationary; ++ri) {
-          for (auto [CodeNode, IROp] : IR->GetCode(Blocks[ri].Node)) {
-            if (IROp->Op == IR::OP_ADD || IROp->Op == IR::OP_ADDWITHFLAGS || IROp->Op == IR::OP_ADDNZCV) {
-              RegionStationary = false;
-              break;
-            }
-            if (IROp->Op == IR::OP_SUB && ++RegionSubCount > 1) {
-              RegionStationary = false;
-              break;
-            }
-          }
-        }
 
         IR::Ref SubNode = nullptr;
         const IR::IROp_Header* SubHdr = nullptr;
@@ -3723,6 +3766,7 @@ void PPC64JITCore::AnalyzeSpinLoops() {
         IR::Ref StoreNode = nullptr;
         uint32_t SubCount = 0;
         bool StoreOfSubSeen = false;
+        bool CopyIsBfe32 = false;
 
         const auto ArgPR = [this](IR::OrderedNodeWrapper Arg) {
           return Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IR->GetNode(Arg));
@@ -3747,6 +3791,25 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             CopySrcPR = ArgPR(COp->Source);
             CopyDstPR = IR::PhysicalRegister(CodeNode);
             CopyNode = CodeNode;
+            CopyIsBfe32 = false;
+            break;
+          }
+          case IR::OP_BFE: {
+            // The OTHER staging form. `mov eax,ecx` ahead of a 32-bit
+            // decrement lowers to Bfe(#32,#0), not OP_COPY — a zero-extend,
+            // because the guest write is 32-bit. CP2077's worker loop stages
+            // its pre-decrement budget exactly this way, and a matcher that
+            // only knew OP_COPY left Cmp1 linked to nothing (live reject
+            // trace 2026-08-15, entry=0x37fff3c830a0). Only the full low-32
+            // field qualifies: a narrower or shifted extract is some other
+            // guest value, not the budget.
+            auto BOp = IROp->C<IR::IROp_Bfe>();
+            if (BOp->Width == 32 && BOp->lsb == 0) {
+              CopySrcPR = ArgPR(BOp->Src);
+              CopyDstPR = IR::PhysicalRegister(CodeNode);
+              CopyNode = CodeNode;
+              CopyIsBfe32 = true;
+            }
             break;
           }
           case IR::OP_STOREREGISTER: {
@@ -3766,17 +3829,57 @@ void PPC64JITCore::AnalyzeSpinLoops() {
           }
         }
 
-        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && StoreOfSubSeen) {
+        // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop, AND one line
+        // per validated spin region the collapse guards REFUSED, naming the
+        // guard — the CP2077 worker loop went unmatched for two sessions
+        // because there was no way to see which stage walked past it
+        // (compile-time events, low volume: only Clean+HasPollLoad regions).
+        static const bool Trace = [] {
+          const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
+          return T && T[0] == '1';
+        }();
+        const char* Reject = nullptr;
+        int RejectCond = -1;
+        int64_t RejectImm = -1;
+
+        // The decrement must genuinely update the guest's budget, not a
+        // throwaway temp. Two forms satisfy that, and only one of them emits
+        // a store: when the budget is SRA-resident, RA gives the Sub the same
+        // physical register for source and destination and the write-back IS
+        // the Sub (`addi r8,r8,-1`) — no StoreRegister exists anywhere in the
+        // block. Demanding the store rejected CP2077's worker loop for two
+        // sessions (live trace 2026-08-15: reason=no-store-of-sub, 9 threads,
+        // 41% of process samples), and would reject every other SRA-held
+        // budget the same way.
+        const bool WritesBack = SubNode && (StoreOfSubSeen || SubDstPR.Raw == SubSrcPR.Raw);
+        if (RegionStationary && SubNode && BranchNode && SubCount == 1 && WritesBack) {
           auto JOp = BranchHdr->C<IR::IROp_CondJump>();
           uint64_t JC = 0;
+          // Two counted-decrement backedge idioms, identical batched form
+          // (keep spinning iff old > K, consuming min(old, K) per iteration):
+          //   NEQ-1 : `dec ecx; jne`            — branch on old != 1
+          //   SGT-0 : `mov eax,ecx; dec ecx; test eax,eax; jg`
+          //           — branch on old >s 0. This is CP2077's redDispatcher
+          //           worker loop (the 40-50%-of-profile block); the v1
+          //           matcher only knew NEQ-1 and walked straight past it.
+          // SGT needs the SIGNED batched compare (see
+          // SpinCollapseBranchSigned in JITClass.h).
+          const bool CondIsInline = IsInlineConstant(JOp->Cmp2, &JC);
+          const bool ShapeNEQ = JOp->Cond == IR::CondClass::NEQ && CondIsInline && JC == 1;
+          const bool ShapeSGT = JOp->Cond == IR::CondClass::SGT && CondIsInline && JC == 0;
           const bool ShapeOK = JOp->VCmpElementSize == IR::OpSize::iInvalid && !JOp->FromNZCV &&
-                               JOp->Cond == IR::CondClass::NEQ && IsInlineConstant(JOp->Cmp2, &JC) && JC == 1 &&
+                               (ShapeNEQ || ShapeSGT) &&
                                JOp->CompareSize == SubHdr->Size &&
                                IR->GetOp<IR::IROp_CodeBlock>(JOp->TrueBlock)->ID == TargetID;
           if (ShapeOK) {
             const auto Cmp1PR = ArgPR(JOp->Cmp1);
-            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw ||
-                                (Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw);
+            // A Bfe-staged compare is only meaningful for a 32-bit budget:
+            // the staging truncates to the low 32 bits, so pairing it with a
+            // 64-bit decrement would batch against a different value than the
+            // guest branched on. ShapeOK already ties CompareSize to the Sub.
+            const bool StagingOK = CopyNode && Cmp1PR.Raw == CopyDstPR.Raw && CopySrcPR.Raw == SubSrcPR.Raw &&
+                                   (!CopyIsBfe32 || SubHdr->Size == IR::OpSize::i32Bit);
+            const bool Linked = Cmp1PR.Raw == SubSrcPR.Raw || StagingOK;
             // Complete budget-liveness guard. Inside the region the ONLY
             // permitted readers of the budget register are the decrement
             // itself, the Copy staging the pre-decrement value, and the
@@ -3796,6 +3899,21 @@ void PPC64JITCore::AnalyzeSpinLoops() {
                 for (auto [RNode, ROp] : IR->GetCode(Blocks[ri].Node)) {
                   if (RNode == SubNode || RNode == BranchNode || RNode == CopyNode) {
                     continue;
+                  }
+                  // A second WRITER is as fatal as a foreign reader: the
+                  // collapse rewrites one def/use chain, so anything else
+                  // driving the budget (or the staged value the backedge
+                  // compares) would be handed a K-granular descent it never
+                  // agreed to. This is what keeps the relaxed write-back rule
+                  // above honest — in-place SRA form is only safe while the
+                  // Sub is the sole definition in the region.
+                  if (IR::GetHasDest(ROp->Op)) {
+                    const auto DefPR = IR::PhysicalRegister(RNode);
+                    if (!DefPR.IsInvalid() &&
+                        (DefPR.Raw == SubSrcPR.Raw || (ri == bi && !CopyDstPR.IsInvalid() && DefPR.Raw == CopyDstPR.Raw))) {
+                      ForeignReader = true;
+                      break;
+                    }
                   }
                   // Only VALUE args may be interpreted as registers: block
                   // references (branch targets) and InlineConstant nodes have
@@ -3861,24 +3979,39 @@ void PPC64JITCore::AnalyzeSpinLoops() {
             if (Linked && !ForeignReader) {
               SpinCollapseSubs[IR->GetID(SubNode).Value] = true;
               SpinCollapseBranches[IR->GetID(BranchNode).Value] = true;
-              // FEX_SPINCOLLAPSE_TRACE=1: one line per collapsed loop so a
-              // misbehaving title can be attributed to a guest RIP without a
-              // debugger (compile-time event, low volume).
-              static const bool Trace = [] {
-                const char* T = getenv("FEX_SPINCOLLAPSE_TRACE");
-                return T && T[0] == '1';
-              }();
-              if (Trace) {
-                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u\n",
-                        IR->GetHeader()->OriginalRIP, TargetID);
+              if (ShapeSGT) {
+                SpinCollapseBranchSigned[IR->GetID(BranchNode).Value] = true;
               }
+              if (Trace) {
+                fprintf(stderr, "SPINCOLLAPSE: entry=0x%lx head-block=%u%s\n",
+                        IR->GetHeader()->OriginalRIP, TargetID, ShapeSGT ? " (sgt0)" : "");
+              }
+            } else {
+              Reject = !Linked ? "unlinked" : "foreign-reader";
             }
+          } else {
+            Reject = "shape";
+            RejectCond = static_cast<int>(JOp->Cond);
+            uint64_t Imm = 0;
+            RejectImm = IsInlineConstant(JOp->Cmp2, &Imm) ? static_cast<int64_t>(Imm) : -1;
           }
+        } else {
+          Reject = !RegionStationary ? "not-stationary" :
+                   !SubNode          ? "no-sub1" :
+                   !BranchNode       ? "no-branch" :
+                   SubCount != 1     ? "multi-sub" :
+                                       "no-writeback";
+        }
+        if (Reject && Trace) {
+          fprintf(stderr, "SPINCOLLAPSE-REJECT: entry=0x%lx head-block=%u reason=%s cond=%d imm=%ld\n",
+                  IR->GetHeader()->OriginalRIP, TargetID, Reject, RejectCond, static_cast<long>(RejectImm));
         }
       }
       // Every edge from a region block to a block outside [ti, bi] restores
-      // medium priority.
-      if (SpinLoopHintEnabled) {
+      // medium priority — but only where a backedge hint actually lowered it.
+      // Emitting restores for an unhinted region would be pure padding, and
+      // worse, would raise the priority of a thread this region never lowered.
+      if (RegionHinted) {
         for (uint32_t ri = ti; ri <= bi; ++ri) {
           for (const uint32_t T : Blocks[ri].Targets) {
             if (T == UINT32_MAX || T >= NumBlocks) {

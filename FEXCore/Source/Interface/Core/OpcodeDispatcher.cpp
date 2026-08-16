@@ -102,7 +102,21 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
     StoreGPRRegister(X86State::REG_RAX, SyscallOp);
   }
 
-  if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END) {
+  // Block-end after a syscall means "the handler may have moved RIP, go look".
+  //
+  // FLAGS_BLOCK_END is set in the static tables only under _WIN32
+  // (X86Tables.h, DEFAULT_SYSCALL_FLAGS). That is too narrow: the property
+  // that makes it necessary is the *ABI*, not the host OS. An OS_GENERIC
+  // handler is by definition a non-Linux one — it is handed the whole
+  // spilled register file and is expected to be able to redirect the guest
+  // (NtContinue, exception dispatch, APC delivery, a bop that returns to the
+  // caller's return address). A CPU DLL built as a native ELF .so for a
+  // ppc64le host does not get _WIN32 defined, so keying off it alone silently
+  // ignored every RIP the handler wrote.
+  //
+  // OS_LINUX{32,64} is unaffected: those handlers never move RIP, and on a
+  // _WIN32 build the table flag still forces the exit as before.
+  if ((Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END) || OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC) {
     // RIP could have been updated after coming back from the Syscall.
     NewRIP = _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, rip));
     ExitFunction(NewRIP);

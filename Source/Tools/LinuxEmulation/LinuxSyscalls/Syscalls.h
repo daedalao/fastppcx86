@@ -167,6 +167,26 @@ namespace HardwareTSO {
   inline int ApplyGuestProt(int prot) {
     return Live ? (prot | PROT_SAO_BIT) : prot;
   }
+
+  // FEX_HWTSO_STRICT=1: treat a refused-SAO range as fatal rather than as a
+  // warning. Every refusal on ORDINARY memory is an ordering hole — the JIT
+  // emits no barriers in this mode, so racing plain accesses through that
+  // range are weakly ordered with nothing to fix it up. The failure that
+  // produces is rare, timing-dependent and leaves no coredump, which is also
+  // the signature of the open intermittent Witcher 3 HWTSO crash.
+  //
+  // Device mappings are exempt: a driver that overrides the page's
+  // cache-control attribute drops SAO, and x86 makes no TSO promise for WC
+  // memory either, so those refusals are legitimate and stay warnings.
+  // `fd` < 0 means the caller has no file to classify (anonymous mmap,
+  // mprotect, shmat) — ordinary memory, never exempt.
+  //
+  // Off by default: this only converts an existing silent hazard into a
+  // diagnosable abort, and turning it on can kill a title that was
+  // previously "working". It is the instrument for hunting the W3 crash and
+  // the precondition for ever defaulting FEX_HWTSO on.
+  extern bool Strict;
+  void OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd);
 } // namespace HardwareTSO
 
 struct ExecveAtArgs {

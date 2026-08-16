@@ -149,9 +149,33 @@ decomposes every 256-bit YMM op into a pair of 128-bit ops plus high-half spill 
 costs more than the guest gains: glibc string routines measured 36 to 67% faster on their SSE
 paths, and a driven Witcher 3 capture burned 16% less CPU with AVX hidden.
 
-Turn it on for the titles that need it. Cyberpunk 2077 refuses to start without AVX. Moonlighter
-measured faster with it on. `FEX_HOSTFEATURES=disableavx` forces it back off if a config layer
-enabled it.
+Turn it on for the titles that need it. Moonlighter measured faster with it on.
+`FEX_HOSTFEATURES=disableavx` forces it back off if a config layer enabled it.
+
+**Cyberpunk 2077 does not need it, and is slower with it.** This page previously said CP2077
+refuses to start without AVX; that does not reproduce. Measured 2026-08-15 with nothing setting
+`FEX_HOSTFEATURES` anywhere (launcher, `launchers.bak`, AppConfig all checked, and the guest's own
+`CPUID.1:ECX.AVX` read back as 0): the title launches and completes its built-in benchmark
+normally. With `enableavx` on top of `FEX_HWTSO=1 FEX_SPINCOLLAPSE=32`, three counterbalanced laps
+per arm, benchmark scene isolated:
+
+| metric | AVX hidden | AVX advertised |
+|--------|-----------|----------------|
+| scene fps | 27.65 | 26.79 (-3.1%) |
+| p50 frametime | 32.31 ms | 32.56 ms |
+| **p99 frametime** | **94.08 ms** | **118.69 ms (+26%)** |
+
+p99 separates completely (all three AVX laps worse than all three hidden laps); the central
+metrics do not separate at that sample size. The shape matters more than the size: p50 barely
+moves while mean and p99 blow out, i.e. AVX is not slowing the typical frame, it is adding tail
+latency — the worst place for it in a game.
+
+Attribution: advertising AVX flips *two* things, guest glibc's ifunc selection (`cpu-features.c`
+gates `Fast_Rep_String | Fast_Unaligned_Load | Fast_Unaligned_Copy` behind `CPUID.1:ECX.AVX`) and
+the JIT's own AVX paths. Setting only the glibc half via
+`GLIBC_TUNABLES=glibc.cpu.hwcaps=Fast_Unaligned_Copy,Fast_Unaligned_Load,Fast_Rep_String` measured
+neutral (fps +0.7%, p99 -2.9%, no separation). **So the regression is JIT codegen, not ifunc
+selection.**
 
 Note that this is a value of the `HostFeatures` option, not an option of its own. There is no
 `FEX_ENABLEAVX`; setting one does nothing.
@@ -164,6 +188,37 @@ Note that this is a value of the `HostFeatures` option, not an option of its own
 loops. No longer required for correctness anywhere in the census, but the automatic form was
 short-circuiting around 1017 library spin loops in Ziggurat, so it remains a measurable
 performance opt-in. Off by default; arm it per title.
+
+`FEX_SPINCOLLAPSE=32` — **the largest measured per-title win on this port so far.** Batches the
+budget decrement of counted spin-poll loops so each iteration retires K units instead of one,
+correcting for the fact that an emulated spin iteration costs several times a native one. Measured
+2026-08-15, Cyberpunk 2077 benchmark scene under `FEX_HWTSO=1`, scene-isolated:
+
+| metric | off | K=32 |
+|--------|-----|------|
+| p50 frametime | 51.64 ms | **32.66 ms (-36.8%)** |
+| mean frametime | 57.26 ms | **35.79 ms (-37.5%)** |
+| p99 frametime | ~156 ms | **75 ms (-52%)** |
+| scene fps | 17.43 | **27.94 (+60.3%)** |
+
+Seven off laps against three K=32 laps, no overlap on any metric (Mann-Whitney U = 0). An off lap
+run *between* two K=32 laps landed on the historical off baseline, so drift and warming are ruled
+out. Reproducible to 0.14% across the K=32 laps — uncollapsed spin is a variance source as well as
+a cost. Result survives every scene-detection threshold tried and is even larger (+75%) on the raw
+unsegmented log.
+
+Pacing improves *more* than the average (p99 -52% vs p50 -37%), which is the opposite of the
+failure mode this feature was kept opt-in for: too large a K exhausts the budget early, workers
+park, and the wake round trip costs pacing invisibly. That does not appear at K=32 here.
+
+★ **Unset is not K=32.** `kSpinCollapseKDefault = 32` is the K *value* once the feature is enabled;
+with `FEX_SPINCOLLAPSE` absent the feature is off entirely. Any benchmark that did not set the
+variable measured the off path. `benchrun.sh` writes the full `FEX_*` environment to
+`env-*.txt` per run — read that, not the banner, which prints only a few variables.
+
+Still opt-in: the K=32 evidence above is one title and one scene. Known semantic coarsening — on
+the found-exit the budget register holds a K-granular value rather than the exact iteration count,
+so code that consumed the leftover count would misbehave.
 
 ## Hardware TSO (experimental)
 
@@ -256,9 +311,33 @@ makes the display lookup lock-free on the hot path. Set it when bisecting a
 links. Useful when a Vulkan title fails at startup and you need to see which
 entry points resolved.
 
+`FEX_MEMSETDCBZ=0` removes the `dcbz` block-zero path from the `rep stosb` fast
+path, leaving plain stores. On by default and it should stay that way: it is
+11.4x faster than plain stores with ordinary pages and still 1.64x faster under
+`PROT_SAO`. The switch exists because that second number was worth checking —
+SAO penalises `dcbz` far harder than it penalises ordinary stores — and because
+an A/B of it in Cyberpunk 2077 found no significant frametime difference either
+way (n=6 per arm), which is the honest ceiling on how much this path matters to
+a real title.
+
+`FEX_MEMCPYDCBZ=1` (off by default) adds a cache-line `dcbz` store tier to the
+forward `rep movsb` fast path, killing the destination read-for-ownership.
+Measured +28.6% at 4 KB and +18.6% at 64 KB on explicit `rep movsb` — but only
+where `PROT_SAO` is *not* live. Under `FEX_HWTSO=1` the same tier is a 63%
+regression, so it is hard-gated off whenever hardware TSO actually engaged. That
+gate keys on SAO being live, not on the CPU: a POWER9 radix host cannot use
+`PROT_SAO` at all, so the tier stays enabled and beneficial there.
+
+Note it reaches very little today. Guest glibc resolves `memcpy` to
+`__memmove_ssse3`, which has no `rep movsb` path, so `DEF_OP(MemCpy)` is close to
+dead for ordinary Linux guest memcpy. The cause is that `cpu-features.c` gates
+its `Fast_Unaligned_Copy` selection behind `CPUID.1:ECX.AVX`, which this port
+reports as 0 — see the AVX section above.
+
 Both `FEX_NO_THUNK_PARTIAL_FILL` and `FEX_VK_PROCADDR_TRACE` are tested for
 presence, not value, so `=0` enables them just as `=1` does. Unset them to turn
-them off. `FEX_TSOPAIRELIDE` and `FEX_X11_SYNC_EVERY_CALL` do read their value.
+them off. `FEX_TSOPAIRELIDE`, `FEX_X11_SYNC_EVERY_CALL`, `FEX_MEMSETDCBZ`,
+`FEX_MEMCPYDCBZ` and `FEX_SPINCOLLAPSE` do read their value.
 
 ## Per-application config files
 

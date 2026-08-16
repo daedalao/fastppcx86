@@ -527,14 +527,38 @@ DEF_OP(CondJump) {
     // bc BI = cr7*4 + EQ_bit(2) = 30. BO=12 → take when EQ set; BO=4 → when clear.
     CC = (Op->Cond == IR::CondClass::TSTNZ) ? Cond{4, 30} : Cond{12, 30};
   } else if (IsSpinCollapseBranch(Node)) {
-    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): this is the
-    // spin backedge `old != 1` of a matched counted-decrement pair whose Sub
-    // now retires K budget per iteration. Exit exactly when the batched
-    // decrement lands on 0, i.e. keep spinning iff old >u K. Unsigned
-    // compare: the budget is a canonicalized zero-extended value. cr7, no Rc.
-    cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+    // FEX_SPINCOLLAPSE (contract at kSpinCollapseK, JITClass.h): the spin
+    // backedge of a matched counted-decrement pair whose Sub now retires K
+    // budget per iteration. Exit exactly when the batched decrement lands on
+    // 0, i.e. keep spinning iff old > K. Compare signedness follows the
+    // matched idiom: NEQ-1 (`dec; jne`) budgets are canonicalized
+    // zero-extended values — unsigned cmpldi, worst case is exiting early;
+    // SGT-0 (`test; jg` — CP2077's redDispatcher worker loop) must use the
+    // SIGNED cmpdi so a negative value exits like the original branch would,
+    // where `>u K` would read it as huge and spin forever. cr7, no Rc.
+    // ★ The compare WIDTH must follow CompareSize, exactly as the generic
+    // EmitCompare path does. The SGT-0 idiom stages its pre-decrement value
+    // through a 32-bit ZERO-EXTEND (Bfe #32,#0 — `mov eax,ecx`), so a
+    // negative budget sits in the register as 0x00000000_FFFFFFFF: a 64-bit
+    // cmpdi reads that as +4294967295 > K and spins FOREVER, while the guest's
+    // own `jg` would have exited. cmpwi compares the low 32 bits signed and
+    // exits, matching the guest.
+    const bool Is32 = Op->CompareSize <= IR::OpSize::i32Bit;
+    if (IsSpinCollapseBranchSigned(Node)) {
+      if (Is32) {
+        cmpwi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+      } else {
+        cmpdi(cr(7), GetReg(Op->Cmp1), static_cast<int16_t>(kSpinCollapseK));
+      }
+    } else {
+      if (Is32) {
+        cmplwi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+      } else {
+        cmpldi(cr(7), GetReg(Op->Cmp1), kSpinCollapseK);
+      }
+    }
     // BO=12 (branch if set), BI=29 (cr7.GT): TrueBlock (the backedge) taken
-    // while old >u K.
+    // while old > K.
     CC = {12, 29};
   } else {
     // Route the compare through cr(7) so we don't disturb CR0 / XER.
@@ -793,7 +817,20 @@ DEF_OP(Syscall) {
   ld(r2, 24, r1);      // restore TOC
 
   // HandleSyscall returns the new guest RAX value in r3.
-  {
+  //
+  // ...but ONLY for the Linux ABIs. OS_GENERIC ("no JIT-side argument
+  // handling, spill/fill all regs") is the ABI a Wine CPU-DLL-shaped embedder
+  // selects, and there the handler owns the whole register file: it writes
+  // gregs[] in the frame directly and its C return value is meaningless.
+  // Upstream FEX expresses this as IR SyscallFlags::NORETURNEDRESULT, which
+  // this fork's Syscall IR op does not carry; the OSABI is fixed for the
+  // process, so testing it here is equivalent and needs no IR change.
+  //
+  // Measured before the fix: an OS_GENERIC handler that set gregs[RAX] had its
+  // value overwritten by this store on the way out (probe T2c).
+  const bool GenericABI = CTX->SyscallHandler && CTX->SyscallHandler->GetOSABI() == FEXCore::HLE::SyscallOSABI::OS_GENERIC;
+
+  if (!GenericABI) {
     const int32_t rax_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame,
                State.gregs[FEXCore::X86State::REG_RAX]));
@@ -840,7 +877,18 @@ DEF_OP(Syscall) {
   // Thread.cpp:103 `TM.CreateThread(0, 0, &Frame->State, ...)` hands the
   // parent's whole CPUState to a new guest thread — and a partial spill would
   // hand them a stale RSI/RDI/R8-R15.
-  if (CTX->Config.Is64BitMode()) {
+  //
+  // NOT applied to OS_GENERIC either, and this one is a correctness bound, not
+  // a tuning choice. The sentinel proves "no *signal* republished the frame".
+  // It says nothing about the handler itself having rewritten gregs[], which
+  // for OS_GENERIC is the handler's whole job: BTCpuSetContext, NtContinue,
+  // KiUserExceptionDispatcher and APC delivery all resume the guest with a
+  // register file the host just wrote. Measured before this fix (probe T2c):
+  // of 15 handler-written GPRs, only the five in ELFv2-volatile SRA slots
+  // (RAX/RCX/RDX/RBX/RBP) reached the guest; RSI, RDI and R8-R15 were silently
+  // dropped. Linux guests are unaffected — their handlers never write gregs[]
+  // except RAX, which is what the elision was designed around.
+  if (CTX->Config.Is64BitMode() && !GenericABI) {
     const int32_t isi_off = static_cast<int32_t>(
       offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
     PPC64Emitter::Label SentinelIntact;
