@@ -679,8 +679,19 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   // hottest block of the session was an engine YMM loop that disappears
   // entirely once the engine's startup CPUID check picks its SSE path.
   // Default OFF therefore; FEX_HOSTFEATURES=enableavx (or a per-app config)
-  // re-advertises it for the rare guest that hard-requires AVX to launch
-  // (e.g. Cyberpunk 2077 refuses to start without it).
+  // re-advertises it for the rare guest that hard-requires AVX to launch.
+  //
+  // This comment used to name Cyberpunk 2077 as such a guest. That does NOT
+  // reproduce (re-measured 2026-08-15): with nothing setting FEX_HOSTFEATURES
+  // anywhere, and the guest's own CPUID.1:ECX.AVX reading back 0, CP2077
+  // launches and completes its built-in benchmark normally. It is also SLOWER
+  // with AVX advertised -- -3.1% scene fps and +26% p99, three counterbalanced
+  // laps per arm. Note the shape: p50 barely moves while p99 blows out, i.e.
+  // AVX is not slowing the typical frame, it is adding tail latency.
+  // Attribution, since advertising AVX flips two things at once: setting only
+  // the guest-glibc ifunc half (cpu-features.c gates Fast_Unaligned_Copy et al.
+  // behind this same CPUID bit) measured neutral, so the regression is JIT
+  // codegen rather than ifunc selection. See docs/GAMING.md.
   HostFeatures.SupportsAVX = false;
   // AES-NI lowering uses the FABI software-helper path (PPC64_VAESEnc et al.
   // in JIT.cpp) — POWER8 has hardware vcipher/vncipher but the bridge through
