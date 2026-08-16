@@ -1,0 +1,24 @@
+{
+  "Comment": [
+    "SpinCollapse measured 2026-08-15 on the built-in benchmark scene under HWTSO, scene-isolated.",
+    "Off -> K=32: p50 51.64 -> 32.66ms (-36.8%), p99 ~156 -> 75ms (-52%), scene fps 17.43 -> 27.94.",
+    "Seven off laps vs three K=32 laps with no overlap on any metric, and an off lap run between",
+    "two K=32 laps landed on the historical off baseline, so drift is excluded.",
+    "",
+    "K=128 rather than 32, from a 16/32/64/128 sweep plus a 32/128/512 confirmation. Improvement",
+    "is monotonic in K and p99 falls the whole way, but the value that matters is CONSISTENCY:",
+    "  K=32   mean 33.37  p99 72.03   mean spread 6.2%   p99 spread 44.0%",
+    "  K=128  mean 33.08  p99 69.66   mean spread 0.7%   p99 spread 13.3%",
+    "  K=512  mean 32.93  p99 72.87   mean spread 3.5%   p99 spread 53.8%",
+    "512 has the best median mean but throws a 108ms p99 lap; 32 throws a 102ms one. That is the",
+    "budget-exhaustion failure mode the feature was held opt-in for, and it shows up as VARIANCE,",
+    "not as a worse median -- which is exactly why a block profile cannot see it.",
+    "",
+    "Scoped per-title deliberately: the feature carries a known semantic coarsening (the budget",
+    "register holds a K-granular value on the found-exit), and K is validated on this title only.",
+    "HostFeatures deliberately absent -- enableavx measured -3.1% scene fps and +26% p99 here."
+  ],
+  "Config": {
+    "SpinCollapse": "128"
+  }
+}

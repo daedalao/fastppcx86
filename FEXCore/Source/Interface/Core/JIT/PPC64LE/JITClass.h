@@ -437,6 +437,13 @@ private:
   // own operands — no state is carried between op handlers (the AES
   // mask-cache rule).
   // -------------------------------------------------------------------------
+  // NOW A CONFIG OPTION, not a bare getenv (2026-08-15). SpinCollapse is
+  // reachable from AppConfig, which is the only per-title mechanism this port
+  // has — without that the largest measured win on the port could not be
+  // persisted for the title it was measured on. FEX_SPINCOLLAPSE still works
+  // unchanged; the option name generates that exact environment spelling.
+  // 0 = off, 1 = on at kSpinCollapseKDefault, 2..1024 = on at that K.
+  // -------------------------------------------------------------------------
   // K corrects the EMULATION INFLATION of a spin iteration, it does not
   // minimize spinning: the engine tuned its budget for native iteration
   // cost, and measurement shows the budget is load-bearing (CP2077
