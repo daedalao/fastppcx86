@@ -12,6 +12,7 @@ $end_info$
 #include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Core/JIT/Relocations.h"
+#include "Interface/IR/PPC64Immediates.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Utils/MemberFunctionToPointer.h"
 #include "Utils/variable_length_integer.h"
@@ -3958,11 +3959,40 @@ void PPC64JITCore::ComputeHighZeroElision() {
 
       // ---- Mask32Tail carriers this pass can prove ----------------------
       case IR::OP_AND: {
-        // and_(Dst, S1, {TMP4 = LoadConstant(C) | S2}) on both arms. Bitwise,
-        // so ONE high-zero input is enough.
+        // Bitwise, so ONE high-zero input is enough -- but for the INLINE
+        // CONSTANT arm "the operand's high half" is no longer the constant's
+        // own high half. DEF_OP(And) stopped materialising the constant and
+        // ANDing it: EmitAndMask (ALUOps.cpp) lowers it to a rotate-and-mask
+        // form, and at i32 ClassifyAndMask is free to complete the constant's
+        // upper half either way (PPC64Immediates.h). When the "keep" completion
+        // wins, the emitted instruction PRESERVES Src1's bits 63:32 --
+        // `and eax,0xFFFF00FF` becomes `rldimi Dst,r0,8,48`, which punches
+        // zeros into LE 8..15 and leaves every other bit of Dst alone -- even
+        // though the IR constant has nothing above bit 31. Claiming high-zero
+        // there elides the tail mask that was the only thing zero-extending the
+        // result, and the guest register keeps whatever the host register held.
+        //
+        // The three kinds below are reachable ONLY from the keep completion
+        // (the clear completion's mask is <= 0xFFFFFFFF, which can only
+        // classify as Zero/ClearLeft/Word), so excluding them is exact rather
+        // than blanket-conservative. It also stays sound with
+        // FEX_PPCLOGICALIMM=0, whose LoadConstant + and_ fallback applies the
+        // constant verbatim: that is a SUBSET of what we decline to claim.
         auto A = IROp->C<IR::IROp_And>();
         MaskCarrier = true;
-        PreZero = OperandHighZero(A->Src1) || OperandHighZero(A->Src2);
+        const auto ConstMaskHighZero = [&](IR::OrderedNodeWrapper W) {
+          uint64_t C;
+          if (!IsInlineConstant(W, &C)) {
+            return OperandHighZero(W);
+          }
+          if ((C >> 32) != 0) {
+            return false;
+          }
+          using Kind = FEXCore::IR::PPC64::AndMaskKind;
+          const auto K = FEXCore::IR::PPC64::ClassifyAndMask(C, MaskSize).Kind;
+          return K != Kind::Move && K != Kind::ClearRight && K != Kind::InsertZeroField;
+        };
+        PreZero = OperandHighZero(A->Src1) || ConstMaskHighZero(A->Src2);
         break;
       }
       case IR::OP_OR: {
