@@ -1889,8 +1889,26 @@ public:
     uint32_t hi = static_cast<uint32_t>(imm >> 32);
     uint32_t lo = static_cast<uint32_t>(imm);
     if (hi) {
-      lis(rt, static_cast<int16_t>(hi >> 16));
-      if (hi & 0xFFFF) ori(rt, rt, static_cast<uint16_t>(hi & 0xFFFF));
+      // hi <= 0x7FFF collapses `lis rt,0` + `ori rt,rt,hi` into one `li`.
+      // Safe because li sign-extends and the following `sldi rt,rt,32` is
+      // `rldicr rt,rt,32,31`, which keeps only the LOW 32 bits of the
+      // pre-shift value -- so any sign extension above bit 31 is discarded
+      // anyway. The bound is 0x7FFF, not 0xFFFF: at 0x8000 and above li would
+      // sign-extend into bits 16-31, which DO survive the shift.
+      //
+      // This is not a corner case, it is the common case for 64-bit guests.
+      // Userspace addresses have top-16-bits <= 0x7FFF by construction:
+      // Proton PE images sit around 0x37ff_...., Linux PIE around 0x5555_....,
+      // and stacks at 0x7fff_..... So this takes the general sequence from 5
+      // instructions to 4 on effectively every guest RIP -- and that sequence
+      // is paid on every constant block exit and on the return address pushed
+      // by every guest CALL.
+      if (hi <= 0x7FFF) {
+        li(rt, static_cast<int16_t>(hi));
+      } else {
+        lis(rt, static_cast<int16_t>(hi >> 16));
+        if (hi & 0xFFFF) ori(rt, rt, static_cast<uint16_t>(hi & 0xFFFF));
+      }
     } else {
       li(rt, 0);
     }
