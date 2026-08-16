@@ -192,6 +192,12 @@ DEF_OP(CallbackReturn) {
 //     target block's X-form rB=r0 addressing — silent guest memory
 //     corruption. The invariant must be re-established before the patchable
 //     word, not after it.
+//
+// FEX_SINKEXITRIP (default OFF) inverts the first of those two, moving the RIP
+// constant and the `std State.rip` BELOW the patch site so a linked exit costs
+// only the r0 re-zero and the branch. The second is not negotiable and does not
+// move. See the long comment at the sink decision in DEF_OP(ExitFunction) for
+// what P5.0.1 actually protects and why this ships off.
 DEF_OP(ExitFunction) {
   auto Op = IROp->C<IR::IROp_ExitFunction>();
   // Snapshot the unit's r0-dirty state BEFORE this handler emits anything:
@@ -213,7 +219,7 @@ DEF_OP(ExitFunction) {
   // use TMP1 for oversized frames, hence this comes after it.
   // ---------------------------------------------------------------------
   GPR RIPReg = TMP1;
-  uint64_t NewRIP;
+  uint64_t NewRIP = 0;
   bool ConstRIP = false;
   if (IsInlineConstant(Op->NewRIP, &NewRIP) ||
       IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
@@ -225,6 +231,11 @@ DEF_OP(ExitFunction) {
     if (!CTX->Config.Is64BitMode()) {
       NewRIP &= 0xFFFFFFFFull;
     }
+  }
+
+  // Emission of the constant destination RIP is a closure because FEX_SINKEXITRIP
+  // moves it below the patch site; see the sink decision further down.
+  auto EmitConstRIPIntoTMP1 = [&]() {
     // S3.7-C2: this constant is a guest RIP baked into host instruction bytes;
     // a code cache saved in one ASLR session and loaded in another would jump
     // to a stale address without a RELOC_GUEST_RIP_MOVE. Record placed AFTER
@@ -242,6 +253,74 @@ DEF_OP(ExitFunction) {
     // (Note BlockLinking is separately interlocked off when
     // FEX_SMCSEMANTICPATCH is enabled; see JIT.cpp BlockLinkingEnabled.)
     InsertExitRIPMove(TMP1, NewRIP);
+  };
+
+  // -------------------------------------------------------------------------
+  // Shadow-RET / linkability predicates, resolved before anything is emitted
+  // because the sink decision below depends on both.
+  // -------------------------------------------------------------------------
+  const bool ShadowActive = ShadowRetStackEnabled &&
+    (Op->Hint == IR::BranchHint::Return || Op->Hint == IR::BranchHint::Call);
+
+  // Plain jumps link whenever BlockLinkingEnabled. CALL exits additionally
+  // require CallLinkingEnabled (= BlockLinkingEnabled && !LazyLinkArmed):
+  // under FEX_SMCLAZYLINK the SMC scrub severs links constantly, and call-
+  // dense guests (32-bit Mono/Unity — Dex) then flood ExitFunctionLinkWith
+  // Record with relink-and-recompile on every call, a compile storm that
+  // throttles guest execution (measured on Dex load 2026-08-05). Under lazy
+  // linking, calls take the fast rldic L1 probe instead; the call-linking win
+  // is retained only where links actually stick (non-lazy configs).
+  const bool Linkable = ConstRIP &&
+    ((Op->Hint == IR::BranchHint::None && BlockLinkingEnabled) ||
+     (Op->Hint == IR::BranchHint::Call && CallLinkingEnabled));
+
+  // -------------------------------------------------------------------------
+  // FEX_SINKEXITRIP (default OFF) — see the invariant discussion below.
+  //
+  // On a LINKED constant exit the destination RIP register is dead: the branch
+  // target is a patched immediate and nothing past the patch site executes. The
+  // only reason the constant and its `std State.rip` sit ABOVE the patch site is
+  // the P5.0.1 invariant. Sinking both below it makes a linked exit
+  //     [ResetStack] ; [li r0,0] ; b HostCode
+  // instead of up to eight instructions, at the cost of retiring P5.0.1 on that
+  // path. Both probe legs still materialise and store it, so unlinked behaviour
+  // is byte-identical to today.
+  //
+  // WHAT P5.0.1 BUYS, precisely. RestoreRIPFromHostPC (Core.cpp) reconstructs a
+  // guest RIP from a host PC using the block's vl64pair table whenever that PC
+  // lies inside the block InlineJITBlockHeader names, and falls back to
+  // Frame->State.rip otherwise. SignalDelegator::SpillSRA assigns that result
+  // straight into State.rip on every guest signal. So State.rip is only read
+  // when the host PC is OUTSIDE the current block:
+  //   - inside the target block's 4-instruction prologue, before its own header
+  //     store retires;
+  //   - inside a host helper called from a JIT block (x87/transcendental
+  //     fallbacks, thunks, split-lock atomics) — syscalls excepted, the frontend
+  //     stores State.rip explicitly before those (OpcodeDispatcher.cpp:5491);
+  //   - in the dispatcher, thunks and the shared spill stubs — all of which are
+  //     reached only through legs that store State.rip themselves.
+  // Today those cases see the current block's entry RIP: coarse, but in the
+  // right function. With the sink they would see the last RIP any UNLINKED exit
+  // stored, which in a steady-state hot loop of linked blocks is frozen and
+  // arbitrary. The guest signal frame then carries a plausible-but-wrong RIP and
+  // sigreturn resumes in the wrong place: silent, and this is why it ships off.
+  //
+  // The clean way to earn this is the InlineJITBlockHeader removal (audit P1):
+  // once a host PC maps to its block without the JIT publishing anything, the
+  // prologue window closes by construction and only the helper case remains.
+  // Evidence that would justify flipping the default: a signal-storm run
+  // (the x87 storm harness, futex_stress sig, the FEXLinuxTests signal set)
+  // comparing reconstructed RIPs with and without the sink, plus a Proton
+  // session under FEX_SIGTRACE checking that state_rip= never names a block
+  // unrelated to guest_rip=.
+  // -------------------------------------------------------------------------
+  static const bool SinkExitRIP = getenv("FEX_SINKEXITRIP") != nullptr;
+  const bool SinkLinkedRIP = SinkExitRIP && Linkable && !ShadowActive;
+
+  if (ConstRIP) {
+    if (!SinkLinkedRIP) {
+      EmitConstRIPIntoTMP1();
+    }
     RIPReg = TMP1;
   } else {
     GPR NewRIPReg = GetReg(Op->NewRIP);
@@ -290,8 +369,6 @@ DEF_OP(ExitFunction) {
   // pushes see new sp(-16) < base(0) -> overflow reset, never storing.
   // ---------------------------------------------------------------------
   PPC64Emitter::Label ShadowRetReprobe{};
-  const bool ShadowActive = ShadowRetStackEnabled &&
-    (Op->Hint == IR::BranchHint::Return || Op->Hint == IR::BranchHint::Call);
   if (ShadowActive) {
     const int16_t sp_off = static_cast<int16_t>(
       offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
@@ -372,24 +449,22 @@ DEF_OP(ExitFunction) {
   // ---------------------------------------------------------------------
   // Block-linking hoist + patch-site registration (see header comment).
   // Only for constant-target plain jumps with the knob on; every other exit
-  // shape keeps the exact non-linking lowering below.
+  // shape keeps the exact non-linking lowering below. Linkable was resolved
+  // above, before any emission, because the sink decision depends on it.
   // ---------------------------------------------------------------------
-  // Plain jumps link whenever BlockLinkingEnabled. CALL exits additionally
-  // require CallLinkingEnabled (= BlockLinkingEnabled && !LazyLinkArmed):
-  // under FEX_SMCLAZYLINK the SMC scrub severs links constantly, and call-
-  // dense guests (32-bit Mono/Unity — Dex) then flood ExitFunctionLinkWith
-  // Record with relink-and-recompile on every call, a compile storm that
-  // throttles guest execution (measured on Dex load 2026-08-05). Under lazy
-  // linking, calls take the fast rldic L1 probe instead; the call-linking win
-  // is retained only where links actually stick (non-lazy configs).
-  const bool Linkable = ConstRIP &&
-    ((Op->Hint == IR::BranchHint::None && BlockLinkingEnabled) ||
-     (Op->Hint == IR::BranchHint::Call && CallLinkingEnabled));
   PPC64Emitter::Label* LinkPathLabel = nullptr;
   if (Linkable) {
     // Hoisted region: rip store + r0 re-zero, then the patch site. Both
     // probe legs below skip their own copies when Linkable.
-    std(RIPReg, rip_off, STATE);
+    //
+    // Under FEX_SINKEXITRIP the rip store (and the constant that feeds it)
+    // moves BELOW the patch site instead, leaving a linked exit as nothing but
+    // the r0 re-zero and the patched branch. The r0 re-zero cannot move: a
+    // linked branch skips everything after the patch site, so a nonzero r0
+    // would reach the target block's X-form rB addressing.
+    if (!SinkLinkedRIP) {
+      std(RIPReg, rip_off, STATE);
+    }
     EmitExitR0Zero(UnitR0Dirty);
     // PatchSite == the probe's first instruction (the ld of L1Pointer just
     // below). All emitted instructions are 4 bytes and SetBuffer lands on a
@@ -397,6 +472,21 @@ DEF_OP(ExitFunction) {
     // linker's atomic 4-byte rewrite.
     PendingJumpThunks.push_back({GetCursorAddress<uint64_t>(), NewRIP, {}});
     LinkPathLabel = &PendingJumpThunks.back().LinkPath;
+    // Sunk region: everything from here on is skipped by a linked branch. The
+    // probe below needs RIPReg regardless, so the constant is not duplicated --
+    // it simply moved. State.rip is stored here so both probe legs (hit ->
+    // bctr, miss -> LinkPath) still leave it correct, exactly as the hoisted
+    // form did; only the linked fast path stops updating it.
+    //
+    // Overwriting the first sunk instruction is the intended behaviour: the
+    // linker only ever patches this word forward, never back. Nothing on this
+    // port unlinks -- LookupCache's BlockLinks map is permanently empty here
+    // (see SMCSemanticPatch.h) so SeverBlockLinks is a no-op -- so the word is
+    // dead the moment it is patched.
+    if (SinkLinkedRIP) {
+      EmitConstRIPIntoTMP1();
+      std(RIPReg, rip_off, STATE);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -507,7 +597,9 @@ DEF_OP(ExitFunction) {
   // ---------------------------------------------------------------------
   Bind(&MissLabel);
   if (Linkable) {
-    // Linkable miss leg: State.rip was already stored by the hoisted region.
+    // Linkable miss leg: State.rip was already stored by the hoisted region
+    // (or, under FEX_SINKEXITRIP, by the sunk region just below the patch
+    // site — either way it is stored before this branch).
     // Branch to this exit's jump thunk LinkPath (emitted at the tail of
     // CompileCode), which PC-discovers the adjacent PPC64BlockLinkRecord into
     // TMP2 and tail-branches to the shared SpillStaticRegs stub

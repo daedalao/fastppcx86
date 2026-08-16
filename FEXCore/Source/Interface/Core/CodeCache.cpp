@@ -375,6 +375,10 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // Linked-exit RIP sink (BranchOps.cpp SinkExitRIP): presence-ENABLED;
+      // moves the destination-RIP constant and its `std State.rip` from above
+      // the block-link patch site to below it, so the emitted exit differs.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_SINKEXITRIP") != nullptr));
       // P5.0.2 re-zero policy at block exits (BranchOps.cpp R0ZeroMode).
       // Three-way: elide (default) / always emit `li r0,0` / emit `tdnei r0,0`.
       // All three differ in emitted bytes, and the trap arm differs in
