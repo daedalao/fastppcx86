@@ -375,6 +375,25 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // Linked-exit RIP sink (BranchOps.cpp SinkExitRIP): presence-ENABLED;
+      // moves the destination-RIP constant and its `std State.rip` from above
+      // the block-link patch site to below it, so the emitted exit differs.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_SINKEXITRIP") != nullptr));
+      // P5.0.2 re-zero policy at block exits (BranchOps.cpp R0ZeroMode).
+      // Three-way: elide (default) / always emit `li r0,0` / emit `tdnei r0,0`.
+      // All three differ in emitted bytes, and the trap arm differs in
+      // behaviour, so hash the resolved mode rather than either flag alone.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_R0TRAP")   != nullptr ? 2 :
+                                       getenv("FEX_NOR0ELIDE") != nullptr ? 1 : 0));
+      // Entry-point prologue shape (JIT.cpp EmitStoreBlockBeginToInlineHeader):
+      // presence-DISABLED; picks between the addi/addis delta fold and the
+      // legacy LoadImm32+subf, which differ in instruction count.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOHDRADDI") != nullptr));
+      // Shifted-32 rule in LoadImm64 (CodeEmitter/PPC64LE/Emitter.h
+      // DisableShiftedImm32): presence-DISABLED; changes how wide the constant
+      // load is at every 64-bit guest-RIP materialisation, so it changes
+      // emitted block bytes and every downstream branch displacement.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSHIFTIMM32") != nullptr));
       // XER arithmetic-write kill switch (PPC64Emitter.h XERArithDisabled):
       // presence-DISABLED; flips every CA/OV write helper between the addic/
       // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.

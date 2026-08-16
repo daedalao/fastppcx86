@@ -114,10 +114,56 @@ public:
   void ClearPendingBranches() { PendingBranches.clear(); }
 
   // -------------------------------------------------------------------------
-  // Raw word emission
+  // Raw word emission + r0-dirty tracking
+  //   (the latter: see DEF_OP(ExitFunction)'s P5.0.2 comment)
   // -------------------------------------------------------------------------
+  // JIT blocks address guest memory with X-form ops that put r0 in the rB
+  // slot, where it reads as its VALUE (the "r0 reads as zero" rule covers rA
+  // only), so the backend maintains a global r0 == 0 invariant. Every site
+  // that breaks it restores it before the enclosing IR op's emitted sequence
+  // ends -- which makes the defensive re-zero at block exits redundant in any
+  // compile unit that never breaks it in the first place.
+  //
+  // Rather than hand-maintain a list of clobber sites (a list that would go
+  // stale the first time someone adds a helper), sniff the two instruction
+  // words that no correct r0 clobber can avoid emitting:
+  //
+  //   li r0, 0  -- the restore itself. A site that clobbers r0 and does NOT
+  //                restore is already broken for the rest of its own block
+  //                (the very next guest load/store would be misaddressed), so
+  //                "a restore was emitted" is a sound proxy for "a clobber
+  //                happened", and it cannot be forgotten by future code.
+  //   any CALL   -- r0 is ELFv2-volatile and a normal non-leaf callee parks its
+  //                return address there, so r0 is garbage on return whether or
+  //                not the call site says anything about it. Every linking
+  //                branch form this emitter can produce is covered: `bctrl`
+  //                (the only one used today), `blrl`, and the I-form `bl`/`bla`
+  //                (primary opcode 18 with LK set).
+  //
+  // Deliberately NOT tracked:
+  //   * `stb r0, ...` / `std r0, ...` -- r0 as a store SOURCE, e.g. the
+  //     deferred-signal poke in every entry prologue. Reads r0, does not write.
+  //   * `ldx rt, ra, r0` style rB uses -- likewise reads.
+  //   * `nop` == `ori r0,r0,0` -- writes r0 with its own value.
+  //   * `bcl 20,31,$+4` -- primary opcode 16, the PC-discovery idiom. It sets
+  //     LR and transfers to the next instruction; it is not a call and no
+  //     callee runs. Flagging it would mark every EntryPoint block dirty.
+  //     A future `bcl` at a REAL target would be a call and would slip past
+  //     this; there is no such site today and adding one means adding it here.
+  static constexpr uint32_t kInsnLiR0Zero = 0x38000000u;  // li r0, 0   (addi r0,0,0)
+  static constexpr uint32_t kInsnBctrl    = 0x4E800421u;  // bctrl
+  static constexpr uint32_t kInsnBlrl     = 0x4E800021u;  // blrl
+
+  void ResetR0Dirty() { R0MaybeDirty = false; }
+  void MarkR0Dirty()  { R0MaybeDirty = true; }
+  [[nodiscard]] bool R0Dirty() const { return R0MaybeDirty; }
+
   void Emit32(uint32_t insn) {
     assert(Offset + 4 <= BufferSize && "Code buffer overflow");
+    if (insn == kInsnLiR0Zero || insn == kInsnBctrl || insn == kInsnBlrl ||
+        ((insn >> 26) == 18u && (insn & 1u))) {
+      R0MaybeDirty = true;
+    }
     memcpy(Buffer + Offset, &insn, 4);
     Offset += 4;
   }
@@ -1843,6 +1889,14 @@ public:
     }
   }
 
+  // Kill switch for the shifted-32 rule in LoadImm64 below (FEX_NOSHIFTIMM32).
+  // Presence-DISABLED, mirroring FEX_NOXERARITH / FEX_NOSPLATFUSION. Hashed
+  // into ComputeCodeCacheConfigId because it changes emitted block bytes.
+  static bool DisableShiftedImm32() {
+    static const bool Disabled = getenv("FEX_NOSHIFTIMM32") != nullptr;
+    return Disabled;
+  }
+
   // Load a 64-bit immediate into a register (up to 5 instructions)
   void LoadImm64(GPR rt, uint64_t imm) {
     if (imm == 0) {
@@ -1884,6 +1938,35 @@ public:
       li(rt, -1);
       rldic(rt, rt, lo, 63 - hi);
       return;
+    }
+    // Shifted 32-bit immediate: imm == (v << tz) with v <= 0x7FFF_FFFF. Three
+    // instructions (lis + ori + sldi) instead of the general path's four.
+    //
+    // Reached only after the shifted-16 rule above declined, which means
+    // v > 0x7FFF and LoadImm32 therefore takes its lis+ori arm -- so this is
+    // always exactly 3, never 2 (the 2-insn forms were already claimed) and
+    // never worse than the 4 below.
+    //
+    // The v <= 0x7FFF_FFFF bound is what makes it sound: LoadImm32 materialises
+    // a SIGN-EXTENDED 32-bit value via lis, and `sldi rt,rt,tz`
+    // (= rldicr rt,rt,tz,63-tz) keeps the rotated low bits without re-masking
+    // the top, so a v with bit 31 set would leave ones above bit 31+tz. At
+    // v <= 0x7FFF_FFFF bit 31 is clear, lis+ori produces exactly v with a zero
+    // upper half, and the shift is exact.
+    //
+    // Who this pays: 64-bit guest RIPs in the Proton PE range (0x1_4000_0000+),
+    // where a quarter of addresses are 4-byte aligned enough to qualify --
+    // every constant block exit and every guest CALL's pushed return address
+    // materialises one. Nothing else in the emitter depends on LoadImm64's
+    // width (LoadImm64Fixed is the fixed-window form and is untouched).
+    if (!DisableShiftedImm32()) {
+      const unsigned tz = std::countr_zero(imm);
+      const uint64_t v = imm >> tz;
+      if (tz > 0 && v <= 0x7FFFFFFFull) {
+        LoadImm32(rt, static_cast<uint32_t>(v));
+        sldi(rt, rt, tz);
+        return;
+      }
     }
     // Full 64-bit load: lis + ori + sldi 32 + oris + ori
     uint32_t hi = static_cast<uint32_t>(imm >> 32);
@@ -1978,6 +2061,10 @@ private:
   uint8_t* Buffer     = nullptr;
   size_t   BufferSize = 0;
   size_t   Offset     = 0;
+
+  // Set by Emit32 when a word that implies an r0 clobber goes out; reset per
+  // compile unit by CompileCode. See the tracking comment above Emit32.
+  bool     R0MaybeDirty = false;
 
   // Pending branch list for forward-label fixup.
   //

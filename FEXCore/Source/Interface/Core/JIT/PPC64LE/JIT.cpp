@@ -2200,6 +2200,34 @@ void PPC64IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Link) {
   PPC64PatchInstruction(ThunkStart, Record->OrigThunkWord);
 }
 
+// Block-link outcome census. Three counters, incremented once per exit site
+// that ever links, on a path that already takes two locks, patches two
+// instructions and does icache maintenance -- the cost is not measurable.
+//
+// WHY THIS EXISTS. The in-tree comment at PPC64EncodeBranch's caller has long
+// asserted that the far case is "the common case against a 128MiB code buffer".
+// Nothing ever measured it, and it decides real things:
+//
+//   * a DIRECT link is `b HostCode`, one instruction;
+//   * a THUNK link is `b Thunk` plus the thunk's bcl/mflr/ld/mtctr/bctr --
+//     five more instructions, a second LR round trip, three branches and a
+//     dependent load, on every traversal for the life of the link;
+//   * NEITHER means the exit stays on the 10-instruction inlined probe
+//     forever.
+//
+// So the direct:thunk ratio is a straight multiplier on what any per-exit
+// saving is worth, and if the thunk share is high the thunk shape itself
+// becomes the target rather than the exit. INITIAL_CODE_SIZE is 16MiB growing
+// to MAX_CODE_SIZE 128MiB, so the answer depends on buffer growth and cannot
+// be reasoned out from the source.
+//
+// Reported by the op-size profiler's dump (BLOCK_LINK lines) because that
+// mechanism already rewrites its file as it goes and therefore survives the
+// SIGKILL that ends every game session.
+std::atomic<uint64_t> LinkOutcomeDirect {};
+std::atomic<uint64_t> LinkOutcomeThunk {};
+std::atomic<uint64_t> LinkOutcomeUnreachable {};
+
 } // anonymous namespace
 
 uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* Frame,
@@ -2276,7 +2304,9 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     // registered undo if this thread stalled between the two.
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64DirectBlockDelinker, lk);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(DirectDelta));
+    LinkOutcomeDirect.fetch_add(1, std::memory_order_relaxed);
   } else if (PPC64BranchDisplacementInRange(ThunkDelta)) {
+    LinkOutcomeThunk.fetch_add(1, std::memory_order_relaxed);
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
     // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
@@ -2295,11 +2325,15 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
 #endif
     PPC64PatchInstruction(ThunkStart, PPC64_BCL_20_31_PLUS4);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(ThunkDelta));
+  } else {
+    // Even the thunk is out of `b` range of the exit (would need a single
+    // compile unit larger than ±32MiB — beyond every intra-block branch this
+    // backend already emits). Leave the exit unlinked; it stays on the
+    // inlined-probe path forever, which is correct, just slower. Counted
+    // rather than assumed impossible: if this is ever nonzero, an exit class
+    // is silently paying the 10-instruction probe on every traversal.
+    LinkOutcomeUnreachable.fetch_add(1, std::memory_order_relaxed);
   }
-  // else: even the thunk is out of `b` range of the exit (would need a
-  // single compile unit larger than ±32MiB — beyond every intra-block branch
-  // this backend already emits). Leave the exit unlinked; it stays on the
-  // inlined-probe path forever, which is correct, just slower.
 
   return HostCode;
 }
@@ -2750,13 +2784,29 @@ static std::atomic<uint32_t> EntryWatchNextSlot {};
 // into LR (the CPU does not push to the link-stack for this exact form),
 // mflr copies it into TMP1, then we subtract the emit-time delta from
 // mflr's location to HeaderLabel to recover the header's absolute address.
-// LoadImm32 handles the delta so blocks of any size work (a naked int16
-// addi would break past 32 KB, which MAXINST=500 readily produces).
+//
+// The subtraction is folded into the addressing instruction itself rather than
+// materialised into a register first. `LoadImm32(TMP2, Delta); subf` was three
+// instructions in the common case and four past 32 KB; `addi TMP1, TMP1,
+// -Delta` is one, and `addis`+`addi` covers the whole int32 range in two. The
+// old form's only justification was that "a naked int16 addi would break past
+// 32 KB, which MAXINST=500 readily produces" -- true of a *single* addi, but
+// addis carries the other 16 bits, and the immediate is a compile-time
+// constant so the split costs nothing at runtime.
+//
+// This runs on every external arrival into an EntryPoint block -- every
+// dispatcher L1 hit, every linked block-to-block branch, every shadow-RET fast
+// path -- and Frontend.cpp marks the return address of every guest CALL as an
+// EntryPoint, so it is also on the RET leg of every guest call.
 //
 // LR is dead at any dispatcher/link entry into a ppc64le block (blocks are
 // entered via bctr), and we call this in the entry-point prologue before
 // any IR op runs, so clobbering LR/TMP1/TMP2 here is safe.
 void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel) {
+  // Field kill switch (hashed into the code-cache config id): restores the
+  // LoadImm32 + subf shape this replaced.
+  static const bool DisableAddiFold = getenv("FEX_NOHDRADDI") != nullptr;
+
   LOGMAN_THROW_A_FMT(HeaderLabel.bound, "HeaderLabel must be bound before this call");
   const int64_t HeaderOffset = HeaderLabel.offset;
   bcl(20, 31, 4);                                    // LR = &mflr (NIA)
@@ -2765,8 +2815,27 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
   const int64_t Delta = MFLROffset - HeaderOffset;
   LOGMAN_THROW_A_FMT(Delta >= 0 && Delta < (int64_t{1} << 31),
                      "InlineHeader delta out of int32_t range: {}", Delta);
-  LoadImm32(TMP2, static_cast<uint32_t>(Delta));     // TMP2 = mflr - HeaderLabel
-  subf(TMP1, TMP2, TMP1);                            // TMP1 = HeaderLabel address
+  if (DisableAddiFold) {
+    LoadImm32(TMP2, static_cast<uint32_t>(Delta));   // TMP2 = mflr - HeaderLabel
+    subf(TMP1, TMP2, TMP1);                          // TMP1 = HeaderLabel address
+  } else if (Delta <= 32768) {
+    // -Delta lands in [-32768, 0], exactly addi's signed range. Note the bound
+    // is 32768 and not 32767: it is the NEGATED value that has to encode.
+    addi(TMP1, TMP1, static_cast<int16_t>(-Delta));
+  } else {
+    // addis + addi. Lo is the sign-extended low half, Hi absorbs the borrow
+    // that sign extension introduces, so Hi<<16 + Lo == -Delta exactly.
+    // Hi is in [-32768, -1] for every Delta the assert above admits:
+    // Hi == floor(-Delta / 65536) or that plus one, and Delta < 2^31 bounds
+    // the floor at -32768.
+    const int64_t Neg = -Delta;
+    const int16_t Lo = static_cast<int16_t>(Neg & 0xFFFF);
+    const int16_t Hi = static_cast<int16_t>((Neg - Lo) >> 16);
+    addis(TMP1, TMP1, Hi);
+    if (Lo) {
+      addi(TMP1, TMP1, Lo);
+    }
+  }
   std(TMP1,
       static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.InlineJITBlockHeader)),
       STATE);
@@ -3132,6 +3201,35 @@ static void Dump() {
                             MaxBlockBytes.load(std::memory_order_relaxed), MaxBlockBytesRIP.load(std::memory_order_relaxed),
                             MaxBlockBytesSSA.load(std::memory_order_relaxed));
   Out += fextl::fmt::format("BLOCK_BUDGET verdict={}\n\n", ScaledPerSSA > ReservePerSSA * kBytesPerSSAScale ? "SHORT" : "OK");
+
+  // ---- Block-link outcomes: direct `b` vs thunk vs never-linked. ----
+  // See the counter definitions next to ExitFunctionLinkWithRecord for why
+  // this ratio matters. Short version: a direct link costs one instruction per
+  // traversal, a thunk link costs six plus an LR round trip and a dependent
+  // load, and an unreachable one costs the full inlined probe forever. Any
+  // per-exit instruction saving is scaled by this distribution, so it has to be
+  // measured before it can be priced.
+  {
+    const uint64_t Direct = LinkOutcomeDirect.load(std::memory_order_relaxed);
+    const uint64_t Thunk = LinkOutcomeThunk.load(std::memory_order_relaxed);
+    const uint64_t Unreachable = LinkOutcomeUnreachable.load(std::memory_order_relaxed);
+    const uint64_t Linked = Direct + Thunk;
+    const uint64_t All = Linked + Unreachable;
+    Out += fextl::fmt::format("################################################################################\n"
+                              "### BLOCK LINK OUTCOMES (per exit site that reached the linker)\n"
+                              "################################################################################\n");
+    if (All) {
+      Out += fextl::fmt::format("BLOCK_LINK direct={} thunk={} unreachable={} total={}\n", Direct, Thunk, Unreachable, All);
+      Out += fextl::fmt::format("BLOCK_LINK direct_pct_x100={} thunk_pct_x100={} unreachable_pct_x100={}\n", (Direct * 10000) / All,
+                                (Thunk * 10000) / All, (Unreachable * 10000) / All);
+      // Extra host instructions executed per traversal of a thunk-linked exit
+      // versus a direct one: b Thunk lands on bcl/mflr/ld/mtctr/bctr.
+      Out += fextl::fmt::format("BLOCK_LINK thunk_extra_insns_per_traversal=5 linked={}\n", Linked);
+    } else {
+      Out += "BLOCK_LINK_NONE (no exit site reached the linker; BlockLinking off, or nothing ran)\n";
+    }
+    Out += "\n";
+  }
 
   // ---- Full table, max descending. ----
   Out += fextl::fmt::format("################################################################################\n"
@@ -4283,6 +4381,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // no longer exists; drop them.
   ClearPendingBranches();
 
+  // r0-clobber tracking is per compile unit (see the Emit32 comment in
+  // CodeEmitter/PPC64LE/Emitter.h and the exit-side use in
+  // DEF_OP(ExitFunction)). Reset it here, alongside the other per-compile
+  // emitter state, so a previous unit's host call cannot make this one
+  // pessimise -- and, more importantly, so it can never make a unit look
+  // clean that isn't.
+  ResetR0Dirty();
+
   // Same for pending block-link jump thunks: their LinkPath labels are the
   // targets of miss-leg branches recorded in PendingBranches, so the two
   // lists must be reset together. Ditto the shared spill stub labels, whose
@@ -4592,6 +4698,41 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // below) skip it -- backward intra-unit edges emit their own poke in
       // DEF_OP(Jump)/DEF_OP(CondJump).
       EmitSuspendInterruptCheck();
+      // ---------------------------------------------------------------------
+      // DO NOT replace this stdu with a fixed reserve carved out of the
+      // dispatcher's own frame. It looks like pure per-block overhead -- one
+      // stdu here, one matching addi in ResetStack at every exit -- and an
+      // audit (notes/2026-08-15-agent-reports/block-overhead-audit.md, "V5")
+      // proposed exactly that, rated medium risk. It is not medium risk, it is
+      // wrong, and the failure mode is silent.
+      //
+      // A JIT block does NOT always run on a dispatcher frame. Guest signal
+      // delivery re-enters the JIT mid-dispatcher with r1 pointing somewhere
+      // else entirely:
+      //
+      //   SignalDelegator::HandleDispatcherGuestSignal calls StoreThreadState,
+      //   which stamps a PPC64ContextBackup onto the host stack and does
+      //   SetSp(ucontext, NewSP) with NewSP == &Backup; the same function then
+      //   does SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA).
+      //
+      //   That entry point is recorded in PPC64Dispatcher.cpp *after*
+      //   PushCalleeSavedRegisters() runs, so no dispatcher frame is allocated
+      //   on this path at all.
+      //
+      // So blocks inside a guest signal handler execute with r1 == &Backup.
+      // Today that is safe precisely BECAUSE of the stdu below: each block
+      // moves r1 down and spills beneath the backup. Take the stdu away and
+      // spill slots resolve to [r1 + kSpillSlotPrefix + slot*32] measured from
+      // &Backup -- slot 0 lands in PPC64ContextBackup's 128-byte LinkageArea
+      // pad and every slot after it overwrites the saved host context that
+      // sigreturn restores from. Wrong guest state, no crash, arbitrarily far
+      // from the cause.
+      //
+      // The per-block stdu is not overhead. It is what makes JIT frames nest,
+      // which they must. A reserve taken at every JIT-*entry* boundary would
+      // nest correctly, but that is a dispatcher plus signal-path redesign
+      // with a matching pop at every exit -- not this.
+      // ---------------------------------------------------------------------
       if (SpillFrameSize) {
         // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
         // For larger frames, emit the equivalent of stdu manually so callers
@@ -4657,7 +4798,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       }
     }
 
-    PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    // EntryPoint blocks ONLY. This record used to fire for every IR block,
+    // logging a zero-byte occurrence for the non-entry ones -- which left the
+    // bucket's total bytes correct but its OCCURRENCE COUNT equal to the number
+    // of IR blocks in the run rather than the number of prologues emitted, so
+    // the reported bytes-per-occurrence was diluted by roughly the ratio
+    // between them. A profile that says "<EntryPointPrologue> 308751 x 2.0
+    // instructions" is reporting neither a real prologue count nor a real
+    // prologue size; the sequence is 6-7 instructions and only entry blocks pay
+    // it. Nothing is emitted between the guard's close and here (Bind moves no
+    // cursor and the splat pre-pass is analysis), so the byte delta is still
+    // exactly the prologue.
+    if (BlockIROp->EntryPoint) {
+      PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    }
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
