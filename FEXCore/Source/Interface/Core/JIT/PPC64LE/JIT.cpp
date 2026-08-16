@@ -2750,13 +2750,29 @@ static std::atomic<uint32_t> EntryWatchNextSlot {};
 // into LR (the CPU does not push to the link-stack for this exact form),
 // mflr copies it into TMP1, then we subtract the emit-time delta from
 // mflr's location to HeaderLabel to recover the header's absolute address.
-// LoadImm32 handles the delta so blocks of any size work (a naked int16
-// addi would break past 32 KB, which MAXINST=500 readily produces).
+//
+// The subtraction is folded into the addressing instruction itself rather than
+// materialised into a register first. `LoadImm32(TMP2, Delta); subf` was three
+// instructions in the common case and four past 32 KB; `addi TMP1, TMP1,
+// -Delta` is one, and `addis`+`addi` covers the whole int32 range in two. The
+// old form's only justification was that "a naked int16 addi would break past
+// 32 KB, which MAXINST=500 readily produces" -- true of a *single* addi, but
+// addis carries the other 16 bits, and the immediate is a compile-time
+// constant so the split costs nothing at runtime.
+//
+// This runs on every external arrival into an EntryPoint block -- every
+// dispatcher L1 hit, every linked block-to-block branch, every shadow-RET fast
+// path -- and Frontend.cpp marks the return address of every guest CALL as an
+// EntryPoint, so it is also on the RET leg of every guest call.
 //
 // LR is dead at any dispatcher/link entry into a ppc64le block (blocks are
 // entered via bctr), and we call this in the entry-point prologue before
 // any IR op runs, so clobbering LR/TMP1/TMP2 here is safe.
 void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel) {
+  // Field kill switch (hashed into the code-cache config id): restores the
+  // LoadImm32 + subf shape this replaced.
+  static const bool DisableAddiFold = getenv("FEX_NOHDRADDI") != nullptr;
+
   LOGMAN_THROW_A_FMT(HeaderLabel.bound, "HeaderLabel must be bound before this call");
   const int64_t HeaderOffset = HeaderLabel.offset;
   bcl(20, 31, 4);                                    // LR = &mflr (NIA)
@@ -2765,8 +2781,27 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
   const int64_t Delta = MFLROffset - HeaderOffset;
   LOGMAN_THROW_A_FMT(Delta >= 0 && Delta < (int64_t{1} << 31),
                      "InlineHeader delta out of int32_t range: {}", Delta);
-  LoadImm32(TMP2, static_cast<uint32_t>(Delta));     // TMP2 = mflr - HeaderLabel
-  subf(TMP1, TMP2, TMP1);                            // TMP1 = HeaderLabel address
+  if (DisableAddiFold) {
+    LoadImm32(TMP2, static_cast<uint32_t>(Delta));   // TMP2 = mflr - HeaderLabel
+    subf(TMP1, TMP2, TMP1);                          // TMP1 = HeaderLabel address
+  } else if (Delta <= 32768) {
+    // -Delta lands in [-32768, 0], exactly addi's signed range. Note the bound
+    // is 32768 and not 32767: it is the NEGATED value that has to encode.
+    addi(TMP1, TMP1, static_cast<int16_t>(-Delta));
+  } else {
+    // addis + addi. Lo is the sign-extended low half, Hi absorbs the borrow
+    // that sign extension introduces, so Hi<<16 + Lo == -Delta exactly.
+    // Hi is in [-32768, -1] for every Delta the assert above admits:
+    // Hi == floor(-Delta / 65536) or that plus one, and Delta < 2^31 bounds
+    // the floor at -32768.
+    const int64_t Neg = -Delta;
+    const int16_t Lo = static_cast<int16_t>(Neg & 0xFFFF);
+    const int16_t Hi = static_cast<int16_t>((Neg - Lo) >> 16);
+    addis(TMP1, TMP1, Hi);
+    if (Lo) {
+      addi(TMP1, TMP1, Lo);
+    }
+  }
   std(TMP1,
       static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.InlineJITBlockHeader)),
       STATE);
