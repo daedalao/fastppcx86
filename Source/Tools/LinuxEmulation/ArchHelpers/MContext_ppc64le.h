@@ -18,6 +18,34 @@ constexpr uint32_t PPC_PT_CCR   = 38;  // Condition Register
 constexpr uint32_t PPC_PT_DSISR = 42;  // Data Storage Interrupt Status Register
 constexpr uint32_t PPC_PT_STATE = 27;  // FEX JIT thread-state pointer (r27)
 
+// MSR_VSX, from arch/powerpc/include/asm/reg.h:
+//   #define MSR_VSX_LG 23   /* Enable VSX */
+//   #define MSR_VSX    __MASK(MSR_VSX_LG)
+// In a SIGNAL FRAME this bit does not mean "the CPU had VSX enabled". It is
+// the kernel's validity flag for the vs0-31 doubleword-1 region described at
+// PPC_SIGCONTEXT_VSX_DW1_OFFSET below: setup_sigcontext clears it
+// unconditionally (`msr &= ~MSR_VSX;`) and re-sets it only on the same branch
+// that copies the region out. Consumers must test it before touching that
+// memory, and restore paths must keep it consistent with what they wrote.
+constexpr uint64_t PPC_MSR_VSX = 1ULL << 23;
+
+// Byte offset from mcontext_t::v_regs to the vs0-31 doubleword-1 region.
+// The kernel's setup_sigcontext publishes v_regs pointing at the 34-quadword
+// VMX area (v0-v31, VSCR, VRSAVE = ELF_NVRREG entries of elf_vrreg_t, which is
+// __vector128), THEN does `v_regs += ELF_NVRREG` before copy_vsx_to_user, so
+// the doubleword-1 region starts exactly ELF_NVRREG * 16 == 544 bytes past the
+// pointer userspace sees. copy_vsx_to_user writes 32 bare host-LE u64s indexed
+// by VSR number, so `((uint64_t*)((uint8_t*)v_regs + 544))[n] == vs(n).dw1`.
+//
+// SIZING TRAP: this region is real memory in every kernel-built rt_sigframe --
+// struct sigcontext reserves `long vmx_reserve[ELF_NVRREG + ELF_NVRREG + 1 +
+// 32]` (101 doublewords) for it -- but glibc's mcontext_t under-declares the
+// same array as `long vmx_reserve[__NVRREG + __NVRREG + 1]` (69). The region
+// therefore sits PAST the end of the struct as the compiler sees it. Never
+// bound-check it against sizeof(mcontext_t) or sizeof(ucontext_t); the only
+// meaningful checks are the two in HasPPCVSXLowBankDW1 below.
+constexpr size_t PPC_SIGCONTEXT_VSX_DW1_OFFSET = 34 * 16;
+
 struct PPC64ContextBackup {
   // ELFv2 caller-frame reservation: linkage area (+0..31) + parameter
   // save area (+32..95). MUST be at the head of the backup so that any
@@ -102,6 +130,51 @@ struct PPC64ContextBackup {
   // mcontext_t, not a pointer, so there is no null case to guard.
   uint64_t FPRs[32];
   uint64_t FPSCR;
+
+  // vs0-vs31 DOUBLEWORD 1 -- the vector half of the FPR-aliased low VSX bank.
+  //
+  // FPRs[] above is doubleword 0 and nothing else: mcontext_t::fp_regs[N] IS
+  // vs(N).dw0, and the other half lives in a separate region of the frame (see
+  // PPC_SIGCONTEXT_VSX_DW1_OFFSET). Backing up only fp_regs therefore saved
+  // half of every low-bank VSX register, and restoring only fp_regs put that
+  // half back on top of whatever dw1 the RESTORE-side signal frame happened to
+  // carry -- a different frame, captured at a different instant.
+  //
+  // Live consequence, not a theoretical one. The AVX-high bank pins guest
+  // YMM_hi[i] in vs(16+i) (AVXHIGH_BANK_FIRST, FEXCore ArchHelpers/
+  // PPC64Emitter.h) whenever HostFeatures.SupportsAVX is set -- default off on
+  // this tree, but individual titles turn it on through AppConfig -- and it
+  // holds them in the VR convention: dw0 = guest HIGH qword, dw1 = guest LOW
+  // qword. An INJIT delivery resumes at the ORIGINAL NIP with the live
+  // register file rather than through FillSRA (see the CONTEXT_FLAG_INJIT
+  // comment in SignalDelegator::RestoreThreadState), so what this pair puts
+  // back IS the guest's architectural state. dw0-only meant every one of the
+  // 16 YMM upper halves came back torn: high qword from the interrupted
+  // context, low qword from whatever last ran on the restore-side frame --
+  // typically the guest's own signal handler, which executed JIT code with the
+  // bank live and left its own YMM highs in these registers. No fault, no
+  // diagnostic, just wrong arithmetic afterwards; exactly the failure shape of
+  // the vs15 AES-mask bug that this hazard class was named for.
+  //
+  // Not merged into FPRs[] as a 128-bit array because the two halves are NOT
+  // adjacent in the frame and are not even governed by the same validity rule:
+  // fp_regs is an inline, always-present member, while this region is
+  // conditional on MSR_VSX (see VSXRegionValid).
+  uint64_t VSXDW1[32];
+
+  // Whether VSXDW1 above was actually captured, i.e. whether HasPPCVSXLowBankDW1
+  // held for the frame BackupContext read.
+  //
+  // This is what keeps the restore honest rather than merely non-crashing.
+  // RestoreContext copies all 48 gp_regs back, MSR included, so the frame it
+  // hands to rt_sigreturn carries the MSR_VSX bit that was captured HERE. The
+  // kernel then acts on that bit: restore_sigcontext reloads dw1 of vs0-31
+  // from the region when it is set, and ZEROES dw1 of all 32 registers when it
+  // is clear. Writing the region without the bit would be a silent no-op;
+  // claiming the bit without the data would hand the guest 32 doublewords of
+  // stale sigframe stack. Carrying the flag makes both impossible: a context
+  // backed up without VSX is restored without VSX.
+  bool VSXRegionValid;
 
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   // Sanity check trailing the GPRs (the head used to hold this cookie, but
@@ -283,10 +356,46 @@ static inline uint64_t GetPPCVSXLowBankDW0(void* ucontext, uint32_t n) {
   memcpy(&v, &GetMContext(ucontext)->fp_regs[n], sizeof(v));
   return v;
 }
-static inline uint64_t GetPPCVSXLowBankDW1(void* ucontext, uint32_t n) {
+
+// Does this frame carry the vs0-31 doubleword-1 region at all?
+//
+// MANDATORY before GetPPCVSXLowBankDW1 / PPCVSXLowBankDW1 below. Two separate
+// things have to hold and they fail differently:
+//
+//  * v_regs != nullptr. Every CONFIG_ALTIVEC kernel publishes a pointer here
+//    unconditionally -- setup_sigcontext sets it before it even knows whether
+//    VMX state is live, precisely so VRSAVE always has a home -- but the
+//    `#else /* CONFIG_ALTIVEC */` arm stores 0. The region address is derived
+//    from this pointer, so a null one turns the access into a read or write of
+//    address 0x220, not a fault-free no-op. BackupContext's existing VRR block
+//    already guards on it; this is the same guard for the same reason.
+//
+//  * MSR_VSX set in the frame's saved MSR. This is a VALIDITY flag, not a CPU
+//    state bit: setup_sigcontext clears it and re-sets it only on the branch
+//    that runs copy_vsx_to_user (gated on tsk->thread.used_vsr). With it clear
+//    the 256 bytes are untouched sigframe stack -- addressable, because
+//    struct sigcontext reserves them either way, but holding garbage. Reading
+//    them yields nonsense; writing them is discarded, because restore_sigcontext
+//    reads the region only when the same bit is set and otherwise zeroes dw1 of
+//    all 32 registers.
+static inline bool HasPPCVSXLowBankDW1(void* ucontext) {
   const auto* mctx = GetMContext(ucontext);
-  const uint64_t* vsx = reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(mctx->v_regs) + 34 * 16);
-  return vsx[n];
+  return mctx->v_regs != nullptr && (mctx->gp_regs[PPC_PT_MSR] & PPC_MSR_VSX) != 0;
+}
+
+static inline uint64_t* PPCVSXLowBankDW1(void* ucontext) {
+  auto* mctx = GetMContext(ucontext);
+  return reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(mctx->v_regs) + PPC_SIGCONTEXT_VSX_DW1_OFFSET);
+}
+
+// Precondition: HasPPCVSXLowBankDW1(ucontext). Deliberately NOT self-guarding.
+// There is no in-band value that could mean "absent" -- 0 is a perfectly good
+// guest qword -- so a self-guarding version would have to invent one, and the
+// only two callers (SpillSRA's AVX-high capture, in LinuxEmulation and
+// FEXInterpreter) need to skip the whole per-register loop rather than fold a
+// sentinel into State.avx_high[]. Make the caller ask the question.
+static inline uint64_t GetPPCVSXLowBankDW1(void* ucontext, uint32_t n) {
+  return PPCVSXLowBankDW1(ucontext)[n];
 }
 
 static inline uint32_t GetProtectFlags(void* ucontext) {
@@ -334,6 +443,20 @@ static inline void BackupContext(void* ucontext, T* Backup) {
   memcpy(&Backup->FPRs[0], &_mcontext->fp_regs[0], sizeof(Backup->FPRs));
   memcpy(&Backup->FPSCR, &_mcontext->fp_regs[32], sizeof(Backup->FPSCR));
 
+  // The other half of vs0-31. See the VSXDW1 declaration for why dw0 alone is
+  // not a register save on a backend that keeps guest YMM highs in this bank.
+  // Modelled on the v_regs guard above, plus the MSR_VSX validity bit the VMX
+  // block does not need (its region is unconditional once v_regs is non-null).
+  Backup->VSXRegionValid = HasPPCVSXLowBankDW1(ucontext);
+  if (Backup->VSXRegionValid) {
+    memcpy(&Backup->VSXDW1[0], PPCVSXLowBankDW1(ucontext), sizeof(Backup->VSXDW1));
+  } else {
+    // Zero for determinism, exactly as the VRR else-branch does -- and it is
+    // also what the guest would observe anyway, since a frame restored with
+    // MSR_VSX clear has dw1 of vs0-31 zeroed by restore_sigcontext.
+    memset(&Backup->VSXDW1[0], 0, sizeof(Backup->VSXDW1));
+  }
+
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   Backup->StackCookie = STACK_COOKIE_MAGIC;
 #endif
@@ -368,4 +491,29 @@ static inline void RestoreContext(void* ucontext, T* Backup) {
   // slots, so writing fp_regs[32] here really does restore the rounding mode.
   memcpy(&_mcontext->fp_regs[0], &Backup->FPRs[0], sizeof(Backup->FPRs));
   memcpy(&_mcontext->fp_regs[32], &Backup->FPSCR, sizeof(Backup->FPSCR));
+
+  // ...and the vector half of vs0-31, which fp_regs does not carry.
+  //
+  // SYMMETRY, and why the condition is the BACKUP's flag rather than this
+  // frame's MSR: the gp_regs memcpy at the top of this function has already
+  // replaced _mcontext->gp_regs[PPC_PT_MSR] with the MSR we captured, so the
+  // frame's MSR_VSX bit is now the backup's. Driving the write off
+  // Backup->VSXRegionValid states that dependency instead of relying on
+  // statement order, and it makes both halves of the contract explicit:
+  //   VSXRegionValid  -> MSR_VSX is set in the restored gp_regs, and
+  //                      restore_sigcontext will reload dw1 of vs0-31 from the
+  //                      bytes we are writing here.
+  //   !VSXRegionValid -> MSR_VSX is clear, restore_sigcontext ignores the
+  //                      region and zeroes dw1 itself, so writing would be a
+  //                      no-op that only pretends to have restored something.
+  // A context backed up without VSX is therefore never restored with it.
+  //
+  // The v_regs re-check is not redundant with the flag: this is a DIFFERENT
+  // signal frame from the one BackupContext read (the backup travels on the
+  // host stack from the delivery handler to the sigreturn/pause handler that
+  // unwinds it), so its pointer has to be validated on its own terms before it
+  // is used as a write base.
+  if (Backup->VSXRegionValid && _mcontext->v_regs) {
+    memcpy(PPCVSXLowBankDW1(ucontext), &Backup->VSXDW1[0], sizeof(Backup->VSXDW1));
+  }
 }

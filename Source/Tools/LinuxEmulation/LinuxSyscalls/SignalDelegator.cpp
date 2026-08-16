@@ -562,7 +562,22 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
   // armed crossing it copies caller-clobbered registers over already-correct
   // spilled state. Deliberately NOT changed here: unlike this bank it is live
   // in the AVX-off configuration, so it needs its own measured/tested pass.
-  if (IgnoreMask == 0) {
+  //
+  // Also only when the frame actually CARRIES the dw1 region. The dw0 half
+  // comes out of fp_regs, which is an inline member and always present, but
+  // dw1 lives in a conditional area the kernel only fills when MSR_VSX is set
+  // in the frame (see HasPPCVSXLowBankDW1 in ArchHelpers/MContext_ppc64le.h).
+  // The reachable configuration cannot violate that -- a thread executing JIT
+  // code has necessarily executed the dispatcher's own xxlxor and the bank's
+  // lxvd2x/xxpermdi fill, so used_vsr is set and the kernel emits the region --
+  // but that argument leans on a sticky kernel-internal flag, and one of this
+  // function's three callers (GdbServer's catch-all host handler) is not gated
+  // on WasInJIT at all, so it can arrive with a frame from anywhere. The check
+  // is a load and a test against a bit we would otherwise be betting
+  // correctness on; skipping the capture leaves State.avx_high[] holding the
+  // last published values, which is strictly better than seeding it with
+  // uninitialised sigframe stack.
+  if (IgnoreMask == 0 && ArchHelpers::Context::HasPPCVSXLowBankDW1(ucontext)) {
     for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
       const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
       Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);
