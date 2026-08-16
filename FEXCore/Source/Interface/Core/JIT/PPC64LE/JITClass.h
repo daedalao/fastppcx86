@@ -1007,6 +1007,12 @@ private:
   // signal queued (and the host mask left at the handler's sa_mask).
   void EmitSuspendInterruptCheck();
 
+  // Emit (or elide, or replace with a trap) the P5.0.2 `li r0, 0` at a block
+  // exit. UnitR0Dirty must be the emitter's R0Dirty() sampled BEFORE the
+  // enclosing exit handler emitted anything, or the handler's own re-zero
+  // will feed back into the decision. Policy comment: BranchOps.cpp.
+  void EmitExitR0Zero(bool UnitR0Dirty);
+
   // -----------------------------------------------------------------------
   // Memory operation helpers (defined in MemoryOps.cpp)
   // -----------------------------------------------------------------------

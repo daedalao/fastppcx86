@@ -4318,6 +4318,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // no longer exists; drop them.
   ClearPendingBranches();
 
+  // r0-clobber tracking is per compile unit (see the Emit32 comment in
+  // CodeEmitter/PPC64LE/Emitter.h and the exit-side use in
+  // DEF_OP(ExitFunction)). Reset it here, alongside the other per-compile
+  // emitter state, so a previous unit's host call cannot make this one
+  // pessimise -- and, more importantly, so it can never make a unit look
+  // clean that isn't.
+  ResetR0Dirty();
+
   // Same for pending block-link jump thunks: their LinkPath labels are the
   // targets of miss-leg branches recorded in PendingBranches, so the two
   // lists must be reset together. Ditto the shared spill stub labels, whose

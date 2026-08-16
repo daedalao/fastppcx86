@@ -15,6 +15,76 @@
 
 namespace FEXCore::CPU {
 
+// ---------------------------------------------------------------------------
+// P5.0.2 re-zero policy: EmitExitR0Zero
+// ---------------------------------------------------------------------------
+// Block exits used to end with an unconditional `li r0, 0`, defending the
+// backend's global "r0 == 0 in JIT code" invariant against a clobber the
+// exiting block might have left behind. The in-tree comment on the hit leg
+// said as much: "Every mflr(r0) in the backend today is paired with a restore,
+// so no bug is visible -- but the invariant is currently globally assumed."
+//
+// It is not merely assumed any more, it is tracked. Emit32 sets an r0-dirty
+// flag for the compile unit whenever it emits `li r0,0` (the restore that any
+// correct clobber site must emit) or `bctrl` (a host call, after which
+// ELFv2-volatile r0 holds the callee's parked return address). See the long
+// comment in CodeEmitter/PPC64LE/Emitter.h for why those two words are a
+// sound proxy that cannot be forgotten by future code.
+//
+// A compile unit that emitted neither has no way to reach an exit with r0
+// non-zero, so the re-zero is dead code there -- which is most units: the
+// clobbering constructs are host calls (x87/transcendental fallbacks, CPUID,
+// thunks, syscalls, split-lock atomics) and the rep-string tiers, none of
+// which appear in ordinary arithmetic/memory blocks.
+//
+// RESIDUAL HOLE, stated plainly: emission is single-pass, so an exit emitted
+// before a later clobber in the same unit sees a clean flag. That is only
+// exploitable by a clobber site that does NOT restore -- and such a site is
+// already broken for the remainder of its own block, since the next guest
+// load/store would be misaddressed. It is a regression detector, not a live
+// risk. FEX_R0TRAP=1 makes it loud anyway (below).
+//
+// Modes:
+//   default        elide when the unit is provably clean
+//   FEX_NOR0ELIDE  always emit `li r0,0` (the pre-change behaviour)
+//   FEX_R0TRAP     never elide the *slot*: emit `tdnei r0, 0` in place of the
+//                  li, which traps if the invariant was ever violated. Same
+//                  one-instruction footprint as the code it replaces, so it
+//                  is a clean A/B and usable in Release. This is the
+//                  FEX_DEADPROLOGUE=trap methodology applied to P5.0.2.
+namespace {
+enum class R0ZeroModeType { Elide, Always, Trap };
+R0ZeroModeType R0ZeroMode() {
+  static const R0ZeroModeType Mode = []() {
+    if (getenv("FEX_R0TRAP")) {
+      return R0ZeroModeType::Trap;
+    }
+    if (getenv("FEX_NOR0ELIDE")) {
+      return R0ZeroModeType::Always;
+    }
+    return R0ZeroModeType::Elide;
+  }();
+  return Mode;
+}
+} // namespace
+
+void PPC64JITCore::EmitExitR0Zero(bool UnitDirty) {
+  switch (R0ZeroMode()) {
+  case R0ZeroModeType::Always: li(r(0), 0); return;
+  case R0ZeroModeType::Trap:
+    // TO=24 (LT|GT) == "not equal". Traps iff r0 != 0. Touches no CR field,
+    // so the block's packed NZCV in CR0 and the cr7 discipline below are
+    // both unaffected.
+    tdi(24, r(0), 0);
+    return;
+  case R0ZeroModeType::Elide:
+    if (UnitDirty) {
+      li(r(0), 0);
+    }
+    return;
+  }
+}
+
 DEF_OP(CallbackReturn) {
   // Spill SRA back to context
   SpillStaticRegs(TMP1);
@@ -124,6 +194,10 @@ DEF_OP(CallbackReturn) {
 //     word, not after it.
 DEF_OP(ExitFunction) {
   auto Op = IROp->C<IR::IROp_ExitFunction>();
+  // Snapshot the unit's r0-dirty state BEFORE this handler emits anything:
+  // the shadow-RET fast path below emits its own `li r0,0`, which would
+  // otherwise make the hoist and hit leg below think the unit was dirty.
+  const bool UnitR0Dirty = R0Dirty();
   ResetStack();
 
   const int32_t rip_off = static_cast<int32_t>(
@@ -243,7 +317,7 @@ DEF_OP(ExitFunction) {
       ld(TMP3, -8, TMP2);                 // TMP3 = host trampoline (== old sp + 8)
       std(RIPReg, rip_off, STATE);        // P5.0.1: store rip before the jump
       mtctr(TMP3);
-      li(r(0), 0);                        // P5.0.2: restore zero-index invariant
+      EmitExitR0Zero(UnitR0Dirty);        // P5.0.2: zero-index invariant
       bctr();
       // Empty / mismatch fall through into the unchanged L1 probe (ShadowRetReprobe).
     } else {
@@ -316,7 +390,7 @@ DEF_OP(ExitFunction) {
     // Hoisted region: rip store + r0 re-zero, then the patch site. Both
     // probe legs below skip their own copies when Linkable.
     std(RIPReg, rip_off, STATE);
-    li(r(0), 0);
+    EmitExitR0Zero(UnitR0Dirty);
     // PatchSite == the probe's first instruction (the ld of L1Pointer just
     // below). All emitted instructions are 4 bytes and SetBuffer lands on a
     // 16-byte boundary, so this address is always 4-byte aligned for the
@@ -398,7 +472,11 @@ DEF_OP(ExitFunction) {
     // restore, so no bug is visible — but the invariant is currently globally
     // assumed, and the failure mode is silent guest memory corruption. Make
     // the local guarantee explicit for 1 extra instruction on this hot leg.
-    li(r(0), 0);
+    //
+    // ...and it is no longer merely assumed: EmitExitR0Zero drops the
+    // instruction entirely in compile units that provably never clobber r0.
+    // See the policy comment at the top of this file.
+    EmitExitR0Zero(UnitR0Dirty);
   }
   // Linkable exits hoisted both of the above ABOVE the patch site: a linked
   // branch replaces the probe's first instruction, so anything after it on
