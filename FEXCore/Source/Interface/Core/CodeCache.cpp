@@ -387,7 +387,13 @@ uint64_t ComputeCodeCacheConfigId() {
       const char* HintAnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
       Hasher.Add(static_cast<uint64_t>(HintAnyEnv && HintAnyEnv[0] == '1'));
       // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
-      // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
+      // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault,
+      // which is 32 since 09fce1fbf — this comment used to say 8).
+      // NOTE the 8 below is NOT that default: it is the sentinel this hash uses
+      // for "enabled but out of range", where the JIT actually runs K=32. The
+      // two disagree on purpose-free grounds but harmlessly — the hash only has
+      // to be a stable LABEL per configuration, and FEX_SPINCOLLAPSE=1 always
+      // maps to 8 here and to K=32 there. Do not "fix" one without the other.
       const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
       uint64_t SpinK = 0;
       if (SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0') {
