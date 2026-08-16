@@ -1353,14 +1353,21 @@ static fextl::string CodeCacheFilename(const FEXCore::ExecutableFileInfo& FileIn
 }
 
 void SyscallHandler::LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::ExecutableFileSectionInfo& Section) {
-  // FEX_HWTSO revocation gate. SOUNDNESS, not policy. CodeCacheConfigId hashes
-  // HWTSO (CodeCache.cpp) and was computed once at startup with it set, so every
-  // cache file this process can even name holds blocks compiled with no TSO
-  // barriers at all. Mapping one in now would re-introduce exactly the
-  // barrier-free code RevokeHardwareTSO just invalidated, straight into the
-  // lookup cache, with no later event to drop it again. There is no second
-  // config id to fall back to, so persistent caching is simply off for the rest
-  // of this process.
+  // FEX_HWTSO revocation gate. SOUNDNESS, not policy.
+  //
+  // CodeCacheConfigId is memoised when this handler is constructed, which is
+  // after FEX::Kernel::Init's TSO setup — so on a machine where SAO worked it
+  // is frozen as the HardwareTSOState::Active id, and every cache file this
+  // process can name holds blocks compiled with no TSO barriers at all. The id
+  // cannot be recomputed (see ComputeCodeCacheConfigId, which says the same
+  // thing from the other side), so a revoked process has no second namespace to
+  // fall back to and mapping one of those files in now would put exactly the
+  // barrier-free code RevokeHardwareTSO just invalidated straight back into the
+  // lookup cache, with no later event to drop it again.
+  //
+  // Note the division of labour: the id keeps a POWER8/SAO cache away from a
+  // radix box that never had SAO; this gate is the half that covers a downgrade
+  // WITHIN one process, which no filename can express.
   if (HardwareTSO::Revoked.load(std::memory_order_acquire)) {
     return;
   }

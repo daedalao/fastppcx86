@@ -71,6 +71,42 @@ struct CustomIRResult {
 using BlockDelinkerFunc = void (*)(FEXCore::Context::ExitFunctionLinkData* Record);
 constexpr uint32_t TSC_SCALE_MAXIMUM = 1'000'000'000; ///< 1Ghz
 
+// EFFECTIVE hardware-TSO state for this process, as distinct from the FEX_HWTSO
+// option the user asked for. The two differ, and the difference is what a guest
+// executes:
+//
+//   FEX_HWTSO=1 on POWER8 with a hash MMU -> the startup PROT_SAO probe
+//   succeeds, SetHardwareTSOSupport(true) is called, and the JIT emits NO TSO
+//   barriers at all because the page attribute carries the ordering.
+//
+//   FEX_HWTSO=1 on POWER9/POWER10 radix, or an LPAR built without
+//   CONFIG_PPC_PROT_SAO_LPAR -> the same probe fails, SetHardwareTSOSupport is
+//   never called with true, and the JIT emits full barriers.
+//
+// Same requested option, opposite code. Anything that has to distinguish the
+// two -- the code-cache config id above all, see ComputeCodeCacheConfigId --
+// must read this and not FEXCore::Config::Get_HWTSO().
+//
+// It is a process-wide variable rather than ContextImpl state because
+// ComputeCodeCacheConfigId is a free function that names no context, and
+// because the id it derives is a property of the process's on-disk cache
+// namespace rather than of any one context. The only writer is
+// ContextImpl::SetHardwareTSOSupport, whose callers are FEX::Kernel::Init's TSO
+// setup (once, at startup, before any thread exists) and
+// FEX::HLE::SyscallHandler::RevokeHardwareTSO (at most once, under the
+// exclusive CodeInvalidationMutex).
+//
+// Revoked is deliberately a third state and not just Off: a process that gave
+// hardware TSO up mid-run has a code buffer holding BOTH barrier-free blocks
+// compiled before the downgrade and barrier-carrying ones compiled after, which
+// is a thing neither Off nor Active describes.
+enum class HardwareTSOState : uint8_t {
+  Off = 0,     ///< Never enabled, or the startup probe refused. JIT emits barriers.
+  Active = 1,  ///< Enabled and still in force. JIT emits none; PROT_SAO carries ordering.
+  Revoked = 2, ///< Was Active, given up mid-run after a PROT_SAO refusal on ordinary memory.
+};
+inline std::atomic<HardwareTSOState> EffectiveHardwareTSO {HardwareTSOState::Off};
+
 class CodeCache : public AbstractCodeCache {
 public:
   CodeCache(ContextImpl&);
@@ -505,6 +541,15 @@ public:
   // bool read compiles to) and make that race well-defined; the mutex, not the
   // memory order here, is what provides the happens-before that matters.
   //
+  // Relaxed is sufficient for that CPUID reader specifically, and the reason is
+  // worth writing down because "relaxed" usually is not. The read produces one
+  // guest-visible feature bit (ERMS, CPUID.07h:EBX[9]) and nothing else; the
+  // flip publishes no other state that this reader then consumes, so there is no
+  // acquire/release pairing to get wrong. A guest racing the downgrade sees
+  // either answer, and both are self-consistent: ERMS is advisory, and a guest
+  // that chooses `rep movsb` on the strength of it executes a block compiled
+  // AFTER the flip, hence with barriers.
+  //
   // If a fifth flag is ever added here it must be atomic for the same reason.
 
   // If Atomic-based TSO emulation is enabled or not.
@@ -533,6 +578,24 @@ public:
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
     SupportsHardwareTSO.store(HardwareTSOSupported, std::memory_order_relaxed);
+
+    // Keep the process-wide effective state in step; this is its only writer.
+    // See the HardwareTSOState comment near the top of this header.
+    if (HardwareTSOSupported) {
+      // Startup only, single-threaded, before any compilation.
+      EffectiveHardwareTSO.store(HardwareTSOState::Active, std::memory_order_release);
+    } else {
+      // Only Active -> Revoked means anything. A false here with the state
+      // still Off is the ordinary "the probe refused, emit barriers" path and
+      // must NOT be recorded as a revocation, or every non-SAO machine would
+      // claim to have given up something it never had. compare_exchange rather
+      // than load-then-store so the one-way property is structural, not just a
+      // consequence of the caller happening to serialise.
+      auto Expected = HardwareTSOState::Active;
+      EffectiveHardwareTSO.compare_exchange_strong(Expected, HardwareTSOState::Revoked, std::memory_order_release,
+                                                   std::memory_order_relaxed);
+    }
+
     UpdateAtomicTSOEmulationConfig();
   }
 

@@ -152,6 +152,18 @@ inline int TranslateGuestSockOptName(int level, int optname) {
 //    process's compiled code is a mix of barrier-free (pre-revocation) and
 //    barrier-carrying (post-revocation) blocks, which is what the code-cache
 //    gates in LoadCodeCache/SaveCodeCaches key off.
+//
+//    It mirrors FEXCore's HardwareTSOState::Revoked, which is the same fact on
+//    the other side of the module boundary. Both are written by
+//    RevokeHardwareTSO in one step under the exclusive CodeInvalidationMutex
+//    (this one directly, FEXCore's via SetHardwareTSOSupport), so they cannot
+//    disagree. The duplication is not an oversight and must not be "cleaned
+//    up" by deleting either: LinuxEmulation has no FEXCore/Source on its
+//    include path and cannot name Interface/Context/Context.h, while
+//    ComputeCodeCacheConfigId is FEXCore-internal and cannot name this. They
+//    serve different consumers too — FEXCore's feeds the cache FILENAME (frozen
+//    at startup, so it can only ever record Off vs Active), this one gates the
+//    cache at RUNTIME, which is the only place a mid-run downgrade can act.
 //  - Every guest-visible mapping site must route its protection through
 //    ApplyGuestProt. The choke points are SyscallHandler::GuestMmap,
 //    GuestMprotect and GuestShmat — the ELF/image loader, brk, guest stack,

@@ -311,9 +311,37 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(MEMCPYSETTSOENABLED);
     HASH_OPT(HALFBARRIERTSOENABLED);
     // HWTSO compiles with NO TSO barriers at all (hardware SAO pages carry the
-    // ordering); a cache built with it on is unsound in any session with it
-    // off. NONTSORBP drops barriers from RBP-addressed accesses the same way.
-    HASH_OPT(HWTSO);
+    // ordering); a cache built with it on is unsound in any session with it off.
+    //
+    // Hash the EFFECTIVE state, never HASH_OPT(HWTSO). The requested option and
+    // what the JIT actually did diverge on any machine that cannot do SAO, and
+    // hashing the request produced the SAME id for two incompatible code images:
+    //
+    //   Box A, POWER8 + hash MMU: FEX_HWTSO=1, probe succeeds, zero barriers
+    //     emitted, cache written under id(HWTSO=1).
+    //   Box B, POWER9/POWER10 radix or an LPAR without
+    //     CONFIG_PPC_PROT_SAO_LPAR: FEX_HWTSO=1, probe FAILS, full barriers
+    //     emitted -- and it computed id(HWTSO=1) too.
+    //
+    // Same filename, and Box A's barrier-free blocks then execute on Box B over
+    // pages with no hardware ordering at all. EffectiveHardwareTSO is what
+    // SetHardwareTSOSupport installed, so the two boxes now land in different
+    // namespaces and Box B simply misses.
+    //
+    // Ordering: FEX::Kernel::Init runs SetupTSOEmulation (FEXInterpreter.cpp
+    // :403) long before the SyscallHandler member initialiser that forces this
+    // function-local static (:614), so the value is already final here.
+    //
+    // What this CANNOT cover, and must not be mistaken for covering: a mid-run
+    // revocation. The id is memoised above; by the time HardwareTSOState goes
+    // Active -> Revoked it can no longer change, so this always observes Active
+    // in the frontend. That case is handled where it has to be, by the
+    // LoadCodeCache/SaveCodeCaches gates in SyscallsSMCTracking.cpp. Revoked is
+    // still hashed distinctly rather than folded into Active, so that if this
+    // computation is ever moved later the failure mode is a cache MISS (cold,
+    // correct) rather than a hit on blocks compiled under the other model.
+    Hasher.Add(static_cast<uint64_t>(Context::EffectiveHardwareTSO.load(std::memory_order_acquire)));
+    // NONTSORBP drops barriers from RBP-addressed accesses the same way.
     HASH_OPT(NONTSORBP);
     HASH_OPT(STRICTINPROCESSSPLITLOCKS);
     HASH_OPT(SPLITLOCKINLINECONTAINED);
@@ -427,6 +455,23 @@ uint64_t ComputeCodeCacheConfigId() {
     // hold absolute host addresses with no relocation records), so the knob
     // provably cannot change the bytes of a cache-mode compile. Do not "fix"
     // this by enabling linking under caching.
+
+    // NOT hashed, and this one IS a gap — flagged deliberately, scoped
+    // separately, do not bolt a fix on here. Everything above is requested
+    // config or an env switch. NOT ONE detected host capability is hashed, and
+    // several of them decide which instructions get emitted:
+    //   * HostFeatures::SupportsISA30 (Source/Common/HostFeatures.cpp:746, from
+    //     HWCAP2 & PPC_FEATURE2_ARCH_3_00_) gates lxvx / stxvx / lxsibzx /
+    //     lxsihzx / mcrxrx. A POWER9-generated cache loaded on POWER8 is a
+    //     SIGILL on the first lxvx, not a slowdown.
+    //   * HostFeatures::DCacheLineSize (:729/:796) is baked into the dcbz block
+    //     shift, so a cache from a host with a different line size zeroes the
+    //     wrong span.
+    // The effective-HWTSO hash above is one instance of this class that had a
+    // live consequence, which is why it was fixed on its own. Closing the rest
+    // needs a decision on how host capability is canonicalised (the detected
+    // set, or the subset the emitters actually branch on) and belongs in its own
+    // change.
 #undef HASH_OPT
 #undef HASH_STR_OPT
 
