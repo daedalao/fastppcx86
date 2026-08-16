@@ -198,6 +198,17 @@ namespace HardwareTSO {
 // entered; such a thread runs barrier-free until that block ends. Per the
 // second bullet above that is harmless: every page it can reach is still SAO.
 //
+// One residual, named rather than hidden: a thread already inside a MULTIBLOCK
+// unit when the invalidation runs is delinked at its next exit, but a unit
+// whose internal backedge spins on a shared flag could observe the syscall's
+// return value (published by another thread after this returns), load a
+// pointer into the newly refused range, and access it barrier-free within that
+// same unit. That needs the spin, the publish and the dereference all inside
+// one pre-revocation compilation unit racing the refusing syscall — so this is
+// a near-exact closure, not an exact one. Closing it fully needs the
+// stop-the-world eviction the bullets above explain this codebase does not
+// have.
+//
 // Pages that already carry SAO keep it. Stripping them would need a walk of
 // every guest VMA reissuing mprotect with each one's own protection, from a
 // syscall that is holding nothing, racing every other thread's mappings -- for
