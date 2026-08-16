@@ -293,6 +293,15 @@ namespace TSO {
       // compiled block. Litmus-proven on op4k 2026-08-13
       // (notes/tools/sao_litmus.c): MP violations 0/16.3M on SAO pages vs
       // ~1.2%/round on plain pages; SB still observable (TSO, not SC).
+      //
+      // Enabling it here is not a permanent commitment. If the kernel later
+      // refuses PROT_SAO for a range of ordinary guest memory,
+      // SyscallHandler::RevokeHardwareTSO gives it back — Live goes false,
+      // SetHardwareTSOSupport(false) is called and all compiled code is
+      // invalidated, once, from inside the exclusive CodeInvalidationMutex.
+      // Nothing on that path runs before the syscall handler exists (it is
+      // only reachable from the three mapping choke points, which are members
+      // of the handler), so the ordering below is unaffected by it.
       FEX_CONFIG_OPT(HWTSOEnabled, HWTSO);
       FEX_CONFIG_OPT(TSOEnabledForHW, TSOENABLED);
       if (HWTSOEnabled() && TSOEnabledForHW()) {

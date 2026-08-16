@@ -138,18 +138,40 @@ inline int TranslateGuestSockOptName(int level, int optname) {
 // TSO IR ops are emitted at all.
 //
 // Invariants:
-//  - Live is written EXACTLY ONCE, in FEX::Kernel::Init's TSO setup, before
-//    the syscall handler exists and before any guest mapping or compilation.
-//    Everything after startup may read it unsynchronized.
+//  - Live starts false and is set true EXACTLY ONCE, in FEX::Kernel::Init's TSO
+//    setup, before the syscall handler exists and before any guest mapping or
+//    compilation. After that it may only ever be DOWNGRADED to false, exactly
+//    once, by SyscallHandler::RevokeHardwareTSO; it never goes back up. That
+//    downgrade is why it is std::atomic rather than a plain bool that
+//    everything after startup could read unsynchronized: writes are release,
+//    reads are acquire. The downgrade itself is published from inside the
+//    exclusive CodeInvalidationMutex, which is what makes it atomic with
+//    respect to every compile — see RevokeHardwareTSO for the whole argument.
+//  - Revoked distinguishes "HWTSO was never on" from "HWTSO was on and has been
+//    given up mid-run". Both leave Live false, but only the second means this
+//    process's compiled code is a mix of barrier-free (pre-revocation) and
+//    barrier-carrying (post-revocation) blocks, which is what the code-cache
+//    gates in LoadCodeCache/SaveCodeCaches key off.
 //  - Every guest-visible mapping site must route its protection through
 //    ApplyGuestProt. The choke points are SyscallHandler::GuestMmap,
 //    GuestMprotect and GuestShmat — the ELF/image loader, brk, guest stack,
 //    VDSO and both 32-bit/64-bit guest allocators all funnel through them.
 //    GuestMremap needs nothing: mremap has no prot argument and the kernel
-//    carries VM_SAO on the VMA (grown pages inherit it).
-//  - Guest mprotect can never strip SAO: ApplyGuestProt ORs it back into
-//    every guest protection change while Live (the kernel also preserves
-//    VM_SAO across mprotect, this keeps the property explicit).
+//    carries VM_SAO on the VMA (grown pages inherit it). pkey_mprotect(2) is
+//    only accepted with pkey == -1 and is forwarded to GuestMprotect.
+//    KNOWN GAP: remap_file_pages(2) is a raw passthrough (Passthrough.cpp), and
+//    the kernel's post-3.16 emulation rebuilds the destination's protection
+//    from VM_READ/VM_WRITE/VM_EXEC alone, so VM_SAO is dropped from the range
+//    it rebuilds. That mapping is invisible to FEX's VMA and SMC tracking too,
+//    which is the older and larger problem; the syscall has been deprecated
+//    since 2014 and nothing we run issues it. Fixing the tracking is what would
+//    give this a place to hook.
+//  - Guest mprotect can never strip SAO, because ApplyGuestProt ORs it back
+//    into every guest protection change while Live. That OR is mandatory, not
+//    a belt-and-braces restatement of what the kernel already does: VM_SAO is
+//    VM_ARCH_1, powerpc lists it in VM_ARCH_CLEAR, and do_mprotect_pkey masks
+//    the ARCH_CLEAR bits off the old flags and re-derives them from the
+//    incoming prot — so an mprotect without PROT_SAO takes SAO away.
 //  - FEX-internal memory (JIT buffers, shadow call/ret stack, host thread
 //    stacks/alt-stacks, FEXCore arenas) is deliberately NOT SAO.
 namespace HardwareTSO {
@@ -157,7 +179,8 @@ namespace HardwareTSO {
   // not export it.
   constexpr int PROT_SAO_BIT = 0x10;
 
-  extern bool Live;
+  extern std::atomic<bool> Live;
+  extern std::atomic<bool> Revoked;
 
   // Startup-only: mmap-probe PROT_SAO acceptance; sets Live on success.
   // Returns Live. Warns loudly on stderr when the probe fails, because the
@@ -165,28 +188,39 @@ namespace HardwareTSO {
   bool ProbeAndEnable();
 
   inline int ApplyGuestProt(int prot) {
-    return Live ? (prot | PROT_SAO_BIT) : prot;
+    return Live.load(std::memory_order_acquire) ? (prot | PROT_SAO_BIT) : prot;
   }
 
-  // FEX_HWTSO_STRICT=1: treat a refused-SAO range as fatal rather than as a
-  // warning. Every refusal on ORDINARY memory is an ordering hole — the JIT
-  // emits no barriers in this mode, so racing plain accesses through that
-  // range are weakly ordered with nothing to fix it up. The failure that
-  // produces is rare, timing-dependent and leaves no coredump, which is also
-  // the signature of the open intermittent Witcher 3 HWTSO crash.
+  // Classifies a range the kernel refused PROT_SAO for, and warns about it.
+  //
+  // Returns true when the caller must revoke hardware TSO process-wide, i.e.
+  // when the refusal is on ORDINARY memory. Every such refusal is an ordering
+  // hole — the JIT emits no barriers in this mode, so racing plain accesses
+  // through that range are weakly ordered with nothing to fix it up. The
+  // failure that produces is rare, timing-dependent and leaves no coredump,
+  // which is also the signature of the open intermittent Witcher 3 HWTSO crash.
+  // Callers must NOT act on a true return inline: revocation has to happen with
+  // VMATracking.Mutex released, so it belongs at the tail of the syscall. See
+  // SyscallHandler::RevokeHardwareTSO.
   //
   // Device mappings are exempt: a driver that overrides the page's
   // cache-control attribute drops SAO, and x86 makes no TSO promise for WC
   // memory either, so those refusals are legitimate and stay warnings.
   // `fd` < 0 means the caller has no file to classify (anonymous mmap,
   // mprotect, shmat) — ordinary memory, never exempt.
+  [[nodiscard]] bool OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd);
+
+  // FEX_HWTSO_STRICT=1: abort on an ordinary-memory SAO refusal instead of
+  // revoking. Now that revocation makes the refusal survivable, this is purely
+  // a debugging mode — it is how you find out WHICH range refuses, with the
+  // syscall site, address and length in the abort message and the guest still
+  // in a state worth inspecting, instead of only learning after the fact that
+  // the process fell back to emitted barriers.
   //
-  // Off by default: this only converts an existing silent hazard into a
-  // diagnosable abort, and turning it on can kill a title that was
-  // previously "working". It is the instrument for hunting the W3 crash and
-  // the precondition for ever defaulting FEX_HWTSO on.
+  // Off by default: revocation is the correct production response, and aborting
+  // kills a title that would otherwise have carried on (more slowly) with a
+  // sound memory model.
   extern bool Strict;
-  void OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd);
 } // namespace HardwareTSO
 
 struct ExecveAtArgs {
@@ -417,6 +451,13 @@ public:
   uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
   uint64_t GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState*, int shmid, const void* shmaddr, int shmflg);
   uint64_t GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState*, const void* shmaddr);
+
+  // FEX_HWTSO: give up hardware TSO for the rest of this process, because a
+  // range of ordinary guest memory could not be mapped PROT_SAO. One-way and
+  // idempotent. See the definition in Syscalls.cpp for the soundness argument,
+  // the quiesce primitive and the required call-site placement (VMATracking
+  // released, mapping not yet returned to the guest).
+  void RevokeHardwareTSO(FEXCore::Core::InternalThreadState* Thread, const char* Site, const void* Addr, size_t Length);
 
   ///// Memory Manager tracking /////
   struct LateApplyExtendedVolatileMetadata {

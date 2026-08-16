@@ -487,19 +487,39 @@ public:
   FEXCore::Utils::PooledAllocatorVirtual FrontendAllocator {"FEXMem_Frontend"};
   FEXCore::Utils::PooledAllocatorVirtualWithGuard CPUBackendAllocator {"FEXMem_CPUBackend"};
 
+  // THE FOUR TSO FLAGS BELOW ARE NOT WRITE-ONCE.
+  //
+  // They used to be plain bools set only during startup, which is why they were
+  // read without any synchronisation. FEX_HWTSO revocation broke that: when the
+  // kernel refuses PROT_SAO for a range of ordinary guest memory, the frontend
+  // calls SetHardwareTSOSupport(false) from a running guest thread and every
+  // subsequent compile has to emit barriers (see
+  // FEX::HLE::SyscallHandler::RevokeHardwareTSO).
+  //
+  // That write is published from inside the EXCLUSIVE CodeInvalidationMutex, so
+  // it is properly ordered against every compile-time reader -- CompileBlock and
+  // ExitFunctionLink hold that mutex shared. The one reader outside it is
+  // CPUID.cpp's SupportsEnhancedREPMOVS, which runs from JIT'd code when the
+  // guest executes CPUID, and would otherwise be a plain data race. Relaxed
+  // atomics cost nothing on ppc64le (a relaxed load is the same `ld` a plain
+  // bool read compiles to) and make that race well-defined; the mutex, not the
+  // memory order here, is what provides the happens-before that matters.
+  //
+  // If a fifth flag is ever added here it must be atomic for the same reason.
+
   // If Atomic-based TSO emulation is enabled or not.
   bool IsAtomicTSOEnabled() const {
-    return AtomicTSOEmulationEnabled;
+    return AtomicTSOEmulationEnabled.load(std::memory_order_relaxed);
   }
 
   // If atomic-based TSO emulation is enabled for vector operations.
   bool IsVectorAtomicTSOEnabled() const {
-    return VectorAtomicTSOEmulationEnabled;
+    return VectorAtomicTSOEmulationEnabled.load(std::memory_order_relaxed);
   }
 
   // If atomic-based TSO emulation is enabled for memcpy operations.
   bool IsMemcpyAtomicTSOEnabled() const {
-    return MemcpyAtomicTSOEmulationEnabled;
+    return MemcpyAtomicTSOEmulationEnabled.load(std::memory_order_relaxed);
   }
 
   // Whether ordering is being carried by the HARDWARE (ppc64le FEX_HWTSO =
@@ -508,11 +528,11 @@ public:
   // Backends need this directly because SAO changes the COST of instructions,
   // not just which ones are needed -- see the dcbz gate in PPC64LE MemoryOps.
   bool IsHardwareTSOSupported() const {
-    return SupportsHardwareTSO;
+    return SupportsHardwareTSO.load(std::memory_order_relaxed);
   }
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
-    SupportsHardwareTSO = HardwareTSOSupported;
+    SupportsHardwareTSO.store(HardwareTSOSupported, std::memory_order_relaxed);
     UpdateAtomicTSOEmulationConfig();
   }
 
@@ -530,15 +550,15 @@ public:
 
 protected:
   void UpdateAtomicTSOEmulationConfig() {
-    if (SupportsHardwareTSO) {
+    if (SupportsHardwareTSO.load(std::memory_order_relaxed)) {
       // If the hardware supports TSO then we don't need to emulate it through atomics.
-      AtomicTSOEmulationEnabled = false;
-      VectorAtomicTSOEmulationEnabled = false;
-      MemcpyAtomicTSOEmulationEnabled = false;
+      AtomicTSOEmulationEnabled.store(false, std::memory_order_relaxed);
+      VectorAtomicTSOEmulationEnabled.store(false, std::memory_order_relaxed);
+      MemcpyAtomicTSOEmulationEnabled.store(false, std::memory_order_relaxed);
     } else {
-      AtomicTSOEmulationEnabled = Config.TSOEnabled;
-      VectorAtomicTSOEmulationEnabled = Config.TSOEnabled && Config.VectorTSOEnabled;
-      MemcpyAtomicTSOEmulationEnabled = Config.TSOEnabled && Config.MemcpySetTSOEnabled;
+      AtomicTSOEmulationEnabled.store(Config.TSOEnabled, std::memory_order_relaxed);
+      VectorAtomicTSOEmulationEnabled.store(Config.TSOEnabled && Config.VectorTSOEnabled, std::memory_order_relaxed);
+      MemcpyAtomicTSOEmulationEnabled.store(Config.TSOEnabled && Config.MemcpySetTSOEnabled, std::memory_order_relaxed);
     }
   }
 
@@ -552,10 +572,11 @@ private:
    */
   void InitializeCompiler(FEXCore::Core::InternalThreadState* Thread);
 
-  bool SupportsHardwareTSO = false;
-  bool AtomicTSOEmulationEnabled = true;
-  bool VectorAtomicTSOEmulationEnabled = false;
-  bool MemcpyAtomicTSOEmulationEnabled = false;
+  // See the comment above IsAtomicTSOEnabled for why these are atomic.
+  std::atomic<bool> SupportsHardwareTSO {false};
+  std::atomic<bool> AtomicTSOEmulationEnabled {true};
+  std::atomic<bool> VectorAtomicTSOEmulationEnabled {false};
+  std::atomic<bool> MemcpyAtomicTSOEmulationEnabled {false};
 
   bool ExitOnHLT = false;
   FEX_CONFIG_OPT(AppFilename, APP_FILENAME);

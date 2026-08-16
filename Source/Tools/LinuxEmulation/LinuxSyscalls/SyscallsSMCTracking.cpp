@@ -1590,12 +1590,13 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   // is what reaches the host mmap; `prot` stays the guest's own request for
   // all tracking below, so bookkeeping is bit-identical to the feature-off
   // world. Applies to file-backed MAP_SHARED too. If a specific mapping
-  // refuses SAO, it is retried exactly as the guest asked — that retry
-  // succeeding is a real ordering hole (racing plain accesses through this
-  // mapping are weakly ordered), hence the loud warning. Device-file
-  // mappings whose driver overrides the page cache-control attribute lose
-  // SAO silently, which matches x86 semantics for WC memory.
+  // refuses SAO, it is retried exactly as the guest asked, and hardware TSO is
+  // then revoked process-wide below — the retried mapping would otherwise have
+  // neither hardware ordering nor emitted barriers. Device-file mappings whose
+  // driver overrides the page cache-control attribute lose SAO silently, which
+  // matches x86 semantics for WC memory, and do not trigger a revocation.
   const int HostProt = HardwareTSO::ApplyGuestProt(prot);
+  bool RevokeHWTSO = false;
 
   {
     // NOTE: Frontend calls this with a nullptr Thread during initialization, but
@@ -1609,7 +1610,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       if (FEX::HLE::HasSyscallError(Result) && HostProt != prot) {
         Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
         if (!FEX::HLE::HasSyscallError(Result)) {
-          HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
+          RevokeHWTSO = HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
         }
       }
       if (FEX::HLE::HasSyscallError(Result)) {
@@ -1638,10 +1639,11 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, HostProt, flags, fd, offset));
       if (Result == ~0ULL && HostProt != prot) {
         // See the HWTSO comment above: retry exactly as the guest asked; a
-        // success here is a documented ordering hole and must be loud.
+        // success here is an ordering hole and must be loud, and on ordinary
+        // memory it revokes hardware TSO before this syscall returns.
         Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
         if (Result != ~0ULL) {
-          HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
+          RevokeHWTSO = HardwareTSO::OnRangeRefusedSAO("mmap", reinterpret_cast<void*>(Result), Size, fd);
         }
       }
       if (Result == ~0ULL) {
@@ -1651,6 +1653,17 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
 
     SMC_AUDIT("[%d] guest-mmap addr=%lx len=%lx prot=%x flags=%x fd=%d\n", FHU::Syscalls::gettid(), Result, length, prot, flags, fd);
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
+  }
+
+  // FEX_HWTSO: the mapping above could not take PROT_SAO and is ordinary
+  // memory. Give up hardware TSO now, first thing outside the VMATracking scope
+  // (RevokeHardwareTSO takes ThreadCreationMutex and the exclusive
+  // CodeInvalidationMutex, which must never be taken under VMATracking) and
+  // still before `Result` is handed back to the guest, which is what makes the
+  // window exactly closed rather than merely narrowed. The whole-cache
+  // invalidation it performs also subsumes the range invalidation below.
+  if (RevokeHWTSO) {
+    RevokeHardwareTSO(Thread, "mmap", reinterpret_cast<void*>(Result), Size);
   }
 
   // An mmap over a deferred-dirty range retires whatever was there; the
@@ -1881,6 +1894,7 @@ int SyscallHandler::OpenCodeMapFile() {
 uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
   uint64_t Result {};
   bool FileImmutableRearm = false;
+  bool RevokeHWTSO = false;
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
@@ -1898,16 +1912,25 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
       return ((prot & PROT_WRITE) && !Hit.MayWrite) ? -EACCES : -ENOMEM;
     }
     // FEX_HWTSO: OR PROT_SAO back into every guest protection change so the
-    // guest can never strip the ordering attribute from a guest page (the
-    // kernel itself preserves VM_SAO across mprotect — this keeps the
-    // invariant explicit and covers any pre-SAO page the guest re-protects).
-    // `prot` stays the guest's request for all tracking below.
+    // guest can never strip the ordering attribute from a guest page. This is
+    // mandatory, not decorative: VM_SAO is VM_ARCH_1, powerpc lists it in
+    // VM_ARCH_CLEAR, and do_mprotect_pkey masks the ARCH_CLEAR bits off the old
+    // flags and re-derives them from the incoming prot — so an mprotect without
+    // PROT_SAO takes SAO away from a page that had it. It also covers any
+    // pre-SAO page the guest re-protects. `prot` stays the guest's request for
+    // all tracking below.
+    //
+    // A refusal here is the one revocation trigger whose range the guest can
+    // already reach, and also the rarest: once an mmap-time refusal has revoked,
+    // ApplyGuestProt is the identity, HostProt == prot and this retry cannot be
+    // entered at all. What is left is a VMA that has never been able to hold
+    // SAO and that the guest is re-protecting for the first time.
     const int HostProt = HardwareTSO::ApplyGuestProt(prot);
     Result = ::mprotect(addr, len, HostProt);
     if (Result == -1 && HostProt != prot) {
       Result = ::mprotect(addr, len, prot);
       if (Result != -1) {
-        HardwareTSO::OnRangeRefusedSAO("mprotect", addr, len, -1);
+        RevokeHWTSO = HardwareTSO::OnRangeRefusedSAO("mprotect", addr, len, -1);
       }
     }
     if (Result == -1) {
@@ -1940,6 +1963,14 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
         SMC_AUDIT("[%d] fileimmutable REARM base=%lx top=%lx prot=%x\n", FHU::Syscalls::gettid(), Base, Top, prot);
       }
     }
+  }
+
+  // FEX_HWTSO: this range could not be re-protected with PROT_SAO. Revoke first
+  // thing outside the VMATracking scope, for the lock-order reason spelled out
+  // in RevokeHardwareTSO, and before the syscall returns so the guest cannot
+  // observe the new protection through barrier-free code.
+  if (RevokeHWTSO) {
+    RevokeHardwareTSO(Thread, "mprotect", addr, len);
   }
 
   // FEX_SMCMPROTECTDEFER: use the guest's own mprotect calls as the SMC
@@ -2050,6 +2081,7 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
 uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, int shmid, const void* shmaddr, int shmflg) {
   uint64_t Result {};
   uint64_t Length {};
+  bool RevokeHWTSO = false;
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
@@ -2078,19 +2110,27 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
     // follow-up mprotect carrying the attachment's effective protection plus
     // PROT_SAO. SysV shm is guest-shared memory — the single most
     // ordering-sensitive mapping class there is — so a refusal here is a
-    // real ordering hole and must be loud (the segment stays attached and
-    // functional either way; failing the guest's shmat over it would be
-    // worse than the hole).
-    if (HardwareTSO::Live) {
+    // real ordering hole, and it revokes hardware TSO below rather than failing
+    // the guest's shmat (the segment stays attached and functional either way;
+    // refusing the attachment over an ordering property the guest never asked
+    // for would be worse).
+    if (HardwareTSO::Live.load(std::memory_order_acquire)) {
       const int ShmProt = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE) | ((shmflg & SHM_EXEC) ? PROT_EXEC : 0);
       if (::mprotect(reinterpret_cast<void*>(Result), Length, HardwareTSO::ApplyGuestProt(ShmProt)) == -1) {
         // SysV shm is guest-shared memory by definition — the single most
-        // ordering-sensitive thing a guest can map, and never a device.
-        HardwareTSO::OnRangeRefusedSAO("shmat", reinterpret_cast<void*>(Result), Length, -1);
+        // ordering-sensitive thing a guest can map, and never a device, so the
+        // fd argument is -1 and this always classifies as ordinary memory.
+        RevokeHWTSO = HardwareTSO::OnRangeRefusedSAO("shmat", reinterpret_cast<void*>(Result), Length, -1);
       }
     }
 
     TrackShmat(Thread, shmid, Result, shmflg, Length);
+  }
+
+  // FEX_HWTSO: same placement rule as GuestMmap — outside the VMATracking scope
+  // (lock order) and before the attachment address reaches the guest.
+  if (RevokeHWTSO) {
+    RevokeHardwareTSO(Thread, "shmat", reinterpret_cast<void*>(Result), Length);
   }
 
   InvalidateCodeRangeIfNecessary(Thread, Result, Length);
