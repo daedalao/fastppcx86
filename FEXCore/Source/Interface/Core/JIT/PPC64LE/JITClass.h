@@ -344,6 +344,45 @@ private:
   fextl::vector<bool> Elide32MaskSet;
   void Compute32MaskElision();
 
+  // -------------------------------------------------------------------------
+  // Producer-side half of the same elision (same FEX_ZEXTOPT=0 kill switch;
+  // deliberately NOT a second knob, so the two mechanisms can only be A/B'd
+  // together and FEX_ZEXTOPT's existing CodeCache config hash — CodeCache.cpp,
+  // the "Backend env toggles that change emitted block bytes" block — keeps
+  // covering both without a new hash entry).
+  //
+  // Compute32MaskElision proves the mask dead by proving NOBODY LOOKS at the
+  // high half. ComputeHighZeroElision proves it dead by proving the high half
+  // IS ALREADY ZERO, so the rldicl would write back the bits it read. That is
+  // a strictly stronger claim and it is what makes this half compose with
+  // everything: the elided op's architectural result is bit-identical, so
+  // multi-use values, values that cross a block boundary, values that reach a
+  // spill slot, and defs coalesced onto an SRA (guest-architectural) register
+  // are all in scope — none of the observability reasoning that constrains the
+  // consumer side applies. A synchronous fault in any later guest instruction
+  // observing an SRA def sees exactly the value it would have seen with the
+  // mask emitted.
+  //
+  // The two results are OR'd into the same Elide32MaskSet. Compute32MaskElision
+  // runs FIRST and is not restructured: its set is this pass's input, never its
+  // output, so its soundness argument stays independently reviewable. The one
+  // coupling runs the other way and is load-bearing — a def the CONSUMER pass
+  // elided is NOT high-zero afterwards (that is the whole point of that pass),
+  // so this pass must read Elide32MaskSet before adding to it and must never
+  // treat a consumer-elided def as a zero source. See the source table and the
+  // per-instruction ISA citations at ComputeHighZeroElision in JIT.cpp.
+  //
+  // Lattice: one bit per HOST GPR ("bits 63:32 of this register are zero"),
+  // not per SSA node. Post-RA the operand wrappers are immediate-encoded
+  // PhysicalRegisters and node identity is gone (see GetReg(OrderedNodeWrapper)
+  // and the matching note in Compute32MaskElision), so the register file IS the
+  // only addressable dataflow space. Host register indices are exact and
+  // collision-free here because the SRA and RA pools are disjoint fixed
+  // assignments (ArchHelpers/PPC64Emitter.h x64::SRA/RA, x32::SRA/RA) and
+  // TMP1-TMP4 / r0 / r1 / STATE belong to neither.
+  // -------------------------------------------------------------------------
+  void ComputeHighZeroElision();
+
   // Tail-mask emission for i32 GPR results: rldicl unless provably dead.
   void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
