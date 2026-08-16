@@ -249,7 +249,7 @@ namespace {
   // 0..95 are the ELFv2 linkage + parameter save area that the helper is
   // entitled to write.
   // ===========================================================================
-  constexpr int16_t kFrameSize = 640; // multiple of 16, keeps r1 16B aligned
+  constexpr int16_t kFrameSize = 816; // multiple of 16, keeps r1 16B aligned
 
   // GPRs saved, in slot order: r0, r2, r3..r12.
   // r1 is the stack pointer, r13 is the TLS pointer (never clobbered by us or
@@ -282,8 +282,33 @@ namespace {
   constexpr int16_t kSlotEA = 232;
   constexpr int16_t kVRBase = 240; // v0..v19, 16B aligned, 320 bytes -> 559
   constexpr uint32_t kNumVolatileVRs = 20;
-  static_assert(kVRBase + kNumVolatileVRs * 16 <= kFrameSize, "stub frame too small");
   static_assert(kVRBase % 16 == 0, "stvx needs a 16B-aligned displacement");
+
+  // ---------------------------------------------------------------------------
+  // AVX-high VSX bank save area: vs16..vs31, full 128 bits each, 256 bytes.
+  //
+  // Duplicated from AVXHIGH_BANK_FIRST / SRAFPR.size() in FEXCore/Source/
+  // Interface/Core/ArchHelpers/PPC64Emitter.h, for the same reason kStateReg is
+  // duplicated above: that header is not on LinuxEmulation's include path. Both
+  // must stay in sync with it.
+  //
+  // WHY 16 AND NOT SRAFPR.size(): the bank is 16 entries for an x86-64 guest and
+  // 8 for i686, but the stub is emitted from a SIGSEGV handler that has no
+  // cheap, guaranteed-correct read of guest bitness, and saving vs24..vs31 in
+  // the i686 case is semantically free -- they are plain host f24..f31, whose
+  // dw0 the helper must preserve by ABI anyway, so writing back the exact 128
+  // bits we read cannot change anything anyone observes.
+  // ---------------------------------------------------------------------------
+  constexpr int16_t kVSXBase = 560; // vs16..vs31, 16B aligned, 256 bytes -> 815
+  constexpr uint32_t kAVXBankFirstVSX = 16;
+  constexpr uint32_t kNumAVXBankRegs = 16;
+  static_assert(kVSXBase >= kVRBase + kNumVolatileVRs * 16, "VSX save area overlaps the VR save area");
+  static_assert(kVSXBase + kNumAVXBankRegs * 16 <= kFrameSize, "stub frame too small");
+  static_assert(kAVXBankFirstVSX + kNumAVXBankRegs <= 32, "AVX-high bank must fit in the low VSX file");
+  // stxvd2x/lxvd2x do not require alignment, unlike the stvx block above --
+  // keeping it aligned anyway is free (r1 is 16B aligned) and keeps each
+  // register's 16 bytes off a cache-line split.
+  static_assert(kVSXBase % 16 == 0, "keep the VSX save area 16B aligned");
 
   constexpr uint32_t kSPR_XER = 1;
 
@@ -495,10 +520,52 @@ namespace {
   //
   // It saves the remaining volatile machine state the helper may clobber: LR,
   // CTR, XER, the whole CR (mfcr/mtcr covers CR0-CR7, including the
-  // callee-saved CR2-CR4 -- deliberately over-broad), and v0-v19.  v0-v15 are
-  // the guest's XMM registers (SRAFPR) and v16-v19 are the first four dynamic
-  // vector allocations, all of which are ELFv2-volatile; v20-v31 are
-  // callee-saved and need no save.
+  // callee-saved CR2-CR4 -- deliberately over-broad), v0-v19, and the AVX-high
+  // VSX bank.  v0-v15 are the guest's XMM registers (SRAFPR) and v16-v19 are
+  // the first four dynamic vector allocations, all of which are ELFv2-volatile;
+  // v20-v31 are callee-saved and need no save.
+  //
+  // THE BANK IS NOT COVERED BY "f16-f31 ARE CALLEE-SAVED".  When AVX is
+  // advertised the JIT pins guest YMM_hi[i] in vs(16+i) for the whole block
+  // (AVXHIGH_BANK_FIRST, FEXCore ArchHelpers/PPC64Emitter.h), holding it as
+  // dw0 = guest HIGH qword, dw1 = guest LOW qword.  ELFv2 preserves only the
+  // FPR half -- dw0 -- of f16-f31 across a call; dw1 is volatile, and a
+  // callee's scalar `lfd f16` epilogue restore leaves it UNDEFINED per the ISA.
+  // This stub is patched over an ORDINARY GPR STORE in the middle of a JIT
+  // block, so the bank is live by construction whenever the feature pair is on,
+  // and the helper below is real host C++ (a locked code-range walk, a mutex, a
+  // pwrite).  Without the save/restore added here, every backpatched store that
+  // reached the helper replaced the guest's LOW qword in all 16 YMM upper
+  // halves with garbage and left the HIGH qwords intact -- torn YMMs, no fault,
+  // no diagnostic.  Unlike every `bctrl` the JIT itself emits, there is no
+  // SpillForABICall/SpillStaticRegs in front of this call to publish the bank
+  // to State.avx_high[] first: the JIT never emitted this call, the SIGSEGV
+  // handler grafted it on.
+  //
+  // Saved UNCONDITIONALLY rather than only when AVX is on.  Gating would need a
+  // HostFeatures read this file deliberately does not have (it stays off
+  // FEXCore's emitter headers and off Syscalls.h), i.e. a new cross-module knob
+  // whose staleness would silently reintroduce exactly this bug; the win would
+  // be 32 VSX memory ops on a path whose next act is a mutex or a pwrite, and
+  // 128 bytes of code emitted once per 64KiB pool.  With AVX off the pair is a
+  // semantic no-op: it writes back the same 128 bits it read.
+  //
+  // The other two pinned low-bank registers need nothing here, and this is the
+  // audit rather than an assumption:
+  //   * VZERO_VSX (vs14) promises only that dw0 == 0 after an arbitrary host
+  //     call, and dw0 is precisely what ELFv2 preserves.  Every consumer in the
+  //     backend is an xxpermdi that takes VZERO's dw0 (verified: the DM low bit
+  //     is 0 in every site that passes it as XB, the DM high bit is 0 in every
+  //     site that passes it as XA).
+  //   * VTMP3_VSX (vs12) is ELFv2-volatile and would be destroyed, but its rule
+  //     is "never live across a host call" and it holds here: its only
+  //     multi-instruction lifetime is the AES byte-reverse mask park, which
+  //     CompileCode invalidates on every non-AES-family IR op and at every
+  //     block bind, and the AES handlers emit vector instructions only -- no
+  //     GPR store, so no patchable site can fall inside a park.  Every other
+  //     use (the SpillStaticRegs/FillStaticRegs bank permutes, the pre-3.0
+  //     StoreUnalignedV128 and StoreFPRSized swaps) is dead one instruction
+  //     later, and those stores are VSX-form, which DecodeStoreForm rejects.
   // ---------------------------------------------------------------------------
   void EmitSharedTail(Emitter& Em, uint64_t HelperAddr) {
     Em.mflr(r0);
@@ -515,6 +582,17 @@ namespace {
       Em.stvx(v(i), r1, r0);
     }
 
+    // AVX-high bank, full width. stxvd2x/lxvd2x produce and consume the
+    // doubleword-SWAPPED memory image, which is irrelevant here because the
+    // pair is symmetric and nothing else ever reads these bytes -- so this is
+    // an exact 128-bit round trip in two POWER8-legal instructions per
+    // register, with no fixup permute and no scratch VSR. (stxvx/lxvx would be
+    // one instruction but are ISA 3.0; this file must run on POWER8.)
+    for (uint32_t i = 0; i < kNumAVXBankRegs; ++i) {
+      Em.li(r0, static_cast<int16_t>(kVSXBase + i * 16));
+      Em.stxvd2x(VSXR {kAVXBankFirstVSX + i}, r1, r0);
+    }
+
     // (EA, Value, Width) -> (Frame, EA, Value, Width). Shift right-to-left so no
     // argument is overwritten before it is read.
     Em.mr(r6, r5);
@@ -529,6 +607,12 @@ namespace {
     Em.LoadImm64(r12, HelperAddr);
     Em.mtctr(r12);
     Em.bctrl();
+
+    // Mirror of the save above, in the same register order.
+    for (uint32_t i = 0; i < kNumAVXBankRegs; ++i) {
+      Em.li(r0, static_cast<int16_t>(kVSXBase + i * 16));
+      Em.lxvd2x(VSXR {kAVXBankFirstVSX + i}, r1, r0);
+    }
 
     for (uint32_t i = 0; i < kNumVolatileVRs; ++i) {
       Em.li(r0, static_cast<int16_t>(kVRBase + i * 16));
