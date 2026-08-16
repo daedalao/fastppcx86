@@ -2816,7 +2816,16 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
   const int64_t Delta = MFLROffset - HeaderOffset;
   LOGMAN_THROW_A_FMT(Delta >= 0 && Delta < (int64_t{1} << 31),
                      "InlineHeader delta out of int32_t range: {}", Delta);
-  if (DisableAddiFold) {
+  if (Delta < 0 || Delta >= (int64_t {1} << 31)) [[unlikely]] {
+    // Real guard, not just the Debug assert above (LOGMAN_THROW_A_FMT compiles
+    // to nothing in Release, and an out-of-range Delta would mis-encode the
+    // addis arm SILENTLY -- the one arm only the largest-MaxInst titles ever
+    // run). Structurally unreachable while blocks live in a sub-2GB buffer,
+    // but if that ever changes this emits a correct sequence instead of a
+    // corrupted header address. LoadImm64 + subf handles any delta.
+    LoadImm64(TMP2, static_cast<uint64_t>(Delta));
+    subf(TMP1, TMP2, TMP1);
+  } else if (DisableAddiFold) {
     LoadImm32(TMP2, static_cast<uint32_t>(Delta));   // TMP2 = mflr - HeaderLabel
     subf(TMP1, TMP2, TMP1);                          // TMP1 = HeaderLabel address
   } else if (Delta <= 32768) {
