@@ -1353,6 +1353,18 @@ static fextl::string CodeCacheFilename(const FEXCore::ExecutableFileInfo& FileIn
 }
 
 void SyscallHandler::LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::ExecutableFileSectionInfo& Section) {
+  // FEX_HWTSO revocation gate. SOUNDNESS, not policy. CodeCacheConfigId hashes
+  // HWTSO (CodeCache.cpp) and was computed once at startup with it set, so every
+  // cache file this process can even name holds blocks compiled with no TSO
+  // barriers at all. Mapping one in now would re-introduce exactly the
+  // barrier-free code RevokeHardwareTSO just invalidated, straight into the
+  // lookup cache, with no later event to drop it again. There is no second
+  // config id to fall back to, so persistent caching is simply off for the rest
+  // of this process.
+  if (HardwareTSO::Revoked.load(std::memory_order_acquire)) {
+    return;
+  }
+
   // Scope gate. In "rootfs" scope only system libraries participate, so a title
   // shares one cache namespace of immutable libraries with every other title
   // instead of re-caching its own frequently-rebuilt binaries.
@@ -1438,6 +1450,19 @@ bool SyscallHandler::IsPathInCodeCacheScope(std::string_view Path) const {
 
 void SyscallHandler::SaveCodeCaches(FEXCore::Core::InternalThreadState* Thread, bool Force) {
   if (!CodeCacheWriteEnabled() || !Thread) {
+    return;
+  }
+
+  // FEX_HWTSO revocation gate. This one is NOT required for soundness -- a
+  // barrier-carrying block is correct in any session, and a future HWTSO run
+  // that hits the same refusal would revoke and drop whatever it had loaded.
+  // It is here because the file would be actively harmful: after revocation the
+  // code buffer is a mix of barrier-free (pre-revocation) and barrier-carrying
+  // (post-revocation) blocks, all of which would be written out under the
+  // HWTSO=1 config id, where a future run that would NOT have refused picks up
+  // the slow ones and has no event that ever invalidates them. One unlucky run
+  // would permanently poison the fast path for every later one.
+  if (HardwareTSO::Revoked.load(std::memory_order_acquire)) {
     return;
   }
   if (!CTX->GetCodeCache().WantsSave(Force)) {
