@@ -798,7 +798,19 @@ std::vector<Candidate> ScanLibraries(const Registry& Reg, const ScanOptions& Opt
       if (!Info) {
         continue;
       }
-      const bool Interesting = IsGuestExecutable(Info->Kind) || Info->Kind == BinaryKind::WindowsPE64 || Info->Kind == BinaryKind::WindowsPE32;
+      // A PE is only a candidate if it is actually named .exe. IsGameCandidateFilename
+      // rejects the PE extensions we know about (.dll, .ocx, .sys, ...), but a
+      // blocklist only removes what it has heard of: a renamed or backed-up library
+      // keeps its PE header and walks straight through it, which is how
+      // `CChromaEditorLibrary.dll.bak` and `itemtest.com` were offered as games.
+      // The rule that file's own comment states -- Windows titles are launched
+      // through a .exe, full stop -- is an allowlist, so apply it as one here.
+      //
+      // ELF candidates deliberately keep the executable-bit test instead. Linux
+      // game binaries carry no consistent extension (FTL.amd64,
+      // Grimrock.bin.x86_64, Moonlighter.x86_64), so there is nothing to allowlist.
+      const bool InterestingPE = (Info->Kind == BinaryKind::WindowsPE64 || Info->Kind == BinaryKind::WindowsPE32) && LooksWindows;
+      const bool Interesting = IsGuestExecutable(Info->Kind) || InterestingPE;
       if (!Interesting) {
         continue;
       }
