@@ -2200,6 +2200,34 @@ void PPC64IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Link) {
   PPC64PatchInstruction(ThunkStart, Record->OrigThunkWord);
 }
 
+// Block-link outcome census. Three counters, incremented once per exit site
+// that ever links, on a path that already takes two locks, patches two
+// instructions and does icache maintenance -- the cost is not measurable.
+//
+// WHY THIS EXISTS. The in-tree comment at PPC64EncodeBranch's caller has long
+// asserted that the far case is "the common case against a 128MiB code buffer".
+// Nothing ever measured it, and it decides real things:
+//
+//   * a DIRECT link is `b HostCode`, one instruction;
+//   * a THUNK link is `b Thunk` plus the thunk's bcl/mflr/ld/mtctr/bctr --
+//     five more instructions, a second LR round trip, three branches and a
+//     dependent load, on every traversal for the life of the link;
+//   * NEITHER means the exit stays on the 10-instruction inlined probe
+//     forever.
+//
+// So the direct:thunk ratio is a straight multiplier on what any per-exit
+// saving is worth, and if the thunk share is high the thunk shape itself
+// becomes the target rather than the exit. INITIAL_CODE_SIZE is 16MiB growing
+// to MAX_CODE_SIZE 128MiB, so the answer depends on buffer growth and cannot
+// be reasoned out from the source.
+//
+// Reported by the op-size profiler's dump (BLOCK_LINK lines) because that
+// mechanism already rewrites its file as it goes and therefore survives the
+// SIGKILL that ends every game session.
+std::atomic<uint64_t> LinkOutcomeDirect {};
+std::atomic<uint64_t> LinkOutcomeThunk {};
+std::atomic<uint64_t> LinkOutcomeUnreachable {};
+
 } // anonymous namespace
 
 uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* Frame,
@@ -2276,7 +2304,9 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     // registered undo if this thread stalled between the two.
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64DirectBlockDelinker, lk);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(DirectDelta));
+    LinkOutcomeDirect.fetch_add(1, std::memory_order_relaxed);
   } else if (PPC64BranchDisplacementInRange(ThunkDelta)) {
+    LinkOutcomeThunk.fetch_add(1, std::memory_order_relaxed);
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
     // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
@@ -2295,11 +2325,15 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
 #endif
     PPC64PatchInstruction(ThunkStart, PPC64_BCL_20_31_PLUS4);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(ThunkDelta));
+  } else {
+    // Even the thunk is out of `b` range of the exit (would need a single
+    // compile unit larger than ±32MiB — beyond every intra-block branch this
+    // backend already emits). Leave the exit unlinked; it stays on the
+    // inlined-probe path forever, which is correct, just slower. Counted
+    // rather than assumed impossible: if this is ever nonzero, an exit class
+    // is silently paying the 10-instruction probe on every traversal.
+    LinkOutcomeUnreachable.fetch_add(1, std::memory_order_relaxed);
   }
-  // else: even the thunk is out of `b` range of the exit (would need a
-  // single compile unit larger than ±32MiB — beyond every intra-block branch
-  // this backend already emits). Leave the exit unlinked; it stays on the
-  // inlined-probe path forever, which is correct, just slower.
 
   return HostCode;
 }
@@ -3167,6 +3201,35 @@ static void Dump() {
                             MaxBlockBytes.load(std::memory_order_relaxed), MaxBlockBytesRIP.load(std::memory_order_relaxed),
                             MaxBlockBytesSSA.load(std::memory_order_relaxed));
   Out += fextl::fmt::format("BLOCK_BUDGET verdict={}\n\n", ScaledPerSSA > ReservePerSSA * kBytesPerSSAScale ? "SHORT" : "OK");
+
+  // ---- Block-link outcomes: direct `b` vs thunk vs never-linked. ----
+  // See the counter definitions next to ExitFunctionLinkWithRecord for why
+  // this ratio matters. Short version: a direct link costs one instruction per
+  // traversal, a thunk link costs six plus an LR round trip and a dependent
+  // load, and an unreachable one costs the full inlined probe forever. Any
+  // per-exit instruction saving is scaled by this distribution, so it has to be
+  // measured before it can be priced.
+  {
+    const uint64_t Direct = LinkOutcomeDirect.load(std::memory_order_relaxed);
+    const uint64_t Thunk = LinkOutcomeThunk.load(std::memory_order_relaxed);
+    const uint64_t Unreachable = LinkOutcomeUnreachable.load(std::memory_order_relaxed);
+    const uint64_t Linked = Direct + Thunk;
+    const uint64_t All = Linked + Unreachable;
+    Out += fextl::fmt::format("################################################################################\n"
+                              "### BLOCK LINK OUTCOMES (per exit site that reached the linker)\n"
+                              "################################################################################\n");
+    if (All) {
+      Out += fextl::fmt::format("BLOCK_LINK direct={} thunk={} unreachable={} total={}\n", Direct, Thunk, Unreachable, All);
+      Out += fextl::fmt::format("BLOCK_LINK direct_pct_x100={} thunk_pct_x100={} unreachable_pct_x100={}\n", (Direct * 10000) / All,
+                                (Thunk * 10000) / All, (Unreachable * 10000) / All);
+      // Extra host instructions executed per traversal of a thunk-linked exit
+      // versus a direct one: b Thunk lands on bcl/mflr/ld/mtctr/bctr.
+      Out += fextl::fmt::format("BLOCK_LINK thunk_extra_insns_per_traversal=5 linked={}\n", Linked);
+    } else {
+      Out += "BLOCK_LINK_NONE (no exit site reached the linker; BlockLinking off, or nothing ran)\n";
+    }
+    Out += "\n";
+  }
 
   // ---- Full table, max descending. ----
   Out += fextl::fmt::format("################################################################################\n"
