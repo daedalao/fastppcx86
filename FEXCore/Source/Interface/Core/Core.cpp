@@ -69,6 +69,7 @@ $end_info$
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -250,6 +251,78 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
   return InlineTail ? InlineTail->RIP : 0;
 }
 
+// FEX_RIPFALLBACKTRAP — instrumentation for "how often does RestoreRIPFromHostPC
+// fail to reconstruct and fall back to Frame->State.rip, with a host PC that is
+// inside the JIT code buffer?"
+//
+// That question decides whether the JIT is allowed to stop maintaining
+// State.rip on block-transfer fast paths. Every exit currently spends a
+// `std RIPReg, State.rip(STATE)` -- and, on a linked constant exit, the whole
+// 3-4 instruction RIP materialisation that feeds it -- purely so this fallback
+// has something sane to return. The fallback is only reachable in-JIT during
+// the handful of instructions at the top of a target block's EntryPoint
+// prologue, before its own InlineJITBlockHeader store lands. If that window is
+// never actually observed, the store is dead weight on every block transfer.
+//
+// Modes (parsed once):
+//   unset / "0"  off (default) -- one predictable branch on a static bool
+//   "1"          log the first 64 occurrences of each kind, then just count
+//   "abort"      ERROR_AND_DIE on the first occurrence
+//
+// This is the same retire-an-invariant methodology as FEX_DEADPROLOGUE=trap in
+// the PPC64LE backend (JIT.cpp): prove the thing is unreachable at runtime
+// before deleting the code that defends it, rather than by inspection.
+//
+// Reachable from signal handlers. Deliberately allocation-free and lock-free:
+// two relaxed atomics and, for the first few hits, the same LogMan::Msg call
+// the existing in-signal diagnostics use (SignalDelegator.cpp SigRIPWatch).
+namespace {
+enum class RIPFallbackTrapMode { Off, Log, Abort };
+
+RIPFallbackTrapMode GetRIPFallbackTrapMode() {
+  static const RIPFallbackTrapMode Mode = []() {
+    const char* Env = getenv("FEX_RIPFALLBACKTRAP");
+    if (!Env || Env[0] == '\0' || (Env[0] == '0' && Env[1] == '\0')) {
+      return RIPFallbackTrapMode::Off;
+    }
+    if (::strcmp(Env, "abort") == 0) {
+      return RIPFallbackTrapMode::Abort;
+    }
+    return RIPFallbackTrapMode::Log;
+  }();
+  return Mode;
+}
+
+// [0] = host PC inside a code buffer but outside the block InlineJITBlockHeader
+//       names (the block-transfer window -- the one that matters).
+// [1] = host PC inside the named block, but the block carries no RIP table.
+std::atomic<uint64_t> RIPFallbackHits[2] {};
+
+void NoteRIPFallback(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t BlockBegin, unsigned Kind) {
+  const auto Mode = GetRIPFallbackTrapMode();
+  if (Mode == RIPFallbackTrapMode::Off) {
+    return;
+  }
+  // Only in-JIT PCs are interesting. A host PC in the dispatcher, in a FABI
+  // stub or in C++ is an expected fallback and always has been.
+  // NonMovableUniquePtr has no operator bool — .get() is the null test.
+  if (!Thread->CPUBackend.get() || !Thread->CPUBackend->IsAddressInCodeBuffer(HostPC)) {
+    return;
+  }
+  const uint64_t N = RIPFallbackHits[Kind].fetch_add(1, std::memory_order_relaxed);
+  if (Mode == RIPFallbackTrapMode::Abort) {
+    ERROR_AND_DIE_FMT("RIPFallbackTrap[{}]: host PC {:#x} is in the code buffer but RestoreRIPFromHostPC "
+                      "fell back to State.rip {:#x} (InlineJITBlockHeader {:#x})",
+                      Kind, HostPC, Thread->CurrentFrame->State.rip, BlockBegin);
+  }
+  if (N < 64) {
+    LogMan::Msg::EFmt("RIPFallbackTrap[{}] #{}: host PC {:#x} in code buffer, InlineJITBlockHeader {:#x}, "
+                      "returning stale State.rip {:#x}",
+                      Kind, N, HostPC, BlockBegin, Thread->CurrentFrame->State.rip);
+  }
+}
+} // namespace
+
 uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
   const auto Frame = Thread->CurrentFrame;
   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
@@ -271,6 +344,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
       // P3.1 landed as 244075383; the old comment claiming otherwise was
       // stale, per P5.0 review.)
       if (InlineTail->NumberOfRIPEntries == 0) {
+        NoteRIPFallback(Thread, HostPC, BlockBegin, 1);
         return Frame->State.rip;
       }
 
@@ -298,6 +372,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
   }
 
   // Fallback to what is stored in the RIP currently.
+  NoteRIPFallback(Thread, HostPC, BlockBegin, 0);
   return Frame->State.rip;
 }
 
