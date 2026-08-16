@@ -1111,24 +1111,20 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
 
   ExtendedMetaData = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(FEXCore::Config::Get_EXTENDEDVOLATILEMETADATA()());
 
-  // The mtrack SMC path drives host mprotect() with FEX_PAGE_SIZE (4K) granularity
-  // and the guest is told AT_PAGESZ=4096, but there is no host-page-size awareness
-  // anywhere in LinuxEmulation.  On a host with a larger page size a 4K-aligned
-  // mprotect is rejected outright (EINVAL -> the AFmt aborts in
-  // SyscallsSMCTracking.cpp), and the cases that do go through degrade to
-  // host-page-granularity protection with re-protect races.  Warn loudly rather
-  // than let someone burn a day chasing the fallout.
-  if (const long HostPageSize = sysconf(_SC_PAGESIZE); HostPageSize > 0 && static_cast<uint64_t>(HostPageSize) != FEXCore::Utils::FEX_PAGE_SIZE) {
-    if (SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
-      LogMan::Msg::EFmt("Host page size is {} but FEX's SMC tracking assumes {}. "
-                        "mtrack SMC detection is unsupported on this kernel and will misbehave or abort; "
-                        "boot a {}-page kernel or run with FEX_SMCCHECKS=full.",
-                        HostPageSize, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE);
-    } else {
-      LogMan::Msg::IFmt("Host page size is {} but FEX assumes {}; SMCChecks is not mtrack so the SMC path is not affected.", HostPageSize,
-                        FEXCore::Utils::FEX_PAGE_SIZE);
-    }
-  }
+  // There was a host-page-size warning here. It has moved, whole, to
+  // FEX::Kernel::PageSize::CheckHostPageSize (FEXInterpreter.cpp), which runs
+  // before any InternalThreadState is allocated and aborts rather than warns.
+  //
+  // Do not re-add a check here. The version that used to live at this spot
+  // warned only when SMCChecks==mtrack and otherwise printed "SMCChecks is not
+  // mtrack so the SMC path is not affected", which was actively false: the SMC
+  // path is not even the worst of it. InterruptFaultPage's arming mprotect and
+  // the call-ret stack's commit mprotect both fail on any non-4K host no matter
+  // how SMC is configured, and both fail silently — their return values are not
+  // checked, and they cannot be, because they run on signal-delivery paths where
+  // LogMan is not async-signal-safe. By the time this constructor runs the
+  // process is already committed; the startup gate is where a refusal is clean.
+  // See docs/PAGE_SIZE_AUDIT.md.
 
   // FEX_SMCFILEIMMUTABLE only has anything to skip where mtrack installs
   // protection in the first place; with SMCChecks=none nothing is tracked and
