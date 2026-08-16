@@ -424,6 +424,13 @@ uint64_t ComputeCodeCacheConfigId() {
       // explicit "0" disables, mirroring InlineConstEnabled().
       const char* InlineConstEnv = getenv("FEX_PPCINLINECONST");
       Hasher.Add(static_cast<uint64_t>(!(InlineConstEnv && InlineConstEnv[0] == '0')));
+      // FEX_PPCLOGICALIMM=0 reverts the logical-immediate lowering in
+      // JIT/PPC64LE/ALUOps.cpp — the rotate-and-mask AND forms, andis. for the
+      // flag-setting ANDs, and the oris+ori pair in Or/Xor — back to
+      // LoadConstant plus a register-form op. Only an explicit "0" disables,
+      // mirroring LogicalImmEnabled().
+      const char* LogicalImmEnv = getenv("FEX_PPCLOGICALIMM");
+      Hasher.Add(static_cast<uint64_t>(!(LogicalImmEnv && LogicalImmEnv[0] == '0')));
     }
 
     // The scope option itself, because it decides whether the process runs as a
