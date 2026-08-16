@@ -4735,7 +4735,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       }
     }
 
-    PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    // EntryPoint blocks ONLY. This record used to fire for every IR block,
+    // logging a zero-byte occurrence for the non-entry ones -- which left the
+    // bucket's total bytes correct but its OCCURRENCE COUNT equal to the number
+    // of IR blocks in the run rather than the number of prologues emitted, so
+    // the reported bytes-per-occurrence was diluted by roughly the ratio
+    // between them. A profile that says "<EntryPointPrologue> 308751 x 2.0
+    // instructions" is reporting neither a real prologue count nor a real
+    // prologue size; the sequence is 6-7 instructions and only entry blocks pay
+    // it. Nothing is emitted between the guard's close and here (Bind moves no
+    // cursor and the splat pre-pass is analysis), so the byte delta is still
+    // exactly the prologue.
+    if (BlockIROp->EntryPoint) {
+      PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    }
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
