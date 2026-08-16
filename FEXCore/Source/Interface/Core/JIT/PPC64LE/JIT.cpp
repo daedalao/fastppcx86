@@ -3668,6 +3668,10 @@ void PPC64JITCore::ComputeHighZeroElision() {
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
   static const char* ProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
   static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ProducerEnv && ProducerEnv[0] == '0');
+  // Producer-only attribution for FEX_ZEXTTRAP. Sized here rather than in
+  // Compute32MaskElision so it is empty when this pass is off, which makes the
+  // trap a no-op instead of firing on the consumer pass's elisions.
+  HighZeroElideSet.assign(IR->GetSSACount(), false);
   if (ZExtOff) {
     // Compute32MaskElision already sized and cleared Elide32MaskSet.
     return;
@@ -3859,6 +3863,7 @@ void PPC64JITCore::ComputeHighZeroElision() {
             WriteZero = true;
             if (SrcZero && Elidable) {
               Elide32MaskSet[ID] = true;
+              HighZeroElideSet[ID] = true;
             }
           }
         } else {
@@ -4087,6 +4092,7 @@ void PPC64JITCore::ComputeHighZeroElision() {
           // so in that case only PreZero can carry the fact.
           if (MaskSize && PreZero && !ConsumerElided && Elidable) {
             Elide32MaskSet[ID] = true;
+            HighZeroElideSet[ID] = true;
           }
           WriteZero = PreZero || (MaskSize && !ConsumerElided);
         }

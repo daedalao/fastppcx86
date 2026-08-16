@@ -344,6 +344,20 @@ private:
   fextl::vector<bool> Elide32MaskSet;
   void Compute32MaskElision();
 
+  // The subset of Elide32MaskSet that ComputeHighZeroElision is responsible
+  // for. It exists only so FEX_ZEXTTRAP can tell the two passes' claims apart,
+  // because they are NOT the same claim:
+  //   * producer-side says "the high half is already zero" -- checkable, and a
+  //     nonzero high half there is a real defect;
+  //   * consumer-side says "nothing observes the high half before this value
+  //     dies" -- a nonzero high half there is EXPECTED and correct, and is the
+  //     entire point of that pass.
+  // A trap that tests "is the high half zero" is therefore meaningful for the
+  // first and meaningless for the second. Written only where the producer pass
+  // sets a bit the consumer had not already set (both its write sites are
+  // guarded by !ConsumerElided).
+  fextl::vector<bool> HighZeroElideSet;
+
   // -------------------------------------------------------------------------
   // Producer-side half of the same elision (same FEX_ZEXTOPT=0 kill switch;
   // deliberately NOT a second knob, so the two mechanisms can only be A/B'd
@@ -407,7 +421,11 @@ private:
   void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
-      if (ZExtTrapEnabled()) {
+      // Only the producer-side claim is checkable this way -- see the comment
+      // on HighZeroElideSet. Trapping on a consumer-side elision would fire on
+      // correct code, constantly, because a dirty high half is exactly what
+      // that pass permits.
+      if (ZExtTrapEnabled() && ID < HighZeroElideSet.size() && HighZeroElideSet[ID]) {
         srdi(TMP4, Dst, 32);   // TMP4 = Dst[0:31]
         tdi(24, TMP4, 0);      // TO=24 (NE): trap unless the high half is zero
       }
