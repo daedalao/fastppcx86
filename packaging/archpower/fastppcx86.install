@@ -5,9 +5,16 @@ FastPPCx86 installed.
 
   Getting started:
     FEXRootFSFetcher              # fetch/extract an x86-64 RootFS
+    ppcx86-launch                 # the game launcher (GUI)
+    ppcx86-launch-tui             # the same launcher in a terminal, for ssh
     FEX /path/to/x86_64-binary    # run an x86-64 executable
     FEXBash                       # a bash running under emulation
     FEXConfig                     # GUI for per-application settings
+
+  The launcher finds your installed games, Proton/Wine, DXVK and RootFS images
+  by itself, works out a CPU cage from this machine's topology, and shows the
+  exact command it runs. Nothing is hardcoded; add anything it missed under
+  Locations. `ppcx86-launch --help` lists the non-interactive modes.
 
   Gaming notes, per-title workarounds and tuning:
     /usr/share/doc/fastppcx86/GAMING.md

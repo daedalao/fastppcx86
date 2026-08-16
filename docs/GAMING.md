@@ -8,6 +8,51 @@ Binaries and environment variables keep the historical `FEX` prefix. `FEX` is th
 `FEXBash` runs a shell inside the guest rootfs, `FEXServer` is the background helper that owns the
 rootfs mount and the log socket.
 
+## The launcher
+
+`ppcx86-launch` is the normal way to run a title, and `ppcx86-launch-tui` is the same launcher in a
+terminal for when you are on ssh with no display. Everything below this section is still correct and
+still worth reading — the launcher does not hide it, it performs it and shows you what it did.
+
+What it takes care of, all of which is otherwise manual:
+
+- Finds installed games, emulator builds, RootFS images, thunk sets, Proton, Wine, DXVK and
+  VKD3D-Proton, and lets you add anything it missed. Every one of those is a list you can extend,
+  and any of them can be chosen per title.
+- Derives the CPU cage from this machine's live topology — one NUMA node, N cores, two threads per
+  core — instead of a hardcoded CPU list. It recomputes on every launch, because `ppc64_cpu --smt=N`
+  changes which CPUs are online without renumbering them.
+- Sets `FEX_BIN` and `FEXBASH` together from one choice, so the failure described under
+  [Steam](#steam) — a new build in one and the old build in the other — cannot happen.
+- Forces the XCB window-system environment and resolves `DISPLAY`/`XAUTHORITY`, including the
+  per-boot xauth filename.
+- Arms `FEX_SMCCHECKS` explicitly whenever an SMC recipe is set, which is what stops a stale
+  AppConfig from silently disarming it.
+
+Two views are worth knowing about:
+
+- **Command** shows the exact command the launch runs, generated from the same call that performs
+  it. Copy it to reproduce a run in a terminal or to attach to a bug report.
+- **Verify** reads the `FEX_*` environment back off the live process and compares it with what was
+  asked for, and flags a `/proc/<pid>/exe` that has become `(deleted)`. That is the
+  [troubleshooting](#troubleshooting) ritual below, performed for you — worth using any time a flag
+  appears to have done nothing.
+
+Non-interactive modes, which go through the same code as the GUI:
+
+```sh
+ppcx86-launch --list             # configured titles
+ppcx86-launch --print <id>       # the exact command, without running it
+ppcx86-launch --launch <id>      # run it and stream the output
+ppcx86-launch --paths            # every configured location, and whether it is usable
+ppcx86-launch --cage             # this host's topology and the cage it produces
+ppcx86-launch --recipes          # the tuning recipes and knobs, with the reasoning
+```
+
+Titles, locations and per-title tuning live in `$XDG_CONFIG_HOME/fex-emu/Launcher/Titles.json`.
+Paths are stored exactly as typed, with `~` and `$VARS` expanded only when used, so that file
+survives being copied to another machine.
+
 ## Prerequisites
 
 **A 4K-page kernel.** The self-modifying-code tracker (`SMCChecks=mtrack`, the default)

@@ -1,0 +1,54 @@
+{
+  "Comment": [
+    "Per-title tuning hints for the FastPPCx86 launcher (ppcx86-launch).",
+    "",
+    "These are measurements that hold on any POWER8/9 host, so they are worth",
+    "shipping rather than leaving each user to rediscover. The launcher offers a",
+    "matching hint when a title is imported, shows the 'Why' text, and applies it",
+    "only if the user agrees. It never overwrites a value already set on a title.",
+    "",
+    "Match on 'AppId' when the Steam appid is known and verified -- it identifies a",
+    "title exactly. Match on 'Basename' otherwise; it is a good guess but not a",
+    "certainty, since plenty of games ship a binary called 'game' or 'launcher'.",
+    "",
+    "Every entry needs a 'Why' that says what was measured. A hint without evidence",
+    "is folklore, and folklore is what this file exists to replace. See",
+    "docs/GAMING.md for the full write-ups.",
+    "",
+    "Keys are bare FEX option names; the launcher exports each as FEX_<KEY>."
+  ],
+  "Version": 1,
+  "Hints": [
+    {
+      "Match": { "Basename": "witcher3.exe", "AppId": 292030 },
+      "Fex": { "HOSTFEATURES": "enableavx" },
+      "Why": "The Witcher 3 will not load a save without AVX advertised: with enableavx removed and everything else identical it crashes, confirmed 2026-08-15. This is a correctness setting for this title, not a performance one, so do not remove it to 'fix' the AVX cost. AVX is hidden by default on this port because POWER's vector units are 128-bit and 256-bit YMM ops decompose into pairs plus spill traffic."
+    },
+    {
+      "Match": { "Basename": "Cyberpunk2077.exe", "AppId": 1091500 },
+      "Fex": { "SPINCOLLAPSE": "128" },
+      "Why": "Spin-loop collapse is the largest measured per-title win on this port. On the built-in benchmark scene under hardware TSO: p50 frametime 51.64 -> 32.66 ms, p99 ~156 -> 75 ms, scene fps 17.43 -> 27.94 (+60%), with no overlap between arms. K=128 rather than 32 comes from a 16/32/64/128 sweep: the medians are close but K=128 is far more consistent (mean spread 0.7% against 6.2%), and the failure mode this feature was held opt-in for shows up as variance, not as a worse median. AVX is deliberately absent here: enableavx measured -3.1% scene fps and +26% p99 on this title."
+    },
+    {
+      "Match": { "Basename": "Moonlighter.x86_64" },
+      "Fex": {
+        "SMCCHECKS": "mtrack",
+        "SMCSOFTINVALIDATE": "1",
+        "SMCLAZYINVAL": "1",
+        "SMCLAZYLINK": "1",
+        "SMCFILEIMMUTABLE": "1"
+      },
+      "Why": "Lazy invalidation measured better than strict, which measured about the same as off. Lazy linking is included because without it ExitFunctionLink became the hottest symbol in a combat profile at 7.3%; with it that drops to 0.10%, and the improvement scales with the number of on-screen entities. Note this title is entity-count bound rather than invalidation bound, so do not expect an SMC recipe to fix a crowded scene."
+    },
+    {
+      "Match": { "Basename": "Ziggurat.x86_64" },
+      "Fex": { "SPINLOOPCLAMPAUTO": "1" },
+      "Why": "Automatic spin-loop clamping was short-circuiting around 1017 library spin loops in this title, which is a measurable performance win. It is no longer load-bearing for correctness: the finalize spin it was originally added for was re-diagnosed as a JIT flags-clobber bug and fixed in eb1a4c858. This is a performance opt-in only."
+    },
+    {
+      "Match": { "Basename": "StardewValley" },
+      "Fex": { "SMCCHECKS": "mtrack" },
+      "Why": "Stardew Valley runs on .NET CoreCLR, which generates code at runtime and therefore needs the SMC tracker. It is listed explicitly because an AppConfig setting SMCChecks=none wedges this title at startup, and that failure gives no diagnostic -- every SMC feature gates on mtrack and simply stays off."
+    }
+  ]
+}
