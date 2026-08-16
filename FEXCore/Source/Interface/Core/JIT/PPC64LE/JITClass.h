@@ -384,9 +384,33 @@ private:
   void ComputeHighZeroElision();
 
   // Tail-mask emission for i32 GPR results: rldicl unless provably dead.
+  // FEX_ZEXTTRAP=1: never elide the *slot*. Where the mask would have been
+  // dropped, emit a check that the high half really is already zero and trap if
+  // it is not, instead of emitting nothing. Same instrument as FEX_R0TRAP
+  // (BranchOps.cpp) and the same reason for existing: an unsound elision is
+  // otherwise silent, and only shows up much later as a guest fault on a
+  // pointer whose low 32 bits are correct and whose high 32 are stale.
+  //
+  // Turns "somewhere in one of two dataflow passes" into a SIGTRAP at the
+  // exact emission site, with the guest RIP recoverable from the block's RIP
+  // table the same way any other synchronous fault is.
+  //
+  // Costs two instructions per elided slot and clobbers TMP4, which is dead at
+  // every Mask32Tail callsite (the handlers call this after their result is in
+  // Dst, and TMP4 is their constant/scratch register). Diagnostic only -- do
+  // not ship it on, and do not rely on TMP4 being free here for anything else.
+  static bool ZExtTrapEnabled() {
+    static const bool Enabled = getenv("FEX_ZEXTTRAP") != nullptr;
+    return Enabled;
+  }
+
   void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      if (ZExtTrapEnabled()) {
+        srdi(TMP4, Dst, 32);   // TMP4 = Dst[0:31]
+        tdi(24, TMP4, 0);      // TO=24 (NE): trap unless the high half is zero
+      }
       return;
     }
     rldicl(Dst, Dst, 0, 32);
