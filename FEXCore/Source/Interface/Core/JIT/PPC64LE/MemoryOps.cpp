@@ -2042,11 +2042,20 @@ DEF_OP(Fence) {
 
 DEF_OP(Prefetch) {
   auto Op = IROp->C<IR::IROp_Prefetch>();
-  // dcbt hint: 0 = load, 16 = dcbtst (store). CacheLevel/Stream fields are advisory.
-  uint32_t Hint = Op->ForStore ? 16 : 0;
   GPR Addr = GetReg(Op->Addr);
   if (!CTX->Config.Is64BitMode()) { rldicl(TMP3, Addr, 0, 32); Addr = TMP3; }
-  dcbt(r0, Addr, Hint);
+  // PREFETCHW / prefetch-for-store is `dcbtst`, a DIFFERENT OPCODE (XO 246),
+  // not a TH encoding of dcbt. This used to emit `dcbt RA,RB,16`, which the
+  // assembler spells `dcbtt` — a non-transient LOAD touch. The line arrived
+  // shared, so the store the guest was prefetching for still paid the full
+  // read-for-ownership; the store hint was silently dropped. CacheLevel and
+  // Stream stay advisory and unused (their dcbt/dcbtst TH stream encodings
+  // want a measured depth, which we do not have).
+  if (Op->ForStore) {
+    dcbtst(r0, Addr);
+  } else {
+    dcbt(r0, Addr);
+  }
 }
 
 // =========================================================================
