@@ -3376,8 +3376,16 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 //    arithmetic that reads all 64 bits.
 // -------------------------------------------------------------------------
 void PPC64JITCore::Compute32MaskElision() {
+  // FEX_ZEXTOPT=0 turns BOTH elision passes off; FEX_ZEXTOPT_CONSUMER=0 turns
+  // off only this one. The pair exists because the two passes reach the same
+  // Elide32MaskSet from opposite directions, so a wrong tail-mask elision --
+  // which presents as a correct low 32 bits over a stale high half, and a guest
+  // fault the moment the value is used as a pointer -- cannot be attributed to
+  // one of them with a single switch. Bisect with the sub-switches, not by
+  // rebuilding.
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
-  static const bool ZExtOff = ZExtEnv && ZExtEnv[0] == '0';
+  static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
+  static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
   Elide32MaskSet.assign(IR->GetSSACount(), false);
   if (ZExtOff) {
     return;
@@ -3655,8 +3663,11 @@ void PPC64JITCore::Compute32MaskElision() {
 // they enter each block UNKNOWN like everything else.
 // -------------------------------------------------------------------------
 void PPC64JITCore::ComputeHighZeroElision() {
+  // FEX_ZEXTOPT=0 turns BOTH elision passes off; FEX_ZEXTOPT_PRODUCER=0 turns
+  // off only this one. See the matching note in Compute32MaskElision.
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
-  static const bool ZExtOff = ZExtEnv && ZExtEnv[0] == '0';
+  static const char* ProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
+  static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ProducerEnv && ProducerEnv[0] == '0');
   if (ZExtOff) {
     // Compute32MaskElision already sized and cleared Elide32MaskSet.
     return;

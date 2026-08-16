@@ -394,6 +394,13 @@ uint64_t ComputeCodeCacheConfigId() {
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSPLATFUSION") != nullptr));
       const char* ZExtEnv = getenv("FEX_ZEXTOPT");
       Hasher.Add(static_cast<uint64_t>(!(ZExtEnv && ZExtEnv[0] == '0')));
+      // Per-pass halves of the same switch. Hashed separately: each one changes
+      // emitted code on its own, so a cache built with one off is unsound in a
+      // session with it on.
+      const char* ZExtConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
+      Hasher.Add(static_cast<uint64_t>(!(ZExtConsumerEnv && ZExtConsumerEnv[0] == '0')));
+      const char* ZExtProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
+      Hasher.Add(static_cast<uint64_t>(!(ZExtProducerEnv && ZExtProducerEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_FALLTHROUGH") != nullptr));
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
