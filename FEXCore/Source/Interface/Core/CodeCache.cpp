@@ -22,6 +22,7 @@
 #include <git_version.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <xxhash.h>
 
 // ComputeCodeMapId streams the mapped file to derive a content-based cache
@@ -440,6 +441,23 @@ uint64_t ComputeCodeCacheConfigId() {
       HASH_OPT(DISABLESPINLOOPHINT);
       const char* HintAnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
       Hasher.Add(static_cast<uint64_t>(HintAnyEnv && HintAnyEnv[0] == '1'));
+      // The last three block-transfer-era switches that change emitted code and
+      // were missing from this list (same gap class as the four below).
+      // FEX_DEADPROLOGUE is a three-way mode (off / "trap" / "emit"), resolved
+      // here exactly as JIT.cpp's DeadPrologueMode resolves it — unknown values
+      // fall back to Off there, so they hash as Off here too.
+      const char* DeadProEnv = getenv("FEX_DEADPROLOGUE");
+      Hasher.Add(static_cast<uint64_t>(!DeadProEnv                          ? 0 :
+                                       ::strcmp(DeadProEnv, "trap") == 0 ? 1 :
+                                       ::strcmp(DeadProEnv, "emit") == 0 ? 2 :
+                                                                           0));
+      // FEX_ENTRYWATCH is a guest-RIP range whose VALUE picks which entry
+      // points get the watch instrumentation, so the string itself is hashed.
+      const char* EntryWatchEnv = getenv("FEX_ENTRYWATCH");
+      Hasher.Add(std::string_view {EntryWatchEnv ? EntryWatchEnv : ""});
+      // FEX_NO_ABI_LIVEMASK reverts the syscall mini-frame FPR saves to the
+      // full set; presence-DISABLED.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_ABI_LIVEMASK") != nullptr));
       // These four also change emitted code and were simply missing from this
       // list. Unlike BlockLinking below — which is excluded deliberately and
       // says so — nothing documented their absence, so a cache built with any
