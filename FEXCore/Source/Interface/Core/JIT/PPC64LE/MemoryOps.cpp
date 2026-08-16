@@ -1553,8 +1553,14 @@ DEF_OP(MemSet) {
     // dcbz can neither cross a page nor partially write, and blocks are zeroed
     // in increasing address order -- on a fault the destination still holds a
     // byte-exact prefix, and RCX/RDI are still written back only at op end.
+    // FEX_MEMSETDCBZ=0 kill-switch. This path has shipped default-on, but the
+    // 2026-08-15 HWTSO sweep found `rep stosb` losing 7x under PROT_SAO
+    // (92.5 -> 13.3 GB/s) against `rep movsb`'s 2.15x, and the difference
+    // between them is exactly this dcbz. Kept default-on -- the A/B below it
+    // decides whether SAO should turn it off the way it turns off the memcpy
+    // tier. Hashed into the code-cache config id.
     const uint32_t DBlock = CTX->HostFeatures.DCacheLineSize;
-    const bool UseDcbz = DBlock >= 32 && DBlock <= 256 && (DBlock & (DBlock - 1)) == 0;
+    const bool UseDcbz = MemSetDcbzEnabled && DBlock >= 32 && DBlock <= 256 && (DBlock & (DBlock - 1)) == 0;
     const uint32_t DBlockShift = UseDcbz ? static_cast<uint32_t>(std::countr_zero(DBlock)) : 0;
 
     PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
@@ -1796,7 +1802,50 @@ DEF_OP(MemCpy) {
     // deltas in [16, 32) must stay on the 16B tier.
     cmpldi(cr(7), r(0), 32);
 
+    // FEX_MEMCPYDCBZ cache-line tier (contract at MemCpyDcbzEnabled in
+    // JITClass.h). Line size comes from HostFeatures.DCacheLineSize, which is
+    // the kernel's AT_DCACHEBSIZE -- dcbz's block size *is* that value, so it
+    // is never hardcoded here either (same rule as the memset dcbz path). A
+    // power of two in [64, 256] keeps the align mask, the shift and the
+    // 32-byte unroll below well-formed; anything else compiles the tier out.
+    // ★ HARD GATE ON HARDWARE TSO. Measured on op4k 2026-08-15, rep movsb,
+    // 3 interleaved runs at +-0.5%: with FEX_HWTSO=1 this tier is a large
+    // REGRESSION -- 64K 26.2 -> 9.59 GB/s (-63%), 1M 12.5 -> 6.37 (-49%) --
+    // where without it the same code is +18.6% / -0.3%. PROT_SAO penalises
+    // dcbz far harder than ordinary stores (stosb loses 7x under SAO against
+    // movsb's 2.15x), so establishing a line with dcbz stops being a shortcut
+    // and becomes the bottleneck. HWTSO is already in the code-cache config
+    // hash, so a cache built either way stays consistent.
+    const uint32_t CBlock = CTX->HostFeatures.DCacheLineSize;
+    const bool UseDcbzCopy = MemCpyDcbzEnabled && !CTX->IsHardwareTSOSupported() && CBlock >= 64 && CBlock <= 256 &&
+                             (CBlock & (CBlock - 1)) == 0;
+    const uint32_t CBlockShift = UseDcbzCopy ? static_cast<uint32_t>(std::countr_zero(CBlock)) : 0;
+
+    if (UseDcbzCopy) {
+      // TWO-SIDED distance gate, unlike every tier above. Those chunk loops
+      // read a chunk before they write it, so `dst < src` is safe for free and
+      // the unsigned `delta >= N` test passes it trivially. The dcbz tier
+      // WRITES (zeroes) the destination line BEFORE the matching source loads
+      // run, so a source that sits inside the line being zeroed is destroyed:
+      // dst == 0x1000 / src == 0x1040 would zero 0x1040..0x1080 before reading
+      // it. Both directions therefore need real separation, |delta| >= CBlock,
+      // which also makes the per-iteration source and destination lines
+      // disjoint for every iteration (both advance in lockstep by CBlock).
+      //
+      // |x| >= K, unsigned and branch-free: |x| < K iff x is in
+      // [-(K-1), K-1] iff (uint64)(x + K - 1) <= 2K-2, so one biased unsigned
+      // compare decides it. delta is recomputed into TMP3 rather than read out
+      // of r0 because `addi RT,r0,SI` means the LITERAL zero, not register r0.
+      // TMP3 is free from here on (Step is dead once the generic-loop branch
+      // above is behind us) and CR5 survives the alignment loop, which is what
+      // the CR6/CR7 staging trick above is doing for the other tiers.
+      subf(TMP3, TMP2, TMP1);                                          // delta
+      addi(TMP3, TMP3, static_cast<int16_t>(CBlock - 1));              // delta + K-1
+      cmpldi(cr(5), TMP3, static_cast<uint16_t>(2 * CBlock - 1));      // CR5.LT iff |delta| < K
+    }
+
     PPC64Emitter::Label align_loop, chunk_setup, chunk8_setup, chunk16_setup, chunk16_go, chunk16_loop, chunk32_loop, chunk_loop, tail_loop, done;
+    PPC64Emitter::Label dcbz_skip, dcbz_align, dcbz_setup, dcbz_loop;
     Bind(&align_loop);
     cmpdi(TMP4, 0);
     bc(CC_EQ, &done);
@@ -1852,6 +1901,68 @@ DEF_OP(MemCpy) {
     // index. len >= 24 here (>= 32 gated, minus at most one 8B alignment
     // step), so the 16B CTR count is >= 1 and mtctr 0 is impossible.
     li(r(0), 0);
+
+    if (UseDcbzCopy) {
+      // Cache-line tier. Sits ahead of the 32B tier because it subsumes it for
+      // long copies and leaves a < CBlock remainder that the tiers below
+      // finish. Everything it needs is already true here: dst is 16-aligned,
+      // r0 == 0, TMP3 is scratch, VTMP1/VTMP2 are per-op scratch.
+      bc(Cond {12, 20}, &dcbz_skip);  // CR5.LT (BI = 5*4 + 0): |delta| < CBlock
+      // Below two blocks the align-up would dominate, and the bound is also
+      // what makes the CTR count below provably >= 1: alignment eats at most
+      // CBlock-16 bytes, leaving >= CBlock+16.
+      cmpldi(TMP4, static_cast<uint16_t>(2 * CBlock));
+      bc(CC_ULT, &dcbz_skip);
+
+      // Align dst up to a line with 16B copies (dst is 16-aligned already, so
+      // this runs at most CBlock/16 - 1 times). These stores stay 16-aligned
+      // and read before they write, so the byte-exact-prefix fault property
+      // still holds for everything the tier copies BEFORE the first dcbz.
+      Bind(&dcbz_align);
+      andi_(TMP3, TMP1, static_cast<uint16_t>(CBlock - 1));
+      bc(CC_EQ, &dcbz_setup);
+      lxvd2x(VTMP1, TMP2, r(0));
+      stxvd2x(VTMP1, TMP1, r(0));
+      addi(TMP1, TMP1, 16);
+      addi(TMP2, TMP2, 16);
+      addi(TMP4, TMP4, -16);
+      b(&dcbz_align);
+
+      Bind(&dcbz_setup);
+      srdi(TMP3, TMP4, CBlockShift);                          // whole lines left
+      mtctr(TMP3);
+      andi_(TMP4, TMP4, static_cast<uint16_t>(CBlock - 1));   // remainder for the tiers below
+      li(TMP3, 16);                                           // second-lane RB index
+      Bind(&dcbz_loop);
+      // TMP1 is line-aligned here, so dcbz's truncation to a block boundary is
+      // a no-op and the line it establishes is exactly the one the CBlock/32
+      // store pairs below overwrite in full -- no destination read, and no
+      // byte of the line is left holding the zeroes.
+      dcbz(r(0), TMP1);
+      for (uint32_t Offset = 0; Offset < CBlock; Offset += 32) {
+        lxvd2x(VTMP1, TMP2, r(0));
+        lxvd2x(VTMP2, TMP2, TMP3);
+        stxvd2x(VTMP1, TMP1, r(0));
+        stxvd2x(VTMP2, TMP1, TMP3);
+        addi(TMP1, TMP1, 32);
+        addi(TMP2, TMP2, 32);
+      }
+      bdnz(&dcbz_loop);
+      // Falls through with TMP4 < CBlock and dst still line- (hence 32/16/8-)
+      // aligned. The tiers below are NOT entered unconditionally from here:
+      // chunk16_go does `srdi count,len,4; mtctr; bdnz` with no zero check,
+      // because its only other predecessor guarantees len >= 24. A line-exact
+      // copy leaves len == 0, and mtctr 0 makes bdnz run 2^64 times -- a
+      // 16-byte-per-iteration walk straight off the end of the mapping. Route
+      // anything below one 16B chunk to chunk8_setup, which does test for a
+      // zero count (and whose byte tail tests for zero too).
+      cmpldi(TMP4, 16);
+      bc(CC_ULT, &chunk8_setup);
+      // len >= 16 here, so chunk16_go's count is >= 1; the 32B tier keeps its
+      // own len >= 64 gate, so its count is still >= 2.
+      Bind(&dcbz_skip);
+    }
+
     // 32B tier: 2x-unrolled lxvd2x/stxvd2x. Gates mirror the 16B tier's:
     //   - CR7.LT set (delta < 32): a forward delta in [16, 32) is a legal
     //     self-replicating pattern for 32B chunks to break; the 16B tier is
@@ -2042,11 +2153,20 @@ DEF_OP(Fence) {
 
 DEF_OP(Prefetch) {
   auto Op = IROp->C<IR::IROp_Prefetch>();
-  // dcbt hint: 0 = load, 16 = dcbtst (store). CacheLevel/Stream fields are advisory.
-  uint32_t Hint = Op->ForStore ? 16 : 0;
   GPR Addr = GetReg(Op->Addr);
   if (!CTX->Config.Is64BitMode()) { rldicl(TMP3, Addr, 0, 32); Addr = TMP3; }
-  dcbt(r0, Addr, Hint);
+  // PREFETCHW / prefetch-for-store is `dcbtst`, a DIFFERENT OPCODE (XO 246),
+  // not a TH encoding of dcbt. This used to emit `dcbt RA,RB,16`, which the
+  // assembler spells `dcbtt` — a non-transient LOAD touch. The line arrived
+  // shared, so the store the guest was prefetching for still paid the full
+  // read-for-ownership; the store hint was silently dropped. CacheLevel and
+  // Stream stay advisory and unused (their dcbt/dcbtst TH stream encodings
+  // want a measured depth, which we do not have).
+  if (Op->ForStore) {
+    dcbtst(r0, Addr);
+  } else {
+    dcbt(r0, Addr);
+  }
 }
 
 // =========================================================================

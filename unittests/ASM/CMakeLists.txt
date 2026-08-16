@@ -87,6 +87,13 @@ foreach(ASM_SRC ${ASM_SOURCES})
       list(APPEND FEX_ARGS_LIST "FEX_SMCCHECKS=full")
     endif()
 
+    # The PPC64LE dcbz MemCpy tier is opt-in, so its boundary test has to ask
+    # for it explicitly or it would only ever exercise the 32B tier. Ignored
+    # by every other backend.
+    if (TEST_NAME MATCHES "dcbz128")
+      list(APPEND FEX_ARGS_LIST "FEX_MEMCPYDCBZ=1")
+    endif()
+
     add_test(NAME ${TEST_NAME}
       COMMAND "python3" "${CMAKE_SOURCE_DIR}/Scripts/testharness_runner.py"
       "${CMAKE_SOURCE_DIR}/unittests/ASM/Known_Failures"

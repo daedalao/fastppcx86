@@ -386,15 +386,36 @@ uint64_t ComputeCodeCacheConfigId() {
       HASH_OPT(DISABLESPINLOOPHINT);
       const char* HintAnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
       Hasher.Add(static_cast<uint64_t>(HintAnyEnv && HintAnyEnv[0] == '1'));
-      // Hash the EFFECTIVE collapse K (0 = off), mirroring the backend parse
-      // (JIT.cpp ctor; default K lives in JITClass.h kSpinCollapseKDefault=8).
-      const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
-      uint64_t SpinK = 0;
-      if (SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0') {
-        const long V = strtol(SpinEnv, nullptr, 10);
-        SpinK = (V >= 2 && V <= 1024) ? static_cast<uint64_t>(V) : 8;
-      }
-      Hasher.Add(SpinK);
+      // These four also change emitted code and were simply missing from this
+      // list. Unlike BlockLinking below — which is excluded deliberately and
+      // says so — nothing documented their absence, so a cache built with any
+      // of them flipped would have been reused by a session with it unflipped.
+      // Latent rather than live, since EnableCodeCachingWIP is off by default,
+      // but it is exactly the shape of bug that costs a week when it does bite.
+      // Mind the types: SpinLoopClamp and ForceTSODisplacements are `str`,
+      // SpinLoopClampAuto is `uint32`, the other two are `bool`.
+      HASH_OPT(DISABLECMPBRANCHFUSION);
+      HASH_OPT(DISABLESCALARSPLATCHAIN);
+      HASH_STR_OPT(SPINLOOPCLAMP);
+      HASH_OPT(SPINLOOPCLAMPAUTO);
+      HASH_STR_OPT(FORCETSODISPLACEMENTS);
+
+      // Spin collapse changes the emitted Sub and CondJump inside every matched
+      // spin region, so the raw option value is part of the block identity.
+      // This used to re-parse getenv here and substitute a sentinel 8 for
+      // "enabled but out of range", where the JIT ran K=32 — consistent, but
+      // only by accident, and it read like a bug. Now that SpinCollapse is a
+      // real config option there is one value and no second parse to drift.
+      HASH_OPT(SPINCOLLAPSE);
+      // FEX_MEMCPYDCBZ adds a dcbz cache-line tier to the REP MOVSB fast path,
+      // so MemCpy blocks differ byte-for-byte with it on. Mirrors JIT.cpp's
+      // parse (any non-empty, non-"0" value enables).
+      const char* DcbzEnv = getenv("FEX_MEMCPYDCBZ");
+      Hasher.Add(static_cast<uint64_t>(DcbzEnv && DcbzEnv[0] != '\0' && DcbzEnv[0] != '0'));
+      // FEX_MEMSETDCBZ=0 removes the dcbz block-zero path from every rep-stos
+      // block. Only an explicit "0" disables, mirroring JIT.cpp's parse.
+      const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
+      Hasher.Add(static_cast<uint64_t>(!(SetDcbzEnv && SetDcbzEnv[0] == '0')));
     }
 
     // The scope option itself, because it decides whether the process runs as a

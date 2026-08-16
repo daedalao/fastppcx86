@@ -3498,18 +3498,19 @@ DEF_OP(VFCMPUNO) {
   const auto Dst = GetVReg(Node);
   const auto V1  = GetVReg(Op->Vector1);
   const auto V2  = GetVReg(Op->Vector2);
+  // uno = !(a==a && b==b) is literally NAND, so xxlnand folds the trailing
+  // complement into the AND: 3 instructions instead of 4. (xxl* addresses
+  // VTMP1/VTMP2 = v30/v31 = vs62/vs63 exactly as xxland already does here.)
   switch (ElemSz) {
   case IR::OpSize::i32Bit:
     vcmpeqfp(VTMP1, V1, V1);
     vcmpeqfp(VTMP2, V2, V2);
-    vand    (VTMP1, VTMP1, VTMP2);   // ord
-    vnot    (Dst,   VTMP1);          // uno = !ord
+    xxlnand (Dst,   VTMP1, VTMP2);   // uno = !(ord)
     break;
   case IR::OpSize::i64Bit:
     xvcmpeqdp(VTMP1, V1, V1);
     xvcmpeqdp(VTMP2, V2, V2);
-    xxland   (VTMP1, VTMP1, VTMP2);
-    xxlnor   (Dst,   VTMP1, VTMP1);
+    xxlnand  (Dst,   VTMP1, VTMP2);
     break;
   default: Op_Unhandled(IROp, Node); break;
   }
@@ -4219,16 +4220,16 @@ DEF_OP(VFCMPScalarInsert) {
     }
     break;
   case IR::FloatCompareOp::UNO:
+    // !(a==a && b==b) — one xxlnand instead of AND + complement (see the
+    // matching fold in DEF_OP(VFCMPUNO)).
     if (Is32) {
       vcmpeqfp(VTMP1, Vec1, Vec1);
       vcmpeqfp(VTMP2, Vec2, Vec2);
-      vand    (VTMP1, VTMP1, VTMP2);
-      vnor    (VTMP1, VTMP1, VTMP1);
+      xxlnand (VTMP1, VTMP1, VTMP2);
     } else {
       xvcmpeqdp(VTMP1, Vec1, Vec1);
       xvcmpeqdp(VTMP2, Vec2, Vec2);
-      xxland   (VTMP1, VTMP1, VTMP2);
-      xxlnor   (VTMP1, VTMP1, VTMP1);
+      xxlnand  (VTMP1, VTMP1, VTMP2);
     }
     break;
   }

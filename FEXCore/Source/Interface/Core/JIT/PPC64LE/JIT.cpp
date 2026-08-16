@@ -2503,18 +2503,37 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
     SpinHintAnyLoop = AnyEnv && AnyEnv[0] == '1';
   }
 
-  // FEX_SPINCOLLAPSE=1: batched budget decrement for counted spin loops
-  // (opt-in while the per-app exposure is gathered; see the contract at
-  // kSpinCollapseK in JITClass.h). Hashed into the code-cache config id.
+  // Batched budget decrement for counted spin loops (contract at
+  // kSpinCollapseK in JITClass.h). A real config option rather than a bare
+  // getenv, so it is reachable from AppConfig -- which is the only per-title
+  // mechanism this port has, and the measured -36.8% p50 / -52% p99 on
+  // Cyberpunk 2077 was otherwise impossible to persist for that title.
+  // FEX_SPINCOLLAPSE keeps working: the option is named SpinCollapse, so the
+  // generated environment spelling is unchanged.
+  //   0 = off, 1 = on at the default K, 2..1024 = on at that K, >1024 = default K.
   {
-    const char* SpinEnv = getenv("FEX_SPINCOLLAPSE");
-    SpinCollapseEnabled = SpinEnv && SpinEnv[0] != '\0' && SpinEnv[0] != '0';
-    if (SpinCollapseEnabled) {
-      const long V = strtol(SpinEnv, nullptr, 10);
-      if (V >= 2 && V <= 1024) {
-        kSpinCollapseK = static_cast<uint16_t>(V);
-      }
+    const uint32_t V = FEXCore::Config::Get_SPINCOLLAPSE()();
+    SpinCollapseEnabled = V != 0;
+    if (V >= 2 && V <= 1024) {
+      kSpinCollapseK = static_cast<uint16_t>(V);
     }
+  }
+
+  // FEX_MEMCPYDCBZ=1: dcbz cache-line store tier in the REP MOVSB fast path
+  // (contract at MemCpyDcbzEnabled in JITClass.h). Opt-in for the alignment-
+  // interrupt and fault-granularity reasons documented there. Hashed into the
+  // code-cache config id.
+  {
+    const char* DcbzEnv = getenv("FEX_MEMCPYDCBZ");
+    MemCpyDcbzEnabled = DcbzEnv && DcbzEnv[0] != '\0' && DcbzEnv[0] != '0';
+  }
+
+  // FEX_MEMSETDCBZ=0: turn OFF the long-shipping memset dcbz path (default on).
+  // Only an explicit "0" disables, so an unset/empty value keeps the shipped
+  // behaviour. Hashed into the code-cache config id.
+  {
+    const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
+    MemSetDcbzEnabled = !(SetDcbzEnv && SetDcbzEnv[0] == '0');
   }
 
   // SMC interlocks: two fork features are only sound when every constant-target

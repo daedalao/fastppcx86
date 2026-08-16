@@ -502,6 +502,15 @@ public:
     return MemcpyAtomicTSOEmulationEnabled;
   }
 
+  // Whether ordering is being carried by the HARDWARE (ppc64le FEX_HWTSO =
+  // PROT_SAO pages) rather than by emitted barriers. Distinct from
+  // !IsMemcpyAtomicTSOEnabled(), which is also false when TSO is simply off.
+  // Backends need this directly because SAO changes the COST of instructions,
+  // not just which ones are needed -- see the dcbz gate in PPC64LE MemoryOps.
+  bool IsHardwareTSOSupported() const {
+    return SupportsHardwareTSO;
+  }
+
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
     SupportsHardwareTSO = HardwareTSOSupported;
     UpdateAtomicTSOEmulationConfig();
