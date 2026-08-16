@@ -1843,6 +1843,14 @@ public:
     }
   }
 
+  // Kill switch for the shifted-32 rule in LoadImm64 below (FEX_NOSHIFTIMM32).
+  // Presence-DISABLED, mirroring FEX_NOXERARITH / FEX_NOSPLATFUSION. Hashed
+  // into ComputeCodeCacheConfigId because it changes emitted block bytes.
+  static bool DisableShiftedImm32() {
+    static const bool Disabled = getenv("FEX_NOSHIFTIMM32") != nullptr;
+    return Disabled;
+  }
+
   // Load a 64-bit immediate into a register (up to 5 instructions)
   void LoadImm64(GPR rt, uint64_t imm) {
     if (imm == 0) {
@@ -1884,6 +1892,35 @@ public:
       li(rt, -1);
       rldic(rt, rt, lo, 63 - hi);
       return;
+    }
+    // Shifted 32-bit immediate: imm == (v << tz) with v <= 0x7FFF_FFFF. Three
+    // instructions (lis + ori + sldi) instead of the general path's four.
+    //
+    // Reached only after the shifted-16 rule above declined, which means
+    // v > 0x7FFF and LoadImm32 therefore takes its lis+ori arm -- so this is
+    // always exactly 3, never 2 (the 2-insn forms were already claimed) and
+    // never worse than the 4 below.
+    //
+    // The v <= 0x7FFF_FFFF bound is what makes it sound: LoadImm32 materialises
+    // a SIGN-EXTENDED 32-bit value via lis, and `sldi rt,rt,tz`
+    // (= rldicr rt,rt,tz,63-tz) keeps the rotated low bits without re-masking
+    // the top, so a v with bit 31 set would leave ones above bit 31+tz. At
+    // v <= 0x7FFF_FFFF bit 31 is clear, lis+ori produces exactly v with a zero
+    // upper half, and the shift is exact.
+    //
+    // Who this pays: 64-bit guest RIPs in the Proton PE range (0x1_4000_0000+),
+    // where a quarter of addresses are 4-byte aligned enough to qualify --
+    // every constant block exit and every guest CALL's pushed return address
+    // materialises one. Nothing else in the emitter depends on LoadImm64's
+    // width (LoadImm64Fixed is the fixed-window form and is untouched).
+    if (!DisableShiftedImm32()) {
+      const unsigned tz = std::countr_zero(imm);
+      const uint64_t v = imm >> tz;
+      if (tz > 0 && v <= 0x7FFFFFFFull) {
+        LoadImm32(rt, static_cast<uint32_t>(v));
+        sldi(rt, rt, tz);
+        return;
+      }
     }
     // Full 64-bit load: lis + ori + sldi 32 + oris + ori
     uint32_t hi = static_cast<uint32_t>(imm >> 32);

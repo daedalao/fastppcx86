@@ -375,6 +375,11 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // Shifted-32 rule in LoadImm64 (CodeEmitter/PPC64LE/Emitter.h
+      // DisableShiftedImm32): presence-DISABLED; changes how wide the constant
+      // load is at every 64-bit guest-RIP materialisation, so it changes
+      // emitted block bytes and every downstream branch displacement.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSHIFTIMM32") != nullptr));
       // XER arithmetic-write kill switch (PPC64Emitter.h XERArithDisabled):
       // presence-DISABLED; flips every CA/OV write helper between the addic/
       // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.
