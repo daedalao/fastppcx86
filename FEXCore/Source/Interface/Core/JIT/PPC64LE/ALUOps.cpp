@@ -3,6 +3,7 @@
 #include "Interface/Context/Context.h"
 #include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
+#include "Interface/IR/PPC64Immediates.h"
 
 namespace FEXCore::CPU {
 
@@ -53,6 +54,109 @@ static inline bool SplitAddisAddi(int64_t V, int16_t& Hi, int16_t& Lo) {
   Hi = static_cast<int16_t>(H);
   Lo = static_cast<int16_t>(L);
   return true;
+}
+
+// -------------------------------------------------------------------------
+// Rotate-and-mask AND lowering (FEX_PPCLOGICALIMM=0 kill switch).
+//
+// DEF_OP(And) used to materialise EVERY inline constant with LoadConstant and
+// then `and`, which is up to five instructions of constant building on every
+// execution of the block for something PPC encodes in one. The classification
+// itself lives in Interface/IR/PPC64Immediates.h and is shared verbatim with
+// the IR frontend's InlineLogical predicate -- that sharing is the point. If
+// the two ever disagree the frontend inlines a constant this file then has to
+// rebuild by hand, which is strictly worse than not inlining it at all, so
+// there is exactly one definition of "PPC can mask with this".
+//
+// The worst case is the highest-frequency one. OpcodeDispatcher.cpp's 8/16-bit
+// ALU promotion rewrites `and al,0x0F` into _And(i64, dst, 0xFFFFFFFFFFFFFF0F)
+// -- a full-width AND with an inverted mask -- precisely because AArch64 folds
+// such a constant into its `and` immediate for free. Here it lowers to a single
+// `rldimi Dst, r0, 4, 56`: insert the zero register's low field over LE bits
+// 4..7 and leave every other bit of Dst alone.
+//
+// Two invariants these forms must not break, both of which andi./andis. DO
+// break and which is why they are banned from DEF_OP(And):
+//   * CR0. Every rotate form here reaches EmitM/EmitMD with rc = 0
+//     (CodeEmitter/PPC64LE/Emitter.h), so the packed NZCV that downstream
+//     LoadNZCV consumers read out of CR0 survives.
+//   * XER. None of these instructions writes XER at all, so XER.CA -- FEX's
+//     canonical x86 CF storage when CFInverted is true, see the warning at the
+//     top of DEF_OP(Ashr) -- is untouched.
+//
+// rldimi is a read-modify-write of its destination (RA <- inserted | RA & ~m),
+// so Dst must already hold S1; that costs an `mr` when the allocator did not
+// coalesce them. Two instructions instead of one is still the right trade
+// against LoadConstant + and.
+// -------------------------------------------------------------------------
+static bool LogicalImmEnabled() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("FEX_PPCLOGICALIMM");
+    return !(Env && Env[0] == '0');
+  }();
+  return Enabled;
+}
+
+// Dst = S1 & Mask, using one or two rotate-and-mask instructions. Returns false
+// when the mask is not a shape PPC can express, leaving the caller to fall back
+// to LoadConstant + and.
+//
+// Is32Bit must be exactly `IROp->Size == i32Bit`: only there is the upper half
+// of the result unobservable (Mask32Tail either zero-extends it or
+// Compute32MaskElision proved it dead), which is what lets ClassifyAndMask
+// judge the constant by its low 32 bits.
+static bool EmitAndMask(PPC64Emitter::Emitter& E, PPC64Emitter::GPR Dst, PPC64Emitter::GPR S1, uint64_t Mask, bool Is32Bit) {
+  if (!LogicalImmEnabled()) {
+    return false;
+  }
+  using Kind = FEXCore::IR::PPC64::AndMaskKind;
+  const auto Form = FEXCore::IR::PPC64::ClassifyAndMask(Mask, Is32Bit);
+  switch (Form.Kind) {
+  case Kind::None: return false;
+  case Kind::Zero: E.li(Dst, 0); return true;
+  case Kind::Move:
+    if (Dst != S1) {
+      E.mr(Dst, S1);
+    }
+    return true;
+  case Kind::ClearLeft: E.rldicl(Dst, S1, 0, Form.MB); return true;
+  case Kind::ClearRight: E.rldicr(Dst, S1, 0, Form.ME); return true;
+  case Kind::Word: E.rlwinm(Dst, S1, 0, Form.MB, Form.ME); return true;
+  case Kind::InsertZeroField:
+    // rldimi reads Dst, so it has to be primed. r0 is the JIT's pinned zero
+    // register (PPC64Dispatcher.cpp), and this is a plain RS field -- not one
+    // of the D-form "RA == 0 means literal zero" positions -- so it really does
+    // read GPR[0] == 0 and insert zeros.
+    if (Dst != S1) {
+      E.mr(Dst, S1);
+    }
+    E.rldimi(Dst, r0, Form.SH, Form.MB);
+    return true;
+  case Kind::ClearBoth:
+    // Clear above the run, then below it. The second instruction reads Dst,
+    // which the first has already written, so Dst aliasing S1 is fine.
+    E.rldicl(Dst, S1, 0, Form.MB);
+    E.rldicr(Dst, Dst, 0, Form.ME);
+    return true;
+  }
+  return false;
+}
+
+// Record-form subset of the above, for the ops that MUST leave CR0 holding the
+// AND result (AndWithFlags, TestNZ). Only rldicl. and rlwinm. exist as record
+// forms in the emitter; rldicr/rldimi are Rc=0 only, so those mask classes fall
+// through to LoadConstant + and. here rather than silently dropping the flags.
+static bool EmitAndMaskRc(PPC64Emitter::Emitter& E, PPC64Emitter::GPR Dst, PPC64Emitter::GPR S1, uint64_t Mask, bool Is32Bit) {
+  if (!LogicalImmEnabled()) {
+    return false;
+  }
+  using Kind = FEXCore::IR::PPC64::AndMaskKind;
+  const auto Form = FEXCore::IR::PPC64::ClassifyAndMask(Mask, Is32Bit);
+  switch (Form.Kind) {
+  case Kind::ClearLeft: E.rldicl_(Dst, S1, 0, Form.MB); return true;
+  case Kind::Word: E.rlwinm_(Dst, S1, 0, Form.MB, Form.ME); return true;
+  default: return false;
+  }
 }
 
 // =========================================================================
@@ -657,6 +761,15 @@ DEF_OP(Or) {
       ori(Dst, S1, static_cast<uint16_t>(Const));
     } else if ((Const & 0xFFFF0000ull) == Const) {
       oris(Dst, S1, static_cast<uint16_t>(Const >> 16));
+    } else if (LogicalImmEnabled() && Const <= 0xFFFFFFFFull) {
+      // Both halves non-zero (either-half-zero was handled above). oris+ori is
+      // two instructions with no scratch and no allocatable register; the
+      // LoadConstant path below needs two to three (lis+ori, plus clrldi once
+      // bit 31 is set, because LoadImm32 sign-extends) AND the register-form
+      // `or`. Neither instruction sets Rc or touches XER, so this keeps the
+      // flag-neutrality DEF_OP(Or) is required to have.
+      oris(Dst, S1, static_cast<uint16_t>(Const >> 16));
+      ori(Dst, Dst, static_cast<uint16_t>(Const & 0xFFFF));
     } else {
       LoadConstant(TMP4, Const);
       or_(Dst, S1, TMP4);
@@ -670,13 +783,18 @@ DEF_OP(Or) {
 DEF_OP(And) {
   // Plain `_And` is flag-neutral — avoid PPC `andi.`/`andis.` (always Rc=1)
   // because they wipe CR0 and that breaks downstream LoadNZCV consumers.
+  // The rotate-and-mask forms EmitAndMask emits are Rc=0 and write no XER, so
+  // they are legal here where the andi. family is not — see the block comment
+  // above EmitAndMask.
   auto Op  = IROp->C<IR::IROp_And>();
   auto Dst = GetReg(Node);
   auto S1  = GetReg(Op->Src1);
   uint64_t Const;
   if (IsInlineConstant(Op->Src2, &Const)) {
-    LoadConstant(TMP4, Const);
-    and_(Dst, S1, TMP4);
+    if (!EmitAndMask(*this, Dst, S1, Const, IROp->Size == IR::OpSize::i32Bit)) {
+      LoadConstant(TMP4, Const);
+      and_(Dst, S1, TMP4);
+    }
   } else {
     and_(Dst, S1, GetReg(Op->Src2));
   }
@@ -693,6 +811,11 @@ DEF_OP(Xor) {
       xori(Dst, S1, static_cast<uint16_t>(Const));
     } else if ((Const & 0xFFFF0000ull) == Const) {
       xoris(Dst, S1, static_cast<uint16_t>(Const >> 16));
+    } else if (LogicalImmEnabled() && Const <= 0xFFFFFFFFull) {
+      // Same two-instruction, no-scratch, no-register form as DEF_OP(Or); the
+      // two halves are disjoint bit ranges so the XORs compose.
+      xoris(Dst, S1, static_cast<uint16_t>(Const >> 16));
+      xori(Dst, Dst, static_cast<uint16_t>(Const & 0xFFFF));
     } else {
       LoadConstant(TMP4, Const);
       xor_(Dst, S1, TMP4);
@@ -709,8 +832,14 @@ DEF_OP(Andn) {
   auto Dst = GetReg(Node);
   uint64_t Const;
   if (IsInlineConstant(Op->Src2, &Const)) {
-    LoadConstant(TMP4, ~Const);
-    and_(Dst, GetReg(Op->Src1), TMP4);
+    // The mask actually applied is ~Const, so that is what gets classified —
+    // and it is the more likely of the two to be a contiguous run, because
+    // `Andn` is how the dispatcher spells "clear these bits".
+    auto S1 = GetReg(Op->Src1);
+    if (!EmitAndMask(*this, Dst, S1, ~Const, IROp->Size == IR::OpSize::i32Bit)) {
+      LoadConstant(TMP4, ~Const);
+      and_(Dst, S1, TMP4);
+    }
   } else {
     andc(Dst, GetReg(Op->Src1), GetReg(Op->Src2));
   }
@@ -919,9 +1048,19 @@ DEF_OP(AndWithFlags) {
   auto S1  = GetReg(Op->Src1);
   uint64_t Const;
   if (IsInlineConstant(Op->Src2, &Const)) {
+    // Every arm here must leave CR0 holding the AND result and must not write
+    // XER (the addco below owns CA/OV). andi./andis. and the record-form
+    // rotates all satisfy that; the Rc=0 rotate forms DEF_OP(And) uses do not,
+    // which is why this goes through EmitAndMaskRc's smaller repertoire.
     if ((Const & 0xFFFF) == Const) {
       andi_(Dst, S1, static_cast<uint16_t>(Const));  // andi. sets CR0
-    } else {
+    } else if (LogicalImmEnabled() && (Const & 0xFFFF0000ull) == Const) {
+      // andis. is the exact upper-half counterpart of andi. and was simply
+      // missing: masks like 0x00FF0000 fell all the way to LoadConstant.
+      andis_(Dst, S1, static_cast<uint16_t>(Const >> 16));  // andis. sets CR0
+      // rldicl. / rlwinm. produce bit-for-bit the value `and.` would, and set
+      // CR0 from that same 64-bit result, so N/Z come out identical.
+    } else if (!EmitAndMaskRc(*this, Dst, S1, Const, IROp->Size == IR::OpSize::i32Bit)) {
       LoadConstant(TMP4, Const);
       and__(Dst, S1, TMP4);  // and. sets CR0
     }
@@ -1970,9 +2109,14 @@ DEF_OP(TestNZ) {
   auto S1 = GetReg(Op->Src1);
   uint64_t Const;
   if (IsInlineConstant(Op->Src2, &Const)) {
+    // Same CR0-setting / XER-preserving requirement as DEF_OP(AndWithFlags):
+    // only andi., andis. and the record-form rotates qualify.
     if ((Const & 0xFFFF) == Const) {
       andi_(TMP3, S1, static_cast<uint16_t>(Const));   // sets CR0 from full 64-bit
-    } else {
+    } else if (LogicalImmEnabled() && (Const & 0xFFFF0000ull) == Const) {
+      andis_(TMP3, S1, static_cast<uint16_t>(Const >> 16));  // sets CR0 from full 64-bit
+      // Value and CR0 identical to the and. this replaces.
+    } else if (!EmitAndMaskRc(*this, TMP3, S1, Const, IROp->Size == IR::OpSize::i32Bit)) {
       LoadConstant(TMP4, Const);
       and__(TMP3, S1, TMP4);
     }
