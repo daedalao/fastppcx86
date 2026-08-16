@@ -1,0 +1,15 @@
+{
+  "Comment": [
+    "Hardware TSO via PROT_SAO. Litmus-proven on POWER8/hash (2026-08-13) and the",
+    "configuration every 08-15/16 W3 session ran; on a host that cannot do SAO the",
+    "startup probe refuses and FEX falls back to emitted barriers on its own, so",
+    "this is safe to ship unconditionally.",
+    "",
+    "HostFeatures deliberately absent: 'enableavx' was measured at -16% on this",
+    "title (2026-08-10 A/B) and lived in a deployed copy of this file only as",
+    "AVX-high-bank test residue. Do not add it back without re-measuring."
+  ],
+  "Config": {
+    "HWTSO": "1"
+  }
+}
