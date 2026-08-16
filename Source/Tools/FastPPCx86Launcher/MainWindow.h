@@ -37,6 +37,13 @@ public:
   MainWindow();
   ~MainWindow() override;
 
+protected:
+  /// A running title's stdout/stderr feed through the Runner's pipe, so
+  /// destroying the window mid-run would close the read end and the title's
+  /// next write would take SIGPIPE -- a silent kill at an arbitrary later
+  /// moment. Ask, and on "stop" bring the process group down cleanly first.
+  void closeEvent(QCloseEvent* Event) override;
+
 private slots:
   void OnTitleSelected();
   void OnLaunch();

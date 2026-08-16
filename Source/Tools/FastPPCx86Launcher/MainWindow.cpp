@@ -12,6 +12,7 @@
 
 #include <QAction>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QFormLayout>
@@ -38,6 +39,8 @@
 #include <QVBoxLayout>
 
 #include <fmt/format.h>
+
+#include <unistd.h>
 
 #include <filesystem>
 
@@ -764,6 +767,36 @@ void MainWindow::OnStop() {
     Run->RequestStop();
     W->RunStatus->setText(tr("Asked the title to stop..."));
   }
+}
+
+void MainWindow::closeEvent(QCloseEvent* Event) {
+  if (Run && Run->Running()) {
+    const auto Choice = QMessageBox::question(this, tr("A title is still running"),
+                                              tr("Quitting now would leave the title writing into a closed pipe, and its next line of "
+                                                 "output would kill it with SIGPIPE at some arbitrary later moment.\n\n"
+                                                 "Stop the title (and everything it spawned) and quit?"),
+                                              QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+    if (Choice != QMessageBox::Yes) {
+      Event->ignore();
+      return;
+    }
+    // Bounded synchronous wind-down: SIGTERM the group, give it three seconds
+    // to exit, then SIGKILL. Poll() keeps draining output into the log so the
+    // shutdown lines are captured.
+    Run->RequestStop();
+    for (int I = 0; I < 30 && Run->Running(); ++I) {
+      Run->Poll(nullptr);
+      ::usleep(100 * 1000);
+    }
+    if (Run->Running()) {
+      Run->Kill();
+      for (int I = 0; I < 20 && Run->Running(); ++I) {
+        Run->Poll(nullptr);
+        ::usleep(100 * 1000);
+      }
+    }
+  }
+  QMainWindow::closeEvent(Event);
 }
 
 void MainWindow::OnPollRunner() {
