@@ -401,6 +401,15 @@ uint64_t ComputeCodeCacheConfigId() {
         SpinK = (V >= 2 && V <= 1024) ? static_cast<uint64_t>(V) : 8;
       }
       Hasher.Add(SpinK);
+      // FEX_MEMCPYDCBZ adds a dcbz cache-line tier to the REP MOVSB fast path,
+      // so MemCpy blocks differ byte-for-byte with it on. Mirrors JIT.cpp's
+      // parse (any non-empty, non-"0" value enables).
+      const char* DcbzEnv = getenv("FEX_MEMCPYDCBZ");
+      Hasher.Add(static_cast<uint64_t>(DcbzEnv && DcbzEnv[0] != '\0' && DcbzEnv[0] != '0'));
+      // FEX_MEMSETDCBZ=0 removes the dcbz block-zero path from every rep-stos
+      // block. Only an explicit "0" disables, mirroring JIT.cpp's parse.
+      const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
+      Hasher.Add(static_cast<uint64_t>(!(SetDcbzEnv && SetDcbzEnv[0] == '0')));
     }
 
     // The scope option itself, because it decides whether the process runs as a

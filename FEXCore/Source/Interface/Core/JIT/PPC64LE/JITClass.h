@@ -469,6 +469,51 @@ private:
   // ever coarsens — its worst case is exiting early).
   fextl::vector<bool> SpinCollapseBranchSigned;
 
+  // -------------------------------------------------------------------------
+  // FEX_MEMCPYDCBZ=1 (opt-in): cache-line store tier for the forward REP MOVSB
+  // fast path in DEF_OP(MemCpy). A copy loop normally moves THREE lines of
+  // traffic per line copied — read source, read-for-ownership the destination,
+  // write destination back — because a partial-line store must fetch the line
+  // it is about to overwrite. `dcbz` establishes the destination line in the
+  // cache as zeroes WITHOUT reading it, so a loop that dcbz's a whole line and
+  // then writes all of it pays only source-read + destination-write. That is
+  // the one non-temporal-store-shaped lever POWER8 has, and it is why glibc's
+  // own POWER memset is built on dcbz.
+  //
+  // TWO REASONS THIS IS OPT-IN RATHER THAN DEFAULT-ON, both structural:
+  //
+  //  1. CACHE-INHIBITED STORAGE. dcbz on caching-inhibited or write-through
+  //     memory raises an alignment interrupt instead of zeroing. DEF_OP(MemSet)
+  //     already accepts that exposure for `rep stosb`, but `rep movsb` reaches
+  //     strictly more memory: a guest memcpy into a Vulkan/GL mapping that the
+  //     host driver made uncached (see the vkMapMemory notes) would take a
+  //     SIGBUS it does not take today. Nothing visible in the JIT can tell the
+  //     two kinds of guest pointer apart.
+  //
+  //  2. FAULT GRANULARITY. Every other tier in that op guarantees that a fault
+  //     mid-copy leaves the destination holding a byte-exact PREFIX of the
+  //     copy. dcbz writes the destination line before the corresponding source
+  //     loads run, so a faulting load leaves up to one line of zeroes past the
+  //     prefix. FEX writes guest RCX/RSI/RDI back only at op end, so a handler
+  //     that fixes the fault and returns re-runs the whole copy and the zeroes
+  //     are overwritten; only a handler that *inspects* the partial
+  //     destination can tell, and it could already not trust RCX.
+  //     A second-order version of the same thing: when BOTH the source and the
+  //     destination are unmapped, the dcbz faults on the destination where the
+  //     load used to fault on the source, so si_addr changes. Same signal,
+  //     same faulting guest instruction.
+  //
+  // Hashed into the code-cache config id (CodeCache.cpp) — blocks compiled
+  // with the tier are not interchangeable with blocks compiled without it.
+  // -------------------------------------------------------------------------
+  bool MemCpyDcbzEnabled {};
+
+  // FEX_MEMSETDCBZ=0: kill-switch for the LONG-SHIPPING dcbz block-zero path
+  // in DEF_OP(MemSet). Default ON (unchanged behaviour) — this exists so the
+  // path can be A/B'd under FEX_HWTSO, where PROT_SAO makes dcbz
+  // disproportionately expensive (see the gate comment in MemoryOps.cpp).
+  bool MemSetDcbzEnabled {true};
+
   bool IsSpinCollapseSub(IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     return ID < SpinCollapseSubs.size() && SpinCollapseSubs[ID];

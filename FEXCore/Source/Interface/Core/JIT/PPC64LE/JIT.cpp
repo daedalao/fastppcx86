@@ -2517,6 +2517,23 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
     }
   }
 
+  // FEX_MEMCPYDCBZ=1: dcbz cache-line store tier in the REP MOVSB fast path
+  // (contract at MemCpyDcbzEnabled in JITClass.h). Opt-in for the alignment-
+  // interrupt and fault-granularity reasons documented there. Hashed into the
+  // code-cache config id.
+  {
+    const char* DcbzEnv = getenv("FEX_MEMCPYDCBZ");
+    MemCpyDcbzEnabled = DcbzEnv && DcbzEnv[0] != '\0' && DcbzEnv[0] != '0';
+  }
+
+  // FEX_MEMSETDCBZ=0: turn OFF the long-shipping memset dcbz path (default on).
+  // Only an explicit "0" disables, so an unset/empty value keeps the shipped
+  // behaviour. Hashed into the code-cache config id.
+  {
+    const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
+    MemSetDcbzEnabled = !(SetDcbzEnv && SetDcbzEnv[0] == '0');
+  }
+
   // SMC interlocks: two fork features are only sound when every constant-target
   // exit re-probes the lookup path, which is exactly what a established direct
   // link bypasses.
