@@ -89,23 +89,56 @@ constexpr auto VZERO_VSX = VSXR{14};
 //   * VZERO_VSX guarantees ONLY dw0 == 0 after an arbitrary host call.
 //     Consumers must not read its full 128 bits across one (xxpermdi
 //     selecting B.dw0 is fine; a full-width xxlor copy is not).
+//     SWEPT 2026-08-16, exhaustively: the backend contains six reads of
+//     VZERO_VSX and every one is an xxpermdi that takes its dw0 only —
+//     PPC64Emitter.cpp LoadFPRSized (DM=0, XA), ALUOps.cpp ×2 (DM=0b00, XB),
+//     VectorOps.cpp VBSL-tail (DM=0b00, XA) and the PCLMUL pair (XB with
+//     DM = SrcNDw << 1, whose low bit is 0 by construction). Zero full-width
+//     consumers. The rule to keep: as XA the DM HIGH bit must be 0, as XB the
+//     DM LOW bit must be 0; anything else reads the volatile half.
+//   * VTMP3_VSX (vs12) is caller-saved outright, so its rule is stronger —
+//     "not live across a host call" — and it also holds, verified the same
+//     day. Its only lifetime longer than adjacent instructions is the AES
+//     byte-reverse mask park, and CompileCode kills that on every
+//     non-AES-family IR op and at every block bind (the AES handlers' own
+//     Op_Unhandled bail paths call InvalidateAESCache explicitly). Every
+//     other use — the SpillStaticRegs/FillStaticRegs bank permutes, the
+//     pre-3.0 StoreUnalignedV128 / StoreFPRSized swaps, the FMA scalar-insert
+//     third splat slot — is consumed by the very next instruction.
 //   * Do NOT pin any full-width vector constant in vs14-vs31. An AES
 //     byte-reverse mask briefly lived in vs15 on this theory and produced
 //     garbage AES for any guest code path that had made the wrong host call
 //     first. Materialize such constants per-use (see EmitAESLoadMask:
 //     vspltisb + lvsl@0 + vsububm, 4 instructions, no memory).
 //   * The AVX-high bank below has the same exposure for YMM highs whenever
-//     host calls occur without a SpillStaticRegs sync. AUDITED 2026-08-14:
-//     every `bctrl` emitted by this backend was walked (JIT/PPC64LE ALUOps,
-//     AtomicOps, BranchOps, VectorOps, X87Ops, JIT.cpp, PPC64Dispatcher) and
-//     all of them run behind SpillForABICall or a bare SpillStaticRegs, so
-//     the bank is in State.avx_high[] before any host code runs — including
+//     host calls occur without a SpillStaticRegs sync. AUDITED 2026-08-14 and
+//     RE-WALKED 2026-08-16: every `bctrl` emitted by this backend (JIT/PPC64LE
+//     ALUOps, AtomicOps, BranchOps, VectorOps, X87Ops, JIT.cpp,
+//     PPC64Dispatcher) runs behind SpillForABICall or a bare SpillStaticRegs,
+//     so the bank is in State.avx_high[] before any host code runs — including
 //     the two FABI callsites, which reach the host only through the bridge
 //     stubs' own SpillForFABICall/FillForFABICall pair (details in the bank
-//     comment below). SpillSRA's mcontext read was the one place the false
-//     "callee-saved" premise still governed behaviour; it is now gated on the
-//     crossing sentinel. What is left before AVX can be default-ON is
-//     re-measurement (the 2026-08-10 W3 -16% A/B), not this bank's safety.
+//     comment below). That finding stands; no FABI stub needs a dw1 save pair.
+//
+//     What the bctrl walk STRUCTURALLY COULD NOT FIND, and what actually held
+//     AVX back, is host code that runs on JIT registers without the JIT having
+//     emitted a call at all. Three such holes existed; all three are closed:
+//       - SpillSRA's mcontext read (gated on the crossing sentinel 2026-08-14,
+//         and on the frame's MSR_VSX validity bit 2026-08-16);
+//       - PPC64ContextBackup, which saved fp_regs (dw0) and no dw1 at all, so
+//         every guest-signal round trip returned all 16 YMM upper halves torn
+//         (fixed 2026-08-16, MContext_ppc64le.h VSXDW1);
+//       - the FEX_SMCSTOREBACKPATCH shared tail, a helper call GRAFTED over an
+//         ordinary JIT store by the SIGSEGV handler, which saved v0-v19 but no
+//         bank (fixed 2026-08-16, LinuxSyscalls/SMCStoreBackpatch.cpp).
+//     Binding rule for anything new of that shape — a fault handler that
+//     patches a call into JIT code, a bridge that reads JIT registers out of a
+//     ucontext, a resume path that rebuilds a frame: it owns the bank itself.
+//     "The JIT spills before every call it makes" says nothing about code the
+//     JIT did not emit.
+//
+//     What is left before AVX can be default-ON is re-measurement (the
+//     2026-08-10 W3 -16% A/B), not this bank's safety.
 
 // -------------------------------------------------------------------------
 // AVX-high VSX bank: guest YMM_hi[i] pinned in vs(16+i) == f(16+i).
@@ -152,7 +185,19 @@ constexpr auto VZERO_VSX = VSXR{14};
 //    skips the capture whenever InSyscallInfo is armed (the same
 //    "already spilled, don't touch" rule its GPR loop applies per-register) —
 //    State.avx_high[] is authoritative there, published by the crossing's
-//    SpillStaticRegs before the sentinel was raised.
+//    SpillStaticRegs before the sentinel was raised. The read is additionally
+//    gated on the frame actually carrying a dw1 region: the kernel appends it
+//    only when MSR_VSX is set in the frame's saved MSR, and one SpillSRA caller
+//    (GdbServer's catch-all host handler) is not gated on WasInJIT at all.
+//  * Guest-signal RESUME is a separate, harsher case, and it is why dw0-only
+//    thinking cost this bank twice. An INJIT delivery does not re-enter through
+//    FillStaticRegs; it resumes at the ORIGINAL NIP with the live register
+//    file, so PPC64ContextBackup's save/restore pair IS the bank's persistence
+//    across a guest signal handler. It saved fp_regs and called that the FP
+//    file — dw0 only — so every such round trip put back the interrupted
+//    context's HIGH qwords over the guest handler's LOW qwords, in all 16
+//    slots. MContext_ppc64le.h now carries VSXDW1[32] for the other half; keep
+//    any future addition to that struct symmetric with it.
 //  * VSX-form instructions only (same rule as VTMP3_VSX/VZERO_VSX);
 //    PushCalleeSavedRegisters already saves/restores f14-f31 on dispatcher
 //    entry, protecting the host caller's values.
