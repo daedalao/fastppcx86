@@ -1736,14 +1736,32 @@ DEF_OP(MemSet) {
     // dcbz can neither cross a page nor partially write, and blocks are zeroed
     // in increasing address order -- on a fault the destination still holds a
     // byte-exact prefix, and RCX/RDI are still written back only at op end.
-    // FEX_MEMSETDCBZ=0 kill-switch. This path has shipped default-on, but the
-    // 2026-08-15 HWTSO sweep found `rep stosb` losing 7x under PROT_SAO
-    // (92.5 -> 13.3 GB/s) against `rep movsb`'s 2.15x, and the difference
-    // between them is exactly this dcbz. Kept default-on -- the A/B below it
-    // decides whether SAO should turn it off the way it turns off the memcpy
-    // tier. Hashed into the code-cache config id.
+    // FEX_MEMSETDCBZ=0 kill-switch, default on. Still on where it has always
+    // been on; the open question this comment used to carry -- "whether SAO
+    // should turn it off the way it turns off the memcpy tier" -- is now
+    // answered yes, and the tier is HARD-GATED ON HARDWARE TSO exactly like
+    // UseDcbzCopy below.
+    //
+    // The evidence, and honestly what kind it is. Two things were measured on
+    // op4k 2026-08-15: `rep stosb` loses 7x under PROT_SAO (92.5 -> 13.3 GB/s)
+    // where `rep movsb` loses only 2.15x, and the memcpy dcbz tier under
+    // FEX_HWTSO=1 is a large REGRESSION (64K 26.2 -> 9.59 GB/s, 1M 12.5 ->
+    // 6.37) against +18.6% / -0.3% with SAO off. What was NOT run is a direct
+    // memset-tier-on/off A/B under HWTSO. It does not need to be: the two paths
+    // differ only in what establishes the destination line, both establish it
+    // with dcbz, and SAO's penalty falls on the dcbz -- which is why the fill
+    // that is almost entirely dcbz (stosb, 7x) loses more than the copy that
+    // is dcbz plus loads and stores (movsb, 2.15x). The memset case is the
+    // a-fortiori one; leaving it on under SAO would have been keeping the
+    // worse half of a trade already measured as bad in its milder form.
+    // If someone does run that A/B and it comes out the other way, this gate
+    // is the one line to delete.
+    //
+    // HWTSO is already in the code-cache config hash, so a cache built either
+    // way stays consistent and this gate needs no hash entry of its own.
     const uint32_t DBlock = CTX->HostFeatures.DCacheLineSize;
-    const bool UseDcbz = MemSetDcbzEnabled && DBlock >= 32 && DBlock <= 256 && (DBlock & (DBlock - 1)) == 0;
+    const bool UseDcbz = MemSetDcbzEnabled && !CTX->IsHardwareTSOSupported() && DBlock >= 32 && DBlock <= 256 &&
+                         (DBlock & (DBlock - 1)) == 0;
     const uint32_t DBlockShift = UseDcbz ? static_cast<uint32_t>(std::countr_zero(DBlock)) : 0;
 
     PPC64Emitter::Label align_loop, chunk_setup, chunk_loop, tail_loop, done;
