@@ -396,6 +396,11 @@ uint64_t ComputeCodeCacheConfigId() {
       // SpinLoopClampAuto is `uint32`, the other two are `bool`.
       HASH_OPT(DISABLECMPBRANCHFUSION);
       HASH_OPT(DISABLESCALARSPLATCHAIN);
+      // Aligned 128-bit vector lowering: with it on, an $Align-certified
+      // LoadMem/StoreMem is one lvx/stvx; with it off it is the two-instruction
+      // lxvd2x+xxpermdi / xxpermdi+stxvd2x pair. Different bytes for the same
+      // guest instruction, so the two are not interchangeable in a cache.
+      HASH_OPT(DISABLEALIGNEDVECTORLDST);
       HASH_STR_OPT(SPINLOOPCLAMP);
       HASH_OPT(SPINLOOPCLAMPAUTO);
       HASH_STR_OPT(FORCETSODISPLACEMENTS);

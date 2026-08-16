@@ -948,6 +948,24 @@
           "which is exactly the kind of data-dependent corruption that wants a field kill switch of its own."
         ]
       },
+      "DisableAlignedVectorLdSt": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the PPC64LE aligned 128-bit vector load/store lowering (FEX_DISABLEALIGNEDVECTORLDST=1 turns it OFF).",
+          "When a 128-bit LoadMem/StoreMem (and their TSO forms) carries an IR $Align that certifies a 16-byte boundary -- movaps/movapd/movdqa",
+          "and every legacy-SSE m128 operand, i.e. exactly the encodings x86 #GPs on when misaligned -- the backend emits a single lvx/stvx.",
+          "On POWER8 LE those byte-reverse the whole quadword, producing byte-for-byte the register image the default lowering builds with",
+          "lxvd2x + xxpermdi (load) or xxpermdi-into-VTMP3_VSX + stxvd2x (store), so it halves the instruction count of every aligned vector",
+          "access. movups/movdqu/lddqu and ALL VEX-encoded 128-bit memory operands are flagged 1-byte-aligned by the frontend and keep the",
+          "unaligned lowering.",
+          "The reason this is a switch and not just a fast path: lvx/stvx MASK the effective address to a 16-byte boundary instead of faulting.",
+          "A guest that runs movaps on a genuinely misaligned pointer -- which real x86 answers with #GP -- used to work by accident here and",
+          "now silently accesses the containing aligned quadword instead. That only affects already-broken guest code, but it converts an",
+          "accident into silent data corruption, so the old lowering stays one env var away. Hashed into the code-cache config id."
+        ]
+      },
+
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",
