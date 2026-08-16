@@ -4635,6 +4635,41 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // below) skip it -- backward intra-unit edges emit their own poke in
       // DEF_OP(Jump)/DEF_OP(CondJump).
       EmitSuspendInterruptCheck();
+      // ---------------------------------------------------------------------
+      // DO NOT replace this stdu with a fixed reserve carved out of the
+      // dispatcher's own frame. It looks like pure per-block overhead -- one
+      // stdu here, one matching addi in ResetStack at every exit -- and an
+      // audit (notes/2026-08-15-agent-reports/block-overhead-audit.md, "V5")
+      // proposed exactly that, rated medium risk. It is not medium risk, it is
+      // wrong, and the failure mode is silent.
+      //
+      // A JIT block does NOT always run on a dispatcher frame. Guest signal
+      // delivery re-enters the JIT mid-dispatcher with r1 pointing somewhere
+      // else entirely:
+      //
+      //   SignalDelegator::HandleDispatcherGuestSignal calls StoreThreadState,
+      //   which stamps a PPC64ContextBackup onto the host stack and does
+      //   SetSp(ucontext, NewSP) with NewSP == &Backup; the same function then
+      //   does SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA).
+      //
+      //   That entry point is recorded in PPC64Dispatcher.cpp *after*
+      //   PushCalleeSavedRegisters() runs, so no dispatcher frame is allocated
+      //   on this path at all.
+      //
+      // So blocks inside a guest signal handler execute with r1 == &Backup.
+      // Today that is safe precisely BECAUSE of the stdu below: each block
+      // moves r1 down and spills beneath the backup. Take the stdu away and
+      // spill slots resolve to [r1 + kSpillSlotPrefix + slot*32] measured from
+      // &Backup -- slot 0 lands in PPC64ContextBackup's 128-byte LinkageArea
+      // pad and every slot after it overwrites the saved host context that
+      // sigreturn restores from. Wrong guest state, no crash, arbitrarily far
+      // from the cause.
+      //
+      // The per-block stdu is not overhead. It is what makes JIT frames nest,
+      // which they must. A reserve taken at every JIT-*entry* boundary would
+      // nest correctly, but that is a dispatcher plus signal-path redesign
+      // with a matching pop at every exit -- not this.
+      // ---------------------------------------------------------------------
       if (SpillFrameSize) {
         // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
         // For larger frames, emit the equivalent of stdu manually so callers
