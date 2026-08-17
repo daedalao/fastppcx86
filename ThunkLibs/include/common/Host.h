@@ -932,8 +932,29 @@ public:
 
   template<typename T, typename... Args>
   T* New(Args&&... args) {
+    // The OBJECT is aligned to max(alignof(T), 16). The STACK POINTER handed
+    // back is 8 below it, which is not an accident: both the x86-64 and the
+    // modern i386 psABI require ESP/RSP == 0 (mod 16) at the CALL instruction,
+    // so at function ENTRY -- after the return-address push -- the callee
+    // expects RSP == 8 (mod 16) on x86-64 and ESP == 12 (mod 16) on i386. The
+    // dispatcher's callback prologue (PPC64Dispatcher ExecuteJITCallback)
+    // pushes 16 resp. 12 bytes for the CallbackReturn trampoline, both of
+    // which preserve residue-8, so an SP == 8 (mod 16) here lands the guest
+    // callback on a correctly call-shaped stack in both modes.
+    //
+    // The previous version aligned only to alignof(T) (8 for these packed-args
+    // structs), so every callback ran its guest function on an ABI-misaligned
+    // stack. Compiler-generated `movaps` to stack locals in the callback's
+    // callees would #GP on real x86 hardware; FEX's old vector lowering
+    // silently absorbed the misalignment, and the aligned lvx/stvx tier is
+    // what finally caught it (FEX_ALIGNTRAP, vkcube, 2026-08-16: guest
+    // `movaps %xmm0, 0x20(%rsp)` with RSP == 12 mod 16, two frames below a
+    // thunk callback).
     Next -= sizeof(T);
-    Next &= ~uintptr_t {alignof(T) - 1};
+    constexpr uintptr_t ObjAlign = alignof(T) > 16 ? alignof(T) : 16;
+    Next &= ~(ObjAlign - 1);
+    T* Obj = reinterpret_cast<T*>(Next);
+    Next -= 8; // SP == 8 (mod 16); the object stays untouched above it.
     // Next > Top catches the wrap when Top is small; the second test catches
     // the runaway. Plain fprintf+abort because LOGMAN_THROW headers aren't in
     // this TU.
@@ -942,7 +963,7 @@ public:
       std::abort();
     }
     FEX::HLE::MoveGuestStack(Next);
-    return new (reinterpret_cast<void*>(Next)) T {std::forward<Args>(args)...};
+    return new (reinterpret_cast<void*>(Obj)) T {std::forward<Args>(args)...};
   }
 };
 #endif
