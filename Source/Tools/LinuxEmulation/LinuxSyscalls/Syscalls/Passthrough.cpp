@@ -6,6 +6,7 @@ tags: LinuxSyscalls|syscalls-shared
 $end_info$
 */
 
+#include "Common/CPUInfo.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/ThreadManager.h"
@@ -21,6 +22,7 @@ $end_info$
 
 #include <FEXCore/IR/IR.h>
 
+#include <algorithm>
 #include <errno.h>
 #include <stdint.h>
 #include <sched.h>
@@ -769,12 +771,83 @@ static uint64_t WrappedSchedSetattr(FEXCore::Core::CpuStateFrame* Frame, uint64_
   return Result;
 }
 
+// The guest sees a dense CPU id space [0, MappedCPUCount) while the host's
+// online ids can be sparse (POWER8 SMT4-of-8: 80 online, max id 155). Affinity
+// masks and getcpu results must be translated at the boundary in BOTH
+// directions or careful guests mis-pin and per-CPU-indexed arrays overflow.
 static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t cpusetsize, uint64_t mask) {
-  const uint64_t Result = SyscallPassthrough3<SYSCALL_DEF(sched_setaffinity)>(Frame, pid, cpusetsize, mask);
+  cpu_set_t HostSet;
+  CPU_ZERO(&HostSet);
+  const size_t GuestBytes = std::min<size_t>(cpusetsize, sizeof(cpu_set_t));
+  FaultSafeUserMemAccess::VerifyIsReadable(reinterpret_cast<const void*>(mask), GuestBytes);
+  const auto* GuestMask = reinterpret_cast<const uint8_t*>(mask);
+  const uint32_t GuestCount = FEX::CPUInfo::MappedCPUCount();
+  bool AnyMapped = false;
+  for (uint32_t Bit = 0; Bit < std::min<uint32_t>(GuestBytes * 8, GuestCount); ++Bit) {
+    if (GuestMask[Bit / 8] & (1u << (Bit % 8))) {
+      CPU_SET(FEX::CPUInfo::MapGuestToHostCPU(Bit), &HostSet);
+      AnyMapped = true;
+    }
+  }
+  uint64_t Result;
+  if (!AnyMapped) {
+    // The kernel rejects a mask with no runnable CPU in it.
+    Result = -EINVAL;
+  } else {
+    Result = ::syscall(SYSCALL_DEF(sched_setaffinity), pid, sizeof(HostSet), &HostSet);
+    if (Result == static_cast<uint64_t>(-1)) {
+      Result = -errno;
+    }
+  }
   if (FEX::HLE::ThreadCensus::Enabled()) {
     const bool Readable = GuestStructReadable(mask, Result);
     FEX::HLE::ThreadCensus::OnSetAffinity(static_cast<int64_t>(pid), Readable ? reinterpret_cast<const uint8_t*>(mask) : nullptr,
                                           Readable ? cpusetsize : 0, static_cast<int64_t>(Result));
+  }
+  return Result;
+}
+
+static uint64_t WrappedSchedGetaffinity(FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t cpusetsize, uint64_t mask) {
+  // Mirror the kernel's argument contract against the guest's fictional
+  // nr_cpu_ids: the length must be a multiple of the word size and large
+  // enough for every reportable CPU.
+  const uint32_t GuestCount = FEX::CPUInfo::MappedCPUCount();
+  const size_t NeededBytes = ((GuestCount + 63) / 64) * 8;
+  if ((cpusetsize & (sizeof(uint64_t) - 1)) || cpusetsize < NeededBytes) {
+    return -EINVAL;
+  }
+  cpu_set_t HostSet;
+  CPU_ZERO(&HostSet);
+  const uint64_t Result = ::syscall(SYSCALL_DEF(sched_getaffinity), pid, sizeof(HostSet), &HostSet);
+  if (Result == static_cast<uint64_t>(-1)) {
+    return -errno;
+  }
+  FaultSafeUserMemAccess::VerifyIsWritable(reinterpret_cast<void*>(mask), NeededBytes);
+  auto* GuestMask = reinterpret_cast<uint8_t*>(mask);
+  memset(GuestMask, 0, NeededBytes);
+  for (uint32_t Bit = 0; Bit < GuestCount; ++Bit) {
+    const uint32_t HostID = FEX::CPUInfo::MapGuestToHostCPU(Bit);
+    if (HostID < CPU_SETSIZE && CPU_ISSET(HostID, &HostSet)) {
+      GuestMask[Bit / 8] |= 1u << (Bit % 8);
+    }
+  }
+  return NeededBytes;
+}
+
+static uint64_t WrappedGetcpu(FEXCore::Core::CpuStateFrame* Frame, uint64_t cpu, uint64_t node, uint64_t tcache) {
+  uint32_t HostCPU {};
+  uint32_t HostNode {};
+  const uint64_t Result = ::syscall(SYSCALL_DEF(getcpu), cpu ? &HostCPU : nullptr, node ? &HostNode : nullptr, nullptr);
+  if (Result == static_cast<uint64_t>(-1)) {
+    return -errno;
+  }
+  if (cpu) {
+    FaultSafeUserMemAccess::VerifyIsWritable(reinterpret_cast<void*>(cpu), sizeof(uint32_t));
+    *reinterpret_cast<uint32_t*>(cpu) = FEX::CPUInfo::MapHostToGuestCPU(HostCPU);
+  }
+  if (node) {
+    FaultSafeUserMemAccess::VerifyIsWritable(reinterpret_cast<void*>(node), sizeof(uint32_t));
+    *reinterpret_cast<uint32_t*>(node) = HostNode;
   }
   return Result;
 }
@@ -921,7 +994,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(fremovexattr, SyscallPassthrough2<SYSCALL_DEF(fremovexattr)>);
   REGISTER_SYSCALL_IMPL(tkill, SyscallPassthrough2<SYSCALL_DEF(tkill)>);
   REGISTER_SYSCALL_IMPL(sched_setaffinity, WrappedSchedSetaffinity);
-  REGISTER_SYSCALL_IMPL(sched_getaffinity, SyscallPassthrough3<SYSCALL_DEF(sched_getaffinity)>);
+  REGISTER_SYSCALL_IMPL(sched_getaffinity, WrappedSchedGetaffinity);
   REGISTER_SYSCALL_IMPL(io_setup, SyscallPassthrough2<SYSCALL_DEF(io_setup)>);
   REGISTER_SYSCALL_IMPL(io_destroy, SyscallPassthrough1<SYSCALL_DEF(io_destroy)>);
   REGISTER_SYSCALL_IMPL(io_submit, SyscallPassthrough3<SYSCALL_DEF(io_submit)>);
@@ -959,7 +1032,7 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(open_by_handle_at, SyscallPassthrough3<SYSCALL_DEF(open_by_handle_at)>);
   REGISTER_SYSCALL_IMPL(syncfs, SyscallPassthrough1<SYSCALL_DEF(syncfs)>);
   REGISTER_SYSCALL_IMPL(setns, SyscallPassthrough2<SYSCALL_DEF(setns)>);
-  REGISTER_SYSCALL_IMPL(getcpu, SyscallPassthrough3<SYSCALL_DEF(getcpu)>);
+  REGISTER_SYSCALL_IMPL(getcpu, WrappedGetcpu);
   REGISTER_SYSCALL_IMPL(kcmp, SyscallPassthrough5<SYSCALL_DEF(kcmp)>);
   REGISTER_SYSCALL_IMPL(sched_setattr, WrappedSchedSetattr);
   REGISTER_SYSCALL_IMPL(sched_getattr, SyscallPassthrough4<SYSCALL_DEF(sched_getattr)>);

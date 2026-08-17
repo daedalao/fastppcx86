@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "VDSO_Emulation.h"
 
+#include "Common/CPUInfo.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/Types.h"
 
@@ -110,6 +111,9 @@ namespace x64 {
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
       int Result = FHU::Syscalls::getcpu(args->cpu, args->node);
+      if (Result == 0 && args->cpu) {
+        *args->cpu = FEX::CPUInfo::MapHostToGuestCPU(*args->cpu);
+      }
       args->rv = SyscallRet(Result);
     }
 
@@ -195,7 +199,11 @@ namespace x64 {
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
-      args->rv = VDSOHandlers::GetCPUPtr(args->cpu, args->node);
+      const auto Result = VDSOHandlers::GetCPUPtr(args->cpu, args->node);
+      if (Result == 0 && args->cpu) {
+        *args->cpu = FEX::CPUInfo::MapHostToGuestCPU(*args->cpu);
+      }
+      args->rv = Result;
     }
 
     static void getrandom(void* ArgsRV) {
@@ -316,6 +324,9 @@ namespace x32 {
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
       int Result = FHU::Syscalls::getcpu(args->cpu, args->node);
+      if (Result == 0 && args->cpu) {
+        *args->cpu = FEX::CPUInfo::MapHostToGuestCPU(*args->cpu);
+      }
       args->rv = SyscallRet(Result);
     }
   } // namespace glibc
@@ -411,7 +422,11 @@ namespace x32 {
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
-      args->rv = VDSOHandlers::GetCPUPtr(args->cpu, args->node);
+      const auto Result = VDSOHandlers::GetCPUPtr(args->cpu, args->node);
+      if (Result == 0 && args->cpu) {
+        *args->cpu = FEX::CPUInfo::MapHostToGuestCPU(*args->cpu);
+      }
+      args->rv = Result;
     }
   } // namespace VDSO
 
