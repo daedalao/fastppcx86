@@ -950,9 +950,14 @@
       },
       "DisableAlignedVectorLdSt": {
         "Type": "bool",
-        "Default": "false",
+        "Default": "true",
         "Desc": [
           "Kill switch for the PPC64LE aligned 128-bit vector load/store lowering (FEX_DISABLEALIGNEDVECTORLDST=1 turns it OFF).",
+          "DEFAULT FLIPPED TO DISABLED 2026-08-16: native-guest vkcube SEGVs with the tier on and runs with it off, bisected by kill",
+          "switch on an otherwise-identical binary (JIT-side confirmed via new-FEX/old-thunks x old-FEX/new-thunks; TSO arms exonerated",
+          "via TSOENABLED=0; a movdqa/movdqu byte-order oracle passes all six shapes, so the basic data path is right and the defect is",
+          "in a narrower arm or a wrong $Align certification). Wine/DXVK titles ran green with it on, which is exactly why a silent",
+          "guest-side corruption cannot be shipped default-on. Re-enable per-title or flip back once the failing shape is root-caused.",
           "When a 128-bit LoadMem/StoreMem (and their TSO forms) carries an IR $Align that certifies a 16-byte boundary -- movaps/movapd/movdqa",
           "and every legacy-SSE m128 operand, i.e. exactly the encodings x86 #GPs on when misaligned -- the backend emits a single lvx/stvx.",
           "On POWER8 LE those byte-reverse the whole quadword, producing byte-for-byte the register image the default lowering builds with",
