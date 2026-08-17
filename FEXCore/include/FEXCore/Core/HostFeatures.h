@@ -28,6 +28,11 @@ struct HostFeatures {
   bool SupportsTSODisp16 {};
   bool SupportsRAND {};
   bool SupportsAVX {};
+  // Advertisement-only gate: when false, CPUID leaf 7 stops reporting AVX2
+  // while CPUID.1 AVX (and the backend's YMM lowering) stay intact, so guests
+  // that hard-require AVX still launch but their runtime dispatch falls back
+  // to SSE/AVX1 kernels. Only consulted when SupportsAVX is advertised.
+  bool SupportsAVX2 {};
   bool SupportsSVE128 {};
   bool SupportsSVE256 {};
   bool SupportsSHA {};

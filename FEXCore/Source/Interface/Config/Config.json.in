@@ -105,7 +105,9 @@
           "ENABLESSE4A": "enablesse4a",
           "DISABLESSE4A": "disablesse4a",
           "ENABLEMOPS": "enablemops",
-          "DISABLEMOPS": "disablemops"
+          "DISABLEMOPS": "disablemops",
+          "ENABLEAVX2": "enableavx2",
+          "DISABLEAVX2": "disableavx2"
         },
         "Desc": [
           "Allows controlling of the CPU features in the JIT.",
