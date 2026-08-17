@@ -852,26 +852,50 @@ struct VmxAddrForm {
   GPR RB;
 };
 
+// FEX_ALIGNTRAP=1: verify, at runtime, that every effective address the
+// aligned lvx/stvx tier consumes really is 16-byte aligned, and trap at the
+// access that is not. The tier MASKS a misaligned EA silently (that is lvx's
+// architecture), so a wrong $Align certification upstream corrupts data with
+// no fault anywhere near the cause — this turns it into a SIGTRAP at the
+// exact guest instruction whose operand lied. Same instrument family as
+// FEX_ZEXTTRAP / FEX_R0TRAP: diagnostic only, not hashed into the cache id,
+// do not run with code caching on. Costs 2-3 instructions per aligned access
+// and clobbers TMP4 (dead here: MakeVmxAddr uses TMP3 only, the value being
+// moved lives in a VR, and no GPR result is live across these arms).
+static bool AlignTrapEnabled() {
+  static const bool Enabled = getenv("FEX_ALIGNTRAP") != nullptr;
+  return Enabled;
+}
+
 static VmxAddrForm MakeVmxAddr(PPC64EmitterBase& E, const MemAddrForm& A) {
   // rA=0 encodes the literal value zero in lvx/stvx exactly as it does in the
   // D-forms, so the base must never be r0 — same argument and same guarantee as
   // AssertNonZeroBase (TMPs are r3-r6, both RA pools start at r7).
   LOGMAN_THROW_A_FMT(A.Base != r0, "PPC64 lvx/stvx base register must not be r0");
+  VmxAddrForm Out {A.Base, r0};
   if (A.HasIndex) {
     // The X-form absorbs the index directly. Strictly better than
     // MaterializeAddr, which would burn an `add` collapsing the pair.
-    return {A.Base, A.Index};
+    Out = {A.Base, A.Index};
+  } else if (A.Disp != 0) {
+    // MakeAddrForm only leaves a displacement in the form when it fit a signed
+    // 16-bit field, so this addi is always encodable; wider constants already
+    // arrived as an index.
+    E.addi(TMP3, A.Base, static_cast<int16_t>(A.Disp));
+    Out = {TMP3, r0};
   }
-  if (A.Disp == 0) {
-    // RB=r0 reads GPR0's *contents* (the literal-zero rule covers RA only), and
-    // the backend holds r0 == 0 — the same invariant every X-form here relies on.
-    return {A.Base, r0};
+  if (AlignTrapEnabled()) {
+    // EA = RA + RB (RB may be r0 == 0). rldicl keeps the low 4 bits without
+    // touching CR0 (the packed NZCV) or XER; tdi TO=24 traps iff nonzero.
+    if (Out.RB != r0) {
+      E.add(TMP4, Out.RA, Out.RB);
+      E.rldicl(TMP4, TMP4, 0, 60);
+    } else {
+      E.rldicl(TMP4, Out.RA, 0, 60);
+    }
+    E.tdi(24, TMP4, 0);
   }
-  // MakeAddrForm only leaves a displacement in the form when it fit a signed
-  // 16-bit field, so this addi is always encodable; wider constants already
-  // arrived as an index.
-  E.addi(TMP3, A.Base, static_cast<int16_t>(A.Disp));
-  return {TMP3, r0};
+  return Out;
 }
 
 // Returns true when the aligned form was emitted and the caller must not emit
