@@ -14,6 +14,7 @@ $end_info$
 #include <asm/ipcbuf.h>
 #include <asm/posix_types.h>
 #include <asm/sembuf.h>
+#include <asm/shmbuf.h>
 #include <cstdint>
 #include <sys/stat.h>
 #include <type_traits>
@@ -108,6 +109,52 @@ union semun {
 
 static_assert(std::is_trivially_copyable_v<FEX::HLE::x64::semun>);
 static_assert(sizeof(FEX::HLE::x64::semun) == 8);
+
+// Matches the definition in x86's uapi (asm-generic/shmbuf.h).
+// powerpc64's shmid64_ds places the three timestamps BEFORE shm_segsz, so the
+// host struct cannot be handed to the guest untranslated.
+struct FEX_ANNOTATE("alias-x86_64-shmid64_ds") FEX_ANNOTATE("fex-match") shmid_ds_64 {
+  FEX::HLE::x64::ipc_perm_64 shm_perm;
+  uint64_t shm_segsz;
+  time_t shm_atime;
+  time_t shm_dtime;
+  time_t shm_ctime;
+  int32_t shm_cpid;
+  int32_t shm_lpid;
+  uint64_t shm_nattch;
+  uint64_t __unused4;
+  uint64_t __unused5;
+
+  shmid_ds_64() = delete;
+
+  operator struct shmid64_ds() const {
+    struct shmid64_ds buf {};
+    buf.shm_perm = shm_perm;
+    buf.shm_segsz = shm_segsz;
+    buf.shm_atime = shm_atime;
+    buf.shm_dtime = shm_dtime;
+    buf.shm_ctime = shm_ctime;
+    buf.shm_cpid = shm_cpid;
+    buf.shm_lpid = shm_lpid;
+    buf.shm_nattch = shm_nattch;
+    return buf;
+  }
+
+  shmid_ds_64(struct shmid64_ds buf)
+    : shm_perm {buf.shm_perm} {
+    shm_segsz = buf.shm_segsz;
+    shm_atime = buf.shm_atime;
+    shm_dtime = buf.shm_dtime;
+    shm_ctime = buf.shm_ctime;
+    shm_cpid = buf.shm_cpid;
+    shm_lpid = buf.shm_lpid;
+    shm_nattch = buf.shm_nattch;
+    __unused4 = __unused5 = 0;
+  }
+};
+
+static_assert(std::is_trivially_copyable_v<FEX::HLE::x64::shmid_ds_64>);
+static_assert(sizeof(FEX::HLE::x64::shmid_ds_64) == 112);
 
 struct FEX_ANNOTATE("fex-match") FEX_PACKED guest_stat {
   uint64_t st_dev;

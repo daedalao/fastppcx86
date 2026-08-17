@@ -86,6 +86,205 @@ union semun {
   void* __pad;
 };
 
+// glibc's ipc(SEMCTL) passes the ADDRESS of the semun union in ptr; the direct
+// semctl syscall passes the union itself in the argument register. Both funnel
+// here with the union already loaded.
+static uint64_t Semctl32(uint32_t semid, uint32_t semnum, uint32_t rawcmd, semun_32 semun) {
+  uint64_t Result {};
+  // The host rejects unknown cmd bits, so the guest's IPC_64 flag (0x100) must
+  // be stripped before the host call and only used to pick the guest layout.
+  const int32_t cmd = rawcmd & 0xFF;
+  const bool IPC64 = rawcmd & 0x100;
+  switch (cmd) {
+  case IPC_SET: {
+    struct semid64_ds buf {};
+    if (IPC64) {
+      FaultSafeUserMemAccess::VerifyIsReadable(semun.buf64, sizeof(*semun.buf64));
+      buf = *semun.buf64;
+    } else {
+      FaultSafeUserMemAccess::VerifyIsReadable(semun.buf32, sizeof(*semun.buf32));
+      buf = *semun.buf32;
+    }
+    Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+    if (Result != -1) {
+      if (IPC64) {
+        FaultSafeUserMemAccess::VerifyIsWritable(semun.buf64, sizeof(*semun.buf64));
+        *semun.buf64 = buf;
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(semun.buf32, sizeof(*semun.buf32));
+        *semun.buf32 = buf;
+      }
+    }
+    break;
+  }
+  case SEM_STAT:
+  case SEM_STAT_ANY:
+  case IPC_STAT: {
+    struct semid64_ds buf {};
+    Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+    if (Result != -1) {
+      if (IPC64) {
+        FaultSafeUserMemAccess::VerifyIsWritable(semun.buf64, sizeof(*semun.buf64));
+        *semun.buf64 = buf;
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(semun.buf32, sizeof(*semun.buf32));
+        *semun.buf32 = buf;
+      }
+    }
+    break;
+  }
+  case SEM_INFO:
+  case IPC_INFO: {
+    struct fex_seminfo si {};
+    Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
+    if (Result != -1) {
+      FaultSafeUserMemAccess::VerifyIsWritable(semun.__buf, sizeof(*semun.__buf));
+      memcpy(semun.__buf, &si, sizeof(si));
+    }
+    break;
+  }
+  case GETALL:
+  case SETALL: {
+    // ptr is just a int32_t* in this case
+    Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun.array);
+    break;
+  }
+  case SETVAL: {
+    // ptr is just a int32_t in this case
+    Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun.val);
+    break;
+  }
+  case IPC_RMID:
+  case GETPID:
+  case GETNCNT:
+  case GETZCNT:
+  case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd); break;
+  default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
+  }
+  SYSCALL_ERRNO();
+}
+
+static uint64_t Msgctl32(uint32_t msqid, uint32_t rawcmd, uint32_t ptr) {
+  uint64_t Result {};
+  const int32_t cmd = rawcmd & 0xFF;
+  const bool IPC64 = rawcmd & 0x100;
+  msgun_32 msgun {};
+  msgun.val = ptr;
+  switch (cmd) {
+  case IPC_SET: {
+    struct msqid64_ds buf {};
+    if (IPC64) {
+      FaultSafeUserMemAccess::VerifyIsReadable(msgun.buf64, sizeof(*msgun.buf64));
+      buf = *msgun.buf64;
+    } else {
+      FaultSafeUserMemAccess::VerifyIsReadable(msgun.buf32, sizeof(*msgun.buf32));
+      buf = *msgun.buf32;
+    }
+    Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
+    break;
+  }
+  case MSG_STAT:
+  case MSG_STAT_ANY:
+  case IPC_STAT: {
+    struct msqid64_ds buf {};
+    Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
+    if (Result != -1) {
+      if (IPC64) {
+        FaultSafeUserMemAccess::VerifyIsWritable(msgun.buf64, sizeof(*msgun.buf64));
+        *msgun.buf64 = buf;
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(msgun.buf32, sizeof(*msgun.buf32));
+        *msgun.buf32 = buf;
+      }
+    }
+    break;
+  }
+  case MSG_INFO:
+  case IPC_INFO: {
+    struct msginfo mi {};
+    Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, reinterpret_cast<struct msqid_ds*>(&mi));
+    if (Result != -1) {
+      FaultSafeUserMemAccess::VerifyIsWritable(msgun.__buf, sizeof(mi));
+      memcpy(msgun.__buf, &mi, sizeof(mi));
+    }
+    break;
+  }
+  case IPC_RMID: Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, nullptr); break;
+  default: LOGMAN_MSG_A_FMT("Unhandled msgctl cmd: {}", cmd); return -EINVAL;
+  }
+  SYSCALL_ERRNO();
+}
+
+static uint64_t Shmctl32(uint32_t shmid, uint32_t rawcmd, uint32_t ptr) {
+  uint64_t Result {};
+  const int32_t cmd = rawcmd & 0xFF;
+  const bool IPC64 = rawcmd & 0x100;
+  shmun_32 shmun {};
+  shmun.val = ptr;
+  switch (cmd) {
+  case IPC_SET: {
+    struct shmid64_ds buf {};
+    if (IPC64) {
+      FaultSafeUserMemAccess::VerifyIsReadable(shmun.buf64, sizeof(*shmun.buf64));
+      buf = *shmun.buf64;
+    } else {
+      FaultSafeUserMemAccess::VerifyIsReadable(shmun.buf32, sizeof(*shmun.buf32));
+      buf = *shmun.buf32;
+    }
+    Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
+    // IPC_SET sets the internal data structure that the kernel uses
+    // No need to writeback
+    break;
+  }
+  case SHM_STAT:
+  case SHM_STAT_ANY:
+  case IPC_STAT: {
+    struct shmid64_ds buf {};
+    Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
+    if (Result != -1) {
+      if (IPC64) {
+        FaultSafeUserMemAccess::VerifyIsWritable(shmun.buf64, sizeof(*shmun.buf64));
+        *shmun.buf64 = buf;
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(shmun.buf32, sizeof(*shmun.buf32));
+        *shmun.buf32 = buf;
+      }
+    }
+    break;
+  }
+  case IPC_INFO: {
+    struct shminfo si {};
+    Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
+    if (Result != -1) {
+      if (IPC64) {
+        FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf64, sizeof(*shmun.__buf64));
+        *shmun.__buf64 = si;
+      } else {
+        FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf32, sizeof(*shmun.__buf32));
+        *shmun.__buf32 = si;
+      }
+    }
+    break;
+  }
+  case SHM_INFO: {
+    struct shm_info si {};
+    Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
+    if (Result != -1) {
+      FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf_info_32, sizeof(*shmun.__buf_info_32));
+      // SHM_INFO doesn't follow IPC64 behaviour
+      *shmun.__buf_info_32 = si;
+    }
+    break;
+  }
+  case SHM_LOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
+  case SHM_UNLOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
+  case IPC_RMID: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
+
+  default: LOGMAN_MSG_A_FMT("Unhandled shmctl cmd: {}", cmd); return -EINVAL;
+  }
+  SYSCALL_ERRNO();
+}
+
 uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first, uint32_t second, uint32_t third, uint32_t ptr, uint32_t fifth) {
   uint64_t Result {};
 
@@ -102,79 +301,10 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
     break;
   }
   case OP_SEMCTL: {
-    uint32_t semid = first;
-    uint32_t semnum = second;
-    // Upper 16bits used for a different flag?
-    int32_t cmd = third & 0xFF;
+    // ptr is the address of the guest's semun union
     auto_compat_ptr<semun_32> semun(ptr);
-    bool IPC64 = third & 0x100;
-    switch (cmd) {
-    case IPC_SET: {
-      struct semid64_ds buf {};
-      if (IPC64) {
-        FaultSafeUserMemAccess::VerifyIsReadable(semun->buf64, sizeof(*semun->buf64));
-        buf = *semun->buf64;
-      } else {
-        FaultSafeUserMemAccess::VerifyIsReadable(semun->buf32, sizeof(*semun->buf32));
-        buf = *semun->buf32;
-      }
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
-          *semun->buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf32, sizeof(*semun->buf32));
-          *semun->buf32 = buf;
-        }
-      }
-      break;
-    }
-    case SEM_STAT:
-    case SEM_STAT_ANY:
-    case IPC_STAT: {
-      struct semid64_ds buf {};
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
-          *semun->buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf32, sizeof(*semun->buf32));
-          *semun->buf32 = buf;
-        }
-      }
-      break;
-    }
-    case SEM_INFO:
-    case IPC_INFO: {
-      struct fex_seminfo si {};
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
-      if (Result != -1) {
-        FaultSafeUserMemAccess::VerifyIsWritable(semun->__buf, sizeof(*semun->__buf));
-        memcpy(semun->__buf, &si, sizeof(si));
-      }
-      break;
-    }
-    case GETALL:
-    case SETALL: {
-      // ptr is just a int32_t* in this case
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->array);
-      break;
-    }
-    case SETVAL: {
-      // ptr is just a int32_t in this case
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->val);
-      break;
-    }
-    case IPC_RMID:
-    case GETPID:
-    case GETNCNT:
-    case GETZCNT:
-    case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd); break;
-    default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
-    }
-    break;
+    FaultSafeUserMemAccess::VerifyIsReadable(semun, sizeof(*semun));
+    return Semctl32(first, second, third, *semun);
   }
   case OP_SEMTIMEDOP: {
     timespec32* timeout = reinterpret_cast<timespec32*>(fifth);
@@ -239,54 +369,7 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
     break;
   }
   case OP_MSGCTL: {
-    uint32_t msqid = first;
-    int32_t cmd = second & 0xFF;
-    msgun_32 msgun {};
-    msgun.val = ptr;
-    bool IPC64 = second & 0x100;
-    switch (cmd) {
-    case IPC_SET: {
-      struct msqid64_ds buf {};
-      if (IPC64) {
-        FaultSafeUserMemAccess::VerifyIsReadable(msgun.buf64, sizeof(*msgun.buf64));
-        buf = *msgun.buf64;
-      } else {
-        FaultSafeUserMemAccess::VerifyIsReadable(msgun.buf32, sizeof(*msgun.buf32));
-        buf = *msgun.buf32;
-      }
-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
-      break;
-    }
-    case MSG_STAT:
-    case MSG_STAT_ANY:
-    case IPC_STAT: {
-      struct msqid64_ds buf {};
-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(msgun.buf64, sizeof(*msgun.buf64));
-          *msgun.buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(msgun.buf32, sizeof(*msgun.buf32));
-          *msgun.buf32 = buf;
-        }
-      }
-      break;
-    }
-    case MSG_INFO:
-    case IPC_INFO: {
-      struct msginfo mi {};
-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, reinterpret_cast<struct msqid_ds*>(&mi));
-      if (Result != -1) {
-        FaultSafeUserMemAccess::VerifyIsWritable(msgun.__buf, sizeof(mi));
-        memcpy(msgun.__buf, &mi, sizeof(mi));
-      }
-      break;
-    }
-    case IPC_RMID: Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, nullptr); break;
-    default: LOGMAN_MSG_A_FMT("Unhandled msgctl cmd: {}", cmd); return -EINVAL;
-    }
-    break;
+    return Msgctl32(first, second, ptr);
   }
   case OP_SHMAT: {
     if (Version == 1) {
@@ -307,75 +390,7 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
     break;
   }
   case OP_SHMCTL: {
-    int32_t shmid = first;
-    int32_t shmcmd = second;
-    int32_t cmd = shmcmd & 0xFF;
-    bool IPC64 = shmcmd & 0x100;
-    shmun_32 shmun {};
-    shmun.val = reinterpret_cast<uint32_t>(ptr);
-
-    switch (cmd) {
-    case IPC_SET: {
-      struct shmid64_ds buf {};
-      if (IPC64) {
-        FaultSafeUserMemAccess::VerifyIsReadable(shmun.buf64, sizeof(*shmun.buf64));
-        buf = *shmun.buf64;
-      } else {
-        FaultSafeUserMemAccess::VerifyIsReadable(shmun.buf32, sizeof(*shmun.buf32));
-        buf = *shmun.buf32;
-      }
-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
-      // IPC_SET sets the internal data structure that the kernel uses
-      // No need to writeback
-      break;
-    }
-    case SHM_STAT:
-    case SHM_STAT_ANY:
-    case IPC_STAT: {
-      struct shmid64_ds buf {};
-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(shmun.buf64, sizeof(*shmun.buf64));
-          *shmun.buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(shmun.buf32, sizeof(*shmun.buf32));
-          *shmun.buf32 = buf;
-        }
-      }
-      break;
-    }
-    case IPC_INFO: {
-      struct shminfo si {};
-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf64, sizeof(*shmun.__buf64));
-          *shmun.__buf64 = si;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf32, sizeof(*shmun.__buf32));
-          *shmun.__buf32 = si;
-        }
-      }
-      break;
-    }
-    case SHM_INFO: {
-      struct shm_info si {};
-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
-      if (Result != -1) {
-        FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf_info_32, sizeof(*shmun.__buf_info_32));
-        // SHM_INFO doesn't follow IPC64 behaviour
-        *shmun.__buf_info_32 = si;
-      }
-      break;
-    }
-    case SHM_LOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
-    case SHM_UNLOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
-    case IPC_RMID: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
-
-    default: LOGMAN_MSG_A_FMT("Unhandled shmctl cmd: {}", cmd); return -EINVAL;
-    }
-    break;
+    return Shmctl32(first, second, ptr);
   }
 
   default: return -ENOSYS;
@@ -385,77 +400,21 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
 void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL_X32(ipc, _ipc);
 
-  REGISTER_SYSCALL_IMPL_X32(semctl, [](FEXCore::Core::CpuStateFrame* Frame, int semid, int semnum, int cmd, semun_32* semun) -> uint64_t {
-    uint64_t Result {};
-    bool IPC64 = cmd & 0x100;
+  // The direct SysV IPC syscalls carry the same IPC_64-flagged cmd as the
+  // ipc() multiplexer on i386, but semctl's union argument arrives BY VALUE
+  // in the register instead of by address.
+  REGISTER_SYSCALL_IMPL_X32(semctl, [](FEXCore::Core::CpuStateFrame* Frame, int semid, int semnum, int cmd, uint32_t arg) -> uint64_t {
+    semun_32 semun {};
+    semun.array = arg;
+    return Semctl32(semid, semnum, cmd, semun);
+  });
 
-    switch (cmd) {
-    case IPC_SET: {
-      struct semid64_ds buf {};
-      if (IPC64) {
-        FaultSafeUserMemAccess::VerifyIsReadable(semun->buf64, sizeof(*semun->buf64));
-        buf = *semun->buf64;
-      } else {
-        FaultSafeUserMemAccess::VerifyIsReadable(semun->buf32, sizeof(*semun->buf32));
-        buf = *semun->buf32;
-      }
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
-          *semun->buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf32, sizeof(*semun->buf32));
-          *semun->buf32 = buf;
-        }
-      }
-      break;
-    }
-    case SEM_STAT:
-    case SEM_STAT_ANY:
-    case IPC_STAT: {
-      struct semid64_ds buf {};
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
-      if (Result != -1) {
-        if (IPC64) {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
-          *semun->buf64 = buf;
-        } else {
-          FaultSafeUserMemAccess::VerifyIsWritable(semun->buf32, sizeof(*semun->buf32));
-          *semun->buf32 = buf;
-        }
-      }
-      break;
-    }
-    case SEM_INFO:
-    case IPC_INFO: {
-      struct fex_seminfo si {};
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
-      if (Result != -1) {
-        FaultSafeUserMemAccess::VerifyIsWritable(semun->__buf, sizeof(*semun->__buf));
-        memcpy(semun->__buf, &si, sizeof(si));
-      }
-      break;
-    }
-    case GETALL:
-    case SETALL: {
-      // ptr is just a int32_t* in this case
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->array);
-      break;
-    }
-    case SETVAL: {
-      // ptr is just a int32_t in this case
-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->val);
-      break;
-    }
-    case IPC_RMID:
-    case GETPID:
-    case GETNCNT:
-    case GETZCNT:
-    case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun); break;
-    default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
-    }
-    SYSCALL_ERRNO();
+  REGISTER_SYSCALL_IMPL_X32(msgctl, [](FEXCore::Core::CpuStateFrame* Frame, int msqid, int cmd, uint32_t buf) -> uint64_t {
+    return Msgctl32(msqid, cmd, buf);
+  });
+
+  REGISTER_SYSCALL_IMPL_X32(shmctl, [](FEXCore::Core::CpuStateFrame* Frame, int shmid, int cmd, uint32_t buf) -> uint64_t {
+    return Shmctl32(shmid, cmd, buf);
   });
 }
 } // namespace FEX::HLE::x32

@@ -197,6 +197,16 @@ paths, and a driven Witcher 3 capture burned 16% less CPU with AVX hidden.
 Turn it on for the titles that need it. Moonlighter measured faster with it on.
 `FEX_HOSTFEATURES=disableavx` forces it back off if a config layer enabled it.
 
+**Witcher 3 needs it to load, and that is why `witcher3.exe.json` sets it.** Confirmed 2026-08-15:
+with `enableavx` removed and everything else identical, W3 crashes loading a save that loads fine
+with it on. So the `-16%` CPU figure above is a cost knowingly paid for the title to run, not a
+tuning mistake — do not "fix" that config by deleting the line. An A/B of AVX on this title is not
+merely noisy, it is not runnable: one arm never reaches the measurement.
+
+The general shape is worth internalising: on this port AVX is sometimes a FUNCTIONAL requirement
+rather than a performance choice, so a per-title `enableavx` may be paying for correctness. Check
+whether the title still launches before attributing the setting to performance.
+
 **Cyberpunk 2077 does not need it, and is slower with it.** This page previously said CP2077
 refuses to start without AVX; that does not reproduce. Measured 2026-08-15 with nothing setting
 `FEX_HOSTFEATURES` anywhere (launcher, `launchers.bak`, AppConfig all checked, and the guest's own

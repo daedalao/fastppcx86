@@ -838,7 +838,8 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
   REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
   REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
-  REGISTER_SYSCALL_IMPL(shmctl, SyscallPassthrough3<SYSCALL_DEF(shmctl)>);
+  // shmctl needs struct translation (powerpc64 shmid64_ds field order differs
+  // from x86); registered in x64/x32 Semaphore.cpp.
   REGISTER_SYSCALL_IMPL(getpid, SyscallPassthrough0<SYSCALL_DEF(getpid)>);
   REGISTER_SYSCALL_IMPL(socket, SyscallPassthrough3<SYSCALL_DEF(socket)>);
   REGISTER_SYSCALL_IMPL(connect, SyscallPassthrough3<SYSCALL_DEF(connect)>);
@@ -855,7 +856,9 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(msgget, SyscallPassthrough2<SYSCALL_DEF(msgget)>);
   REGISTER_SYSCALL_IMPL(msgsnd, SyscallPassthrough4<SYSCALL_DEF(msgsnd)>);
   REGISTER_SYSCALL_IMPL(msgrcv, SyscallPassthrough5<SYSCALL_DEF(msgrcv)>);
-  REGISTER_SYSCALL_IMPL(msgctl, SyscallPassthrough3<SYSCALL_DEF(msgctl)>);
+  // msqid64_ds layout matches the host for 64-bit guests only; the 32-bit
+  // direct msgctl is registered in x32/Semaphore.cpp.
+  REGISTER_SYSCALL_IMPL_X64(msgctl, SyscallPassthrough3<SYSCALL_DEF(msgctl)>);
   REGISTER_SYSCALL_IMPL(flock, SyscallPassthrough2<SYSCALL_DEF(flock)>);
   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
