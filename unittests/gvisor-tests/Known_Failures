@@ -16,6 +16,14 @@ mlock_test
 # These used to crash and fail its test, now hang
 #mremap_test
 
+# Fixed_ShrinkingAcrossVMAs/{0,1} assert Linux's historical wart that a
+# multi-VMA MREMAP_FIXED fails with EFAULT but has ALREADY unmapped the
+# shrink tail and the destination as a side effect. Modern kernels made the
+# failure side-effect-free; verified native ppc64le on 7.2.0-rc5 behaves
+# identically to FEX (tail and destination stay mapped). Kernel-version
+# behaviour, not an emulation defect. The other 31 subtests pass.
+mremap_test
+
 # these are flaky on x86
 stat_times_test
 
