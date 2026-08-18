@@ -393,6 +393,13 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
     DBObjectHandler.InsertDependencies(DBObject.second.Depends);
   }
 
+  // Derive the basename fallback map (see FileManagement.h for why).
+  for (const auto& [Overlay, ThunkPath] : ThunkOverlays) {
+    auto Slash = Overlay.rfind('/');
+    fextl::string Base = (Slash == fextl::string::npos) ? Overlay : Overlay.substr(Slash + 1);
+    ThunkOverlayBasenames.emplace(std::move(Base), ThunkPath);
+  }
+
   if (false) {
     // Useful for debugging
     if (ThunkOverlays.size()) {
@@ -569,6 +576,14 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
     return thunkOverlay->second;
   }
 
+  if (const char* Slash = strrchr(pathname, '/'); Slash && !ThunkOverlayBasenames.empty()) {
+    auto Basename = ThunkOverlayBasenames.find(Slash + 1);
+    if (Basename != ThunkOverlayBasenames.end()) {
+      LogMan::Msg::DFmt("ThunkOverlay basename redirect(path): '{}' -> '{}'", pathname, Basename->second);
+      return Basename->second;
+    }
+  }
+
   if (IsHostOnlyPath(pathname)) {
     return {};
   }
@@ -610,9 +625,30 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
 
   const bool GfxProbe = strstr(pathname, "libGL") || strstr(pathname, "libEGL") || strstr(pathname, "libGLX") || strstr(pathname, "libvulkan");
 
+  // Basename fallback lookup, usable from both the early-out branch (ld.so
+  // inside pressure-vessel opens bare sonames relative to a directory FD)
+  // and the exact-match-miss path below.
+  auto FindBasenameOverlay = [this](const char* Path) -> const fextl::string* {
+    if (ThunkOverlayBasenames.empty()) {
+      return nullptr;
+    }
+    const char* Slash = strrchr(Path, '/');
+    auto Basename = ThunkOverlayBasenames.find(Slash ? Slash + 1 : Path);
+    return Basename != ThunkOverlayBasenames.end() ? &Basename->second : nullptr;
+  };
+
   if (pathname[0] != '/' || // If relative
       pathname[1] == 0 ||   // If we are getting root
       dirfd != AT_FDCWD) {  // If dirfd isn't special FDCWD
+    // A dirfd-relative or relative open of a soname we actively thunk must
+    // still be redirected; otherwise ld.so under pressure-vessel loads the
+    // guest's own copy of the library and the host GPU is never reached.
+    if (pathname[0] != '/' && strchr(pathname, '/') == nullptr) {
+      if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
+        LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): dirfd={} '{}' -> '{}'", dirfd, pathname, *ThunkPath);
+        return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+      }
+    }
     if (GfxProbe) {
       LogMan::Msg::DFmt("ThunkOverlay probe(fd): early-out dirfd={} path='{}'", dirfd, pathname);
     }
@@ -625,6 +661,11 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
   }
   if (thunkOverlay != ThunkOverlays.end()) {
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
+  }
+
+  if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
+    LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): '{}' -> '{}'", pathname, *ThunkPath);
+    return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
   }
 
   // See IsHostOnlyPath: returning a rootfs dirfd for these is what breaks
