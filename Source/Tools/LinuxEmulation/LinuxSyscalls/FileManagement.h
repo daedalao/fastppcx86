@@ -201,6 +201,7 @@ private:
   bool IsSelfNoFollow(const char* Pathname, int flags) const;
 
   bool RootFSPathExists(const char* Filepath) const;
+  bool IsThunkRedirectableLibraryDir(const char* Path) const;
   size_t GetRootFSPrefixLen(const char* pathname, size_t len, bool AliasedOnly) const;
   ssize_t StripRootFSPrefix(char* pathname, ssize_t len, bool leaky) const;
 

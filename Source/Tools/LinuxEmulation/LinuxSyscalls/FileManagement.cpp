@@ -561,6 +561,30 @@ static bool IsHostOnlyPath(const char* pathname) {
   return false;
 }
 
+bool FileManager::IsThunkRedirectableLibraryDir(const char* Path) const {
+  // Allow-list for the basename overlay fallback: system library directories
+  // (guest view), pressure-vessel's runtime/capture trees, and the RootFS
+  // (host-prefixed opens). Deliberately excludes everything else -- notably
+  // Steam's own tree under $HOME: its updater reads its bundled copies of
+  // these sonames for checksum verification, and redirecting those reads to
+  // stub bytes makes the updater repair-loop forever. Steam also bundles its
+  // own ANGLE libEGL/libGLESv2 which must never be substituted.
+  static constexpr std::array<std::string_view, 5> AllowedPrefixes = {
+    "/usr/lib",       // also /usr/lib32, /usr/lib64, /usr/lib/<multiarch>, /usr/lib/pressure-vessel
+    "/usr/local/lib", // also lib32/lib64 variants
+    "/lib",           // also /lib32, /lib64
+    "/var/pressure-vessel/",
+    "/run/pressure-vessel/",
+  };
+  for (auto Prefix : AllowedPrefixes) {
+    if (strncmp(Path, Prefix.data(), Prefix.size()) == 0) {
+      return true;
+    }
+  }
+  const auto& RootFSPath = LDPath();
+  return !RootFSPath.empty() && strncmp(Path, RootFSPath.c_str(), RootFSPath.size()) == 0;
+}
+
 fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSymlink) const {
   if (!pathname ||                  // If no pathname
       pathname[0] != '/' ||         // If relative
@@ -576,7 +600,7 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
     return thunkOverlay->second;
   }
 
-  if (const char* Slash = strrchr(pathname, '/'); Slash && !ThunkOverlayBasenames.empty()) {
+  if (const char* Slash = strrchr(pathname, '/'); Slash && !ThunkOverlayBasenames.empty() && IsThunkRedirectableLibraryDir(pathname)) {
     auto Basename = ThunkOverlayBasenames.find(Slash + 1);
     if (Basename != ThunkOverlayBasenames.end()) {
       LogMan::Msg::DFmt("ThunkOverlay basename redirect(path): '{}' -> '{}'", pathname, Basename->second);
@@ -640,13 +664,23 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
   if (pathname[0] != '/' || // If relative
       pathname[1] == 0 ||   // If we are getting root
       dirfd != AT_FDCWD) {  // If dirfd isn't special FDCWD
-    // A dirfd-relative or relative open of a soname we actively thunk must
-    // still be redirected; otherwise ld.so under pressure-vessel loads the
-    // guest's own copy of the library and the host GPU is never reached.
-    if (pathname[0] != '/' && strchr(pathname, '/') == nullptr) {
+    // A dirfd-relative open of a bare soname we actively thunk must still be
+    // redirected; otherwise ld.so under pressure-vessel loads the guest's own
+    // copy of the library and the host GPU is never reached. The directory the
+    // FD points at must pass the same allow-list as absolute paths, or Steam's
+    // updater reading its runtime files for verification gets stub bytes and
+    // repair-loops forever.
+    if (pathname[0] != '/' && strchr(pathname, '/') == nullptr && dirfd != AT_FDCWD) {
       if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
-        LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): dirfd={} '{}' -> '{}'", dirfd, pathname, *ThunkPath);
-        return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+        char DirPath[PATH_MAX];
+        auto DirPathLength = FEX::get_fdpath(dirfd, DirPath);
+        if (DirPathLength != -1) {
+          DirPath[DirPathLength] = 0;
+          if (IsThunkRedirectableLibraryDir(DirPath)) {
+            LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): dirfd='{}' '{}' -> '{}'", DirPath, pathname, *ThunkPath);
+            return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+          }
+        }
       }
     }
     if (GfxProbe) {
@@ -663,9 +697,11 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
   }
 
-  if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
-    LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): '{}' -> '{}'", pathname, *ThunkPath);
-    return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+  if (IsThunkRedirectableLibraryDir(pathname)) {
+    if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
+      LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): '{}' -> '{}'", pathname, *ThunkPath);
+      return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+    }
   }
 
   // See IsHostOnlyPath: returning a rootfs dirfd for these is what breaks
