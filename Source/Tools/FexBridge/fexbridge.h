@@ -83,8 +83,18 @@ extern "C" {
            returns FEXBRIDGE_RUN_FAULT with Rip at the bad address, instead
            of taking a raw host SIGSEGV inside the frontend decoder with the
            code-invalidation lock held.  No surface change; the run result
-           gained a source.                                                */
-#define FEXBRIDGE_ABI_VERSION 3u
+           gained a source.
+   3 -> 4: 32-bit (i386) guest mode.  fexbridge_process_init32() initializes
+           the process for 32-bit guest execution; fexbridge_thread_init()
+           then builds a 32-bit flat segment model (Windows-shaped selectors,
+           CS=0x23 SS/DS/ES/GS=0x2B FS=0x53) instead of the 64-bit one, and
+           fexbridge_set_fs_base() also writes the FS descriptor so a guest
+           segment reload recomputes the same base.  One mode per process:
+           FEXCore bakes IS64BIT_MODE into the Context at creation (decode
+           tables, VirtualMemSize), and the embedder this exists for never
+           mixes modes -- a WoW64 process's 64-bit side is native host code,
+           not emulated.  fexbridge_run_entry() refuses in 32-bit mode.     */
+#define FEXBRIDGE_ABI_VERSION 4u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
@@ -176,6 +186,21 @@ void fexbridge_set_log_handler(fexbridge_log_fn cb);
    Returns 0 on success, negative on failure. Idempotent.                   */
 int fexbridge_process_init(void);
 
+/* 32-bit variant of process_init: the guest is i386, not x86-64.  Mutually
+   exclusive with fexbridge_process_init() -- whichever runs first fixes the
+   process's guest mode, and the other then fails with -5.
+
+   exit_page names one page of 0xF4 (hlt) bytes the CALLER has allocated,
+   made executable, and (if it manages emulator code visibility itself)
+   published.  The bridge uses it as the cooperative-exit trampoline that a
+   trap ending the run executes through.  It must be below 4 GiB: in 32-bit
+   mode every address the guest executes from must fit the guest's address
+   space, and only the embedder's own memory manager can place low pages
+   without racing whatever else owns that range (Wine reserves it).  The
+   64-bit init keeps allocating its own page precisely because it has no such
+   constraint.  Zero, or a page at or above 4 GiB, is refused with -4.      */
+int fexbridge_process_init32(uint64_t exit_page);
+
 /* The trap callback. `thread` is the fexbridge thread handle the trap fired
    on; `ctx` is a FEXBRIDGE_AMD64_CONTEXT with the full guest state (see the
    trap protocol above); `user` is the pointer registered alongside.
@@ -246,6 +271,14 @@ int fexbridge_set_context(void* thread, const void* ctx);
        write it directly — exactly as on hardware.
      - FS exists for symmetry and for embedders running 32-bit or Linux-shaped
        guests. A Windows x86-64 guest does not use FS; leaving it 0 is correct.
+       A 32-bit Windows guest (fexbridge_process_init32) reaches its TIB
+       through FS: set it to the 32-bit TEB per thread.  In 32-bit mode the
+       call also writes the FS descriptor in the emulated GDT, because a
+       segment RELOAD (pop %fs / mov %ax,%fs) recomputes the cached base from
+       the descriptor and must land on the same TIB.  The base must fit in
+       32 bits there; a wider one is refused.  GS in 32-bit mode is the flat
+       data selector and set_gs_base writes only the cached base (no 32-bit
+       Windows ABI puts anything behind GS).
      - `thread` must not be executing: call from its own host thread between
        runs, or from inside the trap callback.
      - fexbridge_run_entry() creates a transient thread with no base set; use
