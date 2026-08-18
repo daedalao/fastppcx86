@@ -64,11 +64,10 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
     if (RootFSIsMultiarch) {
       // Multi-arch debian distros have a fairly complex arrangement of filepaths.
       // These fractal out to the combination of library prefixes with arch suffixes.
-      constexpr static std::array<std::string_view, 4> LibPrefixes = {
+      constexpr static std::array<std::string_view, 3> LibPrefixes = {
         "/usr/lib",
         "/usr/local/lib",
         "/lib",
-        "/usr/lib/pressure-vessel/overrides/lib",
       };
 
       // We only need to generate 32-bit or 64-bit depending on the operating mode.
@@ -81,11 +80,10 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
       // Non multi-arch supporting distros like Fedora and Debian have a much more simple layout.
       // lib/ folders refer to 32-bit library folders.
       // li64/ folders refer to 64-bit library folders.
-      constexpr static std::array<std::string_view, 4> LibPrefixes = {
+      constexpr static std::array<std::string_view, 3> LibPrefixes = {
         "/usr",
         "/usr/local",
         "", // root, the '/' will be appended in the next step.
-        "/usr/lib/pressure-vessel/overrides",
       };
 
       // We only need to generate 32-bit or 64-bit depending on the operating mode.
@@ -115,6 +113,21 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
           PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib32"));
         }
       }
+    }
+
+    // Pressure-vessel (Steam Linux Runtime) containers lay out their graphics
+    // overrides in Debian-multiarch form regardless of what the RootFS looks
+    // like, and pv-adverb points LD_LIBRARY_PATH at the "aliases"
+    // subdirectories. These prefixes must therefore be generated
+    // unconditionally: keying them off the RootFS layout means a
+    // non-multiarch RootFS (Arch) never matches inside the container, so
+    // steamwebhelper's CEF GPU process loads pv's captured x86 Mesa instead
+    // of the thunk, glvnd finds no vendor library, glXQueryExtensionsString
+    // returns NULL, and Chromium silently falls back to software rendering.
+    {
+      const auto PVArch = Is64BitMode() ? "x86_64-linux-gnu" : "i386-linux-gnu";
+      PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}", PVArch));
+      PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}/aliases", PVArch));
     }
 
     FEX::JSON::JsonAllocator Pool {};
