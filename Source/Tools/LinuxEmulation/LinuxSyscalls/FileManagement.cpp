@@ -128,6 +128,23 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
       const auto PVArch = Is64BitMode() ? "x86_64-linux-gnu" : "i386-linux-gnu";
       PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}", PVArch));
       PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}/aliases", PVArch));
+
+      // When pressure-vessel runs with an interpreter root (its FEX-emulation
+      // integration: FEX_ROOTFS=/run/pressure-vessel/interpreter-root), the
+      // graphics provider is captured to /var/pressure-vessel/gfx/main/...
+      // mirroring the provider RootFS's layout, and the regenerated in-container
+      // ld.so cache resolves libGL/libEGL/libvulkan to those paths directly.
+      // These captures are incomplete copies (observed: libGLX_mesa.so.0
+      // missing while libEGL_mesa is present), so without overlay coverage
+      // here the guest loads a broken glvnd stack instead of the thunk.
+      if (Is64BitMode()) {
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib64");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib/x86_64-linux-gnu");
+      } else {
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib32");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib/i386-linux-gnu");
+      }
     }
 
     FEX::JSON::JsonAllocator Pool {};
