@@ -562,6 +562,9 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
   }
 
   auto thunkOverlay = ThunkOverlays.find(pathname);
+  if (strstr(pathname, "libGL") || strstr(pathname, "libEGL") || strstr(pathname, "libGLX") || strstr(pathname, "libvulkan")) {
+    LogMan::Msg::DFmt("ThunkOverlay probe(path): '{}' -> {}", pathname, thunkOverlay != ThunkOverlays.end() ? "HIT" : "miss");
+  }
   if (thunkOverlay != ThunkOverlays.end()) {
     return thunkOverlay->second;
   }
@@ -605,13 +608,21 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
+  const bool GfxProbe = strstr(pathname, "libGL") || strstr(pathname, "libEGL") || strstr(pathname, "libGLX") || strstr(pathname, "libvulkan");
+
   if (pathname[0] != '/' || // If relative
       pathname[1] == 0 ||   // If we are getting root
       dirfd != AT_FDCWD) {  // If dirfd isn't special FDCWD
+    if (GfxProbe) {
+      LogMan::Msg::DFmt("ThunkOverlay probe(fd): early-out dirfd={} path='{}'", dirfd, pathname);
+    }
     return NoEntry;
   }
 
   auto thunkOverlay = ThunkOverlays.find(pathname);
+  if (GfxProbe) {
+    LogMan::Msg::DFmt("ThunkOverlay probe(fd): '{}' -> {}", pathname, thunkOverlay != ThunkOverlays.end() ? "HIT" : "miss");
+  }
   if (thunkOverlay != ThunkOverlays.end()) {
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
   }
