@@ -69,6 +69,7 @@ $end_info$
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -250,6 +251,159 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
   return InlineTail ? InlineTail->RIP : 0;
 }
 
+// FEX_RIPFALLBACKTRAP — instrumentation for "how often does RestoreRIPFromHostPC
+// fail to reconstruct and fall back to Frame->State.rip, with a host PC that is
+// inside the JIT code buffer?"
+//
+// That question decides whether the JIT is allowed to stop maintaining
+// State.rip on block-transfer fast paths. Every exit currently spends a
+// `std RIPReg, State.rip(STATE)` -- and, on a linked constant exit, the whole
+// 3-4 instruction RIP materialisation that feeds it -- purely so this fallback
+// has something sane to return. The fallback is only reachable in-JIT during
+// the handful of instructions at the top of a target block's EntryPoint
+// prologue, before its own InlineJITBlockHeader store lands. If that window is
+// never actually observed, the store is dead weight on every block transfer.
+//
+// Modes (parsed once):
+//   unset / "0"  off (default) -- one predictable branch on a static bool
+//   "1"          log the first 64 occurrences of each kind, then just count
+//   "abort"      ERROR_AND_DIE on the first occurrence
+//
+// This is the same retire-an-invariant methodology as FEX_DEADPROLOGUE=trap in
+// the PPC64LE backend (JIT.cpp): prove the thing is unreachable at runtime
+// before deleting the code that defends it, rather than by inspection.
+//
+// Reachable from signal handlers, so every arm must be async-signal-safe.
+// The first version of this used LogMan::Msg::EFmt, which gates only on the
+// compile-time MSG_LEVEL and then runs fmt formatting plus handler dispatch —
+// neither is signal-safe, and the call sits on a path where FEX already holds
+// signal-machinery locks. Running it against a real title crashed the title
+// (Witcher 3, 2026-08-16, chased as a JIT bug before the trap was exonerated).
+// Now: two relaxed atomics, a raw pre-formatted write(2) for the first 64 hits
+// of each bucket, and an atexit dump so a run that never crashes still yields
+// the counts it was started to collect. The mode static and the atexit
+// registration are forced at library load (single-threaded, no guest, no
+// signals) so neither can first-fire inside a handler.
+namespace {
+enum class RIPFallbackTrapMode { Off, Log, Abort };
+
+RIPFallbackTrapMode GetRIPFallbackTrapMode() {
+  static const RIPFallbackTrapMode Mode = []() {
+    const char* Env = getenv("FEX_RIPFALLBACKTRAP");
+    if (!Env || Env[0] == '\0' || (Env[0] == '0' && Env[1] == '\0')) {
+      return RIPFallbackTrapMode::Off;
+    }
+    if (::strcmp(Env, "abort") == 0) {
+      return RIPFallbackTrapMode::Abort;
+    }
+    return RIPFallbackTrapMode::Log;
+  }();
+  return Mode;
+}
+
+// [0] = host PC inside a code buffer but outside the block InlineJITBlockHeader
+//       names (the block-transfer window -- the one that matters).
+// [1] = host PC inside the named block, but the block carries no RIP table.
+std::atomic<uint64_t> RIPFallbackHits[2] {};
+
+// Minimal fixed-buffer line builder. No allocation, no locks, no fmt; the
+// same shape as Syscalls.cpp's CloneTrace hex writer.
+size_t RIPFallbackHex(char* Dst, uint64_t V) {
+  char Tmp[16];
+  size_t N = 0;
+  if (V == 0) {
+    Tmp[N++] = '0';
+  }
+  while (V) {
+    const unsigned D = V & 0xF;
+    Tmp[N++] = static_cast<char>(D < 10 ? '0' + D : 'a' + D - 10);
+    V >>= 4;
+  }
+  size_t Len = 0;
+  Dst[Len++] = '0';
+  Dst[Len++] = 'x';
+  while (N > 0) {
+    Dst[Len++] = Tmp[--N];
+  }
+  return Len;
+}
+
+size_t RIPFallbackAppend(char* Dst, size_t At, const char* Text) {
+  while (*Text) {
+    Dst[At++] = *Text++;
+  }
+  return At;
+}
+
+void RIPFallbackWriteLine(unsigned Kind, uint64_t N, uint64_t HostPC, uint64_t BlockBegin, uint64_t StateRIP) {
+  // Worst case well under 192 bytes: five hex values at 18 chars each plus the
+  // fixed text.
+  char Line[192];
+  size_t At = RIPFallbackAppend(Line, 0, "RIPFallbackTrap[");
+  Line[At++] = static_cast<char>('0' + (Kind & 1));
+  At = RIPFallbackAppend(Line, At, "] #");
+  At += RIPFallbackHex(Line + At, N);
+  At = RIPFallbackAppend(Line, At, ": hostPC ");
+  At += RIPFallbackHex(Line + At, HostPC);
+  At = RIPFallbackAppend(Line, At, " hdr ");
+  At += RIPFallbackHex(Line + At, BlockBegin);
+  At = RIPFallbackAppend(Line, At, " -> stale State.rip ");
+  At += RIPFallbackHex(Line + At, StateRIP);
+  Line[At++] = '\n';
+  ssize_t Ignored = ::write(STDERR_FILENO, Line, At);
+  (void)Ignored;
+}
+
+// atexit: a completed run reports its counts even when no hit ever reached the
+// first-64 window logging (and a zero/zero line is the positive result the
+// instrument exists to produce). Raw write for consistency; atexit runs on the
+// normal-exit path where that is merely cheap rather than required.
+void RIPFallbackDumpCounters() {
+  char Line[128];
+  size_t At = RIPFallbackAppend(Line, 0, "RIPFallbackTrap exit: window=");
+  At += RIPFallbackHex(Line + At, RIPFallbackHits[0].load(std::memory_order_relaxed));
+  At = RIPFallbackAppend(Line, At, " noRIPTable=");
+  At += RIPFallbackHex(Line + At, RIPFallbackHits[1].load(std::memory_order_relaxed));
+  Line[At++] = '\n';
+  ssize_t Ignored = ::write(STDERR_FILENO, Line, At);
+  (void)Ignored;
+}
+
+// Forces the mode static (getenv) and registers the exit dump at library load,
+// before main, before any guest thread and before any signal can deliver.
+struct RIPFallbackInitializer {
+  RIPFallbackInitializer() {
+    if (GetRIPFallbackTrapMode() != RIPFallbackTrapMode::Off) {
+      ::atexit(RIPFallbackDumpCounters);
+    }
+  }
+} RIPFallbackInitializerInstance;
+
+void NoteRIPFallback(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t BlockBegin, unsigned Kind) {
+  const auto Mode = GetRIPFallbackTrapMode();
+  if (Mode == RIPFallbackTrapMode::Off) {
+    return;
+  }
+  // Only in-JIT PCs are interesting. A host PC in the dispatcher, in a FABI
+  // stub or in C++ is an expected fallback and always has been.
+  // NonMovableUniquePtr has no operator bool — .get() is the null test.
+  if (!Thread->CPUBackend.get() || !Thread->CPUBackend->IsAddressInCodeBuffer(HostPC)) {
+    return;
+  }
+  const uint64_t N = RIPFallbackHits[Kind].fetch_add(1, std::memory_order_relaxed);
+  if (Mode == RIPFallbackTrapMode::Abort) {
+    // Raw write + abort rather than ERROR_AND_DIE_FMT: dying is the point, but
+    // deadlocking inside fmt/LogMan while holding signal-machinery locks is a
+    // hang, not a diagnostic.
+    RIPFallbackWriteLine(Kind, N, HostPC, BlockBegin, Thread->CurrentFrame->State.rip);
+    ::abort();
+  }
+  if (N < 64) {
+    RIPFallbackWriteLine(Kind, N, HostPC, BlockBegin, Thread->CurrentFrame->State.rip);
+  }
+}
+} // namespace
+
 uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
   const auto Frame = Thread->CurrentFrame;
   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
@@ -271,6 +425,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
       // P3.1 landed as 244075383; the old comment claiming otherwise was
       // stale, per P5.0 review.)
       if (InlineTail->NumberOfRIPEntries == 0) {
+        NoteRIPFallback(Thread, HostPC, BlockBegin, 1);
         return Frame->State.rip;
       }
 
@@ -298,6 +453,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
   }
 
   // Fallback to what is stored in the RIP currently.
+  NoteRIPFallback(Thread, HostPC, BlockBegin, 0);
   return Frame->State.rip;
 }
 

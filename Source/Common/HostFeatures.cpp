@@ -489,6 +489,7 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
 
   ENABLE_DISABLE_OPTION(SupportsISA30, ISA30, ISA30);
   ENABLE_DISABLE_OPTION(SupportsAVX, AVX, AVX);
+  ENABLE_DISABLE_OPTION(SupportsAVX2, AVX2, AVX2);
   ENABLE_DISABLE_OPTION(SupportsSVE128, SVE, SVE);
   ENABLE_DISABLE_OPTION(SupportsAFP, AFP, AFP);
   ENABLE_DISABLE_OPTION(SupportsRCPC, LRCPC, LRCPC);
@@ -693,6 +694,12 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   // behind this same CPUID bit) measured neutral, so the regression is JIT
   // codegen rather than ifunc selection. See docs/GAMING.md.
   HostFeatures.SupportsAVX = false;
+  // AVX2 advertisement follows AVX unless FEX_HOSTFEATURES=disableavx2 masks
+  // it: leaf-7 AVX2/BMI reporting is gated on BOTH bits in CPUID.cpp. This is
+  // the discrimination lever the W3 save-load campaign lacked — a title that
+  // hard-requires AVX to launch can still have every 256-bit runtime dispatch
+  // in the guest flipped to its SSE tier, without touching the JIT.
+  HostFeatures.SupportsAVX2 = true;
   // AES-NI lowering uses the FABI software-helper path (PPC64_VAESEnc et al.
   // in JIT.cpp) — POWER8 has hardware vcipher/vncipher but the bridge through
   // the existing FABI mini-frame is the simplest correct first cut. Without

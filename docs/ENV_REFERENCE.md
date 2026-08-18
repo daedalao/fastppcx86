@@ -80,6 +80,8 @@ All of these change emitted code. Unless noted, presence-tested.
 | `FEX_DEADPROLOGUE` | off | `=trap` emits the dead `EmitEntryPoint` prologue behind an unconditional `tw`; `=emit` emits it for real. The methodology for proving a path unreachable. |
 | `FEX_ENTRYWATCH` | off | Emit a ring-buffer store at matching entry points. Changes emitted code. |
 | `FEX_SPINHINT_ANYLOOP` | off | Widen SMT priority hints to any loop, not just stationary polls. |
+| `FEX_PPCINLINECONST` | **ON** | PPC64 inline-constant predicates in `IREmitter` (`Interface/IR/PPC64Immediates.h`). `=0` reverts to the AArch64 `IsImmAddSub` / `IsImmLogical` tests, which reject every negative D-form immediate and accept ARM bitmasks PPC needs 4-5 instructions to rebuild. **Value-tested**: `=0` disables. Changes which operands are folded into instructions and which occupy one of five dynamic GPRs. |
+| `FEX_PPCLOGICALIMM` | **ON** | Logical-immediate lowering in `ALUOps.cpp`: rotate-and-mask forms (`rldicl`/`rldicr`/`rldimi`/`rlwinm`) for `And`/`Andn`, `andis.` plus record-form rotates for `AndWithFlags`/`TestNZ`, and the `oris`+`ori` pair in `Or`/`Xor`. `=0` reverts all of them to `LoadConstant` + a register-form op. **Value-tested**: `=0` disables. |
 
 ### Diagnostics and tripwires
 Absorb-by-default behaviours; setting these makes them loud.

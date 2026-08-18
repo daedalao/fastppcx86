@@ -12,6 +12,7 @@ $end_info$
 #include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/PPC64LE/JITClass.h"
 #include "Interface/Core/JIT/Relocations.h"
+#include "Interface/IR/PPC64Immediates.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Utils/MemberFunctionToPointer.h"
 #include "Utils/variable_length_integer.h"
@@ -2200,6 +2201,34 @@ void PPC64IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Link) {
   PPC64PatchInstruction(ThunkStart, Record->OrigThunkWord);
 }
 
+// Block-link outcome census. Three counters, incremented once per exit site
+// that ever links, on a path that already takes two locks, patches two
+// instructions and does icache maintenance -- the cost is not measurable.
+//
+// WHY THIS EXISTS. The in-tree comment at PPC64EncodeBranch's caller has long
+// asserted that the far case is "the common case against a 128MiB code buffer".
+// Nothing ever measured it, and it decides real things:
+//
+//   * a DIRECT link is `b HostCode`, one instruction;
+//   * a THUNK link is `b Thunk` plus the thunk's bcl/mflr/ld/mtctr/bctr --
+//     five more instructions, a second LR round trip, three branches and a
+//     dependent load, on every traversal for the life of the link;
+//   * NEITHER means the exit stays on the 10-instruction inlined probe
+//     forever.
+//
+// So the direct:thunk ratio is a straight multiplier on what any per-exit
+// saving is worth, and if the thunk share is high the thunk shape itself
+// becomes the target rather than the exit. INITIAL_CODE_SIZE is 16MiB growing
+// to MAX_CODE_SIZE 128MiB, so the answer depends on buffer growth and cannot
+// be reasoned out from the source.
+//
+// Reported by the op-size profiler's dump (BLOCK_LINK lines) because that
+// mechanism already rewrites its file as it goes and therefore survives the
+// SIGKILL that ends every game session.
+std::atomic<uint64_t> LinkOutcomeDirect {};
+std::atomic<uint64_t> LinkOutcomeThunk {};
+std::atomic<uint64_t> LinkOutcomeUnreachable {};
+
 } // anonymous namespace
 
 uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* Frame,
@@ -2276,7 +2305,9 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     // registered undo if this thread stalled between the two.
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64DirectBlockDelinker, lk);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(DirectDelta));
+    LinkOutcomeDirect.fetch_add(1, std::memory_order_relaxed);
   } else if (PPC64BranchDisplacementInRange(ThunkDelta)) {
+    LinkOutcomeThunk.fetch_add(1, std::memory_order_relaxed);
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
     // Publish HostCode BEFORE the thunk-word patch, with a full barrier in
@@ -2295,11 +2326,15 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
 #endif
     PPC64PatchInstruction(ThunkStart, PPC64_BCL_20_31_PLUS4);
     PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(ThunkDelta));
+  } else {
+    // Even the thunk is out of `b` range of the exit (would need a single
+    // compile unit larger than ±32MiB — beyond every intra-block branch this
+    // backend already emits). Leave the exit unlinked; it stays on the
+    // inlined-probe path forever, which is correct, just slower. Counted
+    // rather than assumed impossible: if this is ever nonzero, an exit class
+    // is silently paying the 10-instruction probe on every traversal.
+    LinkOutcomeUnreachable.fetch_add(1, std::memory_order_relaxed);
   }
-  // else: even the thunk is out of `b` range of the exit (would need a
-  // single compile unit larger than ±32MiB — beyond every intra-block branch
-  // this backend already emits). Leave the exit unlinked; it stays on the
-  // inlined-probe path forever, which is correct, just slower.
 
   return HostCode;
 }
@@ -2750,13 +2785,29 @@ static std::atomic<uint32_t> EntryWatchNextSlot {};
 // into LR (the CPU does not push to the link-stack for this exact form),
 // mflr copies it into TMP1, then we subtract the emit-time delta from
 // mflr's location to HeaderLabel to recover the header's absolute address.
-// LoadImm32 handles the delta so blocks of any size work (a naked int16
-// addi would break past 32 KB, which MAXINST=500 readily produces).
+//
+// The subtraction is folded into the addressing instruction itself rather than
+// materialised into a register first. `LoadImm32(TMP2, Delta); subf` was three
+// instructions in the common case and four past 32 KB; `addi TMP1, TMP1,
+// -Delta` is one, and `addis`+`addi` covers the whole int32 range in two. The
+// old form's only justification was that "a naked int16 addi would break past
+// 32 KB, which MAXINST=500 readily produces" -- true of a *single* addi, but
+// addis carries the other 16 bits, and the immediate is a compile-time
+// constant so the split costs nothing at runtime.
+//
+// This runs on every external arrival into an EntryPoint block -- every
+// dispatcher L1 hit, every linked block-to-block branch, every shadow-RET fast
+// path -- and Frontend.cpp marks the return address of every guest CALL as an
+// EntryPoint, so it is also on the RET leg of every guest call.
 //
 // LR is dead at any dispatcher/link entry into a ppc64le block (blocks are
 // entered via bctr), and we call this in the entry-point prologue before
 // any IR op runs, so clobbering LR/TMP1/TMP2 here is safe.
 void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel) {
+  // Field kill switch (hashed into the code-cache config id): restores the
+  // LoadImm32 + subf shape this replaced.
+  static const bool DisableAddiFold = getenv("FEX_NOHDRADDI") != nullptr;
+
   LOGMAN_THROW_A_FMT(HeaderLabel.bound, "HeaderLabel must be bound before this call");
   const int64_t HeaderOffset = HeaderLabel.offset;
   bcl(20, 31, 4);                                    // LR = &mflr (NIA)
@@ -2765,8 +2816,36 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
   const int64_t Delta = MFLROffset - HeaderOffset;
   LOGMAN_THROW_A_FMT(Delta >= 0 && Delta < (int64_t{1} << 31),
                      "InlineHeader delta out of int32_t range: {}", Delta);
-  LoadImm32(TMP2, static_cast<uint32_t>(Delta));     // TMP2 = mflr - HeaderLabel
-  subf(TMP1, TMP2, TMP1);                            // TMP1 = HeaderLabel address
+  if (Delta < 0 || Delta >= (int64_t {1} << 31)) [[unlikely]] {
+    // Real guard, not just the Debug assert above (LOGMAN_THROW_A_FMT compiles
+    // to nothing in Release, and an out-of-range Delta would mis-encode the
+    // addis arm SILENTLY -- the one arm only the largest-MaxInst titles ever
+    // run). Structurally unreachable while blocks live in a sub-2GB buffer,
+    // but if that ever changes this emits a correct sequence instead of a
+    // corrupted header address. LoadImm64 + subf handles any delta.
+    LoadImm64(TMP2, static_cast<uint64_t>(Delta));
+    subf(TMP1, TMP2, TMP1);
+  } else if (DisableAddiFold) {
+    LoadImm32(TMP2, static_cast<uint32_t>(Delta));   // TMP2 = mflr - HeaderLabel
+    subf(TMP1, TMP2, TMP1);                          // TMP1 = HeaderLabel address
+  } else if (Delta <= 32768) {
+    // -Delta lands in [-32768, 0], exactly addi's signed range. Note the bound
+    // is 32768 and not 32767: it is the NEGATED value that has to encode.
+    addi(TMP1, TMP1, static_cast<int16_t>(-Delta));
+  } else {
+    // addis + addi. Lo is the sign-extended low half, Hi absorbs the borrow
+    // that sign extension introduces, so Hi<<16 + Lo == -Delta exactly.
+    // Hi is in [-32768, -1] for every Delta the assert above admits:
+    // Hi == floor(-Delta / 65536) or that plus one, and Delta < 2^31 bounds
+    // the floor at -32768.
+    const int64_t Neg = -Delta;
+    const int16_t Lo = static_cast<int16_t>(Neg & 0xFFFF);
+    const int16_t Hi = static_cast<int16_t>((Neg - Lo) >> 16);
+    addis(TMP1, TMP1, Hi);
+    if (Lo) {
+      addi(TMP1, TMP1, Lo);
+    }
+  }
   std(TMP1,
       static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.InlineJITBlockHeader)),
       STATE);
@@ -3133,6 +3212,35 @@ static void Dump() {
                             MaxBlockBytesSSA.load(std::memory_order_relaxed));
   Out += fextl::fmt::format("BLOCK_BUDGET verdict={}\n\n", ScaledPerSSA > ReservePerSSA * kBytesPerSSAScale ? "SHORT" : "OK");
 
+  // ---- Block-link outcomes: direct `b` vs thunk vs never-linked. ----
+  // See the counter definitions next to ExitFunctionLinkWithRecord for why
+  // this ratio matters. Short version: a direct link costs one instruction per
+  // traversal, a thunk link costs six plus an LR round trip and a dependent
+  // load, and an unreachable one costs the full inlined probe forever. Any
+  // per-exit instruction saving is scaled by this distribution, so it has to be
+  // measured before it can be priced.
+  {
+    const uint64_t Direct = LinkOutcomeDirect.load(std::memory_order_relaxed);
+    const uint64_t Thunk = LinkOutcomeThunk.load(std::memory_order_relaxed);
+    const uint64_t Unreachable = LinkOutcomeUnreachable.load(std::memory_order_relaxed);
+    const uint64_t Linked = Direct + Thunk;
+    const uint64_t All = Linked + Unreachable;
+    Out += fextl::fmt::format("################################################################################\n"
+                              "### BLOCK LINK OUTCOMES (per exit site that reached the linker)\n"
+                              "################################################################################\n");
+    if (All) {
+      Out += fextl::fmt::format("BLOCK_LINK direct={} thunk={} unreachable={} total={}\n", Direct, Thunk, Unreachable, All);
+      Out += fextl::fmt::format("BLOCK_LINK direct_pct_x100={} thunk_pct_x100={} unreachable_pct_x100={}\n", (Direct * 10000) / All,
+                                (Thunk * 10000) / All, (Unreachable * 10000) / All);
+      // Extra host instructions executed per traversal of a thunk-linked exit
+      // versus a direct one: b Thunk lands on bcl/mflr/ld/mtctr/bctr.
+      Out += fextl::fmt::format("BLOCK_LINK thunk_extra_insns_per_traversal=5 linked={}\n", Linked);
+    } else {
+      Out += "BLOCK_LINK_NONE (no exit site reached the linker; BlockLinking off, or nothing ran)\n";
+    }
+    Out += "\n";
+  }
+
   // ---- Full table, max descending. ----
   Out += fextl::fmt::format("################################################################################\n"
                             "### PER-OP TABLE (sorted by max host bytes, descending)\n"
@@ -3277,8 +3385,16 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 //    arithmetic that reads all 64 bits.
 // -------------------------------------------------------------------------
 void PPC64JITCore::Compute32MaskElision() {
+  // FEX_ZEXTOPT=0 turns BOTH elision passes off; FEX_ZEXTOPT_CONSUMER=0 turns
+  // off only this one. The pair exists because the two passes reach the same
+  // Elide32MaskSet from opposite directions, so a wrong tail-mask elision --
+  // which presents as a correct low 32 bits over a stale high half, and a guest
+  // fault the moment the value is used as a pointer -- cannot be attributed to
+  // one of them with a single switch. Bisect with the sub-switches, not by
+  // rebuilding.
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
-  static const bool ZExtOff = ZExtEnv && ZExtEnv[0] == '0';
+  static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
+  static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
   Elide32MaskSet.assign(IR->GetSSACount(), false);
   if (ZExtOff) {
     return;
@@ -3431,6 +3547,579 @@ void PPC64JITCore::Compute32MaskElision() {
 
       if (Elide) {
         Elide32MaskSet[DefID.Value] = true;
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------------------
+// Producer-side 32-bit tail-mask elision. See the ComputeHighZeroElision
+// block comment in JITClass.h for why this composes with the consumer-side
+// pass above and why the lattice is over host registers rather than SSA nodes.
+//
+// The claim per elided mask is: bits 63:32 of the destination are ALREADY zero
+// when Mask32Tail would run, so `rldicl Dst,Dst,0,32` writes back exactly the
+// bits it read. Nothing about who reads the value afterwards enters the
+// argument, which is why an SRA-resident (guest-architectural) def is in scope
+// here and is not in Compute32MaskElision.
+//
+// SOUNDNESS SHAPE
+//   * Every block starts at BOTTOM (nothing known). Blocks are entered from
+//     the dispatcher, from a linked block-to-block branch, from a shadow-RET
+//     trampoline and from intra-unit edges; the emission loop says as much
+//     ("A block can be entered from anywhere; nothing about the previously
+//     emitted block's trailing register contents may be assumed here"). No
+//     cross-block or cross-edge propagation is attempted.
+//   * Any op NOT in the table below clears the WHOLE lattice. That is the
+//     only defence needed against ops that write a modelled register other
+//     than their own destination (StorePF/StoreAF are the common ones, and
+//     they are modelled explicitly), against multi-destination ops, and
+//     against every host-helper call — none of which need auditing to stay
+//     sound, only to stay precise. Ops on the table were each read in full:
+//     they touch no modelled register besides the one recorded, only
+//     TMP1-TMP4 (r3-r6), r0/r1 and vector state, none of which is in any
+//     SRA or RA pool.
+//   * A fact is admitted only when it holds on EVERY emission path the
+//     handler can take FOR THIS NODE. Where a handler branches, the branch
+//     condition is re-evaluated here with the handler's own test
+//     (IsInlineConstant / IROp->Size / ShiftAmount), never approximated; where
+//     the path is not determinable, the value is UNKNOWN.
+//   * Signal detours cannot invalidate a fact. SpillStaticRegs/FillStaticRegs
+//     round-trip an SRA GPR through State.gregs, and in 32-bit guest mode both
+//     halves of that round trip (rldicl-before-std on the way out, lwz on the
+//     way in — ArchHelpers/PPC64Emitter.cpp) only ADD zeros to the high half;
+//     in 64-bit mode the ld restores the exact spilled value. The dynamic RA
+//     pool is entirely callee-saved in both modes (the AllGPRsNonVolatile
+//     static_asserts) and the kernel restores it across signal delivery.
+//
+// ADMITTED SOURCES — instruction semantics verified against
+// CodeEmitter/PPC64LE/Emitter.h (encoding) and the named DEF_OP (which form
+// is actually emitted). "Zero" below always means result bits 63:32 == 0,
+// written in the x86-facing sense this backend uses; in Power's own MSB-0
+// numbering these are bits 0:31.
+//
+//   rlwinm/rlwnm  Word rotate-and-mask. The mask is MASK(MB+32, ME+32), so
+//                 with MB <= ME it selects only bits 32:63 (Power numbering)
+//                 and the high half of the destination is zeroed. EVERY
+//                 rlwinm/rlwnm this table relies on is checked to have
+//                 MB <= ME at its emission site; the wrapping MB > ME form is
+//                 NOT admitted anywhere (see the exclusions).
+//   slw/srw       Same word-rotate structure with m = MASK(32, 63-n) resp.
+//                 MASK(32+n, 63), and m = 0 when the count's bit 58 is set.
+//                 High half zero on every count.
+//   lbz/lhz/lwz   Zero-extending loads (and the lbzx/lhzx/lwzx X-forms).
+//   rldicl mb>=32 Doubleword rotate-and-clear-left clears bits 0:mb-1, so any
+//                 mb >= 32 zeroes the high half. `rldicl Dst,Dst,0,32` is the
+//                 tail mask itself; `srdi`-shaped uses are checked per site.
+//   popcntd       Result is a population count in [0,64].
+//   and/or/xor    Bitwise, so the high half of the result is the same function
+//   andc          of the high halves of the inputs: `and` needs EITHER input
+//                 high-zero, `andc` (RS & ~RB) needs only RS, `or`/`xor` need
+//                 BOTH. ori/oris/xori/xoris leave the high half equal to RS's,
+//                 and their immediates are 16-bit, so they behave as an
+//                 operand that is trivially high-zero.
+//   induction     A def whose Mask32Tail actually runs is high-zero afterwards
+//                 by construction. "Actually runs" is the load-bearing part:
+//                 it does not run when Compute32MaskElision elided it, and
+//                 that case is excluded below.
+//
+// DELIBERATELY EXCLUDED
+//   add/addi/addis/subf/neg   Carry and borrow propagate out of bit 31 into
+//                             bit 32. (These still SEED the lattice through
+//                             their own emitted tail mask; they are never
+//                             elided by this pass.)
+//   mullw/mulli               Sign-extend the 32-bit product across bits
+//                             63:32. mulld/divwu likewise out of scope
+//                             (divwu's high half is architecturally
+//                             undefined).
+//   extsb/extsh/extsw         And every other sign-extending form.
+//   not_ (nor RA,RS,RS)       Its high half is all-ones exactly when the
+//                             input's was zero. XornShift inherits this
+//                             through its `not_` on the shifted temp.
+//   popcntw                   Per-WORD counts: the high half receives
+//                             popcount(high half of the source), not zero.
+//                             DEF_OP(Popcount) documents this as the reason it
+//                             uses popcntd instead, and emits no bare popcntw.
+//   andi.                     Architecturally fine (RA <- RS & ((48)0 || UI))
+//                             but its only emitter is DEF_OP(AndWithFlags),
+//                             whose other arm is `and__` with no such
+//                             guarantee, and which owns a CR0/packed-NZCV
+//                             contract this pass has no business touching.
+//   rlwinm with MB > ME       The wrapping-mask form. Excluded on purpose: the
+//                             two readings of MASK() for a wrapped word mask
+//                             disagree about bits 0:31 and this port has no
+//                             way to settle it by inspection. No site relied
+//                             on for a fact here uses it.
+//   EntrypointOffset          Its constant window is rewritten in place by
+//                             ApplyCodeRelocations on a code-cache load, so
+//                             the emit-time value is not the executed value.
+//   Constant with PatchSite   FEX_SMCSEMANTICPATCH rewrites the immediate at
+//                             fault time to a different guest constant.
+//   Spill slots, helper       Reached only through ops that are off the table
+//   results, anything else    and therefore clear the whole lattice.
+//
+// RETRACTED: "in 32-bit guest mode every SRA register is high-zero because
+// FillStaticRegs uses lwz". That is an ENTRY condition, not an invariant, and
+// it is not even established on the warm path. CodeData.EntryPoints[] is
+// recorded AFTER EmitEntryPoint's FillStaticRegs, so dispatcher L1 hits and
+// linked block-to-block branches — i.e. almost every entry — never refill SRA
+// at all (that is the entire point of the inlined L1 probe in
+// DEF_OP(ExitFunction)). SpillStaticRegs agrees from the other side: in 32-bit
+// mode it emits `rldicl(tmp, SRA[i], 0, 32)` before the store precisely
+// because it "avoids assuming the SRA reg already has a zero upper half".
+// And Compute32MaskElision above deliberately elides masks on GPRFixed defs,
+// which manufactures exactly that garbage. So SRA registers get no free fact:
+// they enter each block UNKNOWN like everything else.
+// -------------------------------------------------------------------------
+void PPC64JITCore::ComputeHighZeroElision() {
+  // FEX_ZEXTOPT=0 turns BOTH elision passes off; FEX_ZEXTOPT_PRODUCER=0 turns
+  // off only this one. See the matching note in Compute32MaskElision.
+  static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
+  static const char* ProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
+  static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ProducerEnv && ProducerEnv[0] == '0');
+  // Producer-only attribution for FEX_ZEXTTRAP. Sized here rather than in
+  // Compute32MaskElision so it is empty when this pass is off, which makes the
+  // trap a no-op instead of firing on the consumer pass's elisions.
+  HighZeroElideSet.assign(IR->GetSSACount(), false);
+  if (ZExtOff) {
+    // Compute32MaskElision already sized and cleared Elide32MaskSet.
+    return;
+  }
+
+  // Bit i == "host GPR r(i) has bits 63:32 == 0".
+  uint32_t HighZeroRegs = 0;
+
+  const auto RegBit = [](PPC64Emitter::GPR R) { return uint32_t {1} << R.idx; };
+
+  // Physical GPR behind an operand wrapper, mirroring GetReg(OrderedNodeWrapper)
+  // exactly (immediate-encoded post-RA, SSA pointer otherwise). Returns false
+  // for invalid operands and for anything that is not a GPR/GPRFixed.
+  const auto OperandGPR = [this](IR::OrderedNodeWrapper W, PPC64Emitter::GPR* Out) {
+    if (W.IsInvalid()) {
+      return false;
+    }
+    const IR::PhysicalRegister PR = W.IsImmediate() ? IR::PhysicalRegister(W)
+                                                    : IR::PhysicalRegister(IR->GetNode(W));
+    const auto C = PR.AsRegClass();
+    if (C != IR::RegClass::GPR && C != IR::RegClass::GPRFixed) {
+      return false;
+    }
+    *Out = GetReg(PR);
+    return true;
+  };
+
+  // "This operand's high half is zero." An inline constant is materialized by
+  // LoadConstant (exact value) or folded into a 16-bit immediate form, so its
+  // own high half is the answer; a register defers to the lattice.
+  const auto OperandHighZero = [&](IR::OrderedNodeWrapper W) {
+    uint64_t C;
+    if (IsInlineConstant(W, &C)) {
+      return (C >> 32) == 0;
+    }
+    PPC64Emitter::GPR R = r(0);
+    if (!OperandGPR(W, &R)) {
+      return false;
+    }
+    return (HighZeroRegs & RegBit(R)) != 0;
+  };
+
+  // The Is32 arm of the XorShift/XornShift/AndShift shift ladder (three
+  // verbatim copies in ALUOps.cpp) lowers LSL/LSR/ROR to rlwinm forms whose
+  // MB <= ME — (·,Amt,0,31-Amt), (·,32-Amt,Amt,31) and (·,·,0,31) — so the
+  // shifted temp is high-zero. ASR is extsw + rldicl(...,64-sh,sh) with
+  // sh <= 31, which leaves the sign fill in place, and ShiftAmount == 0 is a
+  // bare `mr` of the unknown source. Note Amt & 31 == 0 with Amt != 0 still
+  // lands on an MB <= ME rlwinm, so only the literal-zero case is excluded.
+  const auto ShiftedTempHighZero = [](IR::ShiftType S, uint8_t Amt, bool Is32) {
+    return Is32 && Amt != 0 &&
+           (S == IR::ShiftType::LSL || S == IR::ShiftType::LSR || S == IR::ShiftType::ROR);
+  };
+
+  // What this op does to the lattice.
+  enum class Act {
+    Transparent, // emits nothing that writes a modelled register
+    Opaque,      // unmodelled: assume it wrote anything, drop every fact
+    Write,       // writes exactly WriteReg, with the fact in WriteZero
+  };
+
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    // Entry state: nothing known. See the SOUNDNESS SHAPE note above.
+    HighZeroRegs = 0;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      const auto ID = IR->GetID(CodeNode).Value;
+      // Elide32MaskSet is sized to GetSSACount() by Compute32MaskElision; the
+      // bound is belt-and-braces, matching Mask32Tail's own guard at the
+      // emission site.
+      const bool Elidable = ID < Elide32MaskSet.size();
+      const bool ConsumerElided = Elidable && Elide32MaskSet[ID];
+      // Size test copied verbatim from the handlers: every Mask32Tail call in
+      // ALUOps.cpp is guarded by `IROp->Size == IR::OpSize::i32Bit` exactly,
+      // never `<=`, so an i8/i16 op carries no mask and gets no fact.
+      const bool MaskSize = IROp->Size == IR::OpSize::i32Bit;
+
+      // Destination register, when the node has a GPR one. Ops below that
+      // write somewhere else (StoreRegister, StorePF/StoreAF) override this.
+      PPC64Emitter::GPR DstReg = r(0);
+      bool HaveDst = false;
+      if (IR::GetHasDest(IROp->Op)) {
+        const IR::PhysicalRegister DefPR(CodeNode);
+        const auto C = DefPR.AsRegClass();
+        if (C == IR::RegClass::GPR || C == IR::RegClass::GPRFixed) {
+          DstReg = GetReg(DefPR);
+          HaveDst = true;
+        }
+      }
+
+      Act Action = Act::Opaque;
+      PPC64Emitter::GPR WriteReg = r(0);
+      bool WriteZero = false;
+      // Pre-mask fact for a Mask32Tail carrier: "the destination's high half is
+      // already zero when Mask32Tail would run". Setting this is what elides.
+      bool PreZero = false;
+      bool MaskCarrier = false;
+
+      switch (IROp->Op) {
+      // Emit-nothing ops: identical list to Compute32MaskElision's adjacency
+      // skip. None of them writes any register.
+      case IR::OP_DUMMY:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      case IR::OP_GUESTOPCODE:
+        Action = Act::Transparent;
+        break;
+
+      // SpillRegister writes memory and TMP1 only.
+      case IR::OP_SPILLREGISTER:
+        Action = Act::Transparent;
+        break;
+
+      // ---- unconditional zero sources -----------------------------------
+      case IR::OP_LOADMEM:
+      case IR::OP_LOADMEMTSO: {
+        // DEF_OP(LoadMem)/DEF_OP(LoadMemTSO) route the GPR class through
+        // EmitLoadGPR, which emits lbz/lhz/lwz (D-form) or lbzx/lhzx/lwzx
+        // (X-form) for sizes 1/2/4 — both zero-extend — and ld/ldx at 8.
+        // The FPR and i128 classes write a vector register, never a GPR.
+        const auto Class = IROp->Op == IR::OP_LOADMEM ? IROp->C<IR::IROp_LoadMem>()->Class
+                                                      : IROp->C<IR::IROp_LoadMemTSO>()->Class;
+        if (Class != IR::RegClass::GPR) {
+          Action = Act::Transparent;
+        } else if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = IROp->Size <= IR::OpSize::i32Bit;
+        }
+        break;
+      }
+      case IR::OP_FILLREGISTER: {
+        // Sizes 1/2/4 fill with lbz/lhz/lwz; size 8 uses ld/ldx and restores
+        // whatever SpillRegister's std wrote. FPR fills write a vector reg.
+        if (!IsFPR(CodeNode)) {
+          if (HaveDst) {
+            Action = Act::Write;
+            WriteReg = DstReg;
+            WriteZero = IR::OpSizeToSize(IROp->Size) <= 4;
+          }
+        } else {
+          Action = Act::Transparent;
+        }
+        break;
+      }
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR:
+      case IR::OP_ROR: {
+        // Every Size <= i32Bit path of these four ends in an rlwinm/rlwnm with
+        // MB <= ME, an slw/srw, or an explicit rldicl(...,0,32):
+        //   Lshl  const: rlwinm(Dst,S1,sh,0,31-sh)      reg: slw
+        //   Lshr  const: rldicl(Dst,S1,0,32) | rlwinm(Dst,S1,32-sh,sh,31)
+        //         reg:   srw
+        //   Ashr  const and reg arms both end rldicl(Dst,·,0,32)
+        //   Ror   const: rlwinm(Dst,S1,·,0,31)          reg: rlwnm(·,·,·,0,31)
+        // The i64 arms (sldi/srdi/rldicl mb=0/rldcl/or_) carry no such
+        // guarantee, hence the size gate. None of these calls Mask32Tail.
+        if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = IROp->Size <= IR::OpSize::i32Bit;
+        }
+        break;
+      }
+      case IR::OP_BFE: {
+        auto B = IROp->C<IR::IROp_Bfe>();
+        if (!HaveDst) {
+          break;
+        }
+        Action = Act::Write;
+        WriteReg = DstReg;
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          // rlwinm(Dst, Src, rot, 32 - width, 31): MB = 32-width <= 31 = ME
+          // for any width in 1..32, so this is the MB <= ME form. This arm is
+          // never the canonicalizing mask and is never elided.
+          WriteZero = B->Width >= 1 && B->Width <= 32;
+        } else if (B->Width == 32 && B->lsb == 0) {
+          // The 64-bit-mode frontend's canonical tail mask: DEF_OP(Bfe) emits
+          // rldicl(Dst,Src,0,32) — or, when Elide32MaskSet already covers this
+          // node, a bare mr that carries the source's high half through.
+          const bool SrcZero = OperandHighZero(B->Src);
+          if (ConsumerElided) {
+            WriteZero = SrcZero;
+          } else {
+            WriteZero = true;
+            if (SrcZero && Elidable) {
+              Elide32MaskSet[ID] = true;
+              HighZeroElideSet[ID] = true;
+            }
+          }
+        } else {
+          // rldicl(Dst, Src, rot, 64 - width) clears bits 0:(63-width), which
+          // covers the whole high half exactly when width <= 32.
+          WriteZero = B->Width <= 32;
+        }
+        break;
+      }
+      case IR::OP_SBFE: {
+        // Every Size <= i32Bit arm of DEF_OP(Sbfe) ends with an explicit
+        // rldicl(Dst,Dst,0,32) zero-extend writeback — the extsb/extsh/extsw
+        // fast paths and the general neg/sldi/or_ construction alike. The i64
+        // arms end on or_/mr and sign-fill the high half.
+        if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = IROp->Size <= IR::OpSize::i32Bit;
+        }
+        break;
+      }
+      case IR::OP_POPCOUNT: {
+        // DEF_OP(Popcount) always emits popcntd (never popcntw — see the
+        // exclusion note), whose result is a count in [0,64].
+        if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = true;
+        }
+        break;
+      }
+      case IR::OP_CONSTANT: {
+        auto C = IROp->C<IR::IROp_Constant>();
+        // PatchSite != 0 is the FEX_SMCSEMANTICPATCH repatchable window: the
+        // executed immediate can be rewritten later, so nothing is known. All
+        // three ordinary paths (LoadConstant, and the LastConstantCache
+        // addi/mr shortcuts) materialize exactly C->Constant.
+        if (C->PatchSite == 0 && HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = (C->Constant >> 32) == 0;
+        }
+        break;
+      }
+
+      // ---- copies: the fact propagates ----------------------------------
+      case IR::OP_COPY: {
+        auto C = IROp->C<IR::IROp_Copy>();
+        if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = OperandHighZero(C->Source);
+        }
+        break;
+      }
+      case IR::OP_LOADREGISTER: {
+        auto L = IROp->C<IR::IROp_LoadRegister>();
+        if (L->Class == IR::RegClass::FPR) {
+          Action = Act::Transparent;
+        } else if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = (HighZeroRegs & RegBit(StaticRegisters[L->Reg])) != 0;
+        }
+        break;
+      }
+      case IR::OP_STOREREGISTER: {
+        // The destination is the node's own PhysicalRegister (RA coalesced the
+        // guest-register write onto its SRA slot), not a separate dest field —
+        // DEF_OP(StoreRegister) reads it the same way.
+        auto S = IROp->C<IR::IROp_StoreRegister>();
+        const IR::PhysicalRegister DefPR(CodeNode);
+        const auto C = DefPR.AsRegClass();
+        // FPRFixed only — that is the exact test DEF_OP(StoreRegister) uses to
+        // pick its vector arm, and every OTHER class (including plain FPR)
+        // falls into its GPR arm there, so anything else must not be assumed
+        // register-free here.
+        if (C == IR::RegClass::FPRFixed) {
+          Action = Act::Transparent;
+        } else if (C == IR::RegClass::GPR || C == IR::RegClass::GPRFixed) {
+          Action = Act::Write;
+          WriteReg = GetReg(DefPR);
+          WriteZero = OperandHighZero(S->Value);
+        }
+        break;
+      }
+      case IR::OP_LOADPF:
+      case IR::OP_LOADAF: {
+        if (HaveDst) {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          WriteZero = (HighZeroRegs & RegBit(IROp->Op == IR::OP_LOADPF ? REG_PF : REG_AF)) != 0;
+        }
+        break;
+      }
+      case IR::OP_STOREPF:
+      case IR::OP_STOREAF: {
+        // These write REG_PF / REG_AF, which are modelled SRA registers but
+        // are NOT the node's destination — the one shape the "clears the whole
+        // lattice" default exists to catch. Model them rather than pay the
+        // clear, because flag-heavy guest code emits them constantly.
+        Action = Act::Write;
+        WriteReg = IROp->Op == IR::OP_STOREPF ? REG_PF : REG_AF;
+        WriteZero = OperandHighZero(IROp->Op == IR::OP_STOREPF
+                                      ? IROp->C<IR::IROp_StorePF>()->Value
+                                      : IROp->C<IR::IROp_StoreAF>()->Value);
+        break;
+      }
+
+      // ---- Mask32Tail carriers this pass can prove ----------------------
+      case IR::OP_AND: {
+        // Bitwise, so ONE high-zero input is enough -- but for the INLINE
+        // CONSTANT arm "the operand's high half" is no longer the constant's
+        // own high half. DEF_OP(And) stopped materialising the constant and
+        // ANDing it: EmitAndMask (ALUOps.cpp) lowers it to a rotate-and-mask
+        // form, and at i32 ClassifyAndMask is free to complete the constant's
+        // upper half either way (PPC64Immediates.h). When the "keep" completion
+        // wins, the emitted instruction PRESERVES Src1's bits 63:32 --
+        // `and eax,0xFFFF00FF` becomes `rldimi Dst,r0,8,48`, which punches
+        // zeros into LE 8..15 and leaves every other bit of Dst alone -- even
+        // though the IR constant has nothing above bit 31. Claiming high-zero
+        // there elides the tail mask that was the only thing zero-extending the
+        // result, and the guest register keeps whatever the host register held.
+        //
+        // The three kinds below are reachable ONLY from the keep completion
+        // (the clear completion's mask is <= 0xFFFFFFFF, which can only
+        // classify as Zero/ClearLeft/Word), so excluding them is exact rather
+        // than blanket-conservative. It also stays sound with
+        // FEX_PPCLOGICALIMM=0, whose LoadConstant + and_ fallback applies the
+        // constant verbatim: that is a SUBSET of what we decline to claim.
+        auto A = IROp->C<IR::IROp_And>();
+        MaskCarrier = true;
+        const auto ConstMaskHighZero = [&](IR::OrderedNodeWrapper W) {
+          uint64_t C;
+          if (!IsInlineConstant(W, &C)) {
+            return OperandHighZero(W);
+          }
+          if ((C >> 32) != 0) {
+            return false;
+          }
+          using Kind = FEXCore::IR::PPC64::AndMaskKind;
+          const auto K = FEXCore::IR::PPC64::ClassifyAndMask(C, MaskSize).Kind;
+          return K != Kind::Move && K != Kind::ClearRight && K != Kind::InsertZeroField;
+        };
+        PreZero = OperandHighZero(A->Src1) || ConstMaskHighZero(A->Src2);
+        break;
+      }
+      case IR::OP_OR: {
+        // mr / ori / oris / or_ — all four leave the high half equal to
+        // (S1_high | Src2_high), and the ori/oris immediates are 16-bit.
+        auto O = IROp->C<IR::IROp_Or>();
+        MaskCarrier = true;
+        PreZero = OperandHighZero(O->Src1) && OperandHighZero(O->Src2);
+        break;
+      }
+      case IR::OP_XOR: {
+        // xori / xoris / xor_ — same structure as Or.
+        auto X = IROp->C<IR::IROp_Xor>();
+        MaskCarrier = true;
+        PreZero = OperandHighZero(X->Src1) && OperandHighZero(X->Src2);
+        break;
+      }
+      case IR::OP_ANDN: {
+        // andc(Dst, S1, S2) = S1 & ~S2, or and_(Dst, S1, TMP4 = ~C). Either
+        // way the high half is S1's masked by something, so S1 alone decides.
+        auto A = IROp->C<IR::IROp_Andn>();
+        MaskCarrier = true;
+        PreZero = OperandHighZero(A->Src1);
+        break;
+      }
+      case IR::OP_ANDSHIFT: {
+        // and_(Dst, Src1, TMP4): a high-zero shifted temp is sufficient on its
+        // own, which makes the LSL/LSR/ROR forms unconditional.
+        auto A = IROp->C<IR::IROp_AndShift>();
+        MaskCarrier = true;
+        PreZero = ShiftedTempHighZero(A->Shift, A->ShiftAmount, MaskSize) ||
+                  OperandHighZero(A->Src1);
+        break;
+      }
+      case IR::OP_XORSHIFT: {
+        // xor_(Dst, Src1, TMP4): needs BOTH halves zero.
+        auto X = IROp->C<IR::IROp_XorShift>();
+        MaskCarrier = true;
+        PreZero = ShiftedTempHighZero(X->Shift, X->ShiftAmount, MaskSize) &&
+                  OperandHighZero(X->Src1);
+        break;
+      }
+
+      // ---- Mask32Tail carriers this pass does NOT prove -----------------
+      // Listed rather than defaulted so their emitted mask still SEEDS the
+      // lattice (that is what keeps a chain alive across an `add`), and so the
+      // set of ops whose handlers were read in full is explicit. Each writes
+      // only its own destination among modelled registers; the temporaries
+      // they use (TMP1-TMP4) are in no SRA or RA pool.
+      case IR::OP_ADD:
+      case IR::OP_SUB:
+      case IR::OP_NEG:
+      case IR::OP_NOT:
+      case IR::OP_MUL:
+      case IR::OP_UMUL:
+      case IR::OP_ORLSHL:
+      case IR::OP_ORLSHR:
+      case IR::OP_ORNROR:
+      case IR::OP_XORNSHIFT:
+      case IR::OP_ADDSHIFT:
+      case IR::OP_SUBSHIFT:
+        MaskCarrier = true;
+        PreZero = false;
+        break;
+
+      default:
+        Action = Act::Opaque;
+        break;
+      }
+
+      if (MaskCarrier) {
+        if (!HaveDst) {
+          // Should not happen (all of these have a GPR dest), but a dest we
+          // cannot name is a dest we cannot track.
+          Action = Act::Opaque;
+        } else {
+          Action = Act::Write;
+          WriteReg = DstReg;
+          // The mask runs unless someone elided it. ConsumerElided means the
+          // consumer-side proof already removed it WITHOUT establishing zero,
+          // so in that case only PreZero can carry the fact.
+          if (MaskSize && PreZero && !ConsumerElided && Elidable) {
+            Elide32MaskSet[ID] = true;
+            HighZeroElideSet[ID] = true;
+          }
+          WriteZero = PreZero || (MaskSize && !ConsumerElided);
+        }
+      }
+
+      switch (Action) {
+      case Act::Transparent:
+        break;
+      case Act::Write:
+        if (WriteZero) {
+          HighZeroRegs |= RegBit(WriteReg);
+        } else {
+          HighZeroRegs &= ~RegBit(WriteReg);
+        }
+        break;
+      case Act::Opaque:
+        HighZeroRegs = 0;
+        break;
       }
     }
   }
@@ -4283,6 +4972,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // no longer exists; drop them.
   ClearPendingBranches();
 
+  // r0-clobber tracking is per compile unit (see the Emit32 comment in
+  // CodeEmitter/PPC64LE/Emitter.h and the exit-side use in
+  // DEF_OP(ExitFunction)). Reset it here, alongside the other per-compile
+  // emitter state, so a previous unit's host call cannot make this one
+  // pessimise -- and, more importantly, so it can never make a unit look
+  // clean that isn't.
+  ResetR0Dirty();
+
   // Same for pending block-link jump thunks: their LinkPath labels are the
   // targets of miss-leg branches recorded in PendingBranches, so the two
   // lists must be reset together. Ditto the shared spill stub labels, whose
@@ -4461,6 +5158,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   }
 
   Compute32MaskElision();
+  // Producer-side half, OR'd into the same set. Must run AFTER the consumer
+  // pass (it reads Elide32MaskSet to know which masks still actually execute)
+  // and it only ever REMOVES rldicl instructions, so ComputeTSOPairElision's
+  // "emits zero memory-access host instructions" whitelist is unaffected.
+  ComputeHighZeroElision();
   ComputeTSOPairElision();
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
@@ -4592,6 +5294,41 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // below) skip it -- backward intra-unit edges emit their own poke in
       // DEF_OP(Jump)/DEF_OP(CondJump).
       EmitSuspendInterruptCheck();
+      // ---------------------------------------------------------------------
+      // DO NOT replace this stdu with a fixed reserve carved out of the
+      // dispatcher's own frame. It looks like pure per-block overhead -- one
+      // stdu here, one matching addi in ResetStack at every exit -- and an
+      // audit (notes/2026-08-15-agent-reports/block-overhead-audit.md, "V5")
+      // proposed exactly that, rated medium risk. It is not medium risk, it is
+      // wrong, and the failure mode is silent.
+      //
+      // A JIT block does NOT always run on a dispatcher frame. Guest signal
+      // delivery re-enters the JIT mid-dispatcher with r1 pointing somewhere
+      // else entirely:
+      //
+      //   SignalDelegator::HandleDispatcherGuestSignal calls StoreThreadState,
+      //   which stamps a PPC64ContextBackup onto the host stack and does
+      //   SetSp(ucontext, NewSP) with NewSP == &Backup; the same function then
+      //   does SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA).
+      //
+      //   That entry point is recorded in PPC64Dispatcher.cpp *after*
+      //   PushCalleeSavedRegisters() runs, so no dispatcher frame is allocated
+      //   on this path at all.
+      //
+      // So blocks inside a guest signal handler execute with r1 == &Backup.
+      // Today that is safe precisely BECAUSE of the stdu below: each block
+      // moves r1 down and spills beneath the backup. Take the stdu away and
+      // spill slots resolve to [r1 + kSpillSlotPrefix + slot*32] measured from
+      // &Backup -- slot 0 lands in PPC64ContextBackup's 128-byte LinkageArea
+      // pad and every slot after it overwrites the saved host context that
+      // sigreturn restores from. Wrong guest state, no crash, arbitrarily far
+      // from the cause.
+      //
+      // The per-block stdu is not overhead. It is what makes JIT frames nest,
+      // which they must. A reserve taken at every JIT-*entry* boundary would
+      // nest correctly, but that is a dispatcher plus signal-path redesign
+      // with a matching pop at every exit -- not this.
+      // ---------------------------------------------------------------------
       if (SpillFrameSize) {
         // stdu's 14-bit signed DS field encodes byte offsets in [-32768, 32764].
         // For larger frames, emit the equivalent of stdu manually so callers
@@ -4657,7 +5394,20 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       }
     }
 
-    PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    // EntryPoint blocks ONLY. This record used to fire for every IR block,
+    // logging a zero-byte occurrence for the non-entry ones -- which left the
+    // bucket's total bytes correct but its OCCURRENCE COUNT equal to the number
+    // of IR blocks in the run rather than the number of prologues emitted, so
+    // the reported bytes-per-occurrence was diluted by roughly the ratio
+    // between them. A profile that says "<EntryPointPrologue> 308751 x 2.0
+    // instructions" is reporting neither a real prologue count nor a real
+    // prologue size; the sequence is 6-7 instructions and only entry blocks pay
+    // it. Nothing is emitted between the guard's close and here (Bind moves no
+    // cursor and the splat pre-pass is analysis), so the byte delta is still
+    // exactly the prologue.
+    if (BlockIROp->EntryPoint) {
+      PPC64_OPSIZE_RECORD(OpSizeProfileEnabled, OpSizeProfile::BUCKET_ENTRYPOINT_PROLOGUE, GetOffset() - BlockPrologueStart, Entry);
+    }
 
     // Emit all ops in this block
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {

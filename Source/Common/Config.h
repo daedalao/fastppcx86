@@ -59,7 +59,10 @@ void LoadConfig(fextl::string ProgramName = {}, char** const envp = nullptr, con
 
 fextl::string GetHomeDirectory();
 
-fextl::string GetDataDirectory(const PortableInformation& PortableInfo);
+// The definition in Config.cpp takes a Global flag, matching GetConfigDirectory
+// below; the declaration here was missing it. Nothing called this overload, so
+// the mismatch only surfaced as a link error the first time something did.
+fextl::string GetDataDirectory(bool Global, const PortableInformation& PortableInfo);
 fextl::string GetConfigDirectory(bool Global, const PortableInformation& PortableInfo);
 fextl::string GetConfigFileLocation(bool Global, const PortableInformation& PortableInfo);
 fextl::string GetCacheDirectory();

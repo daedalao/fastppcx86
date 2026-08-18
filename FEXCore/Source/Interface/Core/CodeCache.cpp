@@ -22,6 +22,7 @@
 #include <git_version.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <xxhash.h>
 
 // ComputeCodeMapId streams the mapped file to derive a content-based cache
@@ -311,9 +312,37 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(MEMCPYSETTSOENABLED);
     HASH_OPT(HALFBARRIERTSOENABLED);
     // HWTSO compiles with NO TSO barriers at all (hardware SAO pages carry the
-    // ordering); a cache built with it on is unsound in any session with it
-    // off. NONTSORBP drops barriers from RBP-addressed accesses the same way.
-    HASH_OPT(HWTSO);
+    // ordering); a cache built with it on is unsound in any session with it off.
+    //
+    // Hash the EFFECTIVE state, never HASH_OPT(HWTSO). The requested option and
+    // what the JIT actually did diverge on any machine that cannot do SAO, and
+    // hashing the request produced the SAME id for two incompatible code images:
+    //
+    //   Box A, POWER8 + hash MMU: FEX_HWTSO=1, probe succeeds, zero barriers
+    //     emitted, cache written under id(HWTSO=1).
+    //   Box B, POWER9/POWER10 radix or an LPAR without
+    //     CONFIG_PPC_PROT_SAO_LPAR: FEX_HWTSO=1, probe FAILS, full barriers
+    //     emitted -- and it computed id(HWTSO=1) too.
+    //
+    // Same filename, and Box A's barrier-free blocks then execute on Box B over
+    // pages with no hardware ordering at all. EffectiveHardwareTSO is what
+    // SetHardwareTSOSupport installed, so the two boxes now land in different
+    // namespaces and Box B simply misses.
+    //
+    // Ordering: FEX::Kernel::Init runs SetupTSOEmulation (FEXInterpreter.cpp
+    // :403) long before the SyscallHandler member initialiser that forces this
+    // function-local static (:614), so the value is already final here.
+    //
+    // What this CANNOT cover, and must not be mistaken for covering: a mid-run
+    // revocation. The id is memoised above; by the time HardwareTSOState goes
+    // Active -> Revoked it can no longer change, so this always observes Active
+    // in the frontend. That case is handled where it has to be, by the
+    // LoadCodeCache/SaveCodeCaches gates in SyscallsSMCTracking.cpp. Revoked is
+    // still hashed distinctly rather than folded into Active, so that if this
+    // computation is ever moved later the failure mode is a cache MISS (cold,
+    // correct) rather than a hit on blocks compiled under the other model.
+    Hasher.Add(static_cast<uint64_t>(Context::EffectiveHardwareTSO.load(std::memory_order_acquire)));
+    // NONTSORBP drops barriers from RBP-addressed accesses the same way.
     HASH_OPT(NONTSORBP);
     HASH_OPT(STRICTINPROCESSSPLITLOCKS);
     HASH_OPT(SPLITLOCKINLINECONTAINED);
@@ -366,6 +395,13 @@ uint64_t ComputeCodeCacheConfigId() {
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSPLATFUSION") != nullptr));
       const char* ZExtEnv = getenv("FEX_ZEXTOPT");
       Hasher.Add(static_cast<uint64_t>(!(ZExtEnv && ZExtEnv[0] == '0')));
+      // Per-pass halves of the same switch. Hashed separately: each one changes
+      // emitted code on its own, so a cache built with one off is unsound in a
+      // session with it on.
+      const char* ZExtConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
+      Hasher.Add(static_cast<uint64_t>(!(ZExtConsumerEnv && ZExtConsumerEnv[0] == '0')));
+      const char* ZExtProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
+      Hasher.Add(static_cast<uint64_t>(!(ZExtProducerEnv && ZExtProducerEnv[0] == '0')));
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_FALLTHROUGH") != nullptr));
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
@@ -375,6 +411,25 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
+      // Linked-exit RIP sink (BranchOps.cpp SinkExitRIP): presence-ENABLED;
+      // moves the destination-RIP constant and its `std State.rip` from above
+      // the block-link patch site to below it, so the emitted exit differs.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_SINKEXITRIP") != nullptr));
+      // P5.0.2 re-zero policy at block exits (BranchOps.cpp R0ZeroMode).
+      // Three-way: elide (default) / always emit `li r0,0` / emit `tdnei r0,0`.
+      // All three differ in emitted bytes, and the trap arm differs in
+      // behaviour, so hash the resolved mode rather than either flag alone.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_R0TRAP")   != nullptr ? 2 :
+                                       getenv("FEX_NOR0ELIDE") != nullptr ? 1 : 0));
+      // Entry-point prologue shape (JIT.cpp EmitStoreBlockBeginToInlineHeader):
+      // presence-DISABLED; picks between the addi/addis delta fold and the
+      // legacy LoadImm32+subf, which differ in instruction count.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOHDRADDI") != nullptr));
+      // Shifted-32 rule in LoadImm64 (CodeEmitter/PPC64LE/Emitter.h
+      // DisableShiftedImm32): presence-DISABLED; changes how wide the constant
+      // load is at every 64-bit guest-RIP materialisation, so it changes
+      // emitted block bytes and every downstream branch displacement.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSHIFTIMM32") != nullptr));
       // XER arithmetic-write kill switch (PPC64Emitter.h XERArithDisabled):
       // presence-DISABLED; flips every CA/OV write helper between the addic/
       // addo arithmetic forms and the legacy mfspr/rlwimi/mtspr RMW shapes.
@@ -386,6 +441,23 @@ uint64_t ComputeCodeCacheConfigId() {
       HASH_OPT(DISABLESPINLOOPHINT);
       const char* HintAnyEnv = getenv("FEX_SPINHINT_ANYLOOP");
       Hasher.Add(static_cast<uint64_t>(HintAnyEnv && HintAnyEnv[0] == '1'));
+      // The last three block-transfer-era switches that change emitted code and
+      // were missing from this list (same gap class as the four below).
+      // FEX_DEADPROLOGUE is a three-way mode (off / "trap" / "emit"), resolved
+      // here exactly as JIT.cpp's DeadPrologueMode resolves it — unknown values
+      // fall back to Off there, so they hash as Off here too.
+      const char* DeadProEnv = getenv("FEX_DEADPROLOGUE");
+      Hasher.Add(static_cast<uint64_t>(!DeadProEnv                          ? 0 :
+                                       ::strcmp(DeadProEnv, "trap") == 0 ? 1 :
+                                       ::strcmp(DeadProEnv, "emit") == 0 ? 2 :
+                                                                           0));
+      // FEX_ENTRYWATCH is a guest-RIP range whose VALUE picks which entry
+      // points get the watch instrumentation, so the string itself is hashed.
+      const char* EntryWatchEnv = getenv("FEX_ENTRYWATCH");
+      Hasher.Add(std::string_view {EntryWatchEnv ? EntryWatchEnv : ""});
+      // FEX_NO_ABI_LIVEMASK reverts the syscall mini-frame FPR saves to the
+      // full set; presence-DISABLED.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_ABI_LIVEMASK") != nullptr));
       // These four also change emitted code and were simply missing from this
       // list. Unlike BlockLinking below — which is excluded deliberately and
       // says so — nothing documented their absence, so a cache built with any
@@ -396,6 +468,11 @@ uint64_t ComputeCodeCacheConfigId() {
       // SpinLoopClampAuto is `uint32`, the other two are `bool`.
       HASH_OPT(DISABLECMPBRANCHFUSION);
       HASH_OPT(DISABLESCALARSPLATCHAIN);
+      // Aligned 128-bit vector lowering: with it on, an $Align-certified
+      // LoadMem/StoreMem is one lvx/stvx; with it off it is the two-instruction
+      // lxvd2x+xxpermdi / xxpermdi+stxvd2x pair. Different bytes for the same
+      // guest instruction, so the two are not interchangeable in a cache.
+      HASH_OPT(DISABLEALIGNEDVECTORLDST);
       HASH_STR_OPT(SPINLOOPCLAMP);
       HASH_OPT(SPINLOOPCLAMPAUTO);
       HASH_STR_OPT(FORCETSODISPLACEMENTS);
@@ -416,6 +493,21 @@ uint64_t ComputeCodeCacheConfigId() {
       // block. Only an explicit "0" disables, mirroring JIT.cpp's parse.
       const char* SetDcbzEnv = getenv("FEX_MEMSETDCBZ");
       Hasher.Add(static_cast<uint64_t>(!(SetDcbzEnv && SetDcbzEnv[0] == '0')));
+      // FEX_PPCINLINECONST=0 reverts IREmitter's inline-constant predicates to
+      // the AArch64 ones (Interface/IR/PPC64Immediates.h). It decides which
+      // operands are folded into an instruction and which occupy a register, so
+      // it changes the operands, the instruction count AND the allocation of
+      // essentially every arithmetic and logical op in a block. Only an
+      // explicit "0" disables, mirroring InlineConstEnabled().
+      const char* InlineConstEnv = getenv("FEX_PPCINLINECONST");
+      Hasher.Add(static_cast<uint64_t>(!(InlineConstEnv && InlineConstEnv[0] == '0')));
+      // FEX_PPCLOGICALIMM=0 reverts the logical-immediate lowering in
+      // JIT/PPC64LE/ALUOps.cpp — the rotate-and-mask AND forms, andis. for the
+      // flag-setting ANDs, and the oris+ori pair in Or/Xor — back to
+      // LoadConstant plus a register-form op. Only an explicit "0" disables,
+      // mirroring LogicalImmEnabled().
+      const char* LogicalImmEnv = getenv("FEX_PPCLOGICALIMM");
+      Hasher.Add(static_cast<uint64_t>(!(LogicalImmEnv && LogicalImmEnv[0] == '0')));
     }
 
     // The scope option itself, because it decides whether the process runs as a
@@ -427,6 +519,23 @@ uint64_t ComputeCodeCacheConfigId() {
     // hold absolute host addresses with no relocation records), so the knob
     // provably cannot change the bytes of a cache-mode compile. Do not "fix"
     // this by enabling linking under caching.
+
+    // NOT hashed, and this one IS a gap — flagged deliberately, scoped
+    // separately, do not bolt a fix on here. Everything above is requested
+    // config or an env switch. NOT ONE detected host capability is hashed, and
+    // several of them decide which instructions get emitted:
+    //   * HostFeatures::SupportsISA30 (Source/Common/HostFeatures.cpp:746, from
+    //     HWCAP2 & PPC_FEATURE2_ARCH_3_00_) gates lxvx / stxvx / lxsibzx /
+    //     lxsihzx / mcrxrx. A POWER9-generated cache loaded on POWER8 is a
+    //     SIGILL on the first lxvx, not a slowdown.
+    //   * HostFeatures::DCacheLineSize (:729/:796) is baked into the dcbz block
+    //     shift, so a cache from a host with a different line size zeroes the
+    //     wrong span.
+    // The effective-HWTSO hash above is one instance of this class that had a
+    // live consequence, which is why it was fixed on its own. Closing the rest
+    // needs a decision on how host capability is canonicalised (the detected
+    // set, or the subset the emitters actually branch on) and belongs in its own
+    // change.
 #undef HASH_OPT
 #undef HASH_STR_OPT
 

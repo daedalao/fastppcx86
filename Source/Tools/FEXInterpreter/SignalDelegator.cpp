@@ -163,7 +163,13 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
   // crossing is armed: the bank's dw1 half is ELFv2-volatile, so inside a
   // host call the register file is garbage and State.avx_high[] (published by
   // the crossing's SpillStaticRegs) is the authoritative copy.
-  if (IgnoreMask == 0) {
+  //
+  // Also gated on the frame actually carrying the dw1 region, exactly as the
+  // LinuxEmulation copy is: the kernel appends it only when MSR_VSX is set in
+  // the frame's saved MSR, and with it clear those 256 bytes are uninitialised
+  // sigframe stack. Skipping the capture leaves State.avx_high[] holding the
+  // last published values, which is strictly better than seeding it with that.
+  if (IgnoreMask == 0 && ArchHelpers::Context::HasPPCVSXLowBankDW1(ucontext)) {
     for (size_t i = 0; i < Config.SRAAVXHighBankCount; i++) {
       const uint32_t Reg = Config.SRAAVXHighBankFirst + i;
       Thread->CurrentFrame->State.avx_high[i][0] = ArchHelpers::Context::GetPPCVSXLowBankDW1(ucontext, Reg);

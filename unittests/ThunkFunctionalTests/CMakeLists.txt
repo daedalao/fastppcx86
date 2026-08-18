@@ -11,8 +11,10 @@ function(AddThunksTest Bin ThunksFile)
     COMMAND "$<TARGET_FILE:FEX>"
     ${Bin})
     set_property(TEST ${TEST_NAME} APPEND PROPERTY DEPENDS "${Bin}")
+    # Run against the build tree, not the install prefix: ctest must test what
+    # was just built, and the install prefix may not exist at all.
     set_property(TEST "${TEST_NAME}" APPEND PROPERTY ENVIRONMENT
-      "FEX_OUTPUTLOG=stderr;FEX_SILENTLOG=0;FEX_MAXINST=500;FEX_THUNKHOSTLIBS=${HOSTLIBS_DATA_DIRECTORY}/HostThunks;FEX_THUNKGUESTLIBS=${CMAKE_INSTALL_PREFIX}/share/fex-emu/GuestThunks")
+      "FEX_OUTPUTLOG=stderr;FEX_SILENTLOG=0;FEX_MAXINST=500;FEX_THUNKHOSTLIBS=${CMAKE_BINARY_DIR}/HostLibs_64;FEX_THUNKGUESTLIBS=${CMAKE_BINARY_DIR}/Guest")
 
     if (ThunksFile)
       set_property(TEST "${TEST_NAME}" APPEND PROPERTY ENVIRONMENT "FEX_THUNKCONFIG=${CMAKE_SOURCE_DIR}/Data/CI/${ThunksFile}")

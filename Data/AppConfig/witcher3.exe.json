@@ -1,0 +1,20 @@
+{
+  "Comment": [
+    "Hardware TSO via PROT_SAO. Litmus-proven on POWER8/hash (2026-08-13); on a",
+    "host that cannot do SAO the startup probe refuses and FEX falls back to",
+    "emitted barriers on its own, so this is safe to ship unconditionally.",
+    "In-world it measured +10-15 fps (lwsync 2.48% -> 0.17% of cycles).",
+    "",
+    "enableavx: the old -16% (2026-08-10) was a WARMUP MIRAGE -- DXVK's on-disk",
+    "pipeline cache persists across sessions and the cold leg ran first. Re-run",
+    "warm-vs-warm in-world 2026-08-15 (injected Continue-load, same save,",
+    "scene-matched): AVX-on 46.9 fps p95 25.4 / p99 27.6 vs off 44.1 / 28.6 /",
+    "32.5 -> +6.3% avg, p95 -11%, p99 -15%. No crash under AVX+HWTSO. Global",
+    "AVX default stays off (glibc-IFUNC string-op tax); this title carries it",
+    "per-app. Revert = remove the HostFeatures line."
+  ],
+  "Config": {
+    "HWTSO": "1",
+    "HostFeatures": "enableavx"
+  }
+}

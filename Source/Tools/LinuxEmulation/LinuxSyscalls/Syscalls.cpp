@@ -75,10 +75,11 @@ class SignalDelegator;
 SyscallHandler* _SyscallHandler {};
 
 namespace HardwareTSO {
-  bool Live = false;
+  std::atomic<bool> Live {false};
+  std::atomic<bool> Revoked {false};
   bool Strict = false;
 
-  void OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd) {
+  bool OnRangeRefusedSAO(const char* Site, const void* Addr, size_t Length, int fd) {
     // A character device's driver may override the page cache-control
     // attribute and drop SAO; x86 gives no TSO guarantee for WC memory, so
     // that refusal is legitimate. Anything else is ordinary guest memory
@@ -94,13 +95,25 @@ namespace HardwareTSO {
     fprintf(stderr, "FEX: HWTSO: %s(addr=%p len=%zx fd=%d) refused PROT_SAO; %s — this range is not hardware-TSO%s\n", Site, Addr, Length,
             fd, "mapped WITHOUT it", DeviceMapping ? " (device mapping: expected, x86 makes no TSO promise for WC memory)" : "");
 
-    if (Strict && !DeviceMapping) {
+    if (DeviceMapping) {
+      return false;
+    }
+
+    if (Strict) {
       ERROR_AND_DIE_FMT(
         "FEX_HWTSO_STRICT: {}(addr={}, len={:#x}) refused PROT_SAO on ORDINARY memory. "
-        "The JIT emits no barriers under FEX_HWTSO, so accesses through this range have no ordering at all. "
-        "Re-run without FEX_HWTSO (or without FEX_HWTSO_STRICT to continue unsound).",
+        "Without FEX_HWTSO_STRICT this would have revoked hardware TSO and carried on with emitted "
+        "barriers; the abort is here so the refusing range can be identified.",
         Site, Addr, Length);
     }
+
+    // True only while hardware TSO is still live, so a second ordinary-memory
+    // refusal after the downgrade warns and does nothing else. In practice
+    // there is no second refusal: with Live false ApplyGuestProt is the
+    // identity, HostProt == prot, and no site even attempts an SAO mapping. The
+    // check is here because this and the revocation are not otherwise
+    // serialised against each other.
+    return Live.load(std::memory_order_acquire);
   }
 
   bool ProbeAndEnable() {
@@ -121,17 +134,140 @@ namespace HardwareTSO {
     // startup, instead of inside the guest.
     *static_cast<volatile uint32_t*>(Probe) = 1;
     ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
-    Live = true;
+    // The only true-store. Release-ordered so the mapping choke points, which
+    // acquire-load it, cannot see Live true before Strict is initialised below.
+    // (There is no concurrency here yet — this runs before the syscall handler
+    // and before any guest thread — but Live is a cross-thread flag from this
+    // point on and is written consistently.)
+    Live.store(true, std::memory_order_release);
     {
       const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
       Strict = StrictEnv && StrictEnv[0] == '1';
       if (Strict) {
-        fprintf(stderr, "FEX: HWTSO_STRICT: a refused-SAO range on ordinary memory will abort.\n");
+        fprintf(stderr, "FEX: HWTSO_STRICT: a refused-SAO range on ordinary memory will abort instead of revoking.\n");
       }
     }
     return true;
   }
 } // namespace HardwareTSO
+
+// FEX_HWTSO revocation. Reached only from GuestMmap / GuestMprotect /
+// GuestShmat, when HardwareTSO::OnRangeRefusedSAO reported a refusal on
+// ordinary (non-device) memory.
+//
+// WHY THIS IS SOUND, AND WHY IT IS AN EXACT CLOSURE RATHER THAN A NARROWING.
+// Under FEX_HWTSO the JIT emits no TSO barriers whatsoever; ordering is carried
+// entirely by PROT_SAO on the guest's pages. A range the kernel refuses SAO for
+// therefore has neither, which is the hole this closes by downgrading the whole
+// process to emitted barriers. The closure is exact because of WHEN this runs:
+//
+//   * The refused range does not exist from the guest's point of view until the
+//     syscall that produced it returns. No guest thread can hold a pointer into
+//     it, so no barrier-free block anywhere can have accessed it.
+//   * Every range that DOES already exist is still SAO and stays correctly
+//     ordered for whatever barrier-free code is still in flight against it. So
+//     the pre-existing translations remain sound for exactly as long as they
+//     remain reachable.
+//   * By the time this returns, every translation has been dropped from every
+//     lookup path, so the first time any thread needs code again it recompiles
+//     with barriers -- including for the newly refused range.
+//
+// THE QUIESCE PRIMITIVE is the exclusive CodeInvalidationMutex that
+// ThreadManager::InvalidateGuestCodeRange takes, with the flag flip performed
+// in its after-callback so that it lands inside that same critical section.
+// That is the stop-the-world this codebase actually has for a guest thread:
+// ContextImpl::CompileBlock and PPC64JITCore::ExitFunctionLink hold that mutex
+// SHARED, so while it is held exclusively no thread is compiling or linking and
+// none can start until it is released. Everything compiled from then on reads
+// SupportsHardwareTSO == false.
+//
+// ThreadManager::Pause() is NOT usable here and must not be substituted for it:
+//   * it asserts it is not called from an emulation thread, and we are one;
+//   * WaitForIdle waits for IdleWaitRefCount == 0, a count this very thread
+//     holds above zero;
+//   * its quiesce is an asynchronous PC hijack (SignalDelegator's PauseHandler
+//     runs from the host-handler list, ahead of and independent of the
+//     deferred-signal machinery), so it will happily park a thread in the
+//     middle of CompileBlock while that thread holds the shared
+//     CodeInvalidationMutex. The write-lock acquisition below would then spin
+//     for InvalidateGuestCodeRangeStealTimeoutSec and ERROR_AND_DIE. It would
+//     equally park threads inside the allocator that this invalidation walk
+//     itself allocates and frees from.
+//
+// What the mutex does not do is evict a thread from a block it has already
+// entered; such a thread runs barrier-free until that block ends. Per the
+// second bullet above that is harmless: every page it can reach is still SAO.
+//
+// One residual, named rather than hidden: a thread already inside a MULTIBLOCK
+// unit when the invalidation runs is delinked at its next exit, but a unit
+// whose internal backedge spins on a shared flag could observe the syscall's
+// return value (published by another thread after this returns), load a
+// pointer into the newly refused range, and access it barrier-free within that
+// same unit. That needs the spin, the publish and the dereference all inside
+// one pre-revocation compilation unit racing the refusing syscall — so this is
+// a near-exact closure, not an exact one. Closing it fully needs the
+// stop-the-world eviction the bullets above explain this codebase does not
+// have.
+//
+// Pages that already carry SAO keep it. Stripping them would need a walk of
+// every guest VMA reissuing mprotect with each one's own protection, from a
+// syscall that is holding nothing, racing every other thread's mappings -- for
+// a perf refund, not for correctness. It is not free to leave them (SAO caps
+// store throughput at roughly 12.4 GB/s, measured 2026-08-13, and the process
+// now pays that on top of the barriers it just started emitting), but a revoked
+// process has already lost the feature's win and the walk is the riskier half.
+//
+// LOCK ORDER. The caller must have released VMATracking.Mutex first.
+// InvalidateGuestCodeRange takes ThreadCreationMutex and then the exclusive
+// CodeInvalidationMutex, and holding VMATracking across that inverts the order
+// used everywhere else in the syscall layer (see the same rule spelled out in
+// SyscallHandler::TrackMadvise). That is why OnRangeRefusedSAO only reports and
+// the revocation happens at the tail of the syscall.
+//
+// Thread may be nullptr: GuestMmap is called without one during image load,
+// before any guest thread exists. InvalidateGuestCodeRange ignores its
+// CallingThread argument entirely and iterates the (then empty) thread list, so
+// the call degenerates to setting the flags -- which is exactly right, because
+// nothing has been compiled yet.
+void SyscallHandler::RevokeHardwareTSO(FEXCore::Core::InternalThreadState* Thread, const char* Site, const void* Addr, size_t Length) {
+  if (!HardwareTSO::Live.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  bool DidRevoke = false;
+  // Start = 0, Length = ~0 is "every guest page": LookupCache::InvalidateRange
+  // walks [0 >> 12, (0 + ~0ULL - 1) >> 12], which is every tracked code page in
+  // every live code buffer, and the per-thread pass clears every L1/L2 and the
+  // CallRet stacks. Compiled host code is deliberately left in the buffers --
+  // threads currently executing inside a block must be able to finish it -- it
+  // is only made unreachable from every lookup path, exactly as an SMC
+  // invalidation leaves it.
+  TM.InvalidateGuestCodeRange(Thread, 0, ~0ULL, [this, &DidRevoke](uint64_t, uint64_t) {
+    // Runs with ThreadCreationMutex and the EXCLUSIVE CodeInvalidationMutex
+    // held. Re-checked under that mutex so two threads refusing at once produce
+    // exactly one downgrade; the loser has still done a redundant (harmless)
+    // whole-cache invalidation.
+    if (!HardwareTSO::Live.load(std::memory_order_relaxed)) {
+      return;
+    }
+    HardwareTSO::Live.store(false, std::memory_order_release);
+    HardwareTSO::Revoked.store(true, std::memory_order_release);
+    CTX->SetHardwareTSOSupport(false);
+    DidRevoke = true;
+  });
+
+  if (!DidRevoke) {
+    return;
+  }
+
+  // stderr rather than LogMan: FEX logging is off by default, and this is a
+  // silent multi-x performance change that the user must be able to see.
+  fprintf(stderr,
+          "FEX: HWTSO: REVOKED at %s(addr=%p len=%zx). Hardware TSO is off for the rest of this process: "
+          "all compiled code was invalidated and every block from here on emits TSO barriers. "
+          "Run with FEX_HWTSO_STRICT=1 to abort at the refusing range instead.\n",
+          Site, Addr, Length);
+}
 
 // 2026-08-03 diagnostic: FEX_TRACE_CLONE=1 logs the guest-visible clone
 // return value alongside child-thread bring-up, so we can correlate a
@@ -986,24 +1122,20 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
 
   ExtendedMetaData = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(FEXCore::Config::Get_EXTENDEDVOLATILEMETADATA()());
 
-  // The mtrack SMC path drives host mprotect() with FEX_PAGE_SIZE (4K) granularity
-  // and the guest is told AT_PAGESZ=4096, but there is no host-page-size awareness
-  // anywhere in LinuxEmulation.  On a host with a larger page size a 4K-aligned
-  // mprotect is rejected outright (EINVAL -> the AFmt aborts in
-  // SyscallsSMCTracking.cpp), and the cases that do go through degrade to
-  // host-page-granularity protection with re-protect races.  Warn loudly rather
-  // than let someone burn a day chasing the fallout.
-  if (const long HostPageSize = sysconf(_SC_PAGESIZE); HostPageSize > 0 && static_cast<uint64_t>(HostPageSize) != FEXCore::Utils::FEX_PAGE_SIZE) {
-    if (SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
-      LogMan::Msg::EFmt("Host page size is {} but FEX's SMC tracking assumes {}. "
-                        "mtrack SMC detection is unsupported on this kernel and will misbehave or abort; "
-                        "boot a {}-page kernel or run with FEX_SMCCHECKS=full.",
-                        HostPageSize, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE);
-    } else {
-      LogMan::Msg::IFmt("Host page size is {} but FEX assumes {}; SMCChecks is not mtrack so the SMC path is not affected.", HostPageSize,
-                        FEXCore::Utils::FEX_PAGE_SIZE);
-    }
-  }
+  // There was a host-page-size warning here. It has moved, whole, to
+  // FEX::Kernel::PageSize::CheckHostPageSize (FEXInterpreter.cpp), which runs
+  // before any InternalThreadState is allocated and aborts rather than warns.
+  //
+  // Do not re-add a check here. The version that used to live at this spot
+  // warned only when SMCChecks==mtrack and otherwise printed "SMCChecks is not
+  // mtrack so the SMC path is not affected", which was actively false: the SMC
+  // path is not even the worst of it. InterruptFaultPage's arming mprotect and
+  // the call-ret stack's commit mprotect both fail on any non-4K host no matter
+  // how SMC is configured, and both fail silently — their return values are not
+  // checked, and they cannot be, because they run on signal-delivery paths where
+  // LogMan is not async-signal-safe. By the time this constructor runs the
+  // process is already committed; the startup gate is where a refusal is clean.
+  // See docs/PAGE_SIZE_AUDIT.md.
 
   // FEX_SMCFILEIMMUTABLE only has anything to skip where mtrack installs
   // protection in the first place; with SMCChecks=none nothing is tracked and

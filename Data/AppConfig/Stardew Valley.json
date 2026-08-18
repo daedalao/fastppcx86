@@ -1,0 +1,14 @@
+{
+  "Comment": [
+    "CoreCLR rewrites its own code at runtime; mtrack is the line it needs.",
+    "Multiblock + a real TSC scale keep the .NET tiered-JIT timers honest.",
+    "EnableCodeCachingWIP was removed 2026-08-16: it was a cache experiment, not",
+    "load-bearing, and it force-disabled block linking (ExitRIPFixedWidth), which",
+    "made Stardew the only title on the link-free path. Do not re-add it here."
+  ],
+  "Config": {
+    "SMCChecks": "mtrack",
+    "Multiblock": "1",
+    "SmallTSCScale": "0"
+  }
+}

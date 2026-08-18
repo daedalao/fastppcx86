@@ -4,6 +4,7 @@
 #include "CodeEmitter/Emitter.h"
 #include "Interface/IR/IR.h"
 #include "Interface/IR/IntrusiveIRList.h"
+#include "Interface/IR/PPC64Immediates.h"
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/IR/IR.h>
@@ -93,9 +94,42 @@ public:
 
   DEF_INLINE(Any, _, true)
   DEF_INLINE(Zero, X, X == 0)
+
+  // Which constants may be folded into a host instruction is a property of the
+  // HOST, and these three used to ask AArch64 unconditionally. On ppc64le that
+  // both starved the backend of immediates it encodes for free (every negative
+  // D-form SI, every unsigned UI up to 0xFFFF, everything in [0x1000,0x7FFF]
+  // that is not a multiple of 0x1000) and handed it ARM logical bitmasks it
+  // needs a 4-5 instruction LoadImm64 to rebuild on every execution. See
+  // Interface/IR/PPC64Immediates.h for the cost model and for exactly which
+  // constants are accepted and declined.
+  //
+  // Host-conditional rather than a blanket swap: the ARM64 JIT backend is not
+  // present in this tree (Interface/Core/JIT holds only PPC64LE), but the ARM
+  // CodeEmitter headers still compile and ARCHITECTURE_arm64 is still a live
+  // branch in the top-level CMakeLists, so the previous behaviour is preserved
+  // verbatim for any host that is not ppc64le -- including the x86_64 CI debug
+  // build, where these predicates must keep compiling and behaving as before.
+  //
+  // The FEX_PPCINLINECONST bisect switch is a function-local static behind an
+  // inline accessor -- the same shape as PPC64Emitter.h's XERArithDisabled() --
+  // deliberately NOT a data member: IREmitter is a header-only base class and a
+  // member guarded by #ifdef would make the class layout depend on whether a
+  // given translation unit saw ARCHITECTURE_ppc64le, which is an ODR trap for
+  // anything outside FEXCore that includes this header.
+#ifdef ARCHITECTURE_ppc64le
+  DEF_INLINE(AddSub, X, PPC64::InlineConstEnabled() ? PPC64::IsAddSubImm(X) : ARMEmitter::IsImmAddSub(X))
+  DEF_INLINE(LargeAddSub, X,
+             PPC64::InlineConstEnabled() ? PPC64::IsLargeAddSubImm(Size, X) :
+                                           (ARMEmitter::IsImmAddSub(X) && Size >= OpSize::i32Bit));
+  DEF_INLINE(Logical, X,
+             PPC64::InlineConstEnabled() ? PPC64::IsLogicalImm(Size, X) :
+                                           ARMEmitter::Emitter::IsImmLogical(X, std::max((int)IR::OpSizeAsBits(Size), 32)));
+#else
   DEF_INLINE(AddSub, X, ARMEmitter::IsImmAddSub(X))
   DEF_INLINE(LargeAddSub, X, ARMEmitter::IsImmAddSub(X) && Size >= OpSize::i32Bit);
   DEF_INLINE(Logical, X, ARMEmitter::Emitter::IsImmLogical(X, std::max((int)IR::OpSizeAsBits(Size), 32)));
+#endif
 
   Ref InlineSubtractZero(OpSize Size, Ref Src1, Ref Src2) {
     // Only inline a zero if we won't inline the other source.
@@ -196,6 +230,16 @@ public:
     return _NZCVSelect(OpSize::i64Bit, Cond, _InlineConstant(1), _InlineConstant(0));
   }
 
+  // Whether Addsub's Add<->Sub flip below lands on something the active
+  // InlineLargeAddSub predicate will still accept. See the note at the call.
+  static bool NegatedAddSubInlines(uint64_t NegatedSrc2) {
+#ifdef ARCHITECTURE_ppc64le
+    return PPC64::InlineConstEnabled() ? PPC64::IsOneInsnConstant(NegatedSrc2) : ARMEmitter::IsImmAddSub(NegatedSrc2);
+#else
+    return ARMEmitter::IsImmAddSub(NegatedSrc2);
+#endif
+  }
+
   Ref Addsub(IR::OpSize Size, IROps Op, IROps NegatedOp, Ref Src1, uint64_t Src2) {
     // Sign-extend the constant
     if (Size == OpSize::i32Bit) {
@@ -203,7 +247,16 @@ public:
     }
 
     // Negative constants need to be negated to inline.
-    if (Src2 & (1ull << 63) && ARMEmitter::IsImmAddSub(-Src2)) {
+    //
+    // The test has to name the same predicate InlineLargeAddSub will apply, or
+    // the flip trades an encodable constant for an unencodable one. PPC's addi
+    // takes a signed SI field, so a negative addend is already one instruction
+    // and the flip is value-neutral for everything it used to fire on -- except
+    // Src2 == -32768, where 0xFFFF8000 encodes as `addi -32768` but the negated
+    // 0x8000 does not fit SI at all and would have been demoted to a Constant
+    // node holding one of five dynamic GPRs. IsOneInsnConstant flips exactly
+    // when the flipped form still inlines.
+    if (Src2 & (1ull << 63) && NegatedAddSubInlines(-Src2)) {
       Op = NegatedOp;
       Src2 = -Src2;
     }

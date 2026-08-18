@@ -344,10 +344,91 @@ private:
   fextl::vector<bool> Elide32MaskSet;
   void Compute32MaskElision();
 
+  // The subset of Elide32MaskSet that ComputeHighZeroElision is responsible
+  // for. It exists only so FEX_ZEXTTRAP can tell the two passes' claims apart,
+  // because they are NOT the same claim:
+  //   * producer-side says "the high half is already zero" -- checkable, and a
+  //     nonzero high half there is a real defect;
+  //   * consumer-side says "nothing observes the high half before this value
+  //     dies" -- a nonzero high half there is EXPECTED and correct, and is the
+  //     entire point of that pass.
+  // A trap that tests "is the high half zero" is therefore meaningful for the
+  // first and meaningless for the second. Written only where the producer pass
+  // sets a bit the consumer had not already set (both its write sites are
+  // guarded by !ConsumerElided).
+  fextl::vector<bool> HighZeroElideSet;
+
+  // -------------------------------------------------------------------------
+  // Producer-side half of the same elision (same FEX_ZEXTOPT=0 kill switch;
+  // deliberately NOT a second knob, so the two mechanisms can only be A/B'd
+  // together and FEX_ZEXTOPT's existing CodeCache config hash — CodeCache.cpp,
+  // the "Backend env toggles that change emitted block bytes" block — keeps
+  // covering both without a new hash entry).
+  //
+  // Compute32MaskElision proves the mask dead by proving NOBODY LOOKS at the
+  // high half. ComputeHighZeroElision proves it dead by proving the high half
+  // IS ALREADY ZERO, so the rldicl would write back the bits it read. That is
+  // a strictly stronger claim and it is what makes this half compose with
+  // everything: the elided op's architectural result is bit-identical, so
+  // multi-use values, values that cross a block boundary, values that reach a
+  // spill slot, and defs coalesced onto an SRA (guest-architectural) register
+  // are all in scope — none of the observability reasoning that constrains the
+  // consumer side applies. A synchronous fault in any later guest instruction
+  // observing an SRA def sees exactly the value it would have seen with the
+  // mask emitted.
+  //
+  // The two results are OR'd into the same Elide32MaskSet. Compute32MaskElision
+  // runs FIRST and is not restructured: its set is this pass's input, never its
+  // output, so its soundness argument stays independently reviewable. The one
+  // coupling runs the other way and is load-bearing — a def the CONSUMER pass
+  // elided is NOT high-zero afterwards (that is the whole point of that pass),
+  // so this pass must read Elide32MaskSet before adding to it and must never
+  // treat a consumer-elided def as a zero source. See the source table and the
+  // per-instruction ISA citations at ComputeHighZeroElision in JIT.cpp.
+  //
+  // Lattice: one bit per HOST GPR ("bits 63:32 of this register are zero"),
+  // not per SSA node. Post-RA the operand wrappers are immediate-encoded
+  // PhysicalRegisters and node identity is gone (see GetReg(OrderedNodeWrapper)
+  // and the matching note in Compute32MaskElision), so the register file IS the
+  // only addressable dataflow space. Host register indices are exact and
+  // collision-free here because the SRA and RA pools are disjoint fixed
+  // assignments (ArchHelpers/PPC64Emitter.h x64::SRA/RA, x32::SRA/RA) and
+  // TMP1-TMP4 / r0 / r1 / STATE belong to neither.
+  // -------------------------------------------------------------------------
+  void ComputeHighZeroElision();
+
   // Tail-mask emission for i32 GPR results: rldicl unless provably dead.
+  // FEX_ZEXTTRAP=1: never elide the *slot*. Where the mask would have been
+  // dropped, emit a check that the high half really is already zero and trap if
+  // it is not, instead of emitting nothing. Same instrument as FEX_R0TRAP
+  // (BranchOps.cpp) and the same reason for existing: an unsound elision is
+  // otherwise silent, and only shows up much later as a guest fault on a
+  // pointer whose low 32 bits are correct and whose high 32 are stale.
+  //
+  // Turns "somewhere in one of two dataflow passes" into a SIGTRAP at the
+  // exact emission site, with the guest RIP recoverable from the block's RIP
+  // table the same way any other synchronous fault is.
+  //
+  // Costs two instructions per elided slot and clobbers TMP4, which is dead at
+  // every Mask32Tail callsite (the handlers call this after their result is in
+  // Dst, and TMP4 is their constant/scratch register). Diagnostic only -- do
+  // not ship it on, and do not rely on TMP4 being free here for anything else.
+  static bool ZExtTrapEnabled() {
+    static const bool Enabled = getenv("FEX_ZEXTTRAP") != nullptr;
+    return Enabled;
+  }
+
   void Mask32Tail(PPC64Emitter::GPR Dst, IR::Ref Node) {
     const auto ID = IR->GetID(Node).Value;
     if (ID < Elide32MaskSet.size() && Elide32MaskSet[ID]) {
+      // Only the producer-side claim is checkable this way -- see the comment
+      // on HighZeroElideSet. Trapping on a consumer-side elision would fire on
+      // correct code, constantly, because a dirty high half is exactly what
+      // that pass permits.
+      if (ZExtTrapEnabled() && ID < HighZeroElideSet.size() && HighZeroElideSet[ID]) {
+        srdi(TMP4, Dst, 32);   // TMP4 = Dst[0:31]
+        tdi(24, TMP4, 0);      // TO=24 (NE): trap unless the high half is zero
+      }
       return;
     }
     rldicl(Dst, Dst, 0, 32);
@@ -1006,6 +1087,12 @@ private:
   // hot guest loop of fully-linked blocks cannot spin forever with the
   // signal queued (and the host mask left at the handler's sa_mask).
   void EmitSuspendInterruptCheck();
+
+  // Emit (or elide, or replace with a trap) the P5.0.2 `li r0, 0` at a block
+  // exit. UnitR0Dirty must be the emitter's R0Dirty() sampled BEFORE the
+  // enclosing exit handler emitted anything, or the handler's own re-zero
+  // will feed back into the decision. Policy comment: BranchOps.cpp.
+  void EmitExitR0Zero(bool UnitR0Dirty);
 
   // -----------------------------------------------------------------------
   // Memory operation helpers (defined in MemoryOps.cpp)

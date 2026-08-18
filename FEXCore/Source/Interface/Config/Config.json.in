@@ -105,7 +105,9 @@
           "ENABLESSE4A": "enablesse4a",
           "DISABLESSE4A": "disablesse4a",
           "ENABLEMOPS": "enablemops",
-          "DISABLEMOPS": "disablemops"
+          "DISABLEMOPS": "disablemops",
+          "ENABLEAVX2": "enableavx2",
+          "DISABLEAVX2": "disableavx2"
         },
         "Desc": [
           "Allows controlling of the CPU features in the JIT.",
@@ -948,6 +950,31 @@
           "which is exactly the kind of data-dependent corruption that wants a field kill switch of its own."
         ]
       },
+      "DisableAlignedVectorLdSt": {
+        "Type": "bool",
+        "Default": "false",
+        "Desc": [
+          "Kill switch for the PPC64LE aligned 128-bit vector load/store lowering (FEX_DISABLEALIGNEDVECTORLDST=1 turns it OFF).",
+          "HISTORY, so the next scare is triaged faster: the default was flipped off for a few hours on 2026-08-16 when native-guest",
+          "vkcube SEGV'd tier-on. FEX_ALIGNTRAP then proved the tier was the DETECTOR, not the defect: guest callbacks entered via",
+          "the thunk layer ran on a stack violating the psABI's 16-byte call alignment (GuestStackBumpAllocator aligned only to",
+          "alignof(T)), so compiler-correct movaps to stack locals -- which real x86 #GPs on -- was silently mis-masked. With the",
+          "callback stack fixed (common/Host.h) the full vkcube run is ALIGNTRAP-clean and the default is back ON. If a title",
+          "misbehaves only with this tier enabled, run FEX_ALIGNTRAP=1 FIRST: a trap means a misaligned pointer reached an",
+          "alignment-certified encoding, and the tier is exposing that defect, not causing it.",
+          "When a 128-bit LoadMem/StoreMem (and their TSO forms) carries an IR $Align that certifies a 16-byte boundary -- movaps/movapd/movdqa",
+          "and every legacy-SSE m128 operand, i.e. exactly the encodings x86 #GPs on when misaligned -- the backend emits a single lvx/stvx.",
+          "On POWER8 LE those byte-reverse the whole quadword, producing byte-for-byte the register image the default lowering builds with",
+          "lxvd2x + xxpermdi (load) or xxpermdi-into-VTMP3_VSX + stxvd2x (store), so it halves the instruction count of every aligned vector",
+          "access. movups/movdqu/lddqu and ALL VEX-encoded 128-bit memory operands are flagged 1-byte-aligned by the frontend and keep the",
+          "unaligned lowering.",
+          "The reason this is a switch and not just a fast path: lvx/stvx MASK the effective address to a 16-byte boundary instead of faulting.",
+          "A guest that runs movaps on a genuinely misaligned pointer -- which real x86 answers with #GP -- used to work by accident here and",
+          "now silently accesses the containing aligned quadword instead. That only affects already-broken guest code, but it converts an",
+          "accident into silent data corruption, so the old lowering stays one env var away. Hashed into the code-cache config id."
+        ]
+      },
+
       "ShadowRetStack": {
         "Type": "bool",
         "Default": "false",

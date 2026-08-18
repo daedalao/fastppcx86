@@ -64,11 +64,10 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
     if (RootFSIsMultiarch) {
       // Multi-arch debian distros have a fairly complex arrangement of filepaths.
       // These fractal out to the combination of library prefixes with arch suffixes.
-      constexpr static std::array<std::string_view, 4> LibPrefixes = {
+      constexpr static std::array<std::string_view, 3> LibPrefixes = {
         "/usr/lib",
         "/usr/local/lib",
         "/lib",
-        "/usr/lib/pressure-vessel/overrides/lib",
       };
 
       // We only need to generate 32-bit or 64-bit depending on the operating mode.
@@ -81,11 +80,10 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
       // Non multi-arch supporting distros like Fedora and Debian have a much more simple layout.
       // lib/ folders refer to 32-bit library folders.
       // li64/ folders refer to 64-bit library folders.
-      constexpr static std::array<std::string_view, 4> LibPrefixes = {
+      constexpr static std::array<std::string_view, 3> LibPrefixes = {
         "/usr",
         "/usr/local",
         "", // root, the '/' will be appended in the next step.
-        "/usr/lib/pressure-vessel/overrides",
       };
 
       // We only need to generate 32-bit or 64-bit depending on the operating mode.
@@ -114,6 +112,38 @@ void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBO
         for (auto Prefix : LibPrefixes) {
           PathPrefixes.emplace_back(fextl::fmt::format("{}/{}", Prefix, "lib32"));
         }
+      }
+    }
+
+    // Pressure-vessel (Steam Linux Runtime) containers lay out their graphics
+    // overrides in Debian-multiarch form regardless of what the RootFS looks
+    // like, and pv-adverb points LD_LIBRARY_PATH at the "aliases"
+    // subdirectories. These prefixes must therefore be generated
+    // unconditionally: keying them off the RootFS layout means a
+    // non-multiarch RootFS (Arch) never matches inside the container, so
+    // steamwebhelper's CEF GPU process loads pv's captured x86 Mesa instead
+    // of the thunk, glvnd finds no vendor library, glXQueryExtensionsString
+    // returns NULL, and Chromium silently falls back to software rendering.
+    {
+      const auto PVArch = Is64BitMode() ? "x86_64-linux-gnu" : "i386-linux-gnu";
+      PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}", PVArch));
+      PathPrefixes.emplace_back(fextl::fmt::format("/usr/lib/pressure-vessel/overrides/lib/{}/aliases", PVArch));
+
+      // When pressure-vessel runs with an interpreter root (its FEX-emulation
+      // integration: FEX_ROOTFS=/run/pressure-vessel/interpreter-root), the
+      // graphics provider is captured to /var/pressure-vessel/gfx/main/...
+      // mirroring the provider RootFS's layout, and the regenerated in-container
+      // ld.so cache resolves libGL/libEGL/libvulkan to those paths directly.
+      // These captures are incomplete copies (observed: libGLX_mesa.so.0
+      // missing while libEGL_mesa is present), so without overlay coverage
+      // here the guest loads a broken glvnd stack instead of the thunk.
+      if (Is64BitMode()) {
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib64");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib/x86_64-linux-gnu");
+      } else {
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib32");
+        PathPrefixes.emplace_back("/var/pressure-vessel/gfx/main/usr/lib/i386-linux-gnu");
       }
     }
 
@@ -363,6 +393,13 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
     DBObjectHandler.InsertDependencies(DBObject.second.Depends);
   }
 
+  // Derive the basename fallback map (see FileManagement.h for why).
+  for (const auto& [Overlay, ThunkPath] : ThunkOverlays) {
+    auto Slash = Overlay.rfind('/');
+    fextl::string Base = (Slash == fextl::string::npos) ? Overlay : Overlay.substr(Slash + 1);
+    ThunkOverlayBasenames.emplace(std::move(Base), ThunkPath);
+  }
+
   if (false) {
     // Useful for debugging
     if (ThunkOverlays.size()) {
@@ -524,6 +561,30 @@ static bool IsHostOnlyPath(const char* pathname) {
   return false;
 }
 
+bool FileManager::IsThunkRedirectableLibraryDir(const char* Path) const {
+  // Allow-list for the basename overlay fallback: system library directories
+  // (guest view), pressure-vessel's runtime/capture trees, and the RootFS
+  // (host-prefixed opens). Deliberately excludes everything else -- notably
+  // Steam's own tree under $HOME: its updater reads its bundled copies of
+  // these sonames for checksum verification, and redirecting those reads to
+  // stub bytes makes the updater repair-loop forever. Steam also bundles its
+  // own ANGLE libEGL/libGLESv2 which must never be substituted.
+  static constexpr std::array<std::string_view, 5> AllowedPrefixes = {
+    "/usr/lib",       // also /usr/lib32, /usr/lib64, /usr/lib/<multiarch>, /usr/lib/pressure-vessel
+    "/usr/local/lib", // also lib32/lib64 variants
+    "/lib",           // also /lib32, /lib64
+    "/var/pressure-vessel/",
+    "/run/pressure-vessel/",
+  };
+  for (auto Prefix : AllowedPrefixes) {
+    if (strncmp(Path, Prefix.data(), Prefix.size()) == 0) {
+      return true;
+    }
+  }
+  const auto& RootFSPath = LDPath();
+  return !RootFSPath.empty() && strncmp(Path, RootFSPath.c_str(), RootFSPath.size()) == 0;
+}
+
 fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSymlink) const {
   if (!pathname ||                  // If no pathname
       pathname[0] != '/' ||         // If relative
@@ -534,6 +595,14 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
   auto thunkOverlay = ThunkOverlays.find(pathname);
   if (thunkOverlay != ThunkOverlays.end()) {
     return thunkOverlay->second;
+  }
+
+  if (const char* Slash = strrchr(pathname, '/'); Slash && !ThunkOverlayBasenames.empty() && IsThunkRedirectableLibraryDir(pathname)) {
+    auto Basename = ThunkOverlayBasenames.find(Slash + 1);
+    if (Basename != ThunkOverlayBasenames.end()) {
+      LogMan::Msg::DFmt("ThunkOverlay basename redirect(path): '{}' -> '{}'", pathname, Basename->second);
+      return Basename->second;
+    }
   }
 
   if (IsHostOnlyPath(pathname)) {
@@ -575,15 +644,53 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
+  // Basename fallback lookup, usable from both the early-out branch (ld.so
+  // inside pressure-vessel opens bare sonames relative to a directory FD)
+  // and the exact-match-miss path below.
+  auto FindBasenameOverlay = [this](const char* Path) -> const fextl::string* {
+    if (ThunkOverlayBasenames.empty()) {
+      return nullptr;
+    }
+    const char* Slash = strrchr(Path, '/');
+    auto Basename = ThunkOverlayBasenames.find(Slash ? Slash + 1 : Path);
+    return Basename != ThunkOverlayBasenames.end() ? &Basename->second : nullptr;
+  };
+
   if (pathname[0] != '/' || // If relative
       pathname[1] == 0 ||   // If we are getting root
       dirfd != AT_FDCWD) {  // If dirfd isn't special FDCWD
+    // A dirfd-relative open of a bare soname we actively thunk must still be
+    // redirected; otherwise ld.so under pressure-vessel loads the guest's own
+    // copy of the library and the host GPU is never reached. The directory the
+    // FD points at must pass the same allow-list as absolute paths, or Steam's
+    // updater reading its runtime files for verification gets stub bytes and
+    // repair-loops forever.
+    if (pathname[0] != '/' && strchr(pathname, '/') == nullptr && dirfd != AT_FDCWD) {
+      if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
+        char DirPath[PATH_MAX];
+        auto DirPathLength = FEX::get_fdpath(dirfd, DirPath);
+        if (DirPathLength != -1) {
+          DirPath[DirPathLength] = 0;
+          if (IsThunkRedirectableLibraryDir(DirPath)) {
+            LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): dirfd='{}' '{}' -> '{}'", DirPath, pathname, *ThunkPath);
+            return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+          }
+        }
+      }
+    }
     return NoEntry;
   }
 
   auto thunkOverlay = ThunkOverlays.find(pathname);
   if (thunkOverlay != ThunkOverlays.end()) {
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
+  }
+
+  if (IsThunkRedirectableLibraryDir(pathname)) {
+    if (const auto* ThunkPath = FindBasenameOverlay(pathname)) {
+      LogMan::Msg::DFmt("ThunkOverlay basename redirect(fd): '{}' -> '{}'", pathname, *ThunkPath);
+      return EmulatedFDPathResult {AT_FDCWD, ThunkPath->c_str()};
+    }
   }
 
   // See IsHostOnlyPath: returning a rootfs dirfd for these is what breaks

@@ -320,6 +320,10 @@ conformance-interfaces-difftime-1-1.test
 conformance-interfaces-nanosleep-2-1.test
 conformance-interfaces-mmap-13-1.test
 conformance-interfaces-clock_getres-3-1.test
+# 6-2 expects clock_getres(17) to fail with EINVAL; the modern kernel accepts
+# clockid 17. Verified native ppc64le returns rc=0 for it too -- FEX matches
+# host behaviour exactly. Kernel-version behaviour, not an emulation defect.
+conformance-interfaces-clock_getres-6-2.test
 conformance-interfaces-clock_nanosleep-1-1.test
 conformance-interfaces-clock_nanosleep-1-1.test
 
