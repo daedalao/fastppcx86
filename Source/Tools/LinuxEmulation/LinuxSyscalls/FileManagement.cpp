@@ -593,9 +593,6 @@ fextl::string FileManager::GetEmulatedPath(const char* pathname, bool FollowSyml
   }
 
   auto thunkOverlay = ThunkOverlays.find(pathname);
-  if (strstr(pathname, "libGL") || strstr(pathname, "libEGL") || strstr(pathname, "libGLX") || strstr(pathname, "libvulkan")) {
-    LogMan::Msg::DFmt("ThunkOverlay probe(path): '{}' -> {}", pathname, thunkOverlay != ThunkOverlays.end() ? "HIT" : "miss");
-  }
   if (thunkOverlay != ThunkOverlays.end()) {
     return thunkOverlay->second;
   }
@@ -647,8 +644,6 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
-  const bool GfxProbe = strstr(pathname, "libGL") || strstr(pathname, "libEGL") || strstr(pathname, "libGLX") || strstr(pathname, "libvulkan");
-
   // Basename fallback lookup, usable from both the early-out branch (ld.so
   // inside pressure-vessel opens bare sonames relative to a directory FD)
   // and the exact-match-miss path below.
@@ -683,16 +678,10 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
         }
       }
     }
-    if (GfxProbe) {
-      LogMan::Msg::DFmt("ThunkOverlay probe(fd): early-out dirfd={} path='{}'", dirfd, pathname);
-    }
     return NoEntry;
   }
 
   auto thunkOverlay = ThunkOverlays.find(pathname);
-  if (GfxProbe) {
-    LogMan::Msg::DFmt("ThunkOverlay probe(fd): '{}' -> {}", pathname, thunkOverlay != ThunkOverlays.end() ? "HIT" : "miss");
-  }
   if (thunkOverlay != ThunkOverlays.end()) {
     return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
   }

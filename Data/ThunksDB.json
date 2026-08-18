@@ -1,12 +1,15 @@
 {
   "DB": {
     "GL": {
-      "Library" : "libGL-guest.so",
+      "Library": "libGL-guest.so",
       "Overlay": [
         "@PREFIX_LIB@/libGL.so",
         "@PREFIX_LIB@/libGL.so.1",
         "@PREFIX_LIB@/libGL.so.1.2.0",
-        "@PREFIX_LIB@/libGL.so.1.7.0"
+        "@PREFIX_LIB@/libGL.so.1.7.0",
+        "@PREFIX_LIB@/libGLX.so",
+        "@PREFIX_LIB@/libGLX.so.0",
+        "@PREFIX_LIB@/libGLX.so.0.0.0"
       ]
     },
     "EGL": {
@@ -57,7 +60,7 @@
       ]
     },
     "WaylandClient": {
-      "Library" : "libwayland-client-guest.so",
+      "Library": "libwayland-client-guest.so",
       "Overlay": [
         "@PREFIX_LIB@/libwayland-client.so",
         "@PREFIX_LIB@/libwayland-client.so.0",

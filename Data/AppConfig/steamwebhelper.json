@@ -1,6 +1,7 @@
 {
-  "Comment": "Bypasses libGL's glX and instead sends GLX requests directly via xcb",
+  "Comment": "2026-08-17: GL thunk ON for steamwebhelper (CEF). Upstream's guest-GLX-via-xcb route is dead inside pressure-vessel: the pv graphics capture ships glvnd without libGLX_mesa.so.0, so guest GLX has no vendor and glXQueryExtensionsString returns NULL -- Chromium then software-renders the whole Steam UI. With the thunk (plus the libGLX.so overlay in ThunksDB and the pv path coverage in FileManagement), ANGLE initializes hardware GL on the host GPU. EGL stays OFF: the EGL thunk skeleton passes a raw guest Display* to host eglInitialize and poisons ANGLE's EGL fallback.",
   "ThunksDB": {
-    "GL": 0
+    "GL": 1,
+    "EGL": 0
   }
 }
