@@ -22,6 +22,7 @@ $end_info$
 
 #include "fexbridge.h"
 
+#include "Common/Config.h"
 #include "Common/HostFeatures.h"
 
 #include <FEXCore/Config/Config.h>
@@ -409,6 +410,33 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   LogMan::Msg::InstallHandler(MsgHandler);
 
   FEXCore::Config::Initialize();
+  // The FEX_* environment, which until 2026-08-19 the bridge never read: no
+  // frontend meant no config layers at all, so every knob the emulated lane
+  // tunes through the environment (FEX_X87REDUCEDPRECISION being the
+  // measured one -- fex-scripts/fex defaults it to 1 for every emulated
+  // title) was silently inert for a native-lane guest.  The environment
+  // layer is the ONLY layer added, deliberately: config files and AppConfig
+  // stay out, because a bridge guest is launched by a tool (wine-ppc64le's
+  // steamtool) whose appconfig/<appid>.env is already the per-title
+  // mechanism, and two per-title mechanisms with different keys is how a
+  // setting gets lost.
+  //
+  // What this does NOT change, by construction: the two Set() calls below
+  // run AFTER ReloadMetaLayer(), so IS64BIT_MODE and SMCCHECKS still beat
+  // anything the environment says -- FEX_SMCCHECKS=1 cannot turn
+  // mprotect-based SMC tracking back on in a process with no frontend to
+  // host it.  And FEX_HWTSO stays inert here for a different reason:
+  // SetupTSOEmulation (the PROT_SAO probe) is FEXInterpreter's, the bridge
+  // never runs it, so EffectiveHardwareTSO stays false and TSO barriers
+  // keep being emitted -- safe, and named here so nobody reads a benchmark
+  // delta into a knob that does not reach this JIT path.
+  FEXCore::Config::AddLayer(FEX::Config::CreateEnvironmentLayer(environ));
+  // Load() before ReloadMetaLayer(), because the meta merge reads each
+  // layer's ALREADY-LOADED option map -- an added-but-unloaded layer merges
+  // as empty, which is exactly the silent no-op the first cut of this
+  // change shipped ([MEASURED] the x87 discriminator probe still answered
+  // FULL-F80 under FEX_X87REDUCEDPRECISION=1 until this line existed).
+  FEXCore::Config::Load();
   // Order matters (measured): ReloadMetaLayer() rebuilds the top layer and
   // DISCARDS anything Set() placed there earlier. Set after reload or the
   // 64-bit guest decodes with CS.L == 0.
