@@ -42,6 +42,8 @@ $end_info$
 #include <mutex>
 #include <setjmp.h>
 #include <signal.h>
+#include <cerrno>
+#include <cinttypes>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <ucontext.h>
@@ -130,8 +132,32 @@ struct BridgeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public 
     uint8_t Probe;
     struct iovec Local {&Probe, 1};
     struct iovec Remote {reinterpret_cast<void*>(Page), 1};
-    if (process_vm_readv(getpid(), &Local, 1, &Remote, 1, 0) != 1) {
-      return {0, 0, true};
+    // Only EFAULT asserts anything about the page's protection.  Every other
+    // failure (ENOMEM when the kernel cannot pin, EINTR) is about the
+    // syscall, not the page -- and answering "unfetchable" for one of those
+    // is not a transient wrong answer, it is a STICKY one: CompileCode
+    // caches a NoExecOp block for the rip and every later call lands on the
+    // cached refusal even after nothing was ever wrong (measured: Cyberpunk
+    // 2077's crash handler at Cyberpunk2077.exe+29d07bc, readable at every
+    // fault report, permanently NoExec).  So: retry the transient class,
+    // and if it will not clear, say so loudly and answer fetchable -- the
+    // worst case of that answer is the pre-probe behaviour (a real host
+    // fault under the compile mutex), where the worst case of the other
+    // answer is a wrong NoExec cached forever.
+    for (int Attempt = 0;; ++Attempt) {
+      if (process_vm_readv(getpid(), &Local, 1, &Remote, 1, 0) == 1) {
+        break;
+      }
+      if (errno == EFAULT) {
+        return {0, 0, true};
+      }
+      if (Attempt >= 3) {
+        fprintf(stderr,
+                "fexbridge[2]: executable probe of %#" PRIx64 " failed with "
+                "errno %d; answering fetchable rather than caching NoExec\n",
+                Page, errno);
+        break;
+      }
     }
     return {Page, PageSize, true};
   }
@@ -669,6 +695,15 @@ int fexbridge_get_fs_base(void* thread, uint64_t* base_out) {
 }
 
 void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
+  // Before any process init there is no context and nothing cached to
+  // invalidate, and the embedder can not know our init state: wine's memory
+  // syscalls forward every mapping change here from process start, while a
+  // 32-bit-only process does not initialise the bridge until wow64cpu's
+  // BTCpuProcessInit — dereferencing CTX here was a c0000005 inside that
+  // very init (measured: check-wow64-smoke, the 32-bit lane started 0 times).
+  if (!CTX) {
+    return;
+  }
   // InvalidateCodeBuffersCodeRange requires the caller to hold the code
   // invalidation mutex exclusively — unstated in the public header, enforced
   // by (previously side-effecting) assertions. Part of the CPU-DLL contract.
