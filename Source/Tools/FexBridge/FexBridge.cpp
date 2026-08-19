@@ -172,6 +172,51 @@ BridgeSyscallHandler* SyscallHandler {};
 BridgeSignalDelegator* SigDelegator {};
 
 // ---------------------------------------------------------------------------
+// PROT_SAO hardware TSO (FEX_HWTSO).  The frontend's machinery lives in
+// FEX::HLE (SetupTSOEmulation's probe, HardwareTSO::OnRangeRefusedSAO's
+// refusal policy, SyscallHandler::RevokeHardwareTSO's closure) and none of it
+// links here — the bridge deliberately excludes LinuxEmulation.  This is the
+// same semantics re-hosted on the bridge's primitives, with one structural
+// difference: the frontend owns the guest's mmap/mprotect choke points and
+// applies the bit itself, while here the EMBEDDER owns the address space, so
+// the bit crosses the C ABI (fexbridge_hwtso_prot) and refusals cross back
+// (fexbridge_hwtso_refused).  Litmus/semantics provenance: SetupTSOEmulation
+// in FEXInterpreter.cpp — MP violations 0/16.3M on SAO pages, and acceptance
+// is meaningful because powerpc's arch_validate_prot rejects PROT_SAO
+// whenever the CPU/MMU cannot honor it.
+// ---------------------------------------------------------------------------
+namespace HwTso {
+constexpr int PROT_SAO_BIT = 0x10;
+std::atomic<bool> Live {false};
+bool Strict = false;
+
+void ProbeAndEnable() {
+  FEX_CONFIG_OPT(HWTSOEnabled, HWTSO);
+  FEX_CONFIG_OPT(TSOEnabledOpt, TSOENABLED);
+  if (!HWTSOEnabled() || !TSOEnabledOpt()) {
+    return;
+  }
+  void* Probe = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Probe == MAP_FAILED) {
+    fprintf(stderr,
+            "fexbridge: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
+            "Falling back to atomic/barrier TSO emulation.\n",
+            errno);
+    return;
+  }
+  // Touch it so an accept-then-fault setup dies here, at init, not in-guest.
+  *static_cast<volatile uint32_t*>(Probe) = 1;
+  ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+  const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
+  Strict = StrictEnv && StrictEnv[0] == '1';
+  Live.store(true, std::memory_order_release);
+  CTX->SetHardwareTSOSupport(true);
+  fprintf(stderr, "fexbridge: FEX_HWTSO live: PROT_SAO carries ordering, no TSO barriers emitted%s\n",
+          Strict ? " (STRICT: a refused range aborts)" : "");
+}
+} // namespace HwTso
+
+// ---------------------------------------------------------------------------
 // CPUState <-> flat AMD64 CONTEXT marshalling (probe T3, verbatim semantics).
 // YMM is carried through the internal trap round-trip so the flat CONTEXT
 // (which has no YMM home) does not truncate AVX state across a trap.
@@ -459,6 +504,11 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   CTX = CTXPtr.release(); // process-lifetime; FEX teardown is not re-entered
   CTX->SetSignalDelegator(SigDelegator);
   CTX->SetSyscallHandler(SyscallHandler);
+  // Same ordering rule as the frontend's SetupTSOEmulation: hardware TSO must
+  // be decided before the first block is compiled, so before InitCore.  The
+  // embedder reads the verdict through fexbridge_hwtso_prot() after this
+  // returns and retro-applies the bit to whatever it mapped before init.
+  HwTso::ProbeAndEnable();
   if (!CTX->InitCore()) {
     EmitLog(0, "fexbridge: InitCore failed");
     return -2;
@@ -737,6 +787,43 @@ void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
   // by (previously side-effecting) assertions. Part of the CPU-DLL contract.
   std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
   CTX->InvalidateCodeBuffersCodeRange(start, length);
+}
+
+uint32_t fexbridge_hwtso_prot(void) {
+  return HwTso::Live.load(std::memory_order_acquire) ? HwTso::PROT_SAO_BIT : 0;
+}
+
+uint32_t fexbridge_hwtso_refused(uint64_t start, uint64_t length) {
+  if (!HwTso::Live.load(std::memory_order_acquire)) {
+    return 0;
+  }
+  fprintf(stderr,
+          "fexbridge: HWTSO: kernel refused PROT_SAO for %#" PRIx64 "+%#" PRIx64 " on ordinary memory — "
+          "this range would run with neither hardware ordering nor emitted barriers\n",
+          start, length);
+  if (HwTso::Strict) {
+    fprintf(stderr, "fexbridge: FEX_HWTSO_STRICT: aborting so the refusing range can be identified.\n");
+    abort();
+  }
+  // The frontend's RevokeHardwareTSO closure, on the bridge's primitives: the
+  // flag flips and every translation is dropped inside the same exclusive
+  // critical section, so everything compiled from here on reads
+  // SupportsHardwareTSO == false and the first re-entry anywhere recompiles
+  // with barriers.  A thread already inside a block finishes it barrier-free,
+  // which is sound for the same reason as in the frontend: the refused range
+  // does not exist from the guest's point of view until the embedder's
+  // operation returns, and every range that already exists is still SAO.
+  // Re-checked under the mutex so two refusals produce exactly one downgrade.
+  if (CTX) {
+    std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
+    if (HwTso::Live.load(std::memory_order_relaxed)) {
+      CTX->InvalidateCodeBuffersCodeRange(0, ~0ULL);
+      HwTso::Live.store(false, std::memory_order_release);
+      CTX->SetHardwareTSOSupport(false);
+      fprintf(stderr, "fexbridge: HWTSO revoked; TSO barriers are being emitted again.\n");
+    }
+  }
+  return 0;
 }
 
 int fexbridge_fault_is_jit(const void* host_ucontext) {
