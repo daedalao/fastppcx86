@@ -91,6 +91,7 @@ std::atomic<fexbridge_trap_fn> TrapCb {nullptr};
 std::atomic<void*> TrapUser {nullptr};
 uint64_t HltPageAddr {}; // one guest-visible HLT, used to end a run cooperatively
 bool Initialized {};
+bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
 
 thread_local BridgeThread* TLSThread {};
 
@@ -358,9 +359,24 @@ void fexbridge_set_log_handler(fexbridge_log_fn cb) {
   LogCb.store(cb, std::memory_order_release);
 }
 
-int fexbridge_process_init(void) {
+static int process_init_common(bool Is64, uint64_t ExitPage) {
   if (Initialized) {
+    if (GuestIs64 != Is64) {
+      EmitLog(0, Is64 ? "fexbridge: process already initialized 32-bit; 64-bit init refused" :
+                        "fexbridge: process already initialized 64-bit; 32-bit init refused");
+      return -5;
+    }
     return 0;
+  }
+
+  // 32-bit mode: the cooperative-exit trampoline the guest executes through
+  // must live in the guest's own (4 GiB) address space, and only the caller's
+  // memory manager can place a low page without racing whatever else owns
+  // that range -- so the caller provides it, already filled with hlt and
+  // executable.  Checked before any FEX state exists so a refusal is clean.
+  if (!Is64 && (!ExitPage || (ExitPage >> 32) || ((ExitPage + FEXCore::Utils::FEX_PAGE_SIZE - 1) >> 32))) {
+    EmitLog(0, "fexbridge: 32-bit init needs a caller-provided exit page below 4 GiB");
+    return -4;
   }
 
   LogMan::Throw::InstallHandler(AssertHandler);
@@ -371,7 +387,7 @@ int fexbridge_process_init(void) {
   // DISCARDS anything Set() placed there earlier. Set after reload or the
   // 64-bit guest decodes with CS.L == 0.
   FEXCore::Config::ReloadMetaLayer();
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Is64 ? "1" : "0");
   // No frontend => no mprotect-based SMC tracking host. The caller reports
   // code writes through fexbridge_invalidate_code_range.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
@@ -394,18 +410,31 @@ int fexbridge_process_init(void) {
     return -2;
   }
 
-  // One guest-visible HLT used to end runs cooperatively.
-  auto* Page = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (Page == MAP_FAILED) {
-    EmitLog(0, "fexbridge: HLT page mmap failed");
-    return -3;
+  if (Is64) {
+    // One guest-visible HLT used to end runs cooperatively.
+    auto* Page = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (Page == MAP_FAILED) {
+      EmitLog(0, "fexbridge: HLT page mmap failed");
+      return -3;
+    }
+    memset(Page, 0xF4 /* hlt */, FEXCore::Utils::FEX_PAGE_SIZE);
+    HltPageAddr = reinterpret_cast<uint64_t>(Page);
+  } else {
+    HltPageAddr = ExitPage;
   }
-  memset(Page, 0xF4 /* hlt */, FEXCore::Utils::FEX_PAGE_SIZE);
-  HltPageAddr = reinterpret_cast<uint64_t>(Page);
   fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
 
+  GuestIs64 = Is64;
   Initialized = true;
   return 0;
+}
+
+int fexbridge_process_init(void) {
+  return process_init_common(true, 0);
+}
+
+int fexbridge_process_init32(uint64_t exit_page) {
+  return process_init_common(false, exit_page);
 }
 
 void fexbridge_set_trap_handler(fexbridge_trap_fn cb, void* user) {
@@ -427,19 +456,54 @@ int fexbridge_thread_init(void** thread_out) {
   }
   auto* Frame = Thread->CurrentFrame;
 
-  // GDT: CPUState carries private_gdt[32] inline; flat 64-bit code segment.
+  // GDT: CPUState carries private_gdt[32] inline; flat code segment.
   // These two CPUState fields are only ever initialised by frontend code —
   // the JIT reads garbage without them (probe finding).
   Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &Frame->State.private_gdt[0];
   Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = &Frame->State.private_gdt[0];
 
-  Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
-  auto* GDT = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
-  FEXCore::Core::CPUState::SetGDTBase(GDT, 0);
-  FEXCore::Core::CPUState::SetGDTLimit(GDT, 0xF'FFFFU);
-  GDT->L = 1; // 64-bit guest
-  GDT->D = 0;
-  Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*GDT);
+  if (GuestIs64) {
+    Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
+    auto* GDT = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
+    FEXCore::Core::CPUState::SetGDTBase(GDT, 0);
+    FEXCore::Core::CPUState::SetGDTLimit(GDT, 0xF'FFFFU);
+    GDT->L = 1; // 64-bit guest
+    GDT->D = 0;
+    Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*GDT);
+  } else {
+    // 32-bit guest: the Windows flat model with Windows' own selector values,
+    // because they are architecturally visible (mov %cs,%ax; a CONTEXT's
+    // SegCs) and 32-bit code does look at them.  CS=0x23 (GDT index 4, RPL 3)
+    // flat code with D=1; SS/DS/ES/GS=0x2B (index 5) flat data; FS=0x53
+    // (index 10) is the TIB selector whose base fexbridge_set_fs_base
+    // installs -- into the DESCRIPTOR as well as the cached copy, because a
+    // segment reload recomputes the cached base from the descriptor
+    // (OpDispatchBuilder::UpdatePrefixFromSegment reads the GDT qword).
+    // Ordinary flat accesses never consult any of this: GetSegment's 32-bit
+    // arm adds nothing for unprefixed DS/ES/SS and reads fs_cached for fs:.
+    auto InitSeg = [&](uint32_t Selector, bool Code) {
+      auto* GDT = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Selector);
+      FEXCore::Core::CPUState::SetGDTBase(GDT, 0);
+      FEXCore::Core::CPUState::SetGDTLimit(GDT, 0xF'FFFFU);
+      GDT->Type = Code ? 0xB : 0x3; // accessed code RX / accessed data RW
+      GDT->S = 1;
+      GDT->DPL = 3;
+      GDT->P = 1;
+      GDT->L = 0;
+      GDT->D = 1;
+      GDT->G = 1;
+    };
+    InitSeg(0x23, true);
+    InitSeg(0x2b, false);
+    InitSeg(0x53, false); // base written by fexbridge_set_fs_base
+    Frame->State.cs_idx = 0x23;
+    Frame->State.ss_idx = Frame->State.ds_idx = Frame->State.es_idx = 0x2b;
+    Frame->State.gs_idx = 0x2b;
+    Frame->State.fs_idx = 0x53;
+    Frame->State.cs_cached = Frame->State.ss_cached = 0;
+    Frame->State.ds_cached = Frame->State.es_cached = 0;
+    Frame->State.gs_cached = Frame->State.fs_cached = 0;
+  }
 
   // Call-ret shadow stack, guard pages both sides.
   auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CALLRET_ALLOC, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
@@ -492,7 +556,13 @@ int fexbridge_run(void* thread, void* ctx) {
     if (F.ExitRequested) {
       // The run ended through the bridge HLT; put the callback's continuation
       // RIP back so the reported state is the state the guest will resume at.
+      // The HLT executed on the way out populated SynchronousFaultData; clear
+      // it as the other arm does, or a later run could classify against a
+      // stale record.  Harmless today only because both non-exit sources
+      // repopulate it; load-bearing for a caller (the 32-bit lane) that takes
+      // this path on every single trap.
       BT->Thread->CurrentFrame->State.rip = F.ExitRIP;
+      BT->Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException = false;
       Reason = FEXBRIDGE_RUN_EXITED;
     } else {
       // Both a guest HLT and a NoExec entry block (a jump to unfetchable
@@ -572,7 +642,20 @@ int fexbridge_set_fs_base(void* thread, uint64_t base) {
   if (!BT) {
     return -1;
   }
-  BT->Thread->CurrentFrame->State.fs_cached = base;
+  auto& State = BT->Thread->CurrentFrame->State;
+  if (!GuestIs64) {
+    // A 32-bit base has a second home: the FS descriptor.  A guest segment
+    // reload (pop %fs) recomputes fs_cached from the descriptor, so a base
+    // living only in the cache would silently revert to 0 the first time a
+    // guest saves and restores FS around a call.  The descriptor base field
+    // is 32 bits wide, which is also the honest limit for a 32-bit guest.
+    if (base >> 32) {
+      return -2;
+    }
+    auto* GDT = FEXCore::Core::CPUState::GetSegmentFromIndex(State, State.fs_idx);
+    FEXCore::Core::CPUState::SetGDTBase(GDT, static_cast<uint32_t>(base));
+  }
+  State.fs_cached = base;
   return 0;
 }
 
@@ -639,6 +722,11 @@ int fexbridge_run_entry(void* entry, void* arg, unsigned long long* rax_out, cha
 
   if (!entry || !rax_out) {
     return Fail("fexbridge_run_entry: NULL entry or rax_out");
+  }
+  if (Initialized && !GuestIs64) {
+    // The frame built below is MS-x64: 32-byte shadow space, RCX argument,
+    // 64-bit return-address slot.  None of that exists for an i386 guest.
+    return Fail("fexbridge_run_entry: process is in 32-bit guest mode; use fexbridge_run");
   }
   if (fexbridge_process_init() != 0) {
     return Fail("fexbridge_run_entry: process init failed");
