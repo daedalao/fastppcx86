@@ -183,16 +183,19 @@ cmake -S . -B build -GNinja \
   `-DTUNE_CPU=none` for anything another machine will run.
 - `BUILD_TESTS=False` is not enough to skip tests — `unittests/` is gated on
   `BUILD_TESTING`.
-- `libfexbridge.so` builds only with `-DCMAKE_POSITION_INDEPENDENT_CODE=ON`
-  (`Source/Tools/CMakeLists.txt:45`). It adds no external dependency.
+- `libfexbridge.so` (the Wine-facing C-ABI embedding library) builds in every
+  configuration: `CMakeLists.txt:225` sets `CMAKE_POSITION_INDEPENDENT_CODE`
+  unconditionally, which is the condition `Source/Tools/CMakeLists.txt:45` adds the
+  target on. It needs no flag and no external dependency. It has no `install()` rule
+  and is used out of the build tree.
 
 ## 9. Divergence from the ArchPOWER package
 
 `packaging/archpower/PKGBUILD` is the packaged subset, not a superset:
 
 - It omits `ccache` and `nasm` (build caching off, tests off) — correct for a package.
-- It does not set `CMAKE_POSITION_INDEPENDENT_CODE`, so the shipped package contains
-  no `libfexbridge.so`.
+- It does not ship `libfexbridge.so`, deliberately. The bridge is built from source
+  against the tree it is embedded into, not consumed as a distributed binary.
 - Its `pkgver` is a committed placeholder; `pkgver()` recomputes at build time.
 
 `Data/Dockerfile` is inherited upstream scaffolding. It clones `FEX-Emu/FEX` from
