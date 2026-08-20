@@ -30,6 +30,7 @@ pkgbase = fastppcx86
 	depends = xxhash
 	depends = qt6-base
 	depends = qt6-declarative
+	depends = ncurses
 	depends = libglvnd
 	depends = vulkan-icd-loader
 	depends = libdrm
