@@ -28,6 +28,8 @@ split-lock handling) and the self-modifying-code subsystem are written for POWER
   [`docs/allocator_usage.md`](docs/allocator_usage.md): internals, largely inherited from upstream.
 - [`packaging/archpower/README.md`](packaging/archpower/README.md): building the Arch POWER package.
 - [`docs/ReleaseProcess.md`](docs/ReleaseProcess.md): how releases are cut.
+- [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md): authoritative build-dependency list,
+  validated against a working POWER8 build host.
 
 ## Provenance
 
