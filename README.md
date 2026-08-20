@@ -48,6 +48,70 @@ called `FEX`, `FEXBash`, `FEXServer`, `FEXRootFSFetcher`, config keys are unchan
 environment variable is still `FEX_<NAME>`. Only the documentation has been renamed; renaming the
 code would break every existing config file, launcher and script for no benefit.
 
+## Dependencies
+
+Arch POWER package names. Full detail, with the file each one provides and the version
+it was validated at, in [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md).
+
+**Required**
+
+```
+clang (>= 13)  lld  llvm  cmake (>= 3.14)  ninja  python (>= 3.9)  git  pkgconf
+glibc  gcc-libs  fmt  xxhash  range-v3
+```
+
+**Submodules** — `git submodule update --init --recursive`
+
+```
+unordered_dense  jemalloc_glibc  rpmalloc  cpp-optparse  drm-headers
+fmt  xxhash  range-v3            (only if the system copy is absent)
+Vulkan-Headers                   (BUILD_THUNKS)
+Catch2  vixl  fex-*-tests-bins   (BUILD_TESTING)
+zydis                            (ENABLE_ZYDIS)
+tracy                            (ENABLE_FEXCORE_PROFILER, tracy backend)
+```
+
+**BUILD_THUNKS**
+
+```
+clang  llvm                      (thunkgen: libclang-cpp)
+libglvnd  libx11  libxcb  libdrm  libxshmfence  wayland  alsa-lib  vulkan-icd-loader
+x86_64-pc-linux-gnu-gcc  x86_64-pc-linux-gnu-glibc      (BUILD_GUEST_THUNKS)
+a multilib x86 sysroot                                  (BUILD_GUEST_THUNKS_32)
+```
+
+**BUILD_FEXCONFIG / BUILD_LAUNCHER / BUILD_LAUNCHER_TUI**
+
+```
+qt6-base  qt6-declarative  ncurses
+```
+
+**BUILD_TESTING**
+
+```
+nasm
+```
+
+**ENABLE_GDB_SYMBOLS** (auto-detected) — `gdb` · **ENABLE_CCACHE** (default on) — `ccache`
+
+**Runtime**
+
+```
+libglvnd  vulkan-icd-loader  libdrm  libxshmfence  wayland  libx11  libxcb
+```
+
+**Optional**
+
+```
+vulkan-driver     an ICD for the Vulkan thunk to pass through to
+pipewire-pulse    PulseAudio server for guest audio (pulseaudio also works)
+alsa-lib          only if the asound thunk is enabled; ships disabled
+squashfuse        mount squashfs x86-64 RootFS images
+erofs-utils       mount EROFS x86-64 RootFS images
+wget              used by FEXRootFSFetcher to download a RootFS
+xz                RootFS extraction
+```
+
 ## Build
 
 Standard CMake/Ninja build:
