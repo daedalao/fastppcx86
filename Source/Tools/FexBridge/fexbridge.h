@@ -295,6 +295,32 @@ int fexbridge_get_fs_base(void* thread, uint64_t* base_out);
    Callable from any thread; takes the code invalidation lock internally.   */
 void fexbridge_invalidate_code_range(uint64_t start, uint64_t length);
 
+/* ---- PROT_SAO hardware TSO (FEX_HWTSO), ppc64le ----------------------- */
+
+/* Non-zero while hardware TSO is LIVE: the value is the mmap/mprotect PROT
+   bit (PROT_SAO, 0x10) the caller must OR into every guest-visible mapping
+   it creates or reprotects, because with it live the JIT emits NO TSO
+   barriers and ordering is carried entirely by the pages.  Zero when the
+   feature is off, was refused by the kernel at the startup probe, or has
+   been revoked -- the JIT then emits barriers and the caller must stop
+   adding the bit.  Decided during fexbridge_process_init*() from the same
+   FEX_HWTSO/FEX_TSOENABLED configuration the frontend reads (litmus-proven
+   semantics; see FEXInterpreter's SetupTSOEmulation); constant between
+   calls except through fexbridge_hwtso_refused().  0 before process init. */
+uint32_t fexbridge_hwtso_prot(void);
+
+/* Report that the kernel refused a mapping or reprotection carrying the
+   bit on ORDINARY memory (the caller retries without it after this call).
+   Applies the frontend's refusal semantics: under FEX_HWTSO_STRICT it
+   aborts naming the range; otherwise it revokes hardware TSO for the whole
+   process -- every translation is dropped under the exclusive code
+   invalidation lock and recompiles with barriers, the same closure
+   FEX::HLE::SyscallHandler::RevokeHardwareTSO performs.  Returns the new
+   fexbridge_hwtso_prot() value, i.e. 0.  Device/WC mappings the caller
+   manages outside its page tables should simply never carry the bit; x86
+   makes no TSO promise for WC memory, so no report is owed for them.      */
+uint32_t fexbridge_hwtso_refused(uint64_t start, uint64_t length);
+
 /* ---- fault handling, called from the CALLER's host signal handler ------ */
 
 /* 1 if `host_ucontext` (a ppc64le ucontext_t*) points into this thread's JIT

@@ -22,6 +22,7 @@ $end_info$
 
 #include "fexbridge.h"
 
+#include "Common/Config.h"
 #include "Common/HostFeatures.h"
 
 #include <FEXCore/Config/Config.h>
@@ -42,6 +43,8 @@ $end_info$
 #include <mutex>
 #include <setjmp.h>
 #include <signal.h>
+#include <cerrno>
+#include <cinttypes>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <ucontext.h>
@@ -130,8 +133,32 @@ struct BridgeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public 
     uint8_t Probe;
     struct iovec Local {&Probe, 1};
     struct iovec Remote {reinterpret_cast<void*>(Page), 1};
-    if (process_vm_readv(getpid(), &Local, 1, &Remote, 1, 0) != 1) {
-      return {0, 0, true};
+    // Only EFAULT asserts anything about the page's protection.  Every other
+    // failure (ENOMEM when the kernel cannot pin, EINTR) is about the
+    // syscall, not the page -- and answering "unfetchable" for one of those
+    // is not a transient wrong answer, it is a STICKY one: CompileCode
+    // caches a NoExecOp block for the rip and every later call lands on the
+    // cached refusal even after nothing was ever wrong (measured: Cyberpunk
+    // 2077's crash handler at Cyberpunk2077.exe+29d07bc, readable at every
+    // fault report, permanently NoExec).  So: retry the transient class,
+    // and if it will not clear, say so loudly and answer fetchable -- the
+    // worst case of that answer is the pre-probe behaviour (a real host
+    // fault under the compile mutex), where the worst case of the other
+    // answer is a wrong NoExec cached forever.
+    for (int Attempt = 0;; ++Attempt) {
+      if (process_vm_readv(getpid(), &Local, 1, &Remote, 1, 0) == 1) {
+        break;
+      }
+      if (errno == EFAULT) {
+        return {0, 0, true};
+      }
+      if (Attempt >= 3) {
+        fprintf(stderr,
+                "fexbridge[2]: executable probe of %#" PRIx64 " failed with "
+                "errno %d; answering fetchable rather than caching NoExec\n",
+                Page, errno);
+        break;
+      }
     }
     return {Page, PageSize, true};
   }
@@ -143,6 +170,51 @@ struct BridgeSignalDelegator final : public FEXCore::SignalDelegator, public FEX
 
 BridgeSyscallHandler* SyscallHandler {};
 BridgeSignalDelegator* SigDelegator {};
+
+// ---------------------------------------------------------------------------
+// PROT_SAO hardware TSO (FEX_HWTSO).  The frontend's machinery lives in
+// FEX::HLE (SetupTSOEmulation's probe, HardwareTSO::OnRangeRefusedSAO's
+// refusal policy, SyscallHandler::RevokeHardwareTSO's closure) and none of it
+// links here — the bridge deliberately excludes LinuxEmulation.  This is the
+// same semantics re-hosted on the bridge's primitives, with one structural
+// difference: the frontend owns the guest's mmap/mprotect choke points and
+// applies the bit itself, while here the EMBEDDER owns the address space, so
+// the bit crosses the C ABI (fexbridge_hwtso_prot) and refusals cross back
+// (fexbridge_hwtso_refused).  Litmus/semantics provenance: SetupTSOEmulation
+// in FEXInterpreter.cpp — MP violations 0/16.3M on SAO pages, and acceptance
+// is meaningful because powerpc's arch_validate_prot rejects PROT_SAO
+// whenever the CPU/MMU cannot honor it.
+// ---------------------------------------------------------------------------
+namespace HwTso {
+constexpr int PROT_SAO_BIT = 0x10;
+std::atomic<bool> Live {false};
+bool Strict = false;
+
+void ProbeAndEnable() {
+  FEX_CONFIG_OPT(HWTSOEnabled, HWTSO);
+  FEX_CONFIG_OPT(TSOEnabledOpt, TSOENABLED);
+  if (!HWTSOEnabled() || !TSOEnabledOpt()) {
+    return;
+  }
+  void* Probe = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Probe == MAP_FAILED) {
+    fprintf(stderr,
+            "fexbridge: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
+            "Falling back to atomic/barrier TSO emulation.\n",
+            errno);
+    return;
+  }
+  // Touch it so an accept-then-fault setup dies here, at init, not in-guest.
+  *static_cast<volatile uint32_t*>(Probe) = 1;
+  ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+  const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
+  Strict = StrictEnv && StrictEnv[0] == '1';
+  Live.store(true, std::memory_order_release);
+  CTX->SetHardwareTSOSupport(true);
+  fprintf(stderr, "fexbridge: FEX_HWTSO live: PROT_SAO carries ordering, no TSO barriers emitted%s\n",
+          Strict ? " (STRICT: a refused range aborts)" : "");
+}
+} // namespace HwTso
 
 // ---------------------------------------------------------------------------
 // CPUState <-> flat AMD64 CONTEXT marshalling (probe T3, verbatim semantics).
@@ -383,6 +455,33 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   LogMan::Msg::InstallHandler(MsgHandler);
 
   FEXCore::Config::Initialize();
+  // The FEX_* environment, which until 2026-08-19 the bridge never read: no
+  // frontend meant no config layers at all, so every knob the emulated lane
+  // tunes through the environment (FEX_X87REDUCEDPRECISION being the
+  // measured one -- fex-scripts/fex defaults it to 1 for every emulated
+  // title) was silently inert for a native-lane guest.  The environment
+  // layer is the ONLY layer added, deliberately: config files and AppConfig
+  // stay out, because a bridge guest is launched by a tool (wine-ppc64le's
+  // steamtool) whose appconfig/<appid>.env is already the per-title
+  // mechanism, and two per-title mechanisms with different keys is how a
+  // setting gets lost.
+  //
+  // What this does NOT change, by construction: the two Set() calls below
+  // run AFTER ReloadMetaLayer(), so IS64BIT_MODE and SMCCHECKS still beat
+  // anything the environment says -- FEX_SMCCHECKS=1 cannot turn
+  // mprotect-based SMC tracking back on in a process with no frontend to
+  // host it.  And FEX_HWTSO stays inert here for a different reason:
+  // SetupTSOEmulation (the PROT_SAO probe) is FEXInterpreter's, the bridge
+  // never runs it, so EffectiveHardwareTSO stays false and TSO barriers
+  // keep being emitted -- safe, and named here so nobody reads a benchmark
+  // delta into a knob that does not reach this JIT path.
+  FEXCore::Config::AddLayer(FEX::Config::CreateEnvironmentLayer(environ));
+  // Load() before ReloadMetaLayer(), because the meta merge reads each
+  // layer's ALREADY-LOADED option map -- an added-but-unloaded layer merges
+  // as empty, which is exactly the silent no-op the first cut of this
+  // change shipped ([MEASURED] the x87 discriminator probe still answered
+  // FULL-F80 under FEX_X87REDUCEDPRECISION=1 until this line existed).
+  FEXCore::Config::Load();
   // Order matters (measured): ReloadMetaLayer() rebuilds the top layer and
   // DISCARDS anything Set() placed there earlier. Set after reload or the
   // 64-bit guest decodes with CS.L == 0.
@@ -405,6 +504,11 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   CTX = CTXPtr.release(); // process-lifetime; FEX teardown is not re-entered
   CTX->SetSignalDelegator(SigDelegator);
   CTX->SetSyscallHandler(SyscallHandler);
+  // Same ordering rule as the frontend's SetupTSOEmulation: hardware TSO must
+  // be decided before the first block is compiled, so before InitCore.  The
+  // embedder reads the verdict through fexbridge_hwtso_prot() after this
+  // returns and retro-applies the bit to whatever it mapped before init.
+  HwTso::ProbeAndEnable();
   if (!CTX->InitCore()) {
     EmitLog(0, "fexbridge: InitCore failed");
     return -2;
@@ -669,11 +773,57 @@ int fexbridge_get_fs_base(void* thread, uint64_t* base_out) {
 }
 
 void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
+  // Before any process init there is no context and nothing cached to
+  // invalidate, and the embedder can not know our init state: wine's memory
+  // syscalls forward every mapping change here from process start, while a
+  // 32-bit-only process does not initialise the bridge until wow64cpu's
+  // BTCpuProcessInit — dereferencing CTX here was a c0000005 inside that
+  // very init (measured: check-wow64-smoke, the 32-bit lane started 0 times).
+  if (!CTX) {
+    return;
+  }
   // InvalidateCodeBuffersCodeRange requires the caller to hold the code
   // invalidation mutex exclusively — unstated in the public header, enforced
   // by (previously side-effecting) assertions. Part of the CPU-DLL contract.
   std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
   CTX->InvalidateCodeBuffersCodeRange(start, length);
+}
+
+uint32_t fexbridge_hwtso_prot(void) {
+  return HwTso::Live.load(std::memory_order_acquire) ? HwTso::PROT_SAO_BIT : 0;
+}
+
+uint32_t fexbridge_hwtso_refused(uint64_t start, uint64_t length) {
+  if (!HwTso::Live.load(std::memory_order_acquire)) {
+    return 0;
+  }
+  fprintf(stderr,
+          "fexbridge: HWTSO: kernel refused PROT_SAO for %#" PRIx64 "+%#" PRIx64 " on ordinary memory — "
+          "this range would run with neither hardware ordering nor emitted barriers\n",
+          start, length);
+  if (HwTso::Strict) {
+    fprintf(stderr, "fexbridge: FEX_HWTSO_STRICT: aborting so the refusing range can be identified.\n");
+    abort();
+  }
+  // The frontend's RevokeHardwareTSO closure, on the bridge's primitives: the
+  // flag flips and every translation is dropped inside the same exclusive
+  // critical section, so everything compiled from here on reads
+  // SupportsHardwareTSO == false and the first re-entry anywhere recompiles
+  // with barriers.  A thread already inside a block finishes it barrier-free,
+  // which is sound for the same reason as in the frontend: the refused range
+  // does not exist from the guest's point of view until the embedder's
+  // operation returns, and every range that already exists is still SAO.
+  // Re-checked under the mutex so two refusals produce exactly one downgrade.
+  if (CTX) {
+    std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
+    if (HwTso::Live.load(std::memory_order_relaxed)) {
+      CTX->InvalidateCodeBuffersCodeRange(0, ~0ULL);
+      HwTso::Live.store(false, std::memory_order_release);
+      CTX->SetHardwareTSOSupport(false);
+      fprintf(stderr, "fexbridge: HWTSO revoked; TSO barriers are being emitted again.\n");
+    }
+  }
+  return 0;
 }
 
 int fexbridge_fault_is_jit(const void* host_ucontext) {
