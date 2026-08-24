@@ -1064,8 +1064,16 @@ template<>
 struct fex_gen_config<glBufferAttachMemoryNV> {};
 template<>
 struct fex_gen_config<glBufferDataARB> {};
+#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<glBufferData> {};
+#else
+// 32-bit: custom impl purely for the FEX_LIBGL_DEBUG map-traffic sampler --
+// with buffer mapping unused by some titles (Dex streams without a single
+// glMapBuffer* call), the SubData/Data stream is the one to observe.
+template<>
+struct fex_gen_config<glBufferData> : fexgen::custom_host_impl {};
+#endif
 template<>
 struct fex_gen_config<glBufferPageCommitmentARB> {};
 template<>
@@ -1078,8 +1086,14 @@ template<>
 struct fex_gen_config<glBufferStorageMemEXT> {};
 template<>
 struct fex_gen_config<glBufferSubDataARB> {};
+#ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<glBufferSubData> {};
+#else
+// See glBufferData above.
+template<>
+struct fex_gen_config<glBufferSubData> : fexgen::custom_host_impl {};
+#endif
 template<>
 struct fex_gen_config<glCallCommandListNV> {};
 template<>

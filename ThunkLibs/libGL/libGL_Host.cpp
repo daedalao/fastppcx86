@@ -1114,6 +1114,18 @@ static void LogMapTraffic(const char* What, GLenum target, long offset, long len
           static_cast<int>(gettid()));
 }
 
+// Sampler-only passthroughs: the SubData/Data stream is the dynamic-geometry
+// path for titles that never map (Dex). Log, then forward untouched.
+void fexfn_impl_libGL_glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+  LogMapTraffic("bufferdata", target, 0, size, usage);
+  fexldr_ptr_libGL_glBufferData(target, size, data, usage);
+}
+
+void fexfn_impl_libGL_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+  LogMapTraffic("subdata", target, offset, size, 0);
+  fexldr_ptr_libGL_glBufferSubData(target, offset, size, data);
+}
+
 void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
   LogMapTraffic("flush", target, offset, length, 0);
   FlushMappedTargetRange(target, offset, length);
