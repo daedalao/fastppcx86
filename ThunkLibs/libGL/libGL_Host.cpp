@@ -6,6 +6,7 @@ $end_info$
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@ $end_info$
 #include <string_view>
 #include <utility>
 #include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 #define GL_GLEXT_PROTOTYPES 1
@@ -1090,7 +1092,30 @@ void RetireStagingForContext(GLXContext Context) {
 }
 } // namespace
 
+#ifndef GL_MAP_PERSISTENT_BIT
+#define GL_MAP_PERSISTENT_BIT 0x0040
+#endif
+
+// FEX_LIBGL_DEBUG map-traffic sampler: the first 512 map/flush/unmap calls,
+// with the access bits the application actually asked for. The one question
+// this answers cheaply is whether a title streams through
+// GL_MAP_PERSISTENT_BIT mappings — which the staging scheme can only serve
+// when every write is followed by an explicit flush, so persistent maps are
+// logged past the budget too.
+static void LogMapTraffic(const char* What, GLenum target, long offset, long length, unsigned access) {
+  if (!FexLibGLDebug()) {
+    return;
+  }
+  static std::atomic<int> Budget {512};
+  if (Budget.fetch_sub(1, std::memory_order_relaxed) <= 0 && !(access & GL_MAP_PERSISTENT_BIT)) {
+    return;
+  }
+  fprintf(stderr, "[fex-libGL] %s target=0x%x off=%ld len=%ld access=0x%x tid=%d\n", What, target, offset, length, access,
+          static_cast<int>(gettid()));
+}
+
 void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  LogMapTraffic("flush", target, offset, length, 0);
   FlushMappedTargetRange(target, offset, length);
   fexldr_ptr_libGL_glFlushMappedBufferRange(target, offset, length);
 }
@@ -1123,6 +1148,7 @@ void fexfn_impl_libGL_glDeleteSync(GLsync sync) {
 }
 
 guest_layout<void*> fexfn_impl_libGL_glMapBuffer(GLenum target, GLenum access) {
+  LogMapTraffic("map", target, 0, -1, access);
   auto* HostPtr = fexldr_ptr_libGL_glMapBuffer(target, access);
   const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
   const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
@@ -1137,6 +1163,7 @@ guest_layout<void*> fexfn_impl_libGL_glMapBufferARB(GLenum target, GLenum access
 }
 
 guest_layout<void*> fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  LogMapTraffic("map-range", target, offset, length, access);
   auto* HostPtr = fexldr_ptr_libGL_glMapBufferRange(target, offset, length, access);
   // GL_MAP_INVALIDATE_*_BIT means the previous contents are undefined, so there
   // is nothing worth copying in even when GL_MAP_READ_BIT is also set.
@@ -1147,6 +1174,7 @@ guest_layout<void*> fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr of
 }
 
 GLboolean fexfn_impl_libGL_glUnmapBuffer(GLenum target) {
+  LogMapTraffic("unmap", target, 0, 0, 0);
   return UnmapBufferFromGuest(target);
 }
 
