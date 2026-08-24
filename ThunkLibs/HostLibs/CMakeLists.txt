@@ -211,15 +211,6 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # generate(libSDL2)
   # add_host_lib(SDL2 ${GUEST_BITNESS})
   # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
-
-  # libdrm stays 64-bit-guest only until the 32-bit host-side work lands: the
-  # interface carries the repacking annotations but the matching
-  # fex_custom_repack_entry/exit and the guest-heap relocation for the
-  # host-allocated drmDevice/drmVersion returns are not implemented yet.
-  generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
-  add_host_lib(drm ${GUEST_BITNESS})
 endforeach()
 
 # These libs support both guest bitnesses. Generating the 32-bit variants requires thunkgen to parse
@@ -249,6 +240,15 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
   add_host_lib(wayland-client ${GUEST_BITNESS})
   target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+
+  # libdrm: 32-bit lane added 2026-08-23 for the lib32 Mesa DRI loaders. The
+  # host-allocated drmVersion/drmDevice returns are rebuilt on the guest heap
+  # by custom host impls; see the 32-bit design note in
+  # ThunkLibs/libdrm/libdrm_interface.cpp.
+  generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
+  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
+  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
+  add_host_lib(drm ${GUEST_BITNESS})
 
   generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
   add_host_lib(EGL ${GUEST_BITNESS})

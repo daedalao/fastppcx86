@@ -274,9 +274,11 @@ if (BITNESS EQUAL 64)
   # target_include_directories(SDL2-guest PRIVATE ${SDL2_INCLUDE_DIRS})
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
+endif()
 
-  # libdrm stays 64-bit-guest only until its 32-bit host-side repacking and
-  # guest-heap relocation land. See ThunkLibs/HostLibs/CMakeLists.txt.
+# libdrm: 32-bit lane added 2026-08-23 for the lib32 Mesa DRI loaders. See the
+# 32-bit design note in ThunkLibs/libdrm/libdrm_interface.cpp.
+if (BITNESS EQUAL 32 OR BITNESS EQUAL 64)
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
