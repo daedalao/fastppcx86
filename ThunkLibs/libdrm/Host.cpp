@@ -75,6 +75,50 @@ static void* GuestMallocBytes(size_t Size) {
   return Ptr;
 }
 
+// The free half of the host API is deliberately absent from the 32-bit
+// interface (the guest frees its own materialized blocks with plain free()),
+// so the generated loader table carries no fexldr_ptr for it -- but the host
+// originals still have to be released through their own library. Resolve the
+// destructors from the handle fexldr_init_libdrm already opened.
+template<typename FnT>
+static FnT* ResolveHostDrmFree(const char* Name) {
+  auto* Fn = reinterpret_cast<FnT*>(dlsym_default(fexldr_ptr_libdrm_so, Name));
+  if (!Fn) {
+    // Leaking the host object beats crashing; a libdrm without its free half
+    // does not exist in practice.
+    fprintf(stderr, "libdrm-host: host libdrm lacks %s; leaking its objects\n", Name);
+  }
+  return Fn;
+}
+
+static void HostFreeVersion(drmVersionPtr V) {
+  static auto* const Fn = ResolveHostDrmFree<void(drmVersionPtr)>("drmFreeVersion");
+  if (Fn) {
+    Fn(V);
+  }
+}
+
+static void HostFreeBusid(const char* Busid) {
+  static auto* const Fn = ResolveHostDrmFree<void(const char*)>("drmFreeBusid");
+  if (Fn) {
+    Fn(Busid);
+  }
+}
+
+static void HostFreeDevice(drmDevicePtr* Device) {
+  static auto* const Fn = ResolveHostDrmFree<void(drmDevicePtr*)>("drmFreeDevice");
+  if (Fn) {
+    Fn(Device);
+  }
+}
+
+static void HostFreeDevices(drmDevicePtr* Devices, int Count) {
+  static auto* const Fn = ResolveHostDrmFree<void(drmDevicePtr*, int)>("drmFreeDevices");
+  if (Fn) {
+    Fn(Devices, Count);
+  }
+}
+
 // i686 images of the pointer-bearing libdrm structs. Hand-built rather than
 // generator-emitted: drmDevice's businfo/deviceinfo are members of anonymous
 // union type, which the layout-wrapper generator cannot name (it emits an
@@ -305,7 +349,7 @@ static auto fexfn_impl_libdrm_drmGetVersion(int a_0) -> guest_layout<drmVersionP
     return Result;
   }
   Result.data = MaterializeGuestVersion(Host);
-  fexldr_ptr_libdrm_drmFreeVersion(Host);
+  HostFreeVersion(Host);
   return Result;
 }
 
@@ -316,7 +360,7 @@ static auto fexfn_impl_libdrm_drmGetLibVersion(int a_0) -> guest_layout<drmVersi
     return Result;
   }
   Result.data = MaterializeGuestVersion(Host);
-  fexldr_ptr_libdrm_drmFreeVersion(Host);
+  HostFreeVersion(Host);
   return Result;
 }
 
@@ -324,7 +368,7 @@ static auto fexfn_impl_libdrm_drmGetBusid(int a_0) -> guest_layout<char*> {
   char* Host = fexldr_ptr_libdrm_drmGetBusid(a_0);
   guest_layout<char*> Result {.data = RelocateStringToGuestHeap(Host)};
   if (Host) {
-    fexldr_ptr_libdrm_drmFreeBusid(Host);
+    HostFreeBusid(Host);
   }
   return Result;
 }
@@ -376,7 +420,7 @@ static int GetOneGuestDevice(int HostRet, drmDevicePtr* Host, guest_layout<drmDe
     return -ENODEV;
   }
   const uint32_t GuestDev = MaterializeGuestDevice(*Host);
-  fexldr_ptr_libdrm_drmFreeDevice(Host);
+  HostFreeDevice(Host);
   if (!GuestDev) {
     return -ENOMEM;
   }
@@ -434,7 +478,7 @@ static int GetGuestDeviceList(guest_layout<drmDevicePtr*> GuestArray, int MaxDev
     OOM |= (Hosts[i] && !GuestDev);
     Slots[i].data = GuestDev;
   }
-  fexldr_ptr_libdrm_drmFreeDevices(Hosts.data(), Count);
+  HostFreeDevices(Hosts.data(), Count);
   return OOM ? -ENOMEM : Ret;
 }
 
