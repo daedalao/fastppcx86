@@ -6,6 +6,7 @@ $end_info$
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@ $end_info$
 #include <string_view>
 #include <utility>
 #include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 #define GL_GLEXT_PROTOTYPES 1
@@ -813,27 +815,69 @@ struct MappedBuffer {
 
 std::mutex MappedBufferMutex;
 
-// Keyed by (context, target), NOT by target alone.
+// LEGACY FALLBACK ONLY -- see BoundBufferForTarget below.
 //
-// A GL target names at most one buffer per context, so a target-only key looks
-// sufficient right up until a title renders from two contexts. Unity does: the
-// main thread and the render thread each hold a context, and both stream
-// per-frame dynamic geometry through GL_ARRAY_BUFFER. With one slot per target
-// the second map overwrote the first's HostPtr/Length and handed out the same
-// staging buffer, so the two streams wrote over each other and each unmap
-// copied whatever the other had left behind into its own buffer. Observed in
-// Dex as font glyphs piled up inside the trail effect's draw and white
-// degenerate-triangle streaks through the glyph region -- two dynamic streams
-// cross-contaminated, while everything static drew correctly.
+// This map's (context, target) key was the primary key until 2026-08-23, on
+// the assumption that "a target names at most one buffer per context, and a
+// buffer maps once". That assumption is wrong GL: mapping is per-BUFFER
+// state, and a title may map buffer A on GL_ARRAY_BUFFER, bind B and map it
+// too, then rebind each to flush and unmap it -- every mapping legal and
+// live simultaneously under one (context, target). Unity 5 does exactly this
+// (Dex, Player.log 2026-08-23: back-to-back map-ranges on 0x8892/0x8893 with
+// 58 second-live-map hits in one session). With one slot per key the second
+// map stole the first's staging buffer and HostPtr/Length, so A's flush was
+// clamped to B's length (glyphs missing from the drawn string) and copied
+// into B's mapping (those glyphs piled up at the origin inside other draws).
 //
-// The context is the right granularity, not the thread: GL requires the
-// context to be current for the call, and a context is current on at most one
-// thread at a time, so a title that maps on one thread and unmaps on another
-// must make the same context current in both -- same key either way. Keying by
-// thread would instead split that legal pattern across two entries and lose
-// the mapping.
+// The primary key is therefore the buffer NAME, resolved from the target's
+// binding point at map/flush/unmap time and stored in MappedNamedBuffers
+// alongside the DSA mappings (same per-buffer object, same semantics). This
+// (context, target) map only serves targets whose binding-point query enum
+// is unknown to BindingQueryForTarget -- a set that sees no mapping traffic
+// from real titles.
 using TargetKey = std::pair<GLXContext, GLenum>;
 std::map<TargetKey, MappedBuffer> MappedBuffers;
+
+// Primary store for every live mapping, keyed by buffer name. Shared with the
+// DSA entry points (declared here, documented at its old site below).
+std::map<GLuint, MappedBuffer> MappedNamedBuffers;
+
+// The binding-point query enum for a buffer target, or 0 for targets this
+// table does not know (which then fall back to the legacy (context, target)
+// slot). Kept to the targets real titles map.
+GLenum BindingQueryForTarget(GLenum target) {
+  switch (target) {
+  case GL_ARRAY_BUFFER: return GL_ARRAY_BUFFER_BINDING;
+  case GL_ELEMENT_ARRAY_BUFFER: return GL_ELEMENT_ARRAY_BUFFER_BINDING;
+  case GL_PIXEL_PACK_BUFFER: return GL_PIXEL_PACK_BUFFER_BINDING;
+  case GL_PIXEL_UNPACK_BUFFER: return GL_PIXEL_UNPACK_BUFFER_BINDING;
+  case GL_UNIFORM_BUFFER: return GL_UNIFORM_BUFFER_BINDING;
+  case GL_TRANSFORM_FEEDBACK_BUFFER: return GL_TRANSFORM_FEEDBACK_BUFFER_BINDING;
+  case GL_COPY_READ_BUFFER: return GL_COPY_READ_BUFFER_BINDING;
+  case GL_COPY_WRITE_BUFFER: return GL_COPY_WRITE_BUFFER_BINDING;
+  case GL_DRAW_INDIRECT_BUFFER: return GL_DRAW_INDIRECT_BUFFER_BINDING;
+  case GL_DISPATCH_INDIRECT_BUFFER: return GL_DISPATCH_INDIRECT_BUFFER_BINDING;
+  case GL_SHADER_STORAGE_BUFFER: return GL_SHADER_STORAGE_BUFFER_BINDING;
+  case GL_ATOMIC_COUNTER_BUFFER: return GL_ATOMIC_COUNTER_BUFFER_BINDING;
+  case GL_TEXTURE_BUFFER: return GL_TEXTURE_BUFFER_BINDING;
+  default: return 0;
+  }
+}
+
+// The buffer currently bound to `target`, or 0 when the binding point is
+// unknown or empty. GL requires the buffer to be bound to the target for
+// glMapBuffer*/glFlushMappedBufferRange/glUnmapBuffer on that target, so
+// resolving at each of those calls names the right object even when several
+// mapped buffers rotate through one target.
+GLuint BoundBufferForTarget(GLenum target) {
+  const GLenum Query = BindingQueryForTarget(target);
+  if (!Query) {
+    return 0;
+  }
+  GLint Name = 0;
+  fexldr_ptr_libGL_glGetIntegerv(Query, &Name);
+  return Name > 0 ? static_cast<GLuint>(Name) : 0;
+}
 
 // The current context, read straight from the loader rather than through the
 // generated thunk: the token map that 32-bit guests see is not wanted here, the
@@ -871,16 +915,17 @@ guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length
     return guest_layout<void*> {.data = 0};
   }
 
-  const TargetKey Key {CurrentContext(), target};
+  const GLuint Name = BoundBufferForTarget(target);
   std::lock_guard lk {MappedBufferMutex};
-  auto& Entry = MappedBuffers[Key];
+  auto& Entry = Name ? MappedNamedBuffers[Name] : MappedBuffers[TargetKey {CurrentContext(), target}];
   if (Entry.HostPtr && FexLibGLDebug()) {
-    // Two live mappings on one (context, target) is not a thing GL can produce:
-    // a target names one buffer, and a buffer maps once. If this ever fires,
-    // the key is again too coarse and the staging buffer is about to be shared
-    // between two mappings -- the exact failure this keying was introduced to
-    // end, so say so rather than silently clobbering.
-    fprintf(stderr, "[fex-libGL] staging: second live map on ctx=%p target=0x%x (previous host=%p)\n", (void*)Key.first, target, Entry.HostPtr);
+    // With per-buffer keying, a second live map on one entry means the guest
+    // mapped a buffer that is already mapped -- illegal GL the host driver
+    // would normally have rejected (and returned null before this point), or
+    // a name collision across unshared share groups. Either way the staging
+    // buffer is about to be shared between two mappings, so say so rather
+    // than silently clobbering.
+    fprintf(stderr, "[fex-libGL] staging: second live map on buffer=%u target=0x%x (previous host=%p)\n", Name, target, Entry.HostPtr);
   }
   const uintptr_t Staging = GetStagingBuffer(Entry, Length);
   if (!Staging) {
@@ -917,19 +962,31 @@ guest_layout<void*> MapBufferToGuest(GLenum target, void* HostPtr, size_t Length
   return guest_layout<void*> {.data = static_cast<decltype(guest_layout<void*>::data)>(Staging)};
 }
 
+// The existing entry for the buffer bound to `target` (resolved as `Name` by
+// the caller, 0 for the legacy slot), or null. MappedBufferMutex must be held.
+MappedBuffer* FindTargetEntry(GLenum target, GLuint Name) {
+  if (Name) {
+    auto It = MappedNamedBuffers.find(Name);
+    return It != MappedNamedBuffers.end() ? &It->second : nullptr;
+  }
+  auto It = MappedBuffers.find(TargetKey {CurrentContext(), target});
+  return It != MappedBuffers.end() ? &It->second : nullptr;
+}
+
 GLboolean UnmapBufferFromGuest(GLenum target) {
-  const TargetKey Key {CurrentContext(), target};
-  std::lock_guard lk {MappedBufferMutex};
-  auto It = MappedBuffers.find(Key);
-  if (It != MappedBuffers.end() && It->second.HostPtr) {
-    auto& Entry = It->second;
-    if (Entry.CopyBackOnUnmap && Entry.GuestPtr) {
-      std::memcpy(Entry.HostPtr, reinterpret_cast<const void*>(Entry.GuestPtr), Entry.Length);
+  const GLuint Name = BoundBufferForTarget(target);
+  {
+    std::lock_guard lk {MappedBufferMutex};
+    auto* Entry = FindTargetEntry(target, Name);
+    if (Entry && Entry->HostPtr) {
+      if (Entry->CopyBackOnUnmap && Entry->GuestPtr) {
+        std::memcpy(Entry->HostPtr, reinterpret_cast<const void*>(Entry->GuestPtr), Entry->Length);
+      }
+      // Keep the staging allocation for reuse; only the mapping is retired.
+      Entry->HostPtr = nullptr;
+      Entry->Length = 0;
+      Entry->CopyBackOnUnmap = false;
     }
-    // Keep the staging allocation for reuse; only the mapping is retired.
-    Entry.HostPtr = nullptr;
-    Entry.Length = 0;
-    Entry.CopyBackOnUnmap = false;
   }
   return fexldr_ptr_libGL_glUnmapBuffer(target);
 }
@@ -958,7 +1015,9 @@ size_t BufferSizeForTarget(GLenum target) {
 // context belongs to, so distinguishing them is not available; the collision
 // stays as a known limit. It needs DSA, two unshared contexts, and colliding
 // names to bite, whereas the target collision needed only two contexts.
-std::map<GLuint, MappedBuffer> MappedNamedBuffers;
+// (MappedNamedBuffers itself is declared above, next to the legacy map: since
+// 2026-08-23 the target-based entry points resolve their bound buffer and
+// store their mappings here too.)
 
 size_t BufferSizeForName(GLuint buffer) {
   GLint Size = 0;
@@ -1043,10 +1102,9 @@ void FlushStagingSubRange(MappedBuffer* Entry, GLintptr offset, GLsizeiptr lengt
 }
 
 void FlushMappedTargetRange(GLenum target, GLintptr offset, GLsizeiptr length) {
-  const TargetKey Key {CurrentContext(), target};
+  const GLuint Name = BoundBufferForTarget(target);
   std::lock_guard lk {MappedBufferMutex};
-  auto It = MappedBuffers.find(Key);
-  FlushStagingSubRange(It != MappedBuffers.end() ? &It->second : nullptr, offset, length);
+  FlushStagingSubRange(FindTargetEntry(target, Name), offset, length);
 }
 
 void FlushMappedNameRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
@@ -1060,10 +1118,10 @@ void FlushMappedNameRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
 // for its staging allocation only, and must then answer "no mapping" so the
 // query falls through to the driver's null.
 uintptr_t StagingPointerForTarget(GLenum target) {
-  const TargetKey Key {CurrentContext(), target};
+  const GLuint Name = BoundBufferForTarget(target);
   std::lock_guard lk {MappedBufferMutex};
-  auto It = MappedBuffers.find(Key);
-  return (It != MappedBuffers.end() && It->second.HostPtr) ? It->second.GuestPtr : 0;
+  auto* Entry = FindTargetEntry(target, Name);
+  return (Entry && Entry->HostPtr) ? Entry->GuestPtr : 0;
 }
 
 uintptr_t StagingPointerForName(GLuint buffer) {
@@ -1090,7 +1148,42 @@ void RetireStagingForContext(GLXContext Context) {
 }
 } // namespace
 
+#ifndef GL_MAP_PERSISTENT_BIT
+#define GL_MAP_PERSISTENT_BIT 0x0040
+#endif
+
+// FEX_LIBGL_DEBUG map-traffic sampler: the first 512 map/flush/unmap calls,
+// with the access bits the application actually asked for. The one question
+// this answers cheaply is whether a title streams through
+// GL_MAP_PERSISTENT_BIT mappings — which the staging scheme can only serve
+// when every write is followed by an explicit flush, so persistent maps are
+// logged past the budget too.
+static void LogMapTraffic(const char* What, GLenum target, long offset, long length, unsigned access) {
+  if (!FexLibGLDebug()) {
+    return;
+  }
+  static std::atomic<int> Budget {512};
+  if (Budget.fetch_sub(1, std::memory_order_relaxed) <= 0 && !(access & GL_MAP_PERSISTENT_BIT)) {
+    return;
+  }
+  fprintf(stderr, "[fex-libGL] %s target=0x%x off=%ld len=%ld access=0x%x tid=%d\n", What, target, offset, length, access,
+          static_cast<int>(gettid()));
+}
+
+// Sampler-only passthroughs: the SubData/Data stream is the dynamic-geometry
+// path for titles that never map (Dex). Log, then forward untouched.
+void fexfn_impl_libGL_glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+  LogMapTraffic("bufferdata", target, 0, size, usage);
+  fexldr_ptr_libGL_glBufferData(target, size, data, usage);
+}
+
+void fexfn_impl_libGL_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+  LogMapTraffic("subdata", target, offset, size, 0);
+  fexldr_ptr_libGL_glBufferSubData(target, offset, size, data);
+}
+
 void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+  LogMapTraffic("flush", target, offset, length, 0);
   FlushMappedTargetRange(target, offset, length);
   fexldr_ptr_libGL_glFlushMappedBufferRange(target, offset, length);
 }
@@ -1123,6 +1216,7 @@ void fexfn_impl_libGL_glDeleteSync(GLsync sync) {
 }
 
 guest_layout<void*> fexfn_impl_libGL_glMapBuffer(GLenum target, GLenum access) {
+  LogMapTraffic("map", target, 0, -1, access);
   auto* HostPtr = fexldr_ptr_libGL_glMapBuffer(target, access);
   const bool WantsRead = (access == GL_READ_ONLY || access == GL_READ_WRITE);
   const bool WantsWrite = (access == GL_WRITE_ONLY || access == GL_READ_WRITE);
@@ -1137,6 +1231,7 @@ guest_layout<void*> fexfn_impl_libGL_glMapBufferARB(GLenum target, GLenum access
 }
 
 guest_layout<void*> fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  LogMapTraffic("map-range", target, offset, length, access);
   auto* HostPtr = fexldr_ptr_libGL_glMapBufferRange(target, offset, length, access);
   // GL_MAP_INVALIDATE_*_BIT means the previous contents are undefined, so there
   // is nothing worth copying in even when GL_MAP_READ_BIT is also set.
@@ -1147,6 +1242,7 @@ guest_layout<void*> fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr of
 }
 
 GLboolean fexfn_impl_libGL_glUnmapBuffer(GLenum target) {
+  LogMapTraffic("unmap", target, 0, 0, 0);
   return UnmapBufferFromGuest(target);
 }
 
