@@ -48,6 +48,8 @@ static int (*p_set_gs_base)(void*, uint64_t);
 static int (*p_get_gs_base)(void*, uint64_t*);
 static int (*p_set_fs_base)(void*, uint64_t);
 static int (*p_get_fs_base)(void*, uint64_t*);
+static uint32_t (*p_declare_trap_ctx)(uint32_t);
+static int (*p_ctx_materialize)(void*, void*, uint32_t);
 
 static int checks, failures;
 static void check(int cond, const char* what) {
@@ -120,13 +122,15 @@ static void* map_rw(size_t sz) {
 }
 
 /* ---- trap callback ------------------------------------------------------ */
-enum { MODE_NONE, MODE_BOP, MODE_NESTED, MODE_GS };
+enum { MODE_NONE, MODE_BOP, MODE_NESTED, MODE_GS, MODE_LAZY };
 static int trap_mode = MODE_NONE;
 static uint64_t bop1, bop2, bop3, bop4;
 static uint64_t bop_hits[4];
 static uint64_t gs_bop_hits;
 static uint64_t nested_code, nested_stack_top, nested_result;
 static const uint64_t REGBASE = 0x7700000000ULL;
+static int lazy_poison_phase;   /* S11: expect poison bytes before materialize */
+static uint64_t lazy_hits[2];
 
 static int trap_cb(void* thread, void* vctx, void* user) {
   FEXBRIDGE_AMD64_CONTEXT* ctx = vctx;
@@ -175,6 +179,35 @@ static int trap_cb(void* thread, void* vctx, void* user) {
     nested_result = nctx.Rax;
     /* outer state lives in OUR ctx; hand the nested result to the guest */
     ctx->Rax = nested_result + 1;
+  } else if (trap_mode == MODE_LAZY && ctx->Rip == bop1) {
+    /* S11 hop A: the materialize-and-modify path. */
+    lazy_hits[0]++;
+    check((ctx->ContextFlags & 0x100u) != 0, "lazy ctx carries LAZY_EFLAGS");
+    check((ctx->ContextFlags & 0x200u) != 0, "lazy ctx carries LAZY_FLOAT");
+    if (lazy_poison_phase) {
+      check_eq(ctx->EFlags, 0xDEADF1A6u, "poison: unmaterialized EFlags is the pattern");
+      check_eq(ctx->FltSave.XmmRegisters[0].Low, 0xDDDDDDDDDDDDDDDDULL, "poison: unmaterialized XMM0 is the pattern");
+    }
+    check_eq((uint64_t)p_ctx_materialize(thread, ctx, FEXBRIDGE_CTX_CONTROL), 0, "materialize(CONTROL)");
+    check((ctx->ContextFlags & 0x100u) == 0, "LAZY_EFLAGS cleared by materialize");
+    check((ctx->ContextFlags & 0x200u) != 0, "LAZY_FLOAT untouched by CONTROL materialize");
+    check((ctx->EFlags & 0x1) != 0, "materialized EFlags: guest stc's CF");
+    check((ctx->EFlags & 0x40) != 0, "materialized EFlags: guest sub's ZF");
+    check_eq((uint64_t)p_ctx_materialize(thread, ctx, FEXBRIDGE_CTX_FLOATING_POINT), 0, "materialize(FLOATING_POINT)");
+    check((ctx->ContextFlags & 0x200u) == 0, "LAZY_FLOAT cleared by materialize");
+    check_eq(ctx->FltSave.XmmRegisters[0].Low, 0xA1B2C3D4E5F60718ULL, "materialized XMM0 is the guest's");
+    uint32_t before = ctx->EFlags;
+    check_eq((uint64_t)p_ctx_materialize(thread, ctx, FEXBRIDGE_CTX_CONTROL), 0, "materialize idempotent rc");
+    check_eq(ctx->EFlags, before, "materialize idempotent value");
+    /* modify both groups; the resume must apply exactly these */
+    ctx->EFlags &= ~0x1u; /* clear CF */
+    ctx->FltSave.XmmRegisters[0].Low = 0x1122334455667788ULL;
+    ctx->FltSave.XmmRegisters[0].High = 0;
+  } else if (trap_mode == MODE_LAZY && ctx->Rip == bop2) {
+    /* S11 hop B: touch nothing lazy -- the guest's EFLAGS and XMM must
+       survive the hop with no materialize and no write-back at all. */
+    lazy_hits[1]++;
+    ctx->Rax = 0x77;
   } else if (trap_mode == MODE_GS && ctx->Rip == bop1) {
     /* S10: touch nothing. The point is that a full CONTEXT round trip through
        the callback (which carries selectors, never bases) leaves the guest's
@@ -261,6 +294,8 @@ int main(int argc, char** argv) {
   SYM(p_get_gs_base, "fexbridge_get_gs_base");
   SYM(p_set_fs_base, "fexbridge_set_fs_base");
   SYM(p_get_fs_base, "fexbridge_get_fs_base");
+  SYM(p_declare_trap_ctx, "fexbridge_declare_trap_ctx");
+  SYM(p_ctx_materialize, "fexbridge_ctx_materialize");
 
   fprintf(stderr, "== S1: dlopen'd surface ==\n");
   check_eq(p_abi_version(), FEXBRIDGE_ABI_VERSION, "ABI version");
@@ -630,6 +665,106 @@ int main(int argc, char** argv) {
     pthread_join(t2, NULL);
     check_eq(a1.out, 0x1111, "thread 1 result");
     check_eq(a2.out, 0x2222, "thread 2 result");
+  }
+
+  /* ---- S11: lazy trap contexts (ABI 5) ----------------------------------- */
+  fprintf(stderr, "\n== S11: lazy trap contexts — declare, materialize, poison, eager veto ==\n");
+  {
+    /* hop A guest: known flags (ZF via sub, CF via stc) and a known XMM0,
+       trap, then read back what the callback's materialize-and-modify left:
+       pushfq -> rax, xmm0 -> rdx. */
+    uint8_t* lcode1 = map_rwx(0x1000);
+    {
+      uint8_t* p = lcode1;
+      p = emit_mov_imm32(p, 3, 1);          /* mov rbx, 1 */
+      E(p, 0x48, 0x83, 0xEB, 0x01);         /* sub rbx, 1 -> ZF=1 */
+      E(p, 0xF9);                           /* stc        -> CF=1 */
+      E(p, 0x48, 0xB8);                     /* movabs rax, pattern */
+      uint64_t pat = 0xA1B2C3D4E5F60718ULL;
+      memcpy(p, &pat, 8);
+      p += 8;
+      E(p, 0x66, 0x48, 0x0F, 0x6E, 0xC0);   /* movq xmm0, rax */
+      p = emit_call_abs(p, bop1);
+      E(p, 0x9C);                           /* pushfq */
+      E(p, 0x58);                           /* pop rax */
+      E(p, 0x66, 0x48, 0x0F, 0x7E, 0xC2);   /* movq rdx, xmm0 */
+      E(p, 0xF4);
+    }
+    p_invalidate((uint64_t)lcode1, 0x1000);
+
+    /* hop B guest: CF/SF via a borrowing sub, a known XMM1, a trap the
+       callback leaves lazy -- everything must come back intact. */
+    uint8_t* lcode2 = map_rwx(0x1000);
+    {
+      uint8_t* p = lcode2;
+      p = emit_mov_imm32(p, 3, 0);          /* mov rbx, 0 */
+      E(p, 0x48, 0x83, 0xEB, 0x01);         /* sub rbx, 1 -> CF=1 SF=1 ZF=0 */
+      E(p, 0x48, 0xB8);                     /* movabs rax, pattern2 */
+      uint64_t pat2 = 0x0F1E2D3C4B5A6978ULL;
+      memcpy(p, &pat2, 8);
+      p += 8;
+      E(p, 0x66, 0x48, 0x0F, 0x6E, 0xC8);   /* movq xmm1, rax */
+      p = emit_call_abs(p, bop2);
+      E(p, 0x9C);                           /* pushfq */
+      E(p, 0x58);                           /* pop rax */
+      E(p, 0x66, 0x48, 0x0F, 0x7E, 0xCA);   /* movq rdx, xmm1 */
+      E(p, 0xF4);
+    }
+    p_invalidate((uint64_t)lcode2, 0x1000);
+
+    check_eq(p_declare_trap_ctx(FEXBRIDGE_CTX_LAZY_EFLAGS | FEXBRIDGE_CTX_LAZY_FLOAT), 0x300, "declare accepts both lazy groups");
+
+    trap_mode = MODE_LAZY;
+    lazy_poison_phase = 0;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)lcode1;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "lazy hop A ran to HLT");
+    check_eq(lazy_hits[0], 1, "lazy bop A dispatched");
+    check((ctx.Rax & 0x1) == 0, "callback's CF clear reached the guest");
+    check((ctx.Rax & 0x40) != 0, "guest's ZF survived the modified resume");
+    check_eq(ctx.Rdx, 0x1122334455667788ULL, "callback's XMM0 write reached the guest");
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)lcode2;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "lazy hop B ran to HLT");
+    check_eq(lazy_hits[1], 1, "lazy bop B dispatched");
+    check((ctx.Rax & 0x1) != 0, "guest CF survived an unmaterialized hop");
+    check((ctx.Rax & 0x80) != 0, "guest SF survived an unmaterialized hop");
+    check((ctx.Rax & 0x40) == 0, "guest ZF stayed clear across the hop");
+    check_eq(ctx.Rdx, 0x0F1E2D3C4B5A6978ULL, "guest XMM1 survived an unmaterialized hop");
+
+    /* poison: the same materialize path must first see the pattern */
+    setenv("FEXBRIDGE_CTX_POISON", "1", 1);
+    check_eq(p_declare_trap_ctx(FEXBRIDGE_CTX_LAZY_EFLAGS | FEXBRIDGE_CTX_LAZY_FLOAT), 0x300, "re-declare with poison armed");
+    lazy_poison_phase = 1;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)lcode1;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "poisoned lazy hop ran to HLT");
+    check_eq(lazy_hits[0], 2, "poisoned lazy bop dispatched");
+    check_eq(ctx.Rdx, 0x1122334455667788ULL, "materialize under poison still yields the real state");
+    unsetenv("FEXBRIDGE_CTX_POISON");
+    lazy_poison_phase = 0;
+
+    /* the eager kill switch vetoes a declaration */
+    setenv("FEXBRIDGE_EAGER_CTX", "1", 1);
+    check_eq(p_declare_trap_ctx(FEXBRIDGE_CTX_LAZY_EFLAGS | FEXBRIDGE_CTX_LAZY_FLOAT), 0, "FEXBRIDGE_EAGER_CTX=1 vetoes lazy");
+    unsetenv("FEXBRIDGE_EAGER_CTX");
+
+    /* back to eager for everything after this section */
+    check_eq(p_declare_trap_ctx(0), 0, "declare(0) restores eager");
+    trap_mode = MODE_NONE;
   }
 
   fprintf(stderr, "\n== teardown ==\n");
