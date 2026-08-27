@@ -357,8 +357,13 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
 // caller wrote, and either resumes or steers the run to a cooperative HLT.
 // ---------------------------------------------------------------------------
 uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments*) {
-  BridgeThread* BT = TLSThread;
+  // FrontendPtr, not TLSThread: this is the hottest function in the bridge
+  // (once per guest->native crossing) and TLSThread is general-dynamic TLS in
+  // a dlopen()ed DSO — a __tls_get_addr call per hop.  fexbridge_thread_init
+  // parked the BridgeThread in the frame's own thread object, which the JIT
+  // hands over for free.
   auto* Thread = Frame->Thread;
+  BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
 
   alignas(16) FEXBRIDGE_AMD64_CONTEXT C {};
   alignas(16) __uint128_t YMM[16];
@@ -622,6 +627,11 @@ int fexbridge_thread_init(void** thread_out) {
   auto* BT = new BridgeThread();
   BT->Thread = Thread;
   BT->CallRetAllocBase = AllocBase;
+  // The hot trap path (HandleSyscall) finds the BridgeThread through the
+  // frame instead of TLS; FrontendPtr is FEXCore's embedder-owned slot and
+  // nothing else in the bridge's link set touches it (LinuxEmulation, the
+  // other writer, is deliberately not linked).
+  Thread->FrontendPtr = BT;
   TLSThread = BT;
   *thread_out = BT;
   return 0;
