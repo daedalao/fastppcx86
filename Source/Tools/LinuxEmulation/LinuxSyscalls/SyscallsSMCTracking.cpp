@@ -456,9 +456,69 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // interleaving is a drain that soft-invalidates the page just before we
       // unprotect it, which merely re-arms protection at the next
       // compile/relink through MarkGuestExecutableRange -- sound.
-      const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase);
+      bool EpochStart = false;
+      const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase, &EpochStart);
       UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_PAGE_SIZE);
       LazyDeferred = true;
+
+      // FEX_SMCLAZYCROSSPOKE (opt-in): make the deferral bounded for EVERY
+      // OTHER thread as well.
+      //
+      // The scrub below only closes the same-thread hole. The original design
+      // argued cross-thread SMC needed nothing more, because x86 only promises
+      // coherence to the modifying processor and a reader must execute a
+      // serializing event to see new code. That argument is wrong in practice:
+      // real guest JITs serialize with thread-local handshakes / safepoint
+      // polls that contain NO FEX drain point, and a reader spinning inside
+      // already-compiled code takes no syscall, no signal and no new compile,
+      // so it never drains at all. Worse, HotSpot then REUSES freed code-cache
+      // memory, so a stale translation stops being "the old version of this
+      // method" and becomes a translation of unrelated bytes — truncated
+      // pointers, bogus klass loads, random SIGSEGVs within a minute or two.
+      //
+      // So bound every thread to its next BLOCK ENTRY: set its drain-pending
+      // flag, then mprotect its InterruptFaultPage away. Every dispatcher-
+      // reachable EntryPoint opens with the fault-page poke (the unconditional
+      // EmitSuspendInterruptCheck the deferred-signal machinery needs), and
+      // block links target entries, so this holds with BlockLinking on or off
+      // and does not depend on FEX_SMCLAZYLINK. The flag must be set BEFORE the
+      // mprotect: a thread that races the mprotect (poked just before it landed)
+      // still owes the debt and settles it at its next ExitFunctionLink or
+      // CompileBlock. The spurious arming is what the delegator's fault-page
+      // branch already tolerates by design: with no deferred signal queued it
+      // unprotects, settles the drain, and resumes.
+      //
+      // Paid once per dirty epoch (EpochStart), not once per store: while the
+      // set stays non-empty every thread already owes a drain that covers any
+      // page added since, and the first fault after a drain empties the set
+      // re-arms everyone. Threads created mid-epoch need no arming either —
+      // a fresh thread must reach CompileBlock before it can execute anything,
+      // and CompileBlock is drain point (a).
+      if (_SyscallHandler->SMCLazyCrossPokeActive() && EpochStart) {
+        const bool Armed = _SyscallHandler->TM.TryForEachThread([Thread](FEX::HLE::ThreadStateObject* Object) {
+          auto* Other = Object->Thread;
+          if (!Other || Other == Thread) {
+            // The faulting thread bounds itself via the scrub (and, under
+            // FEX_SMCLAZYLINK, its own fault page) below.
+            return;
+          }
+          Thread->CTX->ArmLazySMCDrainPending(Other);
+          mprotect(reinterpret_cast<void*>(&Other->InterruptFaultPage), sizeof(Other->InterruptFaultPage), PROT_NONE);
+        });
+
+        if (!Armed) {
+          // ThreadCreationMutex was contended (or, if this thread somehow
+          // already owned it, unlockable) and this handler must not block on
+          // it. Deferring without arming would be exactly the unsound state
+          // this exists to remove, so pay the fully synchronous price instead:
+          // drain now, which soft-invalidates every dirty page across every
+          // thread. Strictly stronger than the lazy path, so the W^X deferral
+          // bookkeeping below must treat this fault as a real invalidation.
+          _SyscallHandler->DrainSMCLazyDirtyPages(Thread, FEX::HLE::SMCLazy::DrainPoint::CrossPokeFallback);
+          LazyDeferred = false;
+          SMC_AUDIT("[%d] fault addr=%lx LAZY-CROSSPOKE-FALLBACK page=%lx\n", FHU::Syscalls::gettid(), FaultAddress, FaultBase);
+        }
+      }
 
       // FEX_SMCLAZYSCRUB (default on): make the deferral sound for THIS thread.
       // x86 only guarantees SMC coherence to the modifying processor, so it is

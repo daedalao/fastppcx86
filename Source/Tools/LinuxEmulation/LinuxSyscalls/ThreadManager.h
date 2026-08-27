@@ -413,6 +413,36 @@ public:
     return &Threads;
   }
 
+  // FEX_SMCLAZYCROSSPOKE: run `fn` over every live thread under
+  // ThreadCreationMutex, acquired NON-BLOCKING.
+  //
+  // Unlike the invalidation helpers above this deliberately does not take (or
+  // steal) the CodeInvalidationMutex: the only per-thread state it is used to
+  // touch is the lazy-drain flag and the InterruptFaultPage protection, neither
+  // of which races a compile. The caller is the SIGSEGV handler, and returning
+  // false rather than blocking lets it fall back to a fully synchronous drain
+  // instead of gambling on the lock. Note that try_lock also returns false when
+  // this very thread already owns the mutex (it is not recursive), which is the
+  // one case where blocking here would self-deadlock.
+  template<typename F>
+  [[nodiscard]]
+  bool TryForEachThread(F&& fn) {
+    if (!ThreadCreationMutex.try_lock()) {
+      return false;
+    }
+    struct UniqueGuard {
+      FEXCore::ForkableUniqueMutex& M;
+      ~UniqueGuard() {
+        M.unlock();
+      }
+    } lk {ThreadCreationMutex};
+
+    for (auto& Thread : Threads) {
+      fn(Thread);
+    }
+    return true;
+  }
+
 private:
   StatAlloc Stat;
   FEXCore::Context::Context* CTX;

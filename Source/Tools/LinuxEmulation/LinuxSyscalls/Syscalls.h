@@ -725,14 +725,41 @@ public:
     return SMCLazyLinkEnabled.load(std::memory_order_relaxed);
   }
 
+  // FEX_SMCLAZYCROSSPOKE (default OFF; opt-in with =1 while the residual
+  // holes named in SMCLazyInvalidate.h stay open -- writer-only is the
+  // default behaviour).
+  // When active, a lazy SMC fault that opens a dirty epoch arms EVERY other
+  // thread's InterruptFaultPage, bounding each thread's staleness to its next
+  // block entry. Without it a thread that stays inside already-compiled code —
+  // no syscall, no signal, no new compile — never reaches a drain point and
+  // runs stale translations indefinitely; that is what crashes the HotSpot JVM
+  // (which patches nmethods at safepoints and then REUSES freed code-cache
+  // memory, so "stale" becomes "translation of unrelated garbage").
+  // See LinuxSyscalls/SMCLazyInvalidate.h "CROSS-THREAD SMC".
+  std::atomic<bool> SMCLazyCrossPokeEnabled {false};
+
+  bool SMCLazyCrossPokeActive() const {
+    return SMCLazyCrossPokeEnabled.load(std::memory_order_relaxed);
+  }
+
   // Records a page as dirty-but-not-invalidated. Returns true if this is the
   // first time the page entered the set since the last drain (the audit trace
   // logs the lazy unprotect once per page per dirty epoch, not once per
   // store). Called from the SIGSEGV handler.
-  bool MarkSMCLazyDirtyPage(uint64_t Page) {
+  // EpochStart (optional) receives whether the set was EMPTY before this
+  // insert, i.e. whether this fault opens a fresh dirty epoch. That is the
+  // gate FEX_SMCLAZYCROSSPOKE arms on: every thread is poked once per epoch,
+  // so a store burst into an already-dirty page pays nothing, and the next
+  // fault after a drain empties the set re-arms. Computed under the same lock
+  // as the insert so the transition cannot be missed or double-counted.
+  bool MarkSMCLazyDirtyPage(uint64_t Page, bool* EpochStart = nullptr) {
     std::lock_guard lk {SMCLazyDirtyMutex};
+    const bool WasEmpty = SMCLazyDirtyPages.empty();
     const bool Inserted = SMCLazyDirtyPages.insert(Page).second;
     SMCLazyDirtyCount.store(SMCLazyDirtyPages.size(), std::memory_order_release);
+    if (EpochStart) {
+      *EpochStart = WasEmpty;
+    }
     return Inserted;
   }
 

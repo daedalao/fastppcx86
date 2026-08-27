@@ -1339,7 +1339,14 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // load-bearing: the drain compiles/relinks nothing, but the thread's
       // next entry poke must not re-fault into a loop. No-op (one relaxed
       // load) unless the lazy-link mode armed it.
-      if (FEX::HLE::_SyscallHandler && FEX::HLE::_SyscallHandler->SMCLazyLinkActive()) {
+      //
+      // FEX_SMCLAZYCROSSPOKE arms this same page on threads that did NOT do
+      // the writing, so the gate is the whole lazy mode rather than the
+      // lazy-link sub-option: with cross-poke on, a thread reaching here may be
+      // an innocent reader whose only bound on staleness is this settle. The
+      // widened gate costs one relaxed load, and the settle itself is a no-op
+      // (one more relaxed load) when this thread owes nothing.
+      if (FEX::HLE::_SyscallHandler && FEX::HLE::_SyscallHandler->SMCLazyInvalActive()) {
         Thread->CTX->SettleLazySMCDrainIfPending(Thread);
       }
 

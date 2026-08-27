@@ -1166,6 +1166,29 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
     // it drain in the lookup slow path, which closes the same-thread
     // patch-then-call hole. Only meaningful once lazy is actually armed.
     SMCLazyScrubEnabled.store(SMCLazyScrub(), std::memory_order_relaxed);
+    // FEX_SMCLAZYCROSSPOKE (default OFF, opt-in with =1): bound EVERY thread's
+    // staleness to its next block entry, not just the writer's. Measured
+    // 2026-08-25 on the HotSpot Churn harness: closes a provable hole but does
+    // NOT cure the JVM crashes (3/6 pass vs 2/6 without — noise at that N), so
+    // it does not yet buy the safety that would justify charging every lazy
+    // title one mprotect per thread per dirty epoch plus a spurious SIGSEGV per
+    // thread. Residual suspects: multiblock internal loops never cross a block
+    // entry, and a poke-settled thread still resumes into the entered stale
+    // body. Until those are closed and the cost is measured on a CP2077-class
+    // title, this stays opt-in. Env rather than a Config.json option because it
+    // exists to A/B a fix in progress; same getenv style as the FEX_ZEXTOPT
+    // switches in the PPC64LE JIT.
+    {
+      const char* CrossPokeEnv = getenv("FEX_SMCLAZYCROSSPOKE");
+      const bool CrossPoke = CrossPokeEnv && CrossPokeEnv[0] == '1';
+      SMCLazyCrossPokeEnabled.store(CrossPoke, std::memory_order_relaxed);
+      if (CrossPoke) {
+        LogMan::Msg::IFmt("FEX_SMCLAZYCROSSPOKE armed: a lazy SMC fault that opens a dirty epoch arms EVERY "
+                          "thread's InterruptFaultPage, so every thread drains at its next block entry. "
+                          "This narrows but does NOT close the lazy cross-thread hole; JVM-class guests "
+                          "should run with FEX_SMCLAZYINVAL=0 instead.");
+      }
+    }
     // FEX_SMCLAZYLINK: fault-page-armed drains for linked chains. Only arms if
     // the scrub (the guarantee being extended) is itself on, and never with
     // semantic patch (which keeps linking hard-off in the JIT regardless —

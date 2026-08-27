@@ -1704,6 +1704,14 @@ void ContextImpl::ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThread
   Thread->LookupCache->ScrubForLazySMC();
 }
 
+void ContextImpl::ArmLazySMCDrainPending(FEXCore::Core::InternalThreadState* Thread) {
+  // FEX_SMCLAZYCROSSPOKE. Unlike ScrubThreadLookupCacheForLazySMC this may be
+  // called for a thread other than the caller, so it must not touch anything
+  // that thread owns exclusively — only the drain-pending flag, which is a
+  // std::atomic<bool> written relaxed.
+  Thread->LookupCache->ArmLazySMCDrainPending();
+}
+
 void ContextImpl::SettleLazySMCDrainIfPending(FEXCore::Core::InternalThreadState* Thread) {
   // FEX_SMCLAZYLINK. Same consume-then-drain sequence as the copy in
   // PPC64JITCore::ExitFunctionLink, reachable from the frontend's fault-page
