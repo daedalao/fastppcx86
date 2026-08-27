@@ -34,9 +34,16 @@ endif()
 if (ENABLE_CLANG_THUNKS)
   message(STATUS "Enabling thunk clang building. Force enabling LLD as well")
 
-  set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
-  set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")
-  set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
+  # Not the _INIT forms: the outer CMakeLists passes explicit-empty
+  # -DCMAKE_*_LINKER_FLAGS= to isolate the guest from host makepkg flags,
+  # and an explicitly set cache variable makes _INIT a no-op -- so a FRESH
+  # Guest configure fell back to the host BFD ld ("unrecognised emulation
+  # mode: elf_i386") while every existing build dir kept working off its
+  # old cache.  Plain set() shadows the cache for this configure, the same
+  # mechanism CMAKE_C_FLAGS below already relies on.
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+  set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -fuse-ld=lld")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=lld")
   set(CMAKE_C_COMPILER clang)
   set(CMAKE_CXX_COMPILER clang++)
   set(CLANG_FLAGS "-target x86_64-linux-gnu")
