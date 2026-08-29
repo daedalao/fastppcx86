@@ -40,6 +40,7 @@ $end_info$
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <setjmp.h>
 #include <signal.h>
@@ -47,6 +48,7 @@ $end_info$
 #include <cinttypes>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <vector>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -104,6 +106,37 @@ bool Initialized {};
 bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
 
 thread_local BridgeThread* TLSThread {};
+
+// EVERY live BridgeThread, because invalidating code is a PROCESS-wide act.
+//
+// FEXCore keeps two tiers of translated-code bookkeeping: the shared
+// BlockList, and a per-thread L1/L2 dispatch cache that the JIT consults on
+// every indirect branch.  InvalidateCodeBuffersCodeRange() clears only the
+// first.  FEX's own frontend has always cleared both -- see
+// ThreadManager::InvalidateGuestCodeRange, which calls
+// InvalidateCodeBuffersCodeRange and then loops its thread list calling
+// InvalidateThreadCachedCodeRange.  The bridge never had a thread list, so it
+// could only ever do the first half, and a thread that had already executed
+// code at a since-reused address kept dispatching to the stale translation.
+//
+// [MEASURED 2026-08-29] that is a real, title-killing bug and not a
+// theoretical one.  On the i386 lane, msacm32's DllMain loads, exercises and
+// frees the ACM codecs in turn; msadp32.acm and msg711.acm have IDENTICAL
+// SizeOfImage (0x14000), so msg711 maps into msadp32's just-freed hole at the
+// same guest base.  wine's map-notify reaches us and the shared BlockList is
+// cleared, but the calling thread's L2 still maps those RIPs to msadp32's
+// translations -- and because the codecs are near-clones with DriverProc at
+// the same RVA, DRV_LOAD/ENABLE/OPEN all "succeed" against the WRONG module's
+// code.  The first divergent message then reads module-relative data in
+// msg711's different layout and jumps into it: the observed fault was at
+// 0x6C75646F, which is a dword of the string "GetModuleHandleW" sitting in
+// the new image where the old image had an IAT slot.
+//
+// This is NOT specific to msacm32, or to the 32-bit lane.  Any guest that
+// unloads and reloads DLLs over reused addresses is exposed, on either lane;
+// AMD64 has simply been masked by workload.
+std::mutex BridgeThreadsMutex;
+std::vector<BridgeThread*> BridgeThreads;
 
 constexpr size_t CALLRET_ALLOC = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
 
@@ -863,6 +896,10 @@ int fexbridge_thread_init(void** thread_out) {
   // other writer, is deliberately not linked).
   Thread->FrontendPtr = BT;
   TLSThread = BT;
+  {
+    std::lock_guard Lk {BridgeThreadsMutex};
+    BridgeThreads.push_back(BT);
+  }
   *thread_out = BT;
   return 0;
 }
@@ -874,6 +911,12 @@ void fexbridge_thread_term(void* thread) {
   }
   if (TLSThread == BT) {
     TLSThread = nullptr;
+  }
+  {
+    // Before DestroyThread, so an invalidation racing this teardown can never
+    // reach a thread whose InternalThreadState is being freed.
+    std::lock_guard Lk {BridgeThreadsMutex};
+    BridgeThreads.erase(std::remove(BridgeThreads.begin(), BridgeThreads.end(), BT), BridgeThreads.end());
   }
   CTX->DestroyThread(BT->Thread);
   ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
@@ -1084,6 +1127,13 @@ void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
   // by (previously side-effecting) assertions. Part of the CPU-DLL contract.
   std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
   CTX->InvalidateCodeBuffersCodeRange(start, length);
+  // ...and the per-thread dispatch caches, which the shared BlockList erase
+  // above does not touch.  See the BridgeThreads banner for why omitting this
+  // half let a guest keep executing a freed module's translations.
+  std::lock_guard TLk {BridgeThreadsMutex};
+  for (auto* BT : BridgeThreads) {
+    CTX->InvalidateThreadCachedCodeRange(BT->Thread, start, length);
+  }
 }
 
 uint32_t fexbridge_hwtso_prot(void) {
