@@ -181,6 +181,21 @@ public:
   FEX_DEFAULT_VISIBILITY virtual void ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThreadState* Thread) = 0;
 
   /**
+   * @brief FEX_SMCLAZYCROSSPOKE: record a pending lazy-SMC drain debt on a
+   * thread that is NOT the caller, without touching its lookup caches.
+   *
+   * The caller pairs this with an mprotect(PROT_NONE) of that thread's
+   * InterruptFaultPage: the flag is what SettleLazySMCDrainIfPending consumes
+   * once the fault-page poke at the thread's next block entry traps. Set the
+   * flag BEFORE the mprotect so a thread that races the mprotect still owes
+   * (and settles) the debt at its next ExitFunctionLink/CompileBlock.
+   *
+   * A single relaxed store; safe from a signal handler and safe to run against
+   * a thread executing concurrently.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void ArmLazySMCDrainPending(FEXCore::Core::InternalThreadState* Thread) = 0;
+
+  /**
    * @brief FEX_SMCLAZYLINK: consume this thread's pending lazy-SMC drain debt,
    * if any, and run the drain. Called from the frontend's InterruptFaultPage
    * SIGSEGV branch — with block linking live under lazy invalidation, the

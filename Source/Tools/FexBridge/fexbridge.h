@@ -93,8 +93,23 @@ extern "C" {
            FEXCore bakes IS64BIT_MODE into the Context at creation (decode
            tables, VirtualMemSize), and the embedder this exists for never
            mixes modes -- a WoW64 process's 64-bit side is native host code,
-           not emulated.  fexbridge_run_entry() refuses in 32-bit mode.     */
-#define FEXBRIDGE_ABI_VERSION 4u
+           not emulated.  fexbridge_run_entry() refuses in 32-bit mode.
+   4 -> 5: lazy trap contexts.  fexbridge_declare_trap_ctx() lets the embedder
+           declare that its trap callback will call fexbridge_ctx_materialize()
+           before READING OR WRITING EFlags and/or the floating-point group
+           (FltSave, both MxCsr homes) of a trap CONTEXT.  The trap path then
+           skips the EFLAGS reconstruction and the XMM/x87 store on every
+           crossing, marking the skipped groups with FEXBRIDGE_CTX_LAZY_* in
+           ContextFlags, and the resume skips their write-back when they were
+           never materialized (writes to an unmaterialized group are IGNORED
+           at resume -- materialize first, then write).  An embedder that
+           never declares keeps the fully eager contexts, so ABI 4 callers are
+           unaffected.  FEXBRIDGE_EAGER_CTX=1 in the environment forces eager
+           regardless of declaration (the kill switch); FEXBRIDGE_CTX_POISON=1
+           fills the skipped groups with a recognizable pattern (EFlags
+           0xDEADF1A6, FltSave 0xDD bytes) so a reader that forgot to
+           materialize fails loudly -- the embedder's negative control.      */
+#define FEXBRIDGE_ABI_VERSION 5u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
@@ -172,6 +187,17 @@ FEXBRIDGE_SASSERT(offsetof(FEXBRIDGE_AMD64_CONTEXT, FltSave) == 0x100, fexbridge
 #define FEXBRIDGE_CTX_FLOATING_POINT (FEXBRIDGE_CTX_AMD64 | 0x8u) /* XMM0-15, x87, MXCSR */
 #define FEXBRIDGE_CTX_FULL (FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER | FEXBRIDGE_CTX_FLOATING_POINT)
 
+/* Lazy-trap markers (ABI 5).  Set by the bridge in a trap CONTEXT's
+   ContextFlags when the embedder declared the group lazy: the group's bytes
+   are NOT filled (or are poison under FEXBRIDGE_CTX_POISON=1) and its
+   CONTEXT_* bit describes only the resume contract, not the content.
+   fexbridge_ctx_materialize() fills the group and clears the marker.  The
+   values sit outside every winnt.h AMD64 ContextFlags bit (those stop at
+   CONTEXT_KERNEL_CET, 0x80) so a CONTEXT that leaves the trap path by being
+   copied somewhere neutral carries them harmlessly.                        */
+#define FEXBRIDGE_CTX_LAZY_EFLAGS (FEXBRIDGE_CTX_AMD64 | 0x100u)
+#define FEXBRIDGE_CTX_LAZY_FLOAT  (FEXBRIDGE_CTX_AMD64 | 0x200u)
+
 /* ------------------------------------------------------------------------ */
 
 /* Compile-time vs runtime ABI check. */
@@ -209,6 +235,37 @@ int fexbridge_process_init32(uint64_t exit_page);
    Rip still at the trapping instruction.                                   */
 typedef int (*fexbridge_trap_fn)(void* thread, void* ctx, void* user);
 void fexbridge_set_trap_handler(fexbridge_trap_fn cb, void* user);
+
+/* ---- lazy trap contexts (ABI 5) ---------------------------------------- */
+/* Declare which trap-CONTEXT groups the embedder will materialize on demand
+   instead of receiving eagerly on every crossing.  lazy_mask is a bitwise OR
+   of FEXBRIDGE_CTX_LAZY_EFLAGS and FEXBRIDGE_CTX_LAZY_FLOAT (the AMD64 tag
+   bit is tolerated and ignored).  Returns the mask actually in effect: 0
+   when FEXBRIDGE_EAGER_CTX=1 vetoed it, and the environment's
+   FEXBRIDGE_CTX_POISON is (re)sampled on every call.  Call it next to
+   fexbridge_set_trap_handler, before the first run; it applies process-wide
+   to every subsequent trap.
+
+   THE CONTRACT the declaration buys into: for a declared group, the trap
+   callback must call fexbridge_ctx_materialize() before it reads OR writes
+   any field of that group.  Reads without it see unfilled bytes (poison
+   under the lever); writes without it are ignored at resume.  The bridge
+   parks its own resume bookkeeping in the CONTEXT's P2Home; a callback must
+   leave P1Home..P6Home alone (winnt marks them spare, and nothing else on
+   this path uses them).                                                    */
+uint32_t fexbridge_declare_trap_ctx(uint32_t lazy_mask);
+
+/* Fill the requested groups of a LAZY trap CONTEXT from the live guest state
+   and clear their FEXBRIDGE_CTX_LAZY_* markers.  `thread` and `ctx` are the
+   trap callback's own arguments -- this is only meaningful between trap
+   entry and the callback's return, on the callback's own thread.  `flags`
+   names the groups with the ordinary bits: FEXBRIDGE_CTX_CONTROL requests
+   EFlags (the rest of the control group is always eager),
+   FEXBRIDGE_CTX_FLOATING_POINT requests FltSave/MxCsr.  Idempotent: a group
+   already materialized (or never lazy) is left exactly as is, so a callback
+   may call it unconditionally on any path that touches the group.  Returns
+   0, negative on a NULL argument.                                          */
+int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags);
 
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides

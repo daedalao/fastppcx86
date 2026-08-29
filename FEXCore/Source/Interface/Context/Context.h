@@ -305,6 +305,8 @@ public:
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   // FEX_SMCLAZYSCRUB; see the declaration in FEXCore/Core/Context.h.
   void ScrubThreadLookupCacheForLazySMC(FEXCore::Core::InternalThreadState* Thread) override;
+  // FEX_SMCLAZYCROSSPOKE; see the declaration in FEXCore/Core/Context.h.
+  void ArmLazySMCDrainPending(FEXCore::Core::InternalThreadState* Thread) override;
   void SettleLazySMCDrainIfPending(FEXCore::Core::InternalThreadState* Thread) override;
 
   // SMC v3: attempts to revalidate and re-publish a soft-invalidated block for

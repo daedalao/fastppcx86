@@ -1067,6 +1067,16 @@ public:
     }
   }
 
+  // FEX_SMCLAZYCROSSPOKE: record a drain debt WITHOUT scrubbing the L1.  Used
+  // by the SMC fault handler to arm every *other* thread, whose stale L1/L2
+  // entries are cleaned by the drain itself (DrainLazySMCInvalidations ->
+  // SoftInvalidateGuestCodeRange invalidates every thread's cached code range),
+  // so no cross-thread cache write is needed or wanted from here.  A single
+  // relaxed store, so it is safe against a concurrently running owner thread.
+  void ArmLazySMCDrainPending() {
+    LazySMCDrainPending.store(true, std::memory_order_relaxed);
+  }
+
   // Consume this thread's lazy-drain debt.  Cleared BEFORE the drain runs so
   // that a fault re-arming it while the drain is in flight is not lost.
   bool TakeLazySMCDrainPending() {

@@ -83,11 +83,13 @@
 //     *already running*.  A lazy scheme therefore only exposes blocks whose
 //     translation is currently on-stack or hot-looping at the moment of the
 //     write, plus L1 hits taken before the next drain.
-//   - Cross-thread SMC is unaffected in contract terms: x86 requires the
-//     executing processor to serialize (a branch is not enough) before running
-//     cross-modified code, and every mechanism a guest uses to do that --
-//     syscall, signal, or dispatching code it has not run before -- is a drain
-//     point here.
+//   - Cross-thread SMC was ORIGINALLY argued to be unaffected in contract
+//     terms: x86 requires the executing processor to serialize (a branch is not
+//     enough) before running cross-modified code, and every mechanism a guest
+//     uses to do that -- syscall, signal, or dispatching code it has not run
+//     before -- was said to be a drain point here.
+//
+//     *** THAT ARGUMENT IS WRONG IN PRACTICE.  See "CROSS-THREAD SMC" below. ***
 //   - Same-thread SMC is where we knowingly stretch the contract.  x86 says a
 //     same-thread patch is visible at the next branch; we say it is visible at
 //     the next drain point.  Patch -> call is safe whenever the call misses L1
@@ -237,6 +239,88 @@
 // only, on top of a fault path that already costs microseconds.
 // ===========================================================================
 //
+// ===========================================================================
+// CROSS-THREAD SMC   (FEX_SMCLAZYCROSSPOKE=1, OPT-IN -- see the field result)
+// --------------------------------------------------------------------
+// The original design (see "What bounds the exposure" above) claimed lazy
+// invalidation changed nothing for cross-thread SMC, because x86 makes a reader
+// responsible for executing a serializing event before it may run
+// cross-modified code, and every such event was assumed to be a FEX drain
+// point.  Field-confirmed 2026-08-25: that is false, and it crashes real
+// guests.
+//
+//   - The serialization real guest JITs use is NOT a syscall.  HotSpot patches
+//     nmethods at a safepoint and brings threads to it with thread-local
+//     handshakes and polling loads.  A compute-bound Java thread reaches the
+//     poll, spins, and resumes entirely inside code FEX has ALREADY compiled:
+//     no syscall, no guest signal, no CompileBlock.  It therefore hits none of
+//     drain points (a)-(c) and never drains -- indefinitely.
+//   - And the stale window is not benign.  HotSpot frees and REUSES code-cache
+//     memory, so a translation that starts out as "the previous version of this
+//     method" degrades into a translation of unrelated bytes.  Observed:
+//     truncated pointers, bogus klass loads, random SIGSEGVs, within ~1-2
+//     minutes of `java -XX:+UseZGC` doing ordinary JIT churn (Project Zomboid,
+//     and a minimal Churn repro).  FEX_SMCCHECKS=mtrack FEX_SMCSOFTINVALIDATE=1
+//     FEX_SMCLAZYINVAL=1 alone reproduces it; LAZYLINK/FILEIMMUTABLE are not
+//     needed.
+//
+// The fix reuses the LAZYLINK trap side, applied to every thread instead of
+// just the writer.  On a lazy fault that opens a dirty epoch, the handler walks
+// ThreadManager::Threads and, for each thread other than itself:
+//
+//   1. sets that thread's lazy-drain-pending flag
+//      (Context::ArmLazySMCDrainPending -> LookupCache::ArmLazySMCDrainPending),
+//      THEN
+//   2. mprotects that thread's InterruptFaultPage to PROT_NONE.
+//
+// Order is load-bearing: a thread that races the mprotect (its poke landed just
+// before the page went away) still holds the flag and settles the debt at its
+// next ExitFunctionLink or CompileBlock.  No cross-thread cache is written --
+// the drain itself soft-invalidates across every thread -- so this is two
+// relaxed stores' worth of interference plus one mprotect per thread.
+//
+// GUARANTEE (narrower than first hoped -- read the field results below):
+// after a lazy SMC fault, EVERY thread's drain-pending flag is set and its
+// fault page armed, so each thread settles the drain at its next block entry.
+// Not at its next syscall, signal, or compile -- its next block entry.  This
+// holds with BlockLinking on or off, because the fault-page poke is emitted
+// unconditionally at every dispatcher-reachable EntryPoint and linked branches
+// target entries.  The delegator's fault-page branch settles the drain for the
+// whole lazy mode now, not only under FEX_SMCLAZYLINK, since the thread that
+// traps may be an innocent reader.
+//
+// *** FIELD RESULT 2026-08-25: NOT SUFFICIENT FOR HOTSPOT. ***  On the Churn
+// JVM harness the cross-poke arm still failed 3/6 (vs 2/6 without it, 6/6 for
+// lazy off) with the same stale-translation crash signatures.  Known residual
+// exposures, either of which could account for that:
+//   - A multiblock translation's internal loops never cross a block ENTRY, so
+//     a thread hot-looping inside one is never poked at all.
+//   - A poke-settled thread resumes INTO the body of the (now soft-invalidated)
+//     block it was entering, executing it stale once; if that block is the one
+//     that was patched, once is enough.
+//   - The block a thread is *inside* at fault time runs to its next entry (the
+//     same-thread scrub's long-standing carve-out).
+// Until these are closed, FEX_SMCLAZYINVAL remains UNSOUND for guests that
+// patch code cross-thread and reuse code memory (HotSpot, and by extension any
+// tiering JIT).  Run those with FEX_SMCLAZYINVAL=0.  Cross-poke therefore
+// defaults OFF (opt-in FEX_SMCLAZYCROSSPOKE=1) until it demonstrably closes
+// the hole and its per-epoch cost is measured on a CP2077-class title.
+//
+// Threads created during an epoch need no arming: a new thread cannot execute
+// anything before reaching CompileBlock, which is drain point (a).
+//
+// Locking: the walk takes ThreadCreationMutex with try_lock
+// (ThreadManager::TryForEachThread) because it runs in the SIGSEGV handler and
+// must not block.  On failure the fault falls back to a full synchronous drain
+// (DrainPoint::CrossPokeFallback) rather than deferring un-armed -- strictly
+// stronger, never unsound, just not lazy.
+//
+// Cost: paid once per dirty EPOCH (the 0 -> non-empty transition of the dirty
+// set), not once per store, so a store burst into an already-dirty page pays
+// nothing.  Kill switch FEX_SMCLAZYCROSSPOKE=0 restores the old writer-only
+// behaviour for A/B; expect guest JITs to crash in that configuration.
+// ===========================================================================
+//
 // Cost model: the scrub is paid once per fault, on the writer, and it is a
 // single syscall.  The drain is paid at the writer's next dispatch, and only
 // then.  A writer that stores into a page and never re-dispatches (smcstorm's
@@ -257,6 +341,10 @@ enum class DrainPoint {
   Syscall,
   GuestSignal,
   MprotectExec,
+  // FEX_SMCLAZYCROSSPOKE could not take ThreadCreationMutex without blocking
+  // inside the SIGSEGV handler, so the fault paid for a full synchronous drain
+  // instead of deferring. Always sound, just not lazy.
+  CrossPokeFallback,
 };
 
 inline const char* DrainPointName(DrainPoint Point) {
@@ -265,6 +353,7 @@ inline const char* DrainPointName(DrainPoint Point) {
   case DrainPoint::Syscall: return "syscall";
   case DrainPoint::GuestSignal: return "gsignal";
   case DrainPoint::MprotectExec: return "mprotect-exec";
+  case DrainPoint::CrossPokeFallback: return "crosspoke-fallback";
   }
   return "unknown";
 }

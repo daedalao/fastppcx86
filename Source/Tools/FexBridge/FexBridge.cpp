@@ -92,6 +92,13 @@ struct BridgeThread {
 FEXCore::Context::Context* CTX {};
 std::atomic<fexbridge_trap_fn> TrapCb {nullptr};
 std::atomic<void*> TrapUser {nullptr};
+// Lazy trap contexts (ABI 5): the sub-bits (0x100/0x200) of the LAZY markers,
+// without the AMD64 tag.  Written by fexbridge_declare_trap_ctx before the
+// first run (the same publication contract as the trap handler itself), read
+// once per trap.  Poison is the declaration-time sample of
+// FEXBRIDGE_CTX_POISON -- a gate lever, never a production state.
+std::atomic<uint32_t> TrapCtxLazyMask {0};
+bool TrapCtxPoison {false};
 uint64_t HltPageAddr {}; // one guest-visible HLT, used to end a run cooperatively
 bool Initialized {};
 bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
@@ -221,7 +228,53 @@ void ProbeAndEnable() {
 // YMM is carried through the internal trap round-trip so the flat CONTEXT
 // (which has no YMM home) does not truncate AVX state across a trap.
 // ---------------------------------------------------------------------------
-void StoreStateToContext(FEXCore::Core::InternalThreadState* Thread, FEXBRIDGE_AMD64_CONTEXT* Context, __uint128_t* YMMOut) {
+// The FLOATING_POINT half of StoreStateToContext, standalone so the lazy trap
+// path (fexbridge_ctx_materialize) can produce exactly the bytes the eager
+// path would have.
+void StoreFPToContext(FEXCore::Core::InternalThreadState* Thread, FEXBRIDGE_AMD64_CONTEXT* Context) {
+  const auto& State = Thread->CurrentFrame->State;
+
+  // Never read State.xmm directly: physical layout is split-vs-converged
+  // by host feature; on ppc64le the split layout is live.
+  // With no YMMOut the high lanes were always gathered into a local and
+  // discarded; passing nullptr instead takes ReconstructXMMRegisters'
+  // SSE-only path (one 256-byte copy, no avx_high gather) with identical
+  // results for everything this function writes.
+  __uint128_t XMM[16];
+  CTX->ReconstructXMMRegisters(Thread, XMM, nullptr);
+  memcpy(Context->FltSave.XmmRegisters, XMM, sizeof(XMM));
+
+  Context->MxCsr = State.mxcsr;
+  Context->FltSave.MxCsr = State.mxcsr;
+  Context->FltSave.ControlWord = State.FCW;
+  Context->FltSave.TagWord = State.AbridgedFTW;
+
+  // x87 mm[] is stored rotated by TOP; the CONTEXT holds architectural
+  // ST(0)..ST(7).
+  const uint32_t Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+  for (size_t i = 0; i < 8; ++i) {
+    const size_t Phys = (Top + i) % 8;
+    memcpy(&Context->FltSave.FloatRegisters[i], &State.mm[Phys][0], 16);
+  }
+  uint16_t FSW = 0;
+  FSW |= (State.flags[FEXCore::X86State::X87FLAG_C0_LOC] != 0) << 8;
+  FSW |= (State.flags[FEXCore::X86State::X87FLAG_C1_LOC] != 0) << 9;
+  FSW |= (State.flags[FEXCore::X86State::X87FLAG_C2_LOC] != 0) << 10;
+  FSW |= (Top & 0b111) << 11;
+  FSW |= (State.flags[FEXCore::X86State::X87FLAG_C3_LOC] != 0) << 14;
+  Context->FltSave.StatusWord = FSW;
+
+  // No FEX source for these; synthesise zero like a CPU DLL must.
+  Context->FltSave.ErrorOffset = Context->FltSave.DataOffset = 0;
+  Context->FltSave.ErrorOpcode = 0;
+}
+
+// LazySkip carries the declared lazy sub-bits (0x100 EFLAGS, 0x200 FP) on the
+// trap path only; every other caller passes 0 and gets the eager store.
+// (The old YMMOut side-channel is gone for good: every caller passed nullptr
+// since the changed-only resume landed, so the SSE-only reconstruction in
+// StoreFPToContext is the one FP store there is.)
+void StoreStateToContext(FEXCore::Core::InternalThreadState* Thread, FEXBRIDGE_AMD64_CONTEXT* Context, uint32_t LazySkip = 0) {
   const auto& State = Thread->CurrentFrame->State;
   const uint32_t Flags = Context->ContextFlags;
 
@@ -232,7 +285,9 @@ void StoreStateToContext(FEXCore::Core::InternalThreadState* Thread, FEXBRIDGE_A
     Context->SegSs = State.ss_idx;
     // State is spilled into the frame on every path this is called from
     // (syscall trap and HLT both spill; the fault path spills SRA first).
-    Context->EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+    if (!(LazySkip & 0x100u)) {
+      Context->EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+    }
   }
 
   if (Flags & FEXBRIDGE_CTX_INTEGER & ~FEXBRIDGE_CTX_AMD64) {
@@ -260,41 +315,44 @@ void StoreStateToContext(FEXCore::Core::InternalThreadState* Thread, FEXBRIDGE_A
     Context->SegGs = State.gs_idx;
   }
 
-  if (Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) {
-    // Never read State.xmm directly: physical layout is split-vs-converged
-    // by host feature; on ppc64le the split layout is live.
-    __uint128_t XMM[16];
-    __uint128_t YMMLocal[16];
-    __uint128_t* YMM = YMMOut ? YMMOut : YMMLocal;
-    CTX->ReconstructXMMRegisters(Thread, XMM, YMM);
-    memcpy(Context->FltSave.XmmRegisters, XMM, sizeof(XMM));
-
-    Context->MxCsr = State.mxcsr;
-    Context->FltSave.MxCsr = State.mxcsr;
-    Context->FltSave.ControlWord = State.FCW;
-    Context->FltSave.TagWord = State.AbridgedFTW;
-
-    // x87 mm[] is stored rotated by TOP; the CONTEXT holds architectural
-    // ST(0)..ST(7).
-    const uint32_t Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
-    for (size_t i = 0; i < 8; ++i) {
-      const size_t Phys = (Top + i) % 8;
-      memcpy(&Context->FltSave.FloatRegisters[i], &State.mm[Phys][0], 16);
-    }
-    uint16_t FSW = 0;
-    FSW |= (State.flags[FEXCore::X86State::X87FLAG_C0_LOC] != 0) << 8;
-    FSW |= (State.flags[FEXCore::X86State::X87FLAG_C1_LOC] != 0) << 9;
-    FSW |= (State.flags[FEXCore::X86State::X87FLAG_C2_LOC] != 0) << 10;
-    FSW |= (Top & 0b111) << 11;
-    FSW |= (State.flags[FEXCore::X86State::X87FLAG_C3_LOC] != 0) << 14;
-    Context->FltSave.StatusWord = FSW;
-
-    // No FEX source for these; synthesise zero like a CPU DLL must.
-    Context->FltSave.ErrorOffset = Context->FltSave.DataOffset = 0;
-    Context->FltSave.ErrorOpcode = 0;
+  if ((Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) && !(LazySkip & 0x200u)) {
+    StoreFPToContext(Thread, Context);
   }
 
   Context->Dr0 = Context->Dr1 = Context->Dr2 = Context->Dr3 = Context->Dr6 = Context->Dr7 = 0;
+}
+
+// The FLOATING_POINT half of LoadStateFromContext, shared with the trap
+// path's changed-only variant below.
+void LoadFPFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
+  auto& State = Thread->CurrentFrame->State;
+
+  __uint128_t XMM[16];
+  memcpy(XMM, Context->FltSave.XmmRegisters, sizeof(XMM));
+  if (YMMIn) {
+    CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn);
+  } else {
+    // Zeroed only where actually consumed: when this ran unconditionally on
+    // the (since removed) per-hop trap load it was 0.35% of the GameThread.
+    __uint128_t YMMZero[16] {};
+    CTX->SetXMMRegistersFromState(Thread, XMM, YMMZero);
+  }
+
+  State.mxcsr = Context->FltSave.MxCsr;
+  State.FCW = Context->FltSave.ControlWord;
+  State.AbridgedFTW = Context->FltSave.TagWord;
+
+  const uint16_t FSW = Context->FltSave.StatusWord;
+  const uint32_t Top = (FSW >> 11) & 0b111;
+  State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = Top;
+  State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (FSW >> 8) & 1;
+  State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (FSW >> 9) & 1;
+  State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (FSW >> 10) & 1;
+  State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (FSW >> 14) & 1;
+  for (size_t i = 0; i < 8; ++i) {
+    const size_t Phys = (Top + i) % 8;
+    memcpy(&State.mm[Phys][0], &Context->FltSave.FloatRegisters[i], 16);
+  }
 }
 
 void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
@@ -329,11 +387,102 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
   // emulated GDT (flat 64-bit CS), matching the probe and the WOW64 module.
 
   if (Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) {
-    __uint128_t XMM[16];
-    __uint128_t YMMZero[16] {};
-    memcpy(XMM, Context->FltSave.XmmRegisters, sizeof(XMM));
-    CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn ? YMMIn : YMMZero);
+    LoadFPFromContext(Thread, Context, YMMIn);
+  }
+}
 
+// Trap-path variant of LoadStateFromContext: identical semantics, but the
+// expensive sections are applied only where the callback actually CHANGED
+// what StoreStateToContext wrote there moments earlier.
+//
+// Nothing here is lazy in the dangerous sense.  CPUState stays fully
+// materialized for the whole trap round-trip -- StoreStateToContext read it
+// without consuming it -- so a signal delivered inside the callback, a
+// debugger attach, or a nested get_context all observe complete, correct
+// flags and XMM state.  What is skipped is only the write-BACK of bytes
+// proven identical, and the proof is a direct compare against the live
+// CPUState (no snapshot: a first cut kept a 512-byte FltSave copy and
+// memcmp'd it wholesale, and the copy+compare traffic gave back most of the
+// win -- [MEASURED] HandleSyscall self 1.53% -> 4.30% plus memcmp 1.66%):
+//   - EFLAGS: Set(Reconstruct(state)) reproduces the same architectural
+//     flags; if the callback left ctx->EFlags at the reconstructed word,
+//     skipping Set leaves CPUState's raw pf/af/nzcv forms in place, which
+//     Reconstruct maps to that same word.  (Equality of the word is the
+//     invariant; the raw forms are strictly finer-grained state.)
+//   - XMM low lanes: StoreStateToContext wrote ctx XmmRegisters[i] FROM
+//     State.xmm.sse.data[i] (ppc64le is never SVE256-converged -- same
+//     precedent as SpillSRAFromHostContext), so ctx==state means nothing to
+//     write; per-register compare, store only the changed ones.  The YMM
+//     high lanes never left State at all on this path (the local YMM[]
+//     round-trip existed only to feed SetXMMRegistersFromState), so they
+//     need no touch: an untouched low lane keeps its high lane by identity.
+//   - x87/control words: same per-field compare against the live state,
+//     with the TOP rotation applied the same way Store applied it.
+// A callback that reaches around its own ctx with fexbridge_set_context is
+// off-contract (fexbridge.h: "Inside a trap callback, use the callback's ctx
+// instead") -- under this variant such writes now survive to the resume
+// instead of being clobbered by the ctx replay, which is the better reading
+// of that contract anyway.
+// EntryLazy is the lazy sub-bit mask the trap ENTRY applied (0 on the eager
+// path).  A group whose lazy marker is STILL SET in ContextFlags was never
+// materialized: CPUState kept the truth the whole time, so there is nothing
+// to load and nothing to compare -- the resume for that group is free.  A
+// group that WAS materialized compares against the value materialize parked
+// (EFLAGS in P2Home) or against the live state (FP), exactly as the eager
+// path compares against its own store.
+void LoadStateFromContextAfterTrap(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context,
+                                   uint32_t StoredEFlags, uint32_t EntryLazy) {
+  auto& State = Thread->CurrentFrame->State;
+  const uint32_t Flags = Context->ContextFlags;
+
+  if (Flags & FEXBRIDGE_CTX_CONTROL & ~FEXBRIDGE_CTX_AMD64) {
+    State.rip = Context->Rip;
+    State.gregs[FEXCore::X86State::REG_RSP] = Context->Rsp;
+    if (EntryLazy & 0x100u) {
+      if (!(Flags & 0x100u) && Context->EFlags != (uint32_t)Context->P2Home) {
+        CTX->SetFlagsFromCompactedEFLAGS(Thread, Context->EFlags);
+      }
+    } else if (Context->EFlags != StoredEFlags) {
+      CTX->SetFlagsFromCompactedEFLAGS(Thread, Context->EFlags);
+    }
+  }
+
+  if (Flags & FEXBRIDGE_CTX_INTEGER & ~FEXBRIDGE_CTX_AMD64) {
+    State.gregs[FEXCore::X86State::REG_RAX] = Context->Rax;
+    State.gregs[FEXCore::X86State::REG_RCX] = Context->Rcx;
+    State.gregs[FEXCore::X86State::REG_RDX] = Context->Rdx;
+    State.gregs[FEXCore::X86State::REG_RBX] = Context->Rbx;
+    State.gregs[FEXCore::X86State::REG_RBP] = Context->Rbp;
+    State.gregs[FEXCore::X86State::REG_RSI] = Context->Rsi;
+    State.gregs[FEXCore::X86State::REG_RDI] = Context->Rdi;
+    State.gregs[FEXCore::X86State::REG_R8] = Context->R8;
+    State.gregs[FEXCore::X86State::REG_R9] = Context->R9;
+    State.gregs[FEXCore::X86State::REG_R10] = Context->R10;
+    State.gregs[FEXCore::X86State::REG_R11] = Context->R11;
+    State.gregs[FEXCore::X86State::REG_R12] = Context->R12;
+    State.gregs[FEXCore::X86State::REG_R13] = Context->R13;
+    State.gregs[FEXCore::X86State::REG_R14] = Context->R14;
+    State.gregs[FEXCore::X86State::REG_R15] = Context->R15;
+  }
+
+  if (Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) {
+    if ((EntryLazy & 0x200u) && (Flags & 0x200u)) {
+      // Declared lazy and never materialized: the callback touched no FP
+      // field (writes without materialize are off-contract and ignored), so
+      // CPUState's FP file is still the guest's own.  Skip the whole block.
+      return;
+    }
+    // XMM low lanes, changed-only.  ppc64le always runs the split layout
+    // (SupportsSVE256 is an ARM notion), so sse.data[i] is exactly what
+    // StoreStateToContext handed the callback for register i.
+    for (size_t i = 0; i < 16; ++i) {
+      if (memcmp(&Context->FltSave.XmmRegisters[i], &State.xmm.sse.data[i][0], sizeof(__uint128_t)) != 0) {
+        memcpy(&State.xmm.sse.data[i][0], &Context->FltSave.XmmRegisters[i], sizeof(__uint128_t));
+      }
+    }
+
+    // Control/status words: cheap unconditional stores of the same values
+    // Store derived them from (or the callback's replacements).
     State.mxcsr = Context->FltSave.MxCsr;
     State.FCW = Context->FltSave.ControlWord;
     State.AbridgedFTW = Context->FltSave.TagWord;
@@ -345,9 +494,13 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
     State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (FSW >> 9) & 1;
     State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (FSW >> 10) & 1;
     State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (FSW >> 14) & 1;
+
+    // x87 stack, changed-only, same TOP rotation as the store side.
     for (size_t i = 0; i < 8; ++i) {
       const size_t Phys = (Top + i) % 8;
-      memcpy(&State.mm[Phys][0], &Context->FltSave.FloatRegisters[i], 16);
+      if (memcmp(&State.mm[Phys][0], &Context->FltSave.FloatRegisters[i], 16) != 0) {
+        memcpy(&State.mm[Phys][0], &Context->FltSave.FloatRegisters[i], 16);
+      }
     }
   }
 }
@@ -357,19 +510,52 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
 // caller wrote, and either resumes or steers the run to a cooperative HLT.
 // ---------------------------------------------------------------------------
 uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments*) {
-  BridgeThread* BT = TLSThread;
+  // FrontendPtr, not TLSThread: this is the hottest function in the bridge
+  // (once per guest->native crossing) and TLSThread is general-dynamic TLS in
+  // a dlopen()ed DSO — a __tls_get_addr call per hop.  fexbridge_thread_init
+  // parked the BridgeThread in the frame's own thread object, which the JIT
+  // hands over for free.
   auto* Thread = Frame->Thread;
+  BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
 
+  // No YMM side-channel any more: the changed-only load below never touches
+  // avx_high, so the high lanes simply stay live in CPUState across the trap
+  // -- the same values the old YMM[] round-trip wrote back verbatim.
+  //
+  // With a lazy declaration (ABI 5) the EFLAGS reconstruction and the whole
+  // FP store are skipped too: the CONTEXT carries the LAZY markers instead,
+  // and fexbridge_ctx_materialize() fills a group only on the hop that
+  // actually reads it.  CPUState stays the uninterrupted truth either way.
+  const uint32_t Lazy = TrapCtxLazyMask.load(std::memory_order_relaxed);
   alignas(16) FEXBRIDGE_AMD64_CONTEXT C {};
-  alignas(16) __uint128_t YMM[16];
-  C.ContextFlags = FEXBRIDGE_CTX_FULL | FEXBRIDGE_CTX_SEGMENTS;
-  StoreStateToContext(Thread, &C, YMM);
+  C.ContextFlags = FEXBRIDGE_CTX_FULL | FEXBRIDGE_CTX_SEGMENTS | (Lazy ? (FEXBRIDGE_CTX_AMD64 | Lazy) : 0);
+  StoreStateToContext(Thread, &C, Lazy);
+  if (Lazy && TrapCtxPoison) {
+    // The negative-control lever: unmaterialized bytes become a pattern no
+    // real flags word or XMM value resembles, so a consumer that reads
+    // without materializing fails a value check instead of working by luck.
+    if (Lazy & 0x100u) {
+      C.EFlags = 0xDEADF1A6u;
+    }
+    if (Lazy & 0x200u) {
+      memset(&C.FltSave, 0xDD, sizeof(C.FltSave));
+      C.MxCsr = 0xDEADF1A6u;
+    }
+  }
+
+  // The load below skips the EFLAGS decompose and stores only the FP bytes
+  // the callback changed -- which on the measured workload (Cyberpunk 2077
+  // GameThread: QPC, descriptor COM calls, critical sections) is nothing on
+  // nearly every hop.  Only the EFLAGS word needs remembering; FP equality
+  // is checked directly against the live CPUState.  (On a lazy hop the word
+  // is not there to remember; materialize parks its own in P2Home.)
+  const uint32_t StoredEFlags = C.EFlags;
 
   auto Cb = TrapCb.load(std::memory_order_acquire);
   int Result = FEXBRIDGE_TRAP_EXIT; // no handler: end the run, Rip at the trap
   if (Cb) {
     Result = Cb(BT, &C, TrapUser.load(std::memory_order_acquire));
-    LoadStateFromContext(Thread, &C, YMM);
+    LoadStateFromContextAfterTrap(Thread, &C, StoredEFlags, Lazy);
   }
 
   if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
@@ -546,6 +732,55 @@ void fexbridge_set_trap_handler(fexbridge_trap_fn cb, void* user) {
   TrapCb.store(cb, std::memory_order_release);
 }
 
+uint32_t fexbridge_declare_trap_ctx(uint32_t lazy_mask) {
+  // Accept the full FEXBRIDGE_CTX_LAZY_* macros or the bare sub-bits; only
+  // the sub-bits are stored.  Everything else in the word is ignored so a
+  // future embedder passing a future bit degrades to "not lazy" here rather
+  // than to undefined behaviour.
+  uint32_t Req = lazy_mask & 0x300u;
+  const char* Eager = getenv("FEXBRIDGE_EAGER_CTX");
+  if (Eager && Eager[0] == '1' && Req) {
+    fprintf(stderr, "fexbridge: FEXBRIDGE_EAGER_CTX=1: lazy trap contexts vetoed, staying eager\n");
+    Req = 0;
+  }
+  const char* Poison = getenv("FEXBRIDGE_CTX_POISON");
+  TrapCtxPoison = Poison && Poison[0] == '1';
+  TrapCtxLazyMask.store(Req, std::memory_order_relaxed);
+  if (Req) {
+    fprintf(stderr, "fexbridge: lazy trap contexts live:%s%s%s\n", (Req & 0x100u) ? " EFLAGS" : "",
+            (Req & 0x200u) ? " FP" : "", TrapCtxPoison ? " (POISON armed)" : "");
+  }
+  return Req;
+}
+
+int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags) {
+  auto* BT = static_cast<BridgeThread*>(thread);
+  auto* Ctx = static_cast<FEXBRIDGE_AMD64_CONTEXT*>(ctx);
+  if (!BT || !Ctx) {
+    return -1;
+  }
+  auto* Thread = BT->Thread;
+
+  if ((flags & FEXBRIDGE_CTX_CONTROL & ~FEXBRIDGE_CTX_AMD64) && (Ctx->ContextFlags & 0x100u)) {
+    // Same expression the eager store runs; the callback's CPUState is
+    // spilled for the whole trap window, and a nested run that scribbled on
+    // the raw flag forms restored them (fexbridge_run's Nested block), so
+    // this is exact at any point inside the callback.
+    const uint32_t EF = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+    Ctx->EFlags = EF;
+    // The resume's compare baseline.  P2Home is winnt spare space and the
+    // declaration contract reserves P1Home..P6Home for the bridge.
+    Ctx->P2Home = EF;
+    Ctx->ContextFlags &= ~0x100u;
+  }
+
+  if ((flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) && (Ctx->ContextFlags & 0x200u)) {
+    StoreFPToContext(Thread, Ctx);
+    Ctx->ContextFlags &= ~0x200u;
+  }
+  return 0;
+}
+
 int fexbridge_thread_init(void** thread_out) {
   if (!Initialized || !thread_out) {
     return -1;
@@ -622,6 +857,11 @@ int fexbridge_thread_init(void** thread_out) {
   auto* BT = new BridgeThread();
   BT->Thread = Thread;
   BT->CallRetAllocBase = AllocBase;
+  // The hot trap path (HandleSyscall) finds the BridgeThread through the
+  // frame instead of TLS; FrontendPtr is FEXCore's embedder-owned slot and
+  // nothing else in the bridge's link set touches it (LinuxEmulation, the
+  // other writer, is deliberately not linked).
+  Thread->FrontendPtr = BT;
   TLSThread = BT;
   *thread_out = BT;
   return 0;
@@ -646,6 +886,47 @@ int fexbridge_run(void* thread, void* ctx) {
     return FEXBRIDGE_RUN_ERROR; // must run on the owning host thread
   }
   auto* Ctx = static_cast<FEXBRIDGE_AMD64_CONTEXT*>(ctx);
+
+  // A NESTED run (guest callback dispatch from inside a trap callback) must
+  // not leak state the outer trap context cannot re-establish.  The outer
+  // resume path restores everything an AMD64 CONTEXT carries -- but a
+  // CONTEXT has no YMM-high home, and the outer trap's changed-only EFLAGS
+  // resume relies on the thread's RAW flag state (pf_raw/af_raw/nzcv forms)
+  // still being the state its stored EFlags word was reconstructed from.
+  // The old code preserved YMM-high by gathering it into a local before the
+  // callback and scattering it back after; this preserves both at the actual
+  // boundary that clobbers them, and only when one exists (callbacks are
+  // ~18/s on the measured workload, traps are millions/s).
+  auto& RunState = BT->Thread->CurrentFrame->State;
+  const bool Nested = BT->RunTop != nullptr;
+  uint8_t SavedAvxHigh[sizeof(RunState.avx_high)];
+  uint8_t SavedFlags[sizeof(RunState.flags)];
+  uint8_t SavedXmm[sizeof(RunState.xmm)];
+  uint8_t SavedMM[sizeof(RunState.mm)];
+  uint64_t SavedPFRaw {}, SavedAFRaw {};
+  uint32_t SavedMxcsr {};
+  uint16_t SavedFCW {};
+  uint8_t SavedFTW {};
+  if (Nested) {
+    memcpy(SavedAvxHigh, &RunState.avx_high, sizeof(SavedAvxHigh));
+    memcpy(SavedFlags, &RunState.flags, sizeof(SavedFlags));
+    SavedPFRaw = RunState.pf_raw;
+    SavedAFRaw = RunState.af_raw;
+    // The whole FP file too, not just the pieces a CONTEXT cannot carry.
+    // Under a lazy trap declaration (ABI 5) the outer trap's CONTEXT may
+    // carry NO FP snapshot at all -- CPUState is the only copy of the outer
+    // guest's XMM/x87 state -- and the nested guest is free to clobber it.
+    // The eager path survived on the resume's ctx-vs-state compare putting
+    // the outer values back; this makes the invariant unconditional, at a
+    // cost paid per nested run (~18/s measured) rather than per trap
+    // (millions/s), which is the whole trade the lazy path lives on.
+    memcpy(SavedXmm, &RunState.xmm, sizeof(SavedXmm));
+    memcpy(SavedMM, &RunState.mm, sizeof(SavedMM));
+    SavedMxcsr = RunState.mxcsr;
+    SavedFCW = RunState.FCW;
+    SavedFTW = RunState.AbridgedFTW;
+  }
+
   if (Ctx) {
     LoadStateFromContext(BT->Thread, Ctx, nullptr);
   }
@@ -694,7 +975,23 @@ int fexbridge_run(void* thread, void* ctx) {
 
   if (Ctx) {
     Ctx->ContextFlags = FEXBRIDGE_CTX_FULL | FEXBRIDGE_CTX_SEGMENTS;
-    StoreStateToContext(BT->Thread, Ctx, nullptr);
+    StoreStateToContext(BT->Thread, Ctx);
+  }
+
+  // After the nested run's own exit state was stored to its ctx: put the
+  // outer thread's YMM-high and raw flag state back, so the outer trap's
+  // resume (which restores everything else from its own CONTEXT) finds them
+  // exactly as its stored EFlags word and untouched high lanes assume.
+  if (Nested) {
+    memcpy(&RunState.avx_high, SavedAvxHigh, sizeof(SavedAvxHigh));
+    memcpy(&RunState.flags, SavedFlags, sizeof(SavedFlags));
+    RunState.pf_raw = SavedPFRaw;
+    RunState.af_raw = SavedAFRaw;
+    memcpy(&RunState.xmm, SavedXmm, sizeof(SavedXmm));
+    memcpy(&RunState.mm, SavedMM, sizeof(SavedMM));
+    RunState.mxcsr = SavedMxcsr;
+    RunState.FCW = SavedFCW;
+    RunState.AbridgedFTW = SavedFTW;
   }
   return Reason;
 }
@@ -704,7 +1001,7 @@ int fexbridge_get_context(void* thread, void* ctx) {
   if (!BT || !ctx) {
     return -1;
   }
-  StoreStateToContext(BT->Thread, static_cast<FEXBRIDGE_AMD64_CONTEXT*>(ctx), nullptr);
+  StoreStateToContext(BT->Thread, static_cast<FEXBRIDGE_AMD64_CONTEXT*>(ctx));
   return 0;
 }
 
