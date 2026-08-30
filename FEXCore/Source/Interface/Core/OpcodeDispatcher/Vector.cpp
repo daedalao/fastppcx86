@@ -2218,6 +2218,25 @@ Ref OpDispatchBuilder::CVTFPR_To_GPRImpl(OpcodeArgs, Ref Src, IR::OpSize SrcElem
   // Source Element size is determined by instruction
   const auto GPRSize = OpSizeFromDst(Op);
 
+#ifdef ARCHITECTURE_ppc64le
+  // The backend's Float_ToGPR_ZS/Float_ToGPR_S ops (ALUOps.cpp) already
+  // reproduce x86's integer-indefinite sentinel (0x80000000 /
+  // 0x8000000000000000 on NaN or out-of-range input) internally, via their
+  // own xscmpudp-gated fixup -- they do not rely on POWER's saturating
+  // convert instructions alone. The SupportsFRINTTS/else split below (and
+  // its MaxF/MaxI/_Select wrapper) exists to patch that same semantic gap
+  // for a backend whose native convert does NOT produce the x86 sentinel;
+  // ppc64le's HostFeatures.SupportsFRINTTS is unconditionally false (it is
+  // an ARM ISAR1 feature bit, never set outside the arm64 detection path),
+  // so this backend always fell through to the ARM-shaped !SupportsFRINTTS
+  // fallback and paid for a fixup it does not need -- 14 dead instructions
+  // (LoadAndCacheNamedVectorConstant + FGT compare + Select) wrapped around
+  // an already-exact 12-instruction op. Go straight to the backend op.
+  // Case-by-case exactness proof and differential test:
+  // docs/sessions/2026-08-29/scalar-lowering-fixes.md §2. 26 -> 12 insns/site.
+  return HostRoundingMode ? _Float_ToGPR_S(GPRSize, SrcElementSize, Src) : _Float_ToGPR_ZS(GPRSize, SrcElementSize, Src);
+#endif
+
   if (CTX->HostFeatures.SupportsFRINTTS) {
     // When we have FRINTTS, this is a two-step process. First, we round to the
     // right integer (where _Vector_FToISized matches x86 semantics), then just
