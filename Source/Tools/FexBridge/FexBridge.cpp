@@ -46,6 +46,8 @@ $end_info$
 #include <signal.h>
 #include <cerrno>
 #include <cinttypes>
+#include <sys/syscall.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <vector>
@@ -76,6 +78,142 @@ void AssertHandler(const char* Message) {
 }
 
 // ---------------------------------------------------------------------------
+// FEXBRIDGE_SPINSENTINEL (default ON, report-only): generic guest-spin
+// detection at the crossing layer.
+//
+// The JIT-side spin machinery (FEX_SPINCOLLAPSE, FEX_SPINLOOPCLAMP*, the SMT
+// priority hints) is COMPILE-TIME: it matches side-effect-free loop shapes
+// inside one translation region, and a region containing a syscall/trap is
+// disqualified by construction.  The spins that machinery can never see are
+// exactly the ones this port keeps capturing at macro level:
+//   - trap storms: one guest site re-trapping at storm rate (the measured
+//     PeekMessageW storm: 247k traps/s, ~12ms of a 34.7ms frame floor), and
+//   - crossing recursion: a periodic guest<->native call cycle deepening
+//     until the 1MB kernel stack dies (the captured 224-deep Quake II /
+//     DOOM __CxxFrameHandler3 shape).
+// Both pass through exactly one choke point each in this file
+// (HandleSyscall per trap, fexbridge_run per reverse crossing), so a
+// DYNAMIC detector here is always-on-cheap and workload-generic.
+//
+// Detection (per thread, no locks, no allocation on the trap path):
+//   - Trap sites are tracked in a 64-slot direct-mapped table keyed by
+//     (rip ^ mix(rax)) -- rax distinguishes syscall numbers behind a shared
+//     bop site.  A slot counts traps at its site; at kArmCount the slot arms
+//     (one clock_gettime) and starts hashing the Win64 argument registers
+//     (r10/rdx/r8/r9) and comparing the post-callback RAX, so a report can
+//     say "identical args, identical result" -- the poll-storm signature --
+//     versus "results vary" (a hot but progressing site, e.g. QPC).
+//   - Fast-path cost per trap: ~10-25 instructions and one 128-byte line;
+//     the whole feature is behind one predictable branch when disabled.
+//   - fexbridge_run counts RunFrame nesting depth; at kDepthFirstReport it
+//     walks the frame chain (bounded), finds the shortest repeating period
+//     of (reverse-entry rip, outer-trap rip) pairs, and names the cycle --
+//     turning a stack-exhaustion death into a diagnosis while the thread is
+//     still alive.  Re-reports each doubling of depth.
+//
+// Response policy, in project discipline order:
+//   - REPORT (default): bounded, rate-limited stderr lines.  Reports gate on
+//     measured rate (>= kReportMinRate) so long-lived ordinary sites never
+//     eat the report budget; FEXBRIDGE_SPINSENTINEL_TRACE=1 removes the
+//     gates and caps.
+//   - THROTTLE (opt-in, FEXBRIDGE_SPINSENTINEL_THROTTLE=<usec>): after
+//     kThrottleRun consecutive traps at one site with IDENTICAL argument
+//     registers and IDENTICAL result, each further such trap sleeps that
+//     many microseconds; any change in args or result resets the run.
+//     This can only ever change TIMING -- it executes everything the guest
+//     asked, so the worst wrong call is added latency (one sleep in flight
+//     when a poll finally lands), never a dropped input or corrupted state.
+//     Answering/eliding the call itself is deliberately NOT offered here:
+//     the bridge cannot know Win32 semantics (PeekMessage returning the
+//     same TRUE twice can still have delivered two different messages
+//     through the out-pointer), and that class of fix belongs in the
+//     embedder, which owns the semantics.
+// Knobs (getenv, same lane precedent as FEXBRIDGE_EAGER_CTX -- steamtool
+// appconfig .env files reach these per-title):
+//   FEXBRIDGE_SPINSENTINEL=0            kill switch (default: enabled)
+//   FEXBRIDGE_SPINSENTINEL_THROTTLE=<n> arm the throttle, n usec (default 0)
+//   FEXBRIDGE_SPINSENTINEL_TRACE=1      loud: no rate gate, no report caps
+// ---------------------------------------------------------------------------
+namespace SpinSentinel {
+constexpr uint32_t kSlotCount = 64;         // per-thread, direct-mapped
+constexpr uint64_t kArmCount = 4096;        // site trap count that arms arg/result tracking
+constexpr uint64_t kFirstReport = 65536;    // site trap count at first report (then x4)
+constexpr uint64_t kReportMinRate = 5000;   // traps/s; below this a site is not a storm
+constexpr uint64_t kThrottleRun = 16384;    // identical-args+result run before throttling
+constexpr uint32_t kDepthFirstReport = 64;  // crossing depth at first report (then x2)
+constexpr uint32_t kMaxThreadReports = 16;  // per-thread lifetime report cap
+constexpr int kMaxProcessReports = 128;     // process-wide lifetime report cap
+
+bool Enabled = true;
+bool Trace = false;
+uint32_t ThrottleUs = 0;
+std::atomic<int> ProcessReports {0};
+
+struct Slot {
+  uint64_t Key {};
+  uint64_t Rip {};          // trap rip (valid once armed)
+  uint64_t Rax {};          // guest RAX at the trap (syscall number for Wine stubs)
+  uint64_t Count {};        // traps at this site since the slot last re-keyed
+  uint64_t NextReport {};
+  uint64_t ArmMonoNs {};    // CLOCK_MONOTONIC at arming; rate baseline
+  uint64_t ArgHash {};      // last trap's r10/rdx/r8/r9 hash (armed only)
+  uint64_t Args[4] {};      // last trap's raw r10/rdx/r8/r9 -- attribution:
+                            // for a Wine syscall stub r10 is the first
+                            // argument, often the HANDLE being polled
+  uint64_t Result {};       // last trap's post-callback RAX (armed only)
+  uint64_t IdenticalRun {}; // consecutive identical (args, result) traps
+  bool Armed {};
+  bool HaveResult {};
+  bool ArgsVaried {};       // any variation observed since arming
+  bool ResultVaried {};
+};
+
+struct ThreadState {
+  Slot Slots[kSlotCount];
+  pid_t Tid {};
+  uint32_t Reports {};
+  uint32_t NextDepthReport {kDepthFirstReport};
+};
+
+uint64_t MonoNs() {
+  timespec TS {};
+  clock_gettime(CLOCK_MONOTONIC, &TS);
+  return uint64_t(TS.tv_sec) * 1000000000ull + uint64_t(TS.tv_nsec);
+}
+
+bool TakeReport(ThreadState* TS) {
+  if (!Trace && (TS->Reports >= kMaxThreadReports || ProcessReports.load(std::memory_order_relaxed) >= kMaxProcessReports)) {
+    return false;
+  }
+  ++TS->Reports;
+  ProcessReports.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void InitFromEnv() {
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL"); E && E[0] == '0' && !E[1]) {
+    Enabled = false;
+    return;
+  }
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL_TRACE"); E && E[0] == '1') {
+    Trace = true;
+    fprintf(stderr, "fexbridge: SPINSENTINEL trace: reports ungated and uncapped\n");
+  }
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL_THROTTLE")) {
+    const long V = atol(E);
+    if (V > 0) {
+      ThrottleUs = V > 100000 ? 100000u : uint32_t(V);
+      // Loud by design: this knob changes guest timing, so its presence must
+      // never be silent.
+      fprintf(stderr,
+              "fexbridge: SPINSENTINEL throttle armed: %uus per no-progress trap after %" PRIu64 " identical repeats\n",
+              ThrottleUs, kThrottleRun);
+    }
+  }
+}
+} // namespace SpinSentinel
+
+// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 struct RunFrame {
@@ -83,12 +221,18 @@ struct RunFrame {
   sigjmp_buf JB;
   bool ExitRequested {};
   uint64_t ExitRIP {};
+  // SpinSentinel crossing-recursion chain: the guest rip this (reverse) run
+  // entered at, and the guest rip of the outer trap that was live when it
+  // began (0 for an outermost run).
+  uint64_t EntryRIP {};
+  uint64_t TrapRIP {};
 };
 
 struct BridgeThread {
   FEXCore::Core::InternalThreadState* Thread {};
   uint64_t CallRetAllocBase {};
   RunFrame* RunTop {}; // innermost active fexbridge_run on this host thread
+  SpinSentinel::ThreadState* Sentinel {}; // null when FEXBRIDGE_SPINSENTINEL=0
 };
 
 FEXCore::Context::Context* CTX {};
@@ -551,6 +695,57 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
   auto* Thread = Frame->Thread;
   BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
 
+  // SpinSentinel, pre-callback half (banner above SpinSentinel namespace):
+  // same-site trap accounting.  State.rip still holds the trap rip here (it
+  // is what StoreStateToContext is about to publish as ctx->Rip).
+  SpinSentinel::Slot* SSlot = nullptr;
+  uint64_t SKey = 0;
+  bool SSameArgs = false;
+  if (auto* SS = BT ? BT->Sentinel : nullptr) {
+    const uint64_t Rip = Frame->State.rip;
+    const uint64_t Rax = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+    SKey = Rip ^ (Rax << 17) ^ (Rax >> 47);
+    auto* Slot = &SS->Slots[(SKey ^ (SKey >> 8)) & (SpinSentinel::kSlotCount - 1)];
+    if (Slot->Key == SKey) {
+      ++Slot->Count;
+      if (!Slot->Armed) {
+        if (Slot->Count >= SpinSentinel::kArmCount) {
+          Slot->Armed = true;
+          Slot->HaveResult = Slot->ArgsVaried = Slot->ResultVaried = false;
+          Slot->IdenticalRun = 0;
+          Slot->Rip = Rip;
+          Slot->Rax = Rax;
+          Slot->ArmMonoNs = SpinSentinel::MonoNs();
+          SSlot = Slot;
+        }
+      } else {
+        // Win64 argument registers (r10 carries the syscall convention's
+        // rcx).  A hash collision under-reports variation; harmless.
+        const auto& G = Frame->State.gregs;
+        const uint64_t AH = G[FEXCore::X86State::REG_R10] ^ (G[FEXCore::X86State::REG_RDX] * 0x9E3779B97F4A7C15ull) ^
+                            ((G[FEXCore::X86State::REG_R8] << 32) | (G[FEXCore::X86State::REG_R8] >> 32)) ^
+                            (G[FEXCore::X86State::REG_R9] * 0xC2B2AE3D27D4EB4Full);
+        SSameArgs = Slot->HaveResult && AH == Slot->ArgHash;
+        if (Slot->HaveResult && !SSameArgs) {
+          Slot->ArgsVaried = true;
+        }
+        Slot->ArgHash = AH;
+        Slot->Args[0] = G[FEXCore::X86State::REG_R10];
+        Slot->Args[1] = G[FEXCore::X86State::REG_RDX];
+        Slot->Args[2] = G[FEXCore::X86State::REG_R8];
+        Slot->Args[3] = G[FEXCore::X86State::REG_R9];
+        SSlot = Slot;
+      }
+    } else {
+      // Re-key.  A different site aliasing this slot only ever delays
+      // detection (false negative), never fabricates one.
+      Slot->Key = SKey;
+      Slot->Count = 1;
+      Slot->Armed = false;
+      Slot->NextReport = SpinSentinel::kFirstReport;
+    }
+  }
+
   // No YMM side-channel any more: the changed-only load below never touches
   // avx_high, so the high lanes simply stay live in CPUState across the trap
   // -- the same values the old YMM[] round-trip wrote back verbatim.
@@ -589,6 +784,72 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
   if (Cb) {
     Result = Cb(BT, &C, TrapUser.load(std::memory_order_acquire));
     LoadStateFromContextAfterTrap(Thread, &C, StoredEFlags, Lazy);
+  }
+
+  // SpinSentinel, post-callback half: result identity, the report, and the
+  // opt-in throttle.  Re-check the key -- a nested run inside the callback
+  // may have re-keyed this very slot (diagnostic-grade tolerance, not a
+  // correctness concern).
+  if (SSlot && Result == FEXBRIDGE_TRAP_CONTINUE && SSlot->Key == SKey) {
+    const uint64_t R = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+    if (SSlot->HaveResult) {
+      if (R != SSlot->Result) {
+        SSlot->ResultVaried = true;
+      }
+      if (SSameArgs && R == SSlot->Result) {
+        ++SSlot->IdenticalRun;
+      } else {
+        SSlot->IdenticalRun = 0;
+      }
+    }
+    SSlot->Result = R;
+    SSlot->HaveResult = true;
+
+    if (SSlot->Count >= SSlot->NextReport) {
+      SSlot->NextReport <<= 2;
+      const uint64_t Dt = SpinSentinel::MonoNs() - SSlot->ArmMonoNs;
+      const uint64_t Rate = Dt ? (SSlot->Count - SpinSentinel::kArmCount) * 1000000000ull / Dt : 0;
+      auto* SS = BT->Sentinel;
+      if ((Rate >= SpinSentinel::kReportMinRate || SpinSentinel::Trace) && SpinSentinel::TakeReport(SS)) {
+        fprintf(stderr,
+                "fexbridge: SPINSENTINEL tid=%d trap-storm rip=0x%" PRIx64 " rax=0x%" PRIx64 " count=%" PRIu64 " rate=%" PRIu64
+                "/s args=%s result=%s last-rax=0x%" PRIx64 " identical-run=%" PRIu64 " last-args=[0x%" PRIx64 " 0x%" PRIx64
+                " 0x%" PRIx64 " 0x%" PRIx64 "]\n",
+                SS->Tid, SSlot->Rip, SSlot->Rax, SSlot->Count, Rate, SSlot->ArgsVaried ? "vary" : "identical",
+                SSlot->ResultVaried ? "varies" : "identical", R, SSlot->IdenticalRun, SSlot->Args[0], SSlot->Args[1],
+                SSlot->Args[2], SSlot->Args[3]);
+        // Attribution: the thread's OTHER hot trap sites.  A spin is usually
+        // a tight cycle of a few crossing sites (poll + yield + clock); the
+        // profile names the companions so "what is it waiting on" can be
+        // read straight from the log instead of profiled for.
+        char Prof[512];
+        int Off = 0;
+        for (uint32_t i = 0; i < SpinSentinel::kSlotCount; ++i) {
+          const auto& O = SS->Slots[i];
+          if (&O == SSlot || !O.Armed || O.Count < SpinSentinel::kArmCount) {
+            continue;
+          }
+          const int W = snprintf(Prof + Off, sizeof(Prof) - size_t(Off), " [rip=0x%" PRIx64 " rax=0x%" PRIx64 " count=%" PRIu64 "]",
+                                 O.Rip, O.Rax, O.Count);
+          if (W < 0 || Off + W >= int(sizeof(Prof))) {
+            break;
+          }
+          Off += W;
+        }
+        if (Off) {
+          fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d thread-profile:%s\n", SS->Tid, Prof);
+        }
+      }
+    }
+
+    if (SpinSentinel::ThrottleUs && SSlot->IdenticalRun >= SpinSentinel::kThrottleRun) {
+      if (SpinSentinel::Trace && SSlot->IdenticalRun == SpinSentinel::kThrottleRun) {
+        fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d throttle engaged rip=0x%" PRIx64 " rax=0x%" PRIx64 "\n",
+                BT->Sentinel->Tid, SSlot->Rip, SSlot->Rax);
+      }
+      timespec TS {0, long(SpinSentinel::ThrottleUs) * 1000};
+      nanosleep(&TS, nullptr);
+    }
   }
 
   if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
@@ -747,6 +1008,8 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   }
   fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
 
+  SpinSentinel::InitFromEnv();
+
   GuestIs64 = Is64;
   Initialized = true;
   return 0;
@@ -895,6 +1158,10 @@ int fexbridge_thread_init(void** thread_out) {
   // nothing else in the bridge's link set touches it (LinuxEmulation, the
   // other writer, is deliberately not linked).
   Thread->FrontendPtr = BT;
+  if (SpinSentinel::Enabled) {
+    BT->Sentinel = new SpinSentinel::ThreadState();
+    BT->Sentinel->Tid = static_cast<pid_t>(syscall(SYS_gettid));
+  }
   TLSThread = BT;
   {
     std::lock_guard Lk {BridgeThreadsMutex};
@@ -920,6 +1187,7 @@ void fexbridge_thread_term(void* thread) {
   }
   CTX->DestroyThread(BT->Thread);
   ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
+  delete BT->Sentinel;
   delete BT;
 }
 
@@ -942,6 +1210,9 @@ int fexbridge_run(void* thread, void* ctx) {
   // ~18/s on the measured workload, traps are millions/s).
   auto& RunState = BT->Thread->CurrentFrame->State;
   const bool Nested = BT->RunTop != nullptr;
+  // SpinSentinel: the outer trap's rip, read before the Ctx load overwrites
+  // it.  Only used in crossing-recursion reports.
+  const uint64_t OuterTrapRIP = Nested ? RunState.rip : 0;
   uint8_t SavedAvxHigh[sizeof(RunState.avx_high)];
   uint8_t SavedFlags[sizeof(RunState.flags)];
   uint8_t SavedXmm[sizeof(RunState.xmm)];
@@ -976,7 +1247,48 @@ int fexbridge_run(void* thread, void* ctx) {
 
   RunFrame F {};
   F.Prev = BT->RunTop;
+  F.EntryRIP = RunState.rip; // post-Ctx-load: the rip this run enters at
+  F.TrapRIP = OuterTrapRIP;
   BT->RunTop = &F;
+
+  // SpinSentinel crossing-recursion check (banner above SpinSentinel
+  // namespace).  Reverse crossings are ~18/s on the measured workload, so a
+  // bounded chain walk here is free; NextDepthReport doubles so a runaway
+  // recursion is named at 64, 128, 256... while the thread is still alive.
+  if (auto* SS = BT->Sentinel; SS && SS->NextDepthReport) {
+    uint32_t Depth = 0;
+    for (RunFrame* P = &F; P && Depth < SS->NextDepthReport; P = P->Prev) {
+      ++Depth;
+    }
+    if (Depth >= SS->NextDepthReport) {
+      uint64_t E[16], T[16];
+      uint32_t N = 0;
+      for (RunFrame* P = &F; P && N < 16; P = P->Prev, ++N) {
+        E[N] = P->EntryRIP;
+        T[N] = P->TrapRIP;
+      }
+      uint32_t Period = 0; // 0: aperiodic within the innermost 16
+      for (uint32_t P = 1; P <= 8 && !Period; ++P) {
+        bool Ok = N > P;
+        for (uint32_t i = 0; Ok && i + P < N; ++i) {
+          Ok = E[i] == E[i + P] && T[i] == T[i + P];
+        }
+        if (Ok) {
+          Period = P;
+        }
+      }
+      if (SpinSentinel::TakeReport(SS)) {
+        fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d crossing-recursion depth=%u period=%u cycle=", SS->Tid, Depth, Period);
+        const uint32_t Show = Period ? Period : (N < 4 ? N : 4);
+        for (uint32_t i = 0; i < Show; ++i) {
+          fprintf(stderr, "%s[reverse=0x%" PRIx64 " trap=0x%" PRIx64 "]", i ? " " : "", E[i], T[i]);
+        }
+        fprintf(stderr, "%s (guest<->native call cycle; stack exhaustion likely if it continues)\n",
+                Period ? "" : " (aperiodic in innermost 16)");
+      }
+      SS->NextDepthReport = SS->NextDepthReport >= 0x80000000u ? 0 : SS->NextDepthReport << 1;
+    }
+  }
 
   int Reason;
   if (sigsetjmp(F.JB, 1) == 0) {

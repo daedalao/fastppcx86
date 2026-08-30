@@ -60,7 +60,16 @@
 
   ============================ CONFIG ========================================
   process_init loads the FEX config layers (FEX_APP_CONFIG honoured) and then
-  forces IS64BIT_MODE=1 and SMCCHECKS=0. Self-modifying/newly-loaded guest
+  forces IS64BIT_MODE=1 and SMCCHECKS=0.
+
+  FEXBRIDGE_SPINSENTINEL (default on) is the bridge's generic guest-spin
+  detector: it names trap storms (one site re-trapping at storm rate with
+  identical args/results) and periodic guest<->native crossing recursions on
+  stderr, report-only and rate-limited.  FEXBRIDGE_SPINSENTINEL=0 disables,
+  FEXBRIDGE_SPINSENTINEL_TRACE=1 removes the report gates/caps, and
+  FEXBRIDGE_SPINSENTINEL_THROTTLE=<usec> opts in to sleeping that long per
+  no-progress trap once a site has repeated identically 16384 times (timing
+  only; the guest's calls all still execute).  Details in FexBridge.cpp. Self-modifying/newly-loaded guest
   code is the CALLER's job to report via fexbridge_invalidate_code_range —
   call it after writing guest instructions to memory that may already have
   been executed from, and after any PE section load.
