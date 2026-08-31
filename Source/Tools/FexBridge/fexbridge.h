@@ -109,7 +109,34 @@ extern "C" {
            fills the skipped groups with a recognizable pattern (EFlags
            0xDEADF1A6, FltSave 0xDD bytes) so a reader that forgot to
            materialize fails loudly -- the embedder's negative control.      */
-#define FEXBRIDGE_ABI_VERSION 5u
+/* 5 -> 6: the zero-copy trap (the trap view).  fexbridge_set_trap_view_handler()
+           registers a callback that receives a FEXBRIDGE_TRAP_VIEW -- pointers
+           into the LIVE guest register file -- instead of a marshalled AMD64
+           CONTEXT.  On a view trap the bridge builds no CONTEXT at all: no
+           GPR store, no EFLAGS reconstruction, no FP store, no write-back
+           pass.  The callback reads and writes guest registers in place and
+           owns RIP through the view exactly as the CONTEXT protocol owns
+           ctx->Rip.  When both handlers are registered the view handler wins;
+           FEXBRIDGE_EAGER_CTX=1 in the environment VETOES the view protocol
+           at registration time (a loud line says so) and every trap then goes
+           to the ABI<=5 CONTEXT handler -- which is why an embedder that
+           registers a view handler must keep its CONTEXT handler registered
+           too: the pair is the kill switch.
+           fexbridge_view_pull()/fexbridge_view_push() are the cold-path
+           bridge to CONTEXT land for the callbacks that need one (a debugger
+           read, an exception, an FP-typed call): pull fills the named groups
+           of a caller-provided CONTEXT from live guest state, push writes
+           the named groups back.  NESTED RUNS under the view protocol:
+           fexbridge_run's own nested-run save/restore already preserves the
+           EFLAGS raw forms and the entire FP file (XMM/x87/MXCSR/FCW/FTW/
+           YMM-high) around a nested run -- but the GPRs, RIP and RSP are
+           loaded from the nested run's CONTEXT and clobbered by the nested
+           guest, and with no outer CONTEXT there is no outer resume to put
+           them back.  A view callback that starts a nested run must
+           pull(CONTROL|INTEGER) first and push(CONTROL|INTEGER) after; that
+           is the ABI<=5 "caller must save/restore the CONTEXT around a
+           nested run" contract restated for the view.                        */
+#define FEXBRIDGE_ABI_VERSION 6u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
@@ -266,6 +293,71 @@ uint32_t fexbridge_declare_trap_ctx(uint32_t lazy_mask);
    may call it unconditionally on any path that touches the group.  Returns
    0, negative on a NULL argument.                                          */
 int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags);
+
+/* ---- zero-copy traps (ABI 6) ------------------------------------------- */
+/* The view: pointers into the live guest register file, valid only from
+   view-trap entry until the callback returns, on the callback's own thread.
+   Both pointers alias CPUState, which is fully spilled for the whole trap
+   window -- a write through them IS a write to guest state, applied at
+   resume with no further copying.                                          */
+typedef struct fexbridge_trap_view {
+  uint64_t* gregs; /* the 16 guest GPRs in x86 encoding order:
+                        RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15 */
+  uint64_t* rip;   /* the live guest RIP.  On entry: the address OF the
+                        trapping instruction (not advanced), exactly like the
+                        CONTEXT protocol's Rip.  The callback owns it; return
+                        without advancing and the trap re-executes.          */
+  uint32_t reserved[4];
+} FEXBRIDGE_TRAP_VIEW;
+
+/* Convenience indices for view->gregs (x86 encoding order). */
+#define FEXBRIDGE_GREG_RAX 0
+#define FEXBRIDGE_GREG_RCX 1
+#define FEXBRIDGE_GREG_RDX 2
+#define FEXBRIDGE_GREG_RBX 3
+#define FEXBRIDGE_GREG_RSP 4
+#define FEXBRIDGE_GREG_RBP 5
+#define FEXBRIDGE_GREG_RSI 6
+#define FEXBRIDGE_GREG_RDI 7
+#define FEXBRIDGE_GREG_R8 8
+#define FEXBRIDGE_GREG_R9 9
+#define FEXBRIDGE_GREG_R10 10
+#define FEXBRIDGE_GREG_R11 11
+#define FEXBRIDGE_GREG_R12 12
+#define FEXBRIDGE_GREG_R13 13
+#define FEXBRIDGE_GREG_R14 14
+#define FEXBRIDGE_GREG_R15 15
+
+/* Return FEXBRIDGE_TRAP_CONTINUE or FEXBRIDGE_TRAP_EXIT, same as the CONTEXT
+   protocol; on EXIT the run leaves with *view->rip as the parked
+   continuation.                                                            */
+typedef int (*fexbridge_trap_view_fn)(void* thread, struct fexbridge_trap_view* view, void* user);
+
+/* Register the view handler.  Takes precedence over the CONTEXT handler on
+   every trap -- unless FEXBRIDGE_EAGER_CTX=1 is in the environment AT
+   REGISTRATION TIME, which vetoes the view protocol process-wide (loudly)
+   and leaves every trap on the CONTEXT handler.  Keep the CONTEXT handler
+   registered: it is the veto's landing spot and the fallback for anything
+   the view path cannot serve.  Same publication contract as
+   fexbridge_set_trap_handler: register before the first run.               */
+void fexbridge_set_trap_view_handler(fexbridge_trap_view_fn cb, void* user);
+
+/* Cold-path CONTEXT bridge for view callbacks.  Callable between view-trap
+   entry and the callback's return, on the callback's own thread (the same
+   rule as fexbridge_ctx_materialize).  flags names groups with the ordinary
+   FEXBRIDGE_CTX_* bits; the CONTEXT's own ContextFlags word is written by
+   pull and IGNORED by push (the flags argument alone gates what push
+   applies).
+   pull fills the named groups of the caller's CONTEXT from live guest
+   state: INTEGER and CONTROL are plain loads (CONTROL includes the
+   reconstructed EFLAGS and CS/SS selectors); FLOATING_POINT is the full
+   XMM/x87 store; SEGMENTS is the DS/ES/FS/GS selectors -- callers that
+   synthesize selectors themselves (Wine does) can skip it.
+   push writes the named groups back into live guest state: CONTROL applies
+   Rip/Rsp and decomposes EFlags; INTEGER stores the 14 GPRs; FLOATING_POINT
+   applies the full FP file.  Returns 0, negative on a NULL argument.       */
+int fexbridge_view_pull(void* thread, void* amd64_ctx, uint32_t flags);
+int fexbridge_view_push(void* thread, const void* amd64_ctx, uint32_t flags);
 
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides

@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,9 @@ static int (*p_set_fs_base)(void*, uint64_t);
 static int (*p_get_fs_base)(void*, uint64_t*);
 static uint32_t (*p_declare_trap_ctx)(uint32_t);
 static int (*p_ctx_materialize)(void*, void*, uint32_t);
+static void (*p_set_trap_view_handler)(fexbridge_trap_view_fn, void*);
+static int (*p_view_pull)(void*, void*, uint32_t);
+static int (*p_view_push)(void*, const void*, uint32_t);
 
 static int checks, failures;
 static void check(int cond, const char* what) {
@@ -122,7 +126,7 @@ static void* map_rw(size_t sz) {
 }
 
 /* ---- trap callback ------------------------------------------------------ */
-enum { MODE_NONE, MODE_BOP, MODE_NESTED, MODE_GS, MODE_LAZY };
+enum { MODE_NONE, MODE_BOP, MODE_NESTED, MODE_GS, MODE_LAZY, MODE_VIEWKILL };
 static int trap_mode = MODE_NONE;
 static uint64_t bop1, bop2, bop3, bop4;
 static uint64_t bop_hits[4];
@@ -131,6 +135,7 @@ static uint64_t nested_code, nested_stack_top, nested_result;
 static const uint64_t REGBASE = 0x7700000000ULL;
 static int lazy_poison_phase;   /* S11: expect poison bytes before materialize */
 static uint64_t lazy_hits[2];
+static int viewkill_ctx_hits;   /* S12: CONTEXT-handler hits under the veto */
 
 static int trap_cb(void* thread, void* vctx, void* user) {
   FEXBRIDGE_AMD64_CONTEXT* ctx = vctx;
@@ -208,6 +213,12 @@ static int trap_cb(void* thread, void* vctx, void* user) {
        survive the hop with no materialize and no write-back at all. */
     lazy_hits[1]++;
     ctx->Rax = 0x77;
+  } else if (trap_mode == MODE_VIEWKILL && ctx->Rip == bop1) {
+    /* S12 kill switch: with the view registration vetoed by
+       FEXBRIDGE_EAGER_CTX=1, traps must land HERE, on the CONTEXT
+       protocol. */
+    viewkill_ctx_hits++;
+    ctx->Rax = 0xEA6E4;
   } else if (trap_mode == MODE_GS && ctx->Rip == bop1) {
     /* S10: touch nothing. The point is that a full CONTEXT round trip through
        the callback (which carries selectors, never bases) leaves the guest's
@@ -219,6 +230,101 @@ static int trap_cb(void* thread, void* vctx, void* user) {
   }
   ctx->Rsp += 8;
   ctx->Rip = ret;
+  return FEXBRIDGE_TRAP_CONTINUE;
+}
+
+/* ---- S12: the zero-copy trap view (ABI 6) ------------------------------- */
+static int view_mode;
+static uint64_t view_hits[3];
+static uint64_t view_nested_result;
+
+static int view_cb(void* thread, FEXBRIDGE_TRAP_VIEW* v, void* user) {
+  uint64_t* g = v->gregs;
+  check(thread == p_current_thread(), "view cb: thread handle matches TLS");
+  check(user == (void*)0x5678, "view cb: user pointer delivered");
+
+  if (view_mode == 1 && *v->rip == bop1) {
+    /* plain read+write through the live file */
+    view_hits[0]++;
+    check_eq(g[FEXBRIDGE_GREG_RAX], 0x42, "view: guest RAX readable through gregs");
+    g[FEXBRIDGE_GREG_RAX] = 0x4242;
+  } else if (view_mode == 2 && *v->rip == bop1) {
+    /* pull sees live truth; push applies edits (the S11 lazy-hop shape,
+       re-proven through the view's cold path) */
+    view_hits[1]++;
+    FEXBRIDGE_AMD64_CONTEXT c;
+    memset(&c, 0, sizeof(c));
+    check_eq((uint64_t)p_view_pull(thread, &c, FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER | FEXBRIDGE_CTX_FLOATING_POINT), 0,
+             "view pull rc");
+    check((c.EFlags & 0x1) != 0, "view pull: guest stc's CF");
+    check((c.EFlags & 0x40) != 0, "view pull: guest sub's ZF");
+    check_eq(c.Rip, *v->rip, "view pull: Rip matches view");
+    check_eq(c.Rax, g[FEXBRIDGE_GREG_RAX], "view pull: RAX matches gregs");
+    check_eq(c.Rsp, g[FEXBRIDGE_GREG_RSP], "view pull: RSP matches gregs");
+    check_eq(c.FltSave.XmmRegisters[0].Low, 0xA1B2C3D4E5F60718ULL, "view pull: guest XMM0");
+    c.EFlags &= ~0x1u; /* clear CF */
+    c.FltSave.XmmRegisters[0].Low = 0x1122334455667788ULL;
+    c.FltSave.XmmRegisters[0].High = 0;
+    check_eq((uint64_t)p_view_push(thread, &c, FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_FLOATING_POINT), 0, "view push rc");
+    /* push(CONTROL) rewrote State.rip with the pulled (trap) address; the
+       common epilogue below advances it, exactly as a callback that never
+       pushed. */
+  } else if (view_mode == 3 && *v->rip == bop2) {
+    /* nested run under the view protocol: pull/push is the caller-side
+       save/restore the ABI 6 changelog demands */
+    view_hits[2]++;
+    FEXBRIDGE_AMD64_CONTEXT save;
+    memset(&save, 0, sizeof(save));
+    check_eq((uint64_t)p_view_pull(thread, &save, FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER), 0, "view nested: pull rc");
+    FEXBRIDGE_AMD64_CONTEXT nctx;
+    memset(&nctx, 0, sizeof(nctx));
+    nctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    nctx.Rip = nested_code;
+    nctx.Rsp = nested_stack_top;
+    nctx.EFlags = 0x202;
+    int r = p_run(thread, &nctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "view nested: run ended at HLT");
+    view_nested_result = nctx.Rax;
+    check_eq((uint64_t)p_view_push(thread, &save, FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER), 0, "view nested: push rc");
+    check_eq(g[FEXBRIDGE_GREG_RSP], save.Rsp, "view nested: push restored RSP in the live file");
+    g[FEXBRIDGE_GREG_RAX] = view_nested_result + 1;
+  } else {
+    check(0, "view cb: unexpected RIP/mode");
+    return FEXBRIDGE_TRAP_EXIT;
+  }
+
+  /* the bop protocol, spelled through the view */
+  uint64_t rsp = g[FEXBRIDGE_GREG_RSP];
+  *v->rip = *(uint64_t*)rsp;
+  g[FEXBRIDGE_GREG_RSP] = rsp + 8;
+  return FEXBRIDGE_TRAP_CONTINUE;
+}
+
+/* ---- S13: the trap floor microbench ------------------------------------- */
+static uint64_t bench_count, bench_limit;
+
+static int bench_ctx_cb(void* thread, void* vctx, void* user) {
+  FEXBRIDGE_AMD64_CONTEXT* ctx = vctx;
+  (void)thread;
+  (void)user;
+  uint64_t ret = *(uint64_t*)ctx->Rsp;
+  ctx->Rsp += 8;
+  ctx->Rip = ret;
+  if (++bench_count >= bench_limit) {
+    return FEXBRIDGE_TRAP_EXIT;
+  }
+  return FEXBRIDGE_TRAP_CONTINUE;
+}
+
+static int bench_view_cb(void* thread, FEXBRIDGE_TRAP_VIEW* v, void* user) {
+  (void)thread;
+  (void)user;
+  uint64_t rsp = v->gregs[FEXBRIDGE_GREG_RSP];
+  *v->rip = *(uint64_t*)rsp;
+  v->gregs[FEXBRIDGE_GREG_RSP] = rsp + 8;
+  if (++bench_count >= bench_limit) {
+    return FEXBRIDGE_TRAP_EXIT;
+  }
   return FEXBRIDGE_TRAP_CONTINUE;
 }
 
@@ -296,6 +402,9 @@ int main(int argc, char** argv) {
   SYM(p_get_fs_base, "fexbridge_get_fs_base");
   SYM(p_declare_trap_ctx, "fexbridge_declare_trap_ctx");
   SYM(p_ctx_materialize, "fexbridge_ctx_materialize");
+  SYM(p_set_trap_view_handler, "fexbridge_set_trap_view_handler");
+  SYM(p_view_pull, "fexbridge_view_pull");
+  SYM(p_view_push, "fexbridge_view_push");
 
   fprintf(stderr, "== S1: dlopen'd surface ==\n");
   check_eq(p_abi_version(), FEXBRIDGE_ABI_VERSION, "ABI version");
@@ -765,6 +874,180 @@ int main(int argc, char** argv) {
     /* back to eager for everything after this section */
     check_eq(p_declare_trap_ctx(0), 0, "declare(0) restores eager");
     trap_mode = MODE_NONE;
+  }
+
+  /* ---- S12: zero-copy trap view (ABI 6) ---------------------------------- */
+  fprintf(stderr, "\n== S12: zero-copy trap view — gregs/rip in place, pull/push, veto, nesting ==\n");
+  {
+    /* leg 1 guest: mov rax,0x42 ; call bop1 ; mov rbx,rax ; hlt */
+    uint8_t* vcode1 = map_rwx(0x1000);
+    {
+      uint8_t* p = vcode1;
+      p = emit_mov_imm32(p, 0, 0x42);
+      p = emit_call_abs(p, bop1);
+      E(p, 0x48, 0x89, 0xC3); /* mov rbx, rax */
+      E(p, 0xF4);
+    }
+    p_invalidate((uint64_t)vcode1, 0x1000);
+
+    /* the CONTEXT handler stays registered in a mode that FAILS on any hit:
+       precedence is proven by the run not failing. */
+    trap_mode = MODE_NONE;
+    p_set_trap_view_handler(view_cb, (void*)0x5678);
+    view_mode = 1;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)vcode1;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "view leg 1 ran to HLT");
+    check_eq(view_hits[0], 1, "view cb dispatched (and won precedence)");
+    check_eq(ctx.Rbx, 0x4242, "view greg write reached the guest");
+    check_eq(ctx.Rsp, stack_top, "view: stack balanced");
+
+    /* leg 2 guest: the S11 hop-A shape — known flags + XMM0, trap, read back */
+    uint8_t* vcode2 = map_rwx(0x1000);
+    {
+      uint8_t* p = vcode2;
+      p = emit_mov_imm32(p, 3, 1);        /* mov rbx, 1 */
+      E(p, 0x48, 0x83, 0xEB, 0x01);       /* sub rbx, 1 -> ZF=1 */
+      E(p, 0xF9);                         /* stc        -> CF=1 */
+      E(p, 0x48, 0xB8);                   /* movabs rax, pattern */
+      uint64_t pat = 0xA1B2C3D4E5F60718ULL;
+      memcpy(p, &pat, 8);
+      p += 8;
+      E(p, 0x66, 0x48, 0x0F, 0x6E, 0xC0); /* movq xmm0, rax */
+      p = emit_call_abs(p, bop1);
+      E(p, 0x9C);                         /* pushfq */
+      E(p, 0x58);                         /* pop rax */
+      E(p, 0x66, 0x48, 0x0F, 0x7E, 0xC2); /* movq rdx, xmm0 */
+      E(p, 0xF4);
+    }
+    p_invalidate((uint64_t)vcode2, 0x1000);
+
+    view_mode = 2;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)vcode2;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "view leg 2 ran to HLT");
+    check_eq(view_hits[1], 1, "view pull/push cb dispatched");
+    check((ctx.Rax & 0x1) == 0, "pushed CF-clear reached the guest");
+    check((ctx.Rax & 0x40) != 0, "guest ZF survived the pushed resume");
+    check_eq(ctx.Rdx, 0x1122334455667788ULL, "pushed XMM0 reached the guest");
+
+    /* leg 3: nested run from a view callback, pull/push around it.
+       guest: mov r15,imm ; call bop2 ; mov rbx,rax ; hlt */
+    uint8_t* vcode3 = map_rwx(0x1000);
+    {
+      uint8_t* p = vcode3;
+      p = emit_mov_imm32(p, 15, 0xBEEF);
+      p = emit_call_abs(p, bop2);
+      E(p, 0x48, 0x89, 0xC3); /* mov rbx, rax */
+      E(p, 0xF4);
+    }
+    p_invalidate((uint64_t)vcode3, 0x1000);
+
+    view_mode = 3;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)vcode3;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "view leg 3 ran to HLT");
+    check_eq(view_hits[2], 1, "view nested cb dispatched");
+    check_eq(view_nested_result, 0x99, "nested run produced its result");
+    check_eq(ctx.Rbx, 0x99 + 1, "nested result handed back through the view");
+    check_eq(ctx.R15, 0xBEEF, "outer R15 survived the nested run (push restored it)");
+
+    /* the kill switch: FEXBRIDGE_EAGER_CTX=1 vetoes the view registration,
+       traps land on the CONTEXT handler */
+    setenv("FEXBRIDGE_EAGER_CTX", "1", 1);
+    p_set_trap_view_handler(view_cb, (void*)0x5678); /* vetoed, loudly */
+    trap_mode = MODE_VIEWKILL;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+    ctx.Rip = (uint64_t)vcode1;
+    ctx.Rsp = stack_top;
+    ctx.EFlags = 0x202;
+    r = p_run(thread, &ctx);
+    check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "vetoed run ran to HLT");
+    check_eq((uint64_t)viewkill_ctx_hits, 1, "veto: trap landed on the CONTEXT handler");
+    check_eq(ctx.Rbx, 0xEA6E4, "veto: CONTEXT handler's RAX reached the guest");
+    unsetenv("FEXBRIDGE_EAGER_CTX");
+    trap_mode = MODE_NONE;
+    p_set_trap_view_handler(NULL, NULL);
+  }
+
+  /* ---- S13: the trap floor microbench (Step 0 of the PPC64EC plan) ------- */
+  fprintf(stderr, "\n== S13: trap floor microbench — eager / lazy / view ns per crossing ==\n");
+  {
+    /* guest: L: call bop1 ; jmp L — the callback ends the run at the limit */
+    uint8_t* bcode = map_rwx(0x1000);
+    {
+      uint8_t* p = bcode;
+      uint64_t loop_top = (uint64_t)p;
+      p = emit_call_abs(p, bop1);
+      int32_t rel = (int32_t)(loop_top - ((uint64_t)p + 5));
+      E(p, 0xE9); /* jmp rel32 back to the call */
+      memcpy(p, &rel, 4);
+      p += 4;
+    }
+    p_invalidate((uint64_t)bcode, 0x1000);
+
+    const uint64_t N = 1000000;
+    struct leg {
+      const char* name;
+      int use_view;
+      uint32_t lazy;
+    } legs[3] = {
+      {"eager", 0, 0},
+      {"lazy", 0, FEXBRIDGE_CTX_LAZY_EFLAGS | FEXBRIDGE_CTX_LAZY_FLOAT},
+      {"view", 1, 0},
+    };
+    for (int i = 0; i < 3; i++) {
+      if (legs[i].use_view) {
+        p_set_trap_view_handler(bench_view_cb, NULL);
+      } else {
+        p_set_trap_view_handler(NULL, NULL);
+        p_set_trap_handler(bench_ctx_cb, NULL);
+        p_declare_trap_ctx(legs[i].lazy);
+      }
+      /* warmup: compile the block, fault in everything */
+      bench_count = 0;
+      bench_limit = 1000;
+      memset(&ctx, 0, sizeof(ctx));
+      ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+      ctx.Rip = (uint64_t)bcode;
+      ctx.Rsp = stack_top;
+      ctx.EFlags = 0x202;
+      r = p_run(thread, &ctx);
+      check_eq((uint64_t)r, FEXBRIDGE_RUN_EXITED, "bench warmup leg exited");
+
+      bench_count = 0;
+      bench_limit = N;
+      memset(&ctx, 0, sizeof(ctx));
+      ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+      ctx.Rip = (uint64_t)bcode;
+      ctx.Rsp = stack_top;
+      ctx.EFlags = 0x202;
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      r = p_run(thread, &ctx);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      check_eq((uint64_t)r, FEXBRIDGE_RUN_EXITED, "bench timed leg exited");
+      check_eq(bench_count, N, "bench leg trap count");
+      double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 + (double)(t1.tv_nsec - t0.tv_nsec);
+      fprintf(stderr, "  BENCH %s_ns_per_trap=%.1f (N=%llu)\n", legs[i].name, ns / (double)N, (unsigned long long)N);
+    }
+    /* restore the functional handlers/protocol for anything after */
+    p_set_trap_view_handler(NULL, NULL);
+    p_declare_trap_ctx(0);
+    p_set_trap_handler(trap_cb, (void*)0x1234);
   }
 
   fprintf(stderr, "\n== teardown ==\n");

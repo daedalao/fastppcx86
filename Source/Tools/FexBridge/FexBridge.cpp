@@ -99,6 +99,11 @@ std::atomic<void*> TrapUser {nullptr};
 // FEXBRIDGE_CTX_POISON -- a gate lever, never a production state.
 std::atomic<uint32_t> TrapCtxLazyMask {0};
 bool TrapCtxPoison {false};
+// Zero-copy traps (ABI 6).  Same publication contract as TrapCb.  The
+// FEXBRIDGE_EAGER_CTX veto is applied at REGISTRATION (the cb is simply not
+// stored), so the hot sink pays one acquire load and no environment read.
+std::atomic<fexbridge_trap_view_fn> TrapViewCb {nullptr};
+std::atomic<void*> TrapViewUser {nullptr};
 uint64_t HltPageAddr {}; // one guest-visible HLT, used to end a run cooperatively
 bool Initialized {};
 bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
@@ -355,9 +360,14 @@ void LoadFPFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRID
   }
 }
 
-void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
+// The Flags argument, not the CONTEXT's own ContextFlags word, gates the
+// groups -- fexbridge_view_push() (ABI 6) applies a caller-chosen subset of a
+// CONTEXT whose ContextFlags may name more groups than the caller wants
+// pushed.  LoadStateFromContext below keeps the historical behaviour of
+// reading the word out of the CONTEXT itself.
+void LoadStateFromContextFlags(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context,
+                               const __uint128_t* YMMIn, const uint32_t Flags) {
   auto& State = Thread->CurrentFrame->State;
-  const uint32_t Flags = Context->ContextFlags;
 
   if (Flags & FEXBRIDGE_CTX_CONTROL & ~FEXBRIDGE_CTX_AMD64) {
     State.rip = Context->Rip;
@@ -389,6 +399,10 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
   if (Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) {
     LoadFPFromContext(Thread, Context, YMMIn);
   }
+}
+
+void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
+  LoadStateFromContextFlags(Thread, Context, YMMIn, Context->ContextFlags);
 }
 
 // Trap-path variant of LoadStateFromContext: identical semantics, but the
@@ -517,6 +531,33 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
   // hands over for free.
   auto* Thread = Frame->Thread;
   BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
+
+  // Zero-copy protocol (ABI 6): the callback reads and writes the live
+  // register file, so the entire CONTEXT round trip below is skipped.  That
+  // is sound because the round trip never NORMALIZED anything the resume
+  // needs: StoreStateToContext only READS CPUState (the x87 TOP rotation and
+  // the EFLAGS reconstruction transform the CONTEXT copy, not the state),
+  // and LoadStateFromContextAfterTrap only writes back what the callback
+  // changed -- its own header comment states the invariant this path leans
+  // on, "CPUState stays fully materialized for the whole trap round-trip".
+  // With no CONTEXT there is no write-back to skip: a register the callback
+  // never touched was never copied anywhere, and one it wrote through the
+  // view is already guest state.  RIP is view->rip = &State.rip, so the
+  // cooperative-exit arm below reads the callback's continuation exactly as
+  // the CONTEXT path reads the resumed State.rip.
+  if (auto ViewCb = TrapViewCb.load(std::memory_order_acquire)) {
+    FEXBRIDGE_TRAP_VIEW View;
+    View.gregs = &Frame->State.gregs[0];
+    View.rip = &Frame->State.rip;
+    memset(View.reserved, 0, sizeof(View.reserved));
+    const int Result = ViewCb(BT, &View, TrapViewUser.load(std::memory_order_acquire));
+    if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
+      BT->RunTop->ExitRequested = true;
+      BT->RunTop->ExitRIP = Frame->State.rip;
+      Frame->State.rip = HltPageAddr;
+    }
+    return 0;
+  }
 
   // No YMM side-channel any more: the changed-only load below never touches
   // avx_high, so the high lanes simply stay live in CPUState across the trap
@@ -778,6 +819,53 @@ int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags) {
     StoreFPToContext(Thread, Ctx);
     Ctx->ContextFlags &= ~0x200u;
   }
+  return 0;
+}
+
+void fexbridge_set_trap_view_handler(fexbridge_trap_view_fn cb, void* user) {
+  // The veto is registration-time so the hot sink never reads the
+  // environment: under FEXBRIDGE_EAGER_CTX=1 the cb is simply not stored and
+  // every trap keeps landing on the ABI<=5 CONTEXT handler (which is why the
+  // header tells embedders to keep that one registered).  Unregistering
+  // (cb == NULL) is never vetoed.
+  if (cb) {
+    const char* Eager = getenv("FEXBRIDGE_EAGER_CTX");
+    if (Eager && Eager[0] == '1') {
+      fprintf(stderr, "fexbridge: FEXBRIDGE_EAGER_CTX=1: zero-copy trap view vetoed, "
+                      "traps stay on the CONTEXT protocol\n");
+      TrapViewUser.store(user, std::memory_order_release);
+      TrapViewCb.store(nullptr, std::memory_order_release);
+      return;
+    }
+  }
+  TrapViewUser.store(user, std::memory_order_release);
+  TrapViewCb.store(cb, std::memory_order_release);
+}
+
+int fexbridge_view_pull(void* thread, void* amd64_ctx, uint32_t flags) {
+  auto* BT = static_cast<BridgeThread*>(thread);
+  auto* Ctx = static_cast<FEXBRIDGE_AMD64_CONTEXT*>(amd64_ctx);
+  if (!BT || !Ctx) {
+    return -1;
+  }
+  // StoreStateToContext gates its groups on the CONTEXT's own word, so pull
+  // writes the word first; the filled CONTEXT then carries exactly what it
+  // holds, which is what a caller parking state for a nested run wants.
+  Ctx->ContextFlags = flags | FEXBRIDGE_CTX_AMD64;
+  StoreStateToContext(BT->Thread, Ctx);
+  return 0;
+}
+
+int fexbridge_view_push(void* thread, const void* amd64_ctx, uint32_t flags) {
+  auto* BT = static_cast<BridgeThread*>(thread);
+  const auto* Ctx = static_cast<const FEXBRIDGE_AMD64_CONTEXT*>(amd64_ctx);
+  if (!BT || !Ctx) {
+    return -1;
+  }
+  // The flags ARGUMENT gates the groups; the CONTEXT's ContextFlags word is
+  // deliberately not consulted (a pulled CONTEXT names every group pull
+  // filled, which may be more than the caller wants applied).
+  LoadStateFromContextFlags(BT->Thread, Ctx, nullptr, flags | FEXBRIDGE_CTX_AMD64);
   return 0;
 }
 
