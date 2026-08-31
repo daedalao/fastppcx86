@@ -1326,6 +1326,13 @@ namespace x64 {
       // futex trace from exactly the process under investigation.
       if (IoctlType == 0x4Eu) {
         static const bool trace_ntsync = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        // The trace plumbing (access/open/write) runs between the real ioctl
+        // and SYSCALL_ERRNO(), so any errno it clobbers becomes the GUEST's
+        // errno for a failed ioctl. The disarmed access() alone turned every
+        // ntsync ETIMEDOUT into ENOENT, which kills Mono launch paths
+        // (mono_os_sem_timedwait treats error 2 as fatal) — W3/RimWorld died
+        // ~80s in with the env set but /tmp/nts_on absent, 2026-08-30.
+        const int saved_errno = errno;
         if (trace_ntsync && access("/tmp/nts_on", F_OK) == 0) {
           static int nts_fd = -1;
           if (nts_fd == -1) {
@@ -1347,12 +1354,13 @@ namespace x64 {
             char line[192];
             const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
                                    static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
-                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? errno : 0);
+                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? saved_errno : 0);
             if (n > 0) {
               [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
             }
           }
         }
+        errno = saved_errno;
       }
       SYSCALL_ERRNO();
     });
