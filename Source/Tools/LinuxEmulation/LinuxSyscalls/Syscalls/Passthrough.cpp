@@ -829,6 +829,11 @@ static uint64_t WrappedSchedGetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
   if (Result == static_cast<uint64_t>(-1)) {
     return -errno;
   }
+  // CoreIsolation narrows host masks behind the guest's back; a thread the
+  // guest never pinned must keep seeing the original allowed mask (games
+  // size thread pools from this result).
+  FEX::HLE::CoreIsolation::ReportedAffinityOverride(pid == 0 ? static_cast<uint32_t>(FHU::Syscalls::gettid()) : static_cast<uint32_t>(pid),
+                                                    &HostSet);
   FaultSafeUserMemAccess::VerifyIsWritable(reinterpret_cast<void*>(mask), NeededBytes);
   auto* GuestMask = reinterpret_cast<uint8_t*>(mask);
   memset(GuestMask, 0, NeededBytes);

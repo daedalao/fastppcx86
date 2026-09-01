@@ -24,6 +24,7 @@
 // never calls sched_setaffinity was already entitled to be run anywhere.
 
 #include <cstdint>
+#include <sched.h>
 
 namespace FEX::HLE {
 class SyscallHandler;
@@ -42,5 +43,13 @@ void Start(FEX::HLE::SyscallHandler* Handler);
 // That tid becomes guest-owned: the manager never repins it and never
 // shrinks its mask. Cheap no-op when the feature is off.
 void OnGuestSetAffinity(uint32_t TargetTID);
+
+// Preserve the affinity illusion for sched_getaffinity: a thread the guest
+// never pinned must keep seeing the process's original allowed mask even
+// while the manager has narrowed its host mask (games size thread pools
+// from this). Returns true and writes that mask into HostSet when the
+// override applies (feature active, tid not guest-owned); false leaves the
+// caller's kernel-reported mask untouched.
+bool ReportedAffinityOverride(uint32_t TargetTID, cpu_set_t* HostSet);
 
 } // namespace FEX::HLE::CoreIsolation

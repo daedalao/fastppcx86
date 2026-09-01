@@ -518,6 +518,21 @@ void OnGuestSetAffinity(uint32_t TargetTID) {
   GuestOwnedTids.insert(TargetTID);
 }
 
+bool ReportedAffinityOverride(uint32_t TargetTID, cpu_set_t* HostSet) {
+  if (!Handler || ::getpid() != ManagerPID || IsGuestOwned(TargetTID)) {
+    return false;
+  }
+  // Only threads of THIS process are ours to lie about; the guest may query
+  // an unrelated pid, whose kernel-reported mask must pass through.
+  char Path[64];
+  snprintf(Path, sizeof(Path), "/proc/self/task/%u", TargetTID);
+  if (::access(Path, F_OK) != 0) {
+    return false;
+  }
+  *HostSet = AllowedMask;
+  return true;
+}
+
 } // namespace FEX::HLE::CoreIsolation
 
 // Called by host thunk libraries (64-bit VK: vkQueuePresentKHR) on the guest
