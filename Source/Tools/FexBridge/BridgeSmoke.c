@@ -55,6 +55,7 @@ static void (*p_set_trap_view_handler)(fexbridge_trap_view_fn, void*);
 static int (*p_view_pull)(void*, void*, uint32_t);
 static int (*p_view_push)(void*, const void*, uint32_t);
 static int (*p_register_ec)(uint64_t, fexbridge_ec_fn, void*);
+static int (*p_register_ec2)(const uint64_t*, const void* const*, uint32_t, fexbridge_ec_fn);
 static int (*p_unregister_ec)(uint64_t, uint64_t);
 
 static int checks, failures;
@@ -413,6 +414,25 @@ static int ec_cb(void* thread, FEXBRIDGE_TRAP_VIEW* v, void* cookie) {
   return FEXBRIDGE_TRAP_CONTINUE;
 }
 
+/* S14 leg 5: the _targets2 form's per-rip cookies, recorded per stub */
+static uint64_t ec2_cookie_seen[2];
+static int ec2_cb(void* thread, FEXBRIDGE_TRAP_VIEW* v, void* cookie) {
+  uint64_t* g = v->gregs;
+  (void)thread;
+  if (*v->rip == ec_stub0) {
+    ec2_cookie_seen[0] = (uint64_t)cookie;
+  } else if (*v->rip == ec_stub1) {
+    ec2_cookie_seen[1] = (uint64_t)cookie;
+  } else {
+    check(0, "ec2 cb: unexpected rip");
+  }
+  g[FEXBRIDGE_GREG_RAX] = 0;
+  uint64_t rsp = g[FEXBRIDGE_GREG_RSP];
+  *v->rip = *(uint64_t*)rsp;
+  g[FEXBRIDGE_GREG_RSP] = rsp + 8;
+  return FEXBRIDGE_TRAP_CONTINUE;
+}
+
 /* ---- S7 worker: adopt this pthread, run a tiny guest, tear down --------- */
 struct warg {
   uint32_t val;
@@ -491,6 +511,7 @@ int main(int argc, char** argv) {
   SYM(p_view_pull, "fexbridge_view_pull");
   SYM(p_view_push, "fexbridge_view_push");
   SYM(p_register_ec, "fexbridge_register_ec_target");
+  SYM(p_register_ec2, "fexbridge_register_ec_targets2");
   SYM(p_unregister_ec, "fexbridge_unregister_ec_range");
 
   fprintf(stderr, "== S1: dlopen'd surface ==\n");
@@ -1264,6 +1285,32 @@ int main(int argc, char** argv) {
     check_eq((uint64_t)p_register_ec(ec_stub0, ec_cb, (void*)0xC00C1E), 0, "ec: re-register after unregister");
     check_eq((uint64_t)p_unregister_ec(ec_stub0, 16), 1, "ec: cleaned up");
     trap_mode = MODE_NONE;
+
+    /* leg 5: per-rip cookies (_targets2) -- two stubs, two cookies, each
+       delivered to the handler for its own rip */
+    {
+      uint64_t rips2[2] = {ec_stub0, ec_stub1};
+      const void* cookies2[2] = {(const void*)0xA110C0, (const void*)0xB220C1};
+      uint8_t* ecode5 = map_rwx(0x1000);
+      {
+        uint8_t* p = ecode5;
+        p = emit_call_abs(p, ec_stub0);
+        p = emit_call_abs(p, ec_stub1);
+        E(p, 0xF4);
+      }
+      p_invalidate((uint64_t)ecode5, 0x1000);
+      check_eq((uint64_t)p_register_ec2(rips2, cookies2, 2, ec2_cb), 2, "ec2: both rips registered with own cookies");
+      memset(&ctx, 0, sizeof(ctx));
+      ctx.ContextFlags = FEXBRIDGE_CTX_CONTROL | FEXBRIDGE_CTX_INTEGER;
+      ctx.Rip = (uint64_t)ecode5;
+      ctx.Rsp = stack_top;
+      ctx.EFlags = 0x202;
+      r = p_run(thread, &ctx);
+      check_eq((uint64_t)r, FEXBRIDGE_RUN_HLT, "ec2 run ran to HLT");
+      check_eq(ec2_cookie_seen[0], 0xA110C0, "ec2: stub0's own cookie delivered");
+      check_eq(ec2_cookie_seen[1], 0xB220C1, "ec2: stub1's own cookie delivered");
+      check_eq((uint64_t)p_unregister_ec(ec_stub0, 32), 2, "ec2: cleaned up both");
+    }
   }
 
   fprintf(stderr, "\n== teardown ==\n");

@@ -1290,7 +1290,8 @@ int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* co
   return 0;
 }
 
-int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie) {
+static int register_ec_batch(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler,
+                             void* shared_cookie) {
   // The batch form exists for a measured reason: a Wine thunk module arms on
   // its FIRST trap, and per-target registration of ntdll's ~2400 exports --
   // each taking the code-invalidation mutex and walking the thread registry
@@ -1300,6 +1301,10 @@ int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridg
   // executed (the trap that triggered the arming), so the wide invalidation
   // drops at most one trap block plus the transition-free span -- harmless
   // and over-invalidation is always safe.
+  //
+  // `cookies` (the _targets2 form) carries one cookie PER RIP -- the
+  // embedder's per-slot row cell; when it is null every rip shares
+  // `shared_cookie` (the original _targets form).
   if (!Initialized || !CTX || !rips || !handler) {
     return -1;
   }
@@ -1312,6 +1317,7 @@ int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridg
     std::scoped_lock Lk {EcLock};
     for (uint32_t i = 0; i < count; i++) {
       const uint64_t rip = rips[i];
+      void* cookie = cookies ? const_cast<void*>(cookies[i]) : shared_cookie;
       if (!rip) {
         continue;
       }
@@ -1345,6 +1351,17 @@ int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridg
     }
   }
   return Registered;
+}
+
+int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie) {
+  return register_ec_batch(rips, nullptr, count, handler, cookie);
+}
+
+int fexbridge_register_ec_targets2(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler) {
+  if (!cookies) {
+    return -1;
+  }
+  return register_ec_batch(rips, cookies, count, handler, nullptr);
 }
 
 int fexbridge_unregister_ec_range(uint64_t start, uint64_t length) {

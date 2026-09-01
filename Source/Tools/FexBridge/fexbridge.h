@@ -441,6 +441,15 @@ int fexbridge_unregister_ec_range(uint64_t start, uint64_t length);
    fexbridge_register_ec_target.  Same lifetime rules.                      */
 int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie);
 
+/* Batch registration with one cookie PER RIP: cookies[i] rides to the
+   handler for calls transitioning through rips[i], letting the embedder hand
+   each slot its own precomputed row (a per-slot dispatch cell) instead of
+   re-resolving the RIP on every call.  Everything else is
+   fexbridge_register_ec_targets exactly; cookies must not be null (use the
+   older form for a shared cookie), the ARRAY is read only during this call,
+   but each cookie VALUE lives by the 6->7 changelog's lifetime rules.      */
+int fexbridge_register_ec_targets2(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler);
+
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides
    Rip/Rsp/etc. Returns 0 and a handle, negative on failure.                */
