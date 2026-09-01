@@ -32,6 +32,7 @@ class SyscallHandler;
 
 namespace FEXCore::IR {
 class IREmitter;
+struct SHA256Sum;
 } // namespace FEXCore::IR
 
 namespace FEXCore::Context {
@@ -145,6 +146,35 @@ public:
   FEX_DEFAULT_VISIBILITY virtual void SetSignalDelegator(FEXCore::SignalDelegator* SignalDelegation) = 0;
   FEX_DEFAULT_VISIBILITY virtual void SetSyscallHandler(FEXCore::HLE::SyscallHandler* Handler) = 0;
   FEX_DEFAULT_VISIBILITY virtual void SetThunkHandler(FEXCore::ThunkHandler* Handler) = 0;
+
+  /**
+   * @brief EC targets (fexbridge ABI 7 / PPC64EC): compile Entrypoint as a
+   * direct host call instead of decoding the bytes there.
+   *
+   * Emits, at compile time for that RIP: store Entrypoint to State.rip, an
+   * IROp_Thunk whose callee resolves through the installed ThunkHandler for
+   * ThunkNameHash (the backend passes the descriptor in the first C argument
+   * and the CpuStateFrame in the second -- see DEF_OP(Thunk)), then an
+   * indirect ExitFunction on the reloaded State.rip, exactly the
+   * OS_GENERIC-syscall block-end pattern.  The registration is consulted
+   * BEFORE the frontend decoder, so invalidation drops compiled blocks but
+   * never the registration.
+   *
+   * Returns true if the registration stands (newly added, or an identical
+   * one already present); false if the Entrypoint is claimed by a different
+   * registration or another custom-IR owner.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool
+  AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) = 0;
+
+  /**
+   * @brief Remove an EC-target registration added by AddECTargetIRHandler.
+   * Erases only registrations that handler created (a foreign custom-IR
+   * entrypoint at the same address is left alone).  Does NOT invalidate
+   * compiled code: the caller owns invalidation, under its own lock
+   * discipline.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void RemoveECTargetIRHandler(uintptr_t Entrypoint) = 0;
 
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunction(uint32_t Function, uint32_t Leaf) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::XCRResults RunXCRFunction(uint32_t Function) = 0;

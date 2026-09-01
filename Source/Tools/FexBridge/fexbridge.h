@@ -136,7 +136,56 @@ extern "C" {
            pull(CONTROL|INTEGER) first and push(CONTROL|INTEGER) after; that
            is the ABI<=5 "caller must save/restore the CONTEXT around a
            nested run" contract restated for the view.                        */
-#define FEXBRIDGE_ABI_VERSION 6u
+/* 6 -> 7: EC targets (PPC64EC).  fexbridge_register_ec_target() makes the
+           emulator COMPILE a registered guest RIP as a direct host call to
+           the handler instead of decoding the bytes at that address -- the
+           whole marshalled-trap round trip (guest call -> stub -> SYSCALL
+           decode -> trap sink) collapses into one JIT-emitted host call with
+           the same spill/refill discipline the trap already pays.
+
+           THE BYTES AT THE RIP ARE NEVER TOUCHED AND NEVER DECODED while the
+           registration stands: registration lives in the emulator's compile
+           path (a custom-IR entrypoint consulted before the frontend
+           decoder), not in guest memory.  A reader (DRM checksums, Detours
+           scans) sees the stub bytes unchanged, and every path that reaches
+           the address without a registration -- after unregistration, or
+           mid-stub -- decodes those bytes and traps exactly as before.  The
+           stub is the always-correct fallback.
+
+           CALLING-CONVENTION DIFFERENCE FROM A TRAP, read this twice: an EC
+           transition fires at the STUB ENTRY, before the stub's
+           `mov r10,rcx` has executed, so argument 0 is still in RCX
+           (gregs[FEXBRIDGE_GREG_RCX]).  A trap-protocol handler reads the
+           rescued copy from R10; an EC handler must NOT.  Likewise *view->rip
+           on entry is the registered RIP itself (the stub base), not
+           stub+trap_off.
+
+           The handler receives the ABI 6 view (gregs/rip into live CPUState;
+           fexbridge_view_pull/push work inside it, including around a nested
+           fexbridge_run) plus its registration cookie, and owns *view->rip
+           exactly like a trap callback: pop the return address, write
+           results, set rip.  FEXBRIDGE_TRAP_CONTINUE resumes at *view->rip
+           through the ordinary dispatcher; FEXBRIDGE_TRAP_EXIT ends the run
+           cooperatively with *view->rip as the parked continuation.
+
+           INVALIDATION: fexbridge_invalidate_code_range over a registered
+           RIP drops the compiled transition block but NOT the registration
+           -- the compile path re-consults registrations before the decoder,
+           so the next execution recompiles the transition and SMC-style
+           invalidation storms cannot silently downgrade an EC target to a
+           trap.  Only fexbridge_unregister_ec_range removes registrations
+           (module unload); it also invalidates the range so stale transition
+           blocks die.  LIFETIME: a handler/cookie must stay callable until
+           unregister_ec_range for its RIP has returned and no call that
+           entered before it is still in flight -- the bridge retires its own
+           per-registration descriptors without freeing them (bounded by the
+           number of registrations ever made), but the embedder's cookie
+           lifetime is the embedder's problem.
+
+           64-bit guest processes only for now: registration in a 32-bit
+           process is refused with -3 (the i386 lane keeps the trap
+           protocol).                                                        */
+#define FEXBRIDGE_ABI_VERSION 7u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
@@ -358,6 +407,28 @@ void fexbridge_set_trap_view_handler(fexbridge_trap_view_fn cb, void* user);
    applies the full FP file.  Returns 0, negative on a NULL argument.       */
 int fexbridge_view_pull(void* thread, void* amd64_ctx, uint32_t flags);
 int fexbridge_view_push(void* thread, const void* amd64_ctx, uint32_t flags);
+
+/* ---- EC targets (ABI 7) ------------------------------------------------- */
+/* The EC handler.  `thread` is the fexbridge thread handle; `view` is the
+   ABI 6 trap view (arg0 in RCX, not R10 -- see the 6->7 changelog);
+   `cookie` is the registration's cookie.  Return FEXBRIDGE_TRAP_CONTINUE or
+   FEXBRIDGE_TRAP_EXIT.                                                     */
+typedef int (*fexbridge_ec_fn)(void* thread, struct fexbridge_trap_view* view, void* cookie);
+
+/* Register `rip` to compile as a direct host call to `handler`.  Callable
+   from any thread after process init; takes effect for every execution that
+   dispatches to `rip` after the call returns (any ordinary block already
+   compiled at exactly that address is invalidated here).  Idempotent for an
+   identical (handler, cookie) pair.
+   Returns 0 on success; -1 uninitialized/bad argument; -2 already registered
+   with a DIFFERENT handler or cookie; -3 32-bit guest process.             */
+int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* cookie);
+
+/* Remove every registration whose rip lies in [start, start+length) and
+   invalidate the range so compiled transition blocks die with it.  Returns
+   the number of registrations removed, or -1 uninitialized/bad argument.
+   See the 6->7 changelog for handler/cookie lifetime.                      */
+int fexbridge_unregister_ec_range(uint64_t start, uint64_t length);
 
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides

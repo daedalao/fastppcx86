@@ -362,6 +362,13 @@ public:
 
   void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;
 
+  bool AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) override;
+  void RemoveECTargetIRHandler(uintptr_t Entrypoint) override;
+  // True when GuestRIP is an EC-target registration (CompileCode's
+  // range-indexing carve-out for custom-IR blocks whose entrypoint is real
+  // guest memory).
+  bool IsECTargetEntrypoint(uint64_t GuestRIP);
+
   void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
 
   void RemoveForceTSOInformation(uint64_t Address, uint64_t Size) override;

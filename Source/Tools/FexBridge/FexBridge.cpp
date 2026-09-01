@@ -29,9 +29,11 @@ $end_info$
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/memory.h>
@@ -41,6 +43,8 @@ $end_info$
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <setjmp.h>
 #include <signal.h>
 #include <cerrno>
@@ -104,6 +108,37 @@ bool TrapCtxPoison {false};
 // stored), so the hot sink pays one acquire load and no environment read.
 std::atomic<fexbridge_trap_view_fn> TrapViewCb {nullptr};
 std::atomic<void*> TrapViewUser {nullptr};
+
+// EC targets (ABI 7).  One descriptor per registration, RETIRED but never
+// freed on unregister: a thread can be inside the transition's host call
+// when the unregister lands, and the descriptor must outlive that call.
+// Bounded by the number of registrations ever made (a Wine process registers
+// once per thunk export at module load), so this is the device-journal
+// bounded-leak pattern, chosen on purpose over a refcount on the hot path.
+struct EcDescriptor {
+  fexbridge_ec_fn Handler;
+  void* Cookie;
+  uint64_t Rip;
+};
+std::mutex EcLock;
+std::unordered_map<uint64_t, EcDescriptor*> EcTargets;      // live, by rip
+std::vector<EcDescriptor*> EcRetired;                       // unregistered, kept
+// Every live BridgeThread, so EC (un)registration can scrub per-thread
+// lookup caches: InvalidateCodeBuffersCodeRange only reaches the shared
+// per-CodeBuffer map, and a thread's own L1/L2 would otherwise keep serving
+// a dropped block to that thread forever (measured: the S14 fallback leg).
+// The Linux frontend does the same walk through its ThreadManager; the
+// bridge never had one because ordinary wine invalidations precede first
+// execution.  Guarded by BridgeThreadsLock, taken AFTER the code
+// invalidation mutex where both are held.
+std::mutex BridgeThreadsLock;
+std::vector<BridgeThread*> BridgeThreads;
+// The well-known name the emitted IROp_Thunk resolves through the installed
+// ThunkHandler.  Not a hash of anything: an opaque 32-byte tag this bridge
+// answers for and nothing else does.
+constexpr FEXCore::IR::SHA256Sum EcSha = {{'F', 'E', 'X', 'B', 'R', 'I', 'D', 'G', 'E', '-', 'E', 'C', '-', 'T', 'R', 'A',
+                                           'M', 'P', 'O', 'L', 'I', 'N', 'E', '-', 'A', 'B', 'I', '7', 0, 0, 0, 0}};
+
 uint64_t HltPageAddr {}; // one guest-visible HLT, used to end a run cooperatively
 bool Initialized {};
 bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
@@ -182,6 +217,52 @@ struct BridgeSignalDelegator final : public FEXCore::SignalDelegator, public FEX
 
 BridgeSyscallHandler* SyscallHandler {};
 BridgeSignalDelegator* SigDelegator {};
+
+// ---------------------------------------------------------------------------
+// EC transition trampoline (ABI 7).  The JIT calls this per DEF_OP(Thunk)'s
+// extended convention: first C argument = the registration descriptor (baked
+// into the transition block as an IR constant), second = the CpuStateFrame.
+// SRA is spilled by the emitted crossing before the call, so the frame's
+// State is the live truth and the view points straight at it -- the same
+// facts HandleSyscall's view path leans on, minus the CONTEXT machinery and
+// minus the trap decode entirely.
+// ---------------------------------------------------------------------------
+extern "C" void FexBridgeEcTrampoline(void* DescPtr, FEXCore::Core::CpuStateFrame* Frame) {
+  auto* Desc = static_cast<EcDescriptor*>(DescPtr);
+  auto* Thread = Frame->Thread;
+  BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
+
+  FEXBRIDGE_TRAP_VIEW View;
+  View.gregs = &Frame->State.gregs[0];
+  View.rip = &Frame->State.rip;
+  memset(View.reserved, 0, sizeof(View.reserved));
+
+  const int Result = Desc->Handler(BT, &View, Desc->Cookie);
+  if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
+    // Cooperative exit, exactly the sink's dance: park the continuation and
+    // route the guest through the bridge HLT so the JIT unwinds itself.  The
+    // emitted transition block reloads State.rip after this call, so the
+    // redirect takes effect at its indirect exit.
+    BT->RunTop->ExitRequested = true;
+    BT->RunTop->ExitRIP = Frame->State.rip;
+    Frame->State.rip = HltPageAddr;
+  }
+}
+
+// Serves the EC trampoline to the JIT for exactly the well-known EcSha tag;
+// every other lookup answers null (fail closed, same as a missing thunk).
+struct BridgeThunkHandler final : public FEXCore::ThunkHandler, public FEXCore::Allocator::FEXAllocOperators {
+  FEXCore::ThunkedFunction* LookupThunk(const FEXCore::IR::SHA256Sum& sha256) override {
+    if (memcmp(sha256.data, EcSha.data, sizeof(EcSha.data)) == 0) {
+      // Two C arguments at the machine level; ThunkedFunction is void(void*).
+      // ELFv2 makes the extra argument register invisible to a narrower
+      // callee, and DEF_OP(Thunk) always passes both.
+      return reinterpret_cast<FEXCore::ThunkedFunction*>(reinterpret_cast<void*>(&FexBridgeEcTrampoline));
+    }
+    return nullptr;
+  }
+};
+BridgeThunkHandler* ThunkHandlerInstance {};
 
 // ---------------------------------------------------------------------------
 // PROT_SAO hardware TSO (FEX_HWTSO).  The frontend's machinery lives in
@@ -731,6 +812,10 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   CTX = CTXPtr.release(); // process-lifetime; FEX teardown is not re-entered
   CTX->SetSignalDelegator(SigDelegator);
   CTX->SetSyscallHandler(SyscallHandler);
+  // EC targets (ABI 7): the JIT resolves the transition callee through this
+  // at compile time, so it must be installed before the first block compiles.
+  ThunkHandlerInstance = new BridgeThunkHandler();
+  CTX->SetThunkHandler(ThunkHandlerInstance);
   // Same ordering rule as the frontend's SetupTSOEmulation: hardware TSO must
   // be decided before the first block is compiled, so before InitCore.  The
   // embedder reads the verdict through fexbridge_hwtso_prot() after this
@@ -951,6 +1036,10 @@ int fexbridge_thread_init(void** thread_out) {
   // other writer, is deliberately not linked).
   Thread->FrontendPtr = BT;
   TLSThread = BT;
+  {
+    std::scoped_lock Lk {BridgeThreadsLock};
+    BridgeThreads.push_back(BT);
+  }
   *thread_out = BT;
   return 0;
 }
@@ -962,6 +1051,10 @@ void fexbridge_thread_term(void* thread) {
   }
   if (TLSThread == BT) {
     TLSThread = nullptr;
+  }
+  {
+    std::scoped_lock Lk {BridgeThreadsLock};
+    std::erase(BridgeThreads, BT);
   }
   CTX->DestroyThread(BT->Thread);
   ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
@@ -1155,6 +1248,79 @@ int fexbridge_get_fs_base(void* thread, uint64_t* base_out) {
   }
   *base_out = BT->Thread->CurrentFrame->State.fs_cached;
   return 0;
+}
+
+int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* cookie) {
+  if (!Initialized || !CTX || !rip || !handler) {
+    return -1;
+  }
+  if (!GuestIs64) {
+    return -3; // the i386 lane keeps the trap protocol for now
+  }
+  std::scoped_lock Lk {EcLock};
+  auto It = EcTargets.find(rip);
+  if (It != EcTargets.end()) {
+    return (It->second->Handler == handler && It->second->Cookie == cookie) ? 0 : -2;
+  }
+  auto* Desc = new EcDescriptor {handler, cookie, rip};
+  if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc)) {
+    // Claimed by a different custom-IR owner (or a racing different
+    // registration); nothing was installed.
+    delete Desc;
+    return -2;
+  }
+  EcTargets.emplace(rip, Desc);
+  // Drop any ordinary block already compiled at exactly this address so the
+  // next dispatch recompiles through the registration.  Same lock discipline
+  // as fexbridge_invalidate_code_range; EcLock never nests inside it.
+  {
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(rip, 1);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, rip, 1);
+    }
+  }
+  return 0;
+}
+
+int fexbridge_unregister_ec_range(uint64_t start, uint64_t length) {
+  if (!Initialized || !CTX) {
+    return -1;
+  }
+  if (!length) {
+    return 0;
+  }
+  int Removed = 0;
+  {
+    std::scoped_lock Lk {EcLock};
+    for (auto It = EcTargets.begin(); It != EcTargets.end();) {
+      if (It->first >= start && It->first - start < length) {
+        CTX->RemoveECTargetIRHandler(It->first);
+        EcRetired.push_back(It->second); // never freed; see EcDescriptor
+        It = EcTargets.erase(It);
+        ++Removed;
+      } else {
+        ++It;
+      }
+    }
+  }
+  if (Removed) {
+    // One invalidation over the whole range, AFTER every erase: a compile
+    // racing the walk can at worst produce a transition block from a not-yet
+    // erased registration, and this drop kills it; nothing can re-create one
+    // afterwards because the map entries are gone.  The per-thread scrub is
+    // what actually makes the CALLING thread stop hitting its own L1 copy of
+    // the transition (see the BridgeThreads comment); for other threads it is
+    // the documented soft cross-thread guarantee.
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(start, length);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, start, length);
+    }
+  }
+  return Removed;
 }
 
 void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {

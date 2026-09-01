@@ -1143,6 +1143,12 @@ DEF_OP(Thunk) {
   mr(r(12), TMP2);
   std(r2, 24, r1);     // save TOC (ELFv2 linkage area, unchanged offset)
   mtctr(TMP2);
+  // Second C argument: the CpuStateFrame.  The EC trampoline (fexbridge
+  // ABI 7) consumes it to reach the spilled register file without TLS; a
+  // Linux-thunk callee is void(void*) and ignores r4, which ELFv2 makes
+  // harmless.  TMP2 (== r4) is dead here: the callee address is already in
+  // CTR and its GEP copy in r12.
+  mr(TMP2, STATE);
   bctrl();
   ld(r2, 24, r1);      // restore TOC
 

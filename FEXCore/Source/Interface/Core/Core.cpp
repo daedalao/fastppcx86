@@ -1278,6 +1278,22 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   };
 }
 
+// EC targets (fexbridge ABI 7 / PPC64EC).  The Creator tag distinguishes
+// registrations made by AddECTargetIRHandler from thunk trampolines and any
+// other custom-IR owner: RemoveECTargetIRHandler never erases what it did not
+// create, and CompileCode's range-indexing carve-out below applies only to
+// these blocks.
+static char ECTargetCreatorTag;
+
+bool ContextImpl::IsECTargetEntrypoint(uint64_t GuestRIP) {
+  if (!HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  std::shared_lock lk(CustomIRMutex);
+  auto it = CustomIRHandlers.find(GuestRIP);
+  return it != CustomIRHandlers.end() && it->second.Creator == &ECTargetCreatorTag;
+}
+
 ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
   if (SourcecodeResolver && Config.GDBSymbols()) {
     auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
@@ -1489,6 +1505,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     if (SMCAuditCompileFD() >= 0 && BlockInfo->CodePages.empty()) {
       dprintf(SMCAuditCompileFD(), "compile rip=%lx NO-PAGES\n", GuestRIP);
+    }
+  } else if (IsECTargetEntrypoint(GuestRIP)) {
+    // An EC transition block is custom IR (no decode ran; the generic branch
+    // above would read STALE decoder state), but unlike a thunk trampoline
+    // its entrypoint is REAL guest memory -- a thunk stub -- and invalidation
+    // over that memory must be able to FIND this block: page-indexed erase is
+    // the only mechanism InvalidateCodeBuffersCodeRange / the thread caches
+    // have, and a block with no CodePages is invisible to it (measured: the
+    // S14 fallback leg kept transitioning after unregister+invalidate).
+    // Index the entrypoint's page exactly as a decoded one-byte block at
+    // GuestRIP would be.  MarkGuestExecutableRange on the stub page is
+    // harmless here (the bridge runs SMCCHECKS=0) and correct in general:
+    // the page really does hold code the guest can execute.
+    fextl::set<uint64_t> Entrypoints {GuestRIP};
+    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE - 1);
+    CodePages.push_back(Page);
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_PAGE_SIZE, GuestRIP, 1);
+    if (NewPage) {
+      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
     }
   }
 
@@ -1789,6 +1824,56 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
       LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
     }
   }
+}
+
+bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) {
+  LOGMAN_THROW_A_FMT(Entrypoint, "Tried to register an EC target at null");
+
+  auto Result = AddCustomIREntrypoint(
+    Entrypoint,
+    [ThunkNameHash, Descriptor](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
+      auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
+      auto Block = emit->CreateCodeNode(true, 0);
+      IRHeader.first->Blocks = emit->WrapNode(Block);
+      emit->SetCurrentCodeBlock(Block);
+
+      // The EC contract says *view->rip on entry is the registered RIP, and a
+      // linked-block entry does not maintain State.rip continuously -- store
+      // it explicitly before the crossing.
+      emit->_StoreContext(IR::OpSize::i64Bit, IR::RegClass::GPR, emit->Constant(Entrypoint), offsetof(Core::CPUState, rip));
+
+      // The host call.  DEF_OP(Thunk) hands the callee the descriptor in the
+      // first C argument and the CpuStateFrame in the second; the callee is
+      // resolved through the installed ThunkHandler for ThunkNameHash.
+      emit->_Thunk(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))), ThunkNameHash);
+
+      // The handler owns RIP; go look where it pointed us, through the
+      // ordinary dispatcher lookup.  This is OpDispatchBuilder::SyscallOp's
+      // OS_GENERIC block-end pattern spelled with the raw emitter.
+      auto NewRIP = emit->_LoadContext(IR::OpSize::i64Bit, IR::RegClass::GPR, offsetof(Core::CPUState, rip));
+      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+    },
+    &ECTargetCreatorTag, Descriptor);
+
+  if (Result.has_value()) {
+    // Already registered: stands only if it is OUR registration with the SAME
+    // descriptor (idempotent re-register); anything else is a refusal.
+    return Result->Creator == &ECTargetCreatorTag && Result->Data == Descriptor;
+  }
+  return true;
+}
+
+void ContextImpl::RemoveECTargetIRHandler(uintptr_t Entrypoint) {
+  std::unique_lock lk(CustomIRMutex);
+  auto it = CustomIRHandlers.find(Entrypoint);
+  if (it == CustomIRHandlers.end() || it->second.Creator != &ECTargetCreatorTag) {
+    return;
+  }
+  CustomIRHandlers.erase(it);
+  HasCustomIRHandlers = !CustomIRHandlers.empty();
+  // Deliberately NO invalidation here (unlike RemoveCustomIREntrypoint): the
+  // caller batches one invalidation over the whole unregistered range, under
+  // its own lock discipline, after every erase.
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
