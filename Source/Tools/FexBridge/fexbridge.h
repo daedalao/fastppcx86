@@ -430,6 +430,17 @@ int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* co
    See the 6->7 changelog for handler/cookie lifetime.                      */
 int fexbridge_unregister_ec_range(uint64_t start, uint64_t length);
 
+/* Batch registration: every rip in rips[0..count) with ONE handler/cookie,
+   ONE invalidation and ONE per-thread cache scrub over the whole span at the
+   end.  Exists because per-target registration of a large module's stub
+   array (ntdll: ~2400) costs a measurable stall -- ~1.1 ms -- inside
+   whatever the guest was timing when the module armed.  Zero rips are
+   skipped; a rip already registered with the SAME handler/cookie counts as
+   standing; one claimed by anything else is skipped.  Returns the number of
+   registrations standing from this call, or a negative from the same set as
+   fexbridge_register_ec_target.  Same lifetime rules.                      */
+int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie);
+
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides
    Rip/Rsp/etc. Returns 0 and a handle, negative on failure.                */

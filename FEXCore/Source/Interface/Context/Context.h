@@ -369,6 +369,14 @@ public:
   // guest memory).
   bool IsECTargetEntrypoint(uint64_t GuestRIP);
 
+  void SetFullFillThunkTag(const FEXCore::IR::SHA256Sum& ThunkNameHash) override;
+  // Compile-time query from DEF_OP(Thunk): must this thunk name take the
+  // full SRA refill?  Written once before the first compile, read with no
+  // lock (the ThunkHandler pointer's publication discipline).
+  bool IsFullFillThunk(const FEXCore::IR::SHA256Sum& ThunkNameHash) const;
+  FEXCore::IR::SHA256Sum FullFillThunkTag {};
+  bool HasFullFillThunkTag {};
+
   void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
 
   void RemoveForceTSOInformation(uint64_t Address, uint64_t Size) override;

@@ -1114,7 +1114,18 @@ DEF_OP(Thunk) {
   // elidable: v0-v15 are ELFv2-volatile and the frame copy is also what
   // signal delivery reads mid-call.
   static const bool NoPartialFill = getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr;
-  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill;
+  // An EC transition's callee (fexbridge ABI 7) WRITES the guest register
+  // file through the frame -- results, RIP, and on a fiber switch or an
+  // unwind redirect the whole file, exactly the registers the partial refill
+  // would leave stale in r14-r23 (and PF/AF) for the linked exit to keep
+  // executing with.  Compile-time decision, race-free: the full fill runs
+  // where the partial one would, with the sentinel still standing, so
+  // mid-window signal delivery keeps treating the frame as the truth.
+  // Measured before this branch existed: the wine fibers gate died on a
+  // stale callee-saved RDI after a SwitchToFiber served through a
+  // transition, and the seh-handlers gate lost unwind redirects the same way.
+  const bool EcFullFill = CTX->IsFullFillThunk(Op->ThunkNameHash);
+  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill && !EcFullFill;
 
   SpillForABICall(TMP1);
   if (PartialFill) {

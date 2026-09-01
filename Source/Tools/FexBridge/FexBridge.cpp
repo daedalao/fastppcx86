@@ -816,6 +816,12 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // at compile time, so it must be installed before the first block compiles.
   ThunkHandlerInstance = new BridgeThunkHandler();
   CTX->SetThunkHandler(ThunkHandlerInstance);
+  // The EC trampoline edits guest state through the frame, so its Thunk ops
+  // must take the FULL SRA refill (a fiber switch or an unwind redirect
+  // rewrites the registers the partial refill leaves stale).  Declared by
+  // name, decided per Thunk op at compile time; Linux-thunk crossings keep
+  // the elision.
+  CTX->SetFullFillThunkTag(EcSha);
   // Same ordering rule as the frontend's SetupTSOEmulation: hardware TSO must
   // be decided before the first block is compiled, so before InitCore.  The
   // embedder reads the verdict through fexbridge_hwtso_prot() after this
@@ -1282,6 +1288,63 @@ int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* co
     }
   }
   return 0;
+}
+
+int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie) {
+  // The batch form exists for a measured reason: a Wine thunk module arms on
+  // its FIRST trap, and per-target registration of ntdll's ~2400 exports --
+  // each taking the code-invalidation mutex and walking the thread registry
+  // -- cost ~1.1 ms inside whatever the guest was timing (the QPC interval
+  // gate caught it).  One lock hold to register, then ONE invalidation and
+  // ONE thread walk over the span.  At most one of these stubs has ever
+  // executed (the trap that triggered the arming), so the wide invalidation
+  // drops at most one trap block plus the transition-free span -- harmless
+  // and over-invalidation is always safe.
+  if (!Initialized || !CTX || !rips || !handler) {
+    return -1;
+  }
+  if (!GuestIs64) {
+    return -3;
+  }
+  uint64_t Lo = ~0ull, Hi = 0;
+  int Registered = 0;
+  {
+    std::scoped_lock Lk {EcLock};
+    for (uint32_t i = 0; i < count; i++) {
+      const uint64_t rip = rips[i];
+      if (!rip) {
+        continue;
+      }
+      auto It = EcTargets.find(rip);
+      if (It != EcTargets.end()) {
+        if (It->second->Handler == handler && It->second->Cookie == cookie) {
+          Registered++; // idempotent re-register counts as standing
+        }
+        continue;
+      }
+      auto* Desc = new EcDescriptor {handler, cookie, rip};
+      if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc)) {
+        delete Desc;
+        continue;
+      }
+      EcTargets.emplace(rip, Desc);
+      Registered++;
+      Lo = rip < Lo ? rip : Lo;
+      Hi = rip > Hi ? rip : Hi;
+    }
+  }
+  if (Lo <= Hi) {
+    // A stub between registration and this drop still traps off its old
+    // block -- correct, just slow -- and nothing serves a stale transition,
+    // because no transition existed before this call.
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(Lo, Hi - Lo + 16);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, Lo, Hi - Lo + 16);
+    }
+  }
+  return Registered;
 }
 
 int fexbridge_unregister_ec_range(uint64_t start, uint64_t length) {

@@ -176,6 +176,21 @@ public:
    */
   FEX_DEFAULT_VISIBILITY virtual void RemoveECTargetIRHandler(uintptr_t Entrypoint) = 0;
 
+  /**
+   * @brief Declare ONE thunk name whose callee edits the guest register file
+   * through the spilled CpuStateFrame (the fexbridge ABI 7 EC trampoline).
+   *
+   * A thunk crossing normally elides the non-volatile SRA refill after the
+   * host call -- sound for Linux library thunks, whose callees never touch
+   * guest state.  An EC callee's whole JOB is writing guest state (results,
+   * RIP, and on a fiber switch or an unwind the entire file), so a Thunk op
+   * carrying this name must take the FULL refill road inside its own emitted
+   * sequence -- the only race-free point: the sentinel still stands there,
+   * so a signal landing mid-window still treats the frame as the truth.
+   * Set before the first block compiles (beside SetThunkHandler).
+   */
+  FEX_DEFAULT_VISIBILITY virtual void SetFullFillThunkTag(const FEXCore::IR::SHA256Sum& ThunkNameHash) = 0;
+
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunction(uint32_t Function, uint32_t Leaf) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::XCRResults RunXCRFunction(uint32_t Function) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) = 0;

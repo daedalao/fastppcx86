@@ -1863,6 +1863,15 @@ bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::
   return true;
 }
 
+void ContextImpl::SetFullFillThunkTag(const FEXCore::IR::SHA256Sum& ThunkNameHash) {
+  FullFillThunkTag = ThunkNameHash;
+  HasFullFillThunkTag = true;
+}
+
+bool ContextImpl::IsFullFillThunk(const FEXCore::IR::SHA256Sum& ThunkNameHash) const {
+  return HasFullFillThunkTag && memcmp(FullFillThunkTag.data, ThunkNameHash.data, sizeof(FullFillThunkTag.data)) == 0;
+}
+
 void ContextImpl::RemoveECTargetIRHandler(uintptr_t Entrypoint) {
   std::unique_lock lk(CustomIRMutex);
   auto it = CustomIRHandlers.find(Entrypoint);
