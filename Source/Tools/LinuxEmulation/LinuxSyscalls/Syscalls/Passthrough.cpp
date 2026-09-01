@@ -13,6 +13,7 @@ $end_info$
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
+#include "LinuxSyscalls/CoreIsolation.h"
 #include "LinuxSyscalls/ThreadCensus.h"
 #include "VDSO_Emulation.h"
 
@@ -21,6 +22,7 @@ $end_info$
 #endif
 
 #include <FEXCore/IR/IR.h>
+#include <FEXHeaderUtils/Syscalls.h>
 
 #include <algorithm>
 #include <errno.h>
@@ -803,6 +805,11 @@ static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
     const bool Readable = GuestStructReadable(mask, Result);
     FEX::HLE::ThreadCensus::OnSetAffinity(static_cast<int64_t>(pid), Readable ? reinterpret_cast<const uint8_t*>(mask) : nullptr,
                                           Readable ? cpusetsize : 0, static_cast<int64_t>(Result));
+  }
+  if (Result == 0) {
+    // The guest placed this thread deliberately; CoreIsolation must never
+    // override it. pid==0 targets the caller (host tid == guest tid).
+    FEX::HLE::CoreIsolation::OnGuestSetAffinity(pid == 0 ? static_cast<uint32_t>(FHU::Syscalls::gettid()) : static_cast<uint32_t>(pid));
   }
   return Result;
 }

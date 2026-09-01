@@ -71,6 +71,12 @@ void OnSetAffinity(int64_t TargetTID, const uint8_t* Mask, size_t MaskBytes, int
 // "rr" step and a nice level for the "nice" steps.
 void OnSchedBoost(int64_t TargetTID, const char* Step, int Policy, int Value, int64_t HostResult, int64_t GuestResult);
 
+// One CoreIsolation manager decision (candidate/engage/evict/skip/release —
+// see CoreIsolation.cpp for the vocabulary). Tid is the thread the decision
+// is about, or -1 for process-wide events. Detail is a preformatted
+// "key=val ..." payload; the census adds the standard line prefix.
+void OnIsolationEvent(int64_t Tid, std::string_view Detail);
+
 // The statically-linked ("MonoKickstart") Mono fallback armed the
 // backpatcher range from the main executable's own mapping instead of a
 // dynamic libmono*.so. Reason is the signal that triggered it ("mono data

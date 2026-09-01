@@ -220,6 +220,14 @@ void OnSchedBoost(int64_t TargetTID, const char* Step, int Policy, int Value, in
            HostResult, GuestResult);
 }
 
+void OnIsolationEvent(int64_t Tid, std::string_view Detail) {
+  if (!Enabled()) {
+    return;
+  }
+
+  EmitLine(Tid, "isolate", " {}", Detail);
+}
+
 void OnMonoFallbackArmed(std::string_view Reason, std::string_view Detail, uint64_t Base, uint64_t End) {
   if (!Enabled()) {
     return;

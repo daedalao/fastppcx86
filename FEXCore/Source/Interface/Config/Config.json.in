@@ -893,6 +893,20 @@
           "cannot change program semantics -- worst case is a priority dip in a loop that was about to do real work."
         ]
       },
+      "CoreIsolate": {
+        "Type": "uint32",
+        "Default": "0",
+        "Desc": [
+          "Host-side scheduling: give the critical guest thread a whole physical core. 0 (default) off; nonzero enables the",
+          "CoreIsolation manager (see docs/CORE_ISOLATION_PLAN.md), which samples per-thread CPU share at 2Hz, picks the sustained-top",
+          "guest thread (voluntary-context-switch vetted, so futex-cycling spinners are rejected), and after four stable windows pins it",
+          "to a reserved core while evicting every other thread in the process to the remaining CPUs. On POWER8 the vacated SMT siblings",
+          "put the core in effective-ST mode, which is direct single-thread throughput for the render/main thread.",
+          "Purely advisory host scheduling: guest-visible affinity/getcpu semantics are untouched, and any thread the guest ever",
+          "sched_setaffinity'd is never overridden. Requires at least two fully-owned cores in the allowed mask; otherwise disables itself.",
+          "Decisions are logged to the ThreadCensus file (event=isolate) when FEX_THREADCENSUS is set."
+        ]
+      },
       "SpinCollapse": {
         "Type": "uint32",
         "Default": "0",

@@ -3601,8 +3601,16 @@ template<>
 struct fex_gen_config<vkGetSwapchainImagesKHR> {};
 template<>
 struct fex_gen_config<vkAcquireNextImageKHR> {};
+#ifndef IS_32BIT_THUNK
+// custom_host_impl solely to notify FEX of the presenting thread
+// (CoreIsolation); the wrapper is otherwise a plain passthrough. 64-bit only
+// so the 32-bit repack path stays fully generated.
+template<>
+struct fex_gen_config<vkQueuePresentKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkQueuePresentKHR> {};
+#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetDeviceGroupPresentCapabilitiesKHR> {};

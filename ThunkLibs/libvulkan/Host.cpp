@@ -17,6 +17,7 @@ $end_info$
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <cstdarg>
 #include <cstring>
@@ -869,6 +870,23 @@ VkResult fexfn_impl_libvulkan_vkEnumeratePhysicalDevices(VkInstance instance, ui
   }
   return ret;
 }
+
+#ifndef IS_32BIT_THUNK
+// CoreIsolation presenter ground truth (docs/CORE_ISOLATION_PLAN.md): record
+// which guest thread performs presents. FEX_NotifyGuestPresent lives in the
+// FEX binary with default visibility; under an FEX build without it (or a
+// foreign host loader) dlsym returns null once and this stays a plain
+// passthrough. 64-bit only — the 32-bit thunk keeps its generated path so
+// this hook cannot disturb the 32-bit repack machinery.
+static VkResult fexfn_impl_libvulkan_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
+  using NotifyFn = void (*)();
+  static const NotifyFn Notify = reinterpret_cast<NotifyFn>(dlsym(RTLD_DEFAULT, "FEX_NotifyGuestPresent"));
+  if (Notify) {
+    Notify();
+  }
+  return LDR_PTR(vkQueuePresentKHR)(queue, present_info);
+}
+#endif
 
 void fexfn_impl_libvulkan_vkGetDeviceQueue(VkDevice device, uint32_t family_index, uint32_t queue_index, guest_layout<VkQueue*> queue) {
   VkQueue out;
