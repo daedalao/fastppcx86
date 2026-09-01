@@ -1109,6 +1109,23 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // No frontend => no mprotect-based SMC tracking host. The caller reports
   // code writes through fexbridge_invalidate_code_range.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
+  // The lazy-SMC trio must fall with it.  The gaming launcher exports
+  // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
+  // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore
+  // constructor) and compiles in the lazy-link regime, whose soundness
+  // contract is "same-thread drains ride the InterruptFaultPage poke".  In
+  // this lane that machinery has no host: DrainLazySMCInvalidations is the
+  // SyscallHandler base-class no-op, no SIGSEGV handler marks dirty pages,
+  // and nothing ever arms a fault page.  The banner the regime prints was a
+  // promise nobody here keeps.  With the trio off, BlockLinking stays
+  // enabled on the ordinary eager contract -- fexbridge_invalidate_code_range
+  // severs shared inbound links (Erase -> SeverLinks) and scrubs every
+  // BridgeThread's dispatch caches + CallRet stack synchronously -- and
+  // CallLinkingEnabled comes back (the lazy regime disabled call-exit
+  // linking to survive a sever-storm this lane never has).
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYINVAL, "0");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYSCRUB, "0");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYLINK, "0");
 
   auto HostFeatures = FEX::FetchHostFeatures();
   auto CTXPtr = FEXCore::Context::Context::CreateNewContext(HostFeatures);
