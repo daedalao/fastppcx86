@@ -3095,6 +3095,54 @@ DEF_OP(VInsElement) {
     return;
   }
 
+  // i32 same-index insert at a doubleword *boundary* lane (LE element 0 or 3)
+  // is a 2-insn xxsldwi pair, not a vperm. This is the movss/movsd-adjacent
+  // reg-reg path: MOVScalarOpImpl/VMOVScalarOpImpl emit exactly
+  // VInsElement(i32, DestIdx=0, SrcIdx=0) for `movss xmm,xmm`, and
+  // VectorBlend's 0b0001/0b1000 (blendps imm) selectors emit the (0,0) and
+  // (3,3) cases respectively.
+  //
+  // Derivation (LE element E <-> BE word index W via W = 3-E, the same
+  // mapping the i64Bit case above documents for doublewords):
+  //   xxsldwi(T,A,B,s) takes 4 consecutive BE words from the 8-word
+  //   concatenation [A.w0,A.w1,A.w2,A.w3,B.w0,B.w1,B.w2,B.w3] starting at
+  //   word s. For s=3, T = [A.w3, B.w0, B.w1, B.w2] -- one word of A plus
+  //   three (but not all four) words of B; this only yields "3 words of one
+  //   operand + the 1 replacement word" at the two ends of the
+  //   concatenation (s=1 or s=3), which is exactly W=0 or W=3, i.e. LE
+  //   element 3 or element 0. Middle elements (1,2) have no such 2-insn
+  //   form and keep using the general vperm path below.
+  //
+  //   DestIdx=SrcIdx=0 (W=3): T = xxsldwi(SrcVec,DestVec,3)
+  //                              = [Src.w3, Dst.w0, Dst.w1, Dst.w2]
+  //                              = [Src.elem0, Dst.elem3, Dst.elem2, Dst.elem1]
+  //                           Dst = xxsldwi(T,T,1) rotates T left one word:
+  //                              = [Dst.elem3, Dst.elem2, Dst.elem1, Src.elem0]
+  //                              i.e. elem0=Src.elem0, elem[1..3]=Dst.elem[1..3]. ✓
+  //   DestIdx=SrcIdx=3 (W=0): symmetric with operand order and shifts
+  //                           swapped: T = xxsldwi(DestVec,SrcVec,1)
+  //                              = [Dst.w1, Dst.w2, Dst.w3, Src.w0]
+  //                              = [Dst.elem2, Dst.elem1, Dst.elem0, Src.elem3]
+  //                           Dst = xxsldwi(T,T,3) rotates T left three words
+  //                              = [Src.elem3, Dst.elem2, Dst.elem1, Dst.elem0]
+  //                              i.e. elem3=Src.elem3, elem[0..2]=Dst.elem[0..2]. ✓
+  //
+  // Both forms write Dst only after fully consuming DestVec/SrcVec into the
+  // scratch register, so Dst may alias either source (same property as the
+  // i64Bit case above). Hardware-verified against real x86 movss/blendps
+  // semantics -- see docs/sessions/2026-08-29/scalar-lowering-fixes.md §1.
+  // 14 -> 2 host instructions.
+  if (ElemSz == IR::OpSize::i32Bit && DestIdx == SrcIdx && (DestIdx == 0 || DestIdx == 3)) {
+    if (DestIdx == 0) {
+      xxsldwi(VTMP1, SrcVec, DestVec, 3);
+      xxsldwi(Dst, VTMP1, VTMP1, 1);
+    } else {
+      xxsldwi(VTMP1, DestVec, SrcVec, 1);
+      xxsldwi(Dst, VTMP1, VTMP1, 3);
+    }
+    return;
+  }
+
   // Strategy: copy DestVec to Dst, then use vperm to insert.
   // Build a 16-byte perm control vector where:
   //   perm[byte] selects from [DestVec (indices 0-15) : SrcVec (indices 16-31)]

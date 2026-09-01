@@ -2594,8 +2594,16 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
                       "FEX_SMCLAZYLINK=1 lifts the LAZYINVAL restriction).");
     BlockLinkingEnabled = false;
   } else if (BlockLinkingEnabled && FEXCore::Config::Get_SMCLAZYINVAL() && LazyLinkArmed) {
-    LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
-                      "same-thread drains ride the InterruptFaultPage poke.");
+    // Announce the decision once per process (this constructor runs per guest
+    // thread, and every thread would otherwise re-derive and re-log the same
+    // process-wide config verdict -- observed flooding logs to 96% of all
+    // lines on guests that create many threads). Same idiom as the
+    // exit-RIP-width Announce below.
+    static std::once_flag SMCLazyLinkAnnounce;
+    std::call_once(SMCLazyLinkAnnounce, [] {
+      LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
+                        "same-thread drains ride the InterruptFaultPage poke.");
+    });
   }
 
   // Constant-target CALL exits (BranchHint::Call) link only when block linking
