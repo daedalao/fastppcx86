@@ -2945,7 +2945,7 @@ static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*>
 }
 static GuestSerializeState* GuestSerializeLock() {
   static GuestSerializeState* const Lock = []() -> GuestSerializeState* {
-    if (GuestSerializeLists().first->empty()) {
+    if (GuestSerializeLists().first->empty() && GuestSerializeRVALists().first->empty()) {
       return nullptr;
     }
     void* M = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -2958,9 +2958,139 @@ static GuestSerializeState* GuestSerializeLock() {
   return Lock;
 }
 
+// -------------------------------------------------------------------------
+// FEX_GUESTANCHOR: ASLR-proof base discovery for the two features above
+// -------------------------------------------------------------------------
+// FEX_GUESTANCHOR=<rva>:<hex bytes, up to 16> names one well-known function
+// entry inside the target module by its image-relative address and its first
+// bytes. During compilation, any block whose guest entry matches the anchor's
+// low 16 bits (module bases are 64KiB-aligned) AND whose guest memory equals
+// the byte signature fixes the module base as GuestEntry - rva; from then on
+// FEX_GUESTTRACE_RVA (comma rvas) and FEX_GUESTSERIALIZE_RVA (entry:exit rva
+// pairs) resolve against that base. Needed because wine may rebase a PE on
+// every launch (the fexproton lane does; the wine-native lane maps the W3 exe
+// at its preferred base) -- absolute-address target lists cannot survive that.
+// Blocks compiled BEFORE discovery are not instrumented: pick an anchor that
+// is the first function of interest to compile (for W3, AddToBucket -- the
+// allocator's construction calls it before any other traced entry).
+// 64-bit guests are identity-mapped in both lanes, so guest VAs are directly
+// readable host pointers here; the entry being compiled is mapped by
+// definition. Discovered base is also stamped into the trace ring header's
+// Reserved field so decoders can rebase records.
+struct GuestAnchorSpec {
+  uint64_t RVA;
+  uint8_t Sig[16];
+  uint32_t SigLen;
+};
+static const GuestAnchorSpec* GuestAnchor() {
+  static const GuestAnchorSpec Spec = []() {
+    GuestAnchorSpec Out {};
+    const char* Env = getenv("FEX_GUESTANCHOR");
+    if (!Env) {
+      return Out;
+    }
+    char* End {};
+    Out.RVA = std::strtoull(Env, &End, 16);
+    if (!Out.RVA || *End != ':') {
+      Out.RVA = 0;
+      return Out;
+    }
+    const char* Hex = End + 1;
+    while (Out.SigLen < 16 && Hex[0] && Hex[1]) {
+      auto Nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      const int Hi = Nib(Hex[0]), Lo = Nib(Hex[1]);
+      if (Hi < 0 || Lo < 0) {
+        break;
+      }
+      Out.Sig[Out.SigLen++] = static_cast<uint8_t>((Hi << 4) | Lo);
+      Hex += 2;
+    }
+    if (Out.SigLen < 8) {
+      Out.RVA = 0; // too weak a signature to trust
+    }
+    return Out;
+  }();
+  return Spec.RVA ? &Spec : nullptr;
+}
+static std::atomic<uint64_t> GuestAnchorBaseAtomic {};
+static const fextl::vector<uint64_t>& GuestTraceRVATargets() {
+  static const fextl::vector<uint64_t> Targets = []() {
+    fextl::vector<uint64_t> Out {};
+    const char* Env = getenv("FEX_GUESTTRACE_RVA");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t RVA = std::strtoull(Env, &End, 16);
+      if (End == Env) {
+        break;
+      }
+      if (RVA) {
+        Out.push_back(RVA);
+      }
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return Targets;
+}
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeRVALists() {
+  static const std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Lists = []() {
+    std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Out {};
+    const char* Env = getenv("FEX_GUESTSERIALIZE_RVA");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t Entry = std::strtoull(Env, &End, 16);
+      if (End == Env || *End != ':') {
+        break;
+      }
+      const char* ExitStr = End + 1;
+      const uint64_t Exit = std::strtoull(ExitStr, &End, 16);
+      if (End == ExitStr || !Entry || !Exit) {
+        break;
+      }
+      Out.first.push_back(Entry);
+      Out.second.push_back(Exit);
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return {&Lists.first, &Lists.second};
+}
+static GuestTraceRingHeader* GuestTraceRingPtrFwd(); // defined below
+static void GuestAnchorTryDiscover(uint64_t GuestEntry) {
+  const auto* Anchor = GuestAnchor();
+  if (!Anchor || GuestAnchorBaseAtomic.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (((GuestEntry ^ Anchor->RVA) & 0xFFFF) != 0 || GuestEntry < Anchor->RVA) {
+    return;
+  }
+  if (::memcmp(reinterpret_cast<const void*>(GuestEntry), Anchor->Sig, Anchor->SigLen) != 0) {
+    return;
+  }
+  const uint64_t Base = GuestEntry - Anchor->RVA;
+  uint64_t Expected = 0;
+  if (GuestAnchorBaseAtomic.compare_exchange_strong(Expected, Base, std::memory_order_release)) {
+    LogMan::Msg::IFmt("FEX_GUESTANCHOR: module base discovered: 0x{:x} (anchor rva 0x{:x})", Base, Anchor->RVA);
+    if (auto* Ring = GuestTraceRingPtrFwd()) {
+      Ring->Reserved = Base;
+    }
+  }
+}
+
 static GuestTraceRingHeader* GuestTraceRingPtr() {
   static GuestTraceRingHeader* const Ring = []() -> GuestTraceRingHeader* {
-    if (GuestTraceTargets().empty()) {
+    if (GuestTraceTargets().empty() && GuestTraceRVATargets().empty()) {
       return nullptr;
     }
     char Path[64];
@@ -2993,6 +3123,9 @@ static GuestTraceRingHeader* GuestTraceRingPtr() {
     return H;
   }();
   return Ring;
+}
+static GuestTraceRingHeader* GuestTraceRingPtrFwd() {
+  return GuestTraceRingPtr();
 }
 
 // EmitStoreBlockBeginToInlineHeader
@@ -5506,15 +5639,23 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         LogMan::Msg::IFmt("EntryWatch: slot {} watching dispatcher entries at guest RIP 0x{:x}", (EntryWatchNextSlot.load() - 1) % std::size(FEX_EntryWatch),
                           GuestEntry);
       }
+      // FEX_GUESTANCHOR module-base discovery + rva resolution for the two
+      // instrumentation features below (definitions above GuestTraceRingPtr).
+      GuestAnchorTryDiscover(GuestEntry);
+      const uint64_t AnchorBase = GuestAnchorBaseAtomic.load(std::memory_order_acquire);
+      const uint64_t GuestEntryRVA = (AnchorBase && GuestEntry > AnchorBase) ? GuestEntry - AnchorBase : 0;
       // FEX_GUESTSERIALIZE lock injection (definition above GuestTraceRingPtr).
       // Same prologue register contract as the trace below: TMP1/TMP2 scratch,
       // TMP3 carries the saved CR, guest CR restored at the end of each
       // sequence. Acquire spins on the Owner word (recursive via STATE
       // identity + depth), isync on acquisition; release is a silent no-op
       // for a non-owner so unpaired paths cannot underflow.
-      if (const auto [SerEntries, SerExits] = GuestSerializeLists(); !SerEntries->empty()) {
-        const bool IsEntry = std::find(SerEntries->begin(), SerEntries->end(), GuestEntry) != SerEntries->end();
-        const bool IsExit = std::find(SerExits->begin(), SerExits->end(), GuestEntry) != SerExits->end();
+      const auto [SerRVAEntries, SerRVAExits] = GuestSerializeRVALists();
+      if (const auto [SerEntries, SerExits] = GuestSerializeLists(); !SerEntries->empty() || !SerRVAEntries->empty()) {
+        const bool IsEntry = std::find(SerEntries->begin(), SerEntries->end(), GuestEntry) != SerEntries->end() ||
+                             (GuestEntryRVA && std::find(SerRVAEntries->begin(), SerRVAEntries->end(), GuestEntryRVA) != SerRVAEntries->end());
+        const bool IsExit = std::find(SerExits->begin(), SerExits->end(), GuestEntry) != SerExits->end() ||
+                            (GuestEntryRVA && std::find(SerRVAExits->begin(), SerRVAExits->end(), GuestEntryRVA) != SerRVAExits->end());
         if (auto* SerLock = (IsEntry || IsExit) ? GuestSerializeLock() : nullptr) {
           mfcr(TMP3);
           LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
@@ -5559,8 +5700,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // only live state is SRA + STATE + the r0==0 invariant + guest CR,
       // which is saved first and restored last. r0 is used only as the
       // "literal zero" RA slot of ldarx/stdcx., never written.
+      const auto& TraceRVATargets = GuestTraceRVATargets();
       if (const auto& TraceTargets = GuestTraceTargets();
-          !TraceTargets.empty() && std::find(TraceTargets.begin(), TraceTargets.end(), GuestEntry) != TraceTargets.end()) {
+          (!TraceTargets.empty() && std::find(TraceTargets.begin(), TraceTargets.end(), GuestEntry) != TraceTargets.end()) ||
+          (GuestEntryRVA && !TraceRVATargets.empty() &&
+           std::find(TraceRVATargets.begin(), TraceRVATargets.end(), GuestEntryRVA) != TraceRVATargets.end())) {
         if (auto* Ring = GuestTraceRingPtr()) {
           const auto [DerefBase, DerefLen] = GuestTraceDeref();
           // SRA index follows the X86State enum: RAX=0, RCX=1, RDX=2, RBX=3.

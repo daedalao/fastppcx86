@@ -402,16 +402,29 @@ uint64_t ComputeCodeCacheConfigId() {
       Hasher.Add(static_cast<uint64_t>(!(ZExtConsumerEnv && ZExtConsumerEnv[0] == '0')));
       const char* ZExtProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
       Hasher.Add(static_cast<uint64_t>(!(ZExtProducerEnv && ZExtProducerEnv[0] == '0')));
-      // FEX_GUESTTRACE / FEX_GUESTTRACE_DEREF (JIT.cpp forensics ring): the
-      // target list and deref window both change the emitted prologue of any
+      // FEX_GUESTTRACE / FEX_GUESTSERIALIZE / FEX_GUESTANCHOR family (JIT.cpp
+      // instrumentation): the target lists change the emitted prologue of any
       // matched block, so hash the raw strings (FNV-1a) rather than presence.
+      // MOREOVER, instrumented prologues bake per-process pointers into host
+      // code (the trace ring mmap, the serialize lock word) and, in anchor
+      // mode, per-LAUNCH module bases -- a cached instrumented block served in
+      // a later process would poke another process's addresses. While any of
+      // these is armed, fold in a per-process random salt so the cache never
+      // matches across runs; disarming the envs restores normal caching.
       {
+        bool Armed = false;
         uint64_t H = 0xcbf29ce484222325ull;
-        for (const char* Env : {getenv("FEX_GUESTTRACE"), getenv("FEX_GUESTTRACE_DEREF"), getenv("FEX_GUESTSERIALIZE")}) {
+        for (const char* Env : {getenv("FEX_GUESTTRACE"), getenv("FEX_GUESTTRACE_DEREF"), getenv("FEX_GUESTSERIALIZE"),
+                                getenv("FEX_GUESTTRACE_RVA"), getenv("FEX_GUESTSERIALIZE_RVA"), getenv("FEX_GUESTANCHOR")}) {
+          Armed |= (Env && *Env);
           for (; Env && *Env; ++Env) {
             H = (H ^ static_cast<uint8_t>(*Env)) * 0x100000001b3ull;
           }
           H = (H ^ 0xff) * 0x100000001b3ull; // separator so "a",""/"","a" differ
+        }
+        if (Armed) {
+          static const uint64_t ProcessSalt = (static_cast<uint64_t>(::getpid()) << 32) ^ static_cast<uint64_t>(::time(nullptr));
+          H ^= ProcessSalt;
         }
         Hasher.Add(H);
       }

@@ -40,9 +40,15 @@ KNOWN_RIPS = {
 def load(path):
     with open(path, "rb") as f:
         data = f.read()
-    magic, recsize, cap, dbase, dlen, _resv, idx = struct.unpack_from("<7Q", data, 0)
+    magic, recsize, cap, dbase, dlen, resv, idx = struct.unpack_from("<7Q", data, 0)
     if magic != MAGIC:
         sys.exit(f"bad magic {magic:#x}; not a guesttrace ring")
+    if resv:
+        # FEX_GUESTANCHOR stamped the discovered module base here; rebase the
+        # known-function name table so rva-mode rings decode identically.
+        global KNOWN_RIPS
+        KNOWN_RIPS = {(rip - 0x140000000) + resv: name for rip, name in KNOWN_RIPS.items()}
+        print(f"anchor base: {resv:#x} (rvas rebased)")
     recs = []
     lo = max(0, idx - cap)  # oldest still-present claim number
     for claim in range(lo, idx):
