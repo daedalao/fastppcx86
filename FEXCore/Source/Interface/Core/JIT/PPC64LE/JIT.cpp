@@ -2896,6 +2896,68 @@ static std::pair<int16_t, int16_t> GuestTraceDeref() {
   return Window;
 }
 
+// -------------------------------------------------------------------------
+// FEX_GUESTSERIALIZE: inject a missing guest-side lock
+// -------------------------------------------------------------------------
+// FEX_GUESTSERIALIZE=<entry>:<exit>[,<entry>:<exit>...] (hex guest RIPs):
+// every dispatcher entry into an <entry> block acquires a single process-
+// global recursive spinlock (owner = STATE pointer, depth-counted for
+// nesting); every entry into an <exit> block releases one level if this
+// thread owns it (and is a silent no-op otherwise, so paths that bypass the
+// paired entry cannot underflow or wedge). Built for the W3 TLSF campaign:
+// the engine's parallel retirement sweeps free into one suballocator with no
+// lock of their own -- serializing destructor entry (0x14070a960) against
+// its sweep return site (0x141c9703b) injects the exclusion the game forgot.
+// A diagnostic/per-title lever, default fully off; both env strings join the
+// CodeCache config hash. The spinlock word lives in a private mmap so a
+// crash cannot leave it in a file. DEADLOCK NOTE: a serialized region that
+// blocks forever wedges every other acquirer -- only serialize regions that
+// provably run straight-line (frees, small mutators).
+struct GuestSerializeState {
+  uint64_t Owner; // STATE pointer of the holder, 0 = free (ldarx/stdcx.)
+  uint64_t Depth; // recursion depth, mutated only by the holder
+};
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeLists() {
+  static const std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Lists = []() {
+    std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Out {};
+    const char* Env = getenv("FEX_GUESTSERIALIZE");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t Entry = std::strtoull(Env, &End, 16);
+      if (End == Env || *End != ':') {
+        break;
+      }
+      const char* ExitStr = End + 1;
+      const uint64_t Exit = std::strtoull(ExitStr, &End, 16);
+      if (End == ExitStr || !Entry || !Exit) {
+        break;
+      }
+      Out.first.push_back(Entry);
+      Out.second.push_back(Exit);
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return {&Lists.first, &Lists.second};
+}
+static GuestSerializeState* GuestSerializeLock() {
+  static GuestSerializeState* const Lock = []() -> GuestSerializeState* {
+    if (GuestSerializeLists().first->empty()) {
+      return nullptr;
+    }
+    void* M = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (M == MAP_FAILED) {
+      return nullptr;
+    }
+    LogMan::Msg::IFmt("FEX_GUESTSERIALIZE: armed, {} region(s)", GuestSerializeLists().first->size());
+    return static_cast<GuestSerializeState*>(M);
+  }();
+  return Lock;
+}
+
 static GuestTraceRingHeader* GuestTraceRingPtr() {
   static GuestTraceRingHeader* const Ring = []() -> GuestTraceRingHeader* {
     if (GuestTraceTargets().empty()) {
@@ -5443,6 +5505,51 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         std(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, Count)), TMP1);
         LogMan::Msg::IFmt("EntryWatch: slot {} watching dispatcher entries at guest RIP 0x{:x}", (EntryWatchNextSlot.load() - 1) % std::size(FEX_EntryWatch),
                           GuestEntry);
+      }
+      // FEX_GUESTSERIALIZE lock injection (definition above GuestTraceRingPtr).
+      // Same prologue register contract as the trace below: TMP1/TMP2 scratch,
+      // TMP3 carries the saved CR, guest CR restored at the end of each
+      // sequence. Acquire spins on the Owner word (recursive via STATE
+      // identity + depth), isync on acquisition; release is a silent no-op
+      // for a non-owner so unpaired paths cannot underflow.
+      if (const auto [SerEntries, SerExits] = GuestSerializeLists(); !SerEntries->empty()) {
+        const bool IsEntry = std::find(SerEntries->begin(), SerEntries->end(), GuestEntry) != SerEntries->end();
+        const bool IsExit = std::find(SerExits->begin(), SerExits->end(), GuestEntry) != SerExits->end();
+        if (auto* SerLock = (IsEntry || IsExit) ? GuestSerializeLock() : nullptr) {
+          mfcr(TMP3);
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
+          if (IsEntry) {
+            PPC64Emitter::Label Retry {}, Mine {};
+            Bind(&Retry);
+            ldarx(TMP2, r0, TMP1);
+            cmpd(cr(0), TMP2, STATE);
+            bc(CC_EQ, &Mine);       // recursive re-entry: skip the claim
+            cmpdi(TMP2, 0);
+            bc(CC_NE, &Retry);      // held by another thread: spin
+            stdcx_(STATE, r0, TMP1);
+            bc(CC_NE, &Retry);      // reservation lost: retry
+            Bind(&Mine);
+            isync();                // acquire barrier
+            ld(TMP2, 8, TMP1);      // Depth
+            addi(TMP2, TMP2, 1);
+            std(TMP2, 8, TMP1);
+          } else {
+            PPC64Emitter::Label SkipRel {};
+            ld(TMP2, 0, TMP1);
+            cmpd(cr(0), TMP2, STATE);
+            bc(CC_NE, &SkipRel);    // not the owner: no-op
+            ld(TMP2, 8, TMP1);
+            addi(TMP2, TMP2, -1);
+            std(TMP2, 8, TMP1);
+            cmpdi(TMP2, 0);
+            bc(CC_NE, &SkipRel);    // still nested: keep ownership
+            lwsync();               // release barrier
+            li(TMP2, 0);
+            std(TMP2, 0, TMP1);     // Owner = 0
+            Bind(&SkipRel);
+          }
+          mtcr(TMP3);
+        }
       }
       // FEX_GUESTTRACE ring store (definition above EmitStoreBlockBeginToInlineHeader).
       // Register contract at this point in the prologue: TMP1/TMP2 are

@@ -407,7 +407,7 @@ uint64_t ComputeCodeCacheConfigId() {
       // matched block, so hash the raw strings (FNV-1a) rather than presence.
       {
         uint64_t H = 0xcbf29ce484222325ull;
-        for (const char* Env : {getenv("FEX_GUESTTRACE"), getenv("FEX_GUESTTRACE_DEREF")}) {
+        for (const char* Env : {getenv("FEX_GUESTTRACE"), getenv("FEX_GUESTTRACE_DEREF"), getenv("FEX_GUESTSERIALIZE")}) {
           for (; Env && *Env; ++Env) {
             H = (H ^ static_cast<uint8_t>(*Env)) * 0x100000001b3ull;
           }
