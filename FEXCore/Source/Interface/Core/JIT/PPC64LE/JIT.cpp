@@ -36,8 +36,10 @@ $end_info$
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <cerrno>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -2791,6 +2793,142 @@ static std::pair<uint64_t, uint64_t> EntryWatchRange() {
 }
 static std::atomic<uint32_t> EntryWatchNextSlot {};
 
+// -------------------------------------------------------------------------
+// FEX_GUESTTRACE: guest-function entry forensics ring
+// -------------------------------------------------------------------------
+// FEX_GUESTTRACE=<rip>[,<rip>...] (hex, 0x prefix accepted): every dispatcher
+// or linked-jump entry into a JIT entry point whose guest RIP matches one of
+// the targets appends a record to a file-backed ring at
+// /tmp/fex-guesttrace-<pid>.bin: timebase, thread identity (STATE pointer),
+// saved CR (CR0 = guest packed NZCV), all 16 SRA GPRs, and a raw memory
+// window dereferenced off guest RCX -- by default [rcx+0x38, rcx+0x1f8), the
+// 16 bucket {begin,end,cap} pointer triples of the W3 TLSF suballocator whose
+// corruption this instrument exists to catch (override with
+// FEX_GUESTTRACE_DEREF=<base>:<len>, both hex, 8-byte granular, len <= 0x300).
+// The deref is guarded (0x10000 <= rcx < 2^48) and skipped, zeros left in the
+// record, when rcx is not plausibly a pointer.
+//
+// MAP_SHARED file backing means the ring survives ANY process death including
+// SIGKILL and a wedged crash reporter. The timebase field is written LAST, so
+// tb==0 marks a torn/in-progress record. Slots are claimed with a real
+// ldarx/stdcx. fetch-add: the cross-thread claim order in the ring is
+// faithful, and that interleave -- who was inside the allocator, when -- is
+// precisely the data. Reader: tools/guesttrace_decode.py (record layout
+// constants below are the format contract).
+struct GuestTraceRingHeader {
+  uint64_t Magic;
+  uint64_t RecordSize;
+  uint64_t Capacity; // records; power of two
+  uint64_t DerefBase;
+  uint64_t DerefLen;
+  uint64_t Reserved;
+  std::atomic<uint64_t> Idx; // monotonic claim counter; 8-aligned for ldarx
+};
+static_assert(offsetof(GuestTraceRingHeader, Idx) == 48 && (offsetof(GuestTraceRingHeader, Idx) & 7) == 0,
+              "emitted ldarx sequence hardcodes the ring layout");
+constexpr uint64_t GuestTraceMagic = 0x3130454341525447ull; // "GTRACE01" little-endian
+constexpr uint32_t GuestTraceCapacityLog2 = 18;             // 256Ki records = 256MiB of slots
+constexpr uint32_t GuestTraceRecordSizeLog2 = 10;           // 1KiB slots
+constexpr uint64_t GuestTraceHeaderBytes = 4096;
+// Record layout (offsets within a slot):
+//   0x00 u64 timebase (completion marker, written last; 0 = torn)
+//   0x08 u64 STATE pointer (per-thread identity)
+//   0x10 u64 guest RIP of the traced entry
+//   0x18 u64 saved CR image (CR0 = guest packed NZCV)
+//   0x20 u64[16] SRA GPRs, SRA order: RAX,RDX,RCX,RBX,RSP,RBP,RSI,RDI,R8..R15
+//   0xa0 deref window ([rcx+DerefBase], DerefLen bytes; zeros if guard skipped)
+constexpr int16_t GuestTraceOffTB = 0x00;
+constexpr int16_t GuestTraceOffState = 0x08;
+constexpr int16_t GuestTraceOffRIP = 0x10;
+constexpr int16_t GuestTraceOffCR = 0x18;
+constexpr int16_t GuestTraceOffGPRs = 0x20;
+constexpr int16_t GuestTraceOffDeref = 0xa0;
+
+static const fextl::vector<uint64_t>& GuestTraceTargets() {
+  static const fextl::vector<uint64_t> Targets = []() {
+    fextl::vector<uint64_t> Out {};
+    const char* Env = getenv("FEX_GUESTTRACE");
+    if (!Env) {
+      return Out;
+    }
+    while (*Env) {
+      char* End {};
+      const uint64_t RIP = std::strtoull(Env, &End, 16);
+      if (End == Env) {
+        break;
+      }
+      if (RIP) {
+        Out.push_back(RIP);
+      }
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return Targets;
+}
+
+static std::pair<int16_t, int16_t> GuestTraceDeref() {
+  static const std::pair<int16_t, int16_t> Window = []() -> std::pair<int16_t, int16_t> {
+    int64_t Base = 0x38;
+    int64_t Len = 0x1c0;
+    if (const char* Env = getenv("FEX_GUESTTRACE_DEREF")) {
+      char* End {};
+      Base = static_cast<int64_t>(std::strtoull(Env, &End, 16));
+      Len = (*End == ':') ? static_cast<int64_t>(std::strtoull(End + 1, nullptr, 16)) : 0;
+    }
+    // Clamp to the format contract: 8-byte granular, blob fits the 1KiB slot,
+    // and every ld/std displacement stays a d-form int16.
+    Base &= ~7ll;
+    Len &= ~7ll;
+    if (Len < 0 || Len > 0x300 || Base < 0 || Base + Len > INT16_MAX) {
+      Base = 0x38;
+      Len = 0x1c0;
+    }
+    return {static_cast<int16_t>(Base), static_cast<int16_t>(Len)};
+  }();
+  return Window;
+}
+
+static GuestTraceRingHeader* GuestTraceRingPtr() {
+  static GuestTraceRingHeader* const Ring = []() -> GuestTraceRingHeader* {
+    if (GuestTraceTargets().empty()) {
+      return nullptr;
+    }
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/tmp/fex-guesttrace-%d.bin", ::getpid());
+    const int FD = ::open(Path, O_CREAT | O_RDWR, 0644);
+    if (FD < 0) {
+      LogMan::Msg::EFmt("FEX_GUESTTRACE: cannot open {}: {}", Path, errno);
+      return nullptr;
+    }
+    const size_t Size = GuestTraceHeaderBytes + ((1ull << GuestTraceCapacityLog2) << GuestTraceRecordSizeLog2);
+    if (::ftruncate(FD, static_cast<off_t>(Size)) != 0) {
+      ::close(FD);
+      return nullptr;
+    }
+    void* M = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, FD, 0);
+    ::close(FD);
+    if (M == MAP_FAILED) {
+      LogMan::Msg::EFmt("FEX_GUESTTRACE: mmap of {} byte ring failed: {}", Size, errno);
+      return nullptr;
+    }
+    auto* H = static_cast<GuestTraceRingHeader*>(M);
+    H->Magic = GuestTraceMagic;
+    H->RecordSize = 1ull << GuestTraceRecordSizeLog2;
+    H->Capacity = 1ull << GuestTraceCapacityLog2;
+    H->DerefBase = static_cast<uint64_t>(GuestTraceDeref().first);
+    H->DerefLen = static_cast<uint64_t>(GuestTraceDeref().second);
+    H->Reserved = 0;
+    H->Idx.store(0, std::memory_order_relaxed);
+    LogMan::Msg::IFmt("FEX_GUESTTRACE: ring {} armed, {} targets", Path, GuestTraceTargets().size());
+    return H;
+  }();
+  return Ring;
+}
+
 // EmitStoreBlockBeginToInlineHeader
 // -------------------------------------------------------------------------
 // PPC64LE equivalent of the ARM64 sequence
@@ -5301,6 +5439,59 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         std(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, Count)), TMP1);
         LogMan::Msg::IFmt("EntryWatch: slot {} watching dispatcher entries at guest RIP 0x{:x}", (EntryWatchNextSlot.load() - 1) % std::size(FEX_EntryWatch),
                           GuestEntry);
+      }
+      // FEX_GUESTTRACE ring store (definition above EmitStoreBlockBeginToInlineHeader).
+      // Register contract at this point in the prologue: TMP1/TMP2 are
+      // clobberable (same as EntryWatch above); TMP3 additionally carries the
+      // saved CR image across the sequence -- every TMP is dead at the block-
+      // prologue boundary (IR ops treat them as transient scratch), and the
+      // only live state is SRA + STATE + the r0==0 invariant + guest CR,
+      // which is saved first and restored last. r0 is used only as the
+      // "literal zero" RA slot of ldarx/stdcx., never written.
+      if (const auto& TraceTargets = GuestTraceTargets();
+          !TraceTargets.empty() && std::find(TraceTargets.begin(), TraceTargets.end(), GuestEntry) != TraceTargets.end()) {
+        if (auto* Ring = GuestTraceRingPtr()) {
+          const auto [DerefBase, DerefLen] = GuestTraceDeref();
+          const auto GuestRCX = StaticRegisters[2]; // SRA order: RAX,RDX,RCX,...
+          PPC64Emitter::Label Retry {}, SkipDeref {};
+          mfcr(TMP3); // CR0 = guest packed NZCV; restored by the mtcr below
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(&Ring->Idx));
+          Bind(&Retry);
+          ldarx(TMP2, r0, TMP1);
+          addi(TMP2, TMP2, 1);
+          stdcx_(TMP2, r0, TMP1);
+          bc(CC_NE, &Retry);
+          addi(TMP2, TMP2, -1);
+          rldicl(TMP2, TMP2, 0, 64 - GuestTraceCapacityLog2); // idx & (Capacity-1)
+          sldi(TMP2, TMP2, GuestTraceRecordSizeLog2);         // -> slot byte offset
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(Ring) + GuestTraceHeaderBytes);
+          add(TMP2, TMP1, TMP2); // TMP2 = slot
+          std(STATE, GuestTraceOffState, TMP2);
+          LoadConstant(TMP1, GuestEntry);
+          std(TMP1, GuestTraceOffRIP, TMP2);
+          std(TMP3, GuestTraceOffCR, TMP2);
+          for (uint32_t i = 0; i < 16; ++i) {
+            std(StaticRegisters[i], static_cast<int16_t>(GuestTraceOffGPRs + i * 8), TMP2);
+          }
+          // Deref window guard: only follow guest RCX when it is plausibly a
+          // canonical user pointer (0x10000 <= rcx < 2^48). The slot's blob
+          // area keeps whatever the previous lap wrote; tb-generation math in
+          // the decoder distinguishes laps, and a skipped deref is recognized
+          // by the guard being false in the recorded rcx itself.
+          srdi(TMP1, GuestRCX, 48);
+          cmpldi(TMP1, 0);
+          bc(CC_NE, &SkipDeref);
+          cmpldi(GuestRCX, 0xFFFF);
+          bc(CC_LE, &SkipDeref);
+          for (int16_t Off = 0; Off < DerefLen; Off += 8) {
+            ld(TMP1, static_cast<int16_t>(DerefBase + Off), GuestRCX);
+            std(TMP1, static_cast<int16_t>(GuestTraceOffDeref + Off), TMP2);
+          }
+          Bind(&SkipDeref);
+          mftb(TMP1);
+          std(TMP1, GuestTraceOffTB, TMP2); // completion marker, written last
+          mtcr(TMP3);
+        }
       }
       // Drain any deferred async signal at this guest instruction boundary.
       // Every dispatcher hit and linked block-to-block jump lands here, so a

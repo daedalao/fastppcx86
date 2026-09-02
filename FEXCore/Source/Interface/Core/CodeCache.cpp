@@ -402,6 +402,19 @@ uint64_t ComputeCodeCacheConfigId() {
       Hasher.Add(static_cast<uint64_t>(!(ZExtConsumerEnv && ZExtConsumerEnv[0] == '0')));
       const char* ZExtProducerEnv = getenv("FEX_ZEXTOPT_PRODUCER");
       Hasher.Add(static_cast<uint64_t>(!(ZExtProducerEnv && ZExtProducerEnv[0] == '0')));
+      // FEX_GUESTTRACE / FEX_GUESTTRACE_DEREF (JIT.cpp forensics ring): the
+      // target list and deref window both change the emitted prologue of any
+      // matched block, so hash the raw strings (FNV-1a) rather than presence.
+      {
+        uint64_t H = 0xcbf29ce484222325ull;
+        for (const char* Env : {getenv("FEX_GUESTTRACE"), getenv("FEX_GUESTTRACE_DEREF")}) {
+          for (; Env && *Env; ++Env) {
+            H = (H ^ static_cast<uint8_t>(*Env)) * 0x100000001b3ull;
+          }
+          H = (H ^ 0xff) * 0x100000001b3ull; // separator so "a",""/"","a" differ
+        }
+        Hasher.Add(H);
+      }
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_FALLTHROUGH") != nullptr));
       const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
       Hasher.Add(static_cast<uint64_t>(!(PairEnv && PairEnv[0] == '0')));
