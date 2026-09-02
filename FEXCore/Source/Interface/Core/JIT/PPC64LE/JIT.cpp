@@ -2835,14 +2835,18 @@ constexpr uint64_t GuestTraceHeaderBytes = 4096;
 //   0x08 u64 STATE pointer (per-thread identity)
 //   0x10 u64 guest RIP of the traced entry
 //   0x18 u64 saved CR image (CR0 = guest packed NZCV)
-//   0x20 u64[16] SRA GPRs, SRA order: RAX,RDX,RCX,RBX,RSP,RBP,RSI,RDI,R8..R15
-//   0xa0 deref window ([rcx+DerefBase], DerefLen bytes; zeros if guard skipped)
+//   0x20 u64[16] SRA GPRs, SRA order per X86State enum: RAX,RCX,RDX,RBX,...
+//   0xa0 u64 [guest rsp] = return address when the traced RIP is a call
+//        target (garbage-but-harmless for jumped-to entries; guest rsp is
+//        always mapped stack at a genuine fn entry)
+//   0xa8 deref window ([rcx+DerefBase], DerefLen bytes; zeros if guard skipped)
 constexpr int16_t GuestTraceOffTB = 0x00;
 constexpr int16_t GuestTraceOffState = 0x08;
 constexpr int16_t GuestTraceOffRIP = 0x10;
 constexpr int16_t GuestTraceOffCR = 0x18;
 constexpr int16_t GuestTraceOffGPRs = 0x20;
-constexpr int16_t GuestTraceOffDeref = 0xa0;
+constexpr int16_t GuestTraceOffRetAddr = 0xa0;
+constexpr int16_t GuestTraceOffDeref = 0xa8;
 
 static const fextl::vector<uint64_t>& GuestTraceTargets() {
   static const fextl::vector<uint64_t> Targets = []() {
@@ -5477,6 +5481,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           for (uint32_t i = 0; i < 16; ++i) {
             std(StaticRegisters[i], static_cast<int16_t>(GuestTraceOffGPRs + i * 8), TMP2);
           }
+          // Guest return address: [rsp] names the call site when this entry
+          // is a genuine call target -- the discriminator between multiple
+          // paths into one traced function. Guest RSP is SRA index 4.
+          ld(TMP1, 0, StaticRegisters[4]);
+          std(TMP1, GuestTraceOffRetAddr, TMP2);
           // Deref window guard: only follow guest RCX when it is plausibly a
           // canonical user pointer (0x10000 <= rcx < 2^48). The slot's blob
           // area keeps whatever the previous lap wrote; tb-generation math in

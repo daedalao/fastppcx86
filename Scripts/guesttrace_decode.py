@@ -9,8 +9,9 @@ Records follow, `recsize` bytes each:
   0x08 u64 state     STATE pointer = per-thread identity
   0x10 u64 rip       guest RIP of the traced entry
   0x18 u64 cr        saved CR image (CR0 = guest packed NZCV)
-  0x20 u64[16] gprs  SRA order: RAX,RDX,RCX,RBX,RSP,RBP,RSI,RDI,R8..R15
-  0xa0 deref blob    [rcx+deref_base, +deref_len) -- for the W3 TLSF campaign
+  0x20 u64[16] gprs  SRA order per X86State enum: RAX,RCX,RDX,RBX,RSP,...
+  0xa0 u64 retaddr   [guest rsp] at entry = call site (garbage if jumped-to)
+  0xa8 deref blob    [rcx+deref_base, +deref_len) -- for the W3 TLSF campaign
                      the 16 bucket triples {begin,end,cap}, 3 u64 ptrs each
 
 Default analysis (--w3): treat the blob as TLSF bucket triples and flag
@@ -51,9 +52,10 @@ def load(path):
             recs.append(None)  # torn
             continue
         gprs = struct.unpack_from("<16Q", data, off + 0x20)
-        blob = data[off + 0xA0 : off + 0xA0 + dlen]
+        retaddr = struct.unpack_from("<Q", data, off + 0xA0)[0]
+        blob = data[off + 0xA8 : off + 0xA8 + dlen]
         recs.append({"claim": claim, "tb": tb, "state": state, "rip": rip,
-                     "cr": cr, "gprs": gprs, "blob": blob})
+                     "cr": cr, "gprs": gprs, "ret": retaddr, "blob": blob})
     return {"idx": idx, "cap": cap, "deref_base": dbase, "deref_len": dlen,
             "recs": recs}
 
@@ -71,7 +73,7 @@ def fmt_rec(r, tb0):
     name = KNOWN_RIPS.get(r["rip"], f"{r['rip']:#x}")
     g = r["gprs"]
     return (f"claim={r['claim']} dt={r['tb']-tb0} state={r['state']:#x} {name:>16} "
-            f"rcx={g[1]:#x} rdx={g[2]:#x} r8={g[8]:#x} r9={g[9]:#x} rbx={g[3]:#x}")
+            f"ret={r['ret']:#x} rcx={g[1]:#x} rdx={g[2]:#x} r8={g[8]:#x} r9={g[9]:#x} rbx={g[3]:#x}")
 
 
 def main():
