@@ -4324,47 +4324,93 @@ DEF_OP(VFCMPScalarInsert) {
 // up (Dst <- Add, then xvmaddasp(Dst, V1, V2) == V1*V2 + Add).
 #define DEF_FMA_SCALAR_INSERT(NAME, XVOP_S, XVOP_D, FOP_S, FOP_D)              \
 DEF_OP(NAME) {                                                                 \
-  const auto Op    = IROp->C<IR::IROp_##NAME>();                               \
-  const auto Dst   = GetVReg(Node);                                            \
-  const auto Upper = GetVReg(Op->Upper);                                       \
-  const auto V1    = GetVReg(Op->Vector1);                                     \
-  const auto V2    = GetVReg(Op->Vector2);                                     \
-  const auto Add   = GetVReg(Op->Addend);                                      \
-  const bool Is32  = Op->Header.ElementSize == IR::OpSize::i32Bit;             \
+  const auto Op     = IROp->C<IR::IROp_##NAME>();                              \
+  const auto ElemSz = Op->Header.ElementSize;                                  \
+  const auto Dst    = GetVReg(Node);                                           \
+  const auto Upper  = GetVReg(Op->Upper);                                      \
+  const auto V1     = GetVReg(Op->Vector1);                                    \
+  const auto V2     = GetVReg(Op->Vector2);                                    \
+  const auto Add    = GetVReg(Op->Addend);                                     \
+  const bool Is32   = ElemSz == IR::OpSize::i32Bit;                            \
                                                                                \
   /* VTMP3_VSX supplies the third splat slot, so this is unconditional now -   \
-   * no Dst == Upper fallback and no red-zone traffic in any case. */          \
+   * no Dst == Upper fallback and no red-zone traffic in any case.             \
+   *                                                                           \
+   * Operands already in splat form pass through with no copy: SplatResult     \
+   * producers upstream (IsSplatFormValue -- the ScalarSplatChain pass) and,   \
+   * for f64, lxvdsx-fused loads (SplatFormLoadNodes) both hold elem0 in       \
+   * every lane this op reads. With SplatResult set on THIS op the merge       \
+   * against Upper is skipped too: the accumulator lands in Dst directly       \
+   * when Dst cannot alias a pass-through source, else via VTMP1 + xxlor. */   \
   if (Is32) {                                                                  \
-    xxspltw(toVSX(VTMP1), toVSX(Add), 3);                                      \
-    xxspltw(toVSX(VTMP2), toVSX(V1), 3);                                       \
-    xxspltw(VTMP3_VSX, toVSX(V2), 3);                                          \
-    XVOP_S(toVSX(VTMP1), toVSX(VTMP2), VTMP3_VSX);                             \
-    xxsldwi(VTMP2, VTMP1, Upper, 3); /* {result.w3, Upper.w0..w2} */           \
-    xxsldwi(Dst, VTMP2, VTMP2, 1);   /* rotate: result into BE word 3 */       \
-  } else {                                                                     \
-    /* Splat-form sources (lxvdsx loads, see SplatFormLoadNodes) already hold \
-     * the value in both doublewords: the accumulator still needs its copy    \
-     * into VTMP1 (the xv*a form is destructive) but drops the permute for a  \
-     * cheaper xxlor; multiplicands pass through with no copy at all. */      \
-    if (IdInVec(SplatFormLoadNodes, Op->Addend.ID().Value)) {                  \
-      xxlor(toVSX(VTMP1), toVSX(Add), toVSX(Add));                             \
-    } else {                                                                   \
-      xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                       \
-    }                                                                          \
     PPC64Emitter::VSXR SrcA = toVSX(VTMP2);                                    \
-    if (IdInVec(SplatFormLoadNodes, Op->Vector1.ID().Value)) {                 \
+    if (IsSplatFormValue(Op->Vector1, ElemSz)) {                               \
+      SrcA = toVSX(V1);                                                        \
+    } else {                                                                   \
+      xxspltw(toVSX(VTMP2), toVSX(V1), 3);                                     \
+    }                                                                          \
+    PPC64Emitter::VSXR SrcB = VTMP3_VSX;                                       \
+    if (IsSplatFormValue(Op->Vector2, ElemSz)) {                               \
+      SrcB = toVSX(V2);                                                        \
+    } else {                                                                   \
+      xxspltw(VTMP3_VSX, toVSX(V2), 3);                                        \
+    }                                                                          \
+    if (Op->SplatResult) {                                                     \
+      const bool DstSafe = SrcA.idx != toVSX(Dst).idx &&                       \
+                           SrcB.idx != toVSX(Dst).idx;                         \
+      const auto Acc = DstSafe ? toVSX(Dst) : toVSX(VTMP1);                    \
+      /* the splat doubles as the accumulator copy (xv*a is destructive);      \
+       * on an already-splat Addend it is the identity, same count as a move */\
+      xxspltw(Acc, toVSX(Add), 3);                                             \
+      XVOP_S(Acc, SrcA, SrcB);                                                 \
+      if (!DstSafe) {                                                          \
+        xxlor(toVSX(Dst), Acc, Acc);                                           \
+      }                                                                        \
+    } else {                                                                   \
+      xxspltw(toVSX(VTMP1), toVSX(Add), 3);                                    \
+      XVOP_S(toVSX(VTMP1), SrcA, SrcB);                                        \
+      xxsldwi(VTMP2, VTMP1, Upper, 3); /* {result.w3, Upper.w0..w2} */         \
+      xxsldwi(Dst, VTMP2, VTMP2, 1);   /* rotate: result into BE word 3 */     \
+    }                                                                          \
+  } else {                                                                     \
+    PPC64Emitter::VSXR SrcA = toVSX(VTMP2);                                    \
+    if (IsSplatFormValue(Op->Vector1, ElemSz) ||                               \
+        IdInVec(SplatFormLoadNodes, Op->Vector1.ID().Value)) {                 \
       SrcA = toVSX(V1);                                                        \
     } else {                                                                   \
       xxpermdi(toVSX(VTMP2), toVSX(V1), toVSX(V1), 3);                         \
     }                                                                          \
     PPC64Emitter::VSXR SrcB = VTMP3_VSX;                                       \
-    if (IdInVec(SplatFormLoadNodes, Op->Vector2.ID().Value)) {                 \
+    if (IsSplatFormValue(Op->Vector2, ElemSz) ||                               \
+        IdInVec(SplatFormLoadNodes, Op->Vector2.ID().Value)) {                 \
       SrcB = toVSX(V2);                                                        \
     } else {                                                                   \
       xxpermdi(VTMP3_VSX, toVSX(V2), toVSX(V2), 3);                            \
     }                                                                          \
-    XVOP_D(toVSX(VTMP1), SrcA, SrcB);                                          \
-    xxpermdi(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), 1);                       \
+    const bool AddSplat = IsSplatFormValue(Op->Addend, ElemSz) ||              \
+                          IdInVec(SplatFormLoadNodes, Op->Addend.ID().Value);  \
+    if (Op->SplatResult) {                                                     \
+      const bool DstSafe = SrcA.idx != toVSX(Dst).idx &&                       \
+                           SrcB.idx != toVSX(Dst).idx;                         \
+      const auto Acc = DstSafe ? toVSX(Dst) : toVSX(VTMP1);                    \
+      if (AddSplat) {                                                          \
+        xxlor(Acc, toVSX(Add), toVSX(Add));                                    \
+      } else {                                                                 \
+        xxpermdi(Acc, toVSX(Add), toVSX(Add), 3);                              \
+      }                                                                        \
+      XVOP_D(Acc, SrcA, SrcB);                                                 \
+      if (!DstSafe) {                                                          \
+        xxlor(toVSX(Dst), Acc, Acc);                                           \
+      }                                                                        \
+    } else {                                                                   \
+      if (AddSplat) {                                                          \
+        xxlor(toVSX(VTMP1), toVSX(Add), toVSX(Add));                           \
+      } else {                                                                 \
+        xxpermdi(toVSX(VTMP1), toVSX(Add), toVSX(Add), 3);                     \
+      }                                                                        \
+      XVOP_D(toVSX(VTMP1), SrcA, SrcB);                                        \
+      xxpermdi(toVSX(Dst), toVSX(Upper), toVSX(VTMP1), 1);                     \
+    }                                                                          \
   }                                                                            \
 }
 // fmadd(t,a,b,c)/fmsub etc per emitter signature: (t, fra, frc, frb).

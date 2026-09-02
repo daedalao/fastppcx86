@@ -1269,6 +1269,13 @@ bool PPC64JITCore::IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpS
     // IR pass enforces the same match when it marks, this is the backend half
     // of that contract.
     return IROp->ElementSize == ElementSize && IROp->C<IR::IROp_VFAddScalarInsert>()->SplatResult;
+  case IR::IROps::OP_VFMLASCALARINSERT:
+  case IR::IROps::OP_VFMLSSCALARINSERT:
+  case IR::IROps::OP_VFNMLASCALARINSERT:
+  case IR::IROps::OP_VFNMLSSCALARINSERT:
+    // Same contract as the arithmetic family; the FMA ops carry SplatResult at
+    // a different struct offset (four vector operands precede it).
+    return IROp->ElementSize == ElementSize && IROp->C<IR::IROp_VFMLAScalarInsert>()->SplatResult;
   default: return false;
   }
 }

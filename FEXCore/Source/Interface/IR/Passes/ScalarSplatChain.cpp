@@ -79,6 +79,21 @@ namespace FEXCore::IR {
 // macro into the VInsElement, same instruction count -- so marking every
 // eligible op is never a regression.
 //
+// THE FMA FAMILY (added 2026-09-01, second pass of the sprint).  The four
+// VF{,N}ML{A,S}ScalarInsert ops join both sides of the transform.  As
+// PRODUCERS they follow the same contract with one layout difference: their
+// merge lineage is the dedicated Upper operand rather than Vector1, so %M's
+// DestVector comes from Upper and all three math operands (Vector1, Vector2,
+// Addend) stay on the splat side.  As CONSUMERS their three math operands are
+// element-0-only reads REGARDLESS of the consumer's own marking -- the
+// backend splats each from element 0 (or passes an already-splat-form value
+// through), unlike an arith consumer's Vector1 whose inline merge reads upper
+// elements when unmarked.  A chain-interior f32 FMA link drops from 6 host
+// instructions (three operand splats + xv*a + 2-insn merge) to 2-3 (the
+// destructive accumulator's copy-splat + xv*a, plus an xxlor only when the
+// destination register aliases a pass-through source); f64 likewise sheds its
+// operand permutes and merge.
+//
 // ---------------------------------------------------------------------------
 // THE REGISTER CACHE, still the load-bearing detail
 //
@@ -129,16 +144,49 @@ namespace FEXCore::IR {
 // ---------------------------------------------------------------------------
 
 namespace {
-  // Producers this pass may mark. Restricted to the four arithmetic ops whose
-  // lowering is the DEF_SCALAR_INSERT macro in VectorOps.cpp -- the splat-both-
-  // operands + single xv* + merge shape the transform reasons about.
-  bool IsSplattableProducer(IROps Op) {
+  // Producers this pass may mark: the four arithmetic ops whose lowering is
+  // the DEF_SCALAR_INSERT macro in VectorOps.cpp, and the four FMA ops
+  // (DEF_FMA_SCALAR_INSERT) -- both are the splat-operands + single xv* +
+  // merge shape the transform reasons about. The families differ in operand
+  // layout: arith merges its result over Vector1 (which is also a math
+  // operand), FMA carries a dedicated Upper operand for the merge and its
+  // three math operands (Vector1, Vector2, Addend) are elem0-only reads.
+  bool IsArithProducer(IROps Op) {
     switch (Op) {
     case OP_VFADDSCALARINSERT:
     case OP_VFSUBSCALARINSERT:
     case OP_VFMULSCALARINSERT:
     case OP_VFDIVSCALARINSERT: return true;
     default: return false;
+    }
+  }
+
+  bool IsFMAProducer(IROps Op) {
+    switch (Op) {
+    case OP_VFMLASCALARINSERT:
+    case OP_VFMLSSCALARINSERT:
+    case OP_VFNMLASCALARINSERT:
+    case OP_VFNMLSSCALARINSERT: return true;
+    default: return false;
+    }
+  }
+
+  bool IsSplattableProducer(IROps Op) {
+    return IsArithProducer(Op) || IsFMAProducer(Op);
+  }
+
+  // Which operand supplies the upper elements of the architectural result --
+  // the DestVector of the explicit VInsElement merge this pass emits.
+  uint8_t LineageArgIdx(IROps Op) {
+    return IsFMAProducer(Op) ? IROp_VFMLAScalarInsert::Upper_Index : IROp_VFAddScalarInsert::Vector1_Index;
+  }
+
+  // SplatResult sits at different struct offsets in the two families.
+  void SetSplatResult(IROp_Header* IROp) {
+    if (IsFMAProducer(IROp->Op)) {
+      IROp->CW<IROp_VFMLAScalarInsert>()->SplatResult = true;
+    } else {
+      IROp->CW<IROp_VFAddScalarInsert>()->SplatResult = true;
     }
   }
 
@@ -169,7 +217,14 @@ namespace {
       return false;
     }
 
-    // All four ops share the ZeroUpperBits field at the same place.
+    // FMA ops have no ZeroUpperBits field: the AVX zero-upper semantic is
+    // encoded by the frontend through the Upper operand itself, which this
+    // pass carries into the merge unchanged.
+    if (IsFMAProducer(IROp->Op)) {
+      return true;
+    }
+
+    // The four arithmetic ops share the ZeroUpperBits field at the same place.
     return !IROp->C<IROp_VFAddScalarInsert>()->ZeroUpperBits;
   }
 
@@ -329,18 +384,28 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
         }
 
         // Element-0-only readers of the same element size take splat form.
-        //   * another ScalarInsert's Vector1 (the arithmetic reads element 0;
+        //   * an arith ScalarInsert's Vector1 (the arithmetic reads element 0;
         //     the consumer's own merge takes its upper elements from its
         //     ORIGINAL operand, handled in the apply phase);
         //   * an element-0-only reader's Vector2;
+        //   * an FMA ScalarInsert's Vector1/Vector2/Addend -- the backend
+        //     splats each from element 0 (or passes a splat-form value
+        //     through) regardless of the consumer's own marking; its Upper
+        //     operand is merge lineage, NOT an element-0 read, and falls
+        //     through to the merge-use classification below;
         //   * a narrow FPR StoreMem (both store paths read only bits inside
         //     element 0, and the backend skips its positioning permute for a
         //     splat-form operand).
-        if (IROp->ElementSize == C.IROp->ElementSize &&
+        if (IROp->ElementSize == C.IROp->ElementSize) {
+          const bool Fwd = IsFMAProducer(IROp->Op) ?
+            (i == IROp_VFMLAScalarInsert::Vector1_Index || i == IROp_VFMLAScalarInsert::Vector2_Index ||
+             i == IROp_VFMLAScalarInsert::Addend_Index) :
             ((i == IROp_VFAddScalarInsert::Vector1_Index && IsEligible(IROp)) ||
-             (i == IROp_VFAddScalarInsert::Vector2_Index && ReadsOnlyElement0OfVector2(IROp->Op)))) {
-          Forwards.push_back(Forward {.User = CodeNode, .ArgIdx = i, .CandIdx = CandIdx});
-          continue;
+             (i == IROp_VFAddScalarInsert::Vector2_Index && ReadsOnlyElement0OfVector2(IROp->Op)));
+          if (Fwd) {
+            Forwards.push_back(Forward {.User = CodeNode, .ArgIdx = i, .CandIdx = CandIdx});
+            continue;
+          }
         }
         if (IROp->Op == OP_STOREMEM && i == IROp_StoreMem::Value_Index && IROp->C<IROp_StoreMem>()->Class == RegClass::FPR &&
             IR::OpSizeToSize(IROp->Size) <= IR::OpSizeToSize(C.IROp->ElementSize)) {
@@ -396,16 +461,17 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
 
     // ------------------------------------------------------------------
     // Apply phase 1: create every marked candidate's merge node. Reads each
-    // candidate's CURRENT Vector1 operand, so this must run before any
-    // operand retargeting. A direct-edge Vector1 (producer candidate node)
-    // is substituted with that producer's %M -- the architectural value --
-    // which exists because phase 1 runs in program order.
+    // candidate's CURRENT lineage operand (arith: Vector1, FMA: Upper), so
+    // this must run before any operand retargeting. A direct-edge lineage
+    // operand (producer candidate node) is substituted with that producer's
+    // %M -- the architectural value -- which exists because phase 1 runs in
+    // program order.
     // ------------------------------------------------------------------
     for (auto& C : Candidates) {
       if (!C.Marked) {
         continue;
       }
-      auto V1Wrap = C.IROp->Args[IROp_VFAddScalarInsert::Vector1_Index];
+      auto V1Wrap = C.IROp->Args[LineageArgIdx(C.IROp->Op)];
       Ref V1 = CurrentIR.GetNode(V1Wrap);
       if (const uint32_t TIdx = TrackedOfArg(V1Wrap); TIdx != kNone && !Trackeds[TIdx].IsAlias) {
         const uint32_t PIdx = Trackeds[TIdx].CandIdx;
@@ -419,7 +485,7 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
 
       IREmit->SetWriteCursor(C.Node);
       C.Merge = IREmit->_VInsElement(OpSize::i128Bit, C.IROp->ElementSize, 0, 0, V1, C.Node);
-      C.IROp->CW<IROp_VFAddScalarInsert>()->SplatResult = true;
+      SetSplatResult(C.IROp);
     }
 
     // ------------------------------------------------------------------
@@ -438,9 +504,22 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
       if (!C.Marked) {
         continue;
       }
-      if (F.ArgIdx == IROp_VFAddScalarInsert::Vector1_Index && IsSplattableProducer(CurrentIR.GetOp<IROp_Header>(F.User)->Op)) {
+      const auto* UserOp = CurrentIR.GetOp<IROp_Header>(F.User);
+      // The both-marked rule applies only to an ARITH consumer's Vector1: an
+      // unmarked arith consumer's inline merge reads Vector1's upper
+      // elements. FMA math operands are elem0-only regardless of the
+      // consumer's marking (its lineage is the separate Upper operand), so
+      // they need only the producer -- same as Vector2/StoreMem forwards.
+      if (F.ArgIdx == IROp_VFAddScalarInsert::Vector1_Index && IsArithProducer(UserOp->Op)) {
         const uint32_t ConsumerIdx = CandidateIndexOfNode(F.User);
         if (ConsumerIdx == kNone || !Candidates[ConsumerIdx].Marked) {
+          // Dropped forward. An ALIAS arg still reads %M through the register
+          // and needs nothing; but a DIRECT SSA edge already names the
+          // candidate -- splat form -- and the unmarked consumer's inline
+          // merge would read its forged upper elements. Point it at %M.
+          if (CurrentIR.GetNode(UserOp->Args[F.ArgIdx]) == C.Node) {
+            IREmit->ReplaceNodeArgument(F.User, F.ArgIdx, C.Merge);
+          }
           continue;
         }
       }
