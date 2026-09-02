@@ -257,6 +257,55 @@ void InitFromEnv() {
   }
 }
 
+std::atomic<bool> MapsDumped {false};
+
+// One /proc/self/maps snapshot, appended to the log file after the first
+// fault record.  A guest data fault carries only DAR -- a bare address --
+// and in this lane the addresses that matter (0x3ffd_xxxx_xxxx and kin) sit
+// in the shared top-down mmap band where a wine view, a native-half malloc
+// arena, dxvk memory and the bridge's own mappings all interleave under host
+// ASLR.  Which mapping owns the faulting address is decidable only from the
+// map of the run that faulted, and by teardown time the process is gone.
+//
+// File only, never stderr: this runs to hundreds of KB and would bury the
+// record it annotates.  Signal-safety is the same contract as Write() --
+// open, read, write, close, a stack buffer, no allocation -- and every
+// failure is accepted silently, because a missing annotation must never
+// cost the fingerprint it was meant to explain.
+void DumpMaps(int FileFd) {
+  if (FileFd < 0) {
+    return;
+  }
+  bool Expected = false;
+  if (!MapsDumped.compare_exchange_strong(Expected, true)) {
+    return;
+  }
+
+  const int MapsFd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (MapsFd < 0) {
+    return;
+  }
+
+  static constexpr char Banner[] = "fexbridge-fault: /proc/self/maps at first fault follows\n";
+  (void)!write(FileFd, Banner, sizeof(Banner) - 1);
+
+  char Buf[4096];
+  size_t Total = 0;
+  constexpr size_t kMaxMapsBytes = 1u << 20; // a wine process runs to a few thousand lines
+  while (Total < kMaxMapsBytes) {
+    const ssize_t R = read(MapsFd, Buf, sizeof(Buf));
+    if (R <= 0) {
+      break;
+    }
+    (void)!write(FileFd, Buf, R);
+    Total += (size_t)R;
+  }
+  close(MapsFd);
+
+  static constexpr char End[] = "fexbridge-fault: end of maps\n";
+  (void)!write(FileFd, End, sizeof(End) - 1);
+}
+
 void Write(FEXCore::Core::InternalThreadState* Thread, const char* Kind, uint32_t EFlags, uint64_t HostPC, uint64_t Dar, uint64_t Dsisr) {
   if (!Enabled) {
     return;
@@ -309,6 +358,8 @@ void Write(FEXCore::Core::InternalThreadState* Thread, const char* Kind, uint32_
       (void)!write(FileFd, Buf, Len);
     }
   }
+
+  DumpMaps(FileFd);
 }
 } // namespace FaultLog
 
