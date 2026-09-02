@@ -112,18 +112,18 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
       InsertPass(CreateDeadFlagCalculationEliminination());
     }
 
-    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult and
-    // LoadRegister nodes with SplatElementSize, and the analysis reads
+    // Must precede RA: it annotates VF*ScalarInsert nodes with SplatResult,
+    // inserts the explicit VInsElement lane merges, and the analysis reads
     // OrderedNode::GetUses() plus the frontend's explicit LoadRegister/
-    // StoreRegister register-cache traffic -- all of which RA rewrites. It is
-    // otherwise order-independent (it neither reads nor writes flags, and
-    // adds/removes no operand uses), so it sits last among the optimisation
-    // passes.
+    // StoreRegister register-cache traffic -- all of which RA rewrites. It
+    // neither reads nor writes flags, and every use it adds or retargets is
+    // created in its own apply phase after analysis, so it sits last among
+    // the optimisation passes.
     //
-    // Own kill switch for the same reason as the two above, plus one more: the
-    // pass deliberately trades exactness of a guest XMM's UPPER elements
-    // mid-block for shorter scalar-float chains, so turning it off is also how
-    // you restore exact upper elements in a signal frame:
+    // Own kill switch for the same reason as the two above. Since the
+    // 2026-09-01 rework the pass is exact at every guest instruction boundary
+    // (the merge is explicit IR, splat form never reaches a StoreRegister),
+    // so the switch is a plain codegen bisection lever, not a precision knob:
     //     FEX_DISABLESCALARSPLATCHAIN=1
     if (!DisableScalarSplatChain()) {
       InsertPass(CreateScalarSplatChain());
