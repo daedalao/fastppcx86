@@ -69,7 +69,16 @@
   FEXBRIDGE_SPINSENTINEL_TRACE=1 removes the report gates/caps, and
   FEXBRIDGE_SPINSENTINEL_THROTTLE=<usec> opts in to sleeping that long per
   no-progress trap once a site has repeated identically 16384 times (timing
-  only; the guest's calls all still execute).  Details in FexBridge.cpp. Self-modifying/newly-loaded guest
+  only; the guest's calls all still execute).  Details in FexBridge.cpp.
+
+  FEXBRIDGE_FAULTLOG (default on) fingerprints every guest fault the bridge
+  surfaces (unwound JIT faults and NoExec entries) BEFORE the guest's own
+  handler runs: guest RIP, all 16 GPRs, EFLAGS, host DAR/DSISR, one record
+  to stderr and to /tmp/fexbridge-faults-<pid>.log, capped at 64 records per
+  process.  Built because in-guest crash reporters (REDengine's) never
+  complete their dumps in this lane.  FEXBRIDGE_FAULTLOG=0 disables.
+
+  Self-modifying/newly-loaded guest
   code is the CALLER's job to report via fexbridge_invalidate_code_range —
   call it after writing guest instructions to memory that may already have
   been executed from, and after any PE section load.

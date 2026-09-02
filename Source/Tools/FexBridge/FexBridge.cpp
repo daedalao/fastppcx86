@@ -50,6 +50,7 @@ $end_info$
 #include <signal.h>
 #include <cerrno>
 #include <cinttypes>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -216,6 +217,100 @@ void InitFromEnv() {
   }
 }
 } // namespace SpinSentinel
+
+// ---------------------------------------------------------------------------
+// Guest fault fingerprinting (FEXBRIDGE_FAULTLOG, default on)
+//
+// The forensics gap this closes (nw-lane Witcher 3, 2026-08-31..09-01): the
+// game's own crash reporter has never once completed a minidump in this lane
+// (every ReportQueue dump is 244 or 0 bytes; the reporter thread deadlocks on
+// locks its own thread-suspension took hostage), so not one guest RIP was
+// ever captured for the whole crash class.  The bridge sees every guest
+// fault BEFORE the game's handler runs -- both host faults in JIT code
+// unwound by fexbridge_fault_unwind and NoExec entry faults classified in
+// the run loop -- so it records the fingerprint here: guest RIP, all 16
+// GPRs, EFLAGS, and for data faults the host DAR/DSISR (fault address and
+// access-type bits straight from the machine).
+//
+// One record per fault to stderr AND to /tmp/fexbridge-faults-<pid>.log --
+// the file survives terminal scrollback and the freeze-then-pkill teardown
+// that ends these sessions.  First-chance faults the guest handles (SEH
+// probes and kin) land here too, so a per-process record cap keeps a fault
+// storm from becoming its own problem.  FEXBRIDGE_FAULTLOG=0 disables.
+//
+// Signal-context rules: the unwind hook runs inside the host SIGSEGV
+// handler, so this path allows itself open/write/close/getpid and a stack
+// snprintf -- no malloc, no stdio streams, and NOT EmitLog (the embedder's
+// log callback has made no signal-safety promise).  Guest memory is never
+// dereferenced: registers only, a re-fault in the handler would trade a
+// fingerprint for a hang.
+// ---------------------------------------------------------------------------
+namespace FaultLog {
+constexpr int kMaxRecords = 64;
+bool Enabled = true;
+std::atomic<int> Records {0};
+std::atomic<int> Fd {-2}; // -2 unopened, -1 open failed (stderr only)
+
+void InitFromEnv() {
+  if (const char* E = getenv("FEXBRIDGE_FAULTLOG"); E && E[0] == '0' && !E[1]) {
+    Enabled = false;
+  }
+}
+
+void Write(FEXCore::Core::InternalThreadState* Thread, const char* Kind, uint32_t EFlags, uint64_t HostPC, uint64_t Dar, uint64_t Dsisr) {
+  if (!Enabled) {
+    return;
+  }
+  const int N = Records.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N > kMaxRecords) {
+    return;
+  }
+
+  int FileFd = Fd.load(std::memory_order_acquire);
+  if (FileFd == -2) {
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/tmp/fexbridge-faults-%d.log", getpid());
+    const int NewFd = open(Path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    int Expected = -2;
+    if (Fd.compare_exchange_strong(Expected, NewFd)) {
+      FileFd = NewFd;
+    } else {
+      // Another thread's fault won the open race; use its fd.
+      if (NewFd >= 0) {
+        close(NewFd);
+      }
+      FileFd = Expected;
+    }
+  }
+
+  const auto& S = Thread->CurrentFrame->State;
+  const uint64_t* G = S.gregs; // X86Enums order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+  timespec TS {};
+  clock_gettime(CLOCK_REALTIME, &TS);
+  char Buf[768];
+  int Len = snprintf(
+    Buf, sizeof(Buf),
+    "fexbridge-fault #%d t=%lld.%03ld tid=%d kind=%s rip=%016llx eflags=%08x dar=%016llx dsisr=%08llx hostpc=%016llx\n"
+    "  rax=%016llx rcx=%016llx rdx=%016llx rbx=%016llx rsp=%016llx rbp=%016llx rsi=%016llx rdi=%016llx\n"
+    "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx%s\n",
+    N, (long long)TS.tv_sec, TS.tv_nsec / 1000000, (int)syscall(SYS_gettid), Kind, (unsigned long long)S.rip, EFlags,
+    (unsigned long long)Dar, (unsigned long long)Dsisr, (unsigned long long)HostPC, (unsigned long long)G[0],
+    (unsigned long long)G[1], (unsigned long long)G[2], (unsigned long long)G[3], (unsigned long long)G[4],
+    (unsigned long long)G[5], (unsigned long long)G[6], (unsigned long long)G[7], (unsigned long long)G[8],
+    (unsigned long long)G[9], (unsigned long long)G[10], (unsigned long long)G[11], (unsigned long long)G[12],
+    (unsigned long long)G[13], (unsigned long long)G[14], (unsigned long long)G[15],
+    N == kMaxRecords ? "\nfexbridge-fault: record cap reached; further faults unlogged" : "");
+  if (Len > 0) {
+    if (Len > (int)sizeof(Buf) - 1) {
+      Len = (int)sizeof(Buf) - 1;
+    }
+    (void)!write(2, Buf, Len);
+    if (FileFd >= 0) {
+      (void)!write(FileFd, Buf, Len);
+    }
+  }
+}
+} // namespace FaultLog
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -1011,6 +1106,8 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
 constexpr uint32_t PPC_PT_NIP = 32;
 constexpr uint32_t PPC_PT_XER = 37;
 constexpr uint32_t PPC_PT_CCR = 38;
+constexpr uint32_t PPC_PT_DAR = 41;   // data address of the faulting access
+constexpr uint32_t PPC_PT_DSISR = 42; // access-type bits (bit 0x02000000 = store)
 
 void SpillSRAFromHostContext(FEXCore::Core::InternalThreadState* Thread, ucontext_t* UC) {
   const auto& Cfg = SigDelegator->GetConfig();
@@ -1175,6 +1272,7 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
 
   SpinSentinel::InitFromEnv();
+  FaultLog::InitFromEnv();
 
   GuestIs64 = Is64;
   Initialized = true;
@@ -1529,6 +1627,9 @@ int fexbridge_run(void* thread, void* ctx) {
       if (SFD.FaultToTopAndGeneratedException && SFD.Signal == FEXCore::Core::FAULT_SIGSEGV &&
           SFD.TrapNo == FEXCore::X86State::X86_TRAPNO_PF) {
         Reason = FEXBRIDGE_RUN_FAULT;
+        // Guest jumped to unfetchable memory; State.rip is the bad target and
+        // the register file is already the flushed architectural state.
+        FaultLog::Write(BT->Thread, "noexec", 0, 0, 0, 0);
       } else {
         Reason = FEXBRIDGE_RUN_HLT;
       }
@@ -1873,6 +1974,10 @@ int fexbridge_fault_unwind(void* host_ucontext) {
   const uint64_t* HostGPRs = reinterpret_cast<const uint64_t*>(&UC->uc_mcontext.gp_regs[0]);
   const uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(BT->Thread, true, HostGPRs, HostPStateFromContext(UC));
   CTX->SetFlagsFromCompactedEFLAGS(BT->Thread, EFlags);
+
+  // Fingerprint before the longjmp: this is the last moment the host fault
+  // context (DAR/DSISR) and the reconstructed guest state exist side by side.
+  FaultLog::Write(BT->Thread, "jit", EFlags, HostPC, UC->uc_mcontext.gp_regs[PPC_PT_DAR], UC->uc_mcontext.gp_regs[PPC_PT_DSISR]);
 
   siglongjmp(BT->RunTop->JB, 1);
 }
