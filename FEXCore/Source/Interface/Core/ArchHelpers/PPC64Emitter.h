@@ -280,8 +280,10 @@ namespace RegVolatility {
 // -------------------------------------------------------------------------
 namespace x64 {
   // Static register allocation: 16 x86 GPRs + PF + AF = 18 host GPRs
-  // Order matches ARM64 backend: RAX, RDX, RCX, RBX, RSP, RBP, RSI, RDI,
-  //                                R8,  R9,  R10, R11, R12, R13, R14, R15, PF, AF
+  // Index follows the X86State enum:  RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
+  //                                   R8,  R9,  R10, R11, R12, R13, R14, R15, PF, AF
+  // (An earlier revision of this comment had RCX/RDX swapped -- disproven
+  //  live via FEX_GUESTTRACE 2026-09-02: index 2 is guest RDX in r9.)
   constexpr std::array<GPR, 18> SRA = {
     r7,  r8,  r9,  r10, r11, r12, r14, r15,
     r16, r17, r18, r19, r20, r21, r22, r23,

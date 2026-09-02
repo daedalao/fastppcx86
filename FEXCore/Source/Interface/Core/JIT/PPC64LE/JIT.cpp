@@ -5452,7 +5452,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           !TraceTargets.empty() && std::find(TraceTargets.begin(), TraceTargets.end(), GuestEntry) != TraceTargets.end()) {
         if (auto* Ring = GuestTraceRingPtr()) {
           const auto [DerefBase, DerefLen] = GuestTraceDeref();
-          const auto GuestRCX = StaticRegisters[2]; // SRA order: RAX,RDX,RCX,...
+          // SRA index follows the X86State enum: RAX=0, RCX=1, RDX=2, RBX=3.
+          // (The order comment on x64::SRA in ArchHelpers/PPC64Emitter.h had
+          // RCX/RDX swapped -- proven live 2026-09-02: index 2 dereferenced as
+          // "rcx" faulted at exactly guest-rdx+0x140 on stack guard pages.)
+          const auto GuestRCX = StaticRegisters[1];
           PPC64Emitter::Label Retry {}, SkipDeref {};
           mfcr(TMP3); // CR0 = guest packed NZCV; restored by the mtcr below
           LoadConstant(TMP1, reinterpret_cast<uint64_t>(&Ring->Idx));

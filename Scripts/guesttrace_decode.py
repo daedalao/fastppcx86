@@ -24,7 +24,7 @@ import argparse
 import struct
 import sys
 
-SRA_NAMES = ["rax", "rdx", "rcx", "rbx", "rsp", "rbp", "rsi", "rdi",
+SRA_NAMES = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
 MAGIC = 0x3130454341525447
 
@@ -71,7 +71,7 @@ def fmt_rec(r, tb0):
     name = KNOWN_RIPS.get(r["rip"], f"{r['rip']:#x}")
     g = r["gprs"]
     return (f"claim={r['claim']} dt={r['tb']-tb0} state={r['state']:#x} {name:>16} "
-            f"rcx={g[2]:#x} rdx={g[1]:#x} r8={g[8]:#x} r9={g[9]:#x} rbx={g[3]:#x}")
+            f"rcx={g[1]:#x} rdx={g[2]:#x} r8={g[8]:#x} r9={g[9]:#x} rbx={g[3]:#x}")
 
 
 def main():
@@ -106,7 +106,7 @@ def main():
     findings = []
     last_by_obj = {}
     for i, r in enumerate(recs):
-        rcx = r["gprs"][2]
+        rcx = r["gprs"][1]
         trip = triples(r["blob"])
         if all(b == 0 and e == 0 and c == 0 for b, e, c in trip):
             continue  # guard-skipped or foreign rcx
