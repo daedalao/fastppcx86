@@ -2813,7 +2813,7 @@ static std::atomic<uint32_t> EntryWatchNextSlot {};
 // tb==0 marks a torn/in-progress record. Slots are claimed with a real
 // ldarx/stdcx. fetch-add: the cross-thread claim order in the ring is
 // faithful, and that interleave -- who was inside the allocator, when -- is
-// precisely the data. Reader: tools/guesttrace_decode.py (record layout
+// precisely the data. Reader: Scripts/guesttrace_decode.py (record layout
 // constants below are the format contract).
 struct GuestTraceRingHeader {
   uint64_t Magic;
