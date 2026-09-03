@@ -626,24 +626,27 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // The block's stdu wrote the ABI back-chain word at 0(r1), so popping
       // exactly the abandoned frame is one load. ARM64 needs nothing: its JIT
       // blocks never move SP, which is why the redirect was sound there.
-      // Unlike ReturningStackLocation (stored only at DispatchPtr entry, so
-      // stale inside a nested CallbackPtr dispatch), the back chain is exact
-      // at any nesting depth. The guest-signal-delivery redirects to the same
-      // loop-top are NOT changed: they park the interrupted context in the
-      // guest sigframe and sigreturn restores it, frame included.
-      //
-      // Guarded: pop only a plausible back chain (16-aligned, strictly above
-      // the current r1, readable by construction since r1's own page is
-      // mapped). A fault taken at a point where r1 is NOT inside a live
-      // stdu frame (fpr_store_pattern showed one: the back-chain word read 0)
-      // falls back to the historical leak-one-frame behaviour, which is
-      // benign everywhere except the thread-exit Pop.
+      // ReturningStackLocation is exactly that r1 (stored right after the
+      // DispatchPtr prologue's PushCalleeSavedRegisters). It is NOT valid
+      // inside a nested CallbackPtr dispatch (CallbackPtr pushes its own
+      // callee-saved frame below but never updates the field), and a back-
+      // chain walk is no alternative there: blocks also lower r1 with ad-hoc
+      // `addi r1,-N` scratch areas whose 0(r1) holds data, not a chain
+      // (fpr_store_pattern faulted inside one; X87Ops parks an LR value
+      // there). So: no active callback or guest-signal frame
+      // (SignalHandlerRefCounter == 0, bumped by CallbackPtr and guest
+      // delivery, not by this host fault) -> restore the exact dispatcher
+      // r1; otherwise keep the historical leak-one-frame behaviour, which is
+      // exactly as (un)sound as it always was on that rare path. The
+      // guest-signal-delivery redirects to the same loop-top need nothing:
+      // they park the interrupted context in the guest sigframe and
+      // sigreturn restores it, frame included.
       {
-        const uint64_t Sp = ArchHelpers::Context::GetSp(ucontext);
-        const uint64_t BackChain = *reinterpret_cast<const uint64_t*>(Sp);
-        SMC_AUDIT("[%d] redirect pc=%lx sp=%lx backchain=%lx\n", FHU::Syscalls::gettid(), FaultPC, Sp, BackChain);
-        if (BackChain > Sp && (BackChain & 0xF) == 0 && BackChain - Sp < 0x100000) {
-          ArchHelpers::Context::SetSp(ucontext, BackChain);
+        const uint64_t RSL = Thread->CurrentFrame->ReturningStackLocation;
+        SMC_AUDIT("[%d] redirect pc=%lx sp=%lx rsl=%lx refct=%u\n", FHU::Syscalls::gettid(), FaultPC, ArchHelpers::Context::GetSp(ucontext),
+                  RSL, Thread->CurrentFrame->SignalHandlerRefCounter);
+        if (RSL && Thread->CurrentFrame->SignalHandlerRefCounter == 0) {
+          ArchHelpers::Context::SetSp(ucontext, RSL);
         }
       }
 #endif
