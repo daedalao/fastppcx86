@@ -2943,6 +2943,7 @@ static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*>
   }();
   return {&Lists.first, &Lists.second};
 }
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeRVALists();
 static GuestSerializeState* GuestSerializeLock() {
   static GuestSerializeState* const Lock = []() -> GuestSerializeState* {
     if (GuestSerializeLists().first->empty() && GuestSerializeRVALists().first->empty()) {
