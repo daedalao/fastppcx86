@@ -2914,8 +2914,9 @@ static std::pair<int16_t, int16_t> GuestTraceDeref() {
 // blocks forever wedges every other acquirer -- only serialize regions that
 // provably run straight-line (frees, small mutators).
 struct GuestSerializeState {
-  uint64_t Owner; // STATE pointer of the holder, 0 = free (ldarx/stdcx.)
-  uint64_t Depth; // recursion depth, mutated only by the holder
+  uint64_t Owner;   // STATE pointer of the holder, 0 = free (ldarx/stdcx.)
+  uint64_t Depth;   // recursion depth, mutated only by the holder
+  uint64_t Suspect; // owner observed at a spin-deadline expiry (leak recovery)
 };
 static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeLists() {
   static const std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Lists = []() {
@@ -5672,7 +5673,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           mfcr(TMP3);
           LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
           if (IsEntry) {
-            PPC64Emitter::Label Arm {}, Retry {}, Held {}, Mine {};
+            PPC64Emitter::Label Arm {}, Retry {}, Held {}, StealTry {}, Mine {};
             // Bounded spin (TMP4 = timebase deadline). A serialized function
             // that early-returns, unwinds, or whose owner thread dies before
             // reaching a configured exit RIP leaves Owner set forever, and
@@ -5680,12 +5681,23 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             // entrant at 100% CPU with EmitSuspendInterruptCheck (below)
             // unreachable. Legit hold times are microseconds (frees, small
             // mutators -- see the DEADLOCK NOTE at GuestSerializeState), so
-            // after ~4s of timebase we declare the lock leaked, force-release
-            // it (Depth = 0 then Owner = 0), and re-arm the deadline. A
-            // stolen-from owner that later reaches its exit block is safe:
-            // release is already a silent no-op for non-owners. The trade is
-            // a momentary loss of the injected exclusion in a state the
-            // original design wedged in permanently.
+            // an owner that sits on the lock across a full deadline period
+            // (~4s of timebase) is declared leaked and the lock recovered.
+            //
+            // Recovery is two-phase so an expired waiter cannot clobber a
+            // LIVE lock a different thread just acquired: on first expiry
+            // the observed owner is only recorded as Suspect and the
+            // deadline re-armed; the steal happens at the NEXT expiry, and
+            // only if Owner still equals Suspect (CAS Suspect -> 0), i.e.
+            // the same owner sat there for a whole further period. Depth is
+            // zeroed before the release so a fresh acquirer starts clean;
+            // racing stealers agree on Suspect and the CAS admits one. The
+            // residual races (a stale owner that is actually alive and
+            // re-enters, two stealers interleaving with an instant acquire)
+            // degrade to a re-leaked lock healed by the next steal cycle --
+            // never a silent loss of the injected exclusion. A stolen-from
+            // owner reaching its exit block is safe: release is already a
+            // silent no-op for non-owners.
             Bind(&Arm);
             mftb(TMP4);
             addis(TMP4, TMP4, 0x7A12); // +2048000000 ticks = 4.0s at 512MHz
@@ -5702,11 +5714,22 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             mftb(TMP2);
             cmpd(cr(0), TMP2, TMP4);
             bc(CC_LT, &Retry);      // deadline not reached: keep spinning
-            li(TMP2, 0);            // leaked: force-release, then re-arm
-            std(TMP2, 8, TMP1);     // Depth = 0
-            lwsync();
-            std(TMP2, 0, TMP1);     // Owner = 0
+            ld(TMP2, 0, TMP1);      // expired: current owner
+            ld(TMP4, 16, TMP1);     // Suspect from the previous expiry
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_EQ, &StealTry);   // same owner a whole period later: steal
+            std(TMP2, 16, TMP1);    // Suspect = owner; give it one more period
             b(&Arm);
+            Bind(&StealTry);
+            li(TMP2, 0);
+            std(TMP2, 8, TMP1);     // Depth = 0 (no live owner mutates it now)
+            lwsync();               // Depth clear ordered before the release
+            ldarx(TMP2, r0, TMP1);
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_NE, &Arm);        // owner moved on: not leaked after all
+            li(TMP2, 0);
+            stdcx_(TMP2, r0, TMP1); // CAS Suspect -> 0: one stealer wins
+            b(&Arm);                // re-arm and reacquire through the front door
             Bind(&Mine);
             isync();                // acquire barrier
             ld(TMP2, 8, TMP1);      // Depth
