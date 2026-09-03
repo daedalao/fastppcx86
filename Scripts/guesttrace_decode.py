@@ -115,9 +115,17 @@ def main():
     last_by_obj = {}
     for i, r in enumerate(recs):
         rcx = r["gprs"][1]
+        # The writer's deref-window guard (JIT.cpp): the blob is only written
+        # when 0x10000 <= rcx < 2^48. A guard-skipped slot KEEPS the previous
+        # lap's blob bytes (there is no per-lap generation tag), so after ring
+        # wrap a stale non-zero blob sits under a fresh tb/rip/rcx -- the only
+        # sound skip test is recomputing the guard from the recorded rcx, not
+        # inspecting the blob.
+        if rcx < 0x10000 or rcx >= (1 << 48):
+            continue  # deref was guard-skipped; blob may be stale
         trip = triples(r["blob"])
         if all(b == 0 and e == 0 and c == 0 for b, e, c in trip):
-            continue  # guard-skipped or foreign rcx
+            continue  # never-deref'd slot (first lap) or all-empty buckets
         bad = []
         for bi, (b, e, c) in enumerate(trip):
             if b == 0 and e == 0 and c == 0:

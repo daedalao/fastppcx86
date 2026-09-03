@@ -3076,6 +3076,16 @@ static void GuestAnchorTryDiscover(uint64_t GuestEntry) {
   if (((GuestEntry ^ Anchor->RVA) & 0xFFFF) != 0 || GuestEntry < Anchor->RVA) {
     return;
   }
+  // Only the entry being compiled is mapped by definition; the low-16-bit
+  // pre-filter matches 1-in-64Ki block entries, and a false candidate within
+  // SigLen-1 bytes of the end of its mapping would send the memcmp into the
+  // next (possibly unmapped) page -- SignalDelegator has no compile-path
+  // fault tolerance, so that is a process death, not a failed match. Skip
+  // signatures that would cross a page boundary; a real anchor sitting in the
+  // last SigLen-1 bytes of a page simply never discovers (pick another).
+  if ((GuestEntry & 0xFFF) > 0x1000 - Anchor->SigLen) {
+    return;
+  }
   if (::memcmp(reinterpret_cast<const void*>(GuestEntry), Anchor->Sig, Anchor->SigLen) != 0) {
     return;
   }
@@ -5646,11 +5656,12 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       const uint64_t AnchorBase = GuestAnchorBaseAtomic.load(std::memory_order_acquire);
       const uint64_t GuestEntryRVA = (AnchorBase && GuestEntry > AnchorBase) ? GuestEntry - AnchorBase : 0;
       // FEX_GUESTSERIALIZE lock injection (definition above GuestTraceRingPtr).
-      // Same prologue register contract as the trace below: TMP1/TMP2 scratch,
-      // TMP3 carries the saved CR, guest CR restored at the end of each
-      // sequence. Acquire spins on the Owner word (recursive via STATE
-      // identity + depth), isync on acquisition; release is a silent no-op
-      // for a non-owner so unpaired paths cannot underflow.
+      // Same prologue register contract as the trace below: TMP1/TMP2/TMP4
+      // scratch, TMP3 carries the saved CR, guest CR restored at the end of
+      // each sequence. Acquire spins on the Owner word (recursive via STATE
+      // identity + depth) with a timebase-bounded leak recovery, isync on
+      // acquisition; release is a silent no-op for a non-owner so unpaired
+      // paths cannot underflow.
       const auto [SerRVAEntries, SerRVAExits] = GuestSerializeRVALists();
       if (const auto [SerEntries, SerExits] = GuestSerializeLists(); !SerEntries->empty() || !SerRVAEntries->empty()) {
         const bool IsEntry = std::find(SerEntries->begin(), SerEntries->end(), GuestEntry) != SerEntries->end() ||
@@ -5661,15 +5672,41 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           mfcr(TMP3);
           LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
           if (IsEntry) {
-            PPC64Emitter::Label Retry {}, Mine {};
+            PPC64Emitter::Label Arm {}, Retry {}, Held {}, Mine {};
+            // Bounded spin (TMP4 = timebase deadline). A serialized function
+            // that early-returns, unwinds, or whose owner thread dies before
+            // reaching a configured exit RIP leaves Owner set forever, and
+            // an unbounded ldarx/cmpd spin here would wedge every later
+            // entrant at 100% CPU with EmitSuspendInterruptCheck (below)
+            // unreachable. Legit hold times are microseconds (frees, small
+            // mutators -- see the DEADLOCK NOTE at GuestSerializeState), so
+            // after ~4s of timebase we declare the lock leaked, force-release
+            // it (Depth = 0 then Owner = 0), and re-arm the deadline. A
+            // stolen-from owner that later reaches its exit block is safe:
+            // release is already a silent no-op for non-owners. The trade is
+            // a momentary loss of the injected exclusion in a state the
+            // original design wedged in permanently.
+            Bind(&Arm);
+            mftb(TMP4);
+            addis(TMP4, TMP4, 0x7A12); // +2048000000 ticks = 4.0s at 512MHz
             Bind(&Retry);
             ldarx(TMP2, r0, TMP1);
             cmpd(cr(0), TMP2, STATE);
             bc(CC_EQ, &Mine);       // recursive re-entry: skip the claim
             cmpdi(TMP2, 0);
-            bc(CC_NE, &Retry);      // held by another thread: spin
+            bc(CC_NE, &Held);       // held by another thread: deadline-check
             stdcx_(STATE, r0, TMP1);
             bc(CC_NE, &Retry);      // reservation lost: retry
+            b(&Mine);
+            Bind(&Held);
+            mftb(TMP2);
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_LT, &Retry);      // deadline not reached: keep spinning
+            li(TMP2, 0);            // leaked: force-release, then re-arm
+            std(TMP2, 8, TMP1);     // Depth = 0
+            lwsync();
+            std(TMP2, 0, TMP1);     // Owner = 0
+            b(&Arm);
             Bind(&Mine);
             isync();                // acquire barrier
             ld(TMP2, 8, TMP1);      // Depth
@@ -5740,9 +5777,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           std(TMP1, GuestTraceOffRetAddr, TMP2);
           // Deref window guard: only follow guest RCX when it is plausibly a
           // canonical user pointer (0x10000 <= rcx < 2^48). The slot's blob
-          // area keeps whatever the previous lap wrote; tb-generation math in
-          // the decoder distinguishes laps, and a skipped deref is recognized
-          // by the guard being false in the recorded rcx itself.
+          // area keeps whatever the previous lap wrote; there is no per-lap
+          // generation tag, so a guard-skipped slot's blob is stale after
+          // ring wrap. The decoder (Scripts/guesttrace_decode.py) recomputes
+          // this exact guard from the recorded rcx and skips blob analysis
+          // when it fails -- keep the two predicates in sync.
           srdi(TMP1, GuestRCX, 48);
           cmpldi(TMP1, 0);
           bc(CC_NE, &SkipDeref);
