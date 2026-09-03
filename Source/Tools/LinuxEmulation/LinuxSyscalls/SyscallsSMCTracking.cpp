@@ -607,6 +607,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
       // Adjust context to return to the dispatcher, reloading SRA from thread state
       const auto& Config = ThreadObject->SignalInfo.Delegator->GetConfig();
+      [[maybe_unused]] const uint64_t FaultPC = ArchHelpers::Context::GetPc(ucontext);
       ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
       ArchHelpers::Context::SetArmReg(ucontext, 1, 1); // Set ENTRY_FILL_SRA_SINGLE_INST_REG to force a single step
 #ifdef ARCHITECTURE_ppc64le
@@ -630,7 +631,21 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // at any nesting depth. The guest-signal-delivery redirects to the same
       // loop-top are NOT changed: they park the interrupted context in the
       // guest sigframe and sigreturn restores it, frame included.
-      ArchHelpers::Context::SetSp(ucontext, *reinterpret_cast<const uint64_t*>(ArchHelpers::Context::GetSp(ucontext)));
+      //
+      // Guarded: pop only a plausible back chain (16-aligned, strictly above
+      // the current r1, readable by construction since r1's own page is
+      // mapped). A fault taken at a point where r1 is NOT inside a live
+      // stdu frame (fpr_store_pattern showed one: the back-chain word read 0)
+      // falls back to the historical leak-one-frame behaviour, which is
+      // benign everywhere except the thread-exit Pop.
+      {
+        const uint64_t Sp = ArchHelpers::Context::GetSp(ucontext);
+        const uint64_t BackChain = *reinterpret_cast<const uint64_t*>(Sp);
+        SMC_AUDIT("[%d] redirect pc=%lx sp=%lx backchain=%lx\n", FHU::Syscalls::gettid(), FaultPC, Sp, BackChain);
+        if (BackChain > Sp && (BackChain & 0xF) == 0 && BackChain - Sp < 0x100000) {
+          ArchHelpers::Context::SetSp(ucontext, BackChain);
+        }
+      }
 #endif
     }
 
