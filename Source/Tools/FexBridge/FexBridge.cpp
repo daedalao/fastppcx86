@@ -740,14 +740,14 @@ void LoadFPFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRID
 
   __uint128_t XMM[16];
   memcpy(XMM, Context->FltSave.XmmRegisters, sizeof(XMM));
-  if (YMMIn) {
-    CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn);
-  } else {
-    // Zeroed only where actually consumed: when this ran unconditionally on
-    // the (since removed) per-hop trap load it was 0.35% of the GameThread.
-    __uint128_t YMMZero[16] {};
-    CTX->SetXMMRegistersFromState(Thread, XMM, YMMZero);
-  }
+  // A null YMMIn means the caller has no YMM-high data (an AMD64 CONTEXT
+  // cannot carry it), NOT that the upper halves are zero: forward the null
+  // and SetXMMRegistersFromState leaves avx_high untouched, matching the
+  // trap CONTEXT path's deliberate preservation and the header's "applies
+  // the full FP file" contract. The old conversion to a zeroed array
+  // memcpy'd zeros into avx_high[0..15] on every push/set_context/nested-run
+  // load — latent while AVX defaults off, destructive the day it is on.
+  CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn);
 
   State.mxcsr = Context->FltSave.MxCsr;
   State.FCW = Context->FltSave.ControlWord;
