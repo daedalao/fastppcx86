@@ -317,10 +317,18 @@ namespace {
 
   void Release(ManagerState& S, const char* Why) {
     Decision(S.IsolatedTid, "action=release reason={} evicted={}", Why, S.Evicted.size());
+    // Re-check IsGuestOwned at release time, not eviction time: a thread the
+    // guest sched_setaffinity'd AFTER we evicted it (or a recycled tid that
+    // landed in S.Evicted) carries a deliberate guest pin now, and widening
+    // it back to AllowedMask would violate the "guest placement is never
+    // overridden" contract. Same for a guest-owned isolated-in-place thread,
+    // whose affinity Engage() never touched in the first place.
     for (const uint32_t Tid : S.Evicted) {
-      ::sched_setaffinity(Tid, sizeof(AllowedMask), &AllowedMask);
+      if (!IsGuestOwned(Tid)) {
+        ::sched_setaffinity(Tid, sizeof(AllowedMask), &AllowedMask);
+      }
     }
-    if (S.IsolatedTid) {
+    if (S.IsolatedTid && !IsGuestOwned(S.IsolatedTid)) {
       ::sched_setaffinity(S.IsolatedTid, sizeof(AllowedMask), &AllowedMask);
     }
     S.Evicted.clear();
@@ -401,7 +409,11 @@ namespace {
       }
       Smp.HasSwitches = ReadVoluntarySwitches(Tid, &Smp.VoluntarySwitches);
       if (WindowNs) {
-        if (const Sample* P = FindPrev(S, Tid)) {
+        // Runtime can move backwards across a tid recycle inside one tick
+        // window (exit + clone reusing the tid): the unsigned subtraction
+        // would wrap to ~1.8e19, crown the newborn thread TopShare and blow
+        // through the spinner veto. Treat it as a new thread instead.
+        if (const Sample* P = FindPrev(S, Tid); P && Smp.RuntimeNs >= P->RuntimeNs) {
           const double Share = double(Smp.RuntimeNs - P->RuntimeNs) / double(WindowNs);
           if (Share > TopShare) {
             TopShare = Share;
@@ -493,8 +505,6 @@ void Start(FEX::HLE::SyscallHandler* SyscallHandler) {
   if (CoreIsolate() == 0) {
     return;
   }
-  Handler = SyscallHandler;
-  ManagerPID = ::getpid();
   BuildTopology();
   if (Cores.size() < 2) {
     // Isolation must leave at least one general-purpose core. A 1-core (or
@@ -502,9 +512,19 @@ void Start(FEX::HLE::SyscallHandler* SyscallHandler) {
     LogMan::Msg::IFmt("CoreIsolation: {} reservable core(s) in the allowed mask; disabled", Cores.size());
     return;
   }
+  // Handler doubles as the "isolation is live" arm for OnGuestSetAffinity and
+  // ReportedAffinityOverride, so it must only stay set once the manager thread
+  // actually exists: a disabled Start() that left it armed would rewrite every
+  // guest sched_getaffinity with the stale startup AllowedMask for the process
+  // lifetime while no manager ever runs. It is assigned before pthread_create
+  // (the manager reads it immediately) and rolled back on failure.
+  Handler = SyscallHandler;
+  ManagerPID = ::getpid();
   pthread_t Thread;
   if (pthread_create(&Thread, nullptr, ManagerThread, nullptr) != 0) {
     LogMan::Msg::EFmt("CoreIsolation: manager thread creation failed (errno {}); disabled", errno);
+    Handler = nullptr;
+    ManagerPID = 0;
     return;
   }
   pthread_detach(Thread);
