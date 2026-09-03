@@ -609,6 +609,29 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       const auto& Config = ThreadObject->SignalInfo.Delegator->GetConfig();
       ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
       ArchHelpers::Context::SetArmReg(ucontext, 1, 1); // Set ENTRY_FILL_SRA_SINGLE_INST_REG to force a single step
+#ifdef ARCHITECTURE_ppc64le
+      // This redirect permanently ABANDONS the interrupted block's context, and
+      // on ppc64le every JIT block owns a real stack frame (the prologue stdu
+      // whose DO-NOT-REMOVE rationale lives in JIT.cpp) that only the block's
+      // own exits pop. Redirecting with r1 still inside that frame leaks one
+      // frame per redirect: benign while blocks only use r1 relatively, fatal
+      // at thread exit, where the dispatcher's SIGSEGV stub runs
+      // PopCalleeSavedRegisters against what it believes is the dispatcher
+      // frame and restores LR/r14-r31 from an abandoned block frame's slots --
+      // then blr's to whatever garbage LR got (observed: a JITCodeHeader word,
+      // SIGILL; on other builds a wild data address the TestHarness longjmp
+      // swallowed). 3_F7_02_3.asm at MAXINST=500 is the deterministic repro:
+      // each unaligned lock-not on a self-code-page takes this redirect once.
+      // The block's stdu wrote the ABI back-chain word at 0(r1), so popping
+      // exactly the abandoned frame is one load. ARM64 needs nothing: its JIT
+      // blocks never move SP, which is why the redirect was sound there.
+      // Unlike ReturningStackLocation (stored only at DispatchPtr entry, so
+      // stale inside a nested CallbackPtr dispatch), the back chain is exact
+      // at any nesting depth. The guest-signal-delivery redirects to the same
+      // loop-top are NOT changed: they park the interrupted context in the
+      // guest sigframe and sigreturn restores it, frame included.
+      ArchHelpers::Context::SetSp(ucontext, *reinterpret_cast<const uint64_t*>(ArchHelpers::Context::GetSp(ucontext)));
+#endif
     }
 
     return true;
