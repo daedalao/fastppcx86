@@ -912,6 +912,10 @@ private:
   // CR0.LT/EQ encode SF/ZF for the operand width (TestNZ/TestZ helper).
   void EmitTestNZSetCR(GPR Result, IR::OpSize Size);
 
+  // Float_ToGPR_ZS / Float_ToGPR_S body: scalar float -> signed GPR with the
+  // x86 INT_MIN sentinel on +overflow/NaN; RoundFirst = host rounding mode.
+  void EmitFloatToGPRSigned(PPC64Emitter::GPR Dst, PPC64Emitter::VR Vec, IR::OpSize SrcES, IR::OpSize DstES, bool RoundFirst);
+
   // Build a 16-byte vperm control vector at r1-16 then `lvx` into Dst.
   // hi packs phys[8..15] (byte 7 = phys[8], byte 0 = phys[15]).
   // lo packs phys[0..7]  (byte 7 = phys[0], byte 0 = phys[7]).
