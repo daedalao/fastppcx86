@@ -5673,7 +5673,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
           mfcr(TMP3);
           LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
           if (IsEntry) {
-            PPC64Emitter::Label Arm {}, Retry {}, Held {}, StealTry {}, Mine {};
+            PPC64Emitter::Label Arm {}, Retry {}, Held {}, StealTry {}, Mine {}, Done {};
             // Bounded spin (TMP4 = timebase deadline). A serialized function
             // that early-returns, unwinds, or whose owner thread dies before
             // reaching a configured exit RIP leaves Owner set forever, and
@@ -5698,9 +5698,15 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             // never a silent loss of the injected exclusion. A stolen-from
             // owner reaching its exit block is safe: release is already a
             // silent no-op for non-owners.
-            Bind(&Arm);
-            mftb(TMP4);
-            addis(TMP4, TMP4, 0x7A12); // +2048000000 ticks = 4.0s at 512MHz
+            //
+            // The deadline is armed lazily: TMP4 = 0 on entry and the
+            // mftb/addis live out of line at Arm, reached from Held the first
+            // time contention is observed (and from every re-arm site). The
+            // uncontended path -- every entry to the serialized frees and
+            // mutators -- therefore pays no SPR read and falls straight
+            // through into Mine; the deadline period simply starts at the
+            // first observed contention, at most one ldarx later.
+            li(TMP4, 0);            // deadline unarmed
             Bind(&Retry);
             ldarx(TMP2, r0, TMP1);
             cmpd(cr(0), TMP2, STATE);
@@ -5709,8 +5715,15 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             bc(CC_NE, &Held);       // held by another thread: deadline-check
             stdcx_(STATE, r0, TMP1);
             bc(CC_NE, &Retry);      // reservation lost: retry
-            b(&Mine);
+            Bind(&Mine);
+            isync();                // acquire barrier
+            ld(TMP2, 8, TMP1);      // Depth
+            addi(TMP2, TMP2, 1);
+            std(TMP2, 8, TMP1);
+            b(&Done);               // contention/steal code is out of line
             Bind(&Held);
+            cmpdi(TMP4, 0);
+            bc(CC_EQ, &Arm);        // first contention: arm the deadline
             mftb(TMP2);
             cmpd(cr(0), TMP2, TMP4);
             bc(CC_LT, &Retry);      // deadline not reached: keep spinning
@@ -5730,11 +5743,11 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
             li(TMP2, 0);
             stdcx_(TMP2, r0, TMP1); // CAS Suspect -> 0: one stealer wins
             b(&Arm);                // re-arm and reacquire through the front door
-            Bind(&Mine);
-            isync();                // acquire barrier
-            ld(TMP2, 8, TMP1);      // Depth
-            addi(TMP2, TMP2, 1);
-            std(TMP2, 8, TMP1);
+            Bind(&Arm);
+            mftb(TMP4);
+            addis(TMP4, TMP4, 0x7A12); // +2048000000 ticks = 4.0s at 512MHz
+            b(&Retry);
+            Bind(&Done);
           } else {
             PPC64Emitter::Label SkipRel {};
             ld(TMP2, 0, TMP1);
