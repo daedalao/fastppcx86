@@ -414,6 +414,11 @@ struct EcDescriptor {
 };
 std::mutex EcLock;
 std::unordered_map<uint64_t, EcDescriptor*> EcTargets;      // live, by rip
+// EC direct calls (fexbridge.h): the JIT serves a registered rip inline
+// when its cell says so.  FEX_NO_EC_DIRECT=1 compiles every transition as
+// the plain trampoline -- the bridge-side half of the kill switch (the
+// embedder's half never stamps a cell DIRECT).
+static const bool EcDirectEnabled = getenv("FEX_NO_EC_DIRECT") == nullptr;
 std::vector<EcDescriptor*> EcRetired;                       // unregistered, kept
 // Every live BridgeThread, so EC (un)registration can scrub per-thread
 // lookup caches: InvalidateCodeBuffersCodeRange only reaches the shared
@@ -1802,7 +1807,7 @@ int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* co
     return (It->second->Handler == handler && It->second->Cookie == cookie) ? 0 : -2;
   }
   auto* Desc = new EcDescriptor {handler, cookie, rip};
-  if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc)) {
+  if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc, EcDirectEnabled ? cookie : nullptr)) {
     // Claimed by a different custom-IR owner (or a racing different
     // registration); nothing was installed.
     delete Desc;
@@ -1862,7 +1867,7 @@ static int register_ec_batch(const uint64_t* rips, const void* const* cookies, u
         continue;
       }
       auto* Desc = new EcDescriptor {handler, cookie, rip};
-      if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc)) {
+      if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc, EcDirectEnabled ? cookie : nullptr)) {
         delete Desc;
         continue;
       }
@@ -1995,6 +2000,35 @@ uint32_t fexbridge_hwtso_refused(uint64_t start, uint64_t length) {
     }
   }
   return 0;
+}
+
+int fexbridge_ec_direct_in_flight(void) {
+  auto* BT = TLSThread;
+  if (!BT || !BT->Thread) {
+    return 0;
+  }
+  return BT->Thread->CurrentFrame->EcDirectInFlight ? 1 : 0;
+}
+
+int fexbridge_fault_unwind_direct(void* host_ucontext) {
+  auto* BT = TLSThread;
+  if (!BT || !BT->RunTop || !host_ucontext || !BT->Thread) {
+    return 0;
+  }
+  auto* Frame = BT->Thread->CurrentFrame;
+  if (!Frame->EcDirectInFlight) {
+    return 0;
+  }
+  // The crossing spilled the whole register file before the call and the
+  // callee never touched the frame, so State IS the guest state at the call
+  // site and State.rip is that site (the transition block stored it).
+  // Nothing to reconstruct from the host context; it belongs to the callee.
+  Frame->EcDirectInFlight = 0;
+  Frame->InSyscallInfo = 0;
+  auto* UC = static_cast<ucontext_t*>(host_ucontext);
+  FaultLog::Write(BT->Thread, "direct", 0, UC->uc_mcontext.gp_regs[PPC_PT_NIP], UC->uc_mcontext.gp_regs[PPC_PT_DAR],
+                  UC->uc_mcontext.gp_regs[PPC_PT_DSISR]);
+  siglongjmp(BT->RunTop->JB, 1);
 }
 
 int fexbridge_fault_is_jit(const void* host_ucontext) {

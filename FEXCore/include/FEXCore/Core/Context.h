@@ -165,7 +165,8 @@ public:
    * registration or another custom-IR owner.
    */
   FEX_DEFAULT_VISIBILITY virtual bool
-  AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) = 0;
+  AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor,
+                       void* DirectCell = nullptr) = 0;
 
   /**
    * @brief Remove an EC-target registration added by AddECTargetIRHandler.

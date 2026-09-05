@@ -1826,12 +1826,13 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
   }
 }
 
-bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) {
+bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor,
+                                       void* DirectCell) {
   LOGMAN_THROW_A_FMT(Entrypoint, "Tried to register an EC target at null");
 
   auto Result = AddCustomIREntrypoint(
     Entrypoint,
-    [ThunkNameHash, Descriptor](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
+    [ThunkNameHash, Descriptor, DirectCell](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
       auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
       auto Block = emit->CreateCodeNode(true, 0);
       IRHeader.first->Blocks = emit->WrapNode(Block);
@@ -1845,7 +1846,15 @@ bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::
       // The host call.  DEF_OP(Thunk) hands the callee the descriptor in the
       // first C argument and the CpuStateFrame in the second; the callee is
       // resolved through the installed ThunkHandler for ThunkNameHash.
-      emit->_Thunk(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))), ThunkNameHash);
+      if (DirectCell) {
+        // The transition with the inline direct-call arm (fexbridge.h, EC
+        // DIRECT): the cell decides at run time; the trampoline is the
+        // fallback inside the same block.
+        emit->_EcTransition(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))),
+                            emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(DirectCell))), ThunkNameHash);
+      } else {
+        emit->_Thunk(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))), ThunkNameHash);
+      }
 
       // The handler owns RIP; go look where it pointed us, through the
       // ordinary dispatcher lookup.  This is OpDispatchBuilder::SyscallOp's

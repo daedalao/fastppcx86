@@ -468,6 +468,71 @@ int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridg
    but each cookie VALUE lives by the 6->7 changelog's lifetime rules.      */
 int fexbridge_register_ec_targets2(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler);
 
+/* ---- EC DIRECT calls (ABI 7, optional symbols; no bump) -----------------
+   A registered rip's cookie (the _targets2 form) is the embedder's per-slot
+   cell.  When the cell's first 32-bit word carries FEXBRIDGE_EC_CELL_DIRECT
+   in its bits, the JIT-compiled transition block serves the call INLINE --
+   no trampoline, no handler -- from the digest at cookie +
+   FEXBRIDGE_EC_DIRECT_OFFSET.  Any check failing (state, dirty byte, proxy
+   validation, ring not quiet) falls through to the handler exactly as
+   before.  The embedder publishes the digest first and the state word last
+   (release), and never changes a digest once published.
+
+   The COM form reads the guest `this` (RCX) as a proxy of the embedder's
+   COM runtime at the offsets below (the embedder pins them with static
+   asserts): host object pointer, interface index, live tag, and the
+   optional recording ring whose pos and cons must agree.  Interface
+   arguments named in in_mask are unwrapped the same way, after checking
+   their vtable pointer lies in [vt_lo, vt_lo + vt_size).
+
+   Argument positions are MS-x64 positions 0..7 (COM: position 0 is `this`,
+   FLAT: position 0 is the first argument); 0..3 come from RCX/RDX/R8/R9,
+   4..7 from the guest stack at RSP + 8 + 8*p.  ext[p] extends position p
+   before the call: 0 none, 1 zero-extend 32, 2 sign-extend 32, 3 zero 16,
+   4 sign 16, 5 zero 8, 6 sign 8.  The callee (ELFv2) gets positions 0..7
+   in r3..r10, its r3 result lands in RAX, the return address is popped
+   from the guest stack into RIP.  Faults inside the callee: see
+   fexbridge_ec_direct_in_flight.                                          */
+#define FEXBRIDGE_EC_CELL_DIRECT   0x8u  /* bit in the cell's state word */
+#define FEXBRIDGE_EC_DIRECT_OFFSET 8u    /* digest offset in the cell */
+#define FEXBRIDGE_EC_DIRECT_COM    1u
+#define FEXBRIDGE_EC_DIRECT_FLAT   2u
+#define FEXBRIDGE_EC_DIRECT_SABOTAGE 0x100u /* kind flag: RAX inverted after the call */
+struct fexbridge_ec_direct {
+  uint32_t kind;      /* low byte FEXBRIDGE_EC_DIRECT_*; bit 8 sabotage */
+  uint32_t nargs;     /* positions used (informational) */
+  uint32_t slot;      /* COM: host vtable slot index */
+  uint32_t iface;     /* COM: the proxy's interface index must equal this */
+  uint64_t fn;        /* FLAT: the function */
+  uint64_t dirty;     /* address of a byte that must read 0, or 0 */
+  uint64_t vt_lo;     /* guest vtable block for interface-argument unwrap */
+  uint64_t vt_size;
+  uint32_t in_mask;   /* bit p: position p is an interface pointer to unwrap */
+  uint8_t ext[8];     /* per position */
+  uint32_t pad;
+};
+/* COM proxy layout the JIT reads (pinned by the embedder's asserts) */
+#define FEXBRIDGE_EC_PROXY_VTBL   0x00u
+#define FEXBRIDGE_EC_PROXY_HOST   0x08u
+#define FEXBRIDGE_EC_PROXY_IFACE  0x14u  /* uint32 */
+#define FEXBRIDGE_EC_PROXY_RING   0x28u  /* ring header pointer, or 0 */
+#define FEXBRIDGE_EC_PROXY_RPOS   0x30u  /* list-scope ring position, must be 0 */
+#define FEXBRIDGE_EC_PROXY_LIVE   0x44u  /* uint32, must be 1 */
+#define FEXBRIDGE_EC_RING_POS     0x00u  /* in the ring header */
+#define FEXBRIDGE_EC_RING_CONS    0x10u
+
+/* 1 while the calling thread is inside a direct-served native call (the
+   guest RIP of the call site is the frame's State.rip); 0 otherwise.  For
+   the embedder's fault handler: a host fault with this set belongs to the
+   guest call site, not to the embedder.                                    */
+int fexbridge_ec_direct_in_flight(void);
+
+/* Unwind a fault taken inside a direct-served native call to the innermost
+   fexbridge_run, which returns FEXBRIDGE_RUN_FAULT with Rip = the guest call
+   site and the register file as it was at the call (the crossing spilled
+   it).  DOES NOT RETURN on success; 0 when no direct call is in flight.   */
+int fexbridge_fault_unwind_direct(void* host_ucontext);
+
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides
    Rip/Rsp/etc. Returns 0 and a handle, negative on failure.                */

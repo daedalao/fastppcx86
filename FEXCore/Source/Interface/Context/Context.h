@@ -362,7 +362,8 @@ public:
 
   void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;
 
-  bool AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor) override;
+  bool AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::SHA256Sum& ThunkNameHash, void* Descriptor,
+                            void* DirectCell = nullptr) override;
   void RemoveECTargetIRHandler(uintptr_t Entrypoint) override;
   // True when GuestRIP is an EC-target registration (CompileCode's
   // range-indexing carve-out for custom-IR blocks whose entrypoint is real
