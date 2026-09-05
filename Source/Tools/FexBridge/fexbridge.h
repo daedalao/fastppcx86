@@ -60,7 +60,25 @@
 
   ============================ CONFIG ========================================
   process_init loads the FEX config layers (FEX_APP_CONFIG honoured) and then
-  forces IS64BIT_MODE=1 and SMCCHECKS=0. Self-modifying/newly-loaded guest
+  forces IS64BIT_MODE=1 and SMCCHECKS=0.
+
+  FEXBRIDGE_SPINSENTINEL (default on) is the bridge's generic guest-spin
+  detector: it names trap storms (one site re-trapping at storm rate with
+  identical args/results) and periodic guest<->native crossing recursions on
+  stderr, report-only and rate-limited.  FEXBRIDGE_SPINSENTINEL=0 disables,
+  FEXBRIDGE_SPINSENTINEL_TRACE=1 removes the report gates/caps, and
+  FEXBRIDGE_SPINSENTINEL_THROTTLE=<usec> opts in to sleeping that long per
+  no-progress trap once a site has repeated identically 16384 times (timing
+  only; the guest's calls all still execute).  Details in FexBridge.cpp.
+
+  FEXBRIDGE_FAULTLOG (default on) fingerprints every guest fault the bridge
+  surfaces (unwound JIT faults and NoExec entries) BEFORE the guest's own
+  handler runs: guest RIP, all 16 GPRs, EFLAGS, host DAR/DSISR, one record
+  to stderr and to /tmp/fexbridge-faults-<pid>.log, capped at 64 records per
+  process.  Built because in-guest crash reporters (REDengine's) never
+  complete their dumps in this lane.  FEXBRIDGE_FAULTLOG=0 disables.
+
+  Self-modifying/newly-loaded guest
   code is the CALLER's job to report via fexbridge_invalidate_code_range —
   call it after writing guest instructions to memory that may already have
   been executed from, and after any PE section load.
@@ -109,7 +127,83 @@ extern "C" {
            fills the skipped groups with a recognizable pattern (EFlags
            0xDEADF1A6, FltSave 0xDD bytes) so a reader that forgot to
            materialize fails loudly -- the embedder's negative control.      */
-#define FEXBRIDGE_ABI_VERSION 5u
+/* 5 -> 6: the zero-copy trap (the trap view).  fexbridge_set_trap_view_handler()
+           registers a callback that receives a FEXBRIDGE_TRAP_VIEW -- pointers
+           into the LIVE guest register file -- instead of a marshalled AMD64
+           CONTEXT.  On a view trap the bridge builds no CONTEXT at all: no
+           GPR store, no EFLAGS reconstruction, no FP store, no write-back
+           pass.  The callback reads and writes guest registers in place and
+           owns RIP through the view exactly as the CONTEXT protocol owns
+           ctx->Rip.  When both handlers are registered the view handler wins;
+           FEXBRIDGE_EAGER_CTX=1 in the environment VETOES the view protocol
+           at registration time (a loud line says so) and every trap then goes
+           to the ABI<=5 CONTEXT handler -- which is why an embedder that
+           registers a view handler must keep its CONTEXT handler registered
+           too: the pair is the kill switch.
+           fexbridge_view_pull()/fexbridge_view_push() are the cold-path
+           bridge to CONTEXT land for the callbacks that need one (a debugger
+           read, an exception, an FP-typed call): pull fills the named groups
+           of a caller-provided CONTEXT from live guest state, push writes
+           the named groups back.  NESTED RUNS under the view protocol:
+           fexbridge_run's own nested-run save/restore already preserves the
+           EFLAGS raw forms and the entire FP file (XMM/x87/MXCSR/FCW/FTW/
+           YMM-high) around a nested run -- but the GPRs, RIP and RSP are
+           loaded from the nested run's CONTEXT and clobbered by the nested
+           guest, and with no outer CONTEXT there is no outer resume to put
+           them back.  A view callback that starts a nested run must
+           pull(CONTROL|INTEGER) first and push(CONTROL|INTEGER) after; that
+           is the ABI<=5 "caller must save/restore the CONTEXT around a
+           nested run" contract restated for the view.                        */
+/* 6 -> 7: EC targets (PPC64EC).  fexbridge_register_ec_target() makes the
+           emulator COMPILE a registered guest RIP as a direct host call to
+           the handler instead of decoding the bytes at that address -- the
+           whole marshalled-trap round trip (guest call -> stub -> SYSCALL
+           decode -> trap sink) collapses into one JIT-emitted host call with
+           the same spill/refill discipline the trap already pays.
+
+           THE BYTES AT THE RIP ARE NEVER TOUCHED AND NEVER DECODED while the
+           registration stands: registration lives in the emulator's compile
+           path (a custom-IR entrypoint consulted before the frontend
+           decoder), not in guest memory.  A reader (DRM checksums, Detours
+           scans) sees the stub bytes unchanged, and every path that reaches
+           the address without a registration -- after unregistration, or
+           mid-stub -- decodes those bytes and traps exactly as before.  The
+           stub is the always-correct fallback.
+
+           CALLING-CONVENTION DIFFERENCE FROM A TRAP, read this twice: an EC
+           transition fires at the STUB ENTRY, before the stub's
+           `mov r10,rcx` has executed, so argument 0 is still in RCX
+           (gregs[FEXBRIDGE_GREG_RCX]).  A trap-protocol handler reads the
+           rescued copy from R10; an EC handler must NOT.  Likewise *view->rip
+           on entry is the registered RIP itself (the stub base), not
+           stub+trap_off.
+
+           The handler receives the ABI 6 view (gregs/rip into live CPUState;
+           fexbridge_view_pull/push work inside it, including around a nested
+           fexbridge_run) plus its registration cookie, and owns *view->rip
+           exactly like a trap callback: pop the return address, write
+           results, set rip.  FEXBRIDGE_TRAP_CONTINUE resumes at *view->rip
+           through the ordinary dispatcher; FEXBRIDGE_TRAP_EXIT ends the run
+           cooperatively with *view->rip as the parked continuation.
+
+           INVALIDATION: fexbridge_invalidate_code_range over a registered
+           RIP drops the compiled transition block but NOT the registration
+           -- the compile path re-consults registrations before the decoder,
+           so the next execution recompiles the transition and SMC-style
+           invalidation storms cannot silently downgrade an EC target to a
+           trap.  Only fexbridge_unregister_ec_range removes registrations
+           (module unload); it also invalidates the range so stale transition
+           blocks die.  LIFETIME: a handler/cookie must stay callable until
+           unregister_ec_range for its RIP has returned and no call that
+           entered before it is still in flight -- the bridge retires its own
+           per-registration descriptors without freeing them (bounded by the
+           number of registrations ever made), but the embedder's cookie
+           lifetime is the embedder's problem.
+
+           64-bit guest processes only for now: registration in a 32-bit
+           process is refused with -3 (the i386 lane keeps the trap
+           protocol).                                                        */
+#define FEXBRIDGE_ABI_VERSION 7u
 
 /* ---- fexbridge_run() results ------------------------------------------- */
 #define FEXBRIDGE_RUN_EXITED 0 /* trap callback returned FEXBRIDGE_TRAP_EXIT */
@@ -266,6 +360,178 @@ uint32_t fexbridge_declare_trap_ctx(uint32_t lazy_mask);
    may call it unconditionally on any path that touches the group.  Returns
    0, negative on a NULL argument.                                          */
 int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags);
+
+/* ---- zero-copy traps (ABI 6) ------------------------------------------- */
+/* The view: pointers into the live guest register file, valid only from
+   view-trap entry until the callback returns, on the callback's own thread.
+   Both pointers alias CPUState, which is fully spilled for the whole trap
+   window -- a write through them IS a write to guest state, applied at
+   resume with no further copying.                                          */
+typedef struct fexbridge_trap_view {
+  uint64_t* gregs; /* the 16 guest GPRs in x86 encoding order:
+                        RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15 */
+  uint64_t* rip;   /* the live guest RIP.  On entry: the address OF the
+                        trapping instruction (not advanced), exactly like the
+                        CONTEXT protocol's Rip.  The callback owns it; return
+                        without advancing and the trap re-executes.          */
+  uint32_t reserved[4];
+} FEXBRIDGE_TRAP_VIEW;
+
+/* Convenience indices for view->gregs (x86 encoding order). */
+#define FEXBRIDGE_GREG_RAX 0
+#define FEXBRIDGE_GREG_RCX 1
+#define FEXBRIDGE_GREG_RDX 2
+#define FEXBRIDGE_GREG_RBX 3
+#define FEXBRIDGE_GREG_RSP 4
+#define FEXBRIDGE_GREG_RBP 5
+#define FEXBRIDGE_GREG_RSI 6
+#define FEXBRIDGE_GREG_RDI 7
+#define FEXBRIDGE_GREG_R8 8
+#define FEXBRIDGE_GREG_R9 9
+#define FEXBRIDGE_GREG_R10 10
+#define FEXBRIDGE_GREG_R11 11
+#define FEXBRIDGE_GREG_R12 12
+#define FEXBRIDGE_GREG_R13 13
+#define FEXBRIDGE_GREG_R14 14
+#define FEXBRIDGE_GREG_R15 15
+
+/* Return FEXBRIDGE_TRAP_CONTINUE or FEXBRIDGE_TRAP_EXIT, same as the CONTEXT
+   protocol; on EXIT the run leaves with *view->rip as the parked
+   continuation.                                                            */
+typedef int (*fexbridge_trap_view_fn)(void* thread, struct fexbridge_trap_view* view, void* user);
+
+/* Register the view handler.  Takes precedence over the CONTEXT handler on
+   every trap -- unless FEXBRIDGE_EAGER_CTX=1 is in the environment AT
+   REGISTRATION TIME, which vetoes the view protocol process-wide (loudly)
+   and leaves every trap on the CONTEXT handler.  Keep the CONTEXT handler
+   registered: it is the veto's landing spot and the fallback for anything
+   the view path cannot serve.  Same publication contract as
+   fexbridge_set_trap_handler: register before the first run.               */
+void fexbridge_set_trap_view_handler(fexbridge_trap_view_fn cb, void* user);
+
+/* Cold-path CONTEXT bridge for view callbacks.  Callable between view-trap
+   entry and the callback's return, on the callback's own thread (the same
+   rule as fexbridge_ctx_materialize).  flags names groups with the ordinary
+   FEXBRIDGE_CTX_* bits; the CONTEXT's own ContextFlags word is written by
+   pull and IGNORED by push (the flags argument alone gates what push
+   applies).
+   pull fills the named groups of the caller's CONTEXT from live guest
+   state: INTEGER and CONTROL are plain loads (CONTROL includes the
+   reconstructed EFLAGS and CS/SS selectors); FLOATING_POINT is the full
+   XMM/x87 store; SEGMENTS is the DS/ES/FS/GS selectors -- callers that
+   synthesize selectors themselves (Wine does) can skip it.
+   push writes the named groups back into live guest state: CONTROL applies
+   Rip/Rsp and decomposes EFlags; INTEGER stores the 14 GPRs; FLOATING_POINT
+   applies the full FP file.  Returns 0, negative on a NULL argument.       */
+int fexbridge_view_pull(void* thread, void* amd64_ctx, uint32_t flags);
+int fexbridge_view_push(void* thread, const void* amd64_ctx, uint32_t flags);
+
+/* ---- EC targets (ABI 7) ------------------------------------------------- */
+/* The EC handler.  `thread` is the fexbridge thread handle; `view` is the
+   ABI 6 trap view (arg0 in RCX, not R10 -- see the 6->7 changelog);
+   `cookie` is the registration's cookie.  Return FEXBRIDGE_TRAP_CONTINUE or
+   FEXBRIDGE_TRAP_EXIT.                                                     */
+typedef int (*fexbridge_ec_fn)(void* thread, struct fexbridge_trap_view* view, void* cookie);
+
+/* Register `rip` to compile as a direct host call to `handler`.  Callable
+   from any thread after process init; takes effect for every execution that
+   dispatches to `rip` after the call returns (any ordinary block already
+   compiled at exactly that address is invalidated here).  Idempotent for an
+   identical (handler, cookie) pair.
+   Returns 0 on success; -1 uninitialized/bad argument; -2 already registered
+   with a DIFFERENT handler or cookie; -3 32-bit guest process.             */
+int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* cookie);
+
+/* Remove every registration whose rip lies in [start, start+length) and
+   invalidate the range so compiled transition blocks die with it.  Returns
+   the number of registrations removed, or -1 uninitialized/bad argument.
+   See the 6->7 changelog for handler/cookie lifetime.                      */
+int fexbridge_unregister_ec_range(uint64_t start, uint64_t length);
+
+/* Batch registration: every rip in rips[0..count) with ONE handler/cookie,
+   ONE invalidation and ONE per-thread cache scrub over the whole span at the
+   end.  Exists because per-target registration of a large module's stub
+   array (ntdll: ~2400) costs a measurable stall -- ~1.1 ms -- inside
+   whatever the guest was timing when the module armed.  Zero rips are
+   skipped; a rip already registered with the SAME handler/cookie counts as
+   standing; one claimed by anything else is skipped.  Returns the number of
+   registrations standing from this call, or a negative from the same set as
+   fexbridge_register_ec_target.  Same lifetime rules.                      */
+int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie);
+
+/* Batch registration with one cookie PER RIP: cookies[i] rides to the
+   handler for calls transitioning through rips[i], letting the embedder hand
+   each slot its own precomputed row (a per-slot dispatch cell) instead of
+   re-resolving the RIP on every call.  Everything else is
+   fexbridge_register_ec_targets exactly; cookies must not be null (use the
+   older form for a shared cookie), the ARRAY is read only during this call,
+   but each cookie VALUE lives by the 6->7 changelog's lifetime rules.      */
+int fexbridge_register_ec_targets2(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler);
+
+/* ---- EC DIRECT calls (ABI 7, optional symbols; no bump) -----------------
+   A registered rip's cookie (the _targets2 form) is the embedder's per-slot
+   cell.  When the cell's first 32-bit word carries FEXBRIDGE_EC_CELL_DIRECT
+   in its bits, the JIT-compiled transition block serves the call INLINE --
+   no trampoline, no handler -- from the digest at cookie +
+   FEXBRIDGE_EC_DIRECT_OFFSET.  Any check failing (state, dirty byte, proxy
+   validation, ring not quiet) falls through to the handler exactly as
+   before.  The embedder publishes the digest first and the state word last
+   (release), and never changes a digest once published.
+
+   The COM form reads the guest `this` (RCX) as a proxy of the embedder's
+   COM runtime at the offsets below (the embedder pins them with static
+   asserts): host object pointer, interface index, live tag, and the
+   optional recording ring whose pos and cons must agree.  Interface
+   arguments named in in_mask are unwrapped the same way, after checking
+   their vtable pointer lies in [vt_lo, vt_lo + vt_size).
+
+   Argument positions are MS-x64 positions 0..7 (COM: position 0 is `this`,
+   FLAT: position 0 is the first argument); 0..3 come from RCX/RDX/R8/R9,
+   4..7 from the guest stack at RSP + 8 + 8*p.  ext[p] extends position p
+   before the call: 0 none, 1 zero-extend 32, 2 sign-extend 32, 3 zero 16,
+   4 sign 16, 5 zero 8, 6 sign 8.  The callee (ELFv2) gets positions 0..7
+   in r3..r10, its r3 result lands in RAX, the return address is popped
+   from the guest stack into RIP.  Faults inside the callee: see
+   fexbridge_ec_direct_in_flight.                                          */
+#define FEXBRIDGE_EC_CELL_DIRECT   0x8u  /* bit in the cell's state word */
+#define FEXBRIDGE_EC_DIRECT_OFFSET 8u    /* digest offset in the cell */
+#define FEXBRIDGE_EC_DIRECT_COM    1u
+#define FEXBRIDGE_EC_DIRECT_FLAT   2u
+#define FEXBRIDGE_EC_DIRECT_SABOTAGE 0x100u /* kind flag: RAX inverted after the call */
+struct fexbridge_ec_direct {
+  uint32_t kind;      /* low byte FEXBRIDGE_EC_DIRECT_*; bit 8 sabotage */
+  uint32_t nargs;     /* positions used (informational) */
+  uint32_t slot;      /* COM: host vtable slot index */
+  uint32_t iface;     /* COM: the proxy's interface index must equal this */
+  uint64_t fn;        /* FLAT: the function */
+  uint64_t dirty;     /* address of a byte that must read 0, or 0 */
+  uint64_t vt_lo;     /* guest vtable block for interface-argument unwrap */
+  uint64_t vt_size;
+  uint32_t in_mask;   /* bit p: position p is an interface pointer to unwrap */
+  uint8_t ext[8];     /* per position */
+  uint32_t pad;
+};
+/* COM proxy layout the JIT reads (pinned by the embedder's asserts) */
+#define FEXBRIDGE_EC_PROXY_VTBL   0x00u
+#define FEXBRIDGE_EC_PROXY_HOST   0x08u
+#define FEXBRIDGE_EC_PROXY_IFACE  0x14u  /* uint32 */
+#define FEXBRIDGE_EC_PROXY_RING   0x28u  /* ring header pointer, or 0 */
+#define FEXBRIDGE_EC_PROXY_RPOS   0x30u  /* list-scope ring position, must be 0 */
+#define FEXBRIDGE_EC_PROXY_LIVE   0x44u  /* uint32, must be 1 */
+#define FEXBRIDGE_EC_RING_POS     0x00u  /* in the ring header */
+#define FEXBRIDGE_EC_RING_CONS    0x10u
+
+/* 1 while the calling thread is inside a direct-served native call (the
+   guest RIP of the call site is the frame's State.rip); 0 otherwise.  For
+   the embedder's fault handler: a host fault with this set belongs to the
+   guest call site, not to the embedder.                                    */
+int fexbridge_ec_direct_in_flight(void);
+
+/* Unwind a fault taken inside a direct-served native call to the innermost
+   fexbridge_run, which returns FEXBRIDGE_RUN_FAULT with Rip = the guest call
+   site and the register file as it was at the call (the crossing spilled
+   it).  DOES NOT RETURN on success; 0 when no direct call is in flight.   */
+int fexbridge_fault_unwind_direct(void* host_ucontext);
 
 /* Create the guest-thread state for THE CALLING host thread. The guest
    register file starts zeroed; the first fexbridge_run's CONTEXT provides

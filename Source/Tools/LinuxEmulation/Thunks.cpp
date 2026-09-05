@@ -93,8 +93,8 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
   //   +8:  [label1] mflr r12
   //   +12: mtlr r0
   //   +16: addi r11, r12, 32       r11 = &InstanceInfo (label1+32 = template+40)
-  //   +20: addis r0, r13, var@tprel@ha
-  //   +24: std r11, var@tprel@l(r0) write TLS
+  //   +20: addis r12, r13, var@tprel@ha
+  //   +24: std r11, var@tprel@l(r12) write TLS (r12 base: see note at the asm)
   //   +28: ld r12, 0(r11)           r12 = InstanceInfo.HostPacker
   //   +32: mtctr r12
   //   +36: bctr
@@ -104,9 +104,16 @@ static __attribute__((aligned(16), naked, section("HostToGuestTrampolineTemplate
     "bl 1f \n"
     "1: mflr %r12 \n"
     "mtlr %r0 \n"
+    // r12 (not r0) as the addis destination and store base: with RA=0 a D-form
+    // memory op addresses from literal zero, so the canonical r0 TLS pair is
+    // only correct after GNU ld's tprel relaxation rewrites the base to r13.
+    // LLD (22.1.8) leaves the pair as written and the std becomes an absolute
+    // store to sign_ext(@tprel@l) -- every trampoline call then SIGSEGVs at
+    // +24. r12 is free here: r11 is already computed, and r12 is reloaded from
+    // the InstanceInfo on the next instruction.
     "addi %r11, %r12, 32 \n"
-    "addis %r0, %r13, __fex_callback_guestcall_ptr@tprel@ha \n"
-    "std %r11, __fex_callback_guestcall_ptr@tprel@l(%r0) \n"
+    "addis %r12, %r13, __fex_callback_guestcall_ptr@tprel@ha \n"
+    "std %r11, __fex_callback_guestcall_ptr@tprel@l(%r12) \n"
     "ld %r12, 0(%r11) \n"
     "mtctr %r12 \n"
     "bctr \n"

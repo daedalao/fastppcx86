@@ -17,6 +17,7 @@ $end_info$
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <cstdarg>
 #include <cstring>
@@ -852,6 +853,21 @@ static void FEXFN_IMPL(vkDestroySamplerYcbcrConversion)(VkDevice a_0, VkSamplerY
 static VkResult FEXFN_IMPL(vkCreateValidationCacheEXT)(VkDevice a_0, const VkValidationCacheCreateInfoEXT* a_1,
                                                        const VkAllocationCallbacks* a_2, VkValidationCacheEXT* a_3) {
   return LDR_DEVICE_PTR_CACHED(vkCreateValidationCacheEXT, a_0)(a_0, a_1, nullptr, a_3);
+}
+
+// CoreIsolation presenter ground truth (docs/CORE_ISOLATION_PLAN.md): record
+// which guest thread performs presents, then pass through. The notify symbol
+// lives in the FEX binary with default visibility; under an FEX build
+// without it (or a foreign host loader) dlsym resolves null once and this
+// stays a plain passthrough. 64-bit only — the 32-bit thunk keeps its fully
+// generated path so this hook cannot disturb the 32-bit repack machinery.
+static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* present_info) {
+  using NotifyFn = void (*)();
+  static const NotifyFn Notify = reinterpret_cast<NotifyFn>(dlsym(RTLD_DEFAULT, "FEX_NotifyGuestPresent"));
+  if (Notify) {
+    Notify();
+  }
+  return LDR_PTR(vkQueuePresentKHR)(queue, present_info);
 }
 #endif
 

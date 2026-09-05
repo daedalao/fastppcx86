@@ -607,8 +607,49 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
       // Adjust context to return to the dispatcher, reloading SRA from thread state
       const auto& Config = ThreadObject->SignalInfo.Delegator->GetConfig();
+      [[maybe_unused]] const uint64_t FaultPC = ArchHelpers::Context::GetPc(ucontext);
       ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
       ArchHelpers::Context::SetArmReg(ucontext, 1, 1); // Set ENTRY_FILL_SRA_SINGLE_INST_REG to force a single step
+#ifdef ARCHITECTURE_ppc64le
+      // This redirect permanently ABANDONS the interrupted block's context, and
+      // on ppc64le every JIT block owns a real stack frame (the prologue stdu
+      // whose DO-NOT-REMOVE rationale lives in JIT.cpp) that only the block's
+      // own exits pop. Redirecting with r1 still inside that frame leaks one
+      // frame per redirect: benign while blocks only use r1 relatively, fatal
+      // at thread exit, where the dispatcher's SIGSEGV stub runs
+      // PopCalleeSavedRegisters against what it believes is the dispatcher
+      // frame and restores LR/r14-r31 from an abandoned block frame's slots --
+      // then blr's to whatever garbage LR got (observed: a JITCodeHeader word,
+      // SIGILL; on other builds a wild data address the TestHarness longjmp
+      // swallowed). 3_F7_02_3.asm at MAXINST=500 is the deterministic repro:
+      // each unaligned lock-not on a self-code-page takes this redirect once.
+      // The block's stdu wrote the ABI back-chain word at 0(r1), so popping
+      // exactly the abandoned frame is one load. ARM64 needs nothing: its JIT
+      // blocks never move SP, which is why the redirect was sound there.
+      // ReturningStackLocation is exactly that r1 (stored right after the
+      // DispatchPtr prologue's PushCalleeSavedRegisters). It is NOT valid
+      // inside a nested CallbackPtr dispatch (CallbackPtr pushes its own
+      // callee-saved frame below but never updates the field), and a back-
+      // chain walk is no alternative there: blocks also lower r1 with ad-hoc
+      // `addi r1,-N` scratch areas whose 0(r1) holds data, not a chain
+      // (fpr_store_pattern faulted inside one; X87Ops parks an LR value
+      // there). So: no active callback or guest-signal frame
+      // (SignalHandlerRefCounter == 0, bumped by CallbackPtr and guest
+      // delivery, not by this host fault) -> restore the exact dispatcher
+      // r1; otherwise keep the historical leak-one-frame behaviour, which is
+      // exactly as (un)sound as it always was on that rare path. The
+      // guest-signal-delivery redirects to the same loop-top need nothing:
+      // they park the interrupted context in the guest sigframe and
+      // sigreturn restores it, frame included.
+      {
+        const uint64_t RSL = Thread->CurrentFrame->ReturningStackLocation;
+        SMC_AUDIT("[%d] redirect pc=%lx sp=%lx rsl=%lx refct=%u\n", FHU::Syscalls::gettid(), FaultPC, ArchHelpers::Context::GetSp(ucontext),
+                  RSL, Thread->CurrentFrame->SignalHandlerRefCounter);
+        if (RSL && Thread->CurrentFrame->SignalHandlerRefCounter == 0) {
+          ArchHelpers::Context::SetSp(ucontext, RSL);
+        }
+      }
+#endif
     }
 
     return true;

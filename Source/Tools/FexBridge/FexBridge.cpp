@@ -29,9 +29,11 @@ $end_info$
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/memory.h>
@@ -40,13 +42,20 @@ $end_info$
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <setjmp.h>
 #include <signal.h>
 #include <cerrno>
 #include <cinttypes>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <vector>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -74,6 +83,287 @@ void AssertHandler(const char* Message) {
 }
 
 // ---------------------------------------------------------------------------
+// FEXBRIDGE_SPINSENTINEL (default ON, report-only): generic guest-spin
+// detection at the crossing layer.
+//
+// The JIT-side spin machinery (FEX_SPINCOLLAPSE, FEX_SPINLOOPCLAMP*, the SMT
+// priority hints) is COMPILE-TIME: it matches side-effect-free loop shapes
+// inside one translation region, and a region containing a syscall/trap is
+// disqualified by construction.  The spins that machinery can never see are
+// exactly the ones this port keeps capturing at macro level:
+//   - trap storms: one guest site re-trapping at storm rate (the measured
+//     PeekMessageW storm: 247k traps/s, ~12ms of a 34.7ms frame floor), and
+//   - crossing recursion: a periodic guest<->native call cycle deepening
+//     until the 1MB kernel stack dies (the captured 224-deep Quake II /
+//     DOOM __CxxFrameHandler3 shape).
+// Both pass through exactly one choke point each in this file
+// (HandleSyscall per trap, fexbridge_run per reverse crossing), so a
+// DYNAMIC detector here is always-on-cheap and workload-generic.
+//
+// Detection (per thread, no locks, no allocation on the trap path):
+//   - Trap sites are tracked in a 64-slot direct-mapped table keyed by
+//     (rip ^ mix(rax)) -- rax distinguishes syscall numbers behind a shared
+//     bop site.  A slot counts traps at its site; at kArmCount the slot arms
+//     (one clock_gettime) and starts hashing the Win64 argument registers
+//     (r10/rdx/r8/r9) and comparing the post-callback RAX, so a report can
+//     say "identical args, identical result" -- the poll-storm signature --
+//     versus "results vary" (a hot but progressing site, e.g. QPC).
+//   - Fast-path cost per trap: ~10-25 instructions and one 128-byte line;
+//     the whole feature is behind one predictable branch when disabled.
+//   - fexbridge_run counts RunFrame nesting depth; at kDepthFirstReport it
+//     walks the frame chain (bounded), finds the shortest repeating period
+//     of (reverse-entry rip, outer-trap rip) pairs, and names the cycle --
+//     turning a stack-exhaustion death into a diagnosis while the thread is
+//     still alive.  Re-reports each doubling of depth.
+//
+// Response policy, in project discipline order:
+//   - REPORT (default): bounded, rate-limited stderr lines.  Reports gate on
+//     measured rate (>= kReportMinRate) so long-lived ordinary sites never
+//     eat the report budget; FEXBRIDGE_SPINSENTINEL_TRACE=1 removes the
+//     gates and caps.
+//   - THROTTLE (opt-in, FEXBRIDGE_SPINSENTINEL_THROTTLE=<usec>): after
+//     kThrottleRun consecutive traps at one site with IDENTICAL argument
+//     registers and IDENTICAL result, each further such trap sleeps that
+//     many microseconds; any change in args or result resets the run.
+//     This can only ever change TIMING -- it executes everything the guest
+//     asked, so the worst wrong call is added latency (one sleep in flight
+//     when a poll finally lands), never a dropped input or corrupted state.
+//     Answering/eliding the call itself is deliberately NOT offered here:
+//     the bridge cannot know Win32 semantics (PeekMessage returning the
+//     same TRUE twice can still have delivered two different messages
+//     through the out-pointer), and that class of fix belongs in the
+//     embedder, which owns the semantics.
+// Knobs (getenv, same lane precedent as FEXBRIDGE_EAGER_CTX -- steamtool
+// appconfig .env files reach these per-title):
+//   FEXBRIDGE_SPINSENTINEL=0            kill switch (default: enabled)
+//   FEXBRIDGE_SPINSENTINEL_THROTTLE=<n> arm the throttle, n usec (default 0)
+//   FEXBRIDGE_SPINSENTINEL_TRACE=1      loud: no rate gate, no report caps
+// ---------------------------------------------------------------------------
+namespace SpinSentinel {
+constexpr uint32_t kSlotCount = 64;         // per-thread, direct-mapped
+constexpr uint64_t kArmCount = 4096;        // site trap count that arms arg/result tracking
+constexpr uint64_t kFirstReport = 65536;    // site trap count at first report (then x4)
+constexpr uint64_t kReportMinRate = 5000;   // traps/s; below this a site is not a storm
+constexpr uint64_t kThrottleRun = 16384;    // identical-args+result run before throttling
+constexpr uint32_t kDepthFirstReport = 64;  // crossing depth at first report (then x2)
+constexpr uint32_t kMaxThreadReports = 16;  // per-thread lifetime report cap
+constexpr int kMaxProcessReports = 128;     // process-wide lifetime report cap
+
+bool Enabled = true;
+bool Trace = false;
+uint32_t ThrottleUs = 0;
+std::atomic<int> ProcessReports {0};
+
+struct Slot {
+  uint64_t Key {};
+  uint64_t Rip {};          // trap rip (valid once armed)
+  uint64_t Rax {};          // guest RAX at the trap (syscall number for Wine stubs)
+  uint64_t Count {};        // traps at this site since the slot last re-keyed
+  uint64_t NextReport {};
+  uint64_t ArmMonoNs {};    // CLOCK_MONOTONIC at arming; rate baseline
+  uint64_t ArgHash {};      // last trap's r10/rdx/r8/r9 hash (armed only)
+  uint64_t Args[4] {};      // last trap's raw r10/rdx/r8/r9 -- attribution:
+                            // for a Wine syscall stub r10 is the first
+                            // argument, often the HANDLE being polled
+  uint64_t Result {};       // last trap's post-callback RAX (armed only)
+  uint64_t IdenticalRun {}; // consecutive identical (args, result) traps
+  bool Armed {};
+  bool HaveResult {};
+  bool ArgsVaried {};       // any variation observed since arming
+  bool ResultVaried {};
+};
+
+struct ThreadState {
+  Slot Slots[kSlotCount];
+  pid_t Tid {};
+  uint32_t Reports {};
+  uint32_t NextDepthReport {kDepthFirstReport};
+};
+
+uint64_t MonoNs() {
+  timespec TS {};
+  clock_gettime(CLOCK_MONOTONIC, &TS);
+  return uint64_t(TS.tv_sec) * 1000000000ull + uint64_t(TS.tv_nsec);
+}
+
+bool TakeReport(ThreadState* TS) {
+  if (!Trace && (TS->Reports >= kMaxThreadReports || ProcessReports.load(std::memory_order_relaxed) >= kMaxProcessReports)) {
+    return false;
+  }
+  ++TS->Reports;
+  ProcessReports.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void InitFromEnv() {
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL"); E && E[0] == '0' && !E[1]) {
+    Enabled = false;
+    return;
+  }
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL_TRACE"); E && E[0] == '1') {
+    Trace = true;
+    fprintf(stderr, "fexbridge: SPINSENTINEL trace: reports ungated and uncapped\n");
+  }
+  if (const char* E = getenv("FEXBRIDGE_SPINSENTINEL_THROTTLE")) {
+    const long V = atol(E);
+    if (V > 0) {
+      ThrottleUs = V > 100000 ? 100000u : uint32_t(V);
+      // Loud by design: this knob changes guest timing, so its presence must
+      // never be silent.
+      fprintf(stderr,
+              "fexbridge: SPINSENTINEL throttle armed: %uus per no-progress trap after %" PRIu64 " identical repeats\n",
+              ThrottleUs, kThrottleRun);
+    }
+  }
+}
+} // namespace SpinSentinel
+
+// ---------------------------------------------------------------------------
+// Guest fault fingerprinting (FEXBRIDGE_FAULTLOG, default on)
+//
+// The forensics gap this closes (nw-lane Witcher 3, 2026-08-31..09-01): the
+// game's own crash reporter has never once completed a minidump in this lane
+// (every ReportQueue dump is 244 or 0 bytes; the reporter thread deadlocks on
+// locks its own thread-suspension took hostage), so not one guest RIP was
+// ever captured for the whole crash class.  The bridge sees every guest
+// fault BEFORE the game's handler runs -- both host faults in JIT code
+// unwound by fexbridge_fault_unwind and NoExec entry faults classified in
+// the run loop -- so it records the fingerprint here: guest RIP, all 16
+// GPRs, EFLAGS, and for data faults the host DAR/DSISR (fault address and
+// access-type bits straight from the machine).
+//
+// One record per fault to stderr AND to /tmp/fexbridge-faults-<pid>.log --
+// the file survives terminal scrollback and the freeze-then-pkill teardown
+// that ends these sessions.  First-chance faults the guest handles (SEH
+// probes and kin) land here too, so a per-process record cap keeps a fault
+// storm from becoming its own problem.  FEXBRIDGE_FAULTLOG=0 disables.
+//
+// Signal-context rules: the unwind hook runs inside the host SIGSEGV
+// handler, so this path allows itself open/write/close/getpid and a stack
+// snprintf -- no malloc, no stdio streams, and NOT EmitLog (the embedder's
+// log callback has made no signal-safety promise).  Guest memory is never
+// dereferenced: registers only, a re-fault in the handler would trade a
+// fingerprint for a hang.
+// ---------------------------------------------------------------------------
+namespace FaultLog {
+constexpr int kMaxRecords = 64;
+bool Enabled = true;
+std::atomic<int> Records {0};
+std::atomic<int> Fd {-2}; // -2 unopened, -1 open failed (stderr only)
+
+void InitFromEnv() {
+  if (const char* E = getenv("FEXBRIDGE_FAULTLOG"); E && E[0] == '0' && !E[1]) {
+    Enabled = false;
+  }
+}
+
+std::atomic<bool> MapsDumped {false};
+
+// One /proc/self/maps snapshot, appended to the log file after the first
+// fault record.  A guest data fault carries only DAR -- a bare address --
+// and in this lane the addresses that matter (0x3ffd_xxxx_xxxx and kin) sit
+// in the shared top-down mmap band where a wine view, a native-half malloc
+// arena, dxvk memory and the bridge's own mappings all interleave under host
+// ASLR.  Which mapping owns the faulting address is decidable only from the
+// map of the run that faulted, and by teardown time the process is gone.
+//
+// File only, never stderr: this runs to hundreds of KB and would bury the
+// record it annotates.  Signal-safety is the same contract as Write() --
+// open, read, write, close, a stack buffer, no allocation -- and every
+// failure is accepted silently, because a missing annotation must never
+// cost the fingerprint it was meant to explain.
+void DumpMaps(int FileFd) {
+  if (FileFd < 0) {
+    return;
+  }
+  bool Expected = false;
+  if (!MapsDumped.compare_exchange_strong(Expected, true)) {
+    return;
+  }
+
+  const int MapsFd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (MapsFd < 0) {
+    return;
+  }
+
+  static constexpr char Banner[] = "fexbridge-fault: /proc/self/maps at first fault follows\n";
+  (void)!write(FileFd, Banner, sizeof(Banner) - 1);
+
+  char Buf[4096];
+  size_t Total = 0;
+  constexpr size_t kMaxMapsBytes = 1u << 20; // a wine process runs to a few thousand lines
+  while (Total < kMaxMapsBytes) {
+    const ssize_t R = read(MapsFd, Buf, sizeof(Buf));
+    if (R <= 0) {
+      break;
+    }
+    (void)!write(FileFd, Buf, R);
+    Total += (size_t)R;
+  }
+  close(MapsFd);
+
+  static constexpr char End[] = "fexbridge-fault: end of maps\n";
+  (void)!write(FileFd, End, sizeof(End) - 1);
+}
+
+void Write(FEXCore::Core::InternalThreadState* Thread, const char* Kind, uint32_t EFlags, uint64_t HostPC, uint64_t Dar, uint64_t Dsisr) {
+  if (!Enabled) {
+    return;
+  }
+  const int N = Records.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N > kMaxRecords) {
+    return;
+  }
+
+  int FileFd = Fd.load(std::memory_order_acquire);
+  if (FileFd == -2) {
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/tmp/fexbridge-faults-%d.log", getpid());
+    const int NewFd = open(Path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    int Expected = -2;
+    if (Fd.compare_exchange_strong(Expected, NewFd)) {
+      FileFd = NewFd;
+    } else {
+      // Another thread's fault won the open race; use its fd.
+      if (NewFd >= 0) {
+        close(NewFd);
+      }
+      FileFd = Expected;
+    }
+  }
+
+  const auto& S = Thread->CurrentFrame->State;
+  const uint64_t* G = S.gregs; // X86Enums order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+  timespec TS {};
+  clock_gettime(CLOCK_REALTIME, &TS);
+  char Buf[768];
+  int Len = snprintf(
+    Buf, sizeof(Buf),
+    "fexbridge-fault #%d t=%lld.%03ld tid=%d kind=%s rip=%016llx eflags=%08x dar=%016llx dsisr=%08llx hostpc=%016llx\n"
+    "  rax=%016llx rcx=%016llx rdx=%016llx rbx=%016llx rsp=%016llx rbp=%016llx rsi=%016llx rdi=%016llx\n"
+    "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx%s\n",
+    N, (long long)TS.tv_sec, TS.tv_nsec / 1000000, (int)syscall(SYS_gettid), Kind, (unsigned long long)S.rip, EFlags,
+    (unsigned long long)Dar, (unsigned long long)Dsisr, (unsigned long long)HostPC, (unsigned long long)G[0],
+    (unsigned long long)G[1], (unsigned long long)G[2], (unsigned long long)G[3], (unsigned long long)G[4],
+    (unsigned long long)G[5], (unsigned long long)G[6], (unsigned long long)G[7], (unsigned long long)G[8],
+    (unsigned long long)G[9], (unsigned long long)G[10], (unsigned long long)G[11], (unsigned long long)G[12],
+    (unsigned long long)G[13], (unsigned long long)G[14], (unsigned long long)G[15],
+    N == kMaxRecords ? "\nfexbridge-fault: record cap reached; further faults unlogged" : "");
+  if (Len > 0) {
+    if (Len > (int)sizeof(Buf) - 1) {
+      Len = (int)sizeof(Buf) - 1;
+    }
+    (void)!write(2, Buf, Len);
+    if (FileFd >= 0) {
+      (void)!write(FileFd, Buf, Len);
+    }
+  }
+
+  DumpMaps(FileFd);
+}
+} // namespace FaultLog
+
+// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 struct RunFrame {
@@ -81,12 +371,18 @@ struct RunFrame {
   sigjmp_buf JB;
   bool ExitRequested {};
   uint64_t ExitRIP {};
+  // SpinSentinel crossing-recursion chain: the guest rip this (reverse) run
+  // entered at, and the guest rip of the outer trap that was live when it
+  // began (0 for an outermost run).
+  uint64_t EntryRIP {};
+  uint64_t TrapRIP {};
 };
 
 struct BridgeThread {
   FEXCore::Core::InternalThreadState* Thread {};
   uint64_t CallRetAllocBase {};
   RunFrame* RunTop {}; // innermost active fexbridge_run on this host thread
+  SpinSentinel::ThreadState* Sentinel {}; // null when FEXBRIDGE_SPINSENTINEL=0
 };
 
 FEXCore::Context::Context* CTX {};
@@ -99,11 +395,85 @@ std::atomic<void*> TrapUser {nullptr};
 // FEXBRIDGE_CTX_POISON -- a gate lever, never a production state.
 std::atomic<uint32_t> TrapCtxLazyMask {0};
 bool TrapCtxPoison {false};
+// Zero-copy traps (ABI 6).  Same publication contract as TrapCb.  The
+// FEXBRIDGE_EAGER_CTX veto is applied at REGISTRATION (the cb is simply not
+// stored), so the hot sink pays one acquire load and no environment read.
+std::atomic<fexbridge_trap_view_fn> TrapViewCb {nullptr};
+std::atomic<void*> TrapViewUser {nullptr};
+
+// EC targets (ABI 7).  One descriptor per registration, RETIRED but never
+// freed on unregister: a thread can be inside the transition's host call
+// when the unregister lands, and the descriptor must outlive that call.
+// Bounded by the number of registrations ever made (a Wine process registers
+// once per thunk export at module load), so this is the device-journal
+// bounded-leak pattern, chosen on purpose over a refcount on the hot path.
+struct EcDescriptor {
+  fexbridge_ec_fn Handler;
+  void* Cookie;
+  uint64_t Rip;
+};
+std::mutex EcLock;
+std::unordered_map<uint64_t, EcDescriptor*> EcTargets;      // live, by rip
+// EC direct calls (fexbridge.h): the JIT serves a registered rip inline
+// when its cell says so.  FEX_NO_EC_DIRECT=1 compiles every transition as
+// the plain trampoline -- the bridge-side half of the kill switch (the
+// embedder's half never stamps a cell DIRECT).
+static const bool EcDirectEnabled = getenv("FEX_NO_EC_DIRECT") == nullptr;
+std::vector<EcDescriptor*> EcRetired;                       // unregistered, kept
+// Every live BridgeThread, so EC (un)registration can scrub per-thread
+// lookup caches: InvalidateCodeBuffersCodeRange only reaches the shared
+// per-CodeBuffer map, and a thread's own L1/L2 would otherwise keep serving
+// a dropped block to that thread forever (measured: the S14 fallback leg).
+// The Linux frontend does the same walk through its ThreadManager; the
+// bridge never had one because ordinary wine invalidations precede first
+// execution.  Guarded by BridgeThreadsLock, taken AFTER the code
+// invalidation mutex where both are held.
+std::mutex BridgeThreadsLock;
+std::vector<BridgeThread*> BridgeThreads;
+// The well-known name the emitted IROp_Thunk resolves through the installed
+// ThunkHandler.  Not a hash of anything: an opaque 32-byte tag this bridge
+// answers for and nothing else does.
+constexpr FEXCore::IR::SHA256Sum EcSha = {{'F', 'E', 'X', 'B', 'R', 'I', 'D', 'G', 'E', '-', 'E', 'C', '-', 'T', 'R', 'A',
+                                           'M', 'P', 'O', 'L', 'I', 'N', 'E', '-', 'A', 'B', 'I', '7', 0, 0, 0, 0}};
+
 uint64_t HltPageAddr {}; // one guest-visible HLT, used to end a run cooperatively
 bool Initialized {};
 bool GuestIs64 {true};   // fixed by whichever process_init variant ran first
 
 thread_local BridgeThread* TLSThread {};
+
+// EVERY live BridgeThread, because invalidating code is a PROCESS-wide act.
+//
+// FEXCore keeps two tiers of translated-code bookkeeping: the shared
+// BlockList, and a per-thread L1/L2 dispatch cache that the JIT consults on
+// every indirect branch.  InvalidateCodeBuffersCodeRange() clears only the
+// first.  FEX's own frontend has always cleared both -- see
+// ThreadManager::InvalidateGuestCodeRange, which calls
+// InvalidateCodeBuffersCodeRange and then loops its thread list calling
+// InvalidateThreadCachedCodeRange.  The bridge never had a thread list, so it
+// could only ever do the first half, and a thread that had already executed
+// code at a since-reused address kept dispatching to the stale translation.
+//
+// [MEASURED 2026-08-29] that is a real, title-killing bug and not a
+// theoretical one.  On the i386 lane, msacm32's DllMain loads, exercises and
+// frees the ACM codecs in turn; msadp32.acm and msg711.acm have IDENTICAL
+// SizeOfImage (0x14000), so msg711 maps into msadp32's just-freed hole at the
+// same guest base.  wine's map-notify reaches us and the shared BlockList is
+// cleared, but the calling thread's L2 still maps those RIPs to msadp32's
+// translations -- and because the codecs are near-clones with DriverProc at
+// the same RVA, DRV_LOAD/ENABLE/OPEN all "succeed" against the WRONG module's
+// code.  The first divergent message then reads module-relative data in
+// msg711's different layout and jumps into it: the observed fault was at
+// 0x6C75646F, which is a dword of the string "GetModuleHandleW" sitting in
+// the new image where the old image had an IAT slot.
+//
+// This is NOT specific to msacm32, or to the 32-bit lane.  Any guest that
+// unloads and reloads DLLs over reused addresses is exposed, on either lane;
+// AMD64 has simply been masked by workload.
+//
+// The registry itself lives above, next to the EC tables (BridgeThreadsLock /
+// BridgeThreads): the EC-target cache scrub and this invalidation walk share
+// one list and one lock.
 
 constexpr size_t CALLRET_ALLOC = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
 
@@ -177,6 +547,52 @@ struct BridgeSignalDelegator final : public FEXCore::SignalDelegator, public FEX
 
 BridgeSyscallHandler* SyscallHandler {};
 BridgeSignalDelegator* SigDelegator {};
+
+// ---------------------------------------------------------------------------
+// EC transition trampoline (ABI 7).  The JIT calls this per DEF_OP(Thunk)'s
+// extended convention: first C argument = the registration descriptor (baked
+// into the transition block as an IR constant), second = the CpuStateFrame.
+// SRA is spilled by the emitted crossing before the call, so the frame's
+// State is the live truth and the view points straight at it -- the same
+// facts HandleSyscall's view path leans on, minus the CONTEXT machinery and
+// minus the trap decode entirely.
+// ---------------------------------------------------------------------------
+extern "C" void FexBridgeEcTrampoline(void* DescPtr, FEXCore::Core::CpuStateFrame* Frame) {
+  auto* Desc = static_cast<EcDescriptor*>(DescPtr);
+  auto* Thread = Frame->Thread;
+  BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
+
+  FEXBRIDGE_TRAP_VIEW View;
+  View.gregs = &Frame->State.gregs[0];
+  View.rip = &Frame->State.rip;
+  memset(View.reserved, 0, sizeof(View.reserved));
+
+  const int Result = Desc->Handler(BT, &View, Desc->Cookie);
+  if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
+    // Cooperative exit, exactly the sink's dance: park the continuation and
+    // route the guest through the bridge HLT so the JIT unwinds itself.  The
+    // emitted transition block reloads State.rip after this call, so the
+    // redirect takes effect at its indirect exit.
+    BT->RunTop->ExitRequested = true;
+    BT->RunTop->ExitRIP = Frame->State.rip;
+    Frame->State.rip = HltPageAddr;
+  }
+}
+
+// Serves the EC trampoline to the JIT for exactly the well-known EcSha tag;
+// every other lookup answers null (fail closed, same as a missing thunk).
+struct BridgeThunkHandler final : public FEXCore::ThunkHandler, public FEXCore::Allocator::FEXAllocOperators {
+  FEXCore::ThunkedFunction* LookupThunk(const FEXCore::IR::SHA256Sum& sha256) override {
+    if (memcmp(sha256.data, EcSha.data, sizeof(EcSha.data)) == 0) {
+      // Two C arguments at the machine level; ThunkedFunction is void(void*).
+      // ELFv2 makes the extra argument register invisible to a narrower
+      // callee, and DEF_OP(Thunk) always passes both.
+      return reinterpret_cast<FEXCore::ThunkedFunction*>(reinterpret_cast<void*>(&FexBridgeEcTrampoline));
+    }
+    return nullptr;
+  }
+};
+BridgeThunkHandler* ThunkHandlerInstance {};
 
 // ---------------------------------------------------------------------------
 // PROT_SAO hardware TSO (FEX_HWTSO).  The frontend's machinery lives in
@@ -329,14 +745,14 @@ void LoadFPFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRID
 
   __uint128_t XMM[16];
   memcpy(XMM, Context->FltSave.XmmRegisters, sizeof(XMM));
-  if (YMMIn) {
-    CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn);
-  } else {
-    // Zeroed only where actually consumed: when this ran unconditionally on
-    // the (since removed) per-hop trap load it was 0.35% of the GameThread.
-    __uint128_t YMMZero[16] {};
-    CTX->SetXMMRegistersFromState(Thread, XMM, YMMZero);
-  }
+  // A null YMMIn means the caller has no YMM-high data (an AMD64 CONTEXT
+  // cannot carry it), NOT that the upper halves are zero: forward the null
+  // and SetXMMRegistersFromState leaves avx_high untouched, matching the
+  // trap CONTEXT path's deliberate preservation and the header's "applies
+  // the full FP file" contract. The old conversion to a zeroed array
+  // memcpy'd zeros into avx_high[0..15] on every push/set_context/nested-run
+  // load — latent while AVX defaults off, destructive the day it is on.
+  CTX->SetXMMRegistersFromState(Thread, XMM, YMMIn);
 
   State.mxcsr = Context->FltSave.MxCsr;
   State.FCW = Context->FltSave.ControlWord;
@@ -355,9 +771,14 @@ void LoadFPFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRID
   }
 }
 
-void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
+// The Flags argument, not the CONTEXT's own ContextFlags word, gates the
+// groups -- fexbridge_view_push() (ABI 6) applies a caller-chosen subset of a
+// CONTEXT whose ContextFlags may name more groups than the caller wants
+// pushed.  LoadStateFromContext below keeps the historical behaviour of
+// reading the word out of the CONTEXT itself.
+void LoadStateFromContextFlags(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context,
+                               const __uint128_t* YMMIn, const uint32_t Flags) {
   auto& State = Thread->CurrentFrame->State;
-  const uint32_t Flags = Context->ContextFlags;
 
   if (Flags & FEXBRIDGE_CTX_CONTROL & ~FEXBRIDGE_CTX_AMD64) {
     State.rip = Context->Rip;
@@ -389,6 +810,10 @@ void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXB
   if (Flags & FEXBRIDGE_CTX_FLOATING_POINT & ~FEXBRIDGE_CTX_AMD64) {
     LoadFPFromContext(Thread, Context, YMMIn);
   }
+}
+
+void LoadStateFromContext(FEXCore::Core::InternalThreadState* Thread, const FEXBRIDGE_AMD64_CONTEXT* Context, const __uint128_t* YMMIn) {
+  LoadStateFromContextFlags(Thread, Context, YMMIn, Context->ContextFlags);
 }
 
 // Trap-path variant of LoadStateFromContext: identical semantics, but the
@@ -505,6 +930,79 @@ void LoadStateFromContextAfterTrap(FEXCore::Core::InternalThreadState* Thread, c
   }
 }
 
+// SpinSentinel, post-callback half: result identity, the report, and the
+// opt-in throttle.  Shared by the CONTEXT trap path and the ABI-6 zero-copy
+// view path -- RAX is read from the live CPUState, which is the post-callback
+// truth on both (the CONTEXT path has already written the callback's result
+// back).  Re-check the key: a nested run inside the callback may have
+// re-keyed this very slot (diagnostic-grade tolerance, not a correctness
+// concern).
+static void SpinSentinelPost(BridgeThread* BT, FEXCore::Core::CpuStateFrame* Frame, SpinSentinel::Slot* SSlot, uint64_t SKey,
+                             bool SSameArgs, int Result) {
+  if (!SSlot || Result != FEXBRIDGE_TRAP_CONTINUE || SSlot->Key != SKey) {
+    return;
+  }
+  const uint64_t R = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+  if (SSlot->HaveResult) {
+    if (R != SSlot->Result) {
+      SSlot->ResultVaried = true;
+    }
+    if (SSameArgs && R == SSlot->Result) {
+      ++SSlot->IdenticalRun;
+    } else {
+      SSlot->IdenticalRun = 0;
+    }
+  }
+  SSlot->Result = R;
+  SSlot->HaveResult = true;
+
+  if (SSlot->Count >= SSlot->NextReport) {
+    SSlot->NextReport <<= 2;
+    const uint64_t Dt = SpinSentinel::MonoNs() - SSlot->ArmMonoNs;
+    const uint64_t Rate = Dt ? (SSlot->Count - SpinSentinel::kArmCount) * 1000000000ull / Dt : 0;
+    auto* SS = BT->Sentinel;
+    if ((Rate >= SpinSentinel::kReportMinRate || SpinSentinel::Trace) && SpinSentinel::TakeReport(SS)) {
+      fprintf(stderr,
+              "fexbridge: SPINSENTINEL tid=%d trap-storm rip=0x%" PRIx64 " rax=0x%" PRIx64 " count=%" PRIu64 " rate=%" PRIu64
+              "/s args=%s result=%s last-rax=0x%" PRIx64 " identical-run=%" PRIu64 " last-args=[0x%" PRIx64 " 0x%" PRIx64
+              " 0x%" PRIx64 " 0x%" PRIx64 "]\n",
+              SS->Tid, SSlot->Rip, SSlot->Rax, SSlot->Count, Rate, SSlot->ArgsVaried ? "vary" : "identical",
+              SSlot->ResultVaried ? "varies" : "identical", R, SSlot->IdenticalRun, SSlot->Args[0], SSlot->Args[1], SSlot->Args[2],
+              SSlot->Args[3]);
+      // Attribution: the thread's OTHER hot trap sites.  A spin is usually
+      // a tight cycle of a few crossing sites (poll + yield + clock); the
+      // profile names the companions so "what is it waiting on" can be
+      // read straight from the log instead of profiled for.
+      char Prof[512];
+      int Off = 0;
+      for (uint32_t i = 0; i < SpinSentinel::kSlotCount; ++i) {
+        const auto& O = SS->Slots[i];
+        if (&O == SSlot || !O.Armed || O.Count < SpinSentinel::kArmCount) {
+          continue;
+        }
+        const int W = snprintf(Prof + Off, sizeof(Prof) - size_t(Off), " [rip=0x%" PRIx64 " rax=0x%" PRIx64 " count=%" PRIu64 "]",
+                               O.Rip, O.Rax, O.Count);
+        if (W < 0 || Off + W >= int(sizeof(Prof))) {
+          break;
+        }
+        Off += W;
+      }
+      if (Off) {
+        fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d thread-profile:%s\n", SS->Tid, Prof);
+      }
+    }
+  }
+
+  if (SpinSentinel::ThrottleUs && SSlot->IdenticalRun >= SpinSentinel::kThrottleRun) {
+    if (SpinSentinel::Trace && SSlot->IdenticalRun == SpinSentinel::kThrottleRun) {
+      fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d throttle engaged rip=0x%" PRIx64 " rax=0x%" PRIx64 "\n", BT->Sentinel->Tid,
+              SSlot->Rip, SSlot->Rax);
+    }
+    timespec TS {0, long(SpinSentinel::ThrottleUs) * 1000};
+    nanosleep(&TS, nullptr);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Trap sink. Marshals the full guest file to the caller, applies whatever the
 // caller wrote, and either resumes or steers the run to a cooperative HLT.
@@ -517,6 +1015,90 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
   // hands over for free.
   auto* Thread = Frame->Thread;
   BridgeThread* BT = static_cast<BridgeThread*>(Thread->FrontendPtr);
+
+  // SpinSentinel, pre-callback half (banner above SpinSentinel namespace):
+  // same-site trap accounting.  State.rip still holds the trap rip here (it
+  // is what StoreStateToContext is about to publish as ctx->Rip).
+  SpinSentinel::Slot* SSlot = nullptr;
+  uint64_t SKey = 0;
+  bool SSameArgs = false;
+  if (auto* SS = BT ? BT->Sentinel : nullptr) {
+    const uint64_t Rip = Frame->State.rip;
+    const uint64_t Rax = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+    SKey = Rip ^ (Rax << 17) ^ (Rax >> 47);
+    auto* Slot = &SS->Slots[(SKey ^ (SKey >> 8)) & (SpinSentinel::kSlotCount - 1)];
+    if (Slot->Key == SKey) {
+      ++Slot->Count;
+      if (!Slot->Armed) {
+        if (Slot->Count >= SpinSentinel::kArmCount) {
+          Slot->Armed = true;
+          Slot->HaveResult = Slot->ArgsVaried = Slot->ResultVaried = false;
+          Slot->IdenticalRun = 0;
+          Slot->Rip = Rip;
+          Slot->Rax = Rax;
+          Slot->ArmMonoNs = SpinSentinel::MonoNs();
+          SSlot = Slot;
+        }
+      } else {
+        // Win64 argument registers (r10 carries the syscall convention's
+        // rcx).  A hash collision under-reports variation; harmless.
+        const auto& G = Frame->State.gregs;
+        const uint64_t AH = G[FEXCore::X86State::REG_R10] ^ (G[FEXCore::X86State::REG_RDX] * 0x9E3779B97F4A7C15ull) ^
+                            ((G[FEXCore::X86State::REG_R8] << 32) | (G[FEXCore::X86State::REG_R8] >> 32)) ^
+                            (G[FEXCore::X86State::REG_R9] * 0xC2B2AE3D27D4EB4Full);
+        SSameArgs = Slot->HaveResult && AH == Slot->ArgHash;
+        if (Slot->HaveResult && !SSameArgs) {
+          Slot->ArgsVaried = true;
+        }
+        Slot->ArgHash = AH;
+        Slot->Args[0] = G[FEXCore::X86State::REG_R10];
+        Slot->Args[1] = G[FEXCore::X86State::REG_RDX];
+        Slot->Args[2] = G[FEXCore::X86State::REG_R8];
+        Slot->Args[3] = G[FEXCore::X86State::REG_R9];
+        SSlot = Slot;
+      }
+    } else {
+      // Re-key.  A different site aliasing this slot only ever delays
+      // detection (false negative), never fabricates one.
+      Slot->Key = SKey;
+      Slot->Count = 1;
+      Slot->Armed = false;
+      Slot->NextReport = SpinSentinel::kFirstReport;
+    }
+  }
+
+  // Zero-copy protocol (ABI 6): the callback reads and writes the live
+  // register file, so the entire CONTEXT round trip below is skipped.  That
+  // is sound because the round trip never NORMALIZED anything the resume
+  // needs: StoreStateToContext only READS CPUState (the x87 TOP rotation and
+  // the EFLAGS reconstruction transform the CONTEXT copy, not the state),
+  // and LoadStateFromContextAfterTrap only writes back what the callback
+  // changed -- its own header comment states the invariant this path leans
+  // on, "CPUState stays fully materialized for the whole trap round-trip".
+  // With no CONTEXT there is no write-back to skip: a register the callback
+  // never touched was never copied anywhere, and one it wrote through the
+  // view is already guest state.  RIP is view->rip = &State.rip, so the
+  // cooperative-exit arm below reads the callback's continuation exactly as
+  // the CONTEXT path reads the resumed State.rip.
+  //
+  // SpinSentinel sees this path too: the pre-half above ran before the
+  // callback, and the post-half reads RAX from the live State the view
+  // callback just wrote -- the same truth the CONTEXT path's write-back
+  // produces.
+  if (auto ViewCb = TrapViewCb.load(std::memory_order_acquire)) {
+    FEXBRIDGE_TRAP_VIEW View;
+    View.gregs = &Frame->State.gregs[0];
+    View.rip = &Frame->State.rip;
+    memset(View.reserved, 0, sizeof(View.reserved));
+    const int Result = ViewCb(BT, &View, TrapViewUser.load(std::memory_order_acquire));
+    SpinSentinelPost(BT, Frame, SSlot, SKey, SSameArgs, Result);
+    if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
+      BT->RunTop->ExitRequested = true;
+      BT->RunTop->ExitRIP = Frame->State.rip;
+      Frame->State.rip = HltPageAddr;
+    }
+    return 0;
+  }
 
   // No YMM side-channel any more: the changed-only load below never touches
   // avx_high, so the high lanes simply stay live in CPUState across the trap
@@ -558,6 +1140,8 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
     LoadStateFromContextAfterTrap(Thread, &C, StoredEFlags, Lazy);
   }
 
+  SpinSentinelPost(BT, Frame, SSlot, SKey, SSameArgs, Result);
+
   if (Result != FEXBRIDGE_TRAP_CONTINUE && BT && BT->RunTop) {
     // Cooperative exit: park the continuation RIP, route the guest through a
     // bridge-owned HLT so the JIT unwinds itself (no longjmp over JIT frames,
@@ -578,6 +1162,8 @@ uint64_t BridgeSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame
 constexpr uint32_t PPC_PT_NIP = 32;
 constexpr uint32_t PPC_PT_XER = 37;
 constexpr uint32_t PPC_PT_CCR = 38;
+constexpr uint32_t PPC_PT_DAR = 41;   // data address of the faulting access
+constexpr uint32_t PPC_PT_DSISR = 42; // access-type bits (bit 0x02000000 = store)
 
 void SpillSRAFromHostContext(FEXCore::Core::InternalThreadState* Thread, ucontext_t* UC) {
   const auto& Cfg = SigDelegator->GetConfig();
@@ -676,6 +1262,23 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // No frontend => no mprotect-based SMC tracking host. The caller reports
   // code writes through fexbridge_invalidate_code_range.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
+  // The lazy-SMC trio must fall with it.  The gaming launcher exports
+  // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
+  // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore
+  // constructor) and compiles in the lazy-link regime, whose soundness
+  // contract is "same-thread drains ride the InterruptFaultPage poke".  In
+  // this lane that machinery has no host: DrainLazySMCInvalidations is the
+  // SyscallHandler base-class no-op, no SIGSEGV handler marks dirty pages,
+  // and nothing ever arms a fault page.  The banner the regime prints was a
+  // promise nobody here keeps.  With the trio off, BlockLinking stays
+  // enabled on the ordinary eager contract -- fexbridge_invalidate_code_range
+  // severs shared inbound links (Erase -> SeverLinks) and scrubs every
+  // BridgeThread's dispatch caches + CallRet stack synchronously -- and
+  // CallLinkingEnabled comes back (the lazy regime disabled call-exit
+  // linking to survive a sever-storm this lane never has).
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYINVAL, "0");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYSCRUB, "0");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCLAZYLINK, "0");
 
   auto HostFeatures = FEX::FetchHostFeatures();
   auto CTXPtr = FEXCore::Context::Context::CreateNewContext(HostFeatures);
@@ -690,6 +1293,16 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   CTX = CTXPtr.release(); // process-lifetime; FEX teardown is not re-entered
   CTX->SetSignalDelegator(SigDelegator);
   CTX->SetSyscallHandler(SyscallHandler);
+  // EC targets (ABI 7): the JIT resolves the transition callee through this
+  // at compile time, so it must be installed before the first block compiles.
+  ThunkHandlerInstance = new BridgeThunkHandler();
+  CTX->SetThunkHandler(ThunkHandlerInstance);
+  // The EC trampoline edits guest state through the frame, so its Thunk ops
+  // must take the FULL SRA refill (a fiber switch or an unwind redirect
+  // rewrites the registers the partial refill leaves stale).  Declared by
+  // name, decided per Thunk op at compile time; Linux-thunk crossings keep
+  // the elision.
+  CTX->SetFullFillThunkTag(EcSha);
   // Same ordering rule as the frontend's SetupTSOEmulation: hardware TSO must
   // be decided before the first block is compiled, so before InitCore.  The
   // embedder reads the verdict through fexbridge_hwtso_prot() after this
@@ -713,6 +1326,9 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
     HltPageAddr = ExitPage;
   }
   fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
+
+  SpinSentinel::InitFromEnv();
+  FaultLog::InitFromEnv();
 
   GuestIs64 = Is64;
   Initialized = true;
@@ -778,6 +1394,53 @@ int fexbridge_ctx_materialize(void* thread, void* ctx, uint32_t flags) {
     StoreFPToContext(Thread, Ctx);
     Ctx->ContextFlags &= ~0x200u;
   }
+  return 0;
+}
+
+void fexbridge_set_trap_view_handler(fexbridge_trap_view_fn cb, void* user) {
+  // The veto is registration-time so the hot sink never reads the
+  // environment: under FEXBRIDGE_EAGER_CTX=1 the cb is simply not stored and
+  // every trap keeps landing on the ABI<=5 CONTEXT handler (which is why the
+  // header tells embedders to keep that one registered).  Unregistering
+  // (cb == NULL) is never vetoed.
+  if (cb) {
+    const char* Eager = getenv("FEXBRIDGE_EAGER_CTX");
+    if (Eager && Eager[0] == '1') {
+      fprintf(stderr, "fexbridge: FEXBRIDGE_EAGER_CTX=1: zero-copy trap view vetoed, "
+                      "traps stay on the CONTEXT protocol\n");
+      TrapViewUser.store(user, std::memory_order_release);
+      TrapViewCb.store(nullptr, std::memory_order_release);
+      return;
+    }
+  }
+  TrapViewUser.store(user, std::memory_order_release);
+  TrapViewCb.store(cb, std::memory_order_release);
+}
+
+int fexbridge_view_pull(void* thread, void* amd64_ctx, uint32_t flags) {
+  auto* BT = static_cast<BridgeThread*>(thread);
+  auto* Ctx = static_cast<FEXBRIDGE_AMD64_CONTEXT*>(amd64_ctx);
+  if (!BT || !Ctx) {
+    return -1;
+  }
+  // StoreStateToContext gates its groups on the CONTEXT's own word, so pull
+  // writes the word first; the filled CONTEXT then carries exactly what it
+  // holds, which is what a caller parking state for a nested run wants.
+  Ctx->ContextFlags = flags | FEXBRIDGE_CTX_AMD64;
+  StoreStateToContext(BT->Thread, Ctx);
+  return 0;
+}
+
+int fexbridge_view_push(void* thread, const void* amd64_ctx, uint32_t flags) {
+  auto* BT = static_cast<BridgeThread*>(thread);
+  const auto* Ctx = static_cast<const FEXBRIDGE_AMD64_CONTEXT*>(amd64_ctx);
+  if (!BT || !Ctx) {
+    return -1;
+  }
+  // The flags ARGUMENT gates the groups; the CONTEXT's ContextFlags word is
+  // deliberately not consulted (a pulled CONTEXT names every group pull
+  // filled, which may be more than the caller wants applied).
+  LoadStateFromContextFlags(BT->Thread, Ctx, nullptr, flags | FEXBRIDGE_CTX_AMD64);
   return 0;
 }
 
@@ -862,7 +1525,15 @@ int fexbridge_thread_init(void** thread_out) {
   // nothing else in the bridge's link set touches it (LinuxEmulation, the
   // other writer, is deliberately not linked).
   Thread->FrontendPtr = BT;
+  if (SpinSentinel::Enabled) {
+    BT->Sentinel = new SpinSentinel::ThreadState();
+    BT->Sentinel->Tid = static_cast<pid_t>(syscall(SYS_gettid));
+  }
   TLSThread = BT;
+  {
+    std::scoped_lock Lk {BridgeThreadsLock};
+    BridgeThreads.push_back(BT);
+  }
   *thread_out = BT;
   return 0;
 }
@@ -875,8 +1546,15 @@ void fexbridge_thread_term(void* thread) {
   if (TLSThread == BT) {
     TLSThread = nullptr;
   }
+  {
+    // Before DestroyThread, so an invalidation racing this teardown can never
+    // reach a thread whose InternalThreadState is being freed.
+    std::scoped_lock Lk {BridgeThreadsLock};
+    std::erase(BridgeThreads, BT);
+  }
   CTX->DestroyThread(BT->Thread);
   ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
+  delete BT->Sentinel;
   delete BT;
 }
 
@@ -899,6 +1577,9 @@ int fexbridge_run(void* thread, void* ctx) {
   // ~18/s on the measured workload, traps are millions/s).
   auto& RunState = BT->Thread->CurrentFrame->State;
   const bool Nested = BT->RunTop != nullptr;
+  // SpinSentinel: the outer trap's rip, read before the Ctx load overwrites
+  // it.  Only used in crossing-recursion reports.
+  const uint64_t OuterTrapRIP = Nested ? RunState.rip : 0;
   uint8_t SavedAvxHigh[sizeof(RunState.avx_high)];
   uint8_t SavedFlags[sizeof(RunState.flags)];
   uint8_t SavedXmm[sizeof(RunState.xmm)];
@@ -933,7 +1614,48 @@ int fexbridge_run(void* thread, void* ctx) {
 
   RunFrame F {};
   F.Prev = BT->RunTop;
+  F.EntryRIP = RunState.rip; // post-Ctx-load: the rip this run enters at
+  F.TrapRIP = OuterTrapRIP;
   BT->RunTop = &F;
+
+  // SpinSentinel crossing-recursion check (banner above SpinSentinel
+  // namespace).  Reverse crossings are ~18/s on the measured workload, so a
+  // bounded chain walk here is free; NextDepthReport doubles so a runaway
+  // recursion is named at 64, 128, 256... while the thread is still alive.
+  if (auto* SS = BT->Sentinel; SS && SS->NextDepthReport) {
+    uint32_t Depth = 0;
+    for (RunFrame* P = &F; P && Depth < SS->NextDepthReport; P = P->Prev) {
+      ++Depth;
+    }
+    if (Depth >= SS->NextDepthReport) {
+      uint64_t E[16], T[16];
+      uint32_t N = 0;
+      for (RunFrame* P = &F; P && N < 16; P = P->Prev, ++N) {
+        E[N] = P->EntryRIP;
+        T[N] = P->TrapRIP;
+      }
+      uint32_t Period = 0; // 0: aperiodic within the innermost 16
+      for (uint32_t P = 1; P <= 8 && !Period; ++P) {
+        bool Ok = N > P;
+        for (uint32_t i = 0; Ok && i + P < N; ++i) {
+          Ok = E[i] == E[i + P] && T[i] == T[i + P];
+        }
+        if (Ok) {
+          Period = P;
+        }
+      }
+      if (SpinSentinel::TakeReport(SS)) {
+        fprintf(stderr, "fexbridge: SPINSENTINEL tid=%d crossing-recursion depth=%u period=%u cycle=", SS->Tid, Depth, Period);
+        const uint32_t Show = Period ? Period : (N < 4 ? N : 4);
+        for (uint32_t i = 0; i < Show; ++i) {
+          fprintf(stderr, "%s[reverse=0x%" PRIx64 " trap=0x%" PRIx64 "]", i ? " " : "", E[i], T[i]);
+        }
+        fprintf(stderr, "%s (guest<->native call cycle; stack exhaustion likely if it continues)\n",
+                Period ? "" : " (aperiodic in innermost 16)");
+      }
+      SS->NextDepthReport = SS->NextDepthReport >= 0x80000000u ? 0 : SS->NextDepthReport << 1;
+    }
+  }
 
   int Reason;
   if (sigsetjmp(F.JB, 1) == 0) {
@@ -961,6 +1683,9 @@ int fexbridge_run(void* thread, void* ctx) {
       if (SFD.FaultToTopAndGeneratedException && SFD.Signal == FEXCore::Core::FAULT_SIGSEGV &&
           SFD.TrapNo == FEXCore::X86State::X86_TRAPNO_PF) {
         Reason = FEXBRIDGE_RUN_FAULT;
+        // Guest jumped to unfetchable memory; State.rip is the bad target and
+        // the register file is already the flushed architectural state.
+        FaultLog::Write(BT->Thread, "noexec", 0, 0, 0, 0);
       } else {
         Reason = FEXBRIDGE_RUN_HLT;
       }
@@ -1069,6 +1794,153 @@ int fexbridge_get_fs_base(void* thread, uint64_t* base_out) {
   return 0;
 }
 
+int fexbridge_register_ec_target(uint64_t rip, fexbridge_ec_fn handler, void* cookie) {
+  if (!Initialized || !CTX || !rip || !handler) {
+    return -1;
+  }
+  if (!GuestIs64) {
+    return -3; // the i386 lane keeps the trap protocol for now
+  }
+  std::scoped_lock Lk {EcLock};
+  auto It = EcTargets.find(rip);
+  if (It != EcTargets.end()) {
+    return (It->second->Handler == handler && It->second->Cookie == cookie) ? 0 : -2;
+  }
+  auto* Desc = new EcDescriptor {handler, cookie, rip};
+  if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc, EcDirectEnabled ? cookie : nullptr)) {
+    // Claimed by a different custom-IR owner (or a racing different
+    // registration); nothing was installed.
+    delete Desc;
+    return -2;
+  }
+  EcTargets.emplace(rip, Desc);
+  // Drop any ordinary block already compiled at exactly this address so the
+  // next dispatch recompiles through the registration.  Same lock discipline
+  // as fexbridge_invalidate_code_range; EcLock never nests inside it.
+  {
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(rip, 1);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, rip, 1);
+    }
+  }
+  return 0;
+}
+
+static int register_ec_batch(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler,
+                             void* shared_cookie) {
+  // The batch form exists for a measured reason: a Wine thunk module arms on
+  // its FIRST trap, and per-target registration of ntdll's ~2400 exports --
+  // each taking the code-invalidation mutex and walking the thread registry
+  // -- cost ~1.1 ms inside whatever the guest was timing (the QPC interval
+  // gate caught it).  One lock hold to register, then ONE invalidation and
+  // ONE thread walk over the span.  At most one of these stubs has ever
+  // executed (the trap that triggered the arming), so the wide invalidation
+  // drops at most one trap block plus the transition-free span -- harmless
+  // and over-invalidation is always safe.
+  //
+  // `cookies` (the _targets2 form) carries one cookie PER RIP -- the
+  // embedder's per-slot row cell; when it is null every rip shares
+  // `shared_cookie` (the original _targets form).
+  if (!Initialized || !CTX || !rips || !handler) {
+    return -1;
+  }
+  if (!GuestIs64) {
+    return -3;
+  }
+  uint64_t Lo = ~0ull, Hi = 0;
+  int Registered = 0;
+  {
+    std::scoped_lock Lk {EcLock};
+    for (uint32_t i = 0; i < count; i++) {
+      const uint64_t rip = rips[i];
+      void* cookie = cookies ? const_cast<void*>(cookies[i]) : shared_cookie;
+      if (!rip) {
+        continue;
+      }
+      auto It = EcTargets.find(rip);
+      if (It != EcTargets.end()) {
+        if (It->second->Handler == handler && It->second->Cookie == cookie) {
+          Registered++; // idempotent re-register counts as standing
+        }
+        continue;
+      }
+      auto* Desc = new EcDescriptor {handler, cookie, rip};
+      if (!CTX->AddECTargetIRHandler(rip, EcSha, Desc, EcDirectEnabled ? cookie : nullptr)) {
+        delete Desc;
+        continue;
+      }
+      EcTargets.emplace(rip, Desc);
+      Registered++;
+      Lo = rip < Lo ? rip : Lo;
+      Hi = rip > Hi ? rip : Hi;
+    }
+  }
+  if (Lo <= Hi) {
+    // A stub between registration and this drop still traps off its old
+    // block -- correct, just slow -- and nothing serves a stale transition,
+    // because no transition existed before this call.
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(Lo, Hi - Lo + 16);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, Lo, Hi - Lo + 16);
+    }
+  }
+  return Registered;
+}
+
+int fexbridge_register_ec_targets(const uint64_t* rips, uint32_t count, fexbridge_ec_fn handler, void* cookie) {
+  return register_ec_batch(rips, nullptr, count, handler, cookie);
+}
+
+int fexbridge_register_ec_targets2(const uint64_t* rips, const void* const* cookies, uint32_t count, fexbridge_ec_fn handler) {
+  if (!cookies) {
+    return -1;
+  }
+  return register_ec_batch(rips, cookies, count, handler, nullptr);
+}
+
+int fexbridge_unregister_ec_range(uint64_t start, uint64_t length) {
+  if (!Initialized || !CTX) {
+    return -1;
+  }
+  if (!length) {
+    return 0;
+  }
+  int Removed = 0;
+  {
+    std::scoped_lock Lk {EcLock};
+    for (auto It = EcTargets.begin(); It != EcTargets.end();) {
+      if (It->first >= start && It->first - start < length) {
+        CTX->RemoveECTargetIRHandler(It->first);
+        EcRetired.push_back(It->second); // never freed; see EcDescriptor
+        It = EcTargets.erase(It);
+        ++Removed;
+      } else {
+        ++It;
+      }
+    }
+  }
+  if (Removed) {
+    // One invalidation over the whole range, AFTER every erase: a compile
+    // racing the walk can at worst produce a transition block from a not-yet
+    // erased registration, and this drop kills it; nothing can re-create one
+    // afterwards because the map entries are gone.  The per-thread scrub is
+    // what actually makes the CALLING thread stop hitting its own L1 copy of
+    // the transition (see the BridgeThreads comment); for other threads it is
+    // the documented soft cross-thread guarantee.
+    std::scoped_lock ILk {CTX->GetCodeInvalidationMutex()};
+    CTX->InvalidateCodeBuffersCodeRange(start, length);
+    std::scoped_lock TLk {BridgeThreadsLock};
+    for (auto* T : BridgeThreads) {
+      CTX->InvalidateThreadCachedCodeRange(T->Thread, start, length);
+    }
+  }
+  return Removed;
+}
+
 void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
   // Before any process init there is no context and nothing cached to
   // invalidate, and the embedder can not know our init state: wine's memory
@@ -1084,6 +1956,13 @@ void fexbridge_invalidate_code_range(uint64_t start, uint64_t length) {
   // by (previously side-effecting) assertions. Part of the CPU-DLL contract.
   std::scoped_lock Lk {CTX->GetCodeInvalidationMutex()};
   CTX->InvalidateCodeBuffersCodeRange(start, length);
+  // ...and the per-thread dispatch caches, which the shared BlockList erase
+  // above does not touch.  See the BridgeThreads banner for why omitting this
+  // half let a guest keep executing a freed module's translations.
+  std::scoped_lock TLk {BridgeThreadsLock};
+  for (auto* BT : BridgeThreads) {
+    CTX->InvalidateThreadCachedCodeRange(BT->Thread, start, length);
+  }
 }
 
 uint32_t fexbridge_hwtso_prot(void) {
@@ -1123,6 +2002,35 @@ uint32_t fexbridge_hwtso_refused(uint64_t start, uint64_t length) {
   return 0;
 }
 
+int fexbridge_ec_direct_in_flight(void) {
+  auto* BT = TLSThread;
+  if (!BT || !BT->Thread) {
+    return 0;
+  }
+  return BT->Thread->CurrentFrame->EcDirectInFlight ? 1 : 0;
+}
+
+int fexbridge_fault_unwind_direct(void* host_ucontext) {
+  auto* BT = TLSThread;
+  if (!BT || !BT->RunTop || !host_ucontext || !BT->Thread) {
+    return 0;
+  }
+  auto* Frame = BT->Thread->CurrentFrame;
+  if (!Frame->EcDirectInFlight) {
+    return 0;
+  }
+  // The crossing spilled the whole register file before the call and the
+  // callee never touched the frame, so State IS the guest state at the call
+  // site and State.rip is that site (the transition block stored it).
+  // Nothing to reconstruct from the host context; it belongs to the callee.
+  Frame->EcDirectInFlight = 0;
+  Frame->InSyscallInfo = 0;
+  auto* UC = static_cast<ucontext_t*>(host_ucontext);
+  FaultLog::Write(BT->Thread, "direct", 0, UC->uc_mcontext.gp_regs[PPC_PT_NIP], UC->uc_mcontext.gp_regs[PPC_PT_DAR],
+                  UC->uc_mcontext.gp_regs[PPC_PT_DSISR]);
+  siglongjmp(BT->RunTop->JB, 1);
+}
+
 int fexbridge_fault_is_jit(const void* host_ucontext) {
   auto* BT = TLSThread;
   if (!BT || !host_ucontext) {
@@ -1151,6 +2059,10 @@ int fexbridge_fault_unwind(void* host_ucontext) {
   const uint64_t* HostGPRs = reinterpret_cast<const uint64_t*>(&UC->uc_mcontext.gp_regs[0]);
   const uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(BT->Thread, true, HostGPRs, HostPStateFromContext(UC));
   CTX->SetFlagsFromCompactedEFLAGS(BT->Thread, EFlags);
+
+  // Fingerprint before the longjmp: this is the last moment the host fault
+  // context (DAR/DSISR) and the reconstructed guest state exist side by side.
+  FaultLog::Write(BT->Thread, "jit", EFlags, HostPC, UC->uc_mcontext.gp_regs[PPC_PT_DAR], UC->uc_mcontext.gp_regs[PPC_PT_DSISR]);
 
   siglongjmp(BT->RunTop->JB, 1);
 }

@@ -14,6 +14,7 @@ $end_info$
 #include "PortabilityInfo.h"
 #include "ELFCodeLoader.h"
 #include "VDSO_Emulation.h"
+#include "LinuxSyscalls/CoreIsolation.h"
 #include "LinuxSyscalls/GdbServer.h"
 #include "LinuxSyscalls/HostOwnedRanges.h"
 #include "LinuxSyscalls/LinuxAllocator.h"
@@ -796,6 +797,11 @@ int main(int argc, char** argv, char** const envp) {
 
   // Close the loader FDs after everything has been parsed and mapped.
   Loader.CloseFDs();
+
+  // Advisory host-side scheduling only; must start after the ThreadManager
+  // exists and before guest code can spawn threads. No-op unless
+  // FEX_COREISOLATE is set.
+  FEX::HLE::CoreIsolation::Start(SyscallHandler.get());
 
   CTX->ExecuteThread(ParentThread->Thread);
 

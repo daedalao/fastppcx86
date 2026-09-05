@@ -462,6 +462,14 @@ struct CpuStateFrame {
    */
   uint64_t InSyscallInfo {};
 
+  /**
+   * @brief 1 while an EC DIRECT call (fexbridge.h) is in flight on this
+   * thread: the transition block spilled the file, stored the call site in
+   * State.rip and is inside the native callee.  Read by
+   * fexbridge_ec_direct_in_flight for the embedder's fault handler.
+   */
+  uint64_t EcDirectInFlight {};
+
   uint32_t SignalHandlerRefCounter {};
 
   struct alignas(8) SynchronousFaultDataStruct {

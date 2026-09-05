@@ -36,8 +36,10 @@ $end_info$
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <cerrno>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -1252,12 +1254,12 @@ bool PPC64JITCore::IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpS
   auto IROp = IR->GetOp<IR::IROp_Header>(WNode);
   switch (IROp->Op) {
   case IR::IROps::OP_LOADREGISTER:
-    // The frontend's per-instruction register-cache flush (Core.cpp:851) means
-    // a chain's consumers read their operands back out of the guest XMM's
-    // static register rather than off an SSA edge. The pass stamps the element
-    // size onto those loads when the value in that register is known splatted;
-    // SRAFPR (v0..v15) is disjoint from RAFPR (v16..v29), so nothing but the
-    // tracked StoreRegister can have written it.
+    // Legacy hook: the pre-2026-09-01 ScalarSplatChain stamped SplatElementSize
+    // onto register-cache loads when the stored value was splat form. The
+    // reworked pass keeps stored guest state exact (merged) and forwards splat
+    // form through direct SSA edges instead, so it never sets this field --
+    // the comparison is against iInvalid and returns false. Kept because the
+    // field is a PERMISSION any future pass may grant with the same meaning.
     return IROp->C<IR::IROp_LoadRegister>()->SplatElementSize == ElementSize;
   case IR::IROps::OP_VFADDSCALARINSERT:
   case IR::IROps::OP_VFSUBSCALARINSERT:
@@ -1269,6 +1271,13 @@ bool PPC64JITCore::IsSplatFormValue(const IR::OrderedNodeWrapper& WNode, IR::OpS
     // IR pass enforces the same match when it marks, this is the backend half
     // of that contract.
     return IROp->ElementSize == ElementSize && IROp->C<IR::IROp_VFAddScalarInsert>()->SplatResult;
+  case IR::IROps::OP_VFMLASCALARINSERT:
+  case IR::IROps::OP_VFMLSSCALARINSERT:
+  case IR::IROps::OP_VFNMLASCALARINSERT:
+  case IR::IROps::OP_VFNMLSSCALARINSERT:
+    // Same contract as the arithmetic family; the FMA ops carry SplatResult at
+    // a different struct offset (four vector operands precede it).
+    return IROp->ElementSize == ElementSize && IROp->C<IR::IROp_VFMLAScalarInsert>()->SplatResult;
   default: return false;
   }
 }
@@ -2594,8 +2603,16 @@ PPC64JITCore::PPC64JITCore(FEXCore::Context::ContextImpl* ctx,
                       "FEX_SMCLAZYLINK=1 lifts the LAZYINVAL restriction).");
     BlockLinkingEnabled = false;
   } else if (BlockLinkingEnabled && FEXCore::Config::Get_SMCLAZYINVAL() && LazyLinkArmed) {
-    LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
-                      "same-thread drains ride the InterruptFaultPage poke.");
+    // Announce the decision once per process (this constructor runs per guest
+    // thread, and every thread would otherwise re-derive and re-log the same
+    // process-wide config verdict -- observed flooding logs to 96% of all
+    // lines on guests that create many threads). Same idiom as the
+    // exit-RIP-width Announce below.
+    static std::once_flag SMCLazyLinkAnnounce;
+    std::call_once(SMCLazyLinkAnnounce, [] {
+      LogMan::Msg::IFmt("FEX_SMCLAZYLINK: BlockLinking stays ON under lazy SMC invalidation; "
+                        "same-thread drains ride the InterruptFaultPage poke.");
+    });
   }
 
   // Constant-target CALL exits (BranchHint::Call) link only when block linking
@@ -2775,6 +2792,353 @@ static std::pair<uint64_t, uint64_t> EntryWatchRange() {
   return Range;
 }
 static std::atomic<uint32_t> EntryWatchNextSlot {};
+
+// -------------------------------------------------------------------------
+// FEX_GUESTTRACE: guest-function entry forensics ring
+// -------------------------------------------------------------------------
+// FEX_GUESTTRACE=<rip>[,<rip>...] (hex, 0x prefix accepted): every dispatcher
+// or linked-jump entry into a JIT entry point whose guest RIP matches one of
+// the targets appends a record to a file-backed ring at
+// /tmp/fex-guesttrace-<pid>.bin: timebase, thread identity (STATE pointer),
+// saved CR (CR0 = guest packed NZCV), all 16 SRA GPRs, and a raw memory
+// window dereferenced off guest RCX -- by default [rcx+0x38, rcx+0x1f8), the
+// 16 bucket {begin,end,cap} pointer triples of the W3 TLSF suballocator whose
+// corruption this instrument exists to catch (override with
+// FEX_GUESTTRACE_DEREF=<base>:<len>, both hex, 8-byte granular, len <= 0x300).
+// The deref is guarded (0x10000 <= rcx < 2^48) and skipped, zeros left in the
+// record, when rcx is not plausibly a pointer.
+//
+// MAP_SHARED file backing means the ring survives ANY process death including
+// SIGKILL and a wedged crash reporter. The timebase field is written LAST, so
+// tb==0 marks a torn/in-progress record. Slots are claimed with a real
+// ldarx/stdcx. fetch-add: the cross-thread claim order in the ring is
+// faithful, and that interleave -- who was inside the allocator, when -- is
+// precisely the data. Reader: Scripts/guesttrace_decode.py (record layout
+// constants below are the format contract).
+struct GuestTraceRingHeader {
+  uint64_t Magic;
+  uint64_t RecordSize;
+  uint64_t Capacity; // records; power of two
+  uint64_t DerefBase;
+  uint64_t DerefLen;
+  uint64_t Reserved;
+  std::atomic<uint64_t> Idx; // monotonic claim counter; 8-aligned for ldarx
+};
+static_assert(offsetof(GuestTraceRingHeader, Idx) == 48 && (offsetof(GuestTraceRingHeader, Idx) & 7) == 0,
+              "emitted ldarx sequence hardcodes the ring layout");
+constexpr uint64_t GuestTraceMagic = 0x3130454341525447ull; // "GTRACE01" little-endian
+constexpr uint32_t GuestTraceCapacityLog2 = 18;             // 256Ki records = 256MiB of slots
+constexpr uint32_t GuestTraceRecordSizeLog2 = 10;           // 1KiB slots
+constexpr uint64_t GuestTraceHeaderBytes = 4096;
+// Record layout (offsets within a slot):
+//   0x00 u64 timebase (completion marker, written last; 0 = torn)
+//   0x08 u64 STATE pointer (per-thread identity)
+//   0x10 u64 guest RIP of the traced entry
+//   0x18 u64 saved CR image (CR0 = guest packed NZCV)
+//   0x20 u64[16] SRA GPRs, SRA order per X86State enum: RAX,RCX,RDX,RBX,...
+//   0xa0 u64 [guest rsp] = return address when the traced RIP is a call
+//        target (garbage-but-harmless for jumped-to entries; guest rsp is
+//        always mapped stack at a genuine fn entry)
+//   0xa8 deref window ([rcx+DerefBase], DerefLen bytes; zeros if guard skipped)
+constexpr int16_t GuestTraceOffTB = 0x00;
+constexpr int16_t GuestTraceOffState = 0x08;
+constexpr int16_t GuestTraceOffRIP = 0x10;
+constexpr int16_t GuestTraceOffCR = 0x18;
+constexpr int16_t GuestTraceOffGPRs = 0x20;
+constexpr int16_t GuestTraceOffRetAddr = 0xa0;
+constexpr int16_t GuestTraceOffDeref = 0xa8;
+
+static const fextl::vector<uint64_t>& GuestTraceTargets() {
+  static const fextl::vector<uint64_t> Targets = []() {
+    fextl::vector<uint64_t> Out {};
+    const char* Env = getenv("FEX_GUESTTRACE");
+    if (!Env) {
+      return Out;
+    }
+    while (*Env) {
+      char* End {};
+      const uint64_t RIP = std::strtoull(Env, &End, 16);
+      if (End == Env) {
+        break;
+      }
+      if (RIP) {
+        Out.push_back(RIP);
+      }
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return Targets;
+}
+
+static std::pair<int16_t, int16_t> GuestTraceDeref() {
+  static const std::pair<int16_t, int16_t> Window = []() -> std::pair<int16_t, int16_t> {
+    int64_t Base = 0x38;
+    int64_t Len = 0x1c0;
+    if (const char* Env = getenv("FEX_GUESTTRACE_DEREF")) {
+      char* End {};
+      Base = static_cast<int64_t>(std::strtoull(Env, &End, 16));
+      Len = (*End == ':') ? static_cast<int64_t>(std::strtoull(End + 1, nullptr, 16)) : 0;
+    }
+    // Clamp to the format contract: 8-byte granular, blob fits the 1KiB slot,
+    // and every ld/std displacement stays a d-form int16.
+    Base &= ~7ll;
+    Len &= ~7ll;
+    if (Len < 0 || Len > 0x300 || Base < 0 || Base + Len > INT16_MAX) {
+      Base = 0x38;
+      Len = 0x1c0;
+    }
+    return {static_cast<int16_t>(Base), static_cast<int16_t>(Len)};
+  }();
+  return Window;
+}
+
+// -------------------------------------------------------------------------
+// FEX_GUESTSERIALIZE: inject a missing guest-side lock
+// -------------------------------------------------------------------------
+// FEX_GUESTSERIALIZE=<entry>:<exit>[,<entry>:<exit>...] (hex guest RIPs):
+// every dispatcher entry into an <entry> block acquires a single process-
+// global recursive spinlock (owner = STATE pointer, depth-counted for
+// nesting); every entry into an <exit> block releases one level if this
+// thread owns it (and is a silent no-op otherwise, so paths that bypass the
+// paired entry cannot underflow or wedge). Built for the W3 TLSF campaign:
+// the engine's parallel retirement sweeps free into one suballocator with no
+// lock of their own -- serializing destructor entry (0x14070a960) against
+// its sweep return site (0x141c9703b) injects the exclusion the game forgot.
+// A diagnostic/per-title lever, default fully off; both env strings join the
+// CodeCache config hash. The spinlock word lives in a private mmap so a
+// crash cannot leave it in a file. DEADLOCK NOTE: a serialized region that
+// blocks forever wedges every other acquirer -- only serialize regions that
+// provably run straight-line (frees, small mutators).
+struct GuestSerializeState {
+  uint64_t Owner;   // STATE pointer of the holder, 0 = free (ldarx/stdcx.)
+  uint64_t Depth;   // recursion depth, mutated only by the holder
+  uint64_t Suspect; // owner observed at a spin-deadline expiry (leak recovery)
+};
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeLists() {
+  static const std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Lists = []() {
+    std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Out {};
+    const char* Env = getenv("FEX_GUESTSERIALIZE");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t Entry = std::strtoull(Env, &End, 16);
+      if (End == Env || *End != ':') {
+        break;
+      }
+      const char* ExitStr = End + 1;
+      const uint64_t Exit = std::strtoull(ExitStr, &End, 16);
+      if (End == ExitStr || !Entry || !Exit) {
+        break;
+      }
+      Out.first.push_back(Entry);
+      Out.second.push_back(Exit);
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return {&Lists.first, &Lists.second};
+}
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeRVALists();
+static GuestSerializeState* GuestSerializeLock() {
+  static GuestSerializeState* const Lock = []() -> GuestSerializeState* {
+    if (GuestSerializeLists().first->empty() && GuestSerializeRVALists().first->empty()) {
+      return nullptr;
+    }
+    void* M = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (M == MAP_FAILED) {
+      return nullptr;
+    }
+    LogMan::Msg::IFmt("FEX_GUESTSERIALIZE: armed, {} region(s)", GuestSerializeLists().first->size());
+    return static_cast<GuestSerializeState*>(M);
+  }();
+  return Lock;
+}
+
+// -------------------------------------------------------------------------
+// FEX_GUESTANCHOR: ASLR-proof base discovery for the two features above
+// -------------------------------------------------------------------------
+// FEX_GUESTANCHOR=<rva>:<hex bytes, up to 16> names one well-known function
+// entry inside the target module by its image-relative address and its first
+// bytes. During compilation, any block whose guest entry matches the anchor's
+// low 16 bits (module bases are 64KiB-aligned) AND whose guest memory equals
+// the byte signature fixes the module base as GuestEntry - rva; from then on
+// FEX_GUESTTRACE_RVA (comma rvas) and FEX_GUESTSERIALIZE_RVA (entry:exit rva
+// pairs) resolve against that base. Needed because wine may rebase a PE on
+// every launch (the fexproton lane does; the wine-native lane maps the W3 exe
+// at its preferred base) -- absolute-address target lists cannot survive that.
+// Blocks compiled BEFORE discovery are not instrumented: pick an anchor that
+// is the first function of interest to compile (for W3, AddToBucket -- the
+// allocator's construction calls it before any other traced entry).
+// 64-bit guests are identity-mapped in both lanes, so guest VAs are directly
+// readable host pointers here; the entry being compiled is mapped by
+// definition. Discovered base is also stamped into the trace ring header's
+// Reserved field so decoders can rebase records.
+struct GuestAnchorSpec {
+  uint64_t RVA;
+  uint8_t Sig[16];
+  uint32_t SigLen;
+};
+static const GuestAnchorSpec* GuestAnchor() {
+  static const GuestAnchorSpec Spec = []() {
+    GuestAnchorSpec Out {};
+    const char* Env = getenv("FEX_GUESTANCHOR");
+    if (!Env) {
+      return Out;
+    }
+    char* End {};
+    Out.RVA = std::strtoull(Env, &End, 16);
+    if (!Out.RVA || *End != ':') {
+      Out.RVA = 0;
+      return Out;
+    }
+    const char* Hex = End + 1;
+    while (Out.SigLen < 16 && Hex[0] && Hex[1]) {
+      auto Nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      const int Hi = Nib(Hex[0]), Lo = Nib(Hex[1]);
+      if (Hi < 0 || Lo < 0) {
+        break;
+      }
+      Out.Sig[Out.SigLen++] = static_cast<uint8_t>((Hi << 4) | Lo);
+      Hex += 2;
+    }
+    if (Out.SigLen < 8) {
+      Out.RVA = 0; // too weak a signature to trust
+    }
+    return Out;
+  }();
+  return Spec.RVA ? &Spec : nullptr;
+}
+static std::atomic<uint64_t> GuestAnchorBaseAtomic {};
+static const fextl::vector<uint64_t>& GuestTraceRVATargets() {
+  static const fextl::vector<uint64_t> Targets = []() {
+    fextl::vector<uint64_t> Out {};
+    const char* Env = getenv("FEX_GUESTTRACE_RVA");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t RVA = std::strtoull(Env, &End, 16);
+      if (End == Env) {
+        break;
+      }
+      if (RVA) {
+        Out.push_back(RVA);
+      }
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return Targets;
+}
+static std::pair<const fextl::vector<uint64_t>*, const fextl::vector<uint64_t>*> GuestSerializeRVALists() {
+  static const std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Lists = []() {
+    std::pair<fextl::vector<uint64_t>, fextl::vector<uint64_t>> Out {};
+    const char* Env = getenv("FEX_GUESTSERIALIZE_RVA");
+    while (Env && *Env) {
+      char* End {};
+      const uint64_t Entry = std::strtoull(Env, &End, 16);
+      if (End == Env || *End != ':') {
+        break;
+      }
+      const char* ExitStr = End + 1;
+      const uint64_t Exit = std::strtoull(ExitStr, &End, 16);
+      if (End == ExitStr || !Entry || !Exit) {
+        break;
+      }
+      Out.first.push_back(Entry);
+      Out.second.push_back(Exit);
+      if (*End != ',') {
+        break;
+      }
+      Env = End + 1;
+    }
+    return Out;
+  }();
+  return {&Lists.first, &Lists.second};
+}
+static GuestTraceRingHeader* GuestTraceRingPtrFwd(); // defined below
+static void GuestAnchorTryDiscover(uint64_t GuestEntry) {
+  const auto* Anchor = GuestAnchor();
+  if (!Anchor || GuestAnchorBaseAtomic.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (((GuestEntry ^ Anchor->RVA) & 0xFFFF) != 0 || GuestEntry < Anchor->RVA) {
+    return;
+  }
+  // Only the entry being compiled is mapped by definition; the low-16-bit
+  // pre-filter matches 1-in-64Ki block entries, and a false candidate within
+  // SigLen-1 bytes of the end of its mapping would send the memcmp into the
+  // next (possibly unmapped) page -- SignalDelegator has no compile-path
+  // fault tolerance, so that is a process death, not a failed match. Skip
+  // signatures that would cross a page boundary; a real anchor sitting in the
+  // last SigLen-1 bytes of a page simply never discovers (pick another).
+  if ((GuestEntry & 0xFFF) > 0x1000 - Anchor->SigLen) {
+    return;
+  }
+  if (::memcmp(reinterpret_cast<const void*>(GuestEntry), Anchor->Sig, Anchor->SigLen) != 0) {
+    return;
+  }
+  const uint64_t Base = GuestEntry - Anchor->RVA;
+  uint64_t Expected = 0;
+  if (GuestAnchorBaseAtomic.compare_exchange_strong(Expected, Base, std::memory_order_release)) {
+    LogMan::Msg::IFmt("FEX_GUESTANCHOR: module base discovered: 0x{:x} (anchor rva 0x{:x})", Base, Anchor->RVA);
+    if (auto* Ring = GuestTraceRingPtrFwd()) {
+      Ring->Reserved = Base;
+    }
+  }
+}
+
+static GuestTraceRingHeader* GuestTraceRingPtr() {
+  static GuestTraceRingHeader* const Ring = []() -> GuestTraceRingHeader* {
+    if (GuestTraceTargets().empty() && GuestTraceRVATargets().empty()) {
+      return nullptr;
+    }
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/tmp/fex-guesttrace-%d.bin", ::getpid());
+    const int FD = ::open(Path, O_CREAT | O_RDWR, 0644);
+    if (FD < 0) {
+      LogMan::Msg::EFmt("FEX_GUESTTRACE: cannot open {}: {}", Path, errno);
+      return nullptr;
+    }
+    const size_t Size = GuestTraceHeaderBytes + ((1ull << GuestTraceCapacityLog2) << GuestTraceRecordSizeLog2);
+    if (::ftruncate(FD, static_cast<off_t>(Size)) != 0) {
+      ::close(FD);
+      return nullptr;
+    }
+    void* M = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, FD, 0);
+    ::close(FD);
+    if (M == MAP_FAILED) {
+      LogMan::Msg::EFmt("FEX_GUESTTRACE: mmap of {} byte ring failed: {}", Size, errno);
+      return nullptr;
+    }
+    auto* H = static_cast<GuestTraceRingHeader*>(M);
+    H->Magic = GuestTraceMagic;
+    H->RecordSize = 1ull << GuestTraceRecordSizeLog2;
+    H->Capacity = 1ull << GuestTraceCapacityLog2;
+    H->DerefBase = static_cast<uint64_t>(GuestTraceDeref().first);
+    H->DerefLen = static_cast<uint64_t>(GuestTraceDeref().second);
+    H->Reserved = 0;
+    H->Idx.store(0, std::memory_order_relaxed);
+    LogMan::Msg::IFmt("FEX_GUESTTRACE: ring {} armed, {} targets", Path, GuestTraceTargets().size());
+    return H;
+  }();
+  return Ring;
+}
+static GuestTraceRingHeader* GuestTraceRingPtrFwd() {
+  return GuestTraceRingPtr();
+}
 
 // EmitStoreBlockBeginToInlineHeader
 // -------------------------------------------------------------------------
@@ -5286,6 +5650,188 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
         std(TMP2, static_cast<int16_t>(offsetof(FEXEntryWatchSlot, Count)), TMP1);
         LogMan::Msg::IFmt("EntryWatch: slot {} watching dispatcher entries at guest RIP 0x{:x}", (EntryWatchNextSlot.load() - 1) % std::size(FEX_EntryWatch),
                           GuestEntry);
+      }
+      // FEX_GUESTANCHOR module-base discovery + rva resolution for the two
+      // instrumentation features below (definitions above GuestTraceRingPtr).
+      GuestAnchorTryDiscover(GuestEntry);
+      const uint64_t AnchorBase = GuestAnchorBaseAtomic.load(std::memory_order_acquire);
+      const uint64_t GuestEntryRVA = (AnchorBase && GuestEntry > AnchorBase) ? GuestEntry - AnchorBase : 0;
+      // FEX_GUESTSERIALIZE lock injection (definition above GuestTraceRingPtr).
+      // Same prologue register contract as the trace below: TMP1/TMP2/TMP4
+      // scratch, TMP3 carries the saved CR, guest CR restored at the end of
+      // each sequence. Acquire spins on the Owner word (recursive via STATE
+      // identity + depth) with a timebase-bounded leak recovery, isync on
+      // acquisition; release is a silent no-op for a non-owner so unpaired
+      // paths cannot underflow.
+      const auto [SerRVAEntries, SerRVAExits] = GuestSerializeRVALists();
+      if (const auto [SerEntries, SerExits] = GuestSerializeLists(); !SerEntries->empty() || !SerRVAEntries->empty()) {
+        const bool IsEntry = std::find(SerEntries->begin(), SerEntries->end(), GuestEntry) != SerEntries->end() ||
+                             (GuestEntryRVA && std::find(SerRVAEntries->begin(), SerRVAEntries->end(), GuestEntryRVA) != SerRVAEntries->end());
+        const bool IsExit = std::find(SerExits->begin(), SerExits->end(), GuestEntry) != SerExits->end() ||
+                            (GuestEntryRVA && std::find(SerRVAExits->begin(), SerRVAExits->end(), GuestEntryRVA) != SerRVAExits->end());
+        if (auto* SerLock = (IsEntry || IsExit) ? GuestSerializeLock() : nullptr) {
+          mfcr(TMP3);
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(&SerLock->Owner));
+          if (IsEntry) {
+            PPC64Emitter::Label Arm {}, Retry {}, Held {}, StealTry {}, Mine {}, Done {};
+            // Bounded spin (TMP4 = timebase deadline). A serialized function
+            // that early-returns, unwinds, or whose owner thread dies before
+            // reaching a configured exit RIP leaves Owner set forever, and
+            // an unbounded ldarx/cmpd spin here would wedge every later
+            // entrant at 100% CPU with EmitSuspendInterruptCheck (below)
+            // unreachable. Legit hold times are microseconds (frees, small
+            // mutators -- see the DEADLOCK NOTE at GuestSerializeState), so
+            // an owner that sits on the lock across a full deadline period
+            // (~4s of timebase) is declared leaked and the lock recovered.
+            //
+            // Recovery is two-phase so an expired waiter cannot clobber a
+            // LIVE lock a different thread just acquired: on first expiry
+            // the observed owner is only recorded as Suspect and the
+            // deadline re-armed; the steal happens at the NEXT expiry, and
+            // only if Owner still equals Suspect (CAS Suspect -> 0), i.e.
+            // the same owner sat there for a whole further period. Depth is
+            // zeroed before the release so a fresh acquirer starts clean;
+            // racing stealers agree on Suspect and the CAS admits one. The
+            // residual races (a stale owner that is actually alive and
+            // re-enters, two stealers interleaving with an instant acquire)
+            // degrade to a re-leaked lock healed by the next steal cycle --
+            // never a silent loss of the injected exclusion. A stolen-from
+            // owner reaching its exit block is safe: release is already a
+            // silent no-op for non-owners.
+            //
+            // The deadline is armed lazily: TMP4 = 0 on entry and the
+            // mftb/addis live out of line at Arm, reached from Held the first
+            // time contention is observed (and from every re-arm site). The
+            // uncontended path -- every entry to the serialized frees and
+            // mutators -- therefore pays no SPR read and falls straight
+            // through into Mine; the deadline period simply starts at the
+            // first observed contention, at most one ldarx later.
+            li(TMP4, 0);            // deadline unarmed
+            Bind(&Retry);
+            ldarx(TMP2, r0, TMP1);
+            cmpd(cr(0), TMP2, STATE);
+            bc(CC_EQ, &Mine);       // recursive re-entry: skip the claim
+            cmpdi(TMP2, 0);
+            bc(CC_NE, &Held);       // held by another thread: deadline-check
+            stdcx_(STATE, r0, TMP1);
+            bc(CC_NE, &Retry);      // reservation lost: retry
+            Bind(&Mine);
+            isync();                // acquire barrier
+            ld(TMP2, 8, TMP1);      // Depth
+            addi(TMP2, TMP2, 1);
+            std(TMP2, 8, TMP1);
+            b(&Done);               // contention/steal code is out of line
+            Bind(&Held);
+            cmpdi(TMP4, 0);
+            bc(CC_EQ, &Arm);        // first contention: arm the deadline
+            mftb(TMP2);
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_LT, &Retry);      // deadline not reached: keep spinning
+            ld(TMP2, 0, TMP1);      // expired: current owner
+            ld(TMP4, 16, TMP1);     // Suspect from the previous expiry
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_EQ, &StealTry);   // same owner a whole period later: steal
+            std(TMP2, 16, TMP1);    // Suspect = owner; give it one more period
+            b(&Arm);
+            Bind(&StealTry);
+            li(TMP2, 0);
+            std(TMP2, 8, TMP1);     // Depth = 0 (no live owner mutates it now)
+            lwsync();               // Depth clear ordered before the release
+            ldarx(TMP2, r0, TMP1);
+            cmpd(cr(0), TMP2, TMP4);
+            bc(CC_NE, &Arm);        // owner moved on: not leaked after all
+            li(TMP2, 0);
+            stdcx_(TMP2, r0, TMP1); // CAS Suspect -> 0: one stealer wins
+            b(&Arm);                // re-arm and reacquire through the front door
+            Bind(&Arm);
+            mftb(TMP4);
+            addis(TMP4, TMP4, 0x7A12); // +2048000000 ticks = 4.0s at 512MHz
+            b(&Retry);
+            Bind(&Done);
+          } else {
+            PPC64Emitter::Label SkipRel {};
+            ld(TMP2, 0, TMP1);
+            cmpd(cr(0), TMP2, STATE);
+            bc(CC_NE, &SkipRel);    // not the owner: no-op
+            ld(TMP2, 8, TMP1);
+            addi(TMP2, TMP2, -1);
+            std(TMP2, 8, TMP1);
+            cmpdi(TMP2, 0);
+            bc(CC_NE, &SkipRel);    // still nested: keep ownership
+            lwsync();               // release barrier
+            li(TMP2, 0);
+            std(TMP2, 0, TMP1);     // Owner = 0
+            Bind(&SkipRel);
+          }
+          mtcr(TMP3);
+        }
+      }
+      // FEX_GUESTTRACE ring store (definition above EmitStoreBlockBeginToInlineHeader).
+      // Register contract at this point in the prologue: TMP1/TMP2 are
+      // clobberable (same as EntryWatch above); TMP3 additionally carries the
+      // saved CR image across the sequence -- every TMP is dead at the block-
+      // prologue boundary (IR ops treat them as transient scratch), and the
+      // only live state is SRA + STATE + the r0==0 invariant + guest CR,
+      // which is saved first and restored last. r0 is used only as the
+      // "literal zero" RA slot of ldarx/stdcx., never written.
+      const auto& TraceRVATargets = GuestTraceRVATargets();
+      if (const auto& TraceTargets = GuestTraceTargets();
+          (!TraceTargets.empty() && std::find(TraceTargets.begin(), TraceTargets.end(), GuestEntry) != TraceTargets.end()) ||
+          (GuestEntryRVA && !TraceRVATargets.empty() &&
+           std::find(TraceRVATargets.begin(), TraceRVATargets.end(), GuestEntryRVA) != TraceRVATargets.end())) {
+        if (auto* Ring = GuestTraceRingPtr()) {
+          const auto [DerefBase, DerefLen] = GuestTraceDeref();
+          // SRA index follows the X86State enum: RAX=0, RCX=1, RDX=2, RBX=3.
+          // (The order comment on x64::SRA in ArchHelpers/PPC64Emitter.h had
+          // RCX/RDX swapped -- proven live 2026-09-02: index 2 dereferenced as
+          // "rcx" faulted at exactly guest-rdx+0x140 on stack guard pages.)
+          const auto GuestRCX = StaticRegisters[1];
+          PPC64Emitter::Label Retry {}, SkipDeref {};
+          mfcr(TMP3); // CR0 = guest packed NZCV; restored by the mtcr below
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(&Ring->Idx));
+          Bind(&Retry);
+          ldarx(TMP2, r0, TMP1);
+          addi(TMP2, TMP2, 1);
+          stdcx_(TMP2, r0, TMP1);
+          bc(CC_NE, &Retry);
+          addi(TMP2, TMP2, -1);
+          rldicl(TMP2, TMP2, 0, 64 - GuestTraceCapacityLog2); // idx & (Capacity-1)
+          sldi(TMP2, TMP2, GuestTraceRecordSizeLog2);         // -> slot byte offset
+          LoadConstant(TMP1, reinterpret_cast<uint64_t>(Ring) + GuestTraceHeaderBytes);
+          add(TMP2, TMP1, TMP2); // TMP2 = slot
+          std(STATE, GuestTraceOffState, TMP2);
+          LoadConstant(TMP1, GuestEntry);
+          std(TMP1, GuestTraceOffRIP, TMP2);
+          std(TMP3, GuestTraceOffCR, TMP2);
+          for (uint32_t i = 0; i < 16; ++i) {
+            std(StaticRegisters[i], static_cast<int16_t>(GuestTraceOffGPRs + i * 8), TMP2);
+          }
+          // Guest return address: [rsp] names the call site when this entry
+          // is a genuine call target -- the discriminator between multiple
+          // paths into one traced function. Guest RSP is SRA index 4.
+          ld(TMP1, 0, StaticRegisters[4]);
+          std(TMP1, GuestTraceOffRetAddr, TMP2);
+          // Deref window guard: only follow guest RCX when it is plausibly a
+          // canonical user pointer (0x10000 <= rcx < 2^48). The slot's blob
+          // area keeps whatever the previous lap wrote; there is no per-lap
+          // generation tag, so a guard-skipped slot's blob is stale after
+          // ring wrap. The decoder (Scripts/guesttrace_decode.py) recomputes
+          // this exact guard from the recorded rcx and skips blob analysis
+          // when it fails -- keep the two predicates in sync.
+          srdi(TMP1, GuestRCX, 48);
+          cmpldi(TMP1, 0);
+          bc(CC_NE, &SkipDeref);
+          cmpldi(GuestRCX, 0xFFFF);
+          bc(CC_LE, &SkipDeref);
+          for (int16_t Off = 0; Off < DerefLen; Off += 8) {
+            ld(TMP1, static_cast<int16_t>(DerefBase + Off), GuestRCX);
+            std(TMP1, static_cast<int16_t>(GuestTraceOffDeref + Off), TMP2);
+          }
+          Bind(&SkipDeref);
+          mftb(TMP1);
+          std(TMP1, GuestTraceOffTB, TMP2); // completion marker, written last
+          mtcr(TMP3);
+        }
       }
       // Drain any deferred async signal at this guest instruction boundary.
       // Every dispatcher hit and linked block-to-block jump lands here, so a

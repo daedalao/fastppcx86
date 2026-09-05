@@ -2,7 +2,7 @@
 /*
 $info$
 tags: ir|opts
-desc: Marks chained scalar-FP inserts whose upper elements nobody observes
+desc: Splits scalar-FP inserts into a splat-domain op plus an explicit lane merge, forwarding splat form between chain links
 $end_info$
 */
 
@@ -22,7 +22,7 @@ $end_info$
 namespace FEXCore::IR {
 
 // ---------------------------------------------------------------------------
-// Scalar splat chains.
+// Scalar splat chains, sound form (2026-09-01 rework).
 //
 // A guest scalar-SSE float chain (movss load; mulss; addss; movss store)
 // reaches the PPC64LE backend as a run of VF*ScalarInsert ops, each lowered
@@ -30,197 +30,163 @@ namespace FEXCore::IR {
 //     xxspltw(T1, Vec1, 3) ; xxspltw(T2, Vec2, 3) ; xv{add,sub,mul,div}sp(T1, T1, T2)
 //     xxsldwi(T2, T1, Vec1, 3) ; xxsldwi(Dst, T2, T2, 1)     <- lane-0 merge
 // -- five instructions, and the next link then splats the merged result apart
-// again. But xv*sp over two FULLY SPLATTED operands yields a result that is
-// itself already splatted in all four elements, so for a chain-internal op the
-// merge and the consumer's re-splat are both dead work, PROVIDED nothing can
-// observe the upper elements.
+// again. xv*sp over two fully splatted operands yields a result that is itself
+// splatted in every element, so between two links the merge-then-resplat round
+// trip moves no information at all.
 //
-// This pass proves that per node and records it as VF*ScalarInsert::SplatResult
-// (and LoadRegister::SplatElementSize, see the register-cache section). Both are
-// PERMISSIONS granted to the backend, never obligations: a backend that ignores
-// them and produces the architectural value stays correct, which is why they
-// cannot break any other target.
+// THE PREDECESSOR OF THIS PASS AND WHY IT WAS OFF BY DEFAULT.  The original
+// pass let the splat-form value become the guest XMM's stored state whenever a
+// later store provably overwrote it in the same block ("rule (d)").  That is
+// unsound under mid-block fault resume: a guest fault inside the window spills
+// the splat-form register, execution resumes at the fault RIP in a FRESH block,
+// and the superseding store of the original block never runs -- the splatted
+// upper elements become architectural and propagate.  Two reproducible
+// Witcher 3 save-load crashes (2026-08-11) traced to exactly that; the pass
+// shipped default-off ever since, which made it worth zero instructions in
+// practice.
+//
+// THIS FORM NEVER LETS SPLAT STATE BECOME ARCHITECTURAL.  For every eligible
+// ScalarInsert %R the pass:
+//
+//   1. sets SplatResult, so the backend emits the xv* and STOPS -- %R is the
+//      splat-form value, one instruction (plus operand splats when its inputs
+//      are not already splat form);
+//
+//   2. emits %M = VInsElement(ElementSize, DestIdx=0, SrcIdx=0,
+//      DestVector=<%R's original Vector1>, SrcVector=%R) immediately after %R
+//      -- the exact architectural value, upper elements from Vector1, element
+//      0 from the splat.  This is the same merge DEF_SCALAR_INSERT used to
+//      emit inline (VInsElement's i32 boundary-lane path is the 2-insn
+//      xxsldwi pair; the i64 path is 1 xxpermdi), only now it is a separate
+//      SSA value;
+//
+//   3. rewrites %R's uses: element-0-only readers (the next link's operands, a
+//      narrow FPR StoreMem) keep or gain %R -- the backend sees SplatResult on
+//      the defining op and skips the re-splat -- while EVERYTHING ELSE,
+//      including the per-instruction StoreRegister flush writeback, gets %M.
+//
+// The stored guest register therefore holds the exact architectural value at
+// every guest instruction boundary, exactly as with the pass disabled.  A
+// fault or asynchronous signal anywhere sees perfect state; there is no
+// accepted-imprecision window, no rule about superseding stores, no concern
+// about SRA spills mid-chain.  What the transform saves is purely the dead
+// half of the round trip: a chain-interior f32 link costs
+//     xv* (1) + merge (2)                       = 3   (was 5)
+// and f64
+//     xv* (1) + xxpermdi merge (1)              = 2   (was 4)
+// with the consumer-side splats gone because consumers read %R.  A lone
+// (chain-less) op costs exactly what it did before -- the merge moved from the
+// macro into the VInsElement, same instruction count -- so marking every
+// eligible op is never a regression.
+//
+// THE FMA FAMILY (added 2026-09-01, second pass of the sprint).  The four
+// VF{,N}ML{A,S}ScalarInsert ops join both sides of the transform.  As
+// PRODUCERS they follow the same contract with one layout difference: their
+// merge lineage is the dedicated Upper operand rather than Vector1, so %M's
+// DestVector comes from Upper and all three math operands (Vector1, Vector2,
+// Addend) stay on the splat side.  As CONSUMERS their three math operands are
+// element-0-only reads REGARDLESS of the consumer's own marking -- the
+// backend splats each from element 0 (or passes an already-splat-form value
+// through), unlike an arith consumer's Vector1 whose inline merge reads upper
+// elements when unmarked.  A chain-interior f32 FMA link drops from 6 host
+// instructions (three operand splats + xv*a + 2-insn merge) to 2-3 (the
+// destructive accumulator's copy-splat + xv*a, plus an xxlor only when the
+// destination register aliases a pass-through source); f64 likewise sheds its
+// operand permutes and merge.
 //
 // ---------------------------------------------------------------------------
-// THE REGISTER CACHE IS THE WHOLE PROBLEM
+// THE REGISTER CACHE, still the load-bearing detail
 //
-// The obvious form of this analysis -- "follow the SSA edges between the
-// ScalarInserts" -- finds NOTHING in this tree, because those edges do not
-// exist. Core.cpp:851 calls FlushRegisterCache(true) before EVERY guest
-// instruction ("a blunt heuristic to make the register cache less aggressive,
-// as the current RA generates bad code in common cases with tied registers
-// otherwise ... it makes our exception handling behaviour more predictable").
-// So each guest XMM def is written straight back out and re-read:
+// Core.cpp:851 flushes the register cache before every guest instruction, so
+// chain links are connected through StoreRegister/LoadRegister pairs on the
+// guest XMM's static register (SRAFPR = v0..v15, disjoint from the dynamic
+// pool), not through SSA edges:
 //
-//     %2 = LoadRegister FPR0                 # movss xmm0, [rsi+rax*4]
-//     ...
 //     %4 = VFMulScalarInsert %2, %3          # mulss xmm0, xmm2
-//          StoreRegister %4 -> FPRFixed[0]   <- %4's ONLY SSA use
+//          StoreRegister %4 -> FPRFixed[0]
 //     %6 = LoadRegister FPR0                 # addss xmm1, xmm0
 //     %7 = VFAddScalarInsert %5, %6
-//          StoreRegister %7 -> FPRFixed[1]
 //
-// (The IRDumper hides this: it prints the operands as bare "V0"/"R1" tags, which
-// reads like a direct SSA edge.) Every candidate therefore has exactly one use,
-// a StoreRegister, and a naive rule set rejects all of them.
+// The pass models that cache per block: a LoadRegister of FPR<n> is an ALIAS
+// of whatever was last StoreRegister'd to FPRFixed[n] in this block.  A
+// consumer's operand that is such an alias of a marked candidate is retargeted
+// to the candidate node itself (%R, splat form) when the use reads only
+// element 0; alias uses this pass cannot classify are simply left pointing at
+// the register, which holds %M -- the exact value -- so an unclassified use is
+// never wrong, only unoptimized.  Cross-block consumers load the register in
+// their own block, where no alias mapping exists, and likewise read %M.
 //
-// So the pass models the register cache itself, per block:
-//   * LoadRegister FPR<n> is treated as an ALIAS of whatever node was last
-//     StoreRegister'd to FPRFixed[n] in this block. Uses of the alias are
-//     classified as uses of that underlying candidate; the alias node itself is
-//     transparent.
-//   * A StoreRegister of a candidate no longer disqualifies outright -- see the
-//     next section.
-//
-// The alias is sound at the machine level because the SRA registers are a
-// dedicated, disjoint register file: PPC64Emitter.h gives SRAFPR = v0..v15 and
-// RAFPR = v16..v29, so the ONLY things that write an SRA vector register are
-// DEF_OP(StoreRegister)'s vmr (tracked here) and the SpillStaticRegs /
-// FillStaticRegs pair around exits, which round-trips all 16 bytes and so
-// preserves splat form exactly.
+// Uses are accounted against OrderedNode::GetUses() for the candidate itself:
+// a candidate whose in-block classified uses do not cover every use it has
+// (e.g. a multiblock SSA edge from another block) is left unmarked entirely.
 //
 // ---------------------------------------------------------------------------
-// ACCEPTED IMPRECISION -- READ THIS BEFORE TOUCHING THE RULES
+// UPPER-ELEMENT LINEAGE FOR THE MERGE
 //
-// Letting a splat-form value be StoreRegister'd means the guest XMM's upper
-// elements hold the replicated element 0 instead of their architectural
-// contents for a window inside the block. Consequences:
+// %M's DestVector must be the ARCHITECTURAL previous value of the guest
+// register, i.e. merged form.  Through the register cache that is exactly the
+// consumer's original Vector1 operand (an alias LoadRegister, reading the
+// previous link's %M out of the register).  The one special case is a DIRECT
+// SSA edge between two candidates (no flush in between): there the Vector1
+// operand is the producer's %R -- splat form -- and using it as DestVector
+// would forge the upper elements.  For that case the pass substitutes the
+// producer's own %M, which is the same architectural value the register would
+// have carried.  The arithmetic operand keeps %R either way (element 0 of
+// splat and merged form agree by construction).
 //
-//   * A synchronous fault in that window, or an asynchronous signal taken
-//     there, builds a guest signal frame whose upper elements read as the
-//     splat. A guest handler that saves or inspects the whole XMM sees the
-//     wrong upper elements. This is the residual exposure and it is accepted.
-//   * A mid-block syscall/thunk/break would spill SRA to CPUState.xmm the same
-//     way. That one is NOT accepted -- SpillsSRA() below lists those ops and
-//     rule (d) refuses to leave a splat live across them.
-//
-// This is a REDUCTION in precision relative to today. The per-instruction flush
-// quoted above deliberately keeps guest register state exact at every
-// instruction boundary, and its own comment calls that "potentially correctness
-// bearing ... but that is a side effect here". What this pass gives up is
-// strictly narrower than that flush's own caveat: only the upper elements of a
-// scalar-float XMM, only between two guest instructions inside one block, and
-// only where the register is provably rewritten again before the block ends
-// (see the StoreRegister rule) so that no imprecision ever survives to a block
-// boundary. GPRs are unaffected -- they are flushed by the same call, and this
-// pass never touches a GPR-class value.
+// FPSCR fidelity is unchanged: operands reach the xv* in splat form exactly as
+// before (the backend splats any operand not already splat form), so every
+// lane computes the same value and the sticky bits match one real computation.
 //
 //     FEX_DISABLESCALARSPLATCHAIN=1
-// turns the pass off and restores exact upper elements everywhere.
-//
-// ---------------------------------------------------------------------------
-// MARKING RULE
-//
-// A node R = VF{Add,Sub,Mul,Div}ScalarInsert(Vector1, Vector2, ZeroUpperBits=0)
-// with Header.Size == 128-bit and ElementSize in {32, 64} may be marked iff
-// EVERY use of R -- and every use of every LoadRegister aliasing R -- is one of:
-//
-//   (a) the Vector1 (destination) operand of another eligible ScalarInsert of
-//       the SAME ElementSize in the same block that is ITSELF marked. Such a
-//       consumer reads Vector1's element 0 for the arithmetic (a splat holds
-//       the right value there) but would otherwise propagate Vector1's upper
-//       elements into its own result -- acceptable only because the consumer's
-//       own result is likewise non-architectural above element 0. Hence the
-//       mutual requirement, resolved by the fixpoint below.
-//
-//   (b) the Vector2 (source) operand of a VF{Add,Sub,Mul,Div,Min,Max}-
-//       ScalarInsert of the SAME ElementSize in the same block. Every one of
-//       those lowerings derives element 0 solely from element 0 of Vector1 and
-//       Vector2, and copies its upper elements from Vector1 only. No
-//       requirement on the consumer's own marking.
-//
-//   (c) the Value operand of a StoreMem with Class == FPR in the same block
-//       whose store size is <= the element size (see the store note below).
-//
-//   (d) the Value operand of a StoreRegister to FPRFixed[n] -- ONLY IF a LATER
-//       StoreRegister to that same FPRFixed[n] supersedes it before the block
-//       ends AND with no SRA-spilling op (SpillsSRA) in between. That later
-//       store is what keeps the splat from reaching architectural state.
-//
-//       Note the rule is evaluated per use against that store's own position,
-//       so the LAST write to a register is never eligible. Combined with (a),
-//       a chain whose tail value is left live in an XMM at block end unwinds
-//       completely and marks nothing -- which is why an accumulator like the
-//       `addss xmm1, ...` of a DSP loop never marks, while a scratch register
-//       reloaded later in the block (an unrolled loop's `movss xmm0, [m+k]`,
-//       or any register the guest reuses) does.
-//
-// Anything else disqualifies: StoreContext, any full-width vector op, a 16-byte
-// store, VStoreVectorElement, a use in another block, a use by a ScalarInsert
-// of a DIFFERENT element size, ...
-//
-// The ElementSize match in (a)/(b) is load-bearing, not tidiness. An f32 splat
-// has element 0's word in all four words, so its doubleword 1 reads
-// {val, val}; the architectural doubleword 1 of that same value is
-// {Vector1.word2, val}. An f64 consumer of an f32 splat would therefore read a
-// wrong 64-bit element 0. Same argument mirrored the other way.
-//
-// "Use in another block" is caught without any cross-block dataflow: uses of
-// every tracked node (candidates AND their aliases) are counted while walking
-// the block, and each total is compared against OrderedNode::GetUses(), which
-// IREmitter maintains exactly (AddUse on every SSA argument at emission;
-// Replace*/Remove keep it in step). Any discrepancy means something outside this
-// block -- or something the walk did not classify -- holds a reference, and the
-// candidate is left alone.
-//
-// ---------------------------------------------------------------------------
-// WHY StoreRegister IS THE WHOLE OF THE SRA STORY
-//
-// The analysis only works if an SSA value can become architectural guest XMM
-// state exclusively by appearing as an operand of an IR op this pass can see.
-// It can:
-//
-//   1. OpcodeDispatcher.h:1338-1349 -- the frontend RegCache flush emits
-//      `Ref R = _StoreRegister(Value, VectorSize); R->Reg =
-//      PhysicalRegister(RegClass::FPRFixed, Index - FPR0Index).Raw;` for cache
-//      indices FPR0..FPR15, and _StoreContext* for the AVX-high/MMX/x87 ones.
-//   2. RegisterAllocationPass.cpp:225-266 -- DecodeSRANode/DecodeSRAReg READ
-//      that existing Value operand and that Reg byte. RA assigns the register;
-//      it does not create the writeback.
-//   3. MemoryOps.cpp:422 -- DEF_OP(StoreRegister) is a bare
-//      vmr(StaticFPRegisters[Reg], GetVReg(Op->Value)).
-//
-// So rule (d) plus the StoreContext exclusion covers every path to architectural
-// state. The two things RA adds after this pass are harmless:
-//   * SpillRegister/FillRegister for an FPR are a full-width stvx/lvx pair
-//     (MemoryOps.cpp:349-402), so splat form round-trips bit-identically. They
-//     also introduce new uses after the analysis ran -- harmless for the same
-//     reason.
-//   * A fill or copy replaces a consumer's operand with a different defining
-//     node, at which point the backend's splat-form test simply fails and it
-//     emits the splat it would have emitted anyway. Re-splatting an
-//     already-splatted value is idempotent, so that failure is one-directional.
-//
-// ---------------------------------------------------------------------------
-// THE STORE CASE
-//
-// PPC64LE lowers `StoreMem FPR` through PPC64EmitterBase::StoreFPRSized
-// (ArchHelpers/PPC64Emitter.cpp:511), whose 4/8-byte fast path is
-//     xxpermdi(T, src, src, 2) ; stxsiwx/stxsdx(T, ea, r0)
-// -- the permute moves the guest value out of doubleword 1 (LE element 0) into
-// doubleword 0, where the scalar-VSX stores read. Sizes 1/2 fall back to a stvx
-// bounce through JITScratch and read the low `size` bytes of doubleword 1. Both
-// paths read ONLY bits inside element 0, which a splat holds correctly; that is
-// why any store of size <= ElementSize is a legal use, and why leaving such a
-// store alone would already be correct. The backend additionally skips the
-// permute for the 4/8-byte case, since in splat form doubleword 0 already
-// equals doubleword 1.
-//
-// StoreMemTSO is deliberately NOT accepted: separate op, own barrier
-// sequencing, not audited here.
+// turns the pass off. The option is hashed into the code cache id
+// (CodeCache.cpp HASH_OPT), so cached translations never cross the toggle.
 // ---------------------------------------------------------------------------
 
 namespace {
-  // Producers this pass may mark. Restricted to the four arithmetic ops whose
-  // lowering is the DEF_SCALAR_INSERT macro in VectorOps.cpp -- the splat-both-
-  // operands + single xv* + merge shape the transform reasons about.
-  bool IsSplattableProducer(IROps Op) {
+  // Producers this pass may mark: the four arithmetic ops whose lowering is
+  // the DEF_SCALAR_INSERT macro in VectorOps.cpp, and the four FMA ops
+  // (DEF_FMA_SCALAR_INSERT) -- both are the splat-operands + single xv* +
+  // merge shape the transform reasons about. The families differ in operand
+  // layout: arith merges its result over Vector1 (which is also a math
+  // operand), FMA carries a dedicated Upper operand for the merge and its
+  // three math operands (Vector1, Vector2, Addend) are elem0-only reads.
+  bool IsArithProducer(IROps Op) {
     switch (Op) {
     case OP_VFADDSCALARINSERT:
     case OP_VFSUBSCALARINSERT:
     case OP_VFMULSCALARINSERT:
     case OP_VFDIVSCALARINSERT: return true;
     default: return false;
+    }
+  }
+
+  bool IsFMAProducer(IROps Op) {
+    switch (Op) {
+    case OP_VFMLASCALARINSERT:
+    case OP_VFMLSSCALARINSERT:
+    case OP_VFNMLASCALARINSERT:
+    case OP_VFNMLSSCALARINSERT: return true;
+    default: return false;
+    }
+  }
+
+  bool IsSplattableProducer(IROps Op) {
+    return IsArithProducer(Op) || IsFMAProducer(Op);
+  }
+
+  // Which operand supplies the upper elements of the architectural result --
+  // the DestVector of the explicit VInsElement merge this pass emits.
+  uint8_t LineageArgIdx(IROps Op) {
+    return IsFMAProducer(Op) ? IROp_VFMLAScalarInsert::Upper_Index : IROp_VFAddScalarInsert::Vector1_Index;
+  }
+
+  // SplatResult sits at different struct offsets in the two families.
+  void SetSplatResult(IROp_Header* IROp) {
+    if (IsFMAProducer(IROp->Op)) {
+      IROp->CW<IROp_VFMLAScalarInsert>()->SplatResult = true;
+    } else {
+      IROp->CW<IROp_VFAddScalarInsert>()->SplatResult = true;
     }
   }
 
@@ -251,7 +217,14 @@ namespace {
       return false;
     }
 
-    // All four ops share the ZeroUpperBits field at the same place.
+    // FMA ops have no ZeroUpperBits field: the AVX zero-upper semantic is
+    // encoded by the frontend through the Upper operand itself, which this
+    // pass carries into the merge unchanged.
+    if (IsFMAProducer(IROp->Op)) {
+      return true;
+    }
+
+    // The four arithmetic ops share the ZeroUpperBits field at the same place.
     return !IROp->C<IROp_VFAddScalarInsert>()->ZeroUpperBits;
   }
 
@@ -272,31 +245,6 @@ namespace {
       return -1;
     }
     return Reg.Reg;
-  }
-
-  // Ops whose PPC64LE lowering copies the SRA registers out to CPUState in the
-  // middle of a block (BranchOps.cpp: SpillStaticRegs at :19, :574, :630, and
-  // the Thunk path). A splat left in an SRA register across one of these would
-  // be written into architectural CPUState.xmm, so they close the window that
-  // rule (d) opens.
-  //
-  // Block TERMINATORS deliberately are not listed: rule (d) requires a LATER
-  // store to the same register, and the frontend flushes the register cache
-  // before emitting any terminator, so the last store always precedes them and
-  // a candidate stored there is already rejected.
-  //
-  // If a future op grows an SRA spill without being added here, the failure
-  // mode is the accepted imprecision documented at the top of this file (a
-  // signal frame with splatted upper elements), not memory corruption or a
-  // wrong arithmetic result.
-  bool SpillsSRA(IROps Op) {
-    switch (Op) {
-    case OP_SYSCALL:
-    case OP_THUNK:
-    case OP_BREAK:
-    case OP_CALLBACKRETURN: return true;
-    default: return false;
-    }
   }
 
   int FPRLoadSource(const IROp_Header* IROp) {
@@ -321,23 +269,32 @@ private:
   struct Candidate {
     Ref Node {};
     IROp_Header* IROp {};
-    // Cleared by any use that is not one of the four allowed forms, or by a
-    // tracked node whose in-block use count does not account for all its uses.
-    bool Allowed {true};
-    bool Marked {};
-    // Consumers using this node (directly or through an alias) as their
-    // Vector1 operand; each must itself be marked for this node to stay marked.
-    fextl::vector<uint32_t> DestConsumers;
-    // LoadRegister nodes that read this value back out of its SRA register.
-    fextl::vector<Ref> Aliases;
+    // The merge node (%M), created in the apply phase.
+    Ref Merge {};
+    bool Marked {true};
+    // Every classified use is either a splat-forward (reads element 0 only,
+    // retarget to %R) or a merge use (needs the architectural value, retarget
+    // to %M). Only DIRECT uses of the candidate node need merge retargeting;
+    // alias uses left alone already read %M through the register.
   };
 
-  // One entry per node whose uses must be accounted for: the candidate itself
-  // and every LoadRegister aliasing it.
+  struct Forward {
+    Ref User {};
+    uint8_t ArgIdx {};
+    uint32_t CandIdx {};
+  };
+  struct MergeUse {
+    Ref User {};
+    uint8_t ArgIdx {};
+    uint32_t CandIdx {};
+  };
+
+  // One entry per node whose value this pass understands: the candidate itself
+  // and every LoadRegister aliasing it through the register cache.
   struct Tracked {
     Ref Node {};
     uint32_t CandIdx {};
-    uint32_t Seen {};
+    bool IsAlias {};
   };
 
   // SSA id -> index into Trackeds, or kNone. Allocated once for the whole IR
@@ -345,6 +302,9 @@ private:
   fextl::vector<uint32_t> TrackedOf;
   fextl::vector<Tracked> Trackeds;
   fextl::vector<Candidate> Candidates;
+  fextl::vector<Forward> Forwards;
+  fextl::vector<MergeUse> MergeUses;
+  fextl::vector<uint32_t> CandUsesSeen;
 };
 
 void ScalarSplatChain::Run(IREmitter* IREmit) {
@@ -355,55 +315,12 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
   TrackedOf.clear();
   TrackedOf.resize(CurrentIR.GetSSACount(), kNone);
 
-  // Per-position verdict for rule (d): is the splat this StoreRegister puts
-  // into its SRA register provably overwritten again, by another store to the
-  // same register, before either the block ends or anything spills SRA to
-  // CPUState? Indexed by the same ordinal the main walk counts.
-  fextl::vector<uint8_t> StoreIsSuperseded;
-  // Index into StoreIsSuperseded of the most recent not-yet-superseded store to
-  // each SRA register.
-  uint32_t PendingStore[kNumSRAFPRs];
-
   for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
     Candidates.clear();
     Trackeds.clear();
-
-    {
-      // Forward pre-walk: resolve rule (d) for every StoreRegister at once. A
-      // store is superseded exactly when the next event touching its register
-      // is another store to it -- a barrier in between clears the pending
-      // entry, and anything still pending at the end of the block survives to
-      // the block boundary.
-      bool AnyCandidate = false;
-      StoreIsSuperseded.clear();
-      for (size_t i = 0; i < kNumSRAFPRs; ++i) {
-        PendingStore[i] = kNone;
-      }
-      for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
-        const uint32_t Pos = static_cast<uint32_t>(StoreIsSuperseded.size());
-        StoreIsSuperseded.push_back(0);
-
-        AnyCandidate |= IsEligible(IROp);
-
-        if (SpillsSRA(IROp->Op)) {
-          for (size_t i = 0; i < kNumSRAFPRs; ++i) {
-            PendingStore[i] = kNone;
-          }
-          continue;
-        }
-
-        const int Reg = FPRStoreTarget(CodeNode, IROp);
-        if (Reg >= 0) {
-          if (PendingStore[Reg] != kNone) {
-            StoreIsSuperseded[PendingStore[Reg]] = 1;
-          }
-          PendingStore[Reg] = Pos;
-        }
-      }
-      if (!AnyCandidate) {
-        continue;
-      }
-    }
+    Forwards.clear();
+    MergeUses.clear();
+    CandUsesSeen.clear();
 
     // Which candidate's value currently sits in each SRA vector register.
     uint32_t CurSRA[kNumSRAFPRs];
@@ -411,30 +328,39 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
       CurSRA[i] = kNone;
     }
 
-    auto Track = [&](Ref Node, uint32_t CandIdx) {
+    auto Track = [&](Ref Node, uint32_t CandIdx, bool IsAlias) {
       TrackedOf[CurrentIR.GetID(Node).Value] = static_cast<uint32_t>(Trackeds.size());
-      Trackeds.emplace_back(Tracked {.Node = Node, .CandIdx = CandIdx});
+      Trackeds.emplace_back(Tracked {.Node = Node, .CandIdx = CandIdx, .IsAlias = IsAlias});
     };
 
-    // Resolve an operand to the candidate it carries the value of, following
-    // the register-cache alias, without counting the use.
-    auto CandidateOfArg = [&](OrderedNodeWrapper Arg) -> uint32_t {
-      if (Arg.IsInvalid() || Arg.IsImmediate()) {
+    // Resolve an operand to the tracked entry carrying its value, following
+    // the register-cache alias. The bounds check matters: merge nodes emitted
+    // for EARLIER blocks have SSA ids past TrackedOf's initial sizing, and a
+    // multiblock argument may name one.
+    auto TrackedOfArg = [&](OrderedNodeWrapper Arg) -> uint32_t {
+      if (Arg.IsInvalid() || Arg.IsImmediate() || Arg.ID().Value >= TrackedOf.size()) {
         return kNone;
       }
-      const uint32_t T = TrackedOf[Arg.ID().Value];
+      return TrackedOf[Arg.ID().Value];
+    };
+    auto CandidateOfArg = [&](OrderedNodeWrapper Arg) -> uint32_t {
+      const uint32_t T = TrackedOfArg(Arg);
       return T == kNone ? kNone : Trackeds[T].CandIdx;
     };
 
-    uint32_t Pos = 0;
+    // ------------------------------------------------------------------
+    // Analysis walk: no mutation. Collect candidates, the register-cache
+    // alias map, and a classification of every use of a tracked node.
+    // ------------------------------------------------------------------
     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
-      // Register a candidate BEFORE classifying its operands, so that a
-      // Vector1 use recorded below can name this node as the consumer it must
-      // wait on. A node is never its own operand, so this cannot self-count.
+      // Register a candidate BEFORE classifying its operands, so a use
+      // recorded below can name this node as its consumer. A node is never
+      // its own operand, so this cannot self-count.
       if (IsEligible(IROp)) {
         const uint32_t Idx = static_cast<uint32_t>(Candidates.size());
         Candidates.emplace_back(Candidate {.Node = CodeNode, .IROp = IROp});
-        Track(CodeNode, Idx);
+        CandUsesSeen.push_back(0);
+        Track(CodeNode, Idx, false);
       }
 
       // --- classify this op's uses of anything tracked -------------------
@@ -445,104 +371,159 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
           continue;
         }
 
-        const uint32_t TIdx = TrackedOf[Arg.ID().Value];
+        const uint32_t TIdx = TrackedOfArg(Arg);
         if (TIdx == kNone) {
           continue;
         }
 
-        ++Trackeds[TIdx].Seen;
-        auto& C = Candidates[Trackeds[TIdx].CandIdx];
+        const auto& T = Trackeds[TIdx];
+        const uint32_t CandIdx = T.CandIdx;
+        auto& C = Candidates[CandIdx];
+        if (!T.IsAlias) {
+          ++CandUsesSeen[CandIdx];
+        }
 
-        // (a)/(b): a ScalarInsert consumer of the same element size.
+        // Element-0-only readers of the same element size take splat form.
+        //   * an arith ScalarInsert's Vector1 (the arithmetic reads element 0;
+        //     the consumer's own merge takes its upper elements from its
+        //     ORIGINAL operand, handled in the apply phase);
+        //   * an element-0-only reader's Vector2;
+        //   * an FMA ScalarInsert's Vector1/Vector2/Addend -- the backend
+        //     splats each from element 0 (or passes a splat-form value
+        //     through) regardless of the consumer's own marking; its Upper
+        //     operand is merge lineage, NOT an element-0 read, and falls
+        //     through to the merge-use classification below;
+        //   * a narrow FPR StoreMem (both store paths read only bits inside
+        //     element 0, and the backend skips its positioning permute for a
+        //     splat-form operand).
         if (IROp->ElementSize == C.IROp->ElementSize) {
-          if (i == IROp_VFAddScalarInsert::Vector1_Index && IsEligible(IROp)) {
-            // The consumer was tracked as a candidate at the top of this
-            // iteration, so it always has an index here.
-            C.DestConsumers.push_back(Trackeds[TrackedOf[CurrentIR.GetID(CodeNode).Value]].CandIdx);
-            continue;
-          }
-          if (i == IROp_VFAddScalarInsert::Vector2_Index && ReadsOnlyElement0OfVector2(IROp->Op)) {
+          const bool Fwd = IsFMAProducer(IROp->Op) ?
+            (i == IROp_VFMLAScalarInsert::Vector1_Index || i == IROp_VFMLAScalarInsert::Vector2_Index ||
+             i == IROp_VFMLAScalarInsert::Addend_Index) :
+            ((i == IROp_VFAddScalarInsert::Vector1_Index && IsEligible(IROp)) ||
+             (i == IROp_VFAddScalarInsert::Vector2_Index && ReadsOnlyElement0OfVector2(IROp->Op)));
+          if (Fwd) {
+            Forwards.push_back(Forward {.User = CodeNode, .ArgIdx = i, .CandIdx = CandIdx});
             continue;
           }
         }
-
-        // (c): a narrow FPR store of the value.
         if (IROp->Op == OP_STOREMEM && i == IROp_StoreMem::Value_Index && IROp->C<IROp_StoreMem>()->Class == RegClass::FPR &&
             IR::OpSizeToSize(IROp->Size) <= IR::OpSizeToSize(C.IROp->ElementSize)) {
+          Forwards.push_back(Forward {.User = CodeNode, .ArgIdx = i, .CandIdx = CandIdx});
           continue;
         }
 
-        // (d): a static-register writeback that a later store to the same
-        // register supersedes before the block ends or SRA is spilled. If the
-        // splat could survive to either, it is the guest XMM's architectural
-        // value there and must stay exact.
-        if (i == IROp_StoreRegister::Value_Index && FPRStoreTarget(CodeNode, IROp) >= 0 && StoreIsSuperseded[Pos]) {
-          continue;
+        // Anything else: a DIRECT use of the candidate must be retargeted to
+        // the merge (%M) so it keeps seeing the architectural value. An alias
+        // use needs nothing -- the register it read already holds %M.
+        if (!T.IsAlias) {
+          MergeUses.push_back(MergeUse {.User = CodeNode, .ArgIdx = i, .CandIdx = CandIdx});
         }
-
-        C.Allowed = false;
       }
 
       // --- then update the register-cache model --------------------------
       // Order matters: a StoreRegister's own operand is classified above
       // against the state BEFORE the store, and the alias it establishes is
-      // visible only to later LoadRegisters.
+      // visible only to later LoadRegisters. Propagates through movaps-style
+      // register copies too: the stored value may itself be an alias.
       if (const int SReg = FPRStoreTarget(CodeNode, IROp); SReg >= 0) {
-        // Propagates through movaps-style register copies too: the stored
-        // value may itself be an alias, and resolving it means a later read of
-        // the destination register still points at the originating candidate.
         CurSRA[SReg] = CandidateOfArg(IROp->Args[IROp_StoreRegister::Value_Index]);
       } else if (const int LReg = FPRLoadSource(IROp); LReg >= 0 && CurSRA[LReg] != kNone) {
-        const uint32_t Idx = CurSRA[LReg];
-        Candidates[Idx].Aliases.push_back(CodeNode);
-        Track(CodeNode, Idx);
-      }
-
-      ++Pos;
-    }
-
-    // A tracked node whose in-block use count does not account for every use it
-    // has is referenced from somewhere this walk could not see.
-    for (const auto& T : Trackeds) {
-      if (T.Seen != T.Node->GetUses()) {
-        Candidates[T.CandIdx].Allowed = false;
+        Track(CodeNode, CurSRA[LReg], true);
       }
     }
 
-    for (auto& C : Candidates) {
-      C.Marked = C.Allowed;
-    }
-
-    // Greatest fixpoint over rule (a). A Vector1 consumer is always an eligible
-    // ScalarInsert and so is a candidate in its own right.
-    for (bool Changed = true; Changed;) {
-      Changed = false;
-      for (auto& C : Candidates) {
-        if (!C.Marked) {
-          continue;
-        }
-        for (uint32_t Consumer : C.DestConsumers) {
-          if (!Candidates[Consumer].Marked) {
-            C.Marked = false;
-            Changed = true;
-            break;
-          }
-        }
+    // A candidate whose directly-classified uses do not account for every use
+    // it has is referenced from somewhere this walk could not see (a
+    // multiblock SSA edge from another block, an op shape not modeled here).
+    // Such a use would keep reading splat form after marking, so the
+    // candidate is left alone entirely.
+    for (uint32_t CandIdx = 0; CandIdx < Candidates.size(); ++CandIdx) {
+      if (CandUsesSeen[CandIdx] != Candidates[CandIdx].Node->GetUses()) {
+        Candidates[CandIdx].Marked = false;
       }
     }
 
+    // A Vector1 forward is only sound when BOTH sides are marked: the
+    // producer for splat form to exist, the consumer because an unmarked
+    // consumer's inline merge reads Vector1's upper elements. Vector2 and
+    // StoreMem forwards need only the producer. Drop the rest.
+    // (Consumer lookup: the user of a Vector1 forward is itself eligible and
+    // therefore a candidate in this block's list.)
+    auto CandidateIndexOfNode = [&](Ref Node) -> uint32_t {
+      const uint32_t ID = CurrentIR.GetID(Node).Value;
+      if (ID >= TrackedOf.size()) {
+        return kNone;
+      }
+      const uint32_t T = TrackedOf[ID];
+      return (T == kNone || Trackeds[T].IsAlias) ? kNone : Trackeds[T].CandIdx;
+    };
+
+    // ------------------------------------------------------------------
+    // Apply phase 1: create every marked candidate's merge node. Reads each
+    // candidate's CURRENT lineage operand (arith: Vector1, FMA: Upper), so
+    // this must run before any operand retargeting. A direct-edge lineage
+    // operand (producer candidate node) is substituted with that producer's
+    // %M -- the architectural value -- which exists because phase 1 runs in
+    // program order.
+    // ------------------------------------------------------------------
     for (auto& C : Candidates) {
       if (!C.Marked) {
         continue;
       }
-      C.IROp->CW<IROp_VFAddScalarInsert>()->SplatResult = true;
-      // Let the backend see splat form through the register cache: a consumer's
-      // operand is the LoadRegister, not the producer. Recording the element
-      // size rather than a bare flag keeps the f32/f64 distinction the marking
-      // rule depends on available at the use site.
-      for (Ref Alias : C.Aliases) {
-        CurrentIR.GetOp<IROp_Header>(Alias)->CW<IROp_LoadRegister>()->SplatElementSize = C.IROp->ElementSize;
+      auto V1Wrap = C.IROp->Args[LineageArgIdx(C.IROp->Op)];
+      Ref V1 = CurrentIR.GetNode(V1Wrap);
+      if (const uint32_t TIdx = TrackedOfArg(V1Wrap); TIdx != kNone && !Trackeds[TIdx].IsAlias) {
+        const uint32_t PIdx = Trackeds[TIdx].CandIdx;
+        // Direct SSA edge between candidates: the operand is splat form; its
+        // architectural counterpart is the producer's merge. An unmarked
+        // producer has no merge and its value IS architectural -- keep it.
+        if (Candidates[PIdx].Marked) {
+          V1 = Candidates[PIdx].Merge;
+        }
       }
+
+      IREmit->SetWriteCursor(C.Node);
+      C.Merge = IREmit->_VInsElement(OpSize::i128Bit, C.IROp->ElementSize, 0, 0, V1, C.Node);
+      SetSplatResult(C.IROp);
+    }
+
+    // ------------------------------------------------------------------
+    // Apply phase 2: retarget uses.
+    // ------------------------------------------------------------------
+    for (const auto& M : MergeUses) {
+      auto& C = Candidates[M.CandIdx];
+      if (!C.Marked) {
+        continue;
+      }
+      IREmit->ReplaceNodeArgument(M.User, M.ArgIdx, C.Merge);
+    }
+
+    for (const auto& F : Forwards) {
+      auto& C = Candidates[F.CandIdx];
+      if (!C.Marked) {
+        continue;
+      }
+      const auto* UserOp = CurrentIR.GetOp<IROp_Header>(F.User);
+      // The both-marked rule applies only to an ARITH consumer's Vector1: an
+      // unmarked arith consumer's inline merge reads Vector1's upper
+      // elements. FMA math operands are elem0-only regardless of the
+      // consumer's marking (its lineage is the separate Upper operand), so
+      // they need only the producer -- same as Vector2/StoreMem forwards.
+      if (F.ArgIdx == IROp_VFAddScalarInsert::Vector1_Index && IsArithProducer(UserOp->Op)) {
+        const uint32_t ConsumerIdx = CandidateIndexOfNode(F.User);
+        if (ConsumerIdx == kNone || !Candidates[ConsumerIdx].Marked) {
+          // Dropped forward. An ALIAS arg still reads %M through the register
+          // and needs nothing; but a DIRECT SSA edge already names the
+          // candidate -- splat form -- and the unmarked consumer's inline
+          // merge would read its forged upper elements. Point it at %M.
+          if (CurrentIR.GetNode(UserOp->Args[F.ArgIdx]) == C.Node) {
+            IREmit->ReplaceNodeArgument(F.User, F.ArgIdx, C.Merge);
+          }
+          continue;
+        }
+      }
+      IREmit->ReplaceNodeArgument(F.User, F.ArgIdx, C.Node);
     }
 
     for (const auto& T : Trackeds) {

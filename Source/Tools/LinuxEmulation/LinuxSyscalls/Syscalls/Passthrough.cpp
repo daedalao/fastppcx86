@@ -13,6 +13,7 @@ $end_info$
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/SyscallObserver.h"
+#include "LinuxSyscalls/CoreIsolation.h"
 #include "LinuxSyscalls/ThreadCensus.h"
 #include "VDSO_Emulation.h"
 
@@ -21,6 +22,7 @@ $end_info$
 #endif
 
 #include <FEXCore/IR/IR.h>
+#include <FEXHeaderUtils/Syscalls.h>
 
 #include <algorithm>
 #include <errno.h>
@@ -804,6 +806,11 @@ static uint64_t WrappedSchedSetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
     FEX::HLE::ThreadCensus::OnSetAffinity(static_cast<int64_t>(pid), Readable ? reinterpret_cast<const uint8_t*>(mask) : nullptr,
                                           Readable ? cpusetsize : 0, static_cast<int64_t>(Result));
   }
+  if (Result == 0) {
+    // The guest placed this thread deliberately; CoreIsolation must never
+    // override it. pid==0 targets the caller (host tid == guest tid).
+    FEX::HLE::CoreIsolation::OnGuestSetAffinity(pid == 0 ? static_cast<uint32_t>(FHU::Syscalls::gettid()) : static_cast<uint32_t>(pid));
+  }
   return Result;
 }
 
@@ -822,6 +829,11 @@ static uint64_t WrappedSchedGetaffinity(FEXCore::Core::CpuStateFrame* Frame, uin
   if (Result == static_cast<uint64_t>(-1)) {
     return -errno;
   }
+  // CoreIsolation narrows host masks behind the guest's back; a thread the
+  // guest never pinned must keep seeing the original allowed mask (games
+  // size thread pools from this result).
+  FEX::HLE::CoreIsolation::ReportedAffinityOverride(pid == 0 ? static_cast<uint32_t>(FHU::Syscalls::gettid()) : static_cast<uint32_t>(pid),
+                                                    &HostSet);
   FaultSafeUserMemAccess::VerifyIsWritable(reinterpret_cast<void*>(mask), NeededBytes);
   auto* GuestMask = reinterpret_cast<uint8_t*>(mask);
   memset(GuestMask, 0, NeededBytes);
@@ -1326,6 +1338,13 @@ namespace x64 {
       // futex trace from exactly the process under investigation.
       if (IoctlType == 0x4Eu) {
         static const bool trace_ntsync = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        // The trace plumbing (access/open/write) runs between the real ioctl
+        // and SYSCALL_ERRNO(), so any errno it clobbers becomes the GUEST's
+        // errno for a failed ioctl. The disarmed access() alone turned every
+        // ntsync ETIMEDOUT into ENOENT, which kills Mono launch paths
+        // (mono_os_sem_timedwait treats error 2 as fatal) — W3/RimWorld died
+        // ~80s in with the env set but /tmp/nts_on absent, 2026-08-30.
+        const int saved_errno = errno;
         if (trace_ntsync && access("/tmp/nts_on", F_OK) == 0) {
           static int nts_fd = -1;
           if (nts_fd == -1) {
@@ -1347,12 +1366,13 @@ namespace x64 {
             char line[192];
             const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
                                    static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
-                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? errno : 0);
+                                   IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? saved_errno : 0);
             if (n > 0) {
               [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
             }
           }
         }
+        errno = saved_errno;
       }
       SYSCALL_ERRNO();
     });

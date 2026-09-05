@@ -4165,52 +4165,37 @@ DEF_OP(VExtractToGPR) {
     break;
   }
 }
-// Helper: substitute Dst with x86 "integer indefinite" sentinel (INT_MIN of
-// the destination width) on +overflow / NaN, after POWER fctiw[z]/fctid[z]
-// has already converted Src into Dst.
-//
-// POWER's scalar fctiw[z]/fctid[z] saturate +overflow to INT_MAX and -overflow
-// to INT_MIN, and produce INT_MIN for NaN.  x86 CVT[T]SS2SI / CVT[T]SD2SI
-// instead want INT_MIN (0x80000000_i32 / 0x8000000000000000_i64) for ALL of
-// {+overflow, -overflow already matches, NaN already matches}.  So we only
-// need to fix up the +overflow case; -overflow and NaN are already correct.
-//
-// Strategy: scalar fcmpu against the smallest FP value strictly greater than
-// INT_MAX in the source precision (equivalently 2^N where N is dst width-1).
-// If Src >= bound  OR  Src is NaN  → load INT_MIN into Dst.
-//
-// fcmpu sets CR.LT / CR.GT / CR.EQ / CR.SO; "no fixup needed" is exactly
-// CR.LT set (Src < bound, finite, ordered).  We use cr(1) so we don't
-// clobber CR0 (packed NZCV).  bc with BO=12 BI=4 branches on CR1.LT set.
-//
-// Bound constants (smallest FP > INT_MAX, equal to 2^(W-1) in source precision):
-//   f32 -> i32:  2^31  as f32 = 0x4F000000
-//   f32 -> i64:  2^63  as f32 = 0x5F000000
-//   f64 -> i32:  2^31  as f64 = 0x41E0000000000000
-//   f64 -> i64:  2^63  as f64 = 0x43E0000000000000
-// Note 2^31 is exactly representable in both f32 and f64 (and 2^63 in f64),
-// so "Src == bound" is also overflow on x86 (x86 INT_MAX = 2^(W-1)-1).
-// The condition is thus Src >= bound (or NaN), i.e. !CR.LT.
+// x86 CVT[T]SS2SI / CVT[T]SD2SI want INT_MIN (0x80000000_i32 /
+// 0x8000000000000000_i64) for ALL of {+overflow, -overflow, NaN}; POWER's
+// saturating converts already produce it for -overflow and NaN, so only the
+// +overflow case needs a fixup. See EmitFloatToGPRSigned for the mechanism.
 
-// "Branch if CR1.LT set" — BO=12 (branch if BI set), BI=4 (CR1 bit 0 = LT).
-// We use cr(1) for the overflow fcmpu so CR0 (packed NZCV) is preserved.
-
-// Float_ToGPR_ZS: scalar float → signed integer GPR, truncate-toward-zero.
-// FPR scalar is element 0 of a vector register; extract via stack roundtrip.
-DEF_OP(Float_ToGPR_ZS) {
-  auto Op = IROp->C<IR::IROp_Float_ToGPR_ZS>();
-  auto Dst = GetReg(Node);
-  auto Vec = GetVReg(Op->Scalar);
-  const auto SrcES = Op->SrcElementSize;
-  const auto DstES = IROp->Size;
-
-  // Register-only path (was: stvx + lfs/lfd for the value AND std + lfs/lfd
-  // for the bound — two store-hit-load stalls per conversion; profiled in
-  // countersunk noise grid-indexing, (int)floor(x) everywhere). Position
-  // elem0 into dw0; f32 promotes to f64 exactly (xscvspdp, same as lfs did),
-  // so the bound compare always runs in the f64 domain with the f64 bound
-  // encodings — identical values to the old source-precision compare since
-  // 2^31/2^63 and all f32 inputs are exact in f64.
+// Shared body of Float_ToGPR_ZS / Float_ToGPR_S: scalar float -> signed
+// integer GPR with the x86 "integer indefinite" sentinel (INT_MIN of the
+// destination width) on +overflow / NaN. RoundFirst selects the host-
+// rounding-mode form (cvtsd2si) over truncation (cvttsd2si).
+//
+// Register-only path (was: stvx + lfs/lfd for the value AND std + lfs/lfd
+// for the bound -- two store-hit-load stalls per conversion; profiled in
+// countersunk noise grid-indexing, (int)floor(x) everywhere). Position elem0
+// into dw0; f32 promotes to f64 exactly (xscvspdp, same as lfs did), so the
+// whole sequence runs in the f64 domain.
+//
+// The overflow test runs on the CONVERTED GPR, not on an FP bound: that
+// drops the li+sldi+mtvsrd+xscmpudp bound materialisation (4 instructions)
+// for a 2-instruction integer test, and emitted instructions are wall clock
+// on this port. Both widths convert with xscvdpsxds (f64 -> i64, truncating,
+// saturating: NaN and -overflow -> INT64_MIN, +overflow -> INT64_MAX):
+//   i32: the x86 result is the low 32 bits iff the i64 value fits in
+//        [-2^31, 2^31), i.e. extsw(r) == r. NaN/-ovf (INT64_MIN), +ovf
+//        (INT64_MAX) and every |v| >= 2^31 fail the test and take the
+//        sentinel; -2^31 itself passes and equals the sentinel anyway.
+//   i64: no f64 in range converts to INT64_MAX (the largest f64 below 2^63
+//        is 2^63-1024), so r == INT64_MAX iff +overflow; r+1 > r (signed)
+//        holds for everything else. NaN/-ovf already ARE the sentinel.
+// cmpd targets cr1 so CR0 (packed NZCV) is untouched; the bc BI is
+// CR1.EQ (=6) / CR1.GT (=5).
+void PPC64JITCore::EmitFloatToGPRSigned(GPR Dst, VR Vec, IR::OpSize SrcES, IR::OpSize DstES, bool RoundFirst) {
   if (SrcES == IR::OpSize::i32Bit) {
     xxsldwi(VTMP1, Vec, Vec, 3);     // BE w0 <- elem0 (BE w3)
     xscvspdp(VTMP1, VTMP1);
@@ -4218,88 +4203,46 @@ DEF_OP(Float_ToGPR_ZS) {
     xxpermdi(VTMP1, Vec, Vec, 0b10); // dw0 <- dw1
   }
 
-  const uint64_t Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL  // 2^31 f64
-                                                       : 0x43E0000000000000ULL; // 2^63 f64
-  LoadConstant(TMP1, Bound);
-  mtvsrd(VTMP2, TMP1);               // bound in dw0
-  xscmpudp(1, VTMP1, VTMP2);         // cr1, same LT/EQ/GT/UN layout as fcmpu
-
-  // xscvdpsx{ws,ds} truncate toward zero and saturate exactly like
-  // fctiwz/fctidz (NaN -> most-negative, +ovf -> INT_MAX), so the sentinel
-  // fixup below is unchanged. The ws form leaves its word-1 result with
-  // word 0 undefined; mfvsrd + clrldi keeps only the defined low 32.
-  if (DstES == IR::OpSize::i32Bit) {
-    xscvdpsxws(VTMP1, VTMP1);
-    mfvsrd(Dst, VTMP1);
-    clrldi(Dst, Dst, 32);  // zero-extend to GPR (high half is undefined per ISA)
-  } else {
-    xscvdpsxds(VTMP1, VTMP1);
-    mfvsrd(Dst, VTMP1);
+  if (RoundFirst) {
+    // x86 rounds FIRST (per MXCSR.RC), THEN range-checks the rounded integer.
+    // Range-checking the UNROUNDED source misses inputs the rounding step
+    // carries across the boundary: f64 in [2^31-0.5, 2^31) under
+    // round-to-nearest rounds to exactly 2^31, which overflows i32 and must
+    // produce the 0x80000000 sentinel. xsrdpic rounds to integral honoring
+    // FPSCR.RN (the guest rounding mode); the truncating convert below is
+    // then exact and the GPR-side range test sees the rounded value.
+    xsrdpic(VTMP1, VTMP1);
   }
 
-  // If CR1.LT set (Src < bound, ordered), POWER's result is x86-correct.
-  // Otherwise (Src >= bound or NaN) overwrite Dst with INT_MIN sentinel.
+  xscvdpsxds(VTMP1, VTMP1);
+  mfvsrd(Dst, VTMP1);
+
   PPC64Emitter::Label NoOvf;
-  bc(PPC64Emitter::Cond{12, 4}, &NoOvf);  // branch if CR1.LT set
   if (DstES == IR::OpSize::i32Bit) {
-    LoadConstant(Dst, 0x80000000ULL);  // INT_MIN_i32 zero-extended to 64
+    extsw(TMP1, Dst);
+    cmpd(cr(1), TMP1, Dst);
+    clrldi(Dst, Dst, 32);                    // zero-extend the fitting value
+    bc(PPC64Emitter::Cond{12, 6}, &NoOvf);   // CR1.EQ: fits in i32
+    LoadConstant(Dst, 0x80000000ULL);        // INT_MIN_i32 zero-extended to 64
   } else {
-    LoadConstant(Dst, 0x8000000000000000ULL);  // INT_MIN_i64
+    addi(TMP1, Dst, 1);
+    cmpd(cr(1), TMP1, Dst);
+    bc(PPC64Emitter::Cond{12, 5}, &NoOvf);   // CR1.GT: r+1 > r, no wrap
+    LoadConstant(Dst, 0x8000000000000000ULL); // INT_MIN_i64
   }
   Bind(&NoOvf);
 }
 
-// Float_ToGPR_S: scalar float → signed integer GPR using host rounding mode.
-// We use fctiw/fctid (which obey FPSCR.RN, default Nearest).
+// Float_ToGPR_ZS: scalar float -> signed integer GPR, truncate-toward-zero.
+DEF_OP(Float_ToGPR_ZS) {
+  auto Op = IROp->C<IR::IROp_Float_ToGPR_ZS>();
+  EmitFloatToGPRSigned(GetReg(Node), GetVReg(Op->Scalar), Op->SrcElementSize, IROp->Size, false);
+}
+
+// Float_ToGPR_S: scalar float -> signed integer GPR using host rounding mode.
 DEF_OP(Float_ToGPR_S) {
   auto Op = IROp->C<IR::IROp_Float_ToGPR_S>();
-  auto Dst = GetReg(Node);
-  auto Vec = GetVReg(Op->Scalar);
-  const auto SrcES = Op->SrcElementSize;
-  const auto DstES = IROp->Size;
-
-  addi(TMP1, r1, -32);
-  stvx(Vec, r(0), TMP1);
-  if (SrcES == IR::OpSize::i32Bit) {
-    lfs(f0, -32, r1);
-  } else {
-    lfd(f0, -32, r1);
-  }
-
-  // Same INT_MIN-on-overflow fixup as Float_ToGPR_ZS above.
-  uint64_t Bound;
-  if (SrcES == IR::OpSize::i32Bit) {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x4F000000ULL
-                                          : 0x5F000000ULL;
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfs(f1, -16, r1);
-  } else {
-    Bound = (DstES == IR::OpSize::i32Bit) ? 0x41E0000000000000ULL
-                                          : 0x43E0000000000000ULL;
-    LoadConstant(TMP1, Bound);
-    std(TMP1, -16, r1);
-    lfd(f1, -16, r1);
-  }
-  fcmpu(cr(1), f0, f1);
-
-  if (DstES == IR::OpSize::i32Bit) {
-    fctiw(f0, f0);
-    mffprd(Dst, f0);
-    clrldi(Dst, Dst, 32);
-  } else {
-    fctid(f0, f0);
-    mffprd(Dst, f0);
-  }
-
-  PPC64Emitter::Label NoOvf;
-  bc(PPC64Emitter::Cond{12, 4}, &NoOvf);  // branch if CR1.LT set
-  if (DstES == IR::OpSize::i32Bit) {
-    LoadConstant(Dst, 0x80000000ULL);
-  } else {
-    LoadConstant(Dst, 0x8000000000000000ULL);
-  }
-  Bind(&NoOvf);
+  EmitFloatToGPRSigned(GetReg(Node), GetVReg(Op->Scalar), Op->SrcElementSize, IROp->Size, true);
 }
 
 // FCmp: scalar FP unordered compare, produces ARM-FCMP-style NZCV.

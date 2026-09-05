@@ -1114,7 +1114,18 @@ DEF_OP(Thunk) {
   // elidable: v0-v15 are ELFv2-volatile and the frame copy is also what
   // signal delivery reads mid-call.
   static const bool NoPartialFill = getenv("FEX_NO_THUNK_PARTIAL_FILL") != nullptr;
-  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill;
+  // An EC transition's callee (fexbridge ABI 7) WRITES the guest register
+  // file through the frame -- results, RIP, and on a fiber switch or an
+  // unwind redirect the whole file, exactly the registers the partial refill
+  // would leave stale in r14-r23 (and PF/AF) for the linked exit to keep
+  // executing with.  Compile-time decision, race-free: the full fill runs
+  // where the partial one would, with the sentinel still standing, so
+  // mid-window signal delivery keeps treating the frame as the truth.
+  // Measured before this branch existed: the wine fibers gate died on a
+  // stale callee-saved RDI after a SwitchToFiber served through a
+  // transition, and the seh-handlers gate lost unwind redirects the same way.
+  const bool EcFullFill = CTX->IsFullFillThunk(Op->ThunkNameHash);
+  const bool PartialFill = CTX->Config.Is64BitMode() && !NoPartialFill && !EcFullFill;
 
   SpillForABICall(TMP1);
   if (PartialFill) {
@@ -1143,6 +1154,12 @@ DEF_OP(Thunk) {
   mr(r(12), TMP2);
   std(r2, 24, r1);     // save TOC (ELFv2 linkage area, unchanged offset)
   mtctr(TMP2);
+  // Second C argument: the CpuStateFrame.  The EC trampoline (fexbridge
+  // ABI 7) consumes it to reach the spilled register file without TLS; a
+  // Linux-thunk callee is void(void*) and ignores r4, which ELFv2 makes
+  // harmless.  TMP2 (== r4) is dead here: the callee address is already in
+  // CTR and its GEP copy in r12.
+  mr(TMP2, STATE);
   bctrl();
   ld(r2, 24, r1);      // restore TOC
 
@@ -1151,6 +1168,268 @@ DEF_OP(Thunk) {
   } else {
     FillForABICall();
   }
+}
+
+// ---------------------------------------------------------------------------
+// EC transition with the inline DIRECT arm (fexbridge.h, "EC DIRECT calls").
+//
+// The block at a registered stub RIP.  Today's transition spills the guest
+// file and calls the bridge trampoline, which calls the embedder's handler,
+// which runs a dispatcher, a marshaller and a second transition before the
+// native body -- ~360 ns on POWER8 for a COM slot whose body is 30 ns.  The
+// embedder proves, once per slot, that the body takes its arguments as they
+// are (scalars, proxies to unwrap, nothing returned through memory it
+// would have to translate) and stamps a digest into the slot's cell.  This
+// op reads the cell AT RUN TIME -- the block is compiled before the slot is
+// ever resolved -- and when the DIRECT bit is set serves the call inline:
+//
+//   spill the file (SpillForABICall, exactly as Thunk), arm the sentinel
+//   check state, dirty byte, the proxy (COM), unwrap interface arguments
+//   positions 0..7 -> r3..r10, per-position extension, the callee
+//   RAX = r3, RIP = [RSP], RSP += 8, partial refill
+//
+// Anything failing falls to the trampoline path below, which is
+// DEF_OP(Thunk)'s body verbatim: the sentinel is disarmed first, so that
+// path runs with the state Thunk's EC (full-fill) contract expects.
+//
+// Register plan after the spill: r3-r12 are volatile scratch (SRA copies
+// are in the frame); the two constants stay in the allocator's registers
+// (r24-r26/r30/r31, ELFv2 callee-saved, so they survive the native call --
+// the same fact DEF_OP(Thunk) relies on for its ArgPtr); r14-r23 hold the
+// non-volatile SRA half the partial refill trusts and are never written;
+// r0 is scratch and the fill restores it to 0.
+// ---------------------------------------------------------------------------
+DEF_OP(EcTransition) {
+  auto Op = IROp->C<IR::IROp_EcTransition>();
+  static const bool NoDirect = getenv("FEX_NO_EC_DIRECT") != nullptr;
+
+  constexpr int32_t kState = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, State));
+  constexpr int32_t kGregs = kState + static_cast<int32_t>(offsetof(FEXCore::Core::CPUState, gregs));
+  constexpr int32_t kRip = kState + static_cast<int32_t>(offsetof(FEXCore::Core::CPUState, rip));
+  constexpr int32_t kInFlight = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, EcDirectInFlight));
+  constexpr int32_t kIsi = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  // X86State order: RAX 0, RCX 1, RDX 2, RBX 3, RSP 4, ..., R8 8, R9 9
+  constexpr int32_t kRAX = kGregs + 0 * 8, kRCX = kGregs + 1 * 8, kRDX = kGregs + 2 * 8;
+  constexpr int32_t kRSP = kGregs + 4 * 8, kR8 = kGregs + 8 * 8, kR9 = kGregs + 9 * 8;
+  // the digest (fexbridge.h struct fexbridge_ec_direct) at cell + 8
+  constexpr int32_t D = 8;
+  constexpr int32_t D_KIND = D + 0, D_SLOT = D + 8, D_IFACE = D + 12, D_FN = D + 16, D_DIRTY = D + 24;
+  constexpr int32_t D_VTLO = D + 32, D_VTSIZE = D + 40, D_INMASK = D + 48, D_EXT = D + 52;
+  // the COM proxy (embedder-pinned)
+  constexpr int32_t P_HOST = 0x08, P_IFACE = 0x14, P_RING = 0x28, P_RPOS = 0x30, P_LIVE = 0x44;
+  constexpr int32_t RING_POS = 0x00, RING_CONS = 0x10;
+
+  const GPR RDESC = GetReg(Op->Desc);
+  const GPR RCELL = GetReg(Op->Cookie);
+
+  SpillForABICall(TMP1);
+
+  PPC64Emitter::Label Slow{}, Done{};
+
+  if (!NoDirect) {
+    ArmInSyscallSentinel();
+
+    // state word: the DIRECT bit
+    lwz(r3, 0, RCELL);
+    andi_(r3, r3, 0x8);
+    bc(CC_EQ, &Slow);
+    // acquire: the embedder publishes the digest, then the state word with a
+    // release store; the branch on the state plus isync orders every digest
+    // load below after it (the PowerPC control-dependency idiom)
+    isync();
+    // the dirty byte, when the digest names one
+    {
+      PPC64Emitter::Label NoDirty{};
+      ld(r3, D_DIRTY, RCELL);
+      cmpdi(r3, 0);
+      bc(CC_EQ, &NoDirty);
+      lbz(r3, 0, r3);
+      cmpwi(r3, 0);
+      bc(CC_NE, &Slow);
+      Bind(&NoDirty);
+    }
+    // positions 0..7 -> r3..r10.  The stack positions are read whether or
+    // not the slot uses them: they are the caller's own stack.
+    ld(r5, kRSP, STATE);
+    ld(r7, 0x28, r5);
+    ld(r8, 0x30, r5);
+    ld(r9, 0x38, r5);
+    ld(r10, 0x40, r5);
+    ld(r3, kRCX, STATE);
+    ld(r4, kRDX, STATE);
+    ld(r5, kR8, STATE);
+    ld(r6, kR9, STATE);
+
+    // interface arguments: positions 1..7 named in in_mask are proxies to
+    // unwrap (NULL stays NULL); a pointer that is not one of ours -- vtable
+    // outside the guest vtable block, or a dead tag -- takes the slow path
+    {
+      const GPR Args[7] = {r4, r5, r6, r7, r8, r9, r10};
+      lwz(r11, D_INMASK, RCELL);
+      for (unsigned p = 1; p <= 7; p++) {
+        PPC64Emitter::Label Next{};
+        const GPR A = Args[p - 1];
+        andi_(r0, r11, static_cast<uint16_t>(1u << p));
+        bc(CC_EQ, &Next);
+        cmpdi(A, 0);
+        bc(CC_EQ, &Next);
+        ld(r0, 0, A);            // its vtable
+        ld(r12, D_VTLO, RCELL);
+        subf(r0, r12, r0);       // r0 = vtable - lo
+        ld(r12, D_VTSIZE, RCELL);
+        cmpld(r0, r12);
+        bc(CC_UGE, &Slow);
+        lwz(r0, P_LIVE, A);
+        cmpwi(r0, 1);
+        bc(CC_NE, &Slow);
+        // an argument object with a recording ring (a command list handed to
+        // ExecuteBundle, a context crossing as an argument) must be drained
+        // before the callee sees it: that is the dispatcher's job
+        ld(r0, P_RING, A);
+        cmpdi(r0, 0);
+        bc(CC_NE, &Slow);
+        ld(A, P_HOST, A);
+        Bind(&Next);
+      }
+    }
+
+    // the callee: COM through `this`, FLAT from the digest
+    {
+      PPC64Emitter::Label NotCom{}, HaveFn{};
+      lwz(r11, D_KIND, RCELL);
+      andi_(r0, r11, 0xff);
+      cmpwi(r0, 1);
+      bc(CC_NE, &NotCom);
+      cmpdi(r3, 0);
+      bc(CC_EQ, &Slow);
+      lwz(r0, P_LIVE, r3);
+      cmpwi(r0, 1);
+      bc(CC_NE, &Slow);
+      lwz(r0, P_IFACE, r3);
+      lwz(r12, D_IFACE, RCELL);
+      cmpw(r0, r12);
+      bc(CC_NE, &Slow);
+      {
+        // a recording ring must be quiet: list-scope position 0, and the
+        // shared header's pos == cons
+        // (r0 is never a BASE here: as RA of a D-form load it means zero)
+        PPC64Emitter::Label NoRing{};
+        ld(r12, P_RING, r3);
+        cmpdi(r12, 0);
+        bc(CC_EQ, &NoRing);
+        ld(r0, P_RPOS, r3);
+        cmpdi(r0, 0);
+        bc(CC_NE, &Slow);
+        ld(r0, RING_POS, r12);
+        ld(r12, RING_CONS, r12);
+        cmpd(r0, r12);
+        bc(CC_NE, &Slow);
+        Bind(&NoRing);
+      }
+      ld(r3, P_HOST, r3);      // this = the host object
+      ld(r12, 0, r3);          // its vtable
+      lwz(r0, D_SLOT, RCELL);
+      sldi(r0, r0, 3);
+      ldx(r12, r12, r0);       // the slot
+      b(&HaveFn);
+      Bind(&NotCom);
+      ld(r12, D_FN, RCELL);
+      Bind(&HaveFn);
+    }
+
+    // per-position extension (positions 1..7; position 0 is `this` or a
+    // pointer-sized first argument, never narrowed)
+    {
+      const GPR Args[7] = {r4, r5, r6, r7, r8, r9, r10};
+      for (unsigned p = 1; p <= 7; p++) {
+        PPC64Emitter::Label Next{}, NotZ32{}, NotS32{}, NotZ16{}, NotS16{}, NotZ8{};
+        const GPR A = Args[p - 1];
+        lbz(r0, D_EXT + static_cast<int32_t>(p), RCELL);
+        cmpwi(r0, 0);
+        bc(CC_EQ, &Next);
+        cmpwi(r0, 1);
+        bc(CC_NE, &NotZ32);
+        clrldi(A, A, 32);
+        b(&Next);
+        Bind(&NotZ32);
+        cmpwi(r0, 2);
+        bc(CC_NE, &NotS32);
+        extsw(A, A);
+        b(&Next);
+        Bind(&NotS32);
+        cmpwi(r0, 3);
+        bc(CC_NE, &NotZ16);
+        clrldi(A, A, 48);
+        b(&Next);
+        Bind(&NotZ16);
+        cmpwi(r0, 4);
+        bc(CC_NE, &NotS16);
+        extsh(A, A);
+        b(&Next);
+        Bind(&NotS16);
+        cmpwi(r0, 5);
+        bc(CC_NE, &NotZ8);
+        clrldi(A, A, 56);
+        b(&Next);
+        Bind(&NotZ8);
+        extsb(A, A);
+        Bind(&Next);
+      }
+    }
+
+    // the call.  ELFv2: r12 = the callee, TOC saved in this frame's linkage
+    // area (DEF_OP(Thunk)'s idiom).  The in-flight marker brackets it for
+    // the embedder's fault handler.
+    li(r0, 1);
+    std(r0, kInFlight, STATE);
+    std(r2, 24, r1);
+    mtctr(r12);
+    bctrl();
+    ld(r2, 24, r1);
+    li(r0, 0);
+    std(r0, kInFlight, STATE);
+
+    // sabotage lever: the embedder's negative control inverts the result
+    {
+      PPC64Emitter::Label NoSab{};
+      lwz(r0, D_KIND, RCELL);
+      andi_(r0, r0, 0x100);
+      bc(CC_EQ, &NoSab);
+      not_(r3, r3);
+      Bind(&NoSab);
+    }
+
+    // results into the frame: RAX, and the return the stub would have done
+    std(r3, kRAX, STATE);
+    ld(r11, kRSP, STATE);
+    ld(r12, 0, r11);
+    std(r12, kRip, STATE);
+    addi(r11, r11, 8);
+    std(r11, kRSP, STATE);
+
+    // the callee touched neither the frame nor the guest: partial refill
+    FillForABICallChecked();
+    b(&Done);
+
+    Bind(&Slow);
+    // disarm before the trampoline path, which runs under Thunk's EC
+    // (full-fill, unarmed) contract
+    li(r0, 0);
+    std(r0, kIsi, STATE);
+  }
+
+  // ---- the trampoline path: DEF_OP(Thunk) for an EC thunk, verbatim ----
+  mr(r3, RDESC);
+  InsertNamedThunkRelocation(TMP2, Op->ThunkNameHash);
+  mr(r(12), TMP2);
+  std(r2, 24, r1);
+  mtctr(TMP2);
+  mr(TMP2, STATE);
+  bctrl();
+  ld(r2, 24, r1);
+  FillForABICall();
+
+  Bind(&Done);
 }
 
 } // namespace FEXCore::CPU
