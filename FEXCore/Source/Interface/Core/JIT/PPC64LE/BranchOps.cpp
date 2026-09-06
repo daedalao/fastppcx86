@@ -546,7 +546,8 @@ DEF_OP(ExitFunction) {
   // direct call that the block linker fills on the first miss, keyed on the
   // target it observed (record.GuestRIP == 0 marks the record indirect):
   //
-  //   A:      b PROBE                 <- patch site; linked: nop (fall in)
+  //   A:      b MISS                  <- patch site; linked: nop (fall in);
+  //                                      given up: b PROBE
   //           lis  TMP2, 0            \  five words, imm fields written by
   //           ori  TMP2, TMP2, 0       |  the linker while A still skips
   //           sldi TMP2, TMP2, 32      |  them (they are unreachable until
@@ -558,17 +559,25 @@ DEF_OP(ExitFunction) {
   //   PROBE:  push(Tramp1) ; L1 probe ; bctrl ; Tramp1
   //   Miss:   std rip ; b LinkPath    <- the record linker, like a const exit
   //
-  // First target wins until the target block is erased (the record is
-  // registered under that RIP, so Erase delinks A back to `b PROBE`); a
-  // site that turns out polymorphic pays the 7-instruction guard and takes
-  // the probe. Gated like constant-call linking (CallLinkingEnabled).
+  // Unlinked, A goes straight to the linker rather than to the probe: the
+  // linker only ever runs from a miss, and a target this thread already
+  // dispatched to sits in its L1, so a site whose first execution hit the
+  // probe would never be linked at all (measured: the crossing bench's
+  // vtable call stayed unlinked forever). The linker fills the guard on
+  // that first execution, or -- when it cannot (suspect target, out of
+  // reach) -- points A at PROBE for good. First target wins until the
+  // target block is erased (the record is registered under that RIP, so
+  // Erase restores `b MISS` and the next execution relinks); a site that
+  // turns out polymorphic pays the 7-instruction guard and takes the
+  // probe. Gated like constant-call linking (CallLinkingEnabled).
   // ---------------------------------------------------------------------
   const bool InlineCache = ShadowCall && !ConstRIP && CallLinkingEnabled;
   PPC64Emitter::Label InlineCacheProbe{};
+  auto MissLabel = PPC64Emitter::Label{};
   if (InlineCache) {
     PendingJumpThunks.push_back({GetCursorAddress<uint64_t>(), 0 /* indirect */, {}});
     LinkPathLabel = &PendingJumpThunks.back().LinkPath;
-    b(&InlineCacheProbe);               // A
+    b(&MissLabel);                      // A: unlinked -> the linker
     lis(TMP2, 0);
     ori(TMP2, TMP2, 0);
     sldi(TMP2, TMP2, 32);
@@ -577,13 +586,15 @@ DEF_OP(ExitFunction) {
     cmpd(cr(7), RIPReg, TMP2);
     bc({4, 30}, &InlineCacheProbe);     // bne cr7
     auto& Thunk = PendingJumpThunks.back();
-    Thunk.LinkedEntryAddress = GetCursorAddress<uint64_t>();
     auto Push2 = EmitShadowCallPush();
     Thunk.FinalAddress = GetCursorAddress<uint64_t>();
     Emit32(0x7FE00008u);                // Final: trap until linked
     PatchShadowCallAddi(Push2, GetCursorAddress<uint64_t>());
     EmitShadowCallTrampoline();         // Tramp2
     Bind(&InlineCacheProbe);
+    // For an indirect record LinkedEntryOffset carries PROBE: the word the
+    // linker points A at when it gives up on this site.
+    Thunk.LinkedEntryAddress = GetCursorAddress<uint64_t>();
   }
 
   // Shadow CALL push, at the patch site for a linkable exit (SinkLinkedRIP
@@ -603,8 +614,6 @@ DEF_OP(ExitFunction) {
     offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
   const int32_t l1mask_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
-
-  auto MissLabel = PPC64Emitter::Label{};
 
   // A shadow RET that found an empty stack or a mismatched top re-enters the
   // normal lookup here, so the fast path degrades to exactly the L1-probe

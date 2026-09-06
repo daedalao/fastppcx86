@@ -2257,9 +2257,22 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
   // never cached.
   const bool Indirect = Record->GuestRIP == 0;
   const uint64_t GuestRIP = Indirect ? Frame->State.rip : Record->GuestRIP;
+  // Give up on an inline-cache site: its patch word stops sending every
+  // execution here and takes the plain probe path instead (record.
+  // LinkedEntryOffset carries PROBE for an indirect record). Never
+  // registered, so nothing ever undoes it -- `b PROBE` is correct forever.
+  auto GiveUpInlineCache = [&]() {
+    if (!Indirect) {
+      return;
+    }
+    const uintptr_t A = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
+    const uintptr_t Probe = reinterpret_cast<uintptr_t>(Record) + Record->LinkedEntryOffset;
+    PPC64PatchInstruction(A, PPC64EncodeBranch(static_cast<int64_t>(Probe) - static_cast<int64_t>(A)));
+  };
   if (Indirect) {
     const int PtrShift = CTX->Config.Is64BitMode() ? 47 : 32;
     if (GuestRIP < 0x1000 || (GuestRIP >> PtrShift) != 0) {
+      GiveUpInlineCache();
       return ExitFunctionLink(Frame, GuestRIP);
     }
   }
@@ -2400,6 +2413,7 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     // rather than assumed impossible: if this is ever nonzero, an exit class
     // is silently paying the 10-instruction probe on every traversal.
     LinkOutcomeUnreachable.fetch_add(1, std::memory_order_relaxed);
+    GiveUpInlineCache();
   }
 
   return HostCode;
