@@ -369,81 +369,130 @@ DEF_OP(ExitFunction) {
   // pushes see new sp(-16) < base(0) -> overflow reset, never storing.
   // ---------------------------------------------------------------------
   PPC64Emitter::Label ShadowRetReprobe{};
-  if (ShadowActive) {
-    const int16_t sp_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-    const int16_t base_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, State.callret_base));
-    const int16_t end_off = static_cast<int16_t>(
-      offsetof(FEXCore::Core::CpuStateFrame, State.callret_end));
+  // ---------------------------------------------------------------------
+  // Link-stack pairing [2026-09-06]. On the POWER8 this port targets the
+  // count cache predicts NOTHING: a bcctr/bcctrl to a target that never
+  // changes mispredicts on every execution (native microbench, CTR written
+  // once outside the loop: 1.000 pm_br_mpred_ccache per iteration, ~20
+  // cycles), while direct branches and the link stack predict perfectly
+  // (bl/blr pair: 0.000). So every indirect exit this backend emits costs
+  // a mispredict, and the one exit class that CAN be made predictable is
+  // the return: if the CALL ends in an LK=1 branch (bctrl, or the linked
+  // bl), the hardware pushes the word after it on the link stack, and a
+  // RET that restores exactly that word into LR and ends in `blr` is
+  // predicted. The shadow stack already carries a host continuation per
+  // call; the layout below makes that continuation THE word after the
+  // call's final branch, so the entry's pointer and the link stack agree:
+  //
+  //   [Linkable: hoisted rip store + r0 zero]
+  //   A:      bcl 20,31,$+4          <- Linkable: the patch site (b LinkedEntry)
+  //           mflr TMP2 ; addi TMP2,TMP2,D1    D1 patched = &Tramp1 - &mflr
+  //           push {guest_ret_rip, TMP2}
+  //           L1 probe ... hit: mtctr TMP3 ; [rip, r0] ; bctrl
+  //   Tramp1: b CallReturnEntryLabels[return block]
+  //   Miss:   (unchanged miss leg)
+  //   [Linkable only, reachable only through a patched A:]
+  //   LinkedEntry: bcl ; mflr TMP2 ; addi TMP2,TMP2,D2 ; push {ret_rip, TMP2}
+  //   Final:  trap                   <- linker writes bl HostCode / bl ThunkStart
+  //   Tramp2: b CallReturnEntryLabels[return block]
+  //
+  // A linked call pushes on its own leg because its return word differs
+  // (Tramp2, after the bl); the pre-probe push is skipped by construction
+  // since A itself is the patch site. Final is written while unreachable
+  // and A is the only word that ever flips live, so the single-atomic-word
+  // contract of the block linker is untouched, and a delink restores A
+  // alone (Final goes stale but unreachable). The far form `bl ThunkStart`
+  // still works: the thunk's bcl 20,31,$+4 is the no-push form and its
+  // bctr does not touch the link stack, so the callee returns to Tramp2.
+  // Without a return block in this unit the pushed entry is {0,0}, never
+  // matches, and the trampoline word is a `trap` nothing ever reaches
+  // architecturally (the link stack may fetch it speculatively).
+  //
+  // The RET fast path ends in mtlr/blr instead of mtctr/bctr for the same
+  // reason. Everything is byte-identical to the pre-existing lowering when
+  // FEX_SHADOWRETSTACK is off.
+  // ---------------------------------------------------------------------
+  const bool ShadowCall = ShadowActive && Op->Hint == IR::BranchHint::Call;
+  const uint32_t CRBID = (ShadowCall && !Op->CallReturnBlock.IsInvalid()) ?
+                         IR->GetOp<IR::IROp_CodeBlock>(Op->CallReturnBlock)->ID : 0u;
+  const int16_t sp_off = static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  const int16_t base_off = static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.callret_base));
+  const int16_t end_off = static_cast<int16_t>(offsetof(FEXCore::Core::CpuStateFrame, State.callret_end));
 
-    if (Op->Hint == IR::BranchHint::Return) {
-      ld(TMP2, sp_off, STATE);            // TMP2 = sp
-      ld(TMP3, end_off, STATE);           // TMP3 = base + SIZE (empty / top guard)
-      cmpd(cr(7), TMP2, TMP3);
-      bc({4, 28}, &ShadowRetReprobe);     // sp >= base+SIZE -> empty -> probe
-      ld(TMP3, 0, TMP2);                  // TMP3 = guest_ret_rip (top slot)
-      if (CTX->Config.Is64BitMode()) {
-        cmpd(cr(7), TMP3, RIPReg);
-      } else {
-        cmpw(cr(7), TMP3, RIPReg);        // 32-bit guest: compare low 32 only
-      }
-      addi(TMP2, TMP2, 16);               // pop (unconditional, mirrors ARM64)
-      std(TMP2, sp_off, STATE);
-      bc({4, 30}, &ShadowRetReprobe);     // guest_ret_rip != target -> probe
-      ld(TMP3, -8, TMP2);                 // TMP3 = host trampoline (== old sp + 8)
-      std(RIPReg, rip_off, STATE);        // P5.0.1: store rip before the jump
-      mtctr(TMP3);
-      EmitExitR0Zero(UnitR0Dirty);        // P5.0.2: zero-index invariant
-      bctr();
-      // Empty / mismatch fall through into the unchanged L1 probe (ShadowRetReprobe).
+  // Emits bcl/mflr/addi(placeholder) + the push. Returns {&mflr, &addi word}
+  // so the caller can patch the addi's SI once the trampoline address is
+  // known (compile-time write into the buffer we are emitting into; the
+  // whole unit is icache-flushed once at the end of CompileCode).
+  auto EmitShadowCallPush = [&]() -> std::pair<uint64_t, uint32_t*> {
+    bcl(20, 31, 4);                     // LK form the link stack does not push
+    const uint64_t MflrAddr = GetCursorAddress<uint64_t>();
+    mflr(TMP2);                         // TMP2 = &mflr
+    uint32_t* AddiWord = GetCursorAddress<uint32_t*>();
+    addi(TMP2, TMP2, 0);                // SI patched: TMP2 = &trampoline
+    ld(TMP3, sp_off, STATE);            // TMP3 = sp
+    ld(TMP4, base_off, STATE);          // TMP4 = base (frame mirror)
+    addi(TMP3, TMP3, -16);              // TMP3 = new sp
+    cmpd(cr(7), TMP3, TMP4);
+    PPC64Emitter::Label l_do_push{}, l_push_done{};
+    bc({4, 28}, &l_do_push);            // new sp >= base -> room to push
+    // Overflow: reset to empty (base+SIZE, read from the end mirror), skip
+    // the store, never write below the low guard page.
+    ld(TMP4, end_off, STATE);
+    std(TMP4, sp_off, STATE);
+    b(&l_push_done);
+    Bind(&l_do_push);
+    if (!Op->CallReturnBlock.IsInvalid()) {
+      std(GetReg(Op->CallReturnAddress), 0, TMP3); // slot0 = guest_ret_rip
+      std(TMP2, 8, TMP3);                          // slot8 = host trampoline
     } else {
-      // BranchHint::Call push.
-      const GPR HostPtr = TMP2;           // host trampoline pointer (0 if no in-buffer return block)
-      if (!Op->CallReturnBlock.IsInvalid()) {
-        // host trampoline = &l_cont, discovered PC-relatively so it is
-        // position-independent and needs no relocation across code-cache
-        // save/load. Fixed 3-instruction layout after mflr keeps the addi
-        // delta a hard constant (= 12 bytes, {mflr, addi, b}):
-        //     bcl 20,31,$+4 ; mflr TMP2      TMP2 = &mflr  (LK form: no link-stack push)
-        //     addi TMP2, TMP2, 12            TMP2 = &l_cont
-        //     b l_skip                       jump over the 1-insn trampoline
-        //   l_cont: b CallReturnEntryLabels[return-block]
-        //   l_skip:
-        PPC64Emitter::Label l_skip{};
-        const uint32_t CRBID = IR->GetOp<IR::IROp_CodeBlock>(Op->CallReturnBlock)->ID;
-        bcl(20, 31, 4);
-        mflr(TMP2);
-        addi(TMP2, TMP2, 12);
-        b(&l_skip);
-        b(&CallReturnEntryLabels[CRBID]); // l_cont trampoline (reached only via a matching RET)
-        Bind(&l_skip);
-      } else {
-        li(TMP2, 0);                      // no return block: push a zero entry (never matches)
-      }
-      ld(TMP3, sp_off, STATE);            // TMP3 = sp
-      ld(TMP4, base_off, STATE);          // TMP4 = base (frame mirror)
-      addi(TMP3, TMP3, -16);              // TMP3 = new sp
-      cmpd(cr(7), TMP3, TMP4);
-      PPC64Emitter::Label l_do_push{}, l_push_done{};
-      bc({4, 28}, &l_do_push);            // new sp >= base -> room to push
-      // Overflow: reset to empty (base+SIZE, read from the end mirror), skip
-      // the store, never write below the low guard page.
-      ld(TMP4, end_off, STATE);
-      std(TMP4, sp_off, STATE);
-      b(&l_push_done);
-      Bind(&l_do_push);
-      if (!Op->CallReturnBlock.IsInvalid()) {
-        std(GetReg(Op->CallReturnAddress), 0, TMP3); // slot0 = guest_ret_rip
-      } else {
-        std(HostPtr, 0, TMP3);            // slot0 = 0
-      }
-      std(HostPtr, 8, TMP3);              // slot8 = host trampoline (0 if invalid)
-      std(TMP3, sp_off, STATE);           // callret_sp = new sp
-      Bind(&l_push_done);
-      // Fall through to the existing exit (linkable hoist + L1 probe to callee);
-      // RIPReg (= TMP1 for const targets) was deliberately left untouched.
+      li(TMP2, 0);                      // no return block: a {0,0} entry never matches
+      std(TMP2, 0, TMP3);
+      std(TMP2, 8, TMP3);
     }
+    std(TMP3, sp_off, STATE);           // callret_sp = new sp
+    Bind(&l_push_done);
+    return {MflrAddr, AddiWord};
+  };
+  auto PatchShadowCallAddi = [&](std::pair<uint64_t, uint32_t*> Push, uint64_t TrampAddr) {
+    const int64_t Delta = static_cast<int64_t>(TrampAddr) - static_cast<int64_t>(Push.first);
+    LOGMAN_THROW_A_FMT(Delta > 0 && Delta < 0x7FFF, "shadow call trampoline out of addi reach: {}", Delta);
+    // addi TMP2, TMP2, Delta  (D-form, opcode 14)
+    *Push.second = (14u << 26) | (static_cast<uint32_t>(TMP2.idx) << 21) |
+                   (static_cast<uint32_t>(TMP2.idx) << 16) | (static_cast<uint32_t>(Delta) & 0xFFFFu);
+  };
+  // The trampoline word the link stack returns to: a direct branch to the
+  // return block's shadow entry label, or a trap when the unit has none.
+  auto EmitShadowCallTrampoline = [&]() {
+    if (!Op->CallReturnBlock.IsInvalid()) {
+      b(&CallReturnEntryLabels[CRBID]);
+    } else {
+      Emit32(0x7FE00008u);              // trap (tw 31,0,0): never reached architecturally
+    }
+  };
+
+  if (ShadowActive && Op->Hint == IR::BranchHint::Return) {
+    // RET pop: peek {guest_ret_rip, host_trampoline}; on a match restore
+    // the trampoline into LR and `blr` -- the link stack, primed by the
+    // call's LK=1 branch, predicts this; the count cache would not.
+    ld(TMP2, sp_off, STATE);            // TMP2 = sp
+    ld(TMP3, end_off, STATE);           // TMP3 = base + SIZE (empty / top guard)
+    cmpd(cr(7), TMP2, TMP3);
+    bc({4, 28}, &ShadowRetReprobe);     // sp >= base+SIZE -> empty -> probe
+    ld(TMP3, 0, TMP2);                  // TMP3 = guest_ret_rip (top slot)
+    if (CTX->Config.Is64BitMode()) {
+      cmpd(cr(7), TMP3, RIPReg);
+    } else {
+      cmpw(cr(7), TMP3, RIPReg);        // 32-bit guest: compare low 32 only
+    }
+    addi(TMP2, TMP2, 16);               // pop (unconditional, mirrors the stack discipline)
+    std(TMP2, sp_off, STATE);
+    bc({4, 30}, &ShadowRetReprobe);     // guest_ret_rip != target -> probe
+    ld(TMP3, -8, TMP2);                 // TMP3 = host trampoline (== old sp + 8)
+    std(RIPReg, rip_off, STATE);        // P5.0.1: store rip before the jump
+    mtlr(TMP3);
+    EmitExitR0Zero(UnitR0Dirty);        // P5.0.2: zero-index invariant
+    blr();
+    // Empty / mismatch fall through into the unchanged L1 probe (ShadowRetReprobe).
   }
 
   // ---------------------------------------------------------------------
@@ -487,6 +536,14 @@ DEF_OP(ExitFunction) {
       EmitConstRIPIntoTMP1();
       std(RIPReg, rip_off, STATE);
     }
+  }
+
+  // Shadow CALL push, at the patch site for a linkable exit (SinkLinkedRIP
+  // is false under ShadowActive, so nothing sits between the registration
+  // above and this bcl) and simply before the probe for an indirect one.
+  std::pair<uint64_t, uint32_t*> ShadowPush1 {};
+  if (ShadowCall) {
+    ShadowPush1 = EmitShadowCallPush();
   }
 
   // ---------------------------------------------------------------------
@@ -572,7 +629,13 @@ DEF_OP(ExitFunction) {
   // branch replaces the probe's first instruction, so anything after it on
   // this leg would be skipped by linked callers (P5.0.2's failure mode is
   // silent guest memory corruption — see the hoist comment up top).
-  bctr();
+  if (ShadowCall) {
+    bctrl();                            // LK=1: link stack <- &Tramp1
+    PatchShadowCallAddi(ShadowPush1, GetCursorAddress<uint64_t>());
+    EmitShadowCallTrampoline();         // Tramp1
+  } else {
+    bctr();
+  }
 
   // ---------------------------------------------------------------------
   // Miss. This is where the spill lives now.
@@ -617,6 +680,19 @@ DEF_OP(ExitFunction) {
     // instructions per exit with this one branch; see SharedSpillExitLabel.
     SharedSpillExitUsed = true;
     b(&SharedSpillExitLabel);
+  }
+
+  // Linked shadow call: its own push (return word = Tramp2), the Final word
+  // the linker rewrites to `bl`, and Tramp2. Reachable only once the linker
+  // patches A to `b LinkedEntry`; see the link-stack pairing comment above.
+  if (ShadowCall && Linkable) {
+    auto& Thunk = PendingJumpThunks.back();
+    Thunk.LinkedEntryAddress = GetCursorAddress<uint64_t>();
+    auto Push2 = EmitShadowCallPush();
+    Thunk.FinalAddress = GetCursorAddress<uint64_t>();
+    Emit32(0x7FE00008u);                // Final: trap until linked
+    PatchShadowCallAddi(Push2, GetCursorAddress<uint64_t>());
+    EmitShadowCallTrampoline();         // Tramp2
   }
 }
 

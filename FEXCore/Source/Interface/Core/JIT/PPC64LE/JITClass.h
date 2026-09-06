@@ -206,8 +206,14 @@ struct PPC64BlockLinkRecord {
   // emission from CTX->Dispatcher->GetExitFunctionLinkerWithRecordAddress()
   // (constant over the process lifetime after dispatcher generation).
   uint64_t StubAddr;
+  // Shadow-call exits (FEX_SHADOWRETSTACK, link-stack pairing): the linked
+  // entry the caller word is patched to branch to, and the Final word the
+  // linker rewrites to `bl HostCode` / `bl ThunkStart`. Both relative to
+  // &record; both zero for a plain jump exit.
+  int64_t LinkedEntryOffset;
+  int64_t FinalOffset;
 };
-static_assert(sizeof(PPC64BlockLinkRecord) == 40, "emitted-record layout contract");
+static_assert(sizeof(PPC64BlockLinkRecord) == 56, "emitted-record layout contract");
 static_assert(offsetof(PPC64BlockLinkRecord, StubAddr) == 32, "thunk stub-addr load contract");
 static_assert(offsetof(PPC64BlockLinkRecord, HostCode) == 0, "thunk ld displacement contract");
 
@@ -647,6 +653,8 @@ private:
     uint64_t CallerAddress; // absolute address of the in-block patch site
     uint64_t GuestRIP;      // constant destination RIP (post 32-bit masking)
     PPC64Emitter::Label LinkPath {};
+    uint64_t LinkedEntryAddress {}; // shadow call: linked leg entry (0 otherwise)
+    uint64_t FinalAddress {};       // shadow call: the word the linker writes `bl` into
   };
   fextl::list<PendingJumpThunk> PendingJumpThunks;
 

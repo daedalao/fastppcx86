@@ -2166,6 +2166,10 @@ bool PPC64BranchDisplacementInRange(int64_t Delta) {
 uint32_t PPC64EncodeBranch(int64_t Delta) {
   return 0x48000000u | (static_cast<uint32_t>(Delta) & 0x03FFFFFCu);
 }
+// I-form `bl` (LK=1): the link-stack-pushing form a shadow call's Final word takes.
+uint32_t PPC64EncodeBranchLink(int64_t Delta) {
+  return PPC64EncodeBranch(Delta) | 1u;
+}
 
 // Single atomic 4-byte instruction rewrite + icache maintenance. The store
 // is naturally atomic (4-byte aligned); atomic_ref documents the intent and
@@ -2304,18 +2308,40 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
 
   const uintptr_t CallerAddress = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
   const uintptr_t ThunkStart = reinterpret_cast<uintptr_t>(Record) - PPC64LinkRecordFromThunkStart;
-  const int64_t DirectDelta = static_cast<int64_t>(HostCode) - static_cast<int64_t>(CallerAddress);
-  const int64_t ThunkDelta = static_cast<int64_t>(ThunkStart) - static_cast<int64_t>(CallerAddress);
+  // A shadow-call exit (FEX_SHADOWRETSTACK link-stack pairing, see
+  // DEF_OP(ExitFunction)) branches from its Final word, not from the caller
+  // word: the caller word only ever becomes `b LinkedEntry`, and Final --
+  // unreachable until that patch lands -- takes the `bl`. Final is written
+  // first, so by the time A flips the linked leg is complete; a delink
+  // restores A alone and Final goes stale but unreachable.
+  const bool ShadowCall = Record->FinalOffset != 0;
+  const uintptr_t FinalAddress = ShadowCall ? reinterpret_cast<uintptr_t>(Record) + Record->FinalOffset : CallerAddress;
+  const uintptr_t LinkedEntry = ShadowCall ? reinterpret_cast<uintptr_t>(Record) + Record->LinkedEntryOffset : 0;
+  const int64_t DirectDelta = static_cast<int64_t>(HostCode) - static_cast<int64_t>(FinalAddress);
+  const int64_t ThunkDelta = static_cast<int64_t>(ThunkStart) - static_cast<int64_t>(FinalAddress);
+  const int64_t LinkedEntryDelta = static_cast<int64_t>(LinkedEntry) - static_cast<int64_t>(CallerAddress);
+  // The caller-word patch: a plain exit branches straight at its target
+  // (or thunk); a shadow call branches at its own linked leg.
+  auto PatchCaller = [&](uint32_t PlainWord) {
+    if (ShadowCall) {
+      PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(LinkedEntryDelta));
+    } else {
+      PPC64PatchInstruction(CallerAddress, PlainWord);
+    }
+  };
 
-  if (PPC64BranchDisplacementInRange(DirectDelta)) {
+  if (PPC64BranchDisplacementInRange(DirectDelta) && (!ShadowCall || PPC64BranchDisplacementInRange(LinkedEntryDelta))) {
     // Registration BEFORE patch, under the same locks: once the patched word
     // is observable, the delinker that undoes it is already findable by
     // Erase. The reverse order would leave a patched branch with no
     // registered undo if this thread stalled between the two.
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64DirectBlockDelinker, lk);
-    PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(DirectDelta));
+    if (ShadowCall) {
+      PPC64PatchInstruction(FinalAddress, PPC64EncodeBranchLink(DirectDelta));
+    }
+    PatchCaller(PPC64EncodeBranch(DirectDelta));
     LinkOutcomeDirect.fetch_add(1, std::memory_order_relaxed);
-  } else if (PPC64BranchDisplacementInRange(ThunkDelta)) {
+  } else if (PPC64BranchDisplacementInRange(ThunkDelta) && (!ShadowCall || PPC64BranchDisplacementInRange(LinkedEntryDelta))) {
     LinkOutcomeThunk.fetch_add(1, std::memory_order_relaxed);
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 
@@ -2334,7 +2360,10 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
     PPC64PatchInstruction(ThunkStart, PPC64_BCL_20_31_PLUS4);
-    PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(ThunkDelta));
+    if (ShadowCall) {
+      PPC64PatchInstruction(FinalAddress, PPC64EncodeBranchLink(ThunkDelta));
+    }
+    PatchCaller(PPC64EncodeBranch(ThunkDelta));
   } else {
     // Even the thunk is out of `b` range of the exit (would need a single
     // compile unit larger than ±32MiB — beyond every intra-block branch this
@@ -6148,6 +6177,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
          (static_cast<uint64_t>(OrigThunkWord) << 32));               // Orig{Caller,Thunk}Word
     dc64(StubAddr);                                                   // StubAddr — dispatcher
                                                                       // stub cached per record
+    dc64(Thunk.LinkedEntryAddress ? static_cast<uint64_t>(Thunk.LinkedEntryAddress - RecordAddress) : 0); // LinkedEntryOffset
+    dc64(Thunk.FinalAddress ? static_cast<uint64_t>(Thunk.FinalAddress - RecordAddress) : 0);             // FinalOffset
   }
 
   // -------------------------------------------------------------------------
