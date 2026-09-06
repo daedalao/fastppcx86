@@ -1516,6 +1516,17 @@ int fexbridge_thread_init(void** thread_out) {
   Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
   ::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
   Frame->State.callret_sp = AllocBase + FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  // The JIT's shadow CALL push / RET pop (FEX_SHADOWRETSTACK) bounds-check
+  // against these two mirrors, not against CallRetStackBase.  Left at zero,
+  // every pop reads sp >= end(0) as "empty" (the fast path never fires) and
+  // every push reads new sp >= base(0) as "room", so the pointer walks down
+  // unbounded -- EC transitions pop the guest return address themselves and
+  // never balance the push, so ~64K COM calls later the store lands on the
+  // low guard page.  [MEASURED 2026-09-06: nw-witcher3 died at a guest CALL
+  // with dar == guard page + 0xff0 within a minute of launch, 3/3.]
+  const uint64_t CallRetBase = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+  Frame->State.callret_base = CallRetBase;
+  Frame->State.callret_end = CallRetBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
 
   auto* BT = new BridgeThread();
   BT->Thread = Thread;

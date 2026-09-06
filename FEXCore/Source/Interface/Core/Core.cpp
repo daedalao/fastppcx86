@@ -1856,11 +1856,19 @@ bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::
         emit->_Thunk(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))), ThunkNameHash);
       }
 
-      // The handler owns RIP; go look where it pointed us, through the
-      // ordinary dispatcher lookup.  This is OpDispatchBuilder::SyscallOp's
-      // OS_GENERIC block-end pattern spelled with the raw emitter.
+      // The handler owns RIP; go look where it pointed us.  This is
+      // OpDispatchBuilder::SyscallOp's OS_GENERIC block-end pattern spelled
+      // with the raw emitter, with one difference: the exit carries the
+      // Return hint.  Both the direct arm and the trampoline end by popping
+      // the guest return address into RIP, exactly as the stub's own `ret`
+      // would, so under FEX_SHADOWRETSTACK the entry the calling block's
+      // CALL pushed is this exit's to pop -- a match branches straight to
+      // the caller's continuation instead of an L1 probe at a return site
+      // shared by every caller of this slot (the count-cache-polymorphic
+      // branch in the COM crossing).  A handler that redirected RIP
+      // elsewhere simply fails the compare and takes the probe.
       auto NewRIP = emit->_LoadContext(IR::OpSize::i64Bit, IR::RegClass::GPR, offsetof(Core::CPUState, rip));
-      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, IR::BranchHint::Return, emit->Invalid(), emit->Invalid());
     },
     &ECTargetCreatorTag, Descriptor);
 

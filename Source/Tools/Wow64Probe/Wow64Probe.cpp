@@ -243,6 +243,11 @@ FEXCore::Core::InternalThreadState* ProbeThreadInit(uint64_t RIP, uint64_t RSP) 
   Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
   ::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
   Frame->State.callret_sp = AllocBase + FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  // Bound mirrors for the JIT's shadow CALL push / RET pop; see the same
+  // stores in FexBridge.cpp (fexbridge_thread_init) and ThreadManager.cpp.
+  const uint64_t CallRetBase = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+  Frame->State.callret_base = CallRetBase;
+  Frame->State.callret_end = CallRetBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
 
   SigDelegator->Register(Thread);
   return Thread;
