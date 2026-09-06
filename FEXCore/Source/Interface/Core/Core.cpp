@@ -1867,8 +1867,11 @@ bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::
       // shared by every caller of this slot (the count-cache-polymorphic
       // branch in the COM crossing).  A handler that redirected RIP
       // elsewhere simply fails the compare and takes the probe.
+      // FEX_NO_ECRETHINT=1: bisection lever, the pre-2026-09-06 plain exit.
+      static const bool NoEcRetHint = getenv("FEX_NO_ECRETHINT") != nullptr;
       auto NewRIP = emit->_LoadContext(IR::OpSize::i64Bit, IR::RegClass::GPR, offsetof(Core::CPUState, rip));
-      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, IR::BranchHint::Return, emit->Invalid(), emit->Invalid());
+      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, NoEcRetHint ? IR::BranchHint::None : IR::BranchHint::Return,
+                          emit->Invalid(), emit->Invalid());
     },
     &ECTargetCreatorTag, Descriptor);
 
