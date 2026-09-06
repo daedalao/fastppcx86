@@ -44,6 +44,7 @@ $end_info$
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfenv>
 #include <cstdio>
@@ -5186,6 +5187,48 @@ void PPC64JITCore::AnalyzeSpinLoops() {
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
 // -------------------------------------------------------------------------
+// Per-op emission-loop cache-lifecycle flags.
+//
+// CompileCode's emission loop used to run three separate switch dispatches
+// over IROp->Op around every handler call, each answering one yes/no question
+// about a JIT-side cache. This table answers all three with a single indexed
+// byte load. Every bit's membership is the verbatim case list of the switch
+// it replaces; the comments at the use sites carry the soundness argument.
+// -------------------------------------------------------------------------
+static constexpr uint8_t kOpCacheKeepAES   = 1u << 0; // AES byte-reverse mask park survives
+static constexpr uint8_t kOpCacheKeepXER   = 1u << 1; // XER->CR1 projection survives
+static constexpr uint8_t kOpCacheKeepConst = 1u << 2; // LastConstantCache survives
+static constexpr uint8_t kOpCacheConstBody = 1u << 3; // ... and needs the per-op body
+
+static constexpr auto OpCacheFlags = [] {
+  std::array<uint8_t, static_cast<size_t>(IR::IROps::OP_LAST) + 1> T {};
+
+  for (auto Op : {IR::OP_VAESENC, IR::OP_VAESENCLAST, IR::OP_VAESDEC, IR::OP_VAESDECLAST, IR::OP_VAESIMC}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepAES;
+  }
+
+  for (auto Op : {IR::OP_NZCVSELECT, IR::OP_NZCVSELECTV, IR::OP_NZCVSELECTINCREMENT, IR::OP_STOREREGISTER,
+                  IR::OP_LOADREGISTER, IR::OP_CONSTANT, IR::OP_INLINECONSTANT}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepXER;
+  }
+
+  for (auto Op : {IR::OP_VFADDSCALARINSERT, IR::OP_VFSUBSCALARINSERT, IR::OP_VFMULSCALARINSERT,
+                  IR::OP_VFDIVSCALARINSERT, IR::OP_VFMINSCALARINSERT, IR::OP_VFMAXSCALARINSERT,
+                  IR::OP_VFMLASCALARINSERT, IR::OP_VFMLSSCALARINSERT, IR::OP_VFNMLASCALARINSERT,
+                  IR::OP_VFNMLSSCALARINSERT, IR::OP_LOADNAMEDVECTORCONSTANT}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepConst;
+  }
+
+  // Constant / LoadMem / LoadMemTSO reach the switch body: they may SET the
+  // cache (Constant) or invalidate conditionally on the operand class.
+  for (auto Op : {IR::OP_CONSTANT, IR::OP_LOADMEM, IR::OP_LOADMEMTSO}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheConstBody;
+  }
+
+  return T;
+}();
+
+// -------------------------------------------------------------------------
 // FEX_CODEHASHLOG=<path>: emitted-code identity gate (diagnostic only).
 //
 // Appends one line per compiled block:
@@ -6094,17 +6137,21 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
       uint16_t Op = static_cast<uint16_t>(IROp->Op);
 
+      // Three per-op cache-lifecycle switches used to run around every handler
+      // call (AES mask park before, XER->CR1 projection and last-constant
+      // after). Each compiled to its own dispatch over IROp->Op, on every
+      // emitted op, purely to answer three yes/no questions. They are folded
+      // into one constexpr byte table indexed by opcode: one load and three
+      // bit tests. The membership of each bit is exactly the case list of the
+      // switch it replaces -- see the comments at each use site below.
+      const uint8_t OpCache = Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? OpCacheFlags[Op] : 0;
+
       // AES mask-cache: only the AES-family handlers keep the vs12-parked
       // byte-reverse mask alive (see EmitAESLoadMask). Any other op may
       // clobber VTMP3_VSX or emit a host call, so the park dies here. The
       // AES handlers' own Op_Unhandled bail paths invalidate explicitly.
-      switch (IROp->Op) {
-      case IR::OP_VAESENC:
-      case IR::OP_VAESENCLAST:
-      case IR::OP_VAESDEC:
-      case IR::OP_VAESDECLAST:
-      case IR::OP_VAESIMC: break;
-      default: InvalidateAESCache(); break;
+      if (!(OpCache & kOpCacheKeepAES)) {
+        InvalidateAESCache();
       }
 
       // Op-size profiler: the emitter cursor is the only ground truth for how
@@ -6140,15 +6187,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // is ops verified to write neither XER nor any CR field: the NZCVSelect
       // family (MapNZCVCC writes CR3 composites and CR1 only via the
       // projection itself), plain register moves, and constants.
-      switch (IROp->Op) {
-      case IR::OP_NZCVSELECT:
-      case IR::OP_NZCVSELECTV:
-      case IR::OP_NZCVSELECTINCREMENT:
-      case IR::OP_STOREREGISTER:
-      case IR::OP_LOADREGISTER:
-      case IR::OP_CONSTANT:
-      case IR::OP_INLINECONSTANT: break;
-      default: XERProjectionValid = false; break;
+      if (!(OpCache & kOpCacheKeepXER)) {
+        XERProjectionValid = false;
       }
 
       // Last-constant cache lifecycle (see LastConstantCache in JITClass.h).
@@ -6156,39 +6196,29 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // write no dynamic GPR (FPR-class loads and the scalar-FP inserts —
       // their GPR usage is TMP1-4/r0 only, never RA registers); everything
       // else invalidates. Reset at block entry alongside the AES cache.
-      switch (IROp->Op) {
-      case IR::OP_CONSTANT: {
-        // Field kill switch (hashed into the code-cache config id).
-        static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
-        auto COp = IROp->C<IR::IROp_Constant>();
-        const auto PR = IR::PhysicalRegister(CodeNode);
-        if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
-          LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+      // kOpCacheKeepConst covers the plain "survives" arm; the two opcodes
+      // whose arm has a body carry kOpCacheConstBody instead.
+      if (!(OpCache & (kOpCacheKeepConst | kOpCacheConstBody))) {
+        LastConstantCache.Valid = false;
+      } else if (OpCache & kOpCacheConstBody) {
+        if (IROp->Op == IR::OP_CONSTANT) {
+          // Field kill switch (hashed into the code-cache config id).
+          static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
+          auto COp = IROp->C<IR::IROp_Constant>();
+          const auto PR = IR::PhysicalRegister(CodeNode);
+          if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+            LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+          } else {
+            LastConstantCache.Valid = false;
+          }
         } else {
-          LastConstantCache.Valid = false;
+          // LoadMem / LoadMemTSO: FPR-class loads leave dynamic GPRs
+          // untouched; GPR-class loads write an RA register and must
+          // invalidate.
+          if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
+            LastConstantCache.Valid = false;
+          }
         }
-        break;
-      }
-      case IR::OP_LOADMEM:
-      case IR::OP_LOADMEMTSO:
-        // FPR-class loads leave dynamic GPRs untouched; GPR-class loads
-        // write an RA register and must invalidate.
-        if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
-          LastConstantCache.Valid = false;
-        }
-        break;
-      case IR::OP_VFADDSCALARINSERT:
-      case IR::OP_VFSUBSCALARINSERT:
-      case IR::OP_VFMULSCALARINSERT:
-      case IR::OP_VFDIVSCALARINSERT:
-      case IR::OP_VFMINSCALARINSERT:
-      case IR::OP_VFMAXSCALARINSERT:
-      case IR::OP_VFMLASCALARINSERT:
-      case IR::OP_VFMLSSCALARINSERT:
-      case IR::OP_VFNMLASCALARINSERT:
-      case IR::OP_VFNMLSSCALARINSERT:
-      case IR::OP_LOADNAMEDVECTORCONSTANT: break;
-      default: LastConstantCache.Valid = false; break;
       }
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
