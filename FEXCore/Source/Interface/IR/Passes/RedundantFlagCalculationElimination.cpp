@@ -379,6 +379,21 @@ constexpr auto FlagInfos = std::invoke([] {
   return ret;
 });
 
+// Inline fast path for Classify. The overwhelming majority of ops are not
+// Special, so their whole classification is the one indexed load below --
+// but Classify itself is a large out-of-line function that clang will not
+// inline into its per-op callers, so every op was paying a call to reach a
+// table lookup. Callers go through this wrapper and only make the call for
+// the handful of opcodes whose answer depends on operand fields. Identical
+// by construction: it is Classify's own opening test, duplicated.
+[[nodiscard]] __attribute__((always_inline)) static inline FlagInfo ClassifyFast(IROp_Header* IROp) {
+  const FlagInfo Info = FlagInfos[IROp->Op];
+  if (!Info.Special()) {
+    return Info;
+  }
+  return DeadFlagCalculationEliminination::Classify(IROp);
+}
+
 FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
   FlagInfo Info = FlagInfos[IROp->Op];
   if (!Info.Special()) {
@@ -485,7 +500,7 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
 // fuse the wrong compare -- silent and data-dependent -- so the answer is
 // derived from the table above rather than restated.
 bool IROpWritesNZCV(IROp_Header* IROp) {
-  return (DeadFlagCalculationEliminination::Classify(IROp).Write() & FLAG_NZCV) != 0;
+  return (ClassifyFast(IROp).Write() & FLAG_NZCV) != 0;
 }
 
 // General purpose dead code elimination. Returns whether flag handling should
@@ -674,7 +689,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
       // This order is important: instructions that read-modify-write flags
       // (like adcs) first read flags, then write flags. Since we're iterating
       // the block backwards, that means we handle the write first.
-      struct FlagInfo Info = Classify(IROp);
+      struct FlagInfo Info = ClassifyFast(IROp);
 
       if (!Info.Trivial()) {
         bool Eliminated = false;
