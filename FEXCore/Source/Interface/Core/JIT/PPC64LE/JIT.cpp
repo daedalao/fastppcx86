@@ -51,6 +51,7 @@ $end_info$
 #include <mutex>
 #include <string_view>
 #include <unistd.h>
+#include <xxhash.h>
 
 namespace FEXCore::CPU {
 
@@ -5178,6 +5179,37 @@ void PPC64JITCore::AnalyzeSpinLoops() {
 // -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// FEX_CODEHASHLOG=<path>: emitted-code identity gate (diagnostic only).
+//
+// Appends one line per compiled block:
+//     <GuestRIP hex> <host byte count> <xxh64 of the emitted bytes>
+// so two builds can be compared for byte-identical codegen. OFF by default;
+// when off the cost is a single test of an already-loaded pointer per block
+// (CodeHashLogFile is a function-local static initialised once).
+//
+// The hash covers [BlockBegin, BlockBegin+CodeSize) -- the code region only,
+// before the JITCodeTail is written. Host addresses embedded in the code
+// (LoadConstant of a helper address, thunk record contents) make the hash
+// ASLR-dependent, hence the size column: run under `setarch -R` for a
+// run-to-run reproducible hash, or fall back to comparing (RIP, size).
+// -------------------------------------------------------------------------
+static FILE* CodeHashLogFile() {
+  static FILE* F = [] () -> FILE* {
+    const char* Path = getenv("FEX_CODEHASHLOG");
+    if (!Path || !Path[0]) {
+      return nullptr;
+    }
+    FILE* Out = fopen(Path, "ae");
+    if (Out) {
+      setvbuf(Out, nullptr, _IOLBF, 0);
+    }
+    return Out;
+  }();
+  return F;
+}
+static std::mutex CodeHashLogLock;
+
 CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     uint64_t Entry, uint64_t GuestSize, bool SingleInst,
     const FEXCore::IR::IRListView* IRView,
@@ -6289,6 +6321,39 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // change above.
   CodeData.BlockBegin = CB->Ptr + BlockBufferOffset;
   CodeData.Size       = CodeSize;
+
+  // FEX_CODEHASHLOG identity gate (see CodeHashLogFile above). Zero cost when
+  // unset: one already-loaded pointer test per compiled block.
+  if (FILE* HashLog = CodeHashLogFile()) {
+    const auto* Words = reinterpret_cast<const uint32_t*>(CodeData.BlockBegin);
+    const size_t NumWords = CodeSize / sizeof(uint32_t);
+    const uint64_t Hash = XXH3_64bits(reinterpret_cast<const void*>(CodeData.BlockBegin), CodeSize);
+
+    // Address-normalized hash. Emitted blocks legitimately bake absolute HOST
+    // addresses into ori/oris/lis immediate sequences (LoadImm64 of a FABI
+    // helper, of &SomeRuntimeObject, ...). Those addresses move whenever the
+    // FEX binary's own layout moves, so the plain hash differs between two
+    // builds that emit identical code. Zeroing the 16-bit immediate field of
+    // ori (24), oris (25) and lis (addis with RA==0) makes the hash blind to
+    // exactly that and to nothing else: any real codegen change alters an
+    // opcode, a register field, or the instruction count, all of which
+    // survive normalization.
+    fextl::vector<uint32_t> Norm(NumWords);
+    for (size_t i = 0; i < NumWords; ++i) {
+      uint32_t W = Words[i];
+      const uint32_t Primary = W >> 26;
+      const uint32_t RA = (W >> 16) & 0x1F;
+      if (Primary == 24 || Primary == 25 || (Primary == 15 && RA == 0)) {
+        W &= 0xFFFF0000u;
+      }
+      Norm[i] = W;
+    }
+    const uint64_t NormHash = XXH3_64bits(Norm.data(), NumWords * sizeof(uint32_t));
+
+    std::lock_guard Guard {CodeHashLogLock};
+    fprintf(HashLog, "%016lx %zu %016lx %016lx\n", static_cast<unsigned long>(Entry), CodeSize,
+            static_cast<unsigned long>(NormHash), static_cast<unsigned long>(Hash));
+  }
 
   // DebugData::HostCodeSize has never been populated on this port, and PPC64LE
   // is the only backend left in the tree, so the field was dead: every consumer
