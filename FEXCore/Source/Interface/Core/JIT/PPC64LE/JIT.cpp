@@ -2168,7 +2168,10 @@ uint32_t PPC64EncodeBranch(int64_t Delta) {
 }
 // I-form `bl` (LK=1): the link-stack-pushing form a shadow call's Final word takes.
 uint32_t PPC64EncodeBranchLink(int64_t Delta) {
-  return PPC64EncodeBranch(Delta) | 1u;
+  // FEX_NO_LINKSTACKPAIR (bisection lever, see DEF_OP(ExitFunction)): the
+  // linked leg then branches without LK, matching the bctr call form.
+  static const bool NoLinkStackPair = getenv("FEX_NO_LINKSTACKPAIR") != nullptr;
+  return PPC64EncodeBranch(Delta) | (NoLinkStackPair ? 0u : 1u);
 }
 
 // Single atomic 4-byte instruction rewrite + icache maintenance. The store

@@ -412,6 +412,12 @@ DEF_OP(ExitFunction) {
   // reason. Everything is byte-identical to the pre-existing lowering when
   // FEX_SHADOWRETSTACK is off.
   // ---------------------------------------------------------------------
+  // Bisection levers (read once): FEX_NO_INLINECACHE=1 keeps the indirect
+  // shadow call on the probe; FEX_NO_LINKSTACKPAIR=1 keeps the shadow
+  // layout but ends the call in bctr and the return in mtctr/bctr, i.e.
+  // the pre-pairing branch forms with the pairing's push/pop bookkeeping.
+  static const bool NoInlineCache = getenv("FEX_NO_INLINECACHE") != nullptr;
+  static const bool NoLinkStackPair = getenv("FEX_NO_LINKSTACKPAIR") != nullptr;
   const bool ShadowCall = ShadowActive && Op->Hint == IR::BranchHint::Call;
   const uint32_t CRBID = (ShadowCall && !Op->CallReturnBlock.IsInvalid()) ?
                          IR->GetOp<IR::IROp_CodeBlock>(Op->CallReturnBlock)->ID : 0u;
@@ -489,9 +495,17 @@ DEF_OP(ExitFunction) {
     bc({4, 30}, &ShadowRetReprobe);     // guest_ret_rip != target -> probe
     ld(TMP3, -8, TMP2);                 // TMP3 = host trampoline (== old sp + 8)
     std(RIPReg, rip_off, STATE);        // P5.0.1: store rip before the jump
-    mtlr(TMP3);
+    if (NoLinkStackPair) {
+      mtctr(TMP3);
+    } else {
+      mtlr(TMP3);
+    }
     EmitExitR0Zero(UnitR0Dirty);        // P5.0.2: zero-index invariant
-    blr();
+    if (NoLinkStackPair) {
+      bctr();
+    } else {
+      blr();
+    }
     // Empty / mismatch fall through into the unchanged L1 probe (ShadowRetReprobe).
   }
 
@@ -571,7 +585,7 @@ DEF_OP(ExitFunction) {
   // turns out polymorphic pays the 7-instruction guard and takes the
   // probe. Gated like constant-call linking (CallLinkingEnabled).
   // ---------------------------------------------------------------------
-  const bool InlineCache = ShadowCall && !ConstRIP && CallLinkingEnabled;
+  const bool InlineCache = ShadowCall && !ConstRIP && CallLinkingEnabled && !NoInlineCache;
   PPC64Emitter::Label InlineCacheProbe{};
   auto MissLabel = PPC64Emitter::Label{};
   if (InlineCache) {
@@ -695,7 +709,11 @@ DEF_OP(ExitFunction) {
   // this leg would be skipped by linked callers (P5.0.2's failure mode is
   // silent guest memory corruption — see the hoist comment up top).
   if (ShadowCall) {
-    bctrl();                            // LK=1: link stack <- &Tramp1
+    if (NoLinkStackPair) {
+      bctr();
+    } else {
+      bctrl();                          // LK=1: link stack <- &Tramp1
+    }
     PatchShadowCallAddi(ShadowPush1, GetCursorAddress<uint64_t>());
     EmitShadowCallTrampoline();         // Tramp1
   } else {
