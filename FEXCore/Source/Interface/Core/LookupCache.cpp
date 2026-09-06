@@ -20,12 +20,7 @@ namespace SMC {
   std::atomic<bool> CodeGranuleTrackingEnabled {false};
 } // namespace SMC
 
-GuestToHostMap::GuestToHostMap()
-  : BlockLinks_mbr {"FEXMem_BlockLinks"} {
-  BlockLinks_pma = fextl::make_unique<std::pmr::polymorphic_allocator<std::byte>>(&BlockLinks_mbr);
-  // Setup our PMR map.
-  BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
-
+GuestToHostMap::GuestToHostMap() {
   // SMC Idea 3: allocate the granule bitmap only if one of the SMC store fast
   // paths that consults it is enabled. Enabling it here and nowhere else is
   // load-bearing: a map that acquired blocks while untracked and then had
@@ -122,8 +117,9 @@ LookupCache::~LookupCache() {
   FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(PagePointer), TotalCacheSize);
   ctx->SyscallHandler->UnmarkOvercommitRange(PagePointer, TotalCacheSize);
 
-  // No need to free BlockLinks map.
-  // These will get freed when their memory allocators are deallocated.
+  // BlockLinks and its node pool are ordinary owning containers; their
+  // destructors reclaim everything. (This used to be a raw pointer into a
+  // monotonic buffer resource, hence the note that used to be here.)
 }
 
 void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
@@ -138,6 +134,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // Clear L1 and L2 by clearing the full cache.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer), TotalCacheSize, false);
   CachedCodePages.clear();
+  InvalidateCachedCodePagesMemo();
 }
 
 void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
@@ -147,8 +144,18 @@ void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
 }
 
 void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
-  // Allocate a new pointer from the BlockLinks pma again.
-  BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+  // All code is gone, so every registered inbound link points at a host site in
+  // a code buffer that is being retired. Drop them WITHOUT running any
+  // delinker -- that is the pre-existing contract of this function, and
+  // ContextImpl::ClearCodeCache traps if it is reached with a live code buffer
+  // (Core.cpp, "live code buffer still contains patched callsites").
+  // The pool keeps its capacity so the next generation of links refills it
+  // without allocating; the nodes are trivially destructible, so this is a
+  // pointer reset rather than a walk.
+  BlockLinks.clear();
+  BlockLinkPool.clear();
+  BlockLinkFreeHead = BlockLinkInvalid;
+
   // All code is gone, clear the block list
   BlockList.clear();
 
@@ -156,6 +163,10 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // CodeBuffer that is being retired here, so they must not survive it.
   RetainedBlocks.clear();
   RetainedCodePages.clear();
+
+  // Defensive: ClearCache does not erase CodePages today, but the memo must
+  // never outlive an entry it points at.
+  InvalidateCodePagesMemo();
 
   // SMC Idea 3 CLEAR POINT (whole-cache). BlockList and RetainedBlocks are now
   // empty, so no granule anywhere is backed by a live block. Leaves are zeroed

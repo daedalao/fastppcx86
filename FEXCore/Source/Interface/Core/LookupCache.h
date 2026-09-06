@@ -61,31 +61,58 @@ struct GuestToHostMap {
     return LookupCacheReadLockToken {Lock};
   }
 
-  struct BlockLinkTag {
-    uint64_t GuestDestination;
-    FEXCore::Context::ExitFunctionLinkData* HostLink;
+  // --- Inbound block links --------------------------------------------------
+  //
+  // Every direct branch the backend patches to jump straight into another
+  // block's host code registers itself here, keyed by the GUEST destination it
+  // now jumps to, so that invalidating that destination can restore each
+  // patched site (SeverLinks below).
+  //
+  // Shape: a hash map GuestDestination -> singly linked chain of link records
+  // living in one flat pool. This used to be
+  // std::pmr::map<{GuestDestination, HostLink}, delinker> over a monotonic
+  // buffer resource. On a Cyberpunk 2077 worker thread the red-black
+  // _M_insert_unique for that map was 0.79% of the entire thread -- more than
+  // any IR pass except register allocation -- because it is paid once per
+  // patched exit and blocks here average ~350 bytes of host code. The hash map
+  // makes the insert O(1) amortised with no rebalancing, and turns SeverLinks'
+  // lower_bound/upper_bound pair over the whole map into a walk of one short
+  // chain.
+  //
+  // Semantics preserved EXACTLY:
+  //   * Inserting a (GuestDestination, HostLink) pair that is already present
+  //     keeps the EXISTING entry and its delinker, and is otherwise a no-op.
+  //     The PPC64 linker depends on this: a hart that observes a patched
+  //     caller word against a still-stale thunk word re-enters the linker, and
+  //     that re-registration must not duplicate or replace anything. See
+  //     JIT/PPC64LE/JIT.cpp ExitFunctionLinkWithRecord ("AddBlockLink on a
+  //     duplicate key keeps the existing entry").
+  //   * SeverLinks runs the delinker for every link of one destination and
+  //     removes them all.
+  //   * ClearCache drops everything.
+  //
+  // Nothing iterates block links in key order: the only mention outside this
+  // file is a TODO in CodeCache.cpp, and the two in-file consumers are a
+  // single-destination lookup and a whole-structure clear. So the ordered
+  // container bought nothing that had to be preserved.
+  static constexpr uint64_t BlockLinkInvalid = ~0ULL;
 
-    bool operator<(const BlockLinkTag& other) const {
-      if (GuestDestination < other.GuestDestination) {
-        return true;
-      } else if (GuestDestination == other.GuestDestination) {
-        return HostLink < other.HostLink;
-      } else {
-        return false;
-      }
-    }
+  struct BlockLinkNode {
+    FEXCore::Context::ExitFunctionLinkData* HostLink;
+    FEXCore::Context::BlockDelinkerFunc Delinker;
+    uint64_t Next; // Index into BlockLinkPool, or BlockLinkInvalid.
   };
 
-  // Use a monotonic buffer resource to allocate both the std::pmr::map and its members.
-  // This allows us to quickly clear the block link map by clearing the monotonic allocator.
-  // If we had allocated the block link map without the MBR, then clearing the map would require slowly
-  // walking each block member and destructing objects.
-  //
-  // This makes `BlockLinks` look like a raw pointer that could memory leak, but since it is backed by the MBR, it won't.
-  fextl::pmr::named_monotonic_page_buffer_resource BlockLinks_mbr;
-  using BlockLinksMapType = std::pmr::map<BlockLinkTag, FEXCore::Context::BlockDelinkerFunc>;
-  fextl::unique_ptr<std::pmr::polymorphic_allocator<std::byte>> BlockLinks_pma;
-  BlockLinksMapType* BlockLinks;
+  // Chain storage. Severed nodes are spliced onto BlockLinkFreeHead and
+  // reused, so the pool's high-water mark is the peak live link count and
+  // steady-state link/unlink churn allocates nothing at all. That matters for
+  // the erase side specifically: SeverLinks is reachable from SMC invalidation
+  // with the write lock held, and the monotonic-buffer version it replaces was
+  // likewise allocation-free there.
+  fextl::vector<BlockLinkNode> BlockLinkPool;
+  uint64_t BlockLinkFreeHead = BlockLinkInvalid;
+  // GuestDestination -> head index into BlockLinkPool.
+  fextl::robin_map<uint64_t, uint64_t> BlockLinks;
 
   struct BlockEntry {
     uint64_t HostCode;
@@ -130,6 +157,18 @@ struct GuestToHostMap {
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
+
+  // One-entry memo for the CodePages lookup in AddBlockExecutableRange; see
+  // the note there. ~0ULL can never be a real page index (a 64-bit address
+  // shifted right by 12 has its top 12 bits clear), so it is a safe "empty".
+  // Guarded by the same write lock as CodePages itself.
+  uint64_t CodePagesMemoIndex = ~0ULL;
+  fextl::vector<uint64_t>* CodePagesMemoEntry = nullptr;
+
+  void InvalidateCodePagesMemo() {
+    CodePagesMemoIndex = ~0ULL;
+    CodePagesMemoEntry = nullptr;
+  }
 
   // SMC v3: blocks that have been soft-invalidated. Their host code is still
   // live in the CodeBuffer and their metadata is intact, but they are absent
@@ -188,13 +227,33 @@ struct GuestToHostMap {
   // the same severing (retained blocks must lose inbound direct branches
   // without leaving BlockList's history). Token-enforced.
   size_t SeverLinks(uint64_t Address, const LookupCacheWriteLockToken&) {
-    auto lower = BlockLinks->lower_bound({Address, nullptr});
-    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    auto it = BlockLinks.find(Address);
+    if (it == BlockLinks.end()) {
+      return 0;
+    }
+
+    // A delinker only rewrites one host instruction word in the code buffer and
+    // flushes the icache for it (JIT/PPC64LE/JIT.cpp PPC64*BlockDelinker); it
+    // never re-enters the lookup cache. So neither `it` nor the pool reference
+    // below can be invalidated underneath this loop.
+    const uint64_t Head = it->second;
     size_t Severed = 0;
-    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
-      it->second(it->first.HostLink);
+    uint64_t Index = Head;
+    uint64_t Tail = BlockLinkInvalid;
+    while (Index != BlockLinkInvalid) {
+      auto& Node = BlockLinkPool[Index];
+      Node.Delinker(Node.HostLink);
+      Tail = Index;
+      Index = Node.Next;
       ++Severed;
     }
+
+    // Splice the whole severed chain onto the free list in O(1).
+    if (Tail != BlockLinkInvalid) {
+      BlockLinkPool[Tail].Next = BlockLinkFreeHead;
+      BlockLinkFreeHead = Head;
+    }
+    BlockLinks.erase(it);
     return Severed;
   }
 
@@ -323,6 +382,7 @@ struct GuestToHostMap {
       }
     }
     CodePages.erase(lower, upper);
+    InvalidateCodePagesMemo();
   }
 
   // Returns true if any *compiled block's guest bytes* intersect
@@ -685,6 +745,7 @@ public:
       }
     }
     CodePages.erase(lower, upper);
+    InvalidateCodePagesMemo();
 
     // A hard invalidation supersedes any pending soft-invalidation of the same
     // guest memory: the bytes may be about to be unmapped or reused, so their
@@ -694,7 +755,32 @@ public:
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
                     const FEXCore::Context::BlockDelinkerFunc& delinker, const LookupCacheWriteLockToken&) {
-    BlockLinks->insert({{GuestDestination, HostLink}, delinker});
+    auto [it, Inserted] = BlockLinks.try_emplace(GuestDestination, BlockLinkInvalid);
+
+    if (!Inserted) {
+      // Duplicate (GuestDestination, HostLink) registrations keep the existing
+      // entry, matching the old std::map::insert. The chain is the inbound
+      // fan-in of a single guest destination, which is small, so this scan is
+      // cheaper than the tree descent it replaces even in the duplicate case.
+      for (uint64_t Index = it->second; Index != BlockLinkInvalid; Index = BlockLinkPool[Index].Next) {
+        if (BlockLinkPool[Index].HostLink == HostLink) {
+          return;
+        }
+      }
+    }
+
+    // NOTE: `it` points into BlockLinks, which is not touched again below; the
+    // pool may reallocate, but it is addressed by index, never by pointer.
+    uint64_t NewIndex;
+    if (BlockLinkFreeHead != BlockLinkInvalid) {
+      NewIndex = BlockLinkFreeHead;
+      BlockLinkFreeHead = BlockLinkPool[NewIndex].Next;
+      BlockLinkPool[NewIndex] = BlockLinkNode {HostLink, delinker, it->second};
+    } else {
+      NewIndex = BlockLinkPool.size();
+      BlockLinkPool.push_back(BlockLinkNode {HostLink, delinker, it->second});
+    }
+    it->second = NewIndex;
   }
 
   // SMC Idea 3 SET POINT. This is the single choke point through which a guest
@@ -709,9 +795,26 @@ public:
     bool rv = false;
 
     for (auto CurrentPage = Start >> 12, EndPage = (Start + Length - 1) >> 12; CurrentPage <= EndPage; CurrentPage++) {
-      auto& CodePage = CodePages[CurrentPage];
-      rv |= CodePage.empty();
-      CodePage.insert(CodePage.end(), Addresses.begin(), Addresses.end());
+      // One-entry memo over the CodePages descent. Callers invoke this once per
+      // guest code page per compiled block (Core.cpp's CompileBlock loop passes
+      // a single page at a time, so the loop body normally runs once), and
+      // consecutive compilations overwhelmingly touch the page the previous one
+      // did -- so this turns a red-black descent into a compare on the common
+      // path. std::map nodes are address-stable and only an erase of THIS key
+      // can invalidate the cached pointer; every path in this file that erases
+      // from CodePages drops the memo (InvalidateRange, SoftInvalidateRange,
+      // ClearCache). CodePages is a public member, so any future code that
+      // erases from it directly must do the same.
+      fextl::vector<uint64_t>* CodePage;
+      if (CurrentPage == CodePagesMemoIndex) {
+        CodePage = CodePagesMemoEntry;
+      } else {
+        CodePage = &CodePages[CurrentPage];
+        CodePagesMemoIndex = CurrentPage;
+        CodePagesMemoEntry = CodePage;
+      }
+      rv |= CodePage->empty();
+      CodePage->insert(CodePage->end(), Addresses.begin(), Addresses.end());
 
       if (CodeGranules.Enabled()) {
         CodeGranules.SetPageRange(CurrentPage << 12, GuestRangeStart, GuestRangeLength);
@@ -1000,6 +1103,7 @@ public:
     }
     bool ret = upper != lower;
     CachedCodePages.erase(lower, upper);
+    InvalidateCachedCodePagesMemo();
     return ret;
   }
 
@@ -1113,8 +1217,21 @@ public:
 
 private:
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
+    // One-entry memo over the CachedCodePages descent, for the same reason as
+    // GuestToHostMap::AddBlockExecutableRange: this runs once per code page per
+    // block on the compile path AND once per L3 hit on the lookup path (where
+    // the insert is almost always redundant), and successive calls nearly
+    // always name the page the previous call did. CachedCodePages is private to
+    // LookupCache and is only ever erased by InvalidateCacheRange and cleared
+    // by ClearThreadLocalCaches; both drop the memo. std::map nodes are
+    // address-stable otherwise.
     for (const auto& CodePage : Entry.CodePages) {
-      CachedCodePages[CodePage >> 12].insert(Address);
+      const uint64_t PageIndex = CodePage >> 12;
+      if (PageIndex != CachedCodePagesMemoIndex) {
+        CachedCodePagesMemoEntry = &CachedCodePages[PageIndex];
+        CachedCodePagesMemoIndex = PageIndex;
+      }
+      CachedCodePagesMemoEntry->insert(Address);
     }
 
     // Do L1.  Atomic publish: see LookupCacheEntry::Publish for why ordering
@@ -1177,6 +1294,16 @@ private:
 
   // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
   fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+
+  // One-entry memo for the CachedCodePages lookup in CacheBlockMapping; see
+  // the note there. ~0ULL is not a reachable page index.
+  uint64_t CachedCodePagesMemoIndex = ~0ULL;
+  fextl::robin_set<uint64_t>* CachedCodePagesMemoEntry = nullptr;
+
+  void InvalidateCachedCodePagesMemo() {
+    CachedCodePagesMemoIndex = ~0ULL;
+    CachedCodePagesMemoEntry = nullptr;
+  }
 
   uintptr_t PagePointer;
   uintptr_t PageMemory;
