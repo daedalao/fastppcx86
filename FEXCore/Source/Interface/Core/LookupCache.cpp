@@ -134,6 +134,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // Clear L1 and L2 by clearing the full cache.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer), TotalCacheSize, false);
   CachedCodePages.clear();
+  InvalidateCachedCodePagesMemo();
 }
 
 void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
@@ -162,6 +163,10 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // CodeBuffer that is being retired here, so they must not survive it.
   RetainedBlocks.clear();
   RetainedCodePages.clear();
+
+  // Defensive: ClearCache does not erase CodePages today, but the memo must
+  // never outlive an entry it points at.
+  InvalidateCodePagesMemo();
 
   // SMC Idea 3 CLEAR POINT (whole-cache). BlockList and RetainedBlocks are now
   // empty, so no granule anywhere is backed by a live block. Leaves are zeroed

@@ -158,6 +158,18 @@ struct GuestToHostMap {
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
 
+  // One-entry memo for the CodePages lookup in AddBlockExecutableRange; see
+  // the note there. ~0ULL can never be a real page index (a 64-bit address
+  // shifted right by 12 has its top 12 bits clear), so it is a safe "empty".
+  // Guarded by the same write lock as CodePages itself.
+  uint64_t CodePagesMemoIndex = ~0ULL;
+  fextl::vector<uint64_t>* CodePagesMemoEntry = nullptr;
+
+  void InvalidateCodePagesMemo() {
+    CodePagesMemoIndex = ~0ULL;
+    CodePagesMemoEntry = nullptr;
+  }
+
   // SMC v3: blocks that have been soft-invalidated. Their host code is still
   // live in the CodeBuffer and their metadata is intact, but they are absent
   // from BlockList/L1/L2 so every dispatch of them misses into CompileBlock,
@@ -370,6 +382,7 @@ struct GuestToHostMap {
       }
     }
     CodePages.erase(lower, upper);
+    InvalidateCodePagesMemo();
   }
 
   // Returns true if any *compiled block's guest bytes* intersect
@@ -732,6 +745,7 @@ public:
       }
     }
     CodePages.erase(lower, upper);
+    InvalidateCodePagesMemo();
 
     // A hard invalidation supersedes any pending soft-invalidation of the same
     // guest memory: the bytes may be about to be unmapped or reused, so their
@@ -781,9 +795,26 @@ public:
     bool rv = false;
 
     for (auto CurrentPage = Start >> 12, EndPage = (Start + Length - 1) >> 12; CurrentPage <= EndPage; CurrentPage++) {
-      auto& CodePage = CodePages[CurrentPage];
-      rv |= CodePage.empty();
-      CodePage.insert(CodePage.end(), Addresses.begin(), Addresses.end());
+      // One-entry memo over the CodePages descent. Callers invoke this once per
+      // guest code page per compiled block (Core.cpp's CompileBlock loop passes
+      // a single page at a time, so the loop body normally runs once), and
+      // consecutive compilations overwhelmingly touch the page the previous one
+      // did -- so this turns a red-black descent into a compare on the common
+      // path. std::map nodes are address-stable and only an erase of THIS key
+      // can invalidate the cached pointer; every path in this file that erases
+      // from CodePages drops the memo (InvalidateRange, SoftInvalidateRange,
+      // ClearCache). CodePages is a public member, so any future code that
+      // erases from it directly must do the same.
+      fextl::vector<uint64_t>* CodePage;
+      if (CurrentPage == CodePagesMemoIndex) {
+        CodePage = CodePagesMemoEntry;
+      } else {
+        CodePage = &CodePages[CurrentPage];
+        CodePagesMemoIndex = CurrentPage;
+        CodePagesMemoEntry = CodePage;
+      }
+      rv |= CodePage->empty();
+      CodePage->insert(CodePage->end(), Addresses.begin(), Addresses.end());
 
       if (CodeGranules.Enabled()) {
         CodeGranules.SetPageRange(CurrentPage << 12, GuestRangeStart, GuestRangeLength);
@@ -1072,6 +1103,7 @@ public:
     }
     bool ret = upper != lower;
     CachedCodePages.erase(lower, upper);
+    InvalidateCachedCodePagesMemo();
     return ret;
   }
 
@@ -1185,8 +1217,21 @@ public:
 
 private:
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
+    // One-entry memo over the CachedCodePages descent, for the same reason as
+    // GuestToHostMap::AddBlockExecutableRange: this runs once per code page per
+    // block on the compile path AND once per L3 hit on the lookup path (where
+    // the insert is almost always redundant), and successive calls nearly
+    // always name the page the previous call did. CachedCodePages is private to
+    // LookupCache and is only ever erased by InvalidateCacheRange and cleared
+    // by ClearThreadLocalCaches; both drop the memo. std::map nodes are
+    // address-stable otherwise.
     for (const auto& CodePage : Entry.CodePages) {
-      CachedCodePages[CodePage >> 12].insert(Address);
+      const uint64_t PageIndex = CodePage >> 12;
+      if (PageIndex != CachedCodePagesMemoIndex) {
+        CachedCodePagesMemoEntry = &CachedCodePages[PageIndex];
+        CachedCodePagesMemoIndex = PageIndex;
+      }
+      CachedCodePagesMemoEntry->insert(Address);
     }
 
     // Do L1.  Atomic publish: see LookupCacheEntry::Publish for why ordering
@@ -1249,6 +1294,16 @@ private:
 
   // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
   fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+
+  // One-entry memo for the CachedCodePages lookup in CacheBlockMapping; see
+  // the note there. ~0ULL is not a reachable page index.
+  uint64_t CachedCodePagesMemoIndex = ~0ULL;
+  fextl::robin_set<uint64_t>* CachedCodePagesMemoEntry = nullptr;
+
+  void InvalidateCachedCodePagesMemo() {
+    CachedCodePagesMemoIndex = ~0ULL;
+    CachedCodePagesMemoEntry = nullptr;
+  }
 
   uintptr_t PagePointer;
   uintptr_t PageMemory;
