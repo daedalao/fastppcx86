@@ -587,6 +587,14 @@ DEF_OP(ExitFunction) {
     bc({4, 30}, &InlineCacheProbe);     // bne cr7
     auto& Thunk = PendingJumpThunks.back();
     auto Push2 = EmitShadowCallPush();
+    // Every path out of a block stores the destination RIP (P5.0.1) and
+    // re-zeroes r0 (P5.0.2) before the branch; a constant exit hoists both
+    // above its patch site, but this leg has no hoist to share. Leaving r0
+    // dirty here silently offset every X-form access in the callee
+    // [2026-09-06: nw-cp2077 callback c0000005, nw-witcher3 c000001d and a
+    // DXVK spinlock hang on the first build with this leg].
+    std(RIPReg, rip_off, STATE);
+    EmitExitR0Zero(UnitR0Dirty);
     Thunk.FinalAddress = GetCursorAddress<uint64_t>();
     Emit32(0x7FE00008u);                // Final: trap until linked
     PatchShadowCallAddi(Push2, GetCursorAddress<uint64_t>());
