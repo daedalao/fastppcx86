@@ -107,20 +107,31 @@ struct BlockInfo {
 };
 
 struct ControlFlowGraph {
+  // Persistent across Run() invocations (the graph lives in the pass object,
+  // which is per-thread). BlockMap is only ever grown, and each entry's
+  // Predecessors vector is clear()ed rather than destroyed, so the whole
+  // structure stops allocating after the first few compiles. Previously this
+  // was a function-local built from scratch every compile: one malloc for
+  // BlockMap plus one malloc+free per block for its Predecessors::reserve(2),
+  // which for the typical few-block compile unit was the single largest
+  // source of allocator traffic in the compile pipeline.
   fextl::vector<BlockInfo> BlockMap;
-  IRListView& IR;
+  IRListView* IR {};
 
   void Init(fextl::deque<uint32_t>& Worklist, uint32_t BlockCount) {
-    BlockMap.resize(BlockCount);
+    if (BlockMap.size() < BlockCount) {
+      BlockMap.resize(BlockCount);
+    }
 
     for (unsigned ID = 0; ID < BlockCount; ++ID) {
-      // Add the block with conservative flags and already in the worklist.
-      auto Info = BlockInfo {{}, nullptr, FLAG_ALL, true};
+      // Reset to conservative flags and already in the worklist. clear()
+      // keeps the Predecessors allocation from the previous compile.
+      auto& Info = BlockMap[ID];
+      Info.Predecessors.clear();
+      Info.Node = nullptr;
+      Info.Flags = FLAG_ALL;
+      Info.InWorklist = true;
 
-      // Add some initial capacity
-      Info.Predecessors.reserve(2);
-
-      BlockMap[ID] = std::move(Info);
       Worklist.push_back(ID);
     }
   }
@@ -134,7 +145,7 @@ struct ControlFlowGraph {
   }
 
   BlockInfo* Get(OrderedNodeWrapper Block) {
-    return Get(IR.GetOp<IR::IROp_CodeBlock>(Block));
+    return Get(IR->GetOp<IR::IROp_CodeBlock>(Block));
   }
 
   void RecordEdge(uint32_t From, OrderedNodeWrapper To) {
@@ -165,6 +176,10 @@ public:
   static unsigned FlagsForCondClassType(CondClass Cond);
 
 private:
+  // Reused across compiles; see ControlFlowGraph::BlockMap.
+  ControlFlowGraph CFG {};
+  fextl::deque<uint32_t> Worklist;
+
   bool EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
@@ -843,10 +858,15 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
 
   auto CurrentIR = IREmit->ViewIR();
-  fextl::deque<uint32_t> Worklist;
+
+  // Both of these are pass members so their storage survives between compiles
+  // (see the note on ControlFlowGraph::BlockMap). deque::clear() drops back to
+  // a single node rather than releasing the map, so the worklist also stops
+  // allocating.
+  Worklist.clear();
 
   // Initialize CFG
-  ControlFlowGraph CFG {.IR = CurrentIR};
+  CFG.IR = &CurrentIR;
   CFG.Init(Worklist, CurrentIR.GetHeader()->BlockCount);
 
   // Gather CFG
