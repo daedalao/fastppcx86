@@ -8,7 +8,9 @@ desc: Glues Frontend, OpDispatcher and IR Opts & Compilation, LookupCache, Dispa
 $end_info$
 */
 
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
@@ -100,6 +102,155 @@ static int SMCAuditCompileFD() {
   }();
   return fd;
 }
+
+// ---------------------------------------------------------------------------
+// FEX_COMPILELOG=<path>: compile-rate diagnostic (append-only, raw fd, one
+// dprintf per line so a SIGKILL'd game still leaves a readable timeline).
+//
+// Answers "what is the JIT compiling, how fast, and why" for a live process:
+// per ~1 s window it appends the number of blocks actually compiled (races
+// that found another thread's block are not counted), host bytes emitted,
+// compiler wall time, invalidation calls/bytes, and the busiest guest 16 MiB
+// regions since process start, so a compile storm can be attributed to a
+// module range (a PE image base is stable for the life of the process) and
+// separated from invalidation churn or a code-buffer rotation (which
+// FEX_BUFSTATS logs; point both at different files).
+//
+// Off (no env var) the cost is one relaxed load of a null pointer per
+// compile. On, the counters are relaxed atomics and the bucket table is a
+// fixed open-addressed array with atomic keys, so no lock is taken on any
+// path and nothing here may block a compiling thread.
+namespace {
+struct CompileLogState {
+  int FD {-1};
+  uint64_t BaseNS {};
+  std::atomic<uint64_t> Compiles {};
+  std::atomic<uint64_t> HostBytes {};
+  std::atomic<uint64_t> CompileNS {};
+  std::atomic<uint64_t> InvalCalls {};
+  std::atomic<uint64_t> InvalBytes {};
+  std::atomic<uint64_t> LastFlushSec {};
+  // Last flushed totals, written only by the thread that won the flush.
+  uint64_t PrevCompiles {}, PrevHostBytes {}, PrevCompileNS {}, PrevInvalCalls {}, PrevInvalBytes {};
+
+  static constexpr size_t BUCKETS = 512;
+  struct Bucket {
+    std::atomic<uint64_t> Key {}; // (GuestRIP >> 24) + 1; 0 = empty
+    std::atomic<uint64_t> Count {};
+  };
+  Bucket Buckets[BUCKETS];
+
+  static uint64_t NowNS() {
+    timespec Now {};
+    clock_gettime(CLOCK_MONOTONIC, &Now);
+    return static_cast<uint64_t>(Now.tv_sec) * 1000000000ull + static_cast<uint64_t>(Now.tv_nsec);
+  }
+
+  void RecordCompile(uint64_t GuestRIP, uint64_t Bytes, uint64_t NS) {
+    Compiles.fetch_add(1, std::memory_order_relaxed);
+    HostBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    CompileNS.fetch_add(NS, std::memory_order_relaxed);
+
+    const uint64_t Key = (GuestRIP >> 24) + 1;
+    size_t Idx = (Key * 0x9E3779B97F4A7C15ull) >> 55; // 9 bits
+    for (size_t Probe = 0; Probe < BUCKETS; ++Probe, Idx = (Idx + 1) & (BUCKETS - 1)) {
+      uint64_t Cur = Buckets[Idx].Key.load(std::memory_order_relaxed);
+      if (Cur == 0) {
+        if (!Buckets[Idx].Key.compare_exchange_strong(Cur, Key, std::memory_order_relaxed)) {
+          if (Cur != Key) {
+            continue;
+          }
+        }
+        Cur = Key;
+      }
+      if (Cur == Key) {
+        Buckets[Idx].Count.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+    }
+    MaybeFlush();
+  }
+
+  void RecordInvalidate(uint64_t Bytes) {
+    InvalCalls.fetch_add(1, std::memory_order_relaxed);
+    InvalBytes.fetch_add(Bytes, std::memory_order_relaxed);
+  }
+
+  void MaybeFlush() {
+    const uint64_t Now = NowNS();
+    const uint64_t Sec = (Now - BaseNS) / 1000000000ull;
+    uint64_t Last = LastFlushSec.load(std::memory_order_relaxed);
+    if (Sec == Last || !LastFlushSec.compare_exchange_strong(Last, Sec, std::memory_order_acq_rel)) {
+      return;
+    }
+    const uint64_t C = Compiles.load(std::memory_order_relaxed);
+    const uint64_t B = HostBytes.load(std::memory_order_relaxed);
+    const uint64_t N = CompileNS.load(std::memory_order_relaxed);
+    const uint64_t IC = InvalCalls.load(std::memory_order_relaxed);
+    const uint64_t IB = InvalBytes.load(std::memory_order_relaxed);
+    const uint64_t dC = C - PrevCompiles, dB = B - PrevHostBytes, dN = N - PrevCompileNS;
+    const uint64_t dIC = IC - PrevInvalCalls, dIB = IB - PrevInvalBytes;
+    PrevCompiles = C;
+    PrevHostBytes = B;
+    PrevCompileNS = N;
+    PrevInvalCalls = IC;
+    PrevInvalBytes = IB;
+
+    // Top 6 buckets by cumulative count.
+    struct Top {
+      uint64_t Key, Count;
+    } Tops[6] {};
+    for (auto& Bkt : Buckets) {
+      const uint64_t Key = Bkt.Key.load(std::memory_order_relaxed);
+      if (!Key) {
+        continue;
+      }
+      const uint64_t Count = Bkt.Count.load(std::memory_order_relaxed);
+      for (size_t i = 0; i < 6; ++i) {
+        if (Count > Tops[i].Count) {
+          for (size_t j = 5; j > i; --j) {
+            Tops[j] = Tops[j - 1];
+          }
+          Tops[i] = {Key, Count};
+          break;
+        }
+      }
+    }
+    char TopBuf[6 * 40];
+    int Off = 0;
+    for (auto& T : Tops) {
+      if (!T.Key) {
+        break;
+      }
+      Off += snprintf(TopBuf + Off, sizeof(TopBuf) - Off, " %#" PRIx64 ":%" PRIu64, (T.Key - 1) << 24, T.Count);
+    }
+    const uint64_t Ms = (Now - BaseNS) / 1000000ull;
+    dprintf(FD,
+            "[pid %d +%" PRIu64 ".%03" PRIu64 "s] compiles=+%" PRIu64 " (%" PRIu64 ") hostbytes=+%" PRIu64 " (%" PRIu64 ") "
+            "compile_ms=+%" PRIu64 " avg_us=%" PRIu64 " inval=+%" PRIu64 "/%" PRIu64 "B (%" PRIu64 "/%" PRIu64 "B) top16MiB:%s\n",
+            getpid(), Ms / 1000, Ms % 1000, dC, C, dB, B, dN / 1000000ull, dC ? (dN / 1000ull) / dC : 0, dIC, dIB, IC, IB, TopBuf);
+  }
+};
+
+CompileLogState* GetCompileLog() {
+  static CompileLogState* State = [] () -> CompileLogState* {
+    const char* p = getenv("FEX_COMPILELOG");
+    if (!p) {
+      return nullptr;
+    }
+    const int fd = ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+      return nullptr;
+    }
+    auto* S = new CompileLogState();
+    S->FD = fd;
+    S->BaseNS = CompileLogState::NowNS();
+    dprintf(fd, "[pid %d +0.000s] compilelog start\n", getpid());
+    return S;
+  }();
+  return State;
+}
+} // anonymous namespace
 
 namespace FEXCore::Context {
 // SpinLoopClamp spec: "0x<begin>-0x<end>:<induction>:<bound>", registers by
@@ -1403,6 +1554,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
+  auto* CompileLog = GetCompileLog();
+  const uint64_t CompileStartNS = CompileLog ? CompileLogState::NowNS() : 0;
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites, MovImmSites] =
     CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
@@ -1411,6 +1564,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   } else if (!DebugData) {
     // DebugData wasn't populated, indicating another thread raced us for compiling this block
     return reinterpret_cast<uintptr_t>(CodePtr);
+  }
+  if (CompileLog) {
+    CompileLog->RecordCompile(GuestRIP, CompiledCode.Size, CompileLogState::NowNS() - CompileStartNS);
   }
 
   // The core managed to compile the code.
@@ -1613,6 +1769,9 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   // sees the per-page churn the cheap compile tier keys off. No-op unless
   // FEX_SMCCHEAPTIER is set.
   RecordCodeRangeInvalidation(Start, Length);
+  if (auto* CompileLog = GetCompileLog()) {
+    CompileLog->RecordInvalidate(Length);
+  }
 
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
