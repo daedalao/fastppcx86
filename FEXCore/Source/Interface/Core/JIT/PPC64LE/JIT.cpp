@@ -2249,7 +2249,20 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
   auto* Record = reinterpret_cast<PPC64BlockLinkRecord*>(Link);
   auto Thread = Frame->Thread;
   auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
-  const uint64_t GuestRIP = Record->GuestRIP;
+  // An inline-cache record (DEF_OP(ExitFunction), indirect shadow call) has
+  // no constant target: the exit's miss leg stored the one it observed in
+  // State.rip, and that is both the block to dispatch to and the key the
+  // link is registered under. A target that could not be code (near-NULL,
+  // non-canonical) is left to the plain linker's suspect-RIP handling and
+  // never cached.
+  const bool Indirect = Record->GuestRIP == 0;
+  const uint64_t GuestRIP = Indirect ? Frame->State.rip : Record->GuestRIP;
+  if (Indirect) {
+    const int PtrShift = CTX->Config.Is64BitMode() ? 47 : 32;
+    if (GuestRIP < 0x1000 || (GuestRIP >> PtrShift) != 0) {
+      return ExitFunctionLink(Frame, GuestRIP);
+    }
+  }
 
   // Snapshot the code buffer we would be linking into BEFORE any compile can
   // rotate it — same guard as ExitFunctionLink (commit 9c07619e2). A rotation
@@ -2321,16 +2334,31 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
   const int64_t ThunkDelta = static_cast<int64_t>(ThunkStart) - static_cast<int64_t>(FinalAddress);
   const int64_t LinkedEntryDelta = static_cast<int64_t>(LinkedEntry) - static_cast<int64_t>(CallerAddress);
   // The caller-word patch: a plain exit branches straight at its target
-  // (or thunk); a shadow call branches at its own linked leg.
+  // (or thunk); a constant shadow call branches at its own linked leg; an
+  // inline-cache exit's caller word becomes a nop so execution falls into
+  // the guard, whose constant words were written just before (unreachable
+  // until this very store, so never observed half-written).
   auto PatchCaller = [&](uint32_t PlainWord) {
-    if (ShadowCall) {
+    if (Indirect) {
+      uint32_t* Guard = reinterpret_cast<uint32_t*>(CallerAddress + 4); // lis/ori/sldi/oris/ori
+      auto Imm = [&](unsigned i, uint64_t v) {
+        Guard[i] = (Guard[i] & 0xFFFF0000u) | static_cast<uint32_t>(v & 0xFFFFu);
+      };
+      Imm(0, GuestRIP >> 48);
+      Imm(1, GuestRIP >> 32);
+      Imm(3, GuestRIP >> 16);
+      Imm(4, GuestRIP);
+      FEXCore::ArchHelpers::PPC64::FlushICacheRange(Guard, 5 * 4);
+      PPC64PatchInstruction(CallerAddress, 0x60000000u); // nop
+    } else if (ShadowCall) {
       PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(LinkedEntryDelta));
     } else {
       PPC64PatchInstruction(CallerAddress, PlainWord);
     }
   };
+  const bool CallerReachable = !ShadowCall || Indirect || PPC64BranchDisplacementInRange(LinkedEntryDelta);
 
-  if (PPC64BranchDisplacementInRange(DirectDelta) && (!ShadowCall || PPC64BranchDisplacementInRange(LinkedEntryDelta))) {
+  if (PPC64BranchDisplacementInRange(DirectDelta) && CallerReachable) {
     // Registration BEFORE patch, under the same locks: once the patched word
     // is observable, the delinker that undoes it is already findable by
     // Erase. The reverse order would leave a patched branch with no
@@ -2341,7 +2369,7 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     }
     PatchCaller(PPC64EncodeBranch(DirectDelta));
     LinkOutcomeDirect.fetch_add(1, std::memory_order_relaxed);
-  } else if (PPC64BranchDisplacementInRange(ThunkDelta) && (!ShadowCall || PPC64BranchDisplacementInRange(LinkedEntryDelta))) {
+  } else if (PPC64BranchDisplacementInRange(ThunkDelta) && CallerReachable) {
     LinkOutcomeThunk.fetch_add(1, std::memory_order_relaxed);
     Thread->LookupCache->AddBlockLink(GuestRIP, Link, PPC64IndirectBlockDelinker, lk);
 

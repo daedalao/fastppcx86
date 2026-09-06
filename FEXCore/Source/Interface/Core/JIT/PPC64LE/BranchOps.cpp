@@ -538,6 +538,54 @@ DEF_OP(ExitFunction) {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Inline cache for an INDIRECT shadow call [2026-09-06]: on this POWER8
+  // the count cache never predicts the probe's bctrl (see the pairing
+  // comment above), so a monomorphic `call [reg]` / vtable call pays ~20
+  // cycles per execution for nothing. The exit therefore carries a guarded
+  // direct call that the block linker fills on the first miss, keyed on the
+  // target it observed (record.GuestRIP == 0 marks the record indirect):
+  //
+  //   A:      b PROBE                 <- patch site; linked: nop (fall in)
+  //           lis  TMP2, 0            \  five words, imm fields written by
+  //           ori  TMP2, TMP2, 0       |  the linker while A still skips
+  //           sldi TMP2, TMP2, 32      |  them (they are unreachable until
+  //           oris TMP2, TMP2, 0       |  A flips), so no half-written
+  //           ori  TMP2, TMP2, 0      /   constant is ever compared
+  //           cmpd cr7, RIPReg, TMP2
+  //           bne  cr7, PROBE         <- polymorphic: today's path
+  //   LinkedEntry: push(Tramp2) ; Final: bl HostCode ; Tramp2: b Entry
+  //   PROBE:  push(Tramp1) ; L1 probe ; bctrl ; Tramp1
+  //   Miss:   std rip ; b LinkPath    <- the record linker, like a const exit
+  //
+  // First target wins until the target block is erased (the record is
+  // registered under that RIP, so Erase delinks A back to `b PROBE`); a
+  // site that turns out polymorphic pays the 7-instruction guard and takes
+  // the probe. Gated like constant-call linking (CallLinkingEnabled).
+  // ---------------------------------------------------------------------
+  const bool InlineCache = ShadowCall && !ConstRIP && CallLinkingEnabled;
+  PPC64Emitter::Label InlineCacheProbe{};
+  if (InlineCache) {
+    PendingJumpThunks.push_back({GetCursorAddress<uint64_t>(), 0 /* indirect */, {}});
+    LinkPathLabel = &PendingJumpThunks.back().LinkPath;
+    b(&InlineCacheProbe);               // A
+    lis(TMP2, 0);
+    ori(TMP2, TMP2, 0);
+    sldi(TMP2, TMP2, 32);
+    oris(TMP2, TMP2, 0);
+    ori(TMP2, TMP2, 0);
+    cmpd(cr(7), RIPReg, TMP2);
+    bc({4, 30}, &InlineCacheProbe);     // bne cr7
+    auto& Thunk = PendingJumpThunks.back();
+    Thunk.LinkedEntryAddress = GetCursorAddress<uint64_t>();
+    auto Push2 = EmitShadowCallPush();
+    Thunk.FinalAddress = GetCursorAddress<uint64_t>();
+    Emit32(0x7FE00008u);                // Final: trap until linked
+    PatchShadowCallAddi(Push2, GetCursorAddress<uint64_t>());
+    EmitShadowCallTrampoline();         // Tramp2
+    Bind(&InlineCacheProbe);
+  }
+
   // Shadow CALL push, at the patch site for a linkable exit (SinkLinkedRIP
   // is false under ShadowActive, so nothing sits between the registration
   // above and this bcl) and simply before the probe for an indirect one.
@@ -672,6 +720,11 @@ DEF_OP(ExitFunction) {
     // That path compiles/looks up the target AND backpatches the probe above;
     // it dispatches exactly like ExitFunctionLinker otherwise (deferred-signal
     // guard, FillStaticRegs, bctr).
+    b(LinkPathLabel);
+  } else if (InlineCache) {
+    // Indirect shadow call: the record linker reads the target from
+    // State.rip (record.GuestRIP is 0) and fills the guard above.
+    std(RIPReg, rip_off, STATE);
     b(LinkPathLabel);
   } else {
     std(RIPReg, rip_off, STATE); // BEFORE the shared stub's spill clobbers TMP1-TMP4
