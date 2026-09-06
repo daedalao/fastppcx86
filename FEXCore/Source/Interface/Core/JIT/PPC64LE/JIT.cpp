@@ -5739,7 +5739,24 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       ++BlockEmissionIdx;
     }
 
-    if (!DynVRLiveIn.empty()) {
+    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
+    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
+    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
+    // FMA handler can skip its splat. Same-block pairs only by construction.
+    //
+    // Field kill switch (hashed into the code-cache config id).
+    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
+    SplatCandidateLoads.clear();
+    SplatFormLoadNodes.clear();
+
+    // One backward walk of the block feeds two analyses that both used to walk
+    // it separately: the dynamic-FPR live-in masks and the load-and-splat
+    // candidate marking. Both are pure analysis over the same op list, so
+    // sharing the traversal is emission-neutral; the splat marking simply
+    // discovers its candidates in reverse order, and every consumer of
+    // SplatCandidateLoads is a membership test (IdInVec), never an index.
+    const bool WantLiveMask = !DynVRLiveIn.empty();
+    if (WantLiveMask || !DisableSplatFusion) {
       // Backward scan: Live holds the live-after set of the op under the
       // cursor; live-before = (live-after − def) ∪ uses. Args of inline
       // constants and other non-RA'd references carry an Invalid class byte
@@ -5751,30 +5768,59 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       while (1) {
         auto [CodeNode, IROp] = CodeLast();
 
-        uint32_t Def = 0;
-        if (IR::GetHasDest(IROp->Op)) {
-          const IR::PhysicalRegister PR(CodeNode);
-          if (PR.AsRegClass() == IR::RegClass::FPR) {
-            Def = 1u << PR.Reg;
+        if (WantLiveMask) {
+          uint32_t Def = 0;
+          if (IR::GetHasDest(IROp->Op)) {
+            const IR::PhysicalRegister PR(CodeNode);
+            if (PR.AsRegClass() == IR::RegClass::FPR) {
+              Def = 1u << PR.Reg;
+            }
           }
+
+          uint32_t Use = 0;
+          const int NumArgs = IR::GetRAArgs(IROp->Op);
+          for (int i = 0; i < NumArgs; ++i) {
+            const auto Arg = IROp->Args[i];
+            if (Arg.IsInvalid()) {
+              continue;
+            }
+            const IR::PhysicalRegister PR =
+              Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
+            if (PR.AsRegClass() == IR::RegClass::FPR) {
+              Use |= 1u << PR.Reg;
+            }
+          }
+
+          Live = (Live & ~Def) | Use;
+          DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
         }
 
-        uint32_t Use = 0;
-        const int NumArgs = IR::GetRAArgs(IROp->Op);
-        for (int i = 0; i < NumArgs; ++i) {
-          const auto Arg = IROp->Args[i];
-          if (Arg.IsInvalid()) {
-            continue;
+        if (!DisableSplatFusion) {
+          switch (IROp->Op) {
+          case IR::OP_VFMLASCALARINSERT:
+          case IR::OP_VFMLSSCALARINSERT:
+          case IR::OP_VFNMLASCALARINSERT:
+          case IR::OP_VFNMLSSCALARINSERT: {
+            auto FOp = IROp->C<IR::IROp_VFMLAScalarInsert>();
+            if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
+              break;
+            }
+            for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
+              if (Arg.IsImmediate() || Arg == FOp->Upper) {
+                continue;
+              }
+              auto DefNode = IRView->GetNode(Arg);
+              auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
+              if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
+                  DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
+                SplatCandidateLoads.push_back(Arg.ID().Value);
+              }
+            }
+            break;
           }
-          const IR::PhysicalRegister PR =
-            Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
-          if (PR.AsRegClass() == IR::RegClass::FPR) {
-            Use |= 1u << PR.Reg;
+          default: break;
           }
         }
-
-        Live = (Live & ~Def) | Use;
-        DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
 
         if (CodeLast == CodeBegin) {
           break;
@@ -6082,41 +6128,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     XERProjectionValid = false;
     LastConstantCache.Valid = false;
 
-    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
-    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
-    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
-    // FMA handler can skip its splat. Same-block pairs only by construction.
-    SplatCandidateLoads.clear();
-    SplatFormLoadNodes.clear();
-    // Field kill switch (hashed into the code-cache config id).
-    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
-    if (!DisableSplatFusion)
-    for (auto [CandNode, CandIROp] : IRView->GetCode(BlockNode)) {
-      switch (CandIROp->Op) {
-      case IR::OP_VFMLASCALARINSERT:
-      case IR::OP_VFMLSSCALARINSERT:
-      case IR::OP_VFNMLASCALARINSERT:
-      case IR::OP_VFNMLSSCALARINSERT: {
-        auto FOp = CandIROp->C<IR::IROp_VFMLAScalarInsert>();
-        if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
-          break;
-        }
-        for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
-          if (Arg.IsImmediate() || Arg == FOp->Upper) {
-            continue;
-          }
-          auto DefNode = IRView->GetNode(Arg);
-          auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
-          if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
-              DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
-            SplatCandidateLoads.push_back(Arg.ID().Value);
-          }
-        }
-        break;
-      }
-      default: break;
-      }
-    }
+    // The load-and-splat pre-pass that used to walk the block here now rides
+    // the backward analysis walk at the top of this block iteration.
 
     // EntryPoint blocks ONLY. This record used to fire for every IR block,
     // logging a zero-byte occurrence for the non-entry ones -- which left the
