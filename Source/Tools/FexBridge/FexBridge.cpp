@@ -1668,6 +1668,25 @@ int fexbridge_run(void* thread, void* ctx) {
     }
   }
 
+  // A nested run is a re-entrant guest run with an OUTER block suspended on
+  // the host stack (mid EC call), and its return address lives in whatever
+  // code buffer that block was compiled into.  CPUBackend retires a buffer
+  // the moment it rotates or grows unless the frame's
+  // SignalHandlerRefCounter says a re-entrant run is in progress -- the
+  // JIT's own CallbackPtr re-entry bumps it for exactly this reason
+  // (PPC64Dispatcher.cpp, DEF_OP(CallbackReturn)); the bridge's nested run
+  // never did.  So a nested run that compiled enough to grow the buffer
+  // freed the outer block under its own caller, and the outer EC call
+  // returned into unmapped memory: nw-cp2077's libxess DllMain (a
+  // 64-deep initterm callback nest) died with a host fault whose LR == PC
+  // pointed into the retired buffer, only when FEX_SHADOWRETSTACK's larger
+  // call exits moved the growth into the nest [2026-09-06].  Hold the
+  // count for the nested run's whole life, both exit arms; the SMC
+  // redirect's r1 restore is gated on the same count and correctly treats
+  // a nested run as nesting.
+  if (Nested) {
+    ++BT->Thread->CurrentFrame->SignalHandlerRefCounter;
+  }
   int Reason;
   if (sigsetjmp(F.JB, 1) == 0) {
     CTX->ExecuteThread(BT->Thread);
@@ -1706,6 +1725,9 @@ int fexbridge_run(void* thread, void* ctx) {
     // fexbridge_fault_unwind landed here; guest state was reconstructed from
     // the host fault context before the jump.
     Reason = FEXBRIDGE_RUN_FAULT;
+  }
+  if (Nested) {
+    --BT->Thread->CurrentFrame->SignalHandlerRefCounter;
   }
   BT->RunTop = F.Prev;
 
