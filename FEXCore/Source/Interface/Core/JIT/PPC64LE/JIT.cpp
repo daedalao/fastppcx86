@@ -2192,6 +2192,18 @@ void PPC64PatchInstruction(uintptr_t Address, uint32_t Word) {
   FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Address), 4);
 }
 
+// Conditional form: rewrite only if the word still reads Expected. An
+// inline-cache patch word has three states (b MISS / nop / b PROBE) and only
+// the first may be advanced, by whichever thread gets there first; a site
+// that is already linked or given up keeps its live guard words untouched.
+bool PPC64PatchInstructionIf(uintptr_t Address, uint32_t Expected, uint32_t Word) {
+  if (!std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Address)).compare_exchange_strong(Expected, Word, std::memory_order_relaxed)) {
+    return false;
+  }
+  FEXCore::ArchHelpers::PPC64::FlushICacheRange(reinterpret_cast<void*>(Address), 4);
+  return true;
+}
+
 // Both delinkers run under the LookupCache WRITE lock (GuestToHostMap::Erase
 // walks BlockLinks under it) and must restore the exact pre-link instruction
 // with one atomic 4-byte store. No LOGMAN dependence anywhere on this path.
@@ -2267,7 +2279,7 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
     }
     const uintptr_t A = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
     const uintptr_t Probe = reinterpret_cast<uintptr_t>(Record) + Record->LinkedEntryOffset;
-    PPC64PatchInstruction(A, PPC64EncodeBranch(static_cast<int64_t>(Probe) - static_cast<int64_t>(A)));
+    PPC64PatchInstructionIf(A, Record->OrigCallerWord, PPC64EncodeBranch(static_cast<int64_t>(Probe) - static_cast<int64_t>(A)));
   };
   if (Indirect) {
     const int PtrShift = CTX->Config.Is64BitMode() ? 47 : 32;
@@ -2333,6 +2345,14 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
   }
 
   const uintptr_t CallerAddress = reinterpret_cast<uintptr_t>(Record) + Record->CallerOffset;
+  // An inline-cache site is linked at most once per (un)link cycle: a
+  // polymorphic site's other targets arrive here through the probe's miss
+  // leg with the guard already live, and its constant words must not be
+  // rewritten under a thread that may be comparing against them. Dispatch
+  // without touching the site.
+  if (Indirect && std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).load(std::memory_order_relaxed) != Record->OrigCallerWord) {
+    return HostCode;
+  }
   const uintptr_t ThunkStart = reinterpret_cast<uintptr_t>(Record) - PPC64LinkRecordFromThunkStart;
   // A shadow-call exit (FEX_SHADOWRETSTACK link-stack pairing, see
   // DEF_OP(ExitFunction)) branches from its Final word, not from the caller
@@ -2362,7 +2382,7 @@ uint64_t PPC64JITCore::ExitFunctionLinkWithRecord(FEXCore::Core::CpuStateFrame* 
       Imm(3, GuestRIP >> 16);
       Imm(4, GuestRIP);
       FEXCore::ArchHelpers::PPC64::FlushICacheRange(Guard, 5 * 4);
-      PPC64PatchInstruction(CallerAddress, 0x60000000u); // nop
+      PPC64PatchInstructionIf(CallerAddress, Record->OrigCallerWord, 0x60000000u); // nop
     } else if (ShadowCall) {
       PPC64PatchInstruction(CallerAddress, PPC64EncodeBranch(LinkedEntryDelta));
     } else {
