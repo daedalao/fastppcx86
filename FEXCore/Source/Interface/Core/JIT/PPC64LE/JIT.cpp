@@ -3854,16 +3854,90 @@ void PPC64JITCore::Compute32MaskElision() {
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
   static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
   static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
+  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+  static const bool PairOff = PairEnv && PairEnv[0] == '0';
   Elide32MaskSet.assign(IR->GetSSACount(), false);
-  if (ZExtOff) {
+  // ComputeTSOPairElision's per-block scan is folded into this walk (it needs
+  // exactly the same block/code iteration and shares nothing else with it), so
+  // the two passes cost one traversal of the IR rather than two. The
+  // TSO-pair state machine below is verbatim from that function -- see its
+  // block comment for the whitelist's verification table. Both halves keep
+  // their own kill switch, and the walk is skipped entirely only when both
+  // are off.
+  TSOPairElideSet.assign(IR->GetSSACount(), false);
+  if (ZExtOff && PairOff) {
     return;
   }
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     IR::Ref PrevNode = nullptr;
     const IR::IROp_Header* PrevOp = nullptr;
+    // Reset per block: a block can be entered from anywhere, so nothing about
+    // the previously emitted block's trailing barrier state may be assumed.
+    bool Fresh = false;
 
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      if (!PairOff) {
+        switch (IROp->Op) {
+        case IR::OP_LOADMEMTSO:
+          Fresh = true;
+          break;
+
+        case IR::OP_STOREMEMTSO:
+          if (Fresh) {
+            TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
+          }
+          Fresh = false;
+          break;
+
+        // Whitelist -- see the verification table at ComputeTSOPairElision.
+        case IR::OP_DUMMY:
+        case IR::OP_IRHEADER:
+        case IR::OP_CODEBLOCK:
+        case IR::OP_BEGINBLOCK:
+        case IR::OP_ENDBLOCK:
+        case IR::OP_INVALIDATEFLAGS:
+        case IR::OP_INLINECONSTANT:
+        case IR::OP_INLINEENTRYPOINTOFFSET:
+        case IR::OP_GUESTOPCODE:
+        case IR::OP_SETSMALLNZV:
+        case IR::OP_TELEMETRYSETVALUE:
+        case IR::OP_WFET:
+        case IR::OP_CONSTANT:
+        case IR::OP_ENTRYPOINTOFFSET:
+        case IR::OP_COPY:
+        case IR::OP_BFE:
+        case IR::OP_SBFE:
+        case IR::OP_ADD:
+        case IR::OP_SUB:
+        case IR::OP_NEG:
+        case IR::OP_NOT:
+        case IR::OP_OR:
+        case IR::OP_AND:
+        case IR::OP_XOR:
+        case IR::OP_ANDN:
+        case IR::OP_LSHL:
+        case IR::OP_LSHR:
+        case IR::OP_ASHR:
+        case IR::OP_ADDWITHFLAGS:
+        case IR::OP_SUBWITHFLAGS:
+        case IR::OP_ADDNZCV:
+        case IR::OP_SUBNZCV:
+        case IR::OP_TESTNZ:
+        case IR::OP_TESTZ:
+        case IR::OP_ANDWITHFLAGS:
+          break;
+
+        default:
+          Fresh = false;
+          break;
+        }
+      }
+
+      if (ZExtOff) {
+        continue;
+      }
+
       // Emission no-ops (Op_NoOp table entries) are transparent to the
       // "immediately next op" adjacency test: they emit no host code and, as
       // non-uses, cannot spill or observe the pending def. Without this the
@@ -4633,87 +4707,16 @@ void PPC64JITCore::ComputeHighZeroElision() {
 // here but are left out of v1: they conservatively clear Fresh like any other
 // memory op (missed elision only).
 // -------------------------------------------------------------------------
-void PPC64JITCore::ComputeTSOPairElision() {
-  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
-  static const bool PairOff = PairEnv && PairEnv[0] == '0';
-  TSOPairElideSet.assign(IR->GetSSACount(), false);
-  if (PairOff) {
-    return;
-  }
-
-  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    // Reset per block: a block can be entered from anywhere, so nothing about
-    // the previously emitted block's trailing barrier state may be assumed.
-    bool Fresh = false;
-
-    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-      switch (IROp->Op) {
-      case IR::OP_LOADMEMTSO:
-        Fresh = true;
-        break;
-
-      case IR::OP_STOREMEMTSO:
-        if (Fresh) {
-          TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
-        }
-        Fresh = false;
-        break;
-
-      // Whitelist — see the verification table above.
-      case IR::OP_DUMMY:
-      case IR::OP_IRHEADER:
-      case IR::OP_CODEBLOCK:
-      case IR::OP_BEGINBLOCK:
-      case IR::OP_ENDBLOCK:
-      case IR::OP_INVALIDATEFLAGS:
-      case IR::OP_INLINECONSTANT:
-      case IR::OP_INLINEENTRYPOINTOFFSET:
-      case IR::OP_GUESTOPCODE:
-      case IR::OP_SETSMALLNZV:
-      case IR::OP_TELEMETRYSETVALUE:
-      case IR::OP_WFET:
-      case IR::OP_CONSTANT:
-      case IR::OP_ENTRYPOINTOFFSET:
-      case IR::OP_COPY:
-      case IR::OP_BFE:
-      case IR::OP_SBFE:
-      case IR::OP_ADD:
-      case IR::OP_SUB:
-      case IR::OP_NEG:
-      case IR::OP_NOT:
-      case IR::OP_OR:
-      case IR::OP_AND:
-      case IR::OP_XOR:
-      case IR::OP_ANDN:
-      case IR::OP_LSHL:
-      case IR::OP_LSHR:
-      case IR::OP_ASHR:
-      case IR::OP_ADDWITHFLAGS:
-      case IR::OP_SUBWITHFLAGS:
-      case IR::OP_ADDNZCV:
-      case IR::OP_SUBNZCV:
-      case IR::OP_TESTNZ:
-      case IR::OP_TESTZ:
-      case IR::OP_ANDWITHFLAGS:
-        break;
-
-      default:
-        Fresh = false;
-        break;
-      }
-    }
-  }
-}
+// ComputeTSOPairElision's walk now runs inside Compute32MaskElision (see the
+// fold note there); this shim keeps the entry point and its FEX_TSOPAIRELIDE
+// kill switch documented at the historical location.
+void PPC64JITCore::ComputeTSOPairElision() {}
 
 void PPC64JITCore::AnalyzeSpinLoops() {
-  struct BlockInfo {
-    uint32_t ID = UINT32_MAX;
-    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX};  // CodeBlock IDs
-    uint32_t OpCount = 0;
-    bool Clean = false;
-    bool HasPollLoad = false;
-    IR::Ref Node = nullptr;  // for the SpinCollapse pattern re-walk
-  };
+  // BlockInfo/Blocks/IdxOfID moved to members (SpinBlockInfo/SpinBlocks/
+  // SpinIdxOfID in JITClass.h) so their storage is reused across compiles
+  // instead of being malloc'd and freed once per compiled block.
+  using BlockInfo = SpinBlockInfo;
 
   // SpinCollapse marks are per-compile; reset before any region matching so
   // a block that stops qualifying can never inherit a stale mark. Bounds
@@ -5659,7 +5662,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // and it only ever REMOVES rldicl instructions, so ComputeTSOPairElision's
   // "emits zero memory-access host instructions" whitelist is unaffected.
   ComputeHighZeroElision();
-  ComputeTSOPairElision();
+  // ComputeTSOPairElision's walk is folded into Compute32MaskElision above.
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
