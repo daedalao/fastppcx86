@@ -107,20 +107,31 @@ struct BlockInfo {
 };
 
 struct ControlFlowGraph {
+  // Persistent across Run() invocations (the graph lives in the pass object,
+  // which is per-thread). BlockMap is only ever grown, and each entry's
+  // Predecessors vector is clear()ed rather than destroyed, so the whole
+  // structure stops allocating after the first few compiles. Previously this
+  // was a function-local built from scratch every compile: one malloc for
+  // BlockMap plus one malloc+free per block for its Predecessors::reserve(2),
+  // which for the typical few-block compile unit was the single largest
+  // source of allocator traffic in the compile pipeline.
   fextl::vector<BlockInfo> BlockMap;
-  IRListView& IR;
+  IRListView* IR {};
 
   void Init(fextl::deque<uint32_t>& Worklist, uint32_t BlockCount) {
-    BlockMap.resize(BlockCount);
+    if (BlockMap.size() < BlockCount) {
+      BlockMap.resize(BlockCount);
+    }
 
     for (unsigned ID = 0; ID < BlockCount; ++ID) {
-      // Add the block with conservative flags and already in the worklist.
-      auto Info = BlockInfo {{}, nullptr, FLAG_ALL, true};
+      // Reset to conservative flags and already in the worklist. clear()
+      // keeps the Predecessors allocation from the previous compile.
+      auto& Info = BlockMap[ID];
+      Info.Predecessors.clear();
+      Info.Node = nullptr;
+      Info.Flags = FLAG_ALL;
+      Info.InWorklist = true;
 
-      // Add some initial capacity
-      Info.Predecessors.reserve(2);
-
-      BlockMap[ID] = std::move(Info);
       Worklist.push_back(ID);
     }
   }
@@ -134,7 +145,7 @@ struct ControlFlowGraph {
   }
 
   BlockInfo* Get(OrderedNodeWrapper Block) {
-    return Get(IR.GetOp<IR::IROp_CodeBlock>(Block));
+    return Get(IR->GetOp<IR::IROp_CodeBlock>(Block));
   }
 
   void RecordEdge(uint32_t From, OrderedNodeWrapper To) {
@@ -165,6 +176,10 @@ public:
   static unsigned FlagsForCondClassType(CondClass Cond);
 
 private:
+  // Reused across compiles; see ControlFlowGraph::BlockMap.
+  ControlFlowGraph CFG {};
+  fextl::deque<uint32_t> Worklist;
+
   bool EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
@@ -364,6 +379,21 @@ constexpr auto FlagInfos = std::invoke([] {
   return ret;
 });
 
+// Inline fast path for Classify. The overwhelming majority of ops are not
+// Special, so their whole classification is the one indexed load below --
+// but Classify itself is a large out-of-line function that clang will not
+// inline into its per-op callers, so every op was paying a call to reach a
+// table lookup. Callers go through this wrapper and only make the call for
+// the handful of opcodes whose answer depends on operand fields. Identical
+// by construction: it is Classify's own opening test, duplicated.
+[[nodiscard]] __attribute__((always_inline)) static inline FlagInfo ClassifyFast(IROp_Header* IROp) {
+  const FlagInfo Info = FlagInfos[IROp->Op];
+  if (!Info.Special()) {
+    return Info;
+  }
+  return DeadFlagCalculationEliminination::Classify(IROp);
+}
+
 FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
   FlagInfo Info = FlagInfos[IROp->Op];
   if (!Info.Special()) {
@@ -470,7 +500,7 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
 // fuse the wrong compare -- silent and data-dependent -- so the answer is
 // derived from the table above rather than restated.
 bool IROpWritesNZCV(IROp_Header* IROp) {
-  return (DeadFlagCalculationEliminination::Classify(IROp).Write() & FLAG_NZCV) != 0;
+  return (ClassifyFast(IROp).Write() & FLAG_NZCV) != 0;
 }
 
 // General purpose dead code elimination. Returns whether flag handling should
@@ -659,7 +689,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
       // This order is important: instructions that read-modify-write flags
       // (like adcs) first read flags, then write flags. Since we're iterating
       // the block backwards, that means we handle the write first.
-      struct FlagInfo Info = Classify(IROp);
+      struct FlagInfo Info = ClassifyFast(IROp);
 
       if (!Info.Trivial()) {
         bool Eliminated = false;
@@ -843,10 +873,15 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
 
   auto CurrentIR = IREmit->ViewIR();
-  fextl::deque<uint32_t> Worklist;
+
+  // Both of these are pass members so their storage survives between compiles
+  // (see the note on ControlFlowGraph::BlockMap). deque::clear() drops back to
+  // a single node rather than releasing the map, so the worklist also stops
+  // allocating.
+  Worklist.clear();
 
   // Initialize CFG
-  ControlFlowGraph CFG {.IR = CurrentIR};
+  CFG.IR = &CurrentIR;
   CFG.Init(Worklist, CurrentIR.GetHeader()->BlockCount);
 
   // Gather CFG

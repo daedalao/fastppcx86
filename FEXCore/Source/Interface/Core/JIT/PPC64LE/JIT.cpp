@@ -44,6 +44,7 @@ $end_info$
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfenv>
 #include <cstdio>
@@ -51,6 +52,7 @@ $end_info$
 #include <mutex>
 #include <string_view>
 #include <unistd.h>
+#include <xxhash.h>
 
 namespace FEXCore::CPU {
 
@@ -3853,16 +3855,90 @@ void PPC64JITCore::Compute32MaskElision() {
   static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
   static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
   static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
+  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+  static const bool PairOff = PairEnv && PairEnv[0] == '0';
   Elide32MaskSet.assign(IR->GetSSACount(), false);
-  if (ZExtOff) {
+  // ComputeTSOPairElision's per-block scan is folded into this walk (it needs
+  // exactly the same block/code iteration and shares nothing else with it), so
+  // the two passes cost one traversal of the IR rather than two. The
+  // TSO-pair state machine below is verbatim from that function -- see its
+  // block comment for the whitelist's verification table. Both halves keep
+  // their own kill switch, and the walk is skipped entirely only when both
+  // are off.
+  TSOPairElideSet.assign(IR->GetSSACount(), false);
+  if (ZExtOff && PairOff) {
     return;
   }
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     IR::Ref PrevNode = nullptr;
     const IR::IROp_Header* PrevOp = nullptr;
+    // Reset per block: a block can be entered from anywhere, so nothing about
+    // the previously emitted block's trailing barrier state may be assumed.
+    bool Fresh = false;
 
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      if (!PairOff) {
+        switch (IROp->Op) {
+        case IR::OP_LOADMEMTSO:
+          Fresh = true;
+          break;
+
+        case IR::OP_STOREMEMTSO:
+          if (Fresh) {
+            TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
+          }
+          Fresh = false;
+          break;
+
+        // Whitelist -- see the verification table at ComputeTSOPairElision.
+        case IR::OP_DUMMY:
+        case IR::OP_IRHEADER:
+        case IR::OP_CODEBLOCK:
+        case IR::OP_BEGINBLOCK:
+        case IR::OP_ENDBLOCK:
+        case IR::OP_INVALIDATEFLAGS:
+        case IR::OP_INLINECONSTANT:
+        case IR::OP_INLINEENTRYPOINTOFFSET:
+        case IR::OP_GUESTOPCODE:
+        case IR::OP_SETSMALLNZV:
+        case IR::OP_TELEMETRYSETVALUE:
+        case IR::OP_WFET:
+        case IR::OP_CONSTANT:
+        case IR::OP_ENTRYPOINTOFFSET:
+        case IR::OP_COPY:
+        case IR::OP_BFE:
+        case IR::OP_SBFE:
+        case IR::OP_ADD:
+        case IR::OP_SUB:
+        case IR::OP_NEG:
+        case IR::OP_NOT:
+        case IR::OP_OR:
+        case IR::OP_AND:
+        case IR::OP_XOR:
+        case IR::OP_ANDN:
+        case IR::OP_LSHL:
+        case IR::OP_LSHR:
+        case IR::OP_ASHR:
+        case IR::OP_ADDWITHFLAGS:
+        case IR::OP_SUBWITHFLAGS:
+        case IR::OP_ADDNZCV:
+        case IR::OP_SUBNZCV:
+        case IR::OP_TESTNZ:
+        case IR::OP_TESTZ:
+        case IR::OP_ANDWITHFLAGS:
+          break;
+
+        default:
+          Fresh = false;
+          break;
+        }
+      }
+
+      if (ZExtOff) {
+        continue;
+      }
+
       // Emission no-ops (Op_NoOp table entries) are transparent to the
       // "immediately next op" adjacency test: they emit no host code and, as
       // non-uses, cannot spill or observe the pending def. Without this the
@@ -4632,87 +4708,16 @@ void PPC64JITCore::ComputeHighZeroElision() {
 // here but are left out of v1: they conservatively clear Fresh like any other
 // memory op (missed elision only).
 // -------------------------------------------------------------------------
-void PPC64JITCore::ComputeTSOPairElision() {
-  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
-  static const bool PairOff = PairEnv && PairEnv[0] == '0';
-  TSOPairElideSet.assign(IR->GetSSACount(), false);
-  if (PairOff) {
-    return;
-  }
-
-  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    // Reset per block: a block can be entered from anywhere, so nothing about
-    // the previously emitted block's trailing barrier state may be assumed.
-    bool Fresh = false;
-
-    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-      switch (IROp->Op) {
-      case IR::OP_LOADMEMTSO:
-        Fresh = true;
-        break;
-
-      case IR::OP_STOREMEMTSO:
-        if (Fresh) {
-          TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
-        }
-        Fresh = false;
-        break;
-
-      // Whitelist — see the verification table above.
-      case IR::OP_DUMMY:
-      case IR::OP_IRHEADER:
-      case IR::OP_CODEBLOCK:
-      case IR::OP_BEGINBLOCK:
-      case IR::OP_ENDBLOCK:
-      case IR::OP_INVALIDATEFLAGS:
-      case IR::OP_INLINECONSTANT:
-      case IR::OP_INLINEENTRYPOINTOFFSET:
-      case IR::OP_GUESTOPCODE:
-      case IR::OP_SETSMALLNZV:
-      case IR::OP_TELEMETRYSETVALUE:
-      case IR::OP_WFET:
-      case IR::OP_CONSTANT:
-      case IR::OP_ENTRYPOINTOFFSET:
-      case IR::OP_COPY:
-      case IR::OP_BFE:
-      case IR::OP_SBFE:
-      case IR::OP_ADD:
-      case IR::OP_SUB:
-      case IR::OP_NEG:
-      case IR::OP_NOT:
-      case IR::OP_OR:
-      case IR::OP_AND:
-      case IR::OP_XOR:
-      case IR::OP_ANDN:
-      case IR::OP_LSHL:
-      case IR::OP_LSHR:
-      case IR::OP_ASHR:
-      case IR::OP_ADDWITHFLAGS:
-      case IR::OP_SUBWITHFLAGS:
-      case IR::OP_ADDNZCV:
-      case IR::OP_SUBNZCV:
-      case IR::OP_TESTNZ:
-      case IR::OP_TESTZ:
-      case IR::OP_ANDWITHFLAGS:
-        break;
-
-      default:
-        Fresh = false;
-        break;
-      }
-    }
-  }
-}
+// ComputeTSOPairElision's walk now runs inside Compute32MaskElision (see the
+// fold note there); this shim keeps the entry point and its FEX_TSOPAIRELIDE
+// kill switch documented at the historical location.
+void PPC64JITCore::ComputeTSOPairElision() {}
 
 void PPC64JITCore::AnalyzeSpinLoops() {
-  struct BlockInfo {
-    uint32_t ID = UINT32_MAX;
-    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX};  // CodeBlock IDs
-    uint32_t OpCount = 0;
-    bool Clean = false;
-    bool HasPollLoad = false;
-    IR::Ref Node = nullptr;  // for the SpinCollapse pattern re-walk
-  };
+  // BlockInfo/Blocks/IdxOfID moved to members (SpinBlockInfo/SpinBlocks/
+  // SpinIdxOfID in JITClass.h) so their storage is reused across compiles
+  // instead of being malloc'd and freed once per compiled block.
+  using BlockInfo = SpinBlockInfo;
 
   // SpinCollapse marks are per-compile; reset before any region matching so
   // a block that stops qualifying can never inherit a stale mark. Bounds
@@ -4721,12 +4726,15 @@ void PPC64JITCore::AnalyzeSpinLoops() {
   SpinCollapseBranches.assign(IR->GetSSACount(), false);
   SpinCollapseBranchSigned.assign(IR->GetSSACount(), false);
 
-  fextl::vector<BlockInfo> Blocks;
+  auto& Blocks = SpinBlocks;
+  Blocks.clear();
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
   Blocks.reserve(NumBlocks);
   // CodeBlock ID -> layout index (IDs are dense 0..NumBlocks-1, same keying
   // as JumpTargets).
-  fextl::vector<uint32_t> IdxOfID(NumBlocks, UINT32_MAX);
+  auto& IdxOfID = SpinIdxOfID;
+  IdxOfID.clear();
+  IdxOfID.resize(NumBlocks, UINT32_MAX);
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
@@ -5178,6 +5186,79 @@ void PPC64JITCore::AnalyzeSpinLoops() {
 // -------------------------------------------------------------------------
 // CompileCode: main entry point — translate IR to PPC64LE code
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Per-op emission-loop cache-lifecycle flags.
+//
+// CompileCode's emission loop used to run three separate switch dispatches
+// over IROp->Op around every handler call, each answering one yes/no question
+// about a JIT-side cache. This table answers all three with a single indexed
+// byte load. Every bit's membership is the verbatim case list of the switch
+// it replaces; the comments at the use sites carry the soundness argument.
+// -------------------------------------------------------------------------
+static constexpr uint8_t kOpCacheKeepAES   = 1u << 0; // AES byte-reverse mask park survives
+static constexpr uint8_t kOpCacheKeepXER   = 1u << 1; // XER->CR1 projection survives
+static constexpr uint8_t kOpCacheKeepConst = 1u << 2; // LastConstantCache survives
+static constexpr uint8_t kOpCacheConstBody = 1u << 3; // ... and needs the per-op body
+
+static constexpr auto OpCacheFlags = [] {
+  std::array<uint8_t, static_cast<size_t>(IR::IROps::OP_LAST) + 1> T {};
+
+  for (auto Op : {IR::OP_VAESENC, IR::OP_VAESENCLAST, IR::OP_VAESDEC, IR::OP_VAESDECLAST, IR::OP_VAESIMC}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepAES;
+  }
+
+  for (auto Op : {IR::OP_NZCVSELECT, IR::OP_NZCVSELECTV, IR::OP_NZCVSELECTINCREMENT, IR::OP_STOREREGISTER,
+                  IR::OP_LOADREGISTER, IR::OP_CONSTANT, IR::OP_INLINECONSTANT}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepXER;
+  }
+
+  for (auto Op : {IR::OP_VFADDSCALARINSERT, IR::OP_VFSUBSCALARINSERT, IR::OP_VFMULSCALARINSERT,
+                  IR::OP_VFDIVSCALARINSERT, IR::OP_VFMINSCALARINSERT, IR::OP_VFMAXSCALARINSERT,
+                  IR::OP_VFMLASCALARINSERT, IR::OP_VFMLSSCALARINSERT, IR::OP_VFNMLASCALARINSERT,
+                  IR::OP_VFNMLSSCALARINSERT, IR::OP_LOADNAMEDVECTORCONSTANT}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheKeepConst;
+  }
+
+  // Constant / LoadMem / LoadMemTSO reach the switch body: they may SET the
+  // cache (Constant) or invalidate conditionally on the operand class.
+  for (auto Op : {IR::OP_CONSTANT, IR::OP_LOADMEM, IR::OP_LOADMEMTSO}) {
+    T[static_cast<size_t>(Op)] |= kOpCacheConstBody;
+  }
+
+  return T;
+}();
+
+// -------------------------------------------------------------------------
+// FEX_CODEHASHLOG=<path>: emitted-code identity gate (diagnostic only).
+//
+// Appends one line per compiled block:
+//     <GuestRIP hex> <host byte count> <xxh64 of the emitted bytes>
+// so two builds can be compared for byte-identical codegen. OFF by default;
+// when off the cost is a single test of an already-loaded pointer per block
+// (CodeHashLogFile is a function-local static initialised once).
+//
+// The hash covers [BlockBegin, BlockBegin+CodeSize) -- the code region only,
+// before the JITCodeTail is written. Host addresses embedded in the code
+// (LoadConstant of a helper address, thunk record contents) make the hash
+// ASLR-dependent, hence the size column: run under `setarch -R` for a
+// run-to-run reproducible hash, or fall back to comparing (RIP, size).
+// -------------------------------------------------------------------------
+static FILE* CodeHashLogFile() {
+  static FILE* F = [] () -> FILE* {
+    const char* Path = getenv("FEX_CODEHASHLOG");
+    if (!Path || !Path[0]) {
+      return nullptr;
+    }
+    FILE* Out = fopen(Path, "ae");
+    if (Out) {
+      setvbuf(Out, nullptr, _IOLBF, 0);
+    }
+    return Out;
+  }();
+  return F;
+}
+static std::mutex CodeHashLogLock;
+
 CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     uint64_t Entry, uint64_t GuestSize, bool SingleInst,
     const FEXCore::IR::IRListView* IRView,
@@ -5610,7 +5691,10 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // helper call; saving a possibly-garbage register is harmless, losing a
   // written one is not). FEX_NO_ABI_LIVEMASK reverts to full saves for A/B.
   static const bool DisableABILiveMask = getenv("FEX_NO_ABI_LIVEMASK") != nullptr;
-  fextl::vector<uint32_t> DynVRLiveIn;
+  // Member storage (JITClass.h) so the buffer is reused between compiles; as
+  // a local this assign() was a malloc + free on every compiled block.
+  auto& DynVRLiveIn = DynVRLiveInStorage;
+  DynVRLiveIn.clear();
   if (!DisableABILiveMask) {
     DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
   }
@@ -5621,7 +5705,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // and it only ever REMOVES rldicl instructions, so ComputeTSOPairElision's
   // "emits zero memory-access host instructions" whitelist is unaffected.
   ComputeHighZeroElision();
-  ComputeTSOPairElision();
+  // ComputeTSOPairElision's walk is folded into Compute32MaskElision above.
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
@@ -5655,7 +5739,24 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       ++BlockEmissionIdx;
     }
 
-    if (!DynVRLiveIn.empty()) {
+    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
+    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
+    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
+    // FMA handler can skip its splat. Same-block pairs only by construction.
+    //
+    // Field kill switch (hashed into the code-cache config id).
+    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
+    SplatCandidateLoads.clear();
+    SplatFormLoadNodes.clear();
+
+    // One backward walk of the block feeds two analyses that both used to walk
+    // it separately: the dynamic-FPR live-in masks and the load-and-splat
+    // candidate marking. Both are pure analysis over the same op list, so
+    // sharing the traversal is emission-neutral; the splat marking simply
+    // discovers its candidates in reverse order, and every consumer of
+    // SplatCandidateLoads is a membership test (IdInVec), never an index.
+    const bool WantLiveMask = !DynVRLiveIn.empty();
+    if (WantLiveMask || !DisableSplatFusion) {
       // Backward scan: Live holds the live-after set of the op under the
       // cursor; live-before = (live-after − def) ∪ uses. Args of inline
       // constants and other non-RA'd references carry an Invalid class byte
@@ -5667,30 +5768,59 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       while (1) {
         auto [CodeNode, IROp] = CodeLast();
 
-        uint32_t Def = 0;
-        if (IR::GetHasDest(IROp->Op)) {
-          const IR::PhysicalRegister PR(CodeNode);
-          if (PR.AsRegClass() == IR::RegClass::FPR) {
-            Def = 1u << PR.Reg;
+        if (WantLiveMask) {
+          uint32_t Def = 0;
+          if (IR::GetHasDest(IROp->Op)) {
+            const IR::PhysicalRegister PR(CodeNode);
+            if (PR.AsRegClass() == IR::RegClass::FPR) {
+              Def = 1u << PR.Reg;
+            }
           }
+
+          uint32_t Use = 0;
+          const int NumArgs = IR::GetRAArgs(IROp->Op);
+          for (int i = 0; i < NumArgs; ++i) {
+            const auto Arg = IROp->Args[i];
+            if (Arg.IsInvalid()) {
+              continue;
+            }
+            const IR::PhysicalRegister PR =
+              Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
+            if (PR.AsRegClass() == IR::RegClass::FPR) {
+              Use |= 1u << PR.Reg;
+            }
+          }
+
+          Live = (Live & ~Def) | Use;
+          DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
         }
 
-        uint32_t Use = 0;
-        const int NumArgs = IR::GetRAArgs(IROp->Op);
-        for (int i = 0; i < NumArgs; ++i) {
-          const auto Arg = IROp->Args[i];
-          if (Arg.IsInvalid()) {
-            continue;
+        if (!DisableSplatFusion) {
+          switch (IROp->Op) {
+          case IR::OP_VFMLASCALARINSERT:
+          case IR::OP_VFMLSSCALARINSERT:
+          case IR::OP_VFNMLASCALARINSERT:
+          case IR::OP_VFNMLSSCALARINSERT: {
+            auto FOp = IROp->C<IR::IROp_VFMLAScalarInsert>();
+            if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
+              break;
+            }
+            for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
+              if (Arg.IsImmediate() || Arg == FOp->Upper) {
+                continue;
+              }
+              auto DefNode = IRView->GetNode(Arg);
+              auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
+              if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
+                  DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
+                SplatCandidateLoads.push_back(Arg.ID().Value);
+              }
+            }
+            break;
           }
-          const IR::PhysicalRegister PR =
-            Arg.IsImmediate() ? IR::PhysicalRegister(Arg) : IR::PhysicalRegister(IRView->GetNode(Arg));
-          if (PR.AsRegClass() == IR::RegClass::FPR) {
-            Use |= 1u << PR.Reg;
+          default: break;
           }
         }
-
-        Live = (Live & ~Def) | Use;
-        DynVRLiveIn[IRView->GetID(CodeNode).Value] = Live | Def;
 
         if (CodeLast == CodeBegin) {
           break;
@@ -5998,41 +6128,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     XERProjectionValid = false;
     LastConstantCache.Valid = false;
 
-    // Load-and-splat pre-pass (see SplatCandidateLoads in JITClass.h): mark
-    // single-use f64 FPR loads whose only consumer is an FMA-family scalar
-    // insert multiplicand/addend, so DEF_OP(LoadMem) can emit lxvdsx and the
-    // FMA handler can skip its splat. Same-block pairs only by construction.
-    SplatCandidateLoads.clear();
-    SplatFormLoadNodes.clear();
-    // Field kill switch (hashed into the code-cache config id).
-    static const bool DisableSplatFusion = getenv("FEX_NOSPLATFUSION") != nullptr;
-    if (!DisableSplatFusion)
-    for (auto [CandNode, CandIROp] : IRView->GetCode(BlockNode)) {
-      switch (CandIROp->Op) {
-      case IR::OP_VFMLASCALARINSERT:
-      case IR::OP_VFMLSSCALARINSERT:
-      case IR::OP_VFNMLASCALARINSERT:
-      case IR::OP_VFNMLSSCALARINSERT: {
-        auto FOp = CandIROp->C<IR::IROp_VFMLAScalarInsert>();
-        if (FOp->Header.ElementSize != IR::OpSize::i64Bit) {
-          break;
-        }
-        for (auto Arg : {FOp->Vector1, FOp->Vector2, FOp->Addend}) {
-          if (Arg.IsImmediate() || Arg == FOp->Upper) {
-            continue;
-          }
-          auto DefNode = IRView->GetNode(Arg);
-          auto DefHdr = IRView->GetOp<IR::IROp_Header>(Arg);
-          if (DefHdr->Op == IR::OP_LOADMEM && DefHdr->Size == IR::OpSize::i64Bit &&
-              DefHdr->C<IR::IROp_LoadMem>()->Class == IR::RegClass::FPR && DefNode->GetUses() == 1) {
-            SplatCandidateLoads.push_back(Arg.ID().Value);
-          }
-        }
-        break;
-      }
-      default: break;
-      }
-    }
+    // The load-and-splat pre-pass that used to walk the block here now rides
+    // the backward analysis walk at the top of this block iteration.
 
     // EntryPoint blocks ONLY. This record used to fire for every IR block,
     // logging a zero-byte occurrence for the non-entry ones -- which left the
@@ -6053,17 +6150,21 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
       uint16_t Op = static_cast<uint16_t>(IROp->Op);
 
+      // Three per-op cache-lifecycle switches used to run around every handler
+      // call (AES mask park before, XER->CR1 projection and last-constant
+      // after). Each compiled to its own dispatch over IROp->Op, on every
+      // emitted op, purely to answer three yes/no questions. They are folded
+      // into one constexpr byte table indexed by opcode: one load and three
+      // bit tests. The membership of each bit is exactly the case list of the
+      // switch it replaces -- see the comments at each use site below.
+      const uint8_t OpCache = Op <= static_cast<uint16_t>(IR::IROps::OP_LAST) ? OpCacheFlags[Op] : 0;
+
       // AES mask-cache: only the AES-family handlers keep the vs12-parked
       // byte-reverse mask alive (see EmitAESLoadMask). Any other op may
       // clobber VTMP3_VSX or emit a host call, so the park dies here. The
       // AES handlers' own Op_Unhandled bail paths invalidate explicitly.
-      switch (IROp->Op) {
-      case IR::OP_VAESENC:
-      case IR::OP_VAESENCLAST:
-      case IR::OP_VAESDEC:
-      case IR::OP_VAESDECLAST:
-      case IR::OP_VAESIMC: break;
-      default: InvalidateAESCache(); break;
+      if (!(OpCache & kOpCacheKeepAES)) {
+        InvalidateAESCache();
       }
 
       // Op-size profiler: the emitter cursor is the only ground truth for how
@@ -6099,15 +6200,8 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // is ops verified to write neither XER nor any CR field: the NZCVSelect
       // family (MapNZCVCC writes CR3 composites and CR1 only via the
       // projection itself), plain register moves, and constants.
-      switch (IROp->Op) {
-      case IR::OP_NZCVSELECT:
-      case IR::OP_NZCVSELECTV:
-      case IR::OP_NZCVSELECTINCREMENT:
-      case IR::OP_STOREREGISTER:
-      case IR::OP_LOADREGISTER:
-      case IR::OP_CONSTANT:
-      case IR::OP_INLINECONSTANT: break;
-      default: XERProjectionValid = false; break;
+      if (!(OpCache & kOpCacheKeepXER)) {
+        XERProjectionValid = false;
       }
 
       // Last-constant cache lifecycle (see LastConstantCache in JITClass.h).
@@ -6115,39 +6209,29 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // write no dynamic GPR (FPR-class loads and the scalar-FP inserts —
       // their GPR usage is TMP1-4/r0 only, never RA registers); everything
       // else invalidates. Reset at block entry alongside the AES cache.
-      switch (IROp->Op) {
-      case IR::OP_CONSTANT: {
-        // Field kill switch (hashed into the code-cache config id).
-        static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
-        auto COp = IROp->C<IR::IROp_Constant>();
-        const auto PR = IR::PhysicalRegister(CodeNode);
-        if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
-          LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+      // kOpCacheKeepConst covers the plain "survives" arm; the two opcodes
+      // whose arm has a body carry kOpCacheConstBody instead.
+      if (!(OpCache & (kOpCacheKeepConst | kOpCacheConstBody))) {
+        LastConstantCache.Valid = false;
+      } else if (OpCache & kOpCacheConstBody) {
+        if (IROp->Op == IR::OP_CONSTANT) {
+          // Field kill switch (hashed into the code-cache config id).
+          static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
+          auto COp = IROp->C<IR::IROp_Constant>();
+          const auto PR = IR::PhysicalRegister(CodeNode);
+          if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+            LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+          } else {
+            LastConstantCache.Valid = false;
+          }
         } else {
-          LastConstantCache.Valid = false;
+          // LoadMem / LoadMemTSO: FPR-class loads leave dynamic GPRs
+          // untouched; GPR-class loads write an RA register and must
+          // invalidate.
+          if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
+            LastConstantCache.Valid = false;
+          }
         }
-        break;
-      }
-      case IR::OP_LOADMEM:
-      case IR::OP_LOADMEMTSO:
-        // FPR-class loads leave dynamic GPRs untouched; GPR-class loads
-        // write an RA register and must invalidate.
-        if (IROp->C<IR::IROp_LoadMem>()->Class != IR::RegClass::FPR) {
-          LastConstantCache.Valid = false;
-        }
-        break;
-      case IR::OP_VFADDSCALARINSERT:
-      case IR::OP_VFSUBSCALARINSERT:
-      case IR::OP_VFMULSCALARINSERT:
-      case IR::OP_VFDIVSCALARINSERT:
-      case IR::OP_VFMINSCALARINSERT:
-      case IR::OP_VFMAXSCALARINSERT:
-      case IR::OP_VFMLASCALARINSERT:
-      case IR::OP_VFMLSSCALARINSERT:
-      case IR::OP_VFNMLASCALARINSERT:
-      case IR::OP_VFNMLSSCALARINSERT:
-      case IR::OP_LOADNAMEDVECTORCONSTANT: break;
-      default: LastConstantCache.Valid = false; break;
       }
 
       PPC64_OPSIZE_RECORD(OpSizeProfileEnabled,
@@ -6289,6 +6373,39 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // change above.
   CodeData.BlockBegin = CB->Ptr + BlockBufferOffset;
   CodeData.Size       = CodeSize;
+
+  // FEX_CODEHASHLOG identity gate (see CodeHashLogFile above). Zero cost when
+  // unset: one already-loaded pointer test per compiled block.
+  if (FILE* HashLog = CodeHashLogFile()) {
+    const auto* Words = reinterpret_cast<const uint32_t*>(CodeData.BlockBegin);
+    const size_t NumWords = CodeSize / sizeof(uint32_t);
+    const uint64_t Hash = XXH3_64bits(reinterpret_cast<const void*>(CodeData.BlockBegin), CodeSize);
+
+    // Address-normalized hash. Emitted blocks legitimately bake absolute HOST
+    // addresses into ori/oris/lis immediate sequences (LoadImm64 of a FABI
+    // helper, of &SomeRuntimeObject, ...). Those addresses move whenever the
+    // FEX binary's own layout moves, so the plain hash differs between two
+    // builds that emit identical code. Zeroing the 16-bit immediate field of
+    // ori (24), oris (25) and lis (addis with RA==0) makes the hash blind to
+    // exactly that and to nothing else: any real codegen change alters an
+    // opcode, a register field, or the instruction count, all of which
+    // survive normalization.
+    fextl::vector<uint32_t> Norm(NumWords);
+    for (size_t i = 0; i < NumWords; ++i) {
+      uint32_t W = Words[i];
+      const uint32_t Primary = W >> 26;
+      const uint32_t RA = (W >> 16) & 0x1F;
+      if (Primary == 24 || Primary == 25 || (Primary == 15 && RA == 0)) {
+        W &= 0xFFFF0000u;
+      }
+      Norm[i] = W;
+    }
+    const uint64_t NormHash = XXH3_64bits(Norm.data(), NumWords * sizeof(uint32_t));
+
+    std::lock_guard Guard {CodeHashLogLock};
+    fprintf(HashLog, "%016lx %zu %016lx %016lx\n", static_cast<unsigned long>(Entry), CodeSize,
+            static_cast<unsigned long>(NormHash), static_cast<unsigned long>(Hash));
+  }
 
   // DebugData::HostCodeSize has never been populated on this port, and PPC64LE
   // is the only backend left in the tree, so the field was dead: every consumer
