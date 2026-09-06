@@ -563,6 +563,27 @@ private:
   // ever coarsens — its worst case is exiting early).
   fextl::vector<bool> SpinCollapseBranchSigned;
 
+  // AnalyzeSpinLoops' per-compile scratch, hoisted out of the function so the
+  // vectors keep their capacity between compiles. As locals they cost two
+  // malloc/free pairs on every single compiled block.
+  struct SpinBlockInfo {
+    uint32_t ID = UINT32_MAX;
+    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX}; // CodeBlock IDs
+    uint32_t OpCount = 0;
+    bool Clean = false;
+    bool HasPollLoad = false;
+    IR::Ref Node = nullptr; // for the SpinCollapse pattern re-walk
+  };
+  fextl::vector<SpinBlockInfo> SpinBlocks;
+  fextl::vector<uint32_t> SpinIdxOfID;
+
+  // Per-op live-in mask for the dynamic FPR pool, keyed by SSA node ID (see
+  // the DynVRSpillMask contract and the backward scan in CompileCode). A
+  // member for the same reason as SpinBlocks above: as a CompileCode local it
+  // was a guaranteed malloc/free of 4 * GetSSACount() bytes per compiled
+  // block, on the default path.
+  fextl::vector<uint32_t> DynVRLiveInStorage;
+
   // -------------------------------------------------------------------------
   // FEX_MEMCPYDCBZ=1 (opt-in): cache-line store tier for the forward REP MOVSB
   // fast path in DEF_OP(MemCpy). A copy loop normally moves THREE lines of

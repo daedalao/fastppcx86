@@ -4722,12 +4722,15 @@ void PPC64JITCore::AnalyzeSpinLoops() {
   SpinCollapseBranches.assign(IR->GetSSACount(), false);
   SpinCollapseBranchSigned.assign(IR->GetSSACount(), false);
 
-  fextl::vector<BlockInfo> Blocks;
+  auto& Blocks = SpinBlocks;
+  Blocks.clear();
   const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
   Blocks.reserve(NumBlocks);
   // CodeBlock ID -> layout index (IDs are dense 0..NumBlocks-1, same keying
   // as JumpTargets).
-  fextl::vector<uint32_t> IdxOfID(NumBlocks, UINT32_MAX);
+  auto& IdxOfID = SpinIdxOfID;
+  IdxOfID.clear();
+  IdxOfID.resize(NumBlocks, UINT32_MAX);
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
@@ -5642,7 +5645,10 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // helper call; saving a possibly-garbage register is harmless, losing a
   // written one is not). FEX_NO_ABI_LIVEMASK reverts to full saves for A/B.
   static const bool DisableABILiveMask = getenv("FEX_NO_ABI_LIVEMASK") != nullptr;
-  fextl::vector<uint32_t> DynVRLiveIn;
+  // Member storage (JITClass.h) so the buffer is reused between compiles; as
+  // a local this assign() was a malloc + free on every compiled block.
+  auto& DynVRLiveIn = DynVRLiveInStorage;
+  DynVRLiveIn.clear();
   if (!DisableABILiveMask) {
     DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
   }
