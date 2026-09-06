@@ -16,6 +16,29 @@
           "Maximum number of instruction to store in a block"
         ]
       },
+      "CodeBufferMaxSize": {
+        "Type": "int32",
+        "Default": "1024",
+        "Desc": [
+          "Maximum JIT code buffer size in MiB (the shared buffer every translated block lives in).",
+          "When the buffer fills at this size it ROTATES: every translated block in the process is",
+          "discarded and retranslated on demand, which shows up as a multi-second compile storm on",
+          "every thread. Measured on Cyberpunk 2077 (bridge lane) at the old 128 MiB cap: the",
+          "buffer filled at +6.5s, first rotation at +29.5s discarding 383K blocks, and in-world",
+          "play rotated roughly every 2.5 minutes. Size the cap above the title's live working set.",
+          "Untouched pages cost nothing but address space. Minimum 16."
+        ]
+      },
+      "CodeBufferInitialSize": {
+        "Type": "int32",
+        "Default": "0",
+        "Desc": [
+          "Initial JIT code buffer size in MiB. 0 (default) allocates CodeBufferMaxSize up front,",
+          "so the buffer never grows. Any other value starts there and doubles up to the maximum;",
+          "each growth step discards and retranslates every block (the legacy 16->32->64->128",
+          "ladder cost Cyberpunk 2077 278K retranslations in its first 6.5 seconds)."
+        ]
+      },
       "EnableCodeCachingWIP": {
         "Type": "bool",
         "Default": "false",

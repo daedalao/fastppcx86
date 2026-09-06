@@ -33,9 +33,9 @@
 namespace FEXCore {
 namespace CPU {
 
-  static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
-  // We don't want to move above 128MB atm because that means we will have to encode longer jumps
-  static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+  // Legacy sizing constants, kept as documentation of the old ladder (16 MiB
+  // doubling to 128 MiB). The live policy is CodeBufferManager::Configured*Size
+  // below, driven by FEX_CODEBUFFERMAXSIZE / FEX_CODEBUFFERINITIALSIZE.
 
   constexpr static uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2] = {
     {0x0003'0002'0001'0000ULL, 0x0007'0006'0005'0004ULL}, // NAMED_VECTOR_INCREMENTAL_U16_INDEX
@@ -400,7 +400,7 @@ namespace CPU {
   // Code-buffer growth/rotation instrumentation
   // ------------------------------------------------------------------
   // Answers whether a workload's code footprint ever drives the geometric
-  // buffer growth into the MAX_CODE_SIZE cap and, past it, into steady-state
+  // buffer growth into the configured cap and, past it, into steady-state
   // rotation — every rotation discards all translated code, so at-cap
   // workloads pay a periodic whole-process retranslation storm. Everything
   // hangs off AllocateNew, the one funnel all CodeBuffer changes pass
@@ -511,7 +511,7 @@ namespace CPU {
     const uint64_t RetiredBlocks = Latest ? Latest->LookupCache->BlockList.size() : 0;
     const size_t PrevSize = Latest ? Latest->AllocatedSize : 0;
     // A replacement that could not grow is a rotation; StartLargerCodeBuffer
-    // only stops doubling once AllocatedSize saturates at MAX_CODE_SIZE.
+    // only stops doubling once AllocatedSize saturates at ConfiguredMaxSize().
     const bool Rotation = Latest && Size <= PrevSize;
     if (Latest) {
       StatsRetiredBytes.fetch_add(RetiredBytes, std::memory_order_relaxed);
@@ -570,15 +570,47 @@ namespace CPU {
     return Buffer;
   }
 
+  // Buffer sizing policy (FEX_CODEBUFFERMAXSIZE / FEX_CODEBUFFERINITIALSIZE,
+  // MiB). Every rotation at the cap and every growth step discards the whole
+  // translation of the process, so the cap must sit above a title's live
+  // working set and the initial size should equal it: an untouched RWX
+  // mapping costs address space only. Measured on Cyberpunk 2077 through the
+  // bridge lane at the legacy 16 MiB -> 128 MiB ladder: growth discarded
+  // 38K + 73K + 167K blocks inside the first 6.5 s, the first 128 MiB
+  // rotation came at +29.5 s (383K blocks), and in-world play rotated about
+  // every 2.5 minutes -- a whole-process retranslation storm each time that
+  // the workers' perf profile showed as 21% compiler.
+  //
+  // ppc64le block linking is already distance-aware (JIT/PPC64LE/JIT.cpp
+  // ExitFunctionLinkWithRecord: `b` within +-32 MiB, thunk beyond), so no
+  // branch encoding depends on the cap. The old 128 MiB comment about longer
+  // jumps was an arm64 concern.
+  size_t CodeBufferManager::ConfiguredMaxSize() {
+    static const size_t Size = [] {
+      const int64_t MiB = FEXCore::Config::Get_CODEBUFFERMAXSIZE();
+      const size_t Clamped = static_cast<size_t>(std::max<int64_t>(MiB, 16));
+      return Clamped * 1024 * 1024;
+    }();
+    return Size;
+  }
+
+  size_t CodeBufferManager::ConfiguredInitialSize() {
+    static const size_t Size = [] {
+      const int64_t MiB = FEXCore::Config::Get_CODEBUFFERINITIALSIZE();
+      if (MiB <= 0 || FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+        // Start at the maximum: no growth step ever discards translated code
+        // (and, with code caching, none discards code loaded from caches).
+        return ConfiguredMaxSize();
+      }
+      const size_t Bytes = static_cast<size_t>(std::max<int64_t>(MiB, 1)) * 1024 * 1024;
+      return std::min(Bytes, ConfiguredMaxSize());
+    }();
+    return Size;
+  }
+
   fextl::shared_ptr<CodeBuffer> CodeBufferManager::GetLatest() {
     if (!Latest) {
-      if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
-        // Start with a larger code buffer to avoid resizes that would discard
-        // code loaded from caches
-        AllocateNew(MAX_CODE_SIZE);
-      } else {
-        AllocateNew(INITIAL_CODE_SIZE);
-      }
+      AllocateNew(ConfiguredInitialSize());
     }
     return Latest;
   }
@@ -590,7 +622,10 @@ namespace CPU {
     }
 
     auto NewCodeBufferSize = GetLatest()->AllocatedSize;
-    NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
+    NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, ConfiguredMaxSize());
+    // A buffer that is already at (or, via an old config, above) the cap
+    // rotates at its own size rather than shrinking.
+    NewCodeBufferSize = std::max<size_t>(NewCodeBufferSize, GetLatest()->AllocatedSize);
     return AllocateNew(NewCodeBufferSize);
   }
 
