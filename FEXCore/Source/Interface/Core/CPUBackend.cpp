@@ -397,7 +397,7 @@ namespace CPU {
     // Per-buffer block index (audit P1). Sized for the theoretical worst case
     // — every block the minimum 64 bytes — so AppendBlock can never legitimately
     // overflow it. mmap-backed and untouched until written, so the nominal
-    // 16 MiB for a 1 GiB code buffer costs nothing but address space until
+    // 64 MiB for a 1 GiB code buffer costs nothing but address space until
     // blocks actually land.
     BlockCapacity = static_cast<uint32_t>(UsableSize() / CodeBuffer::MinimumBlockSize + 1);
     BlockOffsets = static_cast<uint32_t*>(FEXCore::Allocator::VirtualAlloc(BlockIndexBytes(), false));

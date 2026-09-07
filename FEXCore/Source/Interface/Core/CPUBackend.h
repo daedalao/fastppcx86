@@ -135,7 +135,7 @@ namespace CPU {
 
     // Block start offsets relative to Ptr, strictly ascending.
     // VirtualAlloc'd (mmap) rather than new[]: capacity is sized off the
-    // buffer maximum (1 GiB by default via FEX_CODEBUFFERMAXSIZE => 16 MiB of
+    // buffer maximum (1 GiB by default via FEX_CODEBUFFERMAXSIZE => 64 MiB of
     // index) and the pages are only ever faulted in as blocks are appended.
     uint32_t* BlockOffsets {};
 
