@@ -315,7 +315,8 @@ private:
   // DEF_OP(CondJump) skip their trailing `b` when the edge targets this
   // block. CompileCode's block loop maintains it, and only ever sets it for a
   // non-EntryPoint successor: EntryPoint blocks emit an out-of-band prologue
-  // (InlineJITBlockHeader store, suspend poke, spill-frame stdu) BEFORE their
+  // (legacy InlineJITBlockHeader store under FEX_NOBLOCKHEADER=0, suspend
+  // poke, spill-frame stdu) BEFORE their
   // intra-unit JumpTarget label binds, and intra-unit edges must land after
   // that prologue — falling into it would run the stdu on an already-live
   // frame. A fallthrough target is by construction forward/unbound, so the
@@ -1100,11 +1101,12 @@ private:
     lvx(dst, base, off);
   }
 
-  // Store the address of the JITCodeHeader (bound at HeaderLabel) into
-  // CpuStateFrame::State.InlineJITBlockHeader so RestoreRIPFromHostPC and the
-  // other GetFrameBlockInfo consumers can find the tail. Emitted at every
-  // dispatcher-reachable entry so any signal fault into this block finds a
-  // fresh header pointer regardless of which entry point the dispatcher used.
+  // LEGACY (audit P1): store the address of the JITCodeHeader (bound at
+  // HeaderLabel) into CpuStateFrame::State.InlineJITBlockHeader. The signal
+  // path no longer reads it -- host PC -> block goes through the per-buffer
+  // block index (CPUBackend.h CodeBuffer::FindBlockHeader) -- so this is only
+  // emitted under FEX_NOBLOCKHEADER=0, for the FEX_RIPRECONLOG cross-check and
+  // for same-binary A/B of the prologue cost.
   // Uses `bcl 20,31,$+4; mflr` (LK=1 form the CPU does not push to the link
   // stack) to load PC then subtracts the emit-time delta to recover BlockBegin.
   // Clobbers TMP1 and TMP2 — safe: only called during entry-point prologue
