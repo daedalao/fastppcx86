@@ -186,10 +186,10 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
   // DetectMonoBackpatcherBlock (SyscallsSMCTracking.cpp) puts in front of this
   // exact call, and the field is printed as <none> when the guard fails.
   //
-  // blk_rip= is the guest RIP of the current block's ENTRY (GetGuestBlockEntry,
-  // read straight out of the JITCodeTail).  Coarser than guest_rip=, but it
-  // does not depend on the per-instruction vl64pair table, so trust it if the
-  // two disagree.  state_rip= is the raw Frame->State.rip and must ALWAYS be
+  // blk_rip= is the guest RIP of the ENTRY of the block containing the host PC
+  // (GetGuestBlockEntry, read straight out of the JITCodeTail).  Coarser than
+  // guest_rip=, but it does not depend on the per-instruction vl64pair table,
+  // so trust it if the two disagree.  state_rip= is the raw Frame->State.rip and must ALWAYS be
   // read as "possibly stale" -- it is the value guest_rip= would have silently
   // degraded to on the fallback path.
   //
@@ -201,8 +201,14 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
 #if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_ppc64le)
   {
     // Re-entrancy guard.  Everything below dereferences JIT-owned memory
-    // reached through CpuStateFrame::State.InlineJITBlockHeader.  If that
-    // pointer is stale the deref faults *inside* this handler, re-enters
+    // (JITCodeHeader/JITCodeTail and the vl64pair RIP table) reached through
+    // the per-CodeBuffer block index -- CPUBackend::FindBlockHeader, keyed on
+    // the host PC.  Audit P1 removed the InlineJITBlockHeader store this used
+    // to go through, so a *stale* pointer is no longer the hazard it was; the
+    // index only ever names fully-written blocks in buffers this thread still
+    // holds a reference to.  The guard stays anyway: the block bytes
+    // themselves are JIT-owned and can be mid-invalidation, and if any deref
+    // here faults it does so *inside* this handler, re-enters
     // SignalHandlerThunk, and loops until the alt stack overflows -- which
     // would destroy the very trace we came here for.  A nested entry skips
     // reconstruction and prints <none>.
@@ -228,7 +234,7 @@ static void TraceSyncSignal(int Signal, siginfo_t* Info, ucontext_t* _context) {
           InJITCode = true;
           GuestRIP = Thread->CTX->RestoreRIPFromHostPC(Thread, HostPC);
           HaveGuestRIP = true;
-          BlockRIP = Thread->CTX->GetGuestBlockEntry(Thread);
+          BlockRIP = Thread->CTX->GetGuestBlockEntry(Thread, HostPC);
           HaveBlockRIP = BlockRIP != 0;
         }
         InReconstruct = 0;

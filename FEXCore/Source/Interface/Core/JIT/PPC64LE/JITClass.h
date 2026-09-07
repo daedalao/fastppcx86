@@ -1191,11 +1191,34 @@ private:
   // switch: set by non-PatchSite OP_CONSTANT with a dynamic-GPR dest,
   // survives ONLY across the verified no-dynamic-GPR-write allowlist
   // (FPR-class LoadMem, the scalar-FP insert family), reset at block entry.
+  //
+  // OP_ENTRYPOINTOFFSET is a producer AND a consumer too, on the variable-
+  // width path only: the return address of every guest `call` is one of these,
+  // and consecutive calls in a basic block sit a handful of bytes apart, so
+  // the delta form applies constantly. Both directions are gated on
+  // !ExitRIPFixedWidth -- when a code cache or SMCSemanticPatch is on, that op
+  // must emit the byte-exact 20-byte LoadConstantFixed window that
+  // CodeCache::ApplyCodeRelocations re-emits RELOC_GUEST_RIP_MOVE into.
   struct {
     uint64_t Value;
     uint8_t Reg;      // GeneralRegisters[] index
     bool Valid;
   } LastConstantCache {};
+
+  // The value DEF_OP(EntrypointOffset) materialises: `(Entry + Op->Offset)`
+  // narrowed by the op's size. Shared by the emit site and CompileCode's
+  // LastConstantCache lifecycle so the cached value is byte-for-byte what was
+  // emitted -- computing that mask twice is exactly how the two would drift.
+  // Defined in ALUOps.cpp next to its emit site.
+  uint64_t EntrypointOffsetValue(const IR::IROp_Header* IROp) const;
+
+  // FEX_NOCONSTCACHE kill switch (hashed into the code-cache config id),
+  // parsed once. Both the LastConstantCache producers (CompileCode's
+  // post-handler lifecycle) and the consumers (DEF_OP(Constant),
+  // DEF_OP(EntrypointOffset)) read it through here, so one env var turns the
+  // mechanism off in both directions and cannot leave a stale entry readable.
+  // Defined in ALUOps.cpp.
+  static bool ConstCacheDisabled();
 
   // Load-and-splat fusion for FMA memory operands (both per-block, cleared at
   // block entry). CompileCode's pre-pass fills SplatCandidateLoads with node

@@ -4,8 +4,10 @@
 // the same page whose code is currently executing. The store faults on the
 // FEX-shadow-protected code page, and FEX's SMC SIGSEGV handler must:
 //   1. invalidate the block, unprotect the page,
-//   2. detect that the fault address is inside the *current* block
-//      (SyscallsSMCTracking.cpp:146 — IsAddressInCurrentBlock),
+//   2. detect that the fault address is inside the block the faulting host PC
+//      is executing in (SyscallsSMCTracking.cpp HandleSegfault —
+//      IsAddressInCurrentBlock, which since audit P1 takes the host PC and
+//      resolves the block through the per-CodeBuffer block index),
 //   3. set ENTRY_FILL_SRA_SINGLE_INST_REG to redirect the dispatcher into
 //      CompileSingleStep on re-entry.
 //

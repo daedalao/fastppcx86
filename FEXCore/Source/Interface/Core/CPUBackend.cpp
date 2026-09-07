@@ -14,8 +14,11 @@
 #include <FEXCore/Utils/PrctlUtils.h>
 #include <FEXCore/Utils/Telemetry.h>
 
+#include <FEXCore/Utils/LogManager.h>
+
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -390,10 +393,158 @@ namespace CPU {
     FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<void*>(Ptr), Size, FEXCore::Allocator::THPControl::Enable);
 
     LookupCache = fextl::make_unique<GuestToHostMap>();
+
+    // Per-buffer block index (audit P1). Sized for the theoretical worst case
+    // — every block the minimum 64 bytes — so AppendBlock can never legitimately
+    // overflow it. mmap-backed and untouched until written, so the nominal
+    // 16 MiB for a 1 GiB code buffer costs nothing but address space until
+    // blocks actually land.
+    BlockCapacity = static_cast<uint32_t>(UsableSize() / CodeBuffer::MinimumBlockSize + 1);
+    BlockOffsets = static_cast<uint32_t*>(FEXCore::Allocator::VirtualAlloc(BlockIndexBytes(), false));
+    if (!BlockOffsets) {
+      ERROR_AND_DIE_FMT("Couldn't allocate the {} byte code buffer block index", BlockIndexBytes());
+    }
+    FEXCore::Allocator::VirtualName("FEXBlockIndex", reinterpret_cast<void*>(BlockOffsets), BlockIndexBytes());
   }
 
   CodeBuffer::~CodeBuffer() {
+    if (BlockOffsets) {
+      FEXCore::Allocator::VirtualFree(BlockOffsets, BlockIndexBytes());
+      BlockOffsets = nullptr;
+    }
     FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
+  }
+
+  // ------------------------------------------------------------------
+  // Per-buffer block index (audit P1)
+  // ------------------------------------------------------------------
+  // Replaces CpuStateFrame::State.InlineJITBlockHeader: instead of every JIT
+  // block entry storing its own header address into guest state, the compiler
+  // records the block's offset here once, and the signal-path C++ binary
+  // searches for it. Nothing is published by executing code.
+
+  void CodeBuffer::AppendBlock(uint32_t BlockOffset) {
+    // Single writer: the caller holds CodeBufferManager::CodeBufferWriteMutex,
+    // so the relaxed load below cannot race another append.
+    const uint32_t Count = BlockCount.load(std::memory_order_relaxed);
+
+    if (Count != 0 && BlockOffset <= BlockOffsets[Count - 1]) {
+      // Blocks are emitted strictly bump-allocated out of LatestOffset, so a
+      // non-monotonic offset means the emitter and the index disagree about
+      // where the block is; the binary search below would then silently return
+      // the wrong block, i.e. a wrong guest RIP in a signal frame.
+      ERROR_AND_DIE_FMT("CodeBuffer block index went backwards: appending {:#x} after {:#x}", BlockOffset, BlockOffsets[Count - 1]);
+    }
+
+    if (Count >= BlockCapacity) {
+      // Structurally impossible (capacity is UsableSize()/64 + 1 and the
+      // smallest block is 64 bytes), but a silently dropped block is a wrong
+      // RIP reconstruction rather than a crash, so refuse to continue.
+      ERROR_AND_DIE_FMT("CodeBuffer block index overflow: {} blocks in a {:#x} byte buffer", Count, UsableSize());
+    }
+
+    BlockOffsets[Count] = BlockOffset;
+    // Release: publishes both this entry AND the JITCodeHeader/JITCodeTail the
+    // caller finished writing before calling us. A reader that acquire-loads
+    // this count is guaranteed to see all of it.
+    BlockCount.store(Count + 1, std::memory_order_release);
+  }
+
+  const JITCodeHeader* CodeBuffer::FindBlockHeader(uintptr_t HostPC) const {
+    // ASYNC-SIGNAL-SAFE: pure loads, a bounded binary search, no locks, no
+    // allocation, no logging.
+    const uintptr_t Base = reinterpret_cast<uintptr_t>(Ptr);
+    if (HostPC < Base) {
+      return nullptr;
+    }
+    const uintptr_t ByteOffset = HostPC - Base;
+    if (ByteOffset >= UsableSize()) {
+      return nullptr;
+    }
+
+    const uint32_t Count = BlockCount.load(std::memory_order_acquire);
+    if (Count == 0 || !BlockOffsets) {
+      return nullptr;
+    }
+
+    const uint32_t Target = static_cast<uint32_t>(ByteOffset);
+
+    // Find the first entry strictly greater than Target; the block that could
+    // contain it is the one before that.
+    uint32_t Lo = 0;
+    uint32_t Hi = Count;
+    while (Lo < Hi) {
+      const uint32_t Mid = Lo + (Hi - Lo) / 2;
+      if (BlockOffsets[Mid] <= Target) {
+        Lo = Mid + 1;
+      } else {
+        Hi = Mid;
+      }
+    }
+
+    if (Lo == 0) {
+      // Below the first block: the code buffer's leading padding.
+      return nullptr;
+    }
+
+    const uint32_t BlockOffset = BlockOffsets[Lo - 1];
+    auto Header = reinterpret_cast<const JITCodeHeader*>(Ptr + BlockOffset);
+    auto Tail = reinterpret_cast<const JITCodeTail*>(Ptr + BlockOffset + Header->OffsetToBlockTail);
+
+    // Between blocks nothing is indexed, so a PC past the end of the preceding
+    // block belongs to no block: aux SMC stub allocations carved out of the
+    // free tail, or the free tail itself.
+    if (Target - BlockOffset >= Tail->Size) {
+      return nullptr;
+    }
+
+    return Header;
+  }
+
+  void CodeBuffer::RebuildBlockIndexByWalk(size_t Bytes, size_t StartOffset) {
+    if (StartOffset == 0) {
+      // Fresh-buffer form: drop whatever was indexed before.
+      BlockCount.store(0, std::memory_order_release);
+    }
+
+    if (Bytes == 0) {
+      return;
+    }
+
+    if (StartOffset > UsableSize() || Bytes > UsableSize() - StartOffset) {
+      LogMan::Msg::EFmt("Block index walk: [{:#x}, {:#x}) is outside the {:#x} byte code buffer", StartOffset, StartOffset + Bytes,
+                        UsableSize());
+      return;
+    }
+
+    const size_t End = StartOffset + Bytes;
+    size_t Offset = StartOffset;
+    while (Offset < End) {
+      const size_t Remaining = End - Offset;
+      if (Remaining < CodeBuffer::MinimumBlockSize || Offset > std::numeric_limits<uint32_t>::max()) {
+        LogMan::Msg::EFmt("Block index walk: stopping at {:#x}; {:#x} bytes left is smaller than the minimum block", Offset, Remaining);
+        break;
+      }
+
+      auto Header = reinterpret_cast<const JITCodeHeader*>(Ptr + Offset);
+      const size_t OffsetToBlockTail = Header->OffsetToBlockTail;
+      // Remaining >= 64 > sizeof(JITCodeTail), so the subtraction cannot wrap.
+      if (OffsetToBlockTail < sizeof(JITCodeHeader) || OffsetToBlockTail > Remaining - sizeof(JITCodeTail)) {
+        LogMan::Msg::EFmt("Block index walk: block at {:#x} has an out-of-range tail offset {:#x} ({:#x} bytes left)", Offset,
+                          OffsetToBlockTail, Remaining);
+        break;
+      }
+
+      auto Tail = reinterpret_cast<const JITCodeTail*>(Ptr + Offset + OffsetToBlockTail);
+      const size_t Size = Tail->Size;
+      if (Size < CodeBuffer::MinimumBlockSize || (Size % 16) != 0 || Size > Remaining) {
+        LogMan::Msg::EFmt("Block index walk: block at {:#x} declares an implausible size {:#x} ({:#x} bytes left)", Offset, Size, Remaining);
+        break;
+      }
+
+      AppendBlock(static_cast<uint32_t>(Offset));
+      Offset += Size;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -745,6 +896,24 @@ namespace CPU {
       }
     }
     return false;
+  }
+
+  const JITCodeHeader* CPUBackend::FindBlockHeader(uintptr_t HostPC) const {
+    // ASYNC-SIGNAL-SAFE, same as CodeBuffer::FindBlockHeader. The iteration
+    // mirrors IsAddressInCodeBuffer exactly: the buffers reachable here are
+    // pinned by this thread's own shared_ptrs, so another thread rotating the
+    // manager's Latest cannot free one out from under a handler running here.
+    if (CurrentCodeBuffer) {
+      if (auto* Header = CurrentCodeBuffer->FindBlockHeader(HostPC)) {
+        return Header;
+      }
+    }
+    for (const auto& Buffer : SignalHandlerCodeBuffers) {
+      if (auto* Header = Buffer->FindBlockHeader(HostPC)) {
+        return Header;
+      }
+    }
+    return nullptr;
   }
 
 } // namespace CPU

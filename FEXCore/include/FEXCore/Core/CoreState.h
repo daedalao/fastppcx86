@@ -88,6 +88,15 @@ struct alignas(64) CPUState {
   };
 
   // Cacheline: 0
+  // LEGACY (audit P1).  Used to hold the address of the running JIT block's
+  // JITCodeHeader, stored by every EntryPoint prologue.  Block lookup now goes
+  // through the per-CodeBuffer host-PC -> block index instead
+  // (Interface/Core/CPUBackend.h, CodeBuffer::FindBlockHeader), so the JIT
+  // publishes nothing here by default.  The store is still emitted under
+  // FEX_NOBLOCKHEADER=0, and the only reader left is the FEX_RIPRECONLOG
+  // cross-check in Interface/Core/Core.cpp.  The field itself is retained
+  // rather than removed: this struct's layout is baked into emitted code
+  // offsets and into out-of-tree tooling that takes offsetof on it.
   uint64_t InlineJITBlockHeader {};
   // Reference counter for FEX's per-thread deferred signals.
   // Counts the nesting depth of program sections that cause signals to be deferred.

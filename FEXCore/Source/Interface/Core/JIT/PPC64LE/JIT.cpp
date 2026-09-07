@@ -3255,10 +3255,23 @@ static GuestTraceRingHeader* GuestTraceRingPtrFwd() {
 // addis carries the other 16 bits, and the immediate is a compile-time
 // constant so the split costs nothing at runtime.
 //
-// This runs on every external arrival into an EntryPoint block -- every
+// This USED to run on every external arrival into an EntryPoint block -- every
 // dispatcher L1 hit, every linked block-to-block branch, every shadow-RET fast
 // path -- and Frontend.cpp marks the return address of every guest CALL as an
-// EntryPoint, so it is also on the RET leg of every guest call.
+// EntryPoint, so it was also on the RET leg of every guest call.
+//
+// AUDIT P1 (FEX_NOBLOCKHEADER, default ON): that per-EntryPoint store is no
+// longer emitted. CodeBuffer::AppendBlock now records every compiled block's
+// offset in a per-CodeBuffer host-PC -> block index, populated at the end of
+// CompileCode under CodeBufferWriteMutex, so the signal path maps a faulting
+// host PC to its JITCodeHeader/JITCodeTail by search instead of by reading a
+// value the JIT had to publish on every single block entry. State.
+// InlineJITBlockHeader is now written by nothing on the hot path and read only
+// as a diagnostic cross-check.
+//
+// The function is KEPT because two callers remain: EmitEntryPoint's dead
+// (gated-off) cold prologue, and FEX_NOBLOCKHEADER=0, which restores the old
+// per-EntryPoint store verbatim for A/B and bisection.
 //
 // LR is dead at any dispatcher/link entry into a ppc64le block (blocks are
 // entered via bctr), and we call this in the entry-point prologue before
@@ -3338,9 +3351,14 @@ void PPC64JITCore::EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& Header
 //   BlockBegin -> JITCodeHeader::OffsetToBlockTail and range-checks it) --
 //   never as a branch target. Both remain valid: the JITCodeHeader at
 //   BlockBegin+0 is emitted by the caller and is untouched by this gate.
-//   The per-block loop re-emits its own InlineJITBlockHeader store, and SRA is
-//   filled by DispatcherLoopTopFillSRA, by ExitFunctionLinker, and by the
-//   signal-return path.
+//   SRA is filled by DispatcherLoopTopFillSRA, by ExitFunctionLinker, and by
+//   the signal-return path.
+//
+//   (Until audit P1 this paragraph also noted that "the per-block loop
+//   re-emits its own InlineJITBlockHeader store". It no longer does by
+//   default -- see FEX_NOBLOCKHEADER at that site and the header comment on
+//   EmitStoreBlockBeginToInlineHeader above. Nothing about THIS gate depends
+//   on that: EmitEntryPoint's copy was already unreachable either way.)
 //
 // HOW IT WAS VERIFIED (2026-08-04)
 //   FEX_DEADPROLOGUE=trap builds the full prologue with an unconditional
@@ -5219,9 +5237,10 @@ static constexpr auto OpCacheFlags = [] {
     T[static_cast<size_t>(Op)] |= kOpCacheKeepConst;
   }
 
-  // Constant / LoadMem / LoadMemTSO reach the switch body: they may SET the
-  // cache (Constant) or invalidate conditionally on the operand class.
-  for (auto Op : {IR::OP_CONSTANT, IR::OP_LOADMEM, IR::OP_LOADMEMTSO}) {
+  // Constant / EntrypointOffset / LoadMem / LoadMemTSO reach the switch body:
+  // they may SET the cache (the two constant producers) or invalidate
+  // conditionally on the operand class (the loads).
+  for (auto Op : {IR::OP_CONSTANT, IR::OP_ENTRYPOINTOFFSET, IR::OP_LOADMEM, IR::OP_LOADMEMTSO}) {
     T[static_cast<size_t>(Op)] |= kOpCacheConstBody;
   }
 
@@ -5854,10 +5873,43 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // in the prologue should map back to (block-entry guest RIP).
       DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset,
                                          GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
-      // Warm-path store: dispatcher L1 hits land here. This is the ONLY
-      // InlineJITBlockHeader store that ever executes (EmitEntryPoint's copy is
-      // unreachable and gated off). Re-emit so it is refreshed on every entry.
-      EmitStoreBlockBeginToInlineHeader(HeaderLabel);
+      // AUDIT P1 -- warm-path InlineJITBlockHeader store, now ELIDED.
+      //
+      // This used to be the ONLY InlineJITBlockHeader store that ever executed
+      // (EmitEntryPoint's copy is unreachable and gated off), re-emitted per
+      // EntryPoint so the value was refreshed on every external arrival:
+      // every dispatcher L1 hit, every linked block-to-block branch, every
+      // shadow-RET fast path, and -- since Frontend.cpp marks every guest CALL
+      // return address as an EntryPoint -- the RET leg of every guest call.
+      // Cost was 4 instructions (bcl, mflr, addi, std) on all of those -- 5
+      // when the block is more than 32 KB past its header and the delta needs
+      // addis+addi -- purely to publish a pointer the signal path could have
+      // derived for itself.
+      //
+      // It can now: CodeBuffer::AppendBlock (called at the end of CompileCode,
+      // see the finalise section) maintains a per-CodeBuffer host-PC -> block
+      // index, so the signal path resolves any host PC inside any block to its
+      // JITCodeHeader/JITCodeTail with the JIT publishing nothing at run time.
+      //
+      // FEX_NOBLOCKHEADER: unset or "1" -> elided (the new default);
+      // "0" -> emitted exactly as before, for A/B and bisection. Parsed once.
+      //
+      // Nothing that follows in this prologue depends on the store having run:
+      // EmitStoreBlockBeginToInlineHeader documents TMP1/TMP2 (and LR) as
+      // clobberable scratch it may freely use, i.e. every later piece here
+      // (EntryWatch, GuestSerialize, GuestTrace, the suspend poke, the spill
+      // stdu) already had to assume TMP1/TMP2/LR held nothing of theirs, and
+      // none of them reads State.InlineJITBlockHeader. The CallReturnEntry
+      // Labels bind, the CodeData.EntryPoints record and the GuestOpcodes seed
+      // all sit at the SAME cursor above and are unaffected -- removing this
+      // does not move the address any of them named.
+      static const bool BlockHeaderStoreElided = [] {
+        const char* Env = getenv("FEX_NOBLOCKHEADER");
+        return !(Env && Env[0] == '0');
+      }();
+      if (!BlockHeaderStoreElided) {
+        EmitStoreBlockBeginToInlineHeader(HeaderLabel);
+      }
       // FEX_ENTRYWATCH ring store (see the definition above). TMP1/TMP2 are
       // clobberable here per the EmitStoreBlockBeginToInlineHeader contract;
       // r10 already holds guest RBX (dispatcher FillStaticRegs ran before the
@@ -6209,18 +6261,37 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
       // write no dynamic GPR (FPR-class loads and the scalar-FP inserts —
       // their GPR usage is TMP1-4/r0 only, never RA registers); everything
       // else invalidates. Reset at block entry alongside the AES cache.
-      // kOpCacheKeepConst covers the plain "survives" arm; the two opcodes
-      // whose arm has a body carry kOpCacheConstBody instead.
+      // kOpCacheKeepConst covers the plain "survives" arm; the opcodes whose
+      // arm has a body carry kOpCacheConstBody instead.
       if (!(OpCache & (kOpCacheKeepConst | kOpCacheConstBody))) {
         LastConstantCache.Valid = false;
       } else if (OpCache & kOpCacheConstBody) {
         if (IROp->Op == IR::OP_CONSTANT) {
-          // Field kill switch (hashed into the code-cache config id).
-          static const bool DisableConstCache = getenv("FEX_NOCONSTCACHE") != nullptr;
           auto COp = IROp->C<IR::IROp_Constant>();
           const auto PR = IR::PhysicalRegister(CodeNode);
-          if (!DisableConstCache && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
+          if (!ConstCacheDisabled() && COp->PatchSite == 0 && PR.AsRegClass() == IR::RegClass::GPR) {
             LastConstantCache = {static_cast<uint64_t>(COp->Constant), PR.Reg, true};
+          } else {
+            LastConstantCache.Valid = false;
+          }
+        } else if (IROp->Op == IR::OP_ENTRYPOINTOFFSET) {
+          // EntrypointOffset is a producer on the variable-width path: the
+          // handler emitted EntrypointOffsetValue(IROp) into its dest with a
+          // plain LoadConstant (or an addi off this very cache), so the dest
+          // holds that value and can seed the next delta. Same soundness as
+          // OP_CONSTANT: the dest is a dynamic RA register, the op writes
+          // nothing else, and every op that could overwrite it invalidates.
+          //
+          // Gated on !ExitRIPFixedWidth to match the consumer in
+          // DEF_OP(EntrypointOffset): with a code cache or SMCSemanticPatch on,
+          // the handler emits the fixed 20-byte relocatable window instead, and
+          // that window must stay byte-exact — so nothing must be tempted to
+          // addi off it. (The register would in fact hold the right value
+          // there; keeping producer and consumer on one predicate is the point,
+          // so a future reader cannot find one converted and the other not.)
+          const auto PR = IR::PhysicalRegister(CodeNode);
+          if (!ConstCacheDisabled() && !ExitRIPFixedWidth && PR.AsRegClass() == IR::RegClass::GPR) {
+            LastConstantCache = {EntrypointOffsetValue(IROp), PR.Reg, true};
           } else {
             LastConstantCache.Valid = false;
           }
@@ -6534,6 +6605,29 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // capacity-checked against BlockHeadroom above so no compile can exceed
   // 4 GiB.
   CodeHeader->OffsetToBlockTail = static_cast<uint32_t>(CodeSize);
+
+  // AUDIT P1: publish this block to the CodeBuffer's host-PC -> block index,
+  // which replaces the per-EntryPoint InlineJITBlockHeader store (see the
+  // FEX_NOBLOCKHEADER site in the block loop above).
+  //
+  // ORDERING CONTRACT, and why this exact line:
+  //   * The block must be COMPLETE before it is indexed. A consumer that
+  //     finds this offset immediately walks BlockBegin -> JITCodeHeader::
+  //     OffsetToBlockTail -> JITCodeTail -> Tail->Size -> the vl64pair
+  //     entries. Tail->Size is written above; OffsetToBlockTail is written on
+  //     the line directly above this one. Both are done, so any observer that
+  //     sees the index entry sees a fully-formed block.
+  //   * We are still inside CompileCode's CodeBufferWriteMutex window, which
+  //     is the same lock the code buffer's readers take, so no additional
+  //     synchronisation is needed and the index cannot be observed torn.
+  //   * BlockBufferOffset is the block's start offset in the whole buffer (the
+  //     S3.7-C0 snapshot taken before SetBuffer). Blocks are emitted strictly
+  //     in increasing offset order -- CodeBuffers.LatestOffset only ever grows
+  //     within a buffer, and a new buffer gets a fresh index -- so appends are
+  //     monotonic and the index stays sorted for a binary search.
+  //   * uint32_t: the buffer is capacity-checked against BlockHeadroom near
+  //     the top of CompileCode, so no offset can exceed 4 GiB.
+  CB->AppendBlock(static_cast<uint32_t>(BlockBufferOffset));
 
   // Op-size profiler: charge the out-of-band tail region (JITCodeTail plus the
   // vl64pair RIP entries plus the 16-byte alignment pad) to its own bucket —

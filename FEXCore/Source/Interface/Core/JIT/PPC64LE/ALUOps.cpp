@@ -163,6 +163,28 @@ static bool EmitAndMaskRc(PPC64Emitter::Emitter& E, PPC64Emitter::GPR Dst, PPC64
 // Constants and inline values
 // =========================================================================
 
+// FEX_NOCONSTCACHE: single parse point for the LastConstantCache kill switch.
+// Declared in JITClass.h; read by the two emit-site consumers below and by
+// CompileCode's post-handler lifecycle (the producers), so setting the env var
+// both stops the cache being populated and stops it being read. Presence-
+// enabled, matching the other field kill switches and the code-cache config-id
+// hash.
+bool PPC64JITCore::ConstCacheDisabled() {
+  static const bool Disabled = getenv("FEX_NOCONSTCACHE") != nullptr;
+  return Disabled;
+}
+
+// The exact value DEF_OP(EntrypointOffset) materialises. CompileCode's
+// LastConstantCache lifecycle caches THIS, so the mask lives in one place: a
+// second copy of `(IROp->Size == i32Bit) ? 0xFFFFFFFF : ~0` is precisely the
+// kind of thing that drifts, and a cached value that differs from the emitted
+// one by even one bit makes every subsequent addi off it silently wrong.
+uint64_t PPC64JITCore::EntrypointOffsetValue(const IR::IROp_Header* IROp) const {
+  auto Op = IROp->C<IR::IROp_EntrypointOffset>();
+  const uint64_t Mask = (IROp->Size == IR::OpSize::i32Bit) ? 0xFFFF'FFFFull : ~0ULL;
+  return (Entry + Op->Offset) & Mask;
+}
+
 DEF_OP(Constant) {
   auto Op  = IROp->C<IR::IROp_Constant>();
   auto Dst = GetReg(Node);
@@ -183,8 +205,10 @@ DEF_OP(Constant) {
   // in the same few pages) become one addi off the previous constant's
   // still-live register. Cache lifecycle (set/invalidate) lives in
   // CompileCode's post-handler switch; validity here means the register
-  // provably still holds that value.
-  if (LastConstantCache.Valid) {
+  // provably still holds that value. FEX_NOCONSTCACHE is checked on the
+  // consumer side as well as the producer side so the switch reads as one
+  // predicate everywhere, rather than relying on "the producer never set it".
+  if (!ConstCacheDisabled() && LastConstantCache.Valid) {
     const int64_t Delta = static_cast<int64_t>(Op->Constant) - static_cast<int64_t>(LastConstantCache.Value);
     const GPR Base = GeneralRegisters[LastConstantCache.Reg];
     if (Delta >= -32768 && Delta <= 32767 && Base != r0 && Base != Dst) {
@@ -201,12 +225,51 @@ DEF_OP(Constant) {
 }
 
 DEF_OP(EntrypointOffset) {
-  auto Op       = IROp->C<IR::IROp_EntrypointOffset>();
-  uint64_t Mask = (IROp->Size == IR::OpSize::i32Bit) ? 0xFFFF'FFFFull : ~0ULL;
-  // S3.7-C2: `Entry + Op->Offset` is a guest RIP baked into 20 bytes of
-  // host constant-load; mirrors ARM64 JIT/ALUOps.cpp:67. The mask is
-  // applied at emit time so the recorded value equals the emitted value.
-  InsertEntrypointRIPMove(GetReg(Node), (Entry + Op->Offset) & Mask);
+  auto Dst = GetReg(Node);
+  // S3.7-C2: `Entry + Op->Offset` is a guest RIP baked into host constant-load
+  // bytes; mirrors ARM64 JIT/ALUOps.cpp:67. The mask is applied at emit time so
+  // the recorded value equals the emitted value — hence the shared helper (see
+  // JITClass.h), which CompileCode's cache lifecycle also uses.
+  const uint64_t Value = EntrypointOffsetValue(IROp);
+
+  // Last-constant delta, same mechanism as DEF_OP(Constant) above and sound for
+  // the same reason: LastConstantCache.Valid means the named dynamic RA
+  // register provably still holds LastConstantCache.Value (CompileCode's
+  // post-handler lifecycle invalidates on every op outside the verified
+  // no-dynamic-GPR-write allowlist), and this op writes nothing but its own
+  // dest, so it neither invalidates its own base nor anything else.
+  //
+  // This is the return address of every guest `call`, so it is on the hot
+  // emission path of essentially every block, and consecutive entrypoint
+  // offsets within one compile unit differ by a handful of bytes — well inside
+  // addi's ±32K — so the delta form applies far more often here than it does
+  // for arbitrary constants.
+  //
+  // ONLY on the variable-width path. With ExitRIPFixedWidth set (code caching
+  // or FEX_SMCSEMANTICPATCH), InsertEntrypointRIPMove must emit the byte-exact
+  // 20-byte LoadConstantFixed window plus its RELOC_GUEST_RIP_MOVE record,
+  // because CodeCache::ApplyCodeRelocations re-emits into that window in place
+  // on load. A one-instruction addi off a neighbouring register is neither 20
+  // bytes nor self-contained (its base register's value is not knowable to the
+  // relocation applier), so it must never appear there. The producer side is
+  // gated on the same predicate, so a fixed-width unit never even populates a
+  // cache entry from this op.
+  if (!ExitRIPFixedWidth && !ConstCacheDisabled() && LastConstantCache.Valid) {
+    const int64_t Delta = static_cast<int64_t>(Value) - static_cast<int64_t>(LastConstantCache.Value);
+    const GPR Base = GeneralRegisters[LastConstantCache.Reg];
+    if (Base != r0 && Base != Dst) {
+      if (Delta == 0) {
+        mr(Dst, Base);
+        return;
+      }
+      if (Delta >= -32768 && Delta <= 32767) {
+        addi(Dst, Base, static_cast<int16_t>(Delta));
+        return;
+      }
+    }
+  }
+
+  InsertEntrypointRIPMove(Dst, Value);
 }
 
 DEF_OP(InlineConstant)         { /* nop — handled by IsInlineConstant */ }

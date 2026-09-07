@@ -437,10 +437,11 @@ uint64_t ComputeCodeCacheConfigId() {
       // their flags-only forms pre-RA, so it changes emitted block bytes.
       // (IS64BIT_MODE itself is hashed above.)
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NO_DFCE_NOWRITE") != nullptr));
-      // Linked-exit RIP sink (BranchOps.cpp SinkExitRIP): presence-ENABLED;
-      // moves the destination-RIP constant and its `std State.rip` from above
-      // the block-link patch site to below it, so the emitted exit differs.
-      Hasher.Add(static_cast<uint64_t>(getenv("FEX_SINKEXITRIP") != nullptr));
+      // Linked-exit RIP sink (BranchOps.cpp): now default-ON, with
+      // FEX_NOSINKEXITRIP as the kill switch. Presence-DISABLED; the switch
+      // moves the destination-RIP constant and its `std State.rip` from below
+      // the block-link patch site back to above it, so the emitted exit differs.
+      Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOSINKEXITRIP") != nullptr));
       // P5.0.2 re-zero policy at block exits (BranchOps.cpp R0ZeroMode).
       // Three-way: elide (default) / always emit `li r0,0` / emit `tdnei r0,0`.
       // All three differ in emitted bytes, and the trap arm differs in
@@ -449,8 +450,19 @@ uint64_t ComputeCodeCacheConfigId() {
                                        getenv("FEX_NOR0ELIDE") != nullptr ? 1 : 0));
       // Entry-point prologue shape (JIT.cpp EmitStoreBlockBeginToInlineHeader):
       // presence-DISABLED; picks between the addi/addis delta fold and the
-      // legacy LoadImm32+subf, which differ in instruction count.
+      // legacy LoadImm32+subf, which differ in instruction count. Only has an
+      // effect when the store is emitted at all, i.e. under FEX_NOBLOCKHEADER=0
+      // (audit P1 elides the whole 5-instruction store by default).
       Hasher.Add(static_cast<uint64_t>(getenv("FEX_NOHDRADDI") != nullptr));
+      // Audit P1 InlineJITBlockHeader store (JIT.cpp EmitEntryPoint): resolved
+      // bool, true = elided (the default). Unset or "1" elides the whole
+      // bcl/mflr/addi/std prologue store; "0" emits it as before. Five
+      // instructions at the head of every entry point, so it changes the
+      // emitted bytes of essentially every block.
+      {
+        const char* NoBlockHeaderEnv = getenv("FEX_NOBLOCKHEADER");
+        Hasher.Add(static_cast<uint64_t>(!(NoBlockHeaderEnv && NoBlockHeaderEnv[0] == '0')));
+      }
       // Shifted-32 rule in LoadImm64 (CodeEmitter/PPC64LE/Emitter.h
       // DisableShiftedImm32): presence-DISABLED; changes how wide the constant
       // load is at every 64-bit guest-RIP materialisation, so it changes
@@ -1611,6 +1623,29 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       return false;
     }
   }
+
+  // Audit P1: register the loaded blocks in the code buffer's host-PC -> block
+  // index. Blocks that arrive this way never pass through CompileCode, so
+  // nothing called CodeBuffer::AppendBlock for them, and without this a signal
+  // taken inside cache-loaded code would resolve to no block at all (a stale
+  // Frame->State.rip in the reconstructed frame).
+  //
+  // The packed image is a contiguous chain of header/tail-delimited blocks:
+  // SaveData concatenates merged block extents 16-byte aligned (kBlockAlignment)
+  // and every block's Tail->Size is already a multiple of 16, so the alignment
+  // padding between regions is always zero-width and the walk never hits a gap.
+  //
+  // Placed here, after the last rejection point: an index entry for a region
+  // that is then handed back would be a stale offset that the next compile
+  // reuses, and AppendBlock's monotonicity check would abort on it.
+  //
+  // The image sits at the (page-aligned) offset the memcpy targeted, which is
+  // above every block already indexed, so this appends rather than resets.
+  // Called with CTX.CodeBufferWriteMutex held (taken at the top of this
+  // function), which is AppendBlock's single-writer requirement.
+  CodeBuffer->RebuildBlockIndexByWalk(header.CodeBufferSize,
+                                      static_cast<size_t>(reinterpret_cast<uintptr_t>(CodeBufferRange.data()) -
+                                                          reinterpret_cast<uintptr_t>(CodeBuffer->Ptr)));
 
   {
     auto& LookupCache = *CodeBuffer->LookupCache;

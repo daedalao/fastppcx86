@@ -598,8 +598,12 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     _SyscallHandler->DetectMonoBackpatcherBlock(Thread, ArchHelpers::Context::GetPc(ucontext));
 
     auto CTX = Thread->CTX;
-    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !CTX->IsCurrentBlockSingleInst(Thread) &&
-        CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
+    // Audit P1: "the current block" is now identified by the host PC rather
+    // than by a store the block made on entry, so the fault PC is passed
+    // through explicitly. Same PC IsAddressInCodeBuffer is already given.
+    const uint64_t FaultHostPC = ArchHelpers::Context::GetPc(ucontext);
+    if (CTX->IsAddressInCodeBuffer(Thread, FaultHostPC) && !CTX->IsCurrentBlockSingleInst(Thread, FaultHostPC) &&
+        CTX->IsAddressInCurrentBlock(Thread, FaultHostPC, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
       // If we are not in a single-instruction block, and the SMC write address could intersect with the current block,
       // reconstruct the context and repeat the faulting instruction as a single-instruction block so any SMC it performs
       // is immediately picked up.
@@ -1155,7 +1159,7 @@ void SyscallHandler::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadSta
     return;
   }
 
-  const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread);
+  const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread, HostPC);
   LogMan::Msg::IFmt("Detected mono backpatcher at {:#x} (faulting RIP {:#x}) — installing write hook, "
                     "disabling fault-based SMC detection for writable+executable mappings.",
                     BlockEntry, RIP);
