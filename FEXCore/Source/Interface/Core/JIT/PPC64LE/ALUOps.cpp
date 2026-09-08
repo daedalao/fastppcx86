@@ -2687,6 +2687,14 @@ DEF_OP(Select) {
     False_reg = GetReg(Op->FalseVal);
   }
   iselcc(Dst, CC, True_reg, False_reg);
+  // x86 32-bit results zero-extend to 64 (the arm64 backend gets this from the
+  // W-form csel). A 32-bit Select must honour the same IR contract: every
+  // i32 def leaves bits 63:32 clear. Without this, a 32-bit CMOV kept the
+  // dirty high half of the destination (condition false) or copied the
+  // source's high half (condition true); JSC's NaN-boxed int32 toLength
+  // turned into 0xFFFE0000_0000000N and Bun 1.3.14+/Claude Code threw
+  // "Out of memory" on Buffer.alloc.
+  if (IROp->Size <= IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(NZCVSelect) {
@@ -2740,6 +2748,7 @@ DEF_OP(NZCVSelect) {
     // isel's rA=0 encoding supplies a literal zero, so only the true value needs materialising.
     LoadConstant(TMP1, const_true == all_ones ? ~0ull : 1);
     iselcc(Dst, CC, TMP1, GPR{0});
+    if (IROp->Size <= IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
     return;
   }
 
@@ -2757,6 +2766,14 @@ DEF_OP(NZCVSelect) {
     False_ = GetReg(Op->FalseVal);
   }
   iselcc(Dst, CC, True, False_);
+  // x86 32-bit results zero-extend to 64 (the arm64 backend gets this from the
+  // W-form csel). A 32-bit Select must honour the same IR contract: every
+  // i32 def leaves bits 63:32 clear. Without this, a 32-bit CMOV kept the
+  // dirty high half of the destination (condition false) or copied the
+  // source's high half (condition true); JSC's NaN-boxed int32 toLength
+  // turned into 0xFFFE0000_0000000N and Bun 1.3.14+/Claude Code threw
+  // "Out of memory" on Buffer.alloc.
+  if (IROp->Size <= IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(NZCVSelectV) {
@@ -2816,6 +2833,9 @@ DEF_OP(NZCVSelectIncrement) {
   }
 
   iselcc(Dst, CC, TrueReg, TMP2);  // cond met → TrueVal, else FalseVal+1
+  // Same i32 zero-extension contract as Select/NZCVSelect above; FalseVal+1
+  // can also carry into bit 32.
+  if (IROp->Size <= IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
 }
 
 DEF_OP(MaskGenerateFromBitWidth) {
