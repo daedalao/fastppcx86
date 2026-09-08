@@ -228,6 +228,67 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     }
 
     auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
+    const bool EntryShared = Entry->second.Flags.Shared;
+
+    // LOCK ORDER. Everything below that touches compiled code -- the hard and
+    // soft invalidations, the semantic patch, the overlap query -- takes
+    // ThreadCreationMutex and then the EXCLUSIVE CodeInvalidationMutex. The
+    // order used everywhere else is CodeInvalidationMutex first and
+    // VMATracking.Mutex second: CompileBlock holds the former shared while
+    // MarkGuestExecutableRange/QueryGuestExecutableRange take the latter
+    // shared, and fork's LockBeforeFork takes both exclusively in that order.
+    // Holding VMATracking (shared) here while asking for CodeInvalidationMutex
+    // therefore deadlocks against a concurrent fork(): the forking thread owns
+    // CodeInvalidationMutex and waits for our VMATracking read lock, we own
+    // VMATracking and wait for its CodeInvalidationMutex, and
+    // TakeCodeInvalidationWriteLockOrSteal dies after 4s (the SIGTRAP Claude
+    // Code / Bun hit on every process spawn under FEX, 2026-09-08; two cores
+    // with the fork thread in ForkableSharedMutex::lock and this thread in
+    // ForcedAssert). Fork could not be reordered instead without inverting
+    // against CompileBlock.
+    //
+    // So read everything the handler needs out of the VMA now and drop the
+    // lock before any invalidation. A shared mapping's mirrors are copied into
+    // fixed storage (this is a signal handler: no heap); if there are more than
+    // fit, the walk is resumed under a fresh read lock below.
+    struct MirrorPage {
+      uint64_t Base;
+      bool Writable;
+    };
+    constexpr size_t MaxMirrors = 32;
+    MirrorPage Mirrors[MaxMirrors];
+    size_t MirrorCount = 0;
+    bool MirrorsRemaining = false;
+
+    // Requires VMATracking.Mutex held. Fills Mirrors[] with the pages that
+    // mirror FaultBase through the resource, skipping the first `Skip` matches;
+    // returns true if matches remain beyond the batch.
+    auto CollectMirrors = [&](decltype(Entry) E, size_t Skip) -> bool {
+      MirrorCount = 0;
+      LOGMAN_THROW_A_FMT(E->second.Resource, "VMA tracking error");
+      const auto Offset = FaultBase - E->first + E->second.Offset;
+      auto VMA = E->second.Resource->FirstVMA;
+      LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
+      size_t Seen = 0;
+      do {
+        if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
+          if (Seen++ < Skip) {
+            continue;
+          }
+          if (MirrorCount == MaxMirrors) {
+            return true;
+          }
+          Mirrors[MirrorCount++] = {Offset - VMA->Offset + VMA->Base, VMA->Prot.Writable};
+        }
+      } while ((VMA = VMA->ResourceNextVMA));
+      return false;
+    };
+
+    if (EntryShared) {
+      MirrorsRemaining = CollectMirrors(Entry, 0);
+    }
+
+    lk.lock.unlock();
 
     // Unprotect callback: mprotect(R+W) on the faulting page so the guest
     // store can complete on re-entry. Failure is fatal — if we return
@@ -362,7 +423,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         return false;
       };
 
-      if (Entry->second.Flags.Shared) {
+      if (EntryShared) {
         Fallback("shared-mapping", 0, 0);
       } else if (!DecodePPCStore(ucontext, StorePC, &Store)) {
         // Not a plain GPR store: VSX/VMX, byte-reversed, store-conditional,
@@ -422,26 +483,34 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // pretend a pending invalidation debt has been settled below.
     bool LazyDeferred = false;
 
-    if (Entry->second.Flags.Shared) {
-      LOGMAN_THROW_A_FMT(Entry->second.Resource, "VMA tracking error");
-
-      auto Offset = FaultBase - Entry->first + Entry->second.Offset;
-
-      auto VMA = Entry->second.Resource->FirstVMA;
-      LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
-
-      // Flush all mirrors, remap the page writable as needed
-      do {
-        if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
-          auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
-
-          if (VMA->Prot.Writable) {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+    if (EntryShared) {
+      // Flush all mirrors, remap the page writable as needed. VMATracking.Mutex
+      // is NOT held (see LOCK ORDER above); Mirrors[] was captured under it.
+      size_t Done = 0;
+      for (;;) {
+        for (size_t i = 0; i < MirrorCount; ++i) {
+          if (Mirrors[i].Writable) {
+            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
           } else {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE);
           }
         }
-      } while ((VMA = VMA->ResourceNextVMA));
+        Done += MirrorCount;
+        if (!MirrorsRemaining) {
+          break;
+        }
+        // More mirrors than the batch holds: resume the walk under a fresh read
+        // lock. If the mapping changed underneath us, the pages already handled
+        // stay handled and the store simply re-faults if it still needs to.
+        lk.lock.lock();
+        Entry = VMATracking->FindVMAEntry(FaultAddress);
+        if (Entry == VMATracking->VMAs.end() || !Entry->second.Flags.Shared || !Entry->second.Resource) {
+          lk.lock.unlock();
+          break;
+        }
+        MirrorsRemaining = CollectMirrors(Entry, Done);
+        lk.lock.unlock();
+      }
     } else if (_SyscallHandler->SMCLazyInvalActive()) {
       // FEX_SMCLAZYINVAL: unprotect and record, invalidate NOTHING. The writer
       // returns to native speed immediately; the page's blocks stay live (and
@@ -571,11 +640,11 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     const char* FaultOutcome = "INVALIDATED";
     if (LazyDeferred) {
       FaultOutcome = "LAZY-DEFERRED";
-    } else if (!Entry->second.Flags.Shared && _SyscallHandler->SMCSoftInvalidate()) {
+    } else if (!EntryShared && _SyscallHandler->SMCSoftInvalidate()) {
       FaultOutcome = "SOFT-INVALIDATED";
     }
     SMC_AUDIT("[%d] fault addr=%lx %s page=%lx shared=%d\n", FHU::Syscalls::gettid(), FaultAddress, FaultOutcome, FaultBase,
-              Entry->second.Flags.Shared ? 1 : 0);
+              EntryShared ? 1 : 0);
 
     // FEX_SMCMPROTECTDEFER: a deferred-dirty page can still fault here if a
     // block was compiled on it afterwards and MarkGuestExecutableRange
