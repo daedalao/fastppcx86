@@ -119,6 +119,40 @@ void DeparentSelf() {
     _exit(0);
   }
 }
+
+/**
+ * @brief Detaches the daemon from any pipe or socket it inherited on stdin/stdout/stderr.
+ *
+ * FEX spawns FEXServer with a plain fork+exec, so the daemon inherits whatever
+ * fds 0-2 the first guest process had. When that is a pipe (`claude -p ... |
+ * tail`, any SDK/script driver, a tee'd play log) the daemon keeps the write
+ * end open for as long as ANY FEX client is connected, hours for a game, and
+ * the reader hangs long after the guest itself has exited.
+ *
+ * Only pipes and sockets are replaced with /dev/null: a terminal or a regular
+ * file does not block anyone, and the daemon's own fprintf(stderr) lines plus
+ * the "server"-routed LogMan traffic of every client still reach the first
+ * client's terminal the way they always did. --foreground never comes here.
+ */
+void DetachStdio() {
+  int null_fd = -1;
+  for (int fd = 0; fd <= 2; ++fd) {
+    struct stat st {};
+    if (fstat(fd, &st) == -1 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+      continue;
+    }
+    if (null_fd == -1) {
+      null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+      if (null_fd == -1) {
+        return;
+      }
+    }
+    dup2(null_fd, fd);
+  }
+  if (null_fd != -1) {
+    close(null_fd);
+  }
+}
 } // namespace
 
 int main(int argc, char** argv, char** const envp) {
@@ -133,6 +167,7 @@ int main(int argc, char** argv, char** const envp) {
 
   if (!Options.Foreground) {
     DeparentSelf();
+    DetachStdio();
   }
 
   FEX::Config::LoadConfig({}, envp, FEX::ReadPortabilityInformation());
