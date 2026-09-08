@@ -1281,6 +1281,37 @@ namespace x64 {
         uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
         SYSCALL_ERRNO();
       }
+      case 0x802c542au: { // x86 TCGETS2 (_IOR(0x54, 0x2a, struct termios2))
+        // Same marshalling as TCGETS; glibc's PowerPC TCGETS wrapper already
+        // fills the numeric c_ispeed/c_ospeed, which is exactly what the
+        // guest's termios2 tail wants.
+        struct termios HostT {};
+        uint64_t Result = ::ioctl(fd, TCGETS, &HostT);
+        if (Result == 0) {
+          auto* Guest2 = reinterpret_cast<FEX::HLE::PPC64::GuestTermios2*>(arg);
+          FEX::HLE::PPC64::HostToGuest(HostT, Guest2->base);
+          Guest2->c_ispeed = HostT.c_ispeed;
+          Guest2->c_ospeed = HostT.c_ospeed;
+        }
+        SYSCALL_ERRNO();
+      }
+      case 0x402c542bu:   // x86 TCSETS2
+      case 0x402c542cu:   // x86 TCSETSW2
+      case 0x402c542du: { // x86 TCSETSF2
+        uint32_t host_cmd;
+        switch (cmd) {
+          case 0x402c542bu: host_cmd = TCSETS;  break;
+          case 0x402c542cu: host_cmd = TCSETSW; break;
+          default:          host_cmd = TCSETSF; break;
+        }
+        const auto* Guest2 = reinterpret_cast<const FEX::HLE::PPC64::GuestTermios2*>(arg);
+        struct termios HostT {};
+        FEX::HLE::PPC64::GuestToHost(Guest2->base, HostT);
+        HostT.c_ispeed = Guest2->c_ispeed;
+        HostT.c_ospeed = Guest2->c_ospeed;
+        uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
+        SYSCALL_ERRNO();
+      }
       default: break;
       }
 
