@@ -346,6 +346,41 @@ public:
     after_callback(Start, Length);
   }
 
+  // Several ranges under ONE exclusive acquisition. A shared mapping's SMC
+  // fault used to take (and convoy on) the exclusive lock once per mirror
+  // page; the per-range Unprotect flag preserves the "writable mirrors get the
+  // after_callback, read-only mirrors do not" split of the single-range form.
+  struct InvalidateRange {
+    uint64_t Start;
+    uint64_t Length;
+    bool Unprotect;
+  };
+
+  void InvalidateGuestCodeRanges(FEXCore::Core::InternalThreadState* CallingThread, const InvalidateRange* Ranges, size_t Count,
+                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
+    FEXCore::ReleaseAllPendingSharedLocks();
+    std::lock_guard lk(ThreadCreationMutex);
+
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
+    for (size_t i = 0; i < Count; ++i) {
+      CTX->InvalidateCodeBuffersCodeRange(Ranges[i].Start, Ranges[i].Length);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Ranges[i].Start, Ranges[i].Length);
+      }
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      if (Ranges[i].Unprotect) {
+        after_callback(Ranges[i].Start, Ranges[i].Length);
+      }
+    }
+  }
+
   // SMC v3 (FEX_SMCSOFTINVALIDATE): identical lock protocol and call shape to
   // the callback overload above -- ReleaseAllPendingSharedLocks, then
   // ThreadCreationMutex, then the steal-capable exclusive CodeInvalidationMutex

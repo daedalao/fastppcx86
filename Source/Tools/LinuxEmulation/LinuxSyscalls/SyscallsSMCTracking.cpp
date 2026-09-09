@@ -488,13 +488,12 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // is NOT held (see LOCK ORDER above); Mirrors[] was captured under it.
       size_t Done = 0;
       for (;;) {
+        // One exclusive acquisition for the whole batch, not one per mirror.
+        FEX::HLE::ThreadManager::InvalidateRange Batch[MaxMirrors];
         for (size_t i = 0; i < MirrorCount; ++i) {
-          if (Mirrors[i].Writable) {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-          } else {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE);
-          }
+          Batch[i] = {Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE, Mirrors[i].Writable};
         }
+        _SyscallHandler->TM.InvalidateGuestCodeRanges(Thread, Batch, MirrorCount, UnprotectRegionCallback);
         Done += MirrorCount;
         if (!MirrorsRemaining) {
           break;

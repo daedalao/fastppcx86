@@ -1991,7 +1991,14 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
 
     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    //
+    // One madvise per thread per invalidation, issued under the exclusive
+    // CodeInvalidationMutex. The CallRet stack is only ever written when the
+    // shadow return stack is armed (FEX_SHADOWRETSTACK); with it off the
+    // stack is empty and the syscall is pure critical-section time, so skip it.
+    if (Config.ShadowRetStack()) {
+      Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    }
   }
 }
 
