@@ -1189,6 +1189,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+    // ForceTSO metadata is read per block and the instruction iterator lives
+    // for the block loop; hold the reader side across it (see ForceTSOMutex).
+    std::shared_lock ForceTSOlk(ForceTSOMutex);
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
 
@@ -2189,14 +2192,13 @@ void ContextImpl::RemoveECTargetIRHandler(uintptr_t Entrypoint) {
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
-  LogMan::Throw::AFmt(CodeInvalidationMutex.is_write_owned(), "CodeInvalidationMutex needs to be unique_locked here");
+  std::unique_lock lk(ForceTSOMutex);
   ForceTSOValidRanges.Insert(ValidRanges);
   ForceTSOInstructions.merge(std::move(Instructions));
 }
 
 void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
-  LogMan::Throw::AFmt(CodeInvalidationMutex.is_write_owned(), "CodeInvalidationMutex needs to be unique_locked here");
-
+  std::unique_lock lk(ForceTSOMutex);
   ForceTSOValidRanges.Remove({Address, Address + Size});
   ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
 }
@@ -2219,7 +2221,13 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
   {
-    auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
+    // Shared, not exclusive: the store is a single aligned host store and the
+    // invalidation below retires whatever any concurrent compile read. The
+    // exclusive form (the guard's default template argument) stopped every
+    // compile and L1-miss link in the process for one store, and a store
+    // that faults into HandleSegfault can only have its lock released by
+    // ReleaseAllPendingSharedLocks if it is a tracked shared hold.
+    auto lk = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
 
     if (Size == 8) {
       *reinterpret_cast<uint64_t*>(Address) = Value;

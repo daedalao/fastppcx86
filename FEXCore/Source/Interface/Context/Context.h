@@ -670,6 +670,13 @@ private:
     void* Data;
   };
   fextl::unordered_map<uint64_t, CustomIRHandlerEntry> CustomIRHandlers;
+  // ForceTSO metadata has its own lock. Readers are CompileBlock's per-block
+  // lookups (shared, for the length of the block loop); writers are the
+  // Add/RemoveForceTSOInformation calls from guest mmap/munmap. These used to
+  // ride on the exclusive CodeInvalidationMutex, which made every mmap and
+  // munmap of a volatile-metadata image a stop-the-world for all compiles and
+  // L1-miss links in the process.
+  std::shared_mutex ForceTSOMutex;
   IntervalList<uint64_t> ForceTSOValidRanges; // The ranges for which ForceTSOInstructions has populated data
   fextl::set<uint64_t> ForceTSOInstructions;
 
