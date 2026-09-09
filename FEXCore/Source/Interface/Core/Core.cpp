@@ -2210,10 +2210,15 @@ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
 void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
   LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
 
-  std::scoped_lock lk(CustomIRMutex);
-
-  CustomIRHandlers.erase(Entrypoint);
-  HasCustomIRHandlers = !CustomIRHandlers.empty();
+  {
+    std::scoped_lock lk(CustomIRMutex);
+    CustomIRHandlers.erase(Entrypoint);
+    HasCustomIRHandlers = !CustomIRHandlers.empty();
+  }
+  // Outside CustomIRMutex: GenerateIR takes CustomIRMutex shared while
+  // holding CodeInvalidationMutex shared, so invalidating (exclusive
+  // CodeInvalidationMutex) while still holding CustomIRMutex exclusive
+  // inverted that order against every concurrent compile.
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 
