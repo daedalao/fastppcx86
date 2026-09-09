@@ -297,6 +297,20 @@ public:
   // detector rather than a contention detector. The fatal stays: a genuine
   // stall here is a lock-order bug (see the VMATracking LOCK ORDER note in
   // HandleSegfault) and must be reported, not hidden.
+  //
+  // LOCK ORDER (2026-09-08): the helpers below take the exclusive
+  // CodeInvalidationMutex FIRST and ThreadCreationMutex only around the
+  // per-thread cache walk. ThreadCreationMutex used to be held for the whole
+  // invalidation -- the wait for readers to drain, the code-buffer walk, the
+  // syscalls in the after_callback -- so every CreateThread/DestroyThread
+  // (Bun does both constantly) serialised behind every SMC fault and vice
+  // versa, and a DestroyThread doing last-thread file I/O stalled invalidation.
+  // Nothing takes CodeInvalidationMutex while holding ThreadCreationMutex
+  // (ThreadManager.cpp never touches it; fork's LockBeforeFork takes the Stat
+  // lock, not this one), so the reversal introduces no inversion. Taking
+  // ThreadCreationMutex inside the exclusive lock, rather than snapshotting
+  // the list before it, is what keeps a thread created mid-invalidation from
+  // compiling the range and then being missed by the walk.
   static constexpr int InvalidateGuestCodeRangeStealTimeoutSec = 4;
 
   void TakeCodeInvalidationWriteLockOrSteal(FEXCore::Utils::WritePriorityMutex::Mutex& M) {
@@ -311,7 +325,6 @@ public:
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -321,15 +334,20 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -339,8 +357,14 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
 
     after_callback(Start, Length);
@@ -359,7 +383,6 @@ public:
   void InvalidateGuestCodeRanges(FEXCore::Core::InternalThreadState* CallingThread, const InvalidateRange* Ranges, size_t Count,
                                  FEXCore::Context::CodeRangeInvalidationFn after_callback) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -370,8 +393,13 @@ public:
 
     for (size_t i = 0; i < Count; ++i) {
       CTX->InvalidateCodeBuffersCodeRange(Ranges[i].Start, Ranges[i].Length);
+    }
+    {
+      std::lock_guard lk(ThreadCreationMutex);
       for (auto& Thread : Threads) {
-        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Ranges[i].Start, Ranges[i].Length);
+        for (size_t i = 0; i < Count; ++i) {
+          CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Ranges[i].Start, Ranges[i].Length);
+        }
       }
     }
     for (size_t i = 0; i < Count; ++i) {
@@ -392,7 +420,6 @@ public:
   void SoftInvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                     FEXCore::Context::CodeRangeInvalidationFn after_callback) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -402,8 +429,14 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->SoftInvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
 
     after_callback(Start, Length);
@@ -426,7 +459,6 @@ public:
   // FEXCore/Source/Interface/Core/SMCSemanticPatch.h.
   bool SemanticPatchGuestCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
