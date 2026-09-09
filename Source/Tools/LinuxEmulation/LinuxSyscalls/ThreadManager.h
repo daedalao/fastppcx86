@@ -278,41 +278,35 @@ public:
     ++IdleWaitRefCount;
   }
 
-  // 2026-05-14 deadlock recovery: both overloads sweep the calling thread's
-  // PendingSharedLockStack first (defensive against the caller having an
-  // unreleased CompileBlock/ExitFunctionLink read lock in scope), and use a
-  // bounded-wait write-lock acquisition that calls StealAndDropActiveLocks()
-  // after InvalidateGuestCodeRangeStealTimeoutSec seconds.  This recovers
-  // from the phantom-reader leak family of bugs we've been hitting under
-  // Steam and FTL.  The underlying leak source(s) should still be found,
-  // but live workloads can make forward progress in the meantime.
+  // Bounded exclusive acquire of CodeInvalidationMutex from the invalidation
+  // helpers (syscall layer and the SIGSEGV handler).
+  //
+  // History: this was a try_lock() poll every 50 us for 4 s, then a steal, then
+  // (co-dev findings §1.2) a fatal instead of the steal because stealing
+  // outside fork() corrupts the mutex word. The poll itself was wrong for a
+  // different reason: try_lock() is a bare CAS from 0 that never registers as
+  // a write waiter, so the mutex's writer priority never engaged -- every
+  // CompileBlock / ExitFunctionLink on every other thread kept taking the
+  // shared side, and with a JIT worker producing code for 8+ executing threads
+  // the reader count could stay non-zero across every sample until the
+  // deadline (reader-starvation livelock, indistinguishable from the deadlock
+  // this was meant to catch). It also cost 10-20k wakeups/s per waiter.
+  //
+  // try_lock_for registers as a writer (readers then drain as designed) and
+  // sleeps on the futex with a real deadline, so the 4 s is now a deadlock
+  // detector rather than a contention detector. The fatal stays: a genuine
+  // stall here is a lock-order bug (see the VMATracking LOCK ORDER note in
+  // HandleSegfault) and must be reported, not hidden.
   static constexpr int InvalidateGuestCodeRangeStealTimeoutSec = 4;
 
   void TakeCodeInvalidationWriteLockOrSteal(FEXCore::Utils::WritePriorityMutex::Mutex& M) {
-    if (M.try_lock()) {
+    if (M.try_lock_for(std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec))) {
       return;
     }
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec);
-    while (!M.try_lock()) {
-      if (std::chrono::steady_clock::now() > deadline) {
-        // Co-dev ISA-neutral findings §1.2 (verified): StealAndDropActiveLocks
-        // outside fork() corrupts the mutex word — the stolen-from reader's
-        // later unlock_shared underflows into phantom waiters with no wake
-        // possible, and the next lock() overflows the waiter field into the
-        // owned bit. Silent corruption, Release-only. Measured ZERO firings
-        // across ~72K invalidations on real workloads, so a fatal here costs
-        // nothing in practice and converts the corruption into an actionable
-        // report. The steal remains valid ONLY on the fork() child path.
-        // (Underlying producer to fix with this: the fork-vs-fault-handler
-        // lock inversion the steal was masking — findings §3.1.)
-        ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
-                          "(phantom reader / lock inversion). Refusing the "
-                          "corrupting steal; report this with the workload.",
-                          InvalidateGuestCodeRangeStealTimeoutSec);
-      }
-      ::usleep(50);
-    }
+    ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
+                      "(phantom reader / lock inversion). Refusing the "
+                      "corrupting steal; report this with the workload.",
+                      InvalidateGuestCodeRangeStealTimeoutSec);
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
