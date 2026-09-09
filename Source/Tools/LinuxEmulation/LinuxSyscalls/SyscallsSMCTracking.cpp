@@ -1891,7 +1891,12 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
 
   if (LateMetadata) {
-    // Own mutex inside; no longer a stop-the-world on CodeInvalidationMutex.
+    // ForceTSO has its own mutex; this is the SHARED side of
+    // CodeInvalidationMutex, not the exclusive stop-the-world it used to be.
+    // The shared hold is still required: fork's LockBeforeFork takes
+    // CodeInvalidationMutex exclusively and is what guarantees no thread is
+    // inside this call, so the child never inherits a locked ForceTSOMutex.
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback<std::shared_lock>(CTX->GetCodeInvalidationMutex(), Thread);
     CTX->AddForceTSOInformation(LateMetadata->VolatileValidRanges, std::move(LateMetadata->VolatileInstructions));
   }
 
@@ -1969,7 +1974,9 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size);
 
   if (length) {
-    // Own mutex inside; no longer a stop-the-world on CodeInvalidationMutex.
+    // Shared side of CodeInvalidationMutex: see GuestMmap for why the hold
+    // (fork exclusion) is still needed now that ForceTSO has its own mutex.
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback<std::shared_lock>(CTX->GetCodeInvalidationMutex(), Thread);
     CTX->RemoveForceTSOInformation(reinterpret_cast<uint64_t>(addr), length);
   }
 

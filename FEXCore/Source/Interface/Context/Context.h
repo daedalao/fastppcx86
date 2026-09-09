@@ -675,7 +675,10 @@ private:
   // Add/RemoveForceTSOInformation calls from guest mmap/munmap. These used to
   // ride on the exclusive CodeInvalidationMutex, which made every mmap and
   // munmap of a volatile-metadata image a stop-the-world for all compiles and
-  // L1-miss links in the process.
+  // L1-miss links in the process. Writers still hold CodeInvalidationMutex
+  // SHARED while they hold this exclusively: that is what keeps fork (which
+  // takes CodeInvalidationMutex exclusively) from snapshotting this mutex in
+  // the locked state into the child.
   std::shared_mutex ForceTSOMutex;
   IntervalList<uint64_t> ForceTSOValidRanges; // The ranges for which ForceTSOInstructions has populated data
   fextl::set<uint64_t> ForceTSOInstructions;
