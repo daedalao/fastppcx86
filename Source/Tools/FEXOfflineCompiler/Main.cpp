@@ -9,6 +9,7 @@
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 
+#include "Common/HostPageGate.h"
 #include <Common/ArgumentLoader.h>
 #include <Common/Config.h>
 #include <Common/FEXServerClient.h>
@@ -321,6 +322,10 @@ static int GenerateCache(int argc, const char** argv) {
   char* envp[] = {nullptr};
   FEX::Config::LoadConfig("", envp, PortableInfo);
 
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
+
   auto NumBlocks = Data.at(ProgramName).size();
   auto GeneratedCache = GenerateSingleCache(ProgramName, Data.at(ProgramName), OutDir);
   if (GeneratedCache) {
@@ -331,6 +336,9 @@ static int GenerateCache(int argc, const char** argv) {
 }
 
 int main(int argc, char** argv) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
 

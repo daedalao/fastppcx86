@@ -1123,7 +1123,7 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   ExtendedMetaData = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(FEXCore::Config::Get_EXTENDEDVOLATILEMETADATA()());
 
   // There was a host-page-size warning here. It has moved, whole, to
-  // FEX::Kernel::PageSize::CheckHostPageSize (FEXInterpreter.cpp), which runs
+  // FEX::HostPageGate::CheckHostPageSize (Source/Common/HostPageGate.h), which runs
   // before any InternalThreadState is allocated and aborts rather than warns.
   //
   // Do not re-add a check here. The version that used to live at this spot

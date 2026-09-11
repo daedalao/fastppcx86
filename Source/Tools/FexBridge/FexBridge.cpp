@@ -22,6 +22,7 @@ $end_info$
 
 #include "fexbridge.h"
 
+#include "Common/HostPageGate.h"
 #include "Common/Config.h"
 #include "Common/HostFeatures.h"
 
@@ -1270,6 +1271,10 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // No frontend => no mprotect-based SMC tracking host. The caller reports
   // code writes through fexbridge_invalidate_code_range.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
+
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
   // The lazy-SMC trio must fall with it.  The gaming launcher exports
   // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
   // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore

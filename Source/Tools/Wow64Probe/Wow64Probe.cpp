@@ -22,6 +22,7 @@ $end_info$
 */
 
 #include "DummyHandlers.h"
+#include "Common/HostPageGate.h"
 #include "Common/HostFeatures.h"
 
 #include <FEXCore/Config/Config.h>
@@ -1050,6 +1051,10 @@ int main(int argc, char** argv) {
   // invalidation from BTCpuNotifyMemory*; here we call
   // InvalidateCodeBuffersCodeRange explicitly after writing guest code.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
+
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
 
   auto HostFeatures = FEX::FetchHostFeatures();
   auto CTXPtr = FEXCore::Context::Context::CreateNewContext(HostFeatures);

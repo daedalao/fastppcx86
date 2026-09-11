@@ -17,6 +17,7 @@ $end_info$
 #include "LinuxSyscalls/SignalDelegator.h"
 #endif
 
+#include "Common/HostPageGate.h"
 #include "Common/HostFeatures.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "HarnessHelpers.h"
@@ -231,6 +232,11 @@ int main(int argc, char** argv, char** const envp) {
   FEXCore::Config::ReloadMetaLayer();
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode() ? "1" : "0");
+
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
+
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");
