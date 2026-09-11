@@ -19,10 +19,20 @@ $end_info$
 // then handed straight to the host kernel (and to host mprotect via
 // UnprotectRegionCallback), which demands host granularity.
 //
-// 64K-TODO(S4/S5): that split is the granule table (design Part 2 sections 2 and 5)
-// and is deliberately NOT done here. This file keeps bit-identical 4K behaviour;
-// on a 64K host the guest memory syscalls and mtrack still fail, which is what
-// FEX_HOSTPAGEMODE=abort exists to report.
+// Stage S4c does the mtrack half of that split: every host mprotect this file
+// issues on mtrack's behalf now goes through FEX::HLE::SMCGranule::Cover(),
+// which rounds it out to the host granule, and the SMC fault path widens its
+// INVALIDATION range to match so the soundness rule of design Part 2 section 5
+// holds -- "whatever range you unprotect, you must invalidate or re-arm every
+// tracked guest page inside it". See LinuxSyscalls/SMCHostGranule.h.
+//
+// Cover() is the identity when HostPage::MatchesGuest(), so on a 4K host every
+// mprotect and every invalidation range in this file is byte-identical to what
+// it was before S4c.
+//
+// 64K-TODO(S4b): the GUEST memory syscalls (mmap/munmap/mprotect/mremap
+// passthrough) are the other half and are the granule table in VMATracking
+// (design Part 2 section 2); they are not touched here.
 // ---------------------------------------------------------------------------
 
 #include <Common/Config.h>
@@ -41,6 +51,7 @@ $end_info$
 #include <FEXCore/fextl/memory.h>
 
 #include "LinuxSyscalls/HostOwnedRanges.h"
+#include "LinuxSyscalls/SMCHostGranule.h"
 #include "LinuxSyscalls/SMCStoreBackpatch.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
@@ -343,17 +354,29 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       }
     }
     auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
-      auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
+      // 64K (S4c): mprotect's quantum is the HOST page. Widen to the granule --
+      // identity on a 4K host. The caller has already widened the INVALIDATION
+      // range to the same cover (or queued the siblings under
+      // FEX_SMCGRANULEPOLICY=rearm), which is the soundness rule: never unprotect
+      // more than you invalidate or re-arm. SMCHostGranule.h.
+      const auto Region = FEX::HLE::SMCGranule::Cover(Start, Length);
+      auto rv = mprotect((void*)Region.Start, Region.Length, PROT_READ | PROT_WRITE);
       // Hard check (power9 8aed92805): the old release-compiled-out assert let a
       // failed unprotect become a silent re-fault-forever hang.
+      //
+      // ENOMEM here on a 64K host means the granule is only partially mapped,
+      // which the S4b granule table is what prevents (see HOOK WANTED in
+      // SMCHostGranule.h). Name the widened range so that shows in the message.
       if (rv != 0) {
-        ERROR_AND_DIE_FMT("SMC unprotect: mprotect({:#x}, {:#x}, R+W) failed errno={}; guest store cannot progress, sigreturn would re-fault forever", Start,
-                          Length, errno);
+        ERROR_AND_DIE_FMT("SMC unprotect: mprotect({:#x}, {:#x}, R+W) failed errno={} (requested {:#x}+{:#x}); guest store cannot "
+                          "progress, sigreturn would re-fault forever",
+                          Region.Start, Region.Length, errno, Start, Length);
       }
 #ifdef ARCHITECTURE_ppc64le
       // FEX_SMCSTOREBACKPATCH: the page is writable again, so an already-
       // backpatched store site targeting it can go back to storing natively.
-      FEX::HLE::SMCBackpatch::NotePagesUnprotected(Start, Length);
+      // The whole granule really is writable again, so report the whole granule.
+      FEX::HLE::SMCBackpatch::NotePagesUnprotected(Region.Start, Region.Length);
 #endif
     };
 
@@ -900,11 +923,14 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
               const auto MirroredSize = std::min(OffsetTop, VMAOffsetTop) - MirroredBase;
 
               const uintptr_t MirroredAbsBase = MirroredBase - VMAOffsetBase + VMABase;
-              auto rv = mprotect((void*)MirroredAbsBase, MirroredSize, PROT_READ);
+              // 64K (S4c): host-granular, and record which guest pages of each
+              // granule this arming actually tracks. Identity on a 4K host.
+              const auto MirrorRegion = FEX::HLE::SMCGranule::Cover(MirroredAbsBase, MirroredSize);
+              auto rv = mprotect((void*)MirrorRegion.Start, MirrorRegion.Length, PROT_READ);
 #ifdef ARCHITECTURE_ppc64le
               // Backpatch bookkeeping only when the protect actually took.
               if (rv == 0) {
-                FEX::HLE::SMCBackpatch::NotePagesProtected(MirroredAbsBase, MirroredSize);
+                FEX::HLE::SMCBackpatch::NotePagesProtected(MirrorRegion.Start, MirrorRegion.Length);
               }
 #endif
               SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(), MirroredAbsBase, MirroredSize);
@@ -964,11 +990,17 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
             continue;
           }
 
-          int rv = mprotect((void*)ProtectBase, ProtectSize, PROT_READ);
+          // 64K (S4c): host-granular. On a 64K host this write-protects up to 15
+          // sibling guest pages that may be plain data the guest writes
+          // constantly -- that thrash is inherent to a 16x quantum, is what
+          // FEX_SMCGRANULEFLIPLOG surfaces, and is why the per-granule tracked
+          // count below exists. Identity on a 4K host.
+          const auto ProtectRegion = FEX::HLE::SMCGranule::Cover(ProtectBase, ProtectSize);
+          int rv = mprotect((void*)ProtectRegion.Start, ProtectRegion.Length, PROT_READ);
 #ifdef ARCHITECTURE_ppc64le
           // FEX_SMCSTOREBACKPATCH: this is where a guest page acquires live
           // compiled code and the mtrack write protection that goes with it.
-          FEX::HLE::SMCBackpatch::NotePagesProtected(ProtectBase, ProtectSize);
+          FEX::HLE::SMCBackpatch::NotePagesProtected(ProtectRegion.Start, ProtectRegion.Length);
 #endif
 
           SMC_AUDIT("[%d] mark PROTECT base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
@@ -1290,11 +1322,19 @@ void SyscallHandler::DisableSMCDetectionLocked(FEXCore::Core::InternalThreadStat
       continue;
     }
 
+    // 64K (S4c): this undoes mtrack protections that were installed granule-
+    // granular, so the undo has to be granule-granular too or the tail of a
+    // granule stays read-only with nothing left to fault it open. Identity on a
+    // 4K host. Widening is safe in the permissive direction: the guest asked for
+    // W+X on this VMA, and a sibling granule page belonging to another VMA
+    // becomes more permissive, never less (design Part 2 section 2's union rule).
+    const auto RestoreRegion = FEX::HLE::SMCGranule::Cover(MapBase, Entry.Length);
     const int Prot = (Entry.Prot.Readable ? PROT_READ : 0) | PROT_WRITE | PROT_EXEC;
-    if (mprotect(reinterpret_cast<void*>(MapBase), Entry.Length, Prot) == 0) {
+    if (mprotect(reinterpret_cast<void*>(RestoreRegion.Start), RestoreRegion.Length, Prot) == 0) {
       ++Restored;
     } else {
-      LogMan::Msg::EFmt("Mono: failed to restore protection on {:#x}-{:#x}: {}", MapBase, MapBase + Entry.Length, strerror(errno));
+      LogMan::Msg::EFmt("Mono: failed to restore protection on {:#x}-{:#x}: {}", RestoreRegion.Start, RestoreRegion.Start + RestoreRegion.Length,
+                        strerror(errno));
     }
   }
   LogMan::Msg::IFmt("Mono: restored write+exec protection on {} mapping(s).", Restored);
