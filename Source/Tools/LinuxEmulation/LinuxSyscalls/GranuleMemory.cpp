@@ -858,6 +858,32 @@ bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t leng
   const uint64_t HostSize = FEXCore::HostPage::Size();
   auto* Hndl = Handler::Get();
 
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#endif
+#ifndef MADV_GUARD_REMOVE
+#define MADV_GUARD_REMOVE 103
+#endif
+  if (advice == MADV_GUARD_INSTALL || advice == MADV_GUARD_REMOVE) {
+    // Guard regions are NOT hints: a guarded page faults (SEGV_MAPERR) and the
+    // kernel refuses to populate it, at HOST page granularity. Modern glibc
+    // installs the 4K guard at the low end of every pthread stack this way.
+    // Rounding the install out to the granule -- as the hint path below does --
+    // guards 60K of the thread's real stack, the first deep push faults
+    // forever, and HandleSegfault (seeing a writable VMA) mistakes it for an
+    // SMC fault and unprotects a page that was never protected. RimWorld Linux
+    // on the 64K kernel spun at 5000 faults/s on exactly that, one thread, one
+    // address. A sub-granule guard is the same relaxation as a PROT_NONE guard
+    // page inside a live granule (PAGE_SIZE_64K_PLAN section 6): tracked in
+    // intent, not enforced. Whole granules pass through unchanged.
+    if (!(HostAligned(GuestBase) && HostAligned(GuestEnd))) {
+      LogOnce(LoggedMadviseSkip, "a guard region on part of a granule (not enforced; permissive tier)", GuestBase, Size);
+      *Result = 0;
+      return true;
+    }
+    return false;
+  }
+
   if (!Destructive) {
     const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
     const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);

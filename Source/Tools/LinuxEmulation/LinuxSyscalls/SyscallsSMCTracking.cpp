@@ -205,6 +205,15 @@ bool DecodePPCStore(void* ucontext, uint64_t PC, DecodedStore* Out) {
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
 
+  // mtrack faults are protection faults (SEGV_ACCERR) on pages FEX itself
+  // write-protected. A SEGV_MAPERR -- no page could be faulted in at all: an
+  // unmapped address, a stack guard gap, a kernel guard region -- is never
+  // ours, and answering it with an unprotect changes nothing but sends the
+  // guest straight back into the same fault. Let it be delivered.
+  if (((siginfo_t*)info)->si_code == SEGV_MAPERR) {
+    return false;
+  }
+
   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
   auto CallRetStackInfo = ThreadObject->GetCallRetStackInfo();
   if (FaultAddress >= CallRetStackInfo.AllocationBase && FaultAddress < CallRetStackInfo.AllocationEnd) {
