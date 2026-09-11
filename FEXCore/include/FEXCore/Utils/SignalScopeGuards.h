@@ -109,12 +109,28 @@ public:
     const auto Result = pthread_rwlock_unlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to unlock with {}", __func__, Result);
   }
+  // A shared acquisition on a thread that already owns the lock for writing is
+  // refused by glibc with EDEADLK. Treating that as "acquired" and unlocking
+  // later ENDS THE WRITE PHASE from under the writer and, on the writer's own
+  // unlock, underflows the reader count: readers then park on a write phase
+  // nobody owns until the next writer happens by (RimWorld Linux on the 64K
+  // kernel ran at one frame per invalidation deadline this way). Remember the
+  // refusal per thread, skip the matching unlock, and say where it came from.
   void lock_shared() {
     const auto Result = pthread_rwlock_rdlock(&Mutex);
+    if (Result == EDEADLK) [[unlikely]] {
+      ++SharedRefusedDepth();
+      ReportUnownedLockAssertion("ForkableSharedMutex::lock_shared refused: caller already holds the WRITE lock");
+      return;
+    }
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
   }
 
   void unlock_shared() {
+    if (SharedRefusedDepth() > 0) [[unlikely]] {
+      --SharedRefusedDepth();
+      return;
+    }
     unlock();
   }
 
@@ -147,6 +163,10 @@ public:
     Mutex = PTHREAD_RWLOCK_INITIALIZER;
   }
 private:
+  static int& SharedRefusedDepth() {
+    static thread_local int Depth = 0;
+    return Depth;
+  }
   pthread_rwlock_t Mutex;
 };
 
