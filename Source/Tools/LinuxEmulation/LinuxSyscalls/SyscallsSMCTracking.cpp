@@ -629,7 +629,29 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // unprotect it, which merely re-arms protection at the next
       // compile/relink through MarkGuestExecutableRange -- sound.
       bool EpochStart = false;
-      const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase, &EpochStart);
+      // 64K (S4c): the dirty-page SET stays indexed per GUEST page (its consumer
+      // is SoftInvalidateGuestCodeRange, a guest-code quantity, and
+      // SMCSoftInvalidate's content hashes are guest-4K). What changes is that
+      // the unprotect below opens the whole granule, so every tracked guest page
+      // in it must be recorded as dirty, not just the faulting one -- otherwise
+      // the drain settles page N and leaves N+1..N+15 unprotected with live
+      // blocks, which is the soundness rule broken through the lazy door.
+      // On a 4K host this loop runs exactly once, on FaultBase.
+      bool FirstThisEpoch = false;
+      for (uint64_t Page = FaultRegion.Start; Page < FaultRegion.Start + FaultRegion.Length; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
+        const bool IsFaultPage = Page == FaultBase;
+        if (!IsFaultPage && !(TrackedInGranule & (1u << FEX::HLE::SMCGranule::PageBit(Page)))) {
+          // Not tracked: no protection of ours was on it and no block was
+          // compiled from it, so there is nothing for a drain to settle.
+          continue;
+        }
+        bool PageEpochStart = false;
+        const bool First = _SyscallHandler->MarkSMCLazyDirtyPage(Page, &PageEpochStart);
+        if (IsFaultPage) {
+          FirstThisEpoch = First;
+        }
+        EpochStart |= PageEpochStart;
+      }
       UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       LazyDeferred = true;
 
