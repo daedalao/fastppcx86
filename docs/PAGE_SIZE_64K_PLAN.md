@@ -1,5 +1,10 @@
 # Running on a 64K-page kernel: review findings and port design
 
+> **2026-09-11:** the schedule that executes this design, with measured
+> findings that changed it (jemalloc is the first blocker, op64k shares
+> /home, Wine already carries host-page support), is
+> [PAGE_SIZE_64K_EXECUTION.md](PAGE_SIZE_64K_EXECUTION.md).
+
 Companion to [PAGE_SIZE_AUDIT.md](PAGE_SIZE_AUDIT.md) (a4b9668b9, 2026-08-16),
 which classified all 245 `FEX_PAGE_SIZE` grep hits. This document is the result
 of a second, independent read of the tree (2026-08-17, source-only — nothing

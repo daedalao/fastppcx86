@@ -10,10 +10,29 @@ split-lock handling) and the self-modifying-code subsystem are written for POWER
   gated behind runtime feature detection, not assumed.
 - **POWER9 hosts are supported** and get additional codegen improvements where the ISA allows it,
   but nothing requires POWER9.
-- **Host page size:** the self-modifying-code tracker (`SMCChecks=mtrack`) mprotect()s guest pages
-  at FEX's fixed 4K granularity to match the AT_PAGESZ=4096 the guest is told. On a host booted
-  with a larger page size, mtrack-based SMC detection is unsupported and will misbehave or abort;
-  boot a 4K-page kernel, or run with `FEX_SMCCHECKS=full` on larger-page hosts.
+- **Host page size: 4K and 64K kernels, one binary.** The guest is always told `AT_PAGESZ=4096`;
+  the host page size is a runtime quantity (`FEXCore::HostPage`), read once at start-up. On a 64K
+  ppc64le kernel the port emulates the guest's 4K view on top of 64K host granules:
+  - the ELF loader and the guest `mmap`/`munmap`/`mprotect`/`mremap` family map, copy or protect
+    whole host granules and keep a per-guest-page table of what the guest intended
+    (`docs/PAGE_SIZE_64K_PLAN.md` §2, the *permissive tier*: a protection stricter than the
+    granule union is tracked but not enforced, so a 4K guard page inside a live granule does not
+    fault);
+  - `mincore`/`msync`/`madvise` and `/proc/self/maps` answer at guest granularity from that table;
+  - mtrack SMC write-protects whole granules and invalidates every tracked guest page in a granule
+    it opens (`docs/PAGE_SIZE_64K_PLAN.md` §5). Mixed code/data granules thrash; `FEX_SMCGRANULEFLIPLOG`
+    reports them and `FEX_HOSTPAGEMODE=degrade` switches to hash-checked SMC instead.
+  - Wine's native ppc64le build (`wine-ppc64le`, the `nw` lane) does its own 64K handling and the
+    bridge lane needs none of the above.
+
+  The 64K lane is new (2026-09-11): The Witcher 3, Cyberpunk 2077 and RimWorld run through the
+  native-wine lane, and Linux-native guests load and run. `FEX_HOSTPAGEMODE` (`abort`, the default
+  for the FEX launcher; `degrade`; `force`) gates a non-4K host. Status, measurements and open items:
+  [`docs/PAGE_SIZE_64K_EXECUTION.md`](docs/PAGE_SIZE_64K_EXECUTION.md); design:
+  [`docs/PAGE_SIZE_64K_PLAN.md`](docs/PAGE_SIZE_64K_PLAN.md); site audit:
+  [`docs/PAGE_SIZE_AUDIT.md`](docs/PAGE_SIZE_AUDIT.md). The bundled `jemalloc_glibc` is compiled
+  for a 64K page (`LG_PAGE 16`) so that one build serves both kernels; a 64K-page host
+  needs `x86_64-pc-linux-gnu-gcc` for the thunk generator like any other.
 
 ## Documentation
 
@@ -259,7 +278,10 @@ are off by default and must be opted into (globally or per-app).
 
 | Flag | Type (default) | Fork? | Description |
 |---|---|---|---|
-| `SMCChecks` | uint8 (mtrack) | | Base SMC detection mode: `none` (no checks), `mtrack` (page-tracking-based invalidation, default), `full` (validate code before every run; slow, but works when the host page size doesn't match FEX's 4K assumption). |
+| `SMCChecks` | uint8 (mtrack) | | Base SMC detection mode: `none` (no checks), `mtrack` (page-tracking-based invalidation, default), `full` (validate code before every run; slow, and the correctness fallback on a 64K-page host where mtrack thrashes on mixed code/data granules). |
+| `HostPageMode` | string (abort) | **Fork** | What to do on a host whose page is larger than the guest's 4K: `abort` (default for the `FEX` launcher: refuse with an explanation), `degrade` (continue and force `SMCChecks=full`), `force` (continue, force nothing). FexBridge defaults to `force`: in the native-wine lane Wine owns every guest mapping. Env `FEX_HOSTPAGEMODE`; `FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1` is an alias for `force`. |
+| `FEX_SMCGRANULEPOLICY` | env (invalidate) | **Fork** | 64K hosts only. What happens to the tracked siblings of a faulting guest page when mtrack opens a granule: `invalidate` (sound: the invalidation is widened to the granule) or `rearm` (unsound measurement mode: invalidate the page, soft-invalidate the granule at the next drain). |
+| `FEX_SMCGRANULEFLIPLOG` | env (64) | **Fork** | 64K hosts only. Faults per granule per second above which one rate-limited line names the granule and its tracked-page count; `0` disables. |
 | `SMCSoftInvalidate` | bool (false) | **Fork** | On an SMC write fault, soft-invalidate the page's blocks (unlink from lookup caches, sever inbound links) but keep the compiled code and a hash of its source bytes instead of discarding it. The next dispatch re-hashes and relinks if unchanged; only genuinely modified blocks recompile. |
 | `SMCFileImmutable` | bool (false) | **Fork** | Treats code from a private file-backed mapping (Wine DLLs, libc, an executable's own `.text`) as immutable and skips mtrack write-protection on it, since such mappings are normally only written at load time. Guest mmap/munmap/mprotect still invalidate unconditionally. **Known breakage:** in-place patching of file-backed `.text` through an already-writable mapping (some DRM/packers, some Mono AOT fixups) goes undetected. Only meaningful with `SMCChecks=mtrack`; opt in per application. |
 | `SMCLazyInval` | bool (false) | **Fork** | On an SMC write fault, unprotect the page and mark it dirty but invalidate nothing immediately; the writer runs at native speed. Soft-invalidation is deferred to the next drain point (a thread entering the block compiler, a guest syscall, guest signal delivery, or a guest `mprotect` granting `PROT_EXEC`). **Sound by default** for same-thread self-modifying code: `SMCLazyScrub` (below, on by default) scrubs the faulting thread's block-lookup fast path so that thread cannot re-enter translated code without draining first. What remains deferred is cross-thread modification, which x86 does not guarantee either; the reading thread must serialize, and every way it can (syscall, signal, dispatching new code) is a drain point. Setting `SMCLazyScrub=0` restores the older, faster, **deliberately unsound** behaviour in which a thread can execute a stale translation of code it just wrote. Requires `SMCSoftInvalidate` and `SMCChecks=mtrack`. |
