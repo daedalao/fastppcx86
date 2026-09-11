@@ -385,14 +385,25 @@ Waves 1 and 2 both landed the same day; `daedalao-wt` 562ede33d, wine fork
 | nw | Cyberpunk 2077 | runs; one cold-cache benchmark lap logged (`~/benchlogs/64k-cp2077-nw-1`, scene 14.5 fps; warm laps still owed before comparing with the 4K reference) |
 | nw | RimWorld (Windows build) | runs, loads defs (the first "black screen" was a missing `LANG` in an ssh launch, not 64K) |
 | Linux-native | `nproc`, `ls`, python3 with threads + mmap | run |
-| Linux-native | RimWorld (Linux build) | loads and renders, then wedges in definition loading: mtrack thrashes (100K faults/s), `degrade` first deadlocked on a lock-ownership checker that acquired the lock it was checking (hardened in 562ede33d), then wedges in a guest spin; under investigation |
+| Linux-native | RimWorld (Linux build) | loads at 60 fps with `FEX_HOSTPAGEMODE=degrade GC_DISABLE_INCREMENTAL=1` after five fixes found by running it (below); with mtrack it still thrashes (design §5), and Mono's incremental GC write barrier is unsound under the permissive tier (§6), hence both knobs until S5 |
 
 Fixes found only by running titles, all landed: wine dbghelp null map
 (475502aa473), bridge gate default (c6745e89a), granule copy past EOF
-(eddcc0e17), lock checkers (562ede33d). Environment gaps found: op64k root
+(eddcc0e17), lock checkers (562ede33d), the gate running after the context
+had cached SMCChecks so degrade never disabled mtrack (94ff5f5c3), a refused
+shared lock being unlocked (b74b0581e), `TrackMadvise` called under the VMA
+write lock -- a lock-order inversion whose fatal trap was delivered to the
+guest and leaked the lock (a90c5cd26), and stale granule-table entries after
+whole-granule munmap/MAP_FIXED that turned every write into a fake SMC fault
+(3bdafb7d9). Diagnostics that found them, all env-gated and landed:
+`FEX_INVALIDATESTALLSEC`, `FEX_LOCKDIAG=1` (acquirer backtrace + a report
+when a guest signal is delivered on a thread holding the VMA write lock).
+Under Unity, FEX's stderr lands in the game's Player.log. Environment gaps found: op64k root
 drift (fmt 12.1 vs 12.2, cross gcc, MangoHud), all recorded in memory notes.
 
-Open items, in priority order: (1) the RimWorld Linux wedge; (2) mtrack arming
+Open items, in priority order: (1) a fatal trap or fault raised in FEX's own
+host code must never be delivered to the guest as a signal (it abandons the
+host frame with its locks); (2) mtrack arming
 heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
 also the flip log prints the count after clearing it); (3) route the raw
 `GuestM*` host calls in `SyscallsSMCTracking.cpp` through the granule layer
