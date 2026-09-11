@@ -276,9 +276,9 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     return false;
   }
 
-  const uint64_t GuestBase = reinterpret_cast<uint64_t>(addr);
+  uint64_t GuestBase = reinterpret_cast<uint64_t>(addr);
   const uint64_t Size = FEXCore::AlignUp(length, GuestPageSize);
-  const uint64_t GuestEnd = GuestBase + Size;
+  uint64_t GuestEnd = GuestBase + Size;
   const bool Anonymous = (flags & MAP_ANONYMOUS) != 0 || fd < 0;
 
   if (!(flags & MAP_FIXED)) {
@@ -313,12 +313,40 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
 
   auto* Hndl = Handler::Get();
   const uint64_t HostSize = FEXCore::HostPage::Size();
+
+  if (!(flags & MAP_FIXED)) {
+    // The guest let the kernel choose, and the only reason we are here is a file
+    // offset the host cannot take. Reserve a granule-rounded private anonymous
+    // span first and then treat the request as fixed at the address we got: the
+    // kernel hands back a host-aligned address, which is 4K-aligned and so a
+    // perfectly legal answer to a non-fixed mmap.
+    void* Reserved = ::mmap(nullptr, FEXCore::AlignUp(Size, HostSize), FEX::HLE::HardwareTSO::ApplyGuestProt(PROT_READ | PROT_WRITE),
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (Reserved == MAP_FAILED) {
+      *Result = static_cast<uint64_t>(-errno);
+      return true;
+    }
+    GuestBase = reinterpret_cast<uint64_t>(Reserved);
+    GuestEnd = GuestBase + Size;
+  }
+
   const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
   const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);
 
   {
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
     auto& Tracking = Hndl->VMATracking;
+
+    if (!(flags & MAP_FIXED)) {
+      // Everything the reservation covers is ours now; record it so the loop
+      // below does not try to preserve siblings that do not exist.
+      for (uint64_t G = GranuleStart; G < GranuleEnd; G += HostSize) {
+        auto& E = Tracking.Granules.FindOrCreate(G);
+        E.FEXBacked = true;
+        E.HostProt = PROT_READ | PROT_WRITE;
+        E.SMCOverlay = PROT_NONE;
+      }
+    }
 
     for (uint64_t G = GranuleStart; G < GranuleEnd; G += HostSize) {
       const uint64_t SubBase = std::max(GuestBase, G);
