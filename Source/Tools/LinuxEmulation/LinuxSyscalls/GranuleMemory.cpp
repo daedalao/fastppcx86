@@ -186,6 +186,41 @@ namespace {
     }
   }
 
+  // Zero [Base, End) inside granule G from host code WITHOUT ever taking a
+  // fault. The guest may have write-protected the page: Mono's Boehm GC uses
+  // mprotect write barriers and then madvise(MADV_DONTNEED)s the pages, which is
+  // exactly the partial-granule case this serves. A host-side SIGSEGV here is
+  // delivered as a GUEST signal on top of this frame; the guest handler runs
+  // (compiling blocks, faulting again) while this function's RAII write lock
+  // is never unwound, and VMATracking's lock is leaked into guest code for
+  // good. RimWorld Linux on the 64K kernel died of exactly that (FEX_LOCKDIAG
+  // named Granule::Madvise as the acquirer). Grant write on the granule for the
+  // duration and restore the union afterwards; the kernel's own DONTNEED zeroes
+  // without consulting the protection either.
+  bool ZeroGuestRangeNoFault(FEX::HLE::VMATracking::VMATracking& Tracking, uint64_t G, uint64_t Base, uint64_t End) {
+    const uint64_t HostSize = FEXCore::HostPage::Size();
+    SeedGranuleFromVMAs(Tracking, G);
+    auto* Entry = Tracking.Granules.FindMutable(G);
+    if (!Entry) {
+      return false;
+    }
+    const int Current = static_cast<int>(Entry->HostProt);
+    bool Flipped = false;
+    if ((Current & PROT_WRITE) == 0) {
+      if (::mprotect(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(Current | PROT_READ | PROT_WRITE)) != 0) {
+        return false;
+      }
+      Entry->HostProt = static_cast<uint8_t>(Current | PROT_READ | PROT_WRITE);
+      Flipped = true;
+    }
+    std::memset(reinterpret_cast<void*>(Base), 0, End - Base);
+    if (Flipped) {
+      // Back to the union of the guest's intended protections.
+      Tracking.Granules.RematerialiseIfNeeded(G);
+    }
+    return true;
+  }
+
   int64_t MakeGranuleFEXBacked(FEX::HLE::VMATracking::VMATracking& Tracking, uint64_t GranuleBase, uint64_t ReplaceBase, uint64_t ReplaceEnd) {
     const uint64_t HostSize = FEXCore::HostPage::Size();
 
@@ -838,10 +873,7 @@ bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t leng
       const bool PrivateAnon = (Entry && Entry->FEXBacked) ||
                                (VMA != Tracking.VMAs.end() && !VMA->second.Flags.Shared && VMA->second.Resource == nullptr);
       if (PrivateAnon && (advice == MADV_DONTNEED || advice == MADV_FREE)) {
-        int Prot = PROT_NONE;
-        const bool Known = Tracking.Granules.LookupPage(SubBase, &Prot);
-        if (!Known || (Prot & PROT_WRITE)) {
-          std::memset(reinterpret_cast<void*>(SubBase), 0, SubEnd - SubBase);
+        if (ZeroGuestRangeNoFault(Tracking, G, SubBase, SubEnd)) {
           continue;
         }
       }
