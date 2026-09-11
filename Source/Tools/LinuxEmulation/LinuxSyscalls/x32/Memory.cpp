@@ -46,8 +46,10 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL_X32(
     mmap2, [](FEXCore::Core::CpuStateFrame* Frame, uint32_t addr, uint32_t length, int prot, int flags, int fd, uint32_t pgoffset) -> uint64_t {
       // NOTE: the (uint64_t)pgoffset * 0x1000 product is the x86 mmap2 ABI and
-      // is stage S4a's to make host-representable; it is deliberately left
-      // spelled exactly as it was.
+      // belongs to stage S4a, so it is left spelled exactly as it was. It now
+      // appears TWICE in this lambda -- whoever makes it host-representable has
+      // to change both, or the granule layer and the normal path will disagree
+      // about which file offset was asked for.
       uint64_t Emulated {};
       if (FEX::HLE::Granule::Mmap(Frame->Thread, false, reinterpret_cast<void*>(addr), length, prot, flags, fd,
                                   (uint64_t)pgoffset * 0x1000, &Emulated)) {

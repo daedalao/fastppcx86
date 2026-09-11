@@ -7,6 +7,8 @@ desc: Guest memory syscalls on a host page larger than the guest's
 $end_info$
 */
 
+#include "Common/HostPageMapping.h"
+
 #include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/GranuleTable.h"
 #include "LinuxSyscalls/HostOwnedRanges.h"
@@ -239,28 +241,13 @@ namespace {
     return 0;
   }
 
-  // pread the whole of [Base, End) from fd at FileOffset, zero-filling whatever
-  // the file does not provide. mmap of a file reads as zero past EOF inside the
-  // last page, and a short read here must behave the same way.
+  // pread [Base, End) from fd at FileOffset. Shares S4a's ReadFully (short
+  // reads, EINTR, EOF-is-not-an-error), whose contract is that the destination
+  // is already zero -- which MakeGranuleFEXBacked guarantees for exactly the
+  // range we fill here.
   int64_t FillFromFile(uint64_t Base, uint64_t End, int fd, off_t FileOffset) {
-    uint64_t Cursor = Base;
-    off_t Offset = FileOffset;
-    while (Cursor < End) {
-      const ssize_t Read = ::pread(fd, reinterpret_cast<void*>(Cursor), End - Cursor, Offset);
-      if (Read < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        return -errno;
-      }
-      if (Read == 0) {
-        break;
-      }
-      Cursor += static_cast<uint64_t>(Read);
-      Offset += Read;
-    }
-    if (Cursor < End) {
-      std::memset(reinterpret_cast<void*>(Cursor), 0, End - Cursor);
+    if (!FEX::HostPageMapping::ReadFully(fd, reinterpret_cast<void*>(Base), End - Base, static_cast<uint64_t>(FileOffset))) {
+      return -errno;
     }
     return 0;
   }
@@ -285,10 +272,11 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     // The kernel picks the address, and it picks a host-aligned one, which is
     // 4K-aligned and therefore legal for the guest. The only thing that can
     // still be unrepresentable is a file offset the host cannot take.
-    if (Anonymous || HostAligned(static_cast<uint64_t>(offset))) {
+    if (!FEX::HostPageMapping::RequiresFallback(GuestBase, static_cast<uint64_t>(offset), flags, fd)) {
       return false;
     }
-  } else if (HostAligned(GuestBase) && HostAligned(GuestEnd) && (Anonymous || HostAligned(static_cast<uint64_t>(offset)))) {
+  } else if (HostAligned(GuestBase) && HostAligned(GuestEnd) &&
+             !FEX::HostPageMapping::RequiresFallback(GuestBase, static_cast<uint64_t>(offset), flags, fd)) {
     // Whole granules, representable offset: the normal path handles it, with
     // all of its SMC, HWTSO and code-cache bookkeeping intact.
     return false;
