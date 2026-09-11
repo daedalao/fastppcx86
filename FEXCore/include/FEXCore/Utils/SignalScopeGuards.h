@@ -5,6 +5,8 @@
 #include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <atomic>
+#include <cstring>
+#include <execinfo.h>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -23,6 +25,20 @@ namespace FEXCore {
 //
 // A fork() only clones the parent's calling thread. Other threads are silently dropped, which permanently leaves any mutexes owned by them locked.
 // To address this issue, ForkableUniqueMutex and ForkableSharedMutex provide a way to forcefully remove any dangling locks and reset the mutexes to their default state.
+// Diagnostic for the ownership checkers below: a caller reached a function that
+// requires the write lock without holding it. Not signal context (the checkers
+// sit in syscall-path bookkeeping), so a backtrace to stderr is affordable and
+// is the only way to name the offending caller in a release build.
+inline void ReportUnownedLockAssertion(const char* Where) {
+  void* Frames[32];
+  const int Count = ::backtrace(Frames, 32);
+  const char Msg[] = "FEX: lock-ownership assertion failed (caller does not hold the write lock); backtrace follows:\n";
+  ::write(STDERR_FILENO, Msg, sizeof(Msg) - 1);
+  ::write(STDERR_FILENO, Where, strlen(Where));
+  ::write(STDERR_FILENO, "\n", 1);
+  ::backtrace_symbols_fd(Frames, Count, STDERR_FILENO);
+}
+
 class ForkableUniqueMutex final {
 public:
   ForkableUniqueMutex()
@@ -55,9 +71,18 @@ public:
     Mutex = PTHREAD_MUTEX_INITIALIZER;
   }
 
-  // Asserts that the mutex isn't exclusively owned by the calling thread.
+  // Asserts that the mutex is already exclusively owned by the calling thread.
+  // A checker must never end up OWNING the lock: with assertions compiled out,
+  // a caller that did not hold it would otherwise acquire it here and return
+  // to the guest with it held forever (RimWorld Linux on the 64K kernel
+  // deadlocked exactly this way). Release an accidental acquisition and say
+  // where it came from.
   void check_lock_owned_by_self() {
     const auto Result = pthread_mutex_lock(&Mutex);
+    if (Result == 0) [[unlikely]] {
+      pthread_mutex_unlock(&Mutex);
+      ReportUnownedLockAssertion("ForkableUniqueMutex::check_lock_owned_by_self");
+    }
     LOGMAN_THROW_A_FMT(Result == EDEADLK, "User of unique lock must have already locked mutex as write!");
   }
 
@@ -103,9 +128,16 @@ public:
     return Result == 0;
   }
 
-  // Asserts that the rwlock isn't exclusively owned by the calling thread.
+  // Asserts that the rwlock is already exclusively owned by the calling thread.
+  // See ForkableUniqueMutex::check_lock_owned_by_self: a checker that succeeds
+  // in taking the lock has found a caller without it, and must give the lock
+  // back rather than leak it.
   void check_lock_owned_by_self_as_write() {
     const auto Result = pthread_rwlock_wrlock(&Mutex);
+    if (Result == 0) [[unlikely]] {
+      pthread_rwlock_unlock(&Mutex);
+      ReportUnownedLockAssertion("ForkableSharedMutex::check_lock_owned_by_self_as_write");
+    }
     LOGMAN_THROW_A_FMT(Result == EDEADLK, "User of rwlock must have already locked mutex as write!");
   }
 
