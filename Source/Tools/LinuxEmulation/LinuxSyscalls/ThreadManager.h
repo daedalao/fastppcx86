@@ -24,6 +24,7 @@ $end_info$
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -313,16 +314,25 @@ public:
   // ThreadCreationMutex inside the exclusive lock, rather than snapshotting
   // the list before it, is what keeps a thread created mid-invalidation from
   // compiling the range and then being missed by the walk.
-  static constexpr int InvalidateGuestCodeRangeStealTimeoutSec = 4;
+  // FEX_INVALIDATESTALLSEC overrides the deadline (diagnostic: a workload that
+  // survives a longer deadline is contention, one that does not is a deadlock).
+  static int InvalidateGuestCodeRangeStealTimeoutSec() {
+    static const int Seconds = [] {
+      const char* Env = ::getenv("FEX_INVALIDATESTALLSEC");
+      const int V = Env ? ::atoi(Env) : 0;
+      return V > 0 ? V : 4;
+    }();
+    return Seconds;
+  }
 
   void TakeCodeInvalidationWriteLockOrSteal(FEXCore::Utils::WritePriorityMutex::Mutex& M) {
-    if (M.try_lock_for(std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec))) {
+    if (M.try_lock_for(std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec()))) {
       return;
     }
     ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
                       "(phantom reader / lock inversion). Refusing the "
                       "corrupting steal; report this with the workload.",
-                      InvalidateGuestCodeRangeStealTimeoutSec);
+                      InvalidateGuestCodeRangeStealTimeoutSec());
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
