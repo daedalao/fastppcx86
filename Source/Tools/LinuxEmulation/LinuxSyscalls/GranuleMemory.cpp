@@ -186,37 +186,31 @@ namespace {
     }
   }
 
-  // Zero [Base, End) inside granule G from host code WITHOUT ever taking a
-  // fault. The guest may have write-protected the page: Mono's Boehm GC uses
-  // mprotect write barriers and then madvise(MADV_DONTNEED)s the pages, which is
-  // exactly the partial-granule case this serves. A host-side SIGSEGV here is
-  // delivered as a GUEST signal on top of this frame; the guest handler runs
-  // (compiling blocks, faulting again) while this function's RAII write lock
-  // is never unwound, and VMATracking's lock is leaked into guest code for
-  // good. RimWorld Linux on the 64K kernel died of exactly that (FEX_LOCKDIAG
-  // named Granule::Madvise as the acquirer). Grant write on the granule for the
-  // duration and restore the union afterwards; the kernel's own DONTNEED zeroes
-  // without consulting the protection either.
-  bool ZeroGuestRangeNoFault(FEX::HLE::VMATracking::VMATracking& Tracking, uint64_t G, uint64_t Base, uint64_t End) {
-    const uint64_t HostSize = FEXCore::HostPage::Size();
-    SeedGranuleFromVMAs(Tracking, G);
-    auto* Entry = Tracking.Granules.FindMutable(G);
-    if (!Entry) {
-      return false;
-    }
-    const int Current = static_cast<int>(Entry->HostProt);
-    bool Flipped = false;
-    if ((Current & PROT_WRITE) == 0) {
-      if (::mprotect(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(Current | PROT_READ | PROT_WRITE)) != 0) {
+  // Zero [Base, End) from host code WITHOUT ever taking a fault. The guest may
+  // have write-protected the page (Mono's Boehm GC arms mprotect write
+  // barriers and then madvises the pages), and the granule table's recorded
+  // host protection cannot be trusted for this either: a whole-granule guest
+  // mprotect takes the passthrough path and never updates it. A host-side
+  // SIGSEGV here is delivered as a GUEST signal on top of this frame, the
+  // guest handler runs while the RAII write lock is never unwound, and
+  // VMATracking's lock is leaked into guest code for good (RimWorld Linux on
+  // the 64K kernel; FEX_LOCKDIAG named Granule::Madvise as the acquirer).
+  //
+  // process_vm_writev goes through the kernel, honours the mapping's current
+  // protection and reports EFAULT instead of faulting. A page the guest cannot
+  // write is left as it is: madvise is advisory, and the caller logs the skip.
+  bool ZeroGuestRangeNoFault(uint64_t Base, uint64_t End) {
+    static const uint8_t Zeros[FEXCore::Utils::FEX_GUEST_PAGE_SIZE] {};
+    const pid_t Self = ::getpid();
+    for (uint64_t Cursor = Base; Cursor < End;) {
+      const size_t Chunk = std::min<size_t>(sizeof(Zeros), End - Cursor);
+      struct iovec Local {const_cast<uint8_t*>(Zeros), Chunk};
+      struct iovec Remote {reinterpret_cast<void*>(Cursor), Chunk};
+      const ssize_t Wrote = ::process_vm_writev(Self, &Local, 1, &Remote, 1, 0);
+      if (Wrote <= 0) {
         return false;
       }
-      Entry->HostProt = static_cast<uint8_t>(Current | PROT_READ | PROT_WRITE);
-      Flipped = true;
-    }
-    std::memset(reinterpret_cast<void*>(Base), 0, End - Base);
-    if (Flipped) {
-      // Back to the union of the guest's intended protections.
-      Tracking.Granules.RematerialiseIfNeeded(G);
+      Cursor += static_cast<uint64_t>(Wrote);
     }
     return true;
   }
@@ -873,7 +867,7 @@ bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t leng
       const bool PrivateAnon = (Entry && Entry->FEXBacked) ||
                                (VMA != Tracking.VMAs.end() && !VMA->second.Flags.Shared && VMA->second.Resource == nullptr);
       if (PrivateAnon && (advice == MADV_DONTNEED || advice == MADV_FREE)) {
-        if (ZeroGuestRangeNoFault(Tracking, G, SubBase, SubEnd)) {
+        if (ZeroGuestRangeNoFault(SubBase, SubEnd)) {
           continue;
         }
       }
