@@ -1054,7 +1054,7 @@ bool SignalDelegator::HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, i
       // If we have more deferred frames to process then mprotect back to PROT_NONE.
       // It will have been RW coming in to this sigreturn and now we need to remove permissions
       // to ensure FEX trampolines back to the SIGSEGV deferred handler.
-      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+      Thread->ProtectInterruptFaultPage(true);
     }
     return true;
   }
@@ -1333,12 +1333,15 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   const bool MustDeferAsync = MustDeferSignal;
 #endif
 
-  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
+  // Identification predicate: the fault page is now an mmap'd host page, so compare
+  // against the stored pointer rather than an address inside the thread state.
+  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && Thread->CurrentFrame->InterruptFaultPagePtr &&
+      SigInfo.si_addr == reinterpret_cast<void*>(Thread->CurrentFrame->InterruptFaultPagePtr)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
       // Pull a signal frame off the stack.
 
-      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_READ | PROT_WRITE);
+      Thread->ProtectInterruptFaultPage(false);
 
       // FEX_SMCLAZYLINK: the SMC fault handler arms this page after a lazy
       // deferral, because with block linking live the fault-page poke at block
@@ -1418,7 +1421,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
 
     // Now update the faulting page permissions so it will fault on write.
-    mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    Thread->ProtectInterruptFaultPage(true);
     SIGTRACE("DEFER sig=%d pc=0x%lx newmask=0x%lx q=%zu", Signal, ArchHelpers::Context::GetPc(UContext), NewMask,
              ThreadObject->SignalInfo.DeferredSignalFrames.size());
 

@@ -1113,7 +1113,8 @@ private:
   // before any IR op writes to SRA/spill state.
   void EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel);
 
-  // Emit a one-instruction poke of the thread's InterruptFaultPage. PPC64LE
+  // Emit a two-instruction poke of the thread's interrupt fault page (load the
+  // page pointer out of the frame, byte-store through it). PPC64LE
   // treats the whole JIT code buffer as an async-signal deferral region
   // (SignalDelegator's InJIT_ForDefer): a deferred signal mprotects the page
   // PROT_NONE and relies on this store faulting at the next guaranteed-

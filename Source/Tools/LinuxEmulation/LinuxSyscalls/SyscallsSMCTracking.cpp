@@ -589,7 +589,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
             return;
           }
           Thread->CTX->ArmLazySMCDrainPending(Other);
-          mprotect(reinterpret_cast<void*>(&Other->InterruptFaultPage), sizeof(Other->InterruptFaultPage), PROT_NONE);
+          // Cross-thread arming (FEX_SMCLAZYLINK): the WRITER's fault page, through the
+          // same pointer its own thread uses.
+          Other->ProtectInterruptFaultPage(true);
         });
 
         if (!Armed) {
@@ -633,7 +635,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // resumes. mprotect from a signal handler is the same call the
         // delegator itself makes on this page.
         if (_SyscallHandler->SMCLazyLinkActive()) {
-          mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+          Thread->ProtectInterruptFaultPage(true);
         }
       }
 

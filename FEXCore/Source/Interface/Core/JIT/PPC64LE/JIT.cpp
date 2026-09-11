@@ -3431,20 +3431,30 @@ void PPC64JITCore::EmitEntryPoint(PPC64Emitter::Label& HeaderLabel, bool CheckTF
 }
 
 void PPC64JITCore::EmitSuspendInterruptCheck() {
-  // Single byte-store poke of the InterruptFaultPage (see JITClass.h and the
-  // matching drain logic in SignalDelegator::HandleGuestSignal). The stored
-  // value is irrelevant -- the page carries no data, it exists to fault when
-  // a deferred signal is pending. r0 is architecturally safe as the source
-  // (the r0==0 block invariant makes it dead here, and stb only reads it).
-  // The SEGV handler's nested-deferral path skips a faulting store by
-  // advancing NIP by 4, which this single fixed-size stb satisfies.
-  constexpr int32_t FaultOff = static_cast<int32_t>(
-    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
-    offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
-  static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) >=
-                offsetof(FEXCore::Core::InternalThreadState, BaseFrameState),
-                "InterruptFaultPage must lie at or after BaseFrameState");
-  stb(r(0), FaultOff, STATE);
+  // Byte-store poke of the interrupt fault page (see JITClass.h and the matching
+  // drain logic in SignalDelegator::HandleGuestSignal). The stored value is
+  // irrelevant -- the page carries no data, it exists to fault when a deferred
+  // signal is pending. r0 is architecturally safe as the source (the r0==0 block
+  // invariant makes it dead here, and stb only reads it).
+  //
+  // 64K port: the page is no longer an array embedded in InternalThreadState (a
+  // page-sized D-form displacement is unencodable once the page is 64K), it is an
+  // mmap'd host page whose address lives in the frame. Two instructions instead of
+  // one: an L1-resident dependent load, then the same stb.
+  //
+  // The SEGV handler's nested-deferral path skips a faulting store by advancing NIP
+  // by 4; the FAULTING instruction is still this single fixed-size stb, and the ld
+  // in front of it cannot fault (the frame is always mapped), so that still holds.
+  //
+  // TMP1 is safe here: TMP1-TMP4 belong to neither the SRA nor the RA pool
+  // (JITClass.h ComputeHighZeroElision note) so nothing is live in it at an entry
+  // point or at a block edge, and ld does not touch CR (the CondJump call sites
+  // emit this between a bc and its b).
+  constexpr int32_t FaultPtrOff = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, InterruptFaultPagePtr));
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, InterruptFaultPagePtr) + sizeof(void*) <= 32768,
+                "InterruptFaultPagePtr must be reachable from STATE with a signed 16-bit D-form displacement");
+  ld(TMP1, FaultPtrOff, STATE);
+  stb(r(0), 0, TMP1);
 }
 
 // ---------------------------------------------------------------------------
