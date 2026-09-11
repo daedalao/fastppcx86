@@ -122,11 +122,15 @@ FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
       for (int i = 0; i < 64; ++i) {
         // Try grabbing a some of the top pages of the range
         // x86 allocates some high pages in the top end
-        void* Ptr = ::mmap(reinterpret_cast<void*>(Size - FEXCore::Utils::FEX_PAGE_SIZE * i), FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE,
+        // HOST: MAP_FIXED_NOREPLACE only accepts host-page-aligned hints, so the probe has
+        // to step in host pages. Stepping in 4K on a 64K kernel makes 15 of every 16
+        // iterations spuriously EINVAL and the probe limps on i == 0 alone.
+        const uintptr_t HostPageSize = FEXCore::HostPage::Size();
+        void* Ptr = ::mmap(reinterpret_cast<void*>(Size - HostPageSize * i), HostPageSize, PROT_NONE,
                            MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (Ptr != (void*)~0ULL) {
-          ::munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
-          if (Ptr == (void*)(Size - FEXCore::Utils::FEX_PAGE_SIZE * i)) {
+          ::munmap(Ptr, HostPageSize);
+          if (Ptr == (void*)(Size - HostPageSize * i)) {
             return true;
           }
         }
