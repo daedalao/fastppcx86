@@ -1055,7 +1055,12 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
       DataSpaceMappedSize = 0;
     } else {
       uint64_t NewSize = NewEnd - DataSpace;
-      uint64_t NewSizeAligned = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+      // HOST: DataSpaceMappedSize describes real mappings, so the emulated break
+      // region is grown and shrunk in host granules. DataSpaceSize, which is what
+      // the guest is told the break is, stays the byte-exact value it asked for --
+      // the guest-visible brk contract does not change with the host page size
+      // (design Part 2 section 2, the audit's GUEST rounding).
+      uint64_t NewSizeAligned = FEXCore::HostPage::AlignUp(NewSize);
 
       if (NewSizeAligned < DataSpaceMappedSize) {
         // If we are shrinking the brk then munmap the ranges
@@ -1069,7 +1074,7 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
 
         DataSpaceMappedSize = NewSizeAligned;
       } else if (NewSize > DataSpaceMappedSize) {
-        uint64_t AllocateNewSize = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE) - DataSpaceMappedSize;
+        uint64_t AllocateNewSize = NewSizeAligned - DataSpaceMappedSize;
         if (!Is64BitMode() && (DataSpace + DataSpaceMappedSize + AllocateNewSize > 0x1'0000'0000ULL)) {
           // If we are 32bit and we tried going about the 32bit limit then out of memory
           return DataSpace + DataSpaceSize;
