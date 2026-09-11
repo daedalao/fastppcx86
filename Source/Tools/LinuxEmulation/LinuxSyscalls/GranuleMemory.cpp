@@ -15,11 +15,14 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
+#include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <iterator>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -811,6 +814,160 @@ bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t leng
 
   *Result = 0;
   return true;
+}
+
+
+///// /proc/self/maps and /proc/self/smaps (PAGE_SIZE_64K_PLAN §7) /////
+//
+// Synthesised from VMATracking and the granule table rather than passed
+// through, for the same reason the CPU ids are densely remapped (c6b0180d3):
+// every granularity the guest can observe must come from the fiction, not the
+// host. The host's own maps file shows FEX's mappings, host page granularity,
+// and -- decisively -- cannot show a sub-granule hole at all, because the
+// granule is still mapped for the sake of its live siblings. Wine's PE loader
+// and glibc both read maps at start-up.
+
+namespace {
+  struct MapRun {
+    uint64_t Base;
+    uint64_t End;
+    int Prot;
+    bool Shared;
+    uint64_t Offset;
+    const FEX::HLE::VMATracking::VMAEntry* VMA;
+  };
+
+  void EmitRun(fextl::string& Out, const MapRun& Run, bool Smaps) {
+    uint64_t Dev = 0;
+    uint64_t Inode = 0;
+    const char* Path = "";
+    if (Run.VMA && Run.VMA->Resource) {
+      const auto& MRID = Run.VMA->Resource->Iterator->first;
+      if (MRID.dev < FEX::HLE::VMATracking::SpecialDev::Anon) {
+        Dev = MRID.dev;
+        Inode = MRID.id;
+      }
+      if (Run.VMA->Resource->MappedFile) {
+        Path = Run.VMA->Resource->MappedFile->Filename.c_str();
+      }
+    }
+
+    fextl::fmt::format_to(std::back_inserter(Out), "{:012x}-{:012x} {}{}{}{} {:08x} {:02x}:{:02x} {}", Run.Base, Run.End,
+                          (Run.Prot & PROT_READ) ? 'r' : '-', (Run.Prot & PROT_WRITE) ? 'w' : '-', (Run.Prot & PROT_EXEC) ? 'x' : '-',
+                          Run.Shared ? 's' : 'p', Run.Offset, static_cast<unsigned>((Dev >> 8) & 0xFF),
+                          static_cast<unsigned>(Dev & 0xFF), Inode);
+    if (Path[0]) {
+      fextl::fmt::format_to(std::back_inserter(Out), "{:<20}{}", "", Path);
+    }
+    Out += '\n';
+
+    if (!Smaps) {
+      return;
+    }
+
+    // A deliberately small but complete-enough smaps block. KernelPageSize and
+    // MMUPageSize are the entire point of synthesising this file: the guest was
+    // told AT_PAGESZ=4096 and every allocator that reads smaps must be told the
+    // same thing here, or it sizes its arenas for a page the guest cannot
+    // address.
+    const uint64_t SizeKB = (Run.End - Run.Base) >> 10;
+    fextl::fmt::format_to(std::back_inserter(Out),
+                          "Size:           {:8} kB\n"
+                          "KernelPageSize: {:8} kB\n"
+                          "MMUPageSize:    {:8} kB\n"
+                          "Rss:            {:8} kB\n"
+                          "Pss:            {:8} kB\n"
+                          "Private_Dirty:  {:8} kB\n"
+                          "Swap:           {:8} kB\n"
+                          "VmFlags:{}{}{}{}\n",
+                          SizeKB, FEXCore::Utils::FEX_GUEST_PAGE_SIZE >> 10, FEXCore::Utils::FEX_GUEST_PAGE_SIZE >> 10, SizeKB, SizeKB,
+                          Run.Shared ? 0 : SizeKB, 0, (Run.Prot & PROT_READ) ? " rd" : "", (Run.Prot & PROT_WRITE) ? " wr" : "",
+                          (Run.Prot & PROT_EXEC) ? " ex" : "", Run.Shared ? " sh" : " mr mw me");
+  }
+} // namespace
+
+fextl::string GenerateMaps(bool Smaps) {
+  if (!Active()) {
+    // On a 4K host the host's own file is already right about granularity, and
+    // replacing it would be a behaviour change in the shipping build. Returning
+    // empty tells the caller to fall back to the real file.
+    return {};
+  }
+
+  auto* Hndl = Handler::Get();
+  if (!Hndl) {
+    return {};
+  }
+
+  fextl::string Out;
+  auto lk = FEXCore::GuardSignalDeferringSectionWithFallback<std::shared_lock>(Hndl->VMATracking.Mutex, nullptr);
+  const auto& Tracking = Hndl->VMATracking;
+  if (Tracking.VMAs.empty()) {
+    return {};
+  }
+
+  // Walk every tracked VMA one guest page at a time, coalescing runs that agree
+  // about protection. The granule table overrides the VMA's own protection
+  // wherever it has an entry, which is exactly where the guest did something
+  // sub-granule -- a 4K guard page inside a live granule, or a hole left by a
+  // partial munmap. Those are invisible in the host's file and are the reason
+  // this function exists.
+  for (const auto& [Base, VMA] : Tracking.VMAs) {
+    MapRun Run {};
+    bool Open = false;
+    for (uint64_t Page = VMA.Base; Page < VMA.Base + VMA.Length; Page += GuestPageSize) {
+      int Prot = PROT_NONE;
+      bool Live = true;
+      const auto* Entry = Tracking.Granules.Find(GranuleTable::GranuleOf(Page));
+      if (Entry) {
+        const uint64_t Nibble = Entry->NibbleAt(GranuleTable::IndexOf(Page));
+        Live = (Nibble & GranuleTable::PageLive) != 0;
+        Prot = GranuleTable::ProtFromNibble(Nibble);
+      } else {
+        if (VMA.Prot.Readable) {
+          Prot |= PROT_READ;
+        }
+        if (VMA.Prot.Writable) {
+          Prot |= PROT_WRITE;
+        }
+        if (VMA.Prot.Executable) {
+          Prot |= PROT_EXEC;
+        }
+      }
+
+      if (!Live) {
+        // A sub-granule hole. It is a hole in the guest's address space even
+        // though the granule under it is still mapped.
+        if (Open) {
+          EmitRun(Out, Run, Smaps);
+          Open = false;
+        }
+        continue;
+      }
+
+      if (Open && Prot == Run.Prot && Page == Run.End) {
+        Run.End += GuestPageSize;
+        continue;
+      }
+      if (Open) {
+        EmitRun(Out, Run, Smaps);
+      }
+      Run = MapRun {
+        .Base = Page,
+        .End = Page + GuestPageSize,
+        .Prot = Prot,
+        .Shared = VMA.Flags.Shared,
+        .Offset = VMA.Offset + (Page - VMA.Base),
+        .VMA = &VMA,
+      };
+      Open = true;
+    }
+    if (Open) {
+      EmitRun(Out, Run, Smaps);
+    }
+  }
+
+  return Out;
 }
 
 } // namespace FEX::HLE::Granule

@@ -10,6 +10,7 @@ $end_info$
 
 #include "Common/CPUInfo.h"
 #include "Common/FDUtils.h"
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/EmulatedFiles/EmulatedFiles.h"
 
@@ -584,6 +585,38 @@ EmulatedFDManager::EmulatedFDManager(FEXCore::Context::Context* ctx)
   // the guest sees every configured host CPU (160 on SMT-off POWER8) no
   // matter what online/present say.
   FDReadCreators["/sys/devices/system/cpu/possible"] = NumCPUCores;
+
+  // /proc/self/maps and /proc/self/smaps, synthesised from VMATracking and the
+  // granule table. PAGE_SIZE_64K_PLAN section 7: every granularity the guest can
+  // observe must come from the fiction, not the host. A sub-granule hole left by
+  // a partial munmap, and a 4K guard page inside a live granule, exist ONLY in
+  // the granule table -- the host's own file cannot show either, because the
+  // granule stays mapped for its live siblings. Wine's PE loader and glibc both
+  // read maps at start-up.
+  //
+  // Granule::GenerateMaps returns an empty string on a 4K host and before any
+  // guest mapping is tracked, and an empty string here means "fall through to
+  // the real file". The shipping 4K build therefore never takes this path.
+  auto ProcMaps = [](bool Smaps) {
+    return [Smaps](FEXCore::Context::Context* ctx, int32_t fd, const char* pathname, int32_t flags, mode_t mode) -> int32_t {
+      const auto Content = FEX::HLE::Granule::GenerateMaps(Smaps);
+      if (Content.empty()) {
+        return -1;
+      }
+      int FD = GenTmpFD(pathname, flags);
+      write(FD, Content.data(), Content.size());
+      lseek(FD, 0, SEEK_SET);
+      SealTmpFD(FD);
+      return FD;
+    };
+  };
+
+  FDReadCreators["/proc/self/maps"] = ProcMaps(false);
+  FDReadCreators["/proc/thread-self/maps"] = ProcMaps(false);
+  FDReadCreators[fextl::fmt::format("/proc/{}/maps", getpid())] = ProcMaps(false);
+  FDReadCreators["/proc/self/smaps"] = ProcMaps(true);
+  FDReadCreators["/proc/thread-self/smaps"] = ProcMaps(true);
+  FDReadCreators[fextl::fmt::format("/proc/{}/smaps", getpid())] = ProcMaps(true);
 
   fextl::string procAuxv = fextl::fmt::format("/proc/{}/auxv", getpid());
 
