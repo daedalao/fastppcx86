@@ -5,6 +5,7 @@ tags: LinuxSyscalls|syscalls-x86-32
 $end_info$
 */
 
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -33,21 +34,42 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
     uint32_t offset;
   };
   REGISTER_SYSCALL_IMPL_X32(mmap, [](FEXCore::Core::CpuStateFrame* Frame, const old_mmap_struct* arg) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mmap(Frame->Thread, false, reinterpret_cast<void*>(arg->addr), arg->len, arg->prot, arg->flags, arg->fd,
+                                arg->offset, &Emulated)) {
+      return Emulated;
+    }
     return reinterpret_cast<uint64_t>(FEX::HLE::_SyscallHandler->GuestMmap(false, Frame->Thread, reinterpret_cast<void*>(arg->addr),
                                                                            arg->len, arg->prot, arg->flags, arg->fd, arg->offset));
   });
 
   REGISTER_SYSCALL_IMPL_X32(
     mmap2, [](FEXCore::Core::CpuStateFrame* Frame, uint32_t addr, uint32_t length, int prot, int flags, int fd, uint32_t pgoffset) -> uint64_t {
+      // NOTE: the (uint64_t)pgoffset * 0x1000 product is the x86 mmap2 ABI and
+      // is stage S4a's to make host-representable; it is deliberately left
+      // spelled exactly as it was.
+      uint64_t Emulated {};
+      if (FEX::HLE::Granule::Mmap(Frame->Thread, false, reinterpret_cast<void*>(addr), length, prot, flags, fd,
+                                  (uint64_t)pgoffset * 0x1000, &Emulated)) {
+        return Emulated;
+      }
       return reinterpret_cast<uint64_t>(FEX::HLE::_SyscallHandler->GuestMmap(false, Frame->Thread, reinterpret_cast<void*>(addr), length,
                                                                              prot, flags, fd, (uint64_t)pgoffset * 0x1000));
     });
 
   REGISTER_SYSCALL_IMPL_X32(munmap, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, size_t length) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Munmap(Frame->Thread, addr, length, &Emulated)) {
+      return Emulated;
+    }
     return FEX::HLE::_SyscallHandler->GuestMunmap(Frame->Thread, addr, length);
   });
 
   REGISTER_SYSCALL_IMPL_X32(mprotect, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, uint32_t len, int prot) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mprotect(Frame->Thread, addr, len, prot, &Emulated)) {
+      return Emulated;
+    }
     return FEX::HLE::_SyscallHandler->GuestMprotect(Frame->Thread, addr, len, prot);
   });
 

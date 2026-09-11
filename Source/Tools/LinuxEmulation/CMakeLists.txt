@@ -6,6 +6,7 @@ add_library(LinuxEmulation STATIC
   Thunks.cpp
   GdbServer/Info.cpp
   LinuxSyscalls/GdbServer.cpp
+  LinuxSyscalls/GranuleMemory.cpp
   LinuxSyscalls/GranuleTable.cpp
   LinuxSyscalls/HostOwnedRanges.cpp
   LinuxSyscalls/EmulatedFiles/EmulatedFiles.cpp
