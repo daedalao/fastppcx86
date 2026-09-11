@@ -619,4 +619,198 @@ bool Mremap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* old_
   return true;
 }
 
+
+///// Guest-visible reporting (PAGE_SIZE_64K_PLAN Part 2 §7) /////
+
+namespace {
+  std::atomic<bool> LoggedMadviseSkip {false};
+
+  // Is this guest page something the guest currently owns? The granule table is
+  // authoritative once FEX has subdivided the granule; VMATracking answers for
+  // everything else.
+  // - VMATracking::Mutex must be held.
+  bool GuestPageLive(const FEX::HLE::VMATracking::VMATracking& Tracking, uint64_t Page) {
+    const auto* Entry = Tracking.Granules.Find(GranuleTable::GranuleOf(Page));
+    if (Entry) {
+      return (Entry->NibbleAt(GranuleTable::IndexOf(Page)) & GranuleTable::PageLive) != 0;
+    }
+    return Tracking.FindVMAEntry(Page) != Tracking.VMAs.end();
+  }
+} // namespace
+
+bool Mincore(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, uint8_t* vec, uint64_t* Result) {
+  if (!Active()) {
+    return false;
+  }
+
+  const uint64_t GuestBase = reinterpret_cast<uint64_t>(addr);
+  if (GuestBase & ~GuestPageMask) {
+    *Result = static_cast<uint64_t>(-EINVAL);
+    return true;
+  }
+  if (!length) {
+    *Result = 0;
+    return true;
+  }
+
+  // The guest's vector is one byte per GUEST page. A raw passthrough asks the
+  // host for one byte per HOST page and writes that many, so on a 64K host it
+  // both under-fills the guest's buffer by 16x and EINVALs the moment the guest
+  // hands it a 4K-aligned address. This is the whole reason the shim exists.
+  const uint64_t Size = FEXCore::AlignUp(length, GuestPageSize);
+  const uint64_t GuestEnd = GuestBase + Size;
+  const uint64_t GuestPages = Size >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT;
+  const uint64_t HostSize = FEXCore::HostPage::Size();
+  const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
+  const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);
+  const uint64_t Granules = (GranuleEnd - GranuleStart) / HostSize;
+
+  fextl::vector<uint8_t> HostVec(Granules);
+  if (::mincore(reinterpret_cast<void*>(GranuleStart), GranuleEnd - GranuleStart, HostVec.data()) != 0) {
+    *Result = static_cast<uint64_t>(-errno);
+    return true;
+  }
+
+  auto* Hndl = Handler::Get();
+  {
+    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback<std::shared_lock>(Hndl->VMATracking.Mutex, Thread);
+    for (uint64_t i = 0; i < GuestPages; ++i) {
+      const uint64_t Page = GuestBase + i * GuestPageSize;
+      if (!GuestPageLive(Hndl->VMATracking, Page)) {
+        // Linux: a hole anywhere in the range is ENOMEM, and nothing is
+        // written. A sub-granule hole exists only in the table -- the host's
+        // own mincore cannot see it, because the granule is still mapped for
+        // the sake of its live siblings.
+        *Result = static_cast<uint64_t>(-ENOMEM);
+        return true;
+      }
+      vec[i] = HostVec[(Page - GranuleStart) / HostSize];
+    }
+  }
+
+  *Result = 0;
+  return true;
+}
+
+bool Msync(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int flags, uint64_t* Result) {
+  if (!Active()) {
+    return false;
+  }
+
+  const uint64_t GuestBase = reinterpret_cast<uint64_t>(addr);
+  if (GuestBase & ~GuestPageMask) {
+    *Result = static_cast<uint64_t>(-EINVAL);
+    return true;
+  }
+  if (HostAligned(GuestBase) && (!length || HostAligned(FEXCore::AlignUp(length, GuestPageSize)))) {
+    return false;
+  }
+  if (!length) {
+    *Result = 0;
+    return true;
+  }
+
+  // Rounding a msync OUT to granules is safe in a way that rounding a madvise
+  // out is not: msync writes dirty pages back, it never discards anything, so
+  // the worst a sibling suffers is being flushed early. A granule FEX converted
+  // to private anonymous backing has nothing to write back and msync on it
+  // succeeds trivially.
+  const uint64_t Size = FEXCore::AlignUp(length, GuestPageSize);
+  const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
+  const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestBase + Size);
+  if (::msync(reinterpret_cast<void*>(GranuleStart), GranuleEnd - GranuleStart, flags) != 0) {
+    *Result = static_cast<uint64_t>(-errno);
+    return true;
+  }
+  *Result = 0;
+  return true;
+}
+
+bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int advice, uint64_t* Result) {
+  if (!Active()) {
+    return false;
+  }
+
+  const uint64_t GuestBase = reinterpret_cast<uint64_t>(addr);
+  if (GuestBase & ~GuestPageMask) {
+    *Result = static_cast<uint64_t>(-EINVAL);
+    return true;
+  }
+  if (!length) {
+    *Result = 0;
+    return true;
+  }
+  const uint64_t Size = FEXCore::AlignUp(length, GuestPageSize);
+  const uint64_t GuestEnd = GuestBase + Size;
+  if (HostAligned(GuestBase) && HostAligned(GuestEnd)) {
+    return false;
+  }
+
+  // Destructive advices lose data. They may never be rounded OUT to granules:
+  // that would discard a sibling page the guest still owns. Non-destructive
+  // hints may, because the worst they cost a sibling is a readahead.
+  const bool Destructive = advice == MADV_DONTNEED || advice == MADV_FREE || advice == MADV_REMOVE || advice == MADV_WIPEONFORK;
+
+  const uint64_t HostSize = FEXCore::HostPage::Size();
+  auto* Hndl = Handler::Get();
+
+  if (!Destructive) {
+    const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
+    const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);
+    if (::madvise(reinterpret_cast<void*>(GranuleStart), GranuleEnd - GranuleStart, advice) != 0) {
+      *Result = static_cast<uint64_t>(-errno);
+      return true;
+    }
+    Hndl->TrackMadvise(Thread, GuestBase, Size, advice);
+    *Result = 0;
+    return true;
+  }
+
+  {
+    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+    auto& Tracking = Hndl->VMATracking;
+
+    const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
+    const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);
+    for (uint64_t G = GranuleStart; G < GranuleEnd; G += HostSize) {
+      const uint64_t SubBase = std::max(GuestBase, G);
+      const uint64_t SubEnd = std::min(GuestEnd, G + HostSize);
+      if (SubBase == G && SubEnd == G + HostSize) {
+        // A whole granule: the kernel can do exactly what the guest asked.
+        if (::madvise(reinterpret_cast<void*>(G), HostSize, advice) != 0) {
+          *Result = static_cast<uint64_t>(-errno);
+          return true;
+        }
+        continue;
+      }
+
+      // A partial granule. For private anonymous memory MADV_DONTNEED means
+      // "the next read sees zeroes", and FEX can deliver exactly that itself.
+      auto VMA = Tracking.FindVMAEntry(SubBase);
+      const auto* Entry = Tracking.Granules.Find(G);
+      const bool PrivateAnon = (Entry && Entry->FEXBacked) ||
+                               (VMA != Tracking.VMAs.end() && !VMA->second.Flags.Shared && VMA->second.Resource == nullptr);
+      if (PrivateAnon && (advice == MADV_DONTNEED || advice == MADV_FREE)) {
+        int Prot = PROT_NONE;
+        const bool Known = Tracking.Granules.LookupPage(SubBase, &Prot);
+        if (!Known || (Prot & PROT_WRITE)) {
+          std::memset(reinterpret_cast<void*>(SubBase), 0, SubEnd - SubBase);
+          continue;
+        }
+      }
+
+      // Everything else -- private file mappings with dirty pages, shared
+      // mappings, MADV_REMOVE -- would need the granule taken apart to honour
+      // exactly. madvise is advisory, so not doing it is a legal answer; say so
+      // once rather than silently discarding a sibling's data, which is the
+      // failure this branch exists to avoid.
+      LogOnce(LoggedMadviseSkip, "a destructive madvise on part of a granule it cannot take apart", SubBase, SubEnd - SubBase);
+    }
+    Hndl->TrackMadvise(Thread, GuestBase, Size, advice);
+  }
+
+  *Result = 0;
+  return true;
+}
+
 } // namespace FEX::HLE::Granule
