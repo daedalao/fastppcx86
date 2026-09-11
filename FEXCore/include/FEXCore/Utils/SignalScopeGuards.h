@@ -5,6 +5,8 @@
 #include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <execinfo.h>
 #include <cstddef>
@@ -104,8 +106,18 @@ public:
   void lock() {
     const auto Result = pthread_rwlock_wrlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
+    if (LockDiagEnabled()) [[unlikely]] {
+      // Diagnostic: remember who took the write lock so a later refusal can
+      // name the acquirer that never released it.
+      AcquirerFrames = ::backtrace(AcquirerBacktrace, AcquirerMax);
+      AcquirerTid = static_cast<uint32_t>(::syscall(SYS_gettid));
+    }
   }
   void unlock() {
+    if (LockDiagEnabled()) [[unlikely]] {
+      AcquirerFrames = 0;
+      AcquirerTid = 0;
+    }
     const auto Result = pthread_rwlock_unlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to unlock with {}", __func__, Result);
   }
@@ -121,6 +133,12 @@ public:
     if (Result == EDEADLK) [[unlikely]] {
       ++SharedRefusedDepth();
       ReportUnownedLockAssertion("ForkableSharedMutex::lock_shared refused: caller already holds the WRITE lock");
+      if (AcquirerFrames > 0) {
+        char Buf[96];
+        const int N = ::snprintf(Buf, sizeof(Buf), "write lock was acquired by tid %u here:\n", AcquirerTid);
+        ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+        ::backtrace_symbols_fd(AcquirerBacktrace, AcquirerFrames, STDERR_FILENO);
+      }
       return;
     }
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
@@ -167,6 +185,19 @@ private:
     static thread_local int Depth = 0;
     return Depth;
   }
+  // FEX_LOCKDIAG=1: record the write acquirer's backtrace (costs a backtrace()
+  // per write lock; diagnostic only).
+  static bool LockDiagEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = ::getenv("FEX_LOCKDIAG");
+      return Env && Env[0] == '1';
+    }();
+    return Enabled;
+  }
+  static constexpr int AcquirerMax = 24;
+  void* AcquirerBacktrace[AcquirerMax] {};
+  int AcquirerFrames {};
+  uint32_t AcquirerTid {};
   pthread_rwlock_t Mutex;
 };
 
