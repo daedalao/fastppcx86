@@ -724,16 +724,19 @@ public:
           ASLR_Offset &= (1ULL << ASLR_BITS_32) - 1;
         }
 
-        // 64K-TODO(S4): the ASLR slide must be host-granular; a 4K slide feeds
-        // MAP_FIXED_NOREPLACE below and is unrepresentable on a 64K kernel. Losing 4 bits
-        // of entropy is the whole cost. Left guest-granular so 4K is unchanged.
+        // The slide is generated in guest pages (that is what the 28/8-bit entropy
+        // figures are denominated in, and it keeps the slide range identical on
+        // every host) and then truncated to the host granule, because the hint it
+        // produces reaches a real mmap. Losing the low bits of entropy -- 4 of them
+        // on a 64K host -- is the whole cost. AlignDown is the identity at 4K.
         ASLR_Offset <<= FEXCore::Utils::FEX_GUEST_PAGE_SHIFT;
+        ASLR_Offset = FEXCore::HostPage::AlignDown(ASLR_Offset);
         ELFLoadHint += ASLR_Offset;
       }
 #endif
-      // Align the mapping
-      // 64K-TODO(S4): same as the slide above -- this hint reaches a real mmap.
-      ELFLoadHint &= FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+      // Align the mapping. HOST: the hint reaches a real mmap, and the base it
+      // is computed from (HostVASize / 3 * 2) is not host aligned either.
+      ELFLoadHint = FEXCore::HostPage::AlignDown(ELFLoadHint);
     }
 
     // load the main elf
@@ -797,17 +800,18 @@ public:
       if (!VSyscallEntry) [[unlikely]] {
         // If the VDSO thunk doesn't exist then we might not have a vsyscall entry.
         // Newer glibc requires vsyscall to exist now. So let's allocate a buffer and stick a vsyscall in to it.
+        // HOST: a whole host page of its own. The guest only ever sees the entry
+        // point, so there is no reason to squeeze this into a guest page it would
+        // have to share -- and protecting a shared host page read-only below would
+        // take whatever the guest allocator put next to it with it.
         auto VSyscallPage =
-          Handler->GuestMmap(Thread, nullptr, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+          Handler->GuestMmap(Thread, nullptr, FEXCore::HostPage::Size(), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         constexpr static uint8_t VSyscallCode[] = {
           0xcd, 0x80, // int 0x80
           0xc3,       // ret
         };
         memcpy(VSyscallPage, VSyscallCode, sizeof(VSyscallCode));
-        // 64K-TODO(S4): a raw HOST mprotect on a guest mapping. Widening it to the host
-        // page here would protect 60K of whatever the guest allocator put next to it, so
-        // it needs the granule table, not a mechanical rename.
-        mprotect(VSyscallPage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, PROT_READ);
+        Handler->GuestMprotect(Thread, VSyscallPage, FEXCore::HostPage::Size(), PROT_READ);
         VSyscallEntry = reinterpret_cast<uint64_t>(VSyscallPage);
       }
 
