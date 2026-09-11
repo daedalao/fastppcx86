@@ -52,7 +52,10 @@ inline Mode ParseMode(std::string_view Value) {
   return Mode::Abort;
 }
 
-inline Mode GetMode(bool ConfigAvailable) {
+// Explicit reports whether the mode came from config or the environment (true) or
+// from the caller-supplied default (false).
+inline Mode GetMode(bool ConfigAvailable, Mode DefaultMode, bool* Explicit) {
+  *Explicit = true;
   // The config layer is only consulted when the caller says it exists: FEXCore::Config's
   // meta layer is a null global until Initialize() runs, and this gate is deliberately
   // callable from before that point.
@@ -70,15 +73,23 @@ inline Mode GetMode(bool ConfigAvailable) {
     return Mode::Force;
   }
 
-  return Mode::Abort;
+  *Explicit = false;
+  return DefaultMode;
 }
 
 /**
  * @brief Call first thing in every tool that hosts guest code.
  *
  * No-op on a 4K host, which is every path the shipping build takes today.
+ *
+ * DefaultMode applies when neither config nor environment says otherwise. The
+ * FEX launcher keeps Abort: the Linux syscall lane still has the loader,
+ * guest-mmap and mtrack gaps. FexBridge passes Force: in the bridge lane Wine
+ * does every guest mapping itself, host-granular, and the bridge forces
+ * SMCChecks off in favour of Wine's explicit invalidation, so none of the
+ * remaining gaps applies -- the stage-S2 fixes are the whole requirement.
  */
-inline void CheckHostPageSize(bool ConfigAvailable = false) {
+inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = Mode::Abort) {
   const long HostPageSize = ::sysconf(_SC_PAGESIZE);
   if (HostPageSize <= 0 || static_cast<uint64_t>(HostPageSize) == FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
     // Either the expected 4K host, or sysconf failed and there is nothing
@@ -87,7 +98,15 @@ inline void CheckHostPageSize(bool ConfigAvailable = false) {
     return;
   }
 
-  const Mode SelectedMode = GetMode(ConfigAvailable);
+  bool Explicit = false;
+  const Mode SelectedMode = GetMode(ConfigAvailable, DefaultMode, &Explicit);
+
+  if (!Explicit && SelectedMode == Mode::Force) {
+    // The caller vouched for this lane: one line, not the bring-up banner.
+    fextl::fmt::print(stderr, "FEX: host page size is {} (guest page {}); this lane is host-granular, continuing.\n",
+                      HostPageSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+    return;
+  }
 
   fextl::fmt::print(stderr,
                     "FEX: {}: host page size is {}, but FEX's guest contract and several of its own\n"

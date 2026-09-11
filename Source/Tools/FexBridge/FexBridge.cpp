@@ -1277,8 +1277,10 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
 
   // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
-  // degrade-mode SMCChecks forcing both work.
-  FEX::HostPageGate::CheckHostPageSize(true);
+  // degrade-mode SMCChecks forcing both work. Bridge lane: Wine owns every guest
+  // mapping (host-granular) and SMCChecks is forced off above, so a larger host page
+  // needs only the stage-S2 fixes -- default to continuing. FEX_HOSTPAGEMODE overrides.
+  FEX::HostPageGate::CheckHostPageSize(true, FEX::HostPageGate::Mode::Force);
   // The lazy-SMC trio must fall with it.  The gaming launcher exports
   // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
   // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore
