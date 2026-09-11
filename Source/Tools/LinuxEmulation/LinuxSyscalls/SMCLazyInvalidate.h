@@ -59,6 +59,35 @@
 //     that grants PROT_EXEC drains the range synchronously before the syscall
 //     returns.
 //
+// HOST PAGES LARGER THAN THE GUEST PAGE   (64K port, stage S4c)
+// ------------------------------------------------------------
+// Step 1's "unprotect it (exactly the mprotect legacy does)" is an mprotect,
+// so on a 64K kernel it opens all 16 guest pages of the host granule, not the
+// one that faulted. The dirty-page SET stays indexed per GUEST page -- its
+// consumer is SoftInvalidateGuestCodeRange, a guest-code quantity, and the
+// content hashes it validates against are guest-4K -- but the RECORDING side
+// has to cover the granule, or the drain settles page N while N+1..N+15 sit
+// unprotected with live blocks on them and nothing left to ever invalidate
+// them. That is the soundness rule of design Part 2 section 5 broken through
+// the lazy door, and it is a strictly worse hole than the one this option
+// knowingly accepts, because no scrub and no cross-poke bounds it.
+//
+// So the fault path marks every TRACKED guest page of the granule dirty, not
+// just the faulting one (SyscallsSMCTracking.cpp, the SMCLazyInvalActive
+// branch). Untracked siblings are skipped: no protection of ours was on them
+// and no block was compiled from them, so a drain would have nothing to do.
+//
+// The cross-thread arming (FEX_SMCLAZYCROSSPOKE / FEX_SMCLAZYLINK) needs no
+// change: it arms the WRITER's InterruptFaultPage through
+// InternalThreadState::ProtectInterruptFaultPage, whose mprotect is already
+// HostPage::Size() and whose page is its own host-page allocation since stage
+// S2 moved it out of the struct and behind a pointer.
+//
+// The epoch bookkeeping is an OR across the pages marked, so a granule whose
+// first dirty page starts the epoch still arms every thread exactly once.
+//
+// 4K: the loop runs exactly once, on the faulting page. Unchanged.
+//
 // Requires FEX_SMCSOFTINVALIDATE=1 and FEX_SMCCHECKS=mtrack; with anything
 // else the option logs once and stays off.  Off => not one line of this runs
 // and behaviour is byte-identical to whatever the other SMC options select.

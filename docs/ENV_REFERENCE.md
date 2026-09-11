@@ -101,6 +101,8 @@ Absorb-by-default behaviours; setting these makes them loud.
 | `FEX_HWTSO_STRICT` | Make a refused `PROT_SAO` range diagnosable instead of silently unordered. **Important**: under `FEX_HWTSO` the JIT emits no barriers, so a refused range has *no ordering at all*. |
 | `FEX_SMC_LOOPTRAP` | Trap on a stuck SMC fault address. Note store-emulation / semantic-patch / mono-storm workloads legitimately fault one address hundreds of thousands of times. |
 | `FEX_SMC_AUDIT` | Compile-side SMC logger, `O_APPEND` alongside the syscall-side one. |
+| `FEX_SMCGRANULEPOLICY` | 64K hosts only. What happens to the tracked SIBLINGS of a faulting guest page when the granule-wide unprotect opens them. `invalidate` (default) widens the invalidation to the granule, which discharges the soundness rule by construction; `rearm` invalidates only the faulting page and soft-invalidates the granule at the next SMC drain point, which is **unsound by construction** in exactly the way `FEX_SMCLAZYINVAL` is and exists only to measure the mixed code/data thrash against. Forced to `invalidate` on a 4K host. |
+| `FEX_SMCGRANULEFLIPLOG` | 64K hosts only. Faults per granule per second above which one rate-limited line is logged (from the next non-signal mtrack mark, never from the handler) naming the granule, its flip count and how many of its guest pages are actually tracked code. Default `64`, `0` disables. |
 | `FEX_BUFSTATS` | Code-buffer rotation log, written as it goes so a SIGKILLed Proton session still leaves it. |
 | `FEX_LOG_UNEXPECTED_FUTEX` | Log futex returns glibc treats as fatal (the "unexpected error code" panic). |
 
