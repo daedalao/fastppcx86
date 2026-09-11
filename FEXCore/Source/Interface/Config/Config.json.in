@@ -534,6 +534,23 @@
           "\tfull: Validate code before every run (slow)"
         ]
       },
+      "HostPageMode": {
+        "Type": "str",
+        "Default": "abort",
+        "Desc": [
+          "What to do when the HOST kernel's page size is larger than the 4096 the",
+          "x86 guest is handed through AT_PAGESZ. See docs/PAGE_SIZE_64K_PLAN.md.",
+          "\tabort (default): explain and refuse to start. The unsupported-host",
+          "\t     failure modes are silent (deferred signals that never arm, a guest",
+          "\t     that hangs with no diagnostic), so refusing is the safe answer.",
+          "\tdegrade: continue, and force SMCChecks=full -- the one SMC mode whose",
+          "\t     correctness does not depend on host protection granularity matching",
+          "\t     the guest's. Relaxed-correctness contract, logged once.",
+          "\tforce: continue and force nothing. Bring-up aid only.",
+          "FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 is kept as an alias for force.",
+          "No effect at all on a 4K host."
+        ]
+      },
       "SMCSoftInvalidate": {
         "Type": "bool",
         "Default": "false",

@@ -930,8 +930,11 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
         LogMan::Msg::EFmt("  {} {:#x}: <out of range>", label, addr);
         return;
       }
-      uint64_t page = addr & ~0xFFFULL;
-      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) != 0) {
+      // HOST: msync demands host-page alignment; a 4K-masked address reports
+      // "<unmapped>" for everything on a 64K kernel, i.e. it breaks exactly the
+      // diagnostics you need while bringing the port up.
+      uint64_t page = FEXCore::HostPage::AlignDown(addr);
+      if (msync(reinterpret_cast<void*>(page), FEXCore::HostPage::Size(), MS_ASYNC) != 0) {
         LogMan::Msg::EFmt("  {} {:#x}: <unmapped>", label, addr);
         return;
       }
@@ -951,8 +954,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     // Stack walk via RBP -- the guest RBP often survives RSP corruption.
     uint64_t rbp = S.gregs[FEXCore::X86State::REG_RBP];
     if (rbp >= 0x1000ULL && rbp <= 0x00007FFFFFFFFFFFULL) {
-      uint64_t page = rbp & ~0xFFFULL;
-      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) == 0) {
+      // HOST: see dump_guest above.
+      uint64_t page = FEXCore::HostPage::AlignDown(rbp);
+      if (msync(reinterpret_cast<void*>(page), FEXCore::HostPage::Size(), MS_ASYNC) == 0) {
         const uint64_t* fp = reinterpret_cast<const uint64_t*>(rbp);
         LogMan::Msg::EFmt("  RBP frame: saved_RBP={:#x} return_RIP={:#x}",
                           fp[0], fp[1]);
@@ -1050,7 +1054,7 @@ bool SignalDelegator::HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, i
       // If we have more deferred frames to process then mprotect back to PROT_NONE.
       // It will have been RW coming in to this sigreturn and now we need to remove permissions
       // to ensure FEX trampolines back to the SIGSEGV deferred handler.
-      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+      Thread->ProtectInterruptFaultPage(true);
     }
     return true;
   }
@@ -1258,7 +1262,7 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* 
 
 #ifdef ARCHITECTURE_arm64
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr >= reinterpret_cast<void*>(Thread->JITGuardPage) &&
-      SigInfo.si_addr < reinterpret_cast<void*>(Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE)) {
+      SigInfo.si_addr < reinterpret_cast<void*>(Thread->JITGuardPage + FEXCore::HostPage::Size())) {
     FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument,
                                                     ArchHelpers::Context::GetArmGPRs(UContext), ArchHelpers::Context::GetArmFPRs(UContext),
                                                     ArchHelpers::Context::GetArmPc(UContext));
@@ -1329,12 +1333,15 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   const bool MustDeferAsync = MustDeferSignal;
 #endif
 
-  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
+  // Identification predicate: the fault page is now an mmap'd host page, so compare
+  // against the stored pointer rather than an address inside the thread state.
+  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && Thread->CurrentFrame->InterruptFaultPagePtr &&
+      SigInfo.si_addr == reinterpret_cast<void*>(Thread->CurrentFrame->InterruptFaultPagePtr)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
       // Pull a signal frame off the stack.
 
-      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_READ | PROT_WRITE);
+      Thread->ProtectInterruptFaultPage(false);
 
       // FEX_SMCLAZYLINK: the SMC fault handler arms this page after a lazy
       // deferral, because with block linking live the fault-page poke at block
@@ -1414,7 +1421,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
 
     // Now update the faulting page permissions so it will fault on write.
-    mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    Thread->ProtectInterruptFaultPage(true);
     SIGTRACE("DEFER sig=%d pc=0x%lx newmask=0x%lx q=%zu", Signal, ArchHelpers::Context::GetPc(UContext), NewMask,
              ThreadObject->SignalInfo.DeferredSignalFrames.size());
 
@@ -1992,7 +1999,9 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
   memcpy(Thread->SignalInfo.AltStackPtr, &Thread, sizeof(void*));
 
   // Protect the first page of the alt-stack for overflow protection.
-  mprotect(Thread->SignalInfo.AltStackPtr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ);
+  // HOST: alt-stack overflow guard. mprotect rounds the length up to the host page, so
+  // saying so explicitly is what keeps the guard from silently eating 60K of alt stack.
+  mprotect(Thread->SignalInfo.AltStackPtr, FEXCore::HostPage::Size(), PROT_READ);
 
   // Register the alt stack
   const int Result = sigaltstack(&altstack, nullptr);

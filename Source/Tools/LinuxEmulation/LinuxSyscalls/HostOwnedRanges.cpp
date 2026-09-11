@@ -226,7 +226,10 @@ void HostOwnedRanges::Add(uint64_t Base, uint64_t Size) {
     return;
   }
   std::lock_guard lk {RangesLock};
-  AddLocked(Base & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Base + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  // HOST: the thing being tracked is one of FEX's own host mappings, so the rounding
+  // has to be to the host page. Rounding to 4K would let a guest request that lands in
+  // the same host page as a FEX-owned mapping slip past the overlap test.
+  AddLocked(FEXCore::HostPage::AlignDown(Base), FEXCore::HostPage::AlignUp(Base + Size));
   SortAndCoalesceLocked();
 }
 
@@ -235,8 +238,9 @@ HostOwnedRanges::Range HostOwnedRanges::FindOverlap(uint64_t Base, uint64_t Size
     return {0, 0};
   }
 
-  const uint64_t Start = Base & FEXCore::Utils::FEX_PAGE_MASK;
-  const uint64_t End = FEXCore::AlignUp(Base + Size, FEXCore::Utils::FEX_PAGE_SIZE);
+  // HOST: see Add(). The ranges compared against are host mappings.
+  const uint64_t Start = FEXCore::HostPage::AlignDown(Base);
+  const uint64_t End = FEXCore::HostPage::AlignUp(Base + Size);
   if (End <= Start) {
     // Wrapped: an absurd length. Report an overlap so it is refused rather than
     // handed to the kernel. MayWrite stays true: the kernel's errno for an

@@ -2,6 +2,19 @@
 
 #pragma once
 
+// ---------------------------------------------------------------------------
+// Host page size (64K port, stage S2)
+// ---------------------------------------------------------------------------
+// The FEX_GUEST_PAGE_* uses here are guest ELF quantities (p_offset/p_vaddr
+// congruence, AT_PAGESZ, the guest BRK base, the ASLR slide unit) and stay 4K.
+//
+// 64K-TODO(S4): MapFile's `off = p_offset - PAGE_OFFSET(p_vaddr)` is 4K-congruent by
+// construction and a host mmap requires `offset % hostpage == 0`, so FEX's own
+// loader is the first thing that fails on a 64K host (design Part 1 finding 3).
+// The anon+pread fallback, explicit BSS tail zeroing and host-granular ASLR slide
+// are stage S4. Untouched here.
+// ---------------------------------------------------------------------------
+
 #include "ArchHelpers/UContext.h"
 #include "CodeLoader.h"
 #include "Common/FDUtils.h"
@@ -75,7 +88,7 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       return 0;
     }
 
-    return FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_PAGE_SIZE);
+    return FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
   }
 
   bool MapFile(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, int prot, int flags,
@@ -188,7 +201,7 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
         // track elf_brk
         if (memend > BrkLoadBase) {
-          BrkLoadBase = FEXCore::AlignUp(memend, FEXCore::Utils::FEX_PAGE_SIZE);
+          BrkLoadBase = FEXCore::AlignUp(memend, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
         }
       }
     }
@@ -471,7 +484,7 @@ public:
     }
 
     auto PageSize = sysconf(_SC_PAGESIZE);
-    PageSize = PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE;
+    PageSize = PageSize > 0 ? PageSize : static_cast<long>(FEXCore::HostPage::Size());
 
     do {
       // Allocate the base of the full 128MB stack range.
@@ -584,12 +597,16 @@ public:
           ASLR_Offset &= (1ULL << ASLR_BITS_32) - 1;
         }
 
-        ASLR_Offset <<= FEXCore::Utils::FEX_PAGE_SHIFT;
+        // 64K-TODO(S4): the ASLR slide must be host-granular; a 4K slide feeds
+        // MAP_FIXED_NOREPLACE below and is unrepresentable on a 64K kernel. Losing 4 bits
+        // of entropy is the whole cost. Left guest-granular so 4K is unchanged.
+        ASLR_Offset <<= FEXCore::Utils::FEX_GUEST_PAGE_SHIFT;
         ELFLoadHint += ASLR_Offset;
       }
 #endif
       // Align the mapping
-      ELFLoadHint &= FEXCore::Utils::FEX_PAGE_MASK;
+      // 64K-TODO(S4): same as the slide above -- this hint reaches a real mmap.
+      ELFLoadHint &= FEXCore::Utils::FEX_GUEST_PAGE_MASK;
     }
 
     // load the main elf
@@ -633,7 +650,7 @@ public:
     AuxVariables.emplace_back(auxv_t {13, getauxval(AT_GID)});            // AT_GID
     AuxVariables.emplace_back(auxv_t {14, getauxval(AT_EGID)});           // AT_EGID
     AuxVariables.emplace_back(auxv_t {17, getauxval(AT_CLKTCK)});         // AT_CLKTIK
-    AuxVariables.emplace_back(auxv_t {6, FEXCore::Utils::FEX_PAGE_SIZE}); // AT_PAGESIZE
+    AuxVariables.emplace_back(auxv_t {6, FEXCore::Utils::FEX_GUEST_PAGE_SIZE}); // AT_PAGESIZE
     AuxRandom = &AuxVariables.emplace_back(auxv_t {25, ~0ULL});           // AT_RANDOM
     AuxVariables.emplace_back(auxv_t {23, getauxval(AT_SECURE)});         // AT_SECURE
     AuxVariables.emplace_back(auxv_t {8, 0});                             // AT_FLAGS
@@ -654,13 +671,16 @@ public:
         // If the VDSO thunk doesn't exist then we might not have a vsyscall entry.
         // Newer glibc requires vsyscall to exist now. So let's allocate a buffer and stick a vsyscall in to it.
         auto VSyscallPage =
-          Handler->GuestMmap(Thread, nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+          Handler->GuestMmap(Thread, nullptr, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         constexpr static uint8_t VSyscallCode[] = {
           0xcd, 0x80, // int 0x80
           0xc3,       // ret
         };
         memcpy(VSyscallPage, VSyscallCode, sizeof(VSyscallCode));
-        mprotect(VSyscallPage, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ);
+        // 64K-TODO(S4): a raw HOST mprotect on a guest mapping. Widening it to the host
+        // page here would protect 60K of whatever the guest allocator put next to it, so
+        // it needs the granule table, not a mechanical rename.
+        mprotect(VSyscallPage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, PROT_READ);
         VSyscallEntry = reinterpret_cast<uint64_t>(VSyscallPage);
       }
 

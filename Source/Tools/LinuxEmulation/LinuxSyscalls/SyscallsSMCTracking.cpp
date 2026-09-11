@@ -7,6 +7,24 @@ desc: SMC/MMan Tracking
 $end_info$
 */
 
+// ---------------------------------------------------------------------------
+// Host page size (64K port, stage S2)
+// ---------------------------------------------------------------------------
+// Every FEX_GUEST_PAGE_SIZE/SHIFT/MASK in this file is the *guest* 4K page: the
+// guest was handed AT_PAGESZ=4096 and computes its mmap/mprotect/munmap ranges
+// from it, and the SMC tracking sets are indexed per guest page.
+//
+// The guest-facing rounding is therefore correct as written. What is NOT correct
+// on a host whose page is larger than 4K is that these 4K-granular results are
+// then handed straight to the host kernel (and to host mprotect via
+// UnprotectRegionCallback), which demands host granularity.
+//
+// 64K-TODO(S4/S5): that split is the granule table (design Part 2 sections 2 and 5)
+// and is deliberately NOT done here. This file keeps bit-identical 4K behaviour;
+// on a 64K host the guest memory syscalls and mtrack still fail, which is what
+// FEX_HOSTPAGEMODE=abort exists to report.
+// ---------------------------------------------------------------------------
+
 #include <Common/Config.h>
 #include "Common/FDUtils.h"
 #include "Common/FEXServerClient.h"
@@ -227,7 +245,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       return false;
     }
 
-    auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
+    auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     const bool EntryShared = Entry->second.Flags.Shared;
 
     // LOCK ORDER. Everything below that touches compiled code -- the hard and
@@ -491,7 +509,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // One exclusive acquisition for the whole batch, not one per mirror.
         FEX::HLE::ThreadManager::InvalidateRange Batch[MaxMirrors];
         for (size_t i = 0; i < MirrorCount; ++i) {
-          Batch[i] = {Mirrors[i].Base, FEXCore::Utils::FEX_PAGE_SIZE, Mirrors[i].Writable};
+          Batch[i] = {Mirrors[i].Base, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Mirrors[i].Writable};
         }
         _SyscallHandler->TM.InvalidateGuestCodeRanges(Thread, Batch, MirrorCount, UnprotectRegionCallback);
         Done += MirrorCount;
@@ -526,7 +544,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // compile/relink through MarkGuestExecutableRange -- sound.
       bool EpochStart = false;
       const bool FirstThisEpoch = _SyscallHandler->MarkSMCLazyDirtyPage(FaultBase, &EpochStart);
-      UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_PAGE_SIZE);
+      UnprotectRegionCallback(FaultBase, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       LazyDeferred = true;
 
       // FEX_SMCLAZYCROSSPOKE (opt-in): make the deferral bounded for EVERY
@@ -571,7 +589,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
             return;
           }
           Thread->CTX->ArmLazySMCDrainPending(Other);
-          mprotect(reinterpret_cast<void*>(&Other->InterruptFaultPage), sizeof(Other->InterruptFaultPage), PROT_NONE);
+          // Cross-thread arming (FEX_SMCLAZYLINK): the WRITER's fault page, through the
+          // same pointer its own thread uses.
+          Other->ProtectInterruptFaultPage(true);
         });
 
         if (!Armed) {
@@ -615,7 +635,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         // resumes. mprotect from a signal handler is the same call the
         // delegator itself makes on this page.
         if (_SyscallHandler->SMCLazyLinkActive()) {
-          mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+          Thread->ProtectInterruptFaultPage(true);
         }
       }
 
@@ -631,9 +651,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // Restricted to private mappings for the same reason as the v1 fast path
       // above: a shared mapping's blocks live under several mirrored VAs and
       // the mirror walk stays on the proven legacy path.
-      _SyscallHandler->TM.SoftInvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+      _SyscallHandler->TM.SoftInvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, UnprotectRegionCallback);
     } else {
-      _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+      _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, UnprotectRegionCallback);
     }
 
     const char* FaultOutcome = "INVALIDATED";
@@ -655,7 +675,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // Not when FEX_SMCLAZYINVAL took the fault: nothing was invalidated, so the
     // W^X deferral is still owed and must survive to its PROT_EXEC.
     if (!LazyDeferred && _SyscallHandler->SMCMprotectDeferActive()) {
-      _SyscallHandler->ClearSMCDeferredDirtyRange(FaultBase, FaultBase + FEXCore::Utils::FEX_PAGE_SIZE);
+      _SyscallHandler->ClearSMCDeferredDirtyRange(FaultBase, FaultBase + FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
@@ -671,7 +691,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // through explicitly. Same PC IsAddressInCodeBuffer is already given.
     const uint64_t FaultHostPC = ArchHelpers::Context::GetPc(ucontext);
     if (CTX->IsAddressInCodeBuffer(Thread, FaultHostPC) && !CTX->IsCurrentBlockSingleInst(Thread, FaultHostPC) &&
-        CTX->IsAddressInCurrentBlock(Thread, FaultHostPC, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
+        CTX->IsAddressInCurrentBlock(Thread, FaultHostPC, FaultAddress & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::Utils::FEX_GUEST_PAGE_SIZE)) {
       // If we are not in a single-instruction block, and the SMC write address could intersect with the current block,
       // reconstruct the context and repeat the faulting instruction as a single-instruction block so any SMC it performs
       // is immediately picked up.
@@ -792,8 +812,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 // and a running skipped-page total; plus `fileimmutable REARM` from GuestMprotect
 // when case 2b fires.
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
-  const auto Base = Start & FEXCore::Utils::FEX_PAGE_MASK;
-  const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_PAGE_SIZE);
+  const auto Base = Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+  const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
     return;
@@ -806,13 +826,13 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   const auto Generation = VMATracking.LoadGeneration();
 
   // Only single-page ranges are memoised. That is what the compile path asks
-  // for (Core.cpp and CodeCache.cpp both call with FEX_PAGE_SIZE), and it keeps
+  // for (Core.cpp and CodeCache.cpp both call with FEX_GUEST_PAGE_SIZE), and it keeps
   // the memo one lookup rather than a loop. FEX_SMCMARKMEMO=0 disables the
   // memo entirely for A/B work: its throughput benefit measured small (0.4%
   // FASTSKIP hit rate on W3), but the mark path contends the VMA mutex with
   // the syscall side, so the interesting axis is hitch/latency tails, not
   // mean CPU -- judge it with stutterwatch, not perf.
-  const bool Memoisable = SMCMarkMemo() && (Top - Base) == FEXCore::Utils::FEX_PAGE_SIZE;
+  const bool Memoisable = SMCMarkMemo() && (Top - Base) == FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
 
   if (Memoisable && VMATracking.IsMarkNoOp(Base, Generation)) {
     // Known to be a private, non-writable mapping (or no mapping at all) as of
@@ -1037,10 +1057,10 @@ void SoftInvalidateLazyPages(FEX::HLE::SyscallHandler* Handler, FEXCore::Core::I
   size_t Index = 0;
   while (Index < Pages.size()) {
     size_t Run = 1;
-    while (Index + Run < Pages.size() && Pages[Index + Run] == Pages[Index + Run - 1] + FEXCore::Utils::FEX_PAGE_SIZE) {
+    while (Index + Run < Pages.size() && Pages[Index + Run] == Pages[Index + Run - 1] + FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
       ++Run;
     }
-    Handler->TM.SoftInvalidateGuestCodeRange(Thread, Pages[Index], Run * FEXCore::Utils::FEX_PAGE_SIZE, NoCallback);
+    Handler->TM.SoftInvalidateGuestCodeRange(Thread, Pages[Index], Run * FEXCore::Utils::FEX_GUEST_PAGE_SIZE, NoCallback);
     Index += Run;
   }
 }
@@ -1241,7 +1261,7 @@ void SyscallHandler::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadSta
 
   // Drop the block so it recompiles with IsMonoBackpatcherBlock set (Core.cpp
   // keys the flag off the block entry RIP at BeginFunction time).
-  TM.InvalidateGuestCodeRange(Thread, BlockEntry & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+  TM.InvalidateGuestCodeRange(Thread, BlockEntry & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 }
 
 void SyscallHandler::DisableSMCDetectionLocked(FEXCore::Core::InternalThreadState* Thread) {
@@ -1785,7 +1805,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   LOGMAN_THROW_A_FMT(Is64Bit || (length >> 32) == 0, "values must fit to 32 bits");
 
   uint64_t Result {};
-  size_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
+  size_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
   std::optional<LateApplyExtendedVolatileMetadata> LateMetadata = std::nullopt;
 
   std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
@@ -1875,17 +1895,17 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   // invalidation above is unconditional, so all that is left is to forget the
   // deferral (otherwise the new mapping's first PROT_EXEC would pay for it).
   if (SMCMprotectDeferActive()) {
-    ClearSMCDeferredDirtyRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+    ClearSMCDeferredDirtyRange(Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   }
 
   // FEX_SMCFILEIMMUTABLE: whatever was mapped here is gone and the invalidation
   // below is unconditional, so the skip records for the range retire with it.
-  ClearSMCImmutableSkippedRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  ClearSMCImmutableSkippedRange(Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   // FEX_SMCLAZYINVAL: same reasoning. The mmap retired whatever was there and
   // InvalidateCodeRangeIfNecessary below hard-invalidates the range, which is
   // strictly stronger than the soft-invalidate the record was owed, so drop it.
   if (SMCLazyInvalActive()) {
-    ClearSMCLazyDirtyRange(Result & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+    ClearSMCLazyDirtyRange(Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   }
 
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
@@ -1917,7 +1937,7 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
   LOGMAN_THROW_A_FMT(Is64Bit || (length >> 32) == 0, "values must fit to 32 bits");
 
   uint64_t Result {};
-  uint64_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
+  uint64_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   {
     // Frontend calls this with nullptr Thread during initialization.
@@ -1955,20 +1975,20 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
   // unconditional, so just drop the deferred records for it.  This is what
   // keeps a deferred page from leaking stale blocks past its mapping.
   if (SMCMprotectDeferActive()) {
-    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
-    ClearSMCDeferredDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    ClearSMCDeferredDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   }
 
   // FEX_SMCFILEIMMUTABLE: same as GuestMmap -- the mapping is gone, so are its
   // skip records.
-  ClearSMCImmutableSkippedRange(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK,
-                                FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+  ClearSMCImmutableSkippedRange(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK,
+                                FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   // FEX_SMCLAZYINVAL: the memory is gone and the hard invalidation below is
   // unconditional; drop the lazy records so a dirty page can never outlive its
   // mapping (and so a later drain can't soft-invalidate an unmapped range).
   if (SMCLazyInvalActive()) {
-    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
-    ClearSMCLazyDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_PAGE_SIZE));
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    ClearSMCLazyDirtyRange(Base, FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   }
 
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size);
@@ -2022,10 +2042,10 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
   InvalidateCodeRangeIfNecessaryOnRemap(Thread, reinterpret_cast<uint64_t>(old_address), Result, old_size, new_size);
 
   if (SMCMprotectDeferActive()) {
-    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_PAGE_SIZE);
-    const auto NewBase = Result & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+    const auto NewBase = Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
     // The old range is invalidated above (when it moved) and is gone either
     // way, so its records just go.
@@ -2050,10 +2070,10 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
   // feature was tracking at the destination is settled with an invalidation
   // now rather than carried across the mapping change.
   {
-    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_PAGE_SIZE);
-    const auto NewBase = Result & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto OldBase = reinterpret_cast<uint64_t>(old_address) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto OldTop = FEXCore::AlignUp(reinterpret_cast<uint64_t>(old_address) + old_size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+    const auto NewBase = Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto NewTop = FEXCore::AlignUp(Result + new_size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
     ClearSMCImmutableSkippedRange(OldBase, OldTop);
     bool SettleNew = ClearSMCImmutableSkippedRange(NewBase, NewTop);
@@ -2167,8 +2187,8 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     // reached when the option is on: with it off no page is ever recorded and
     // ClearSMCImmutableSkippedRange short-circuits on an atomic load.
     if (prot & PROT_WRITE) {
-      const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
-      const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+      const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+      const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       if (ClearSMCImmutableSkippedRange(Base, Top)) {
         RevokeSMCFileImmutabilityLocked(Base, Top);
         FileImmutableRearm = true;
@@ -2190,8 +2210,8 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
   // SMCDeferredDirtyPages in Syscalls.h for the soundness argument.
   bool DeferInvalidation = false;
   if (SMCMprotectDeferActive()) {
-    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
     if (prot & PROT_EXEC) {
       // The guest is (re-)arming the range for execution.  This is the point
@@ -2228,8 +2248,8 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
   // protection was installed here, so any lazy record for this range has lost
   // the page state it was describing and must be settled or dropped now.
   if (SMCLazyInvalActive()) {
-    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_PAGE_MASK;
-    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_PAGE_SIZE);
+    const auto Base = reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+    const auto Top = FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + len, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
     if (prot & PROT_EXEC) {
       // The guest is arming the range for execution: it may branch into it the
@@ -2377,7 +2397,7 @@ uint64_t SyscallHandler::GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadS
 std::optional<SyscallHandler::LateApplyExtendedVolatileMetadata>
 SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t addr, size_t length, int prot, int flags, int fd,
                           off_t offset, std::optional<FEXCore::ExecutableFileSectionInfo>& CachedSection) {
-  size_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
+  size_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
   const auto ProtMapping = VMATracking::VMAProt::fromProt(prot);
 
   VMATracking::MappedResource* Resource = nullptr;
@@ -2532,20 +2552,20 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
 }
 
 void SyscallHandler::TrackMunmap(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length) {
-  uint64_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
+  uint64_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
   VMATracking.DeleteVMARange(CTX, reinterpret_cast<uintptr_t>(addr), Size);
 }
 
 void SyscallHandler::TrackMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
-  uint64_t Size = FEXCore::AlignUp(len, FEXCore::Utils::FEX_PAGE_SIZE);
+  uint64_t Size = FEXCore::AlignUp(len, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   VMATracking.ChangeProtectionFlags(reinterpret_cast<uintptr_t>(addr), Size, VMATracking::VMAProt::fromProt(prot));
 }
 
 void SyscallHandler::TrackMremap(FEXCore::Core::InternalThreadState* Thread, uint64_t OldAddress, size_t OldSize, size_t NewSize, int flags,
                                  uint64_t NewAddress) {
-  OldSize = FEXCore::AlignUp(OldSize, FEXCore::Utils::FEX_PAGE_SIZE);
-  NewSize = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_PAGE_SIZE);
+  OldSize = FEXCore::AlignUp(OldSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+  NewSize = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   const auto OldVMA = VMATracking.FindVMAEntry(OldAddress);
 
@@ -2594,7 +2614,7 @@ uint64_t SyscallHandler::TrackShmdt(FEXCore::Core::InternalThreadState* Thread, 
 }
 
 void SyscallHandler::TrackMadvise(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Size, int advice) {
-  Size = FEXCore::AlignUp(Size, FEXCore::Utils::FEX_PAGE_SIZE);
+  Size = FEXCore::AlignUp(Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   // Destructive advice types replace page contents WITHOUT a page-write fault
   // reaching FEX's SMC tracking, so any translations FEX has for guest code

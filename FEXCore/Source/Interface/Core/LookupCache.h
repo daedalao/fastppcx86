@@ -1323,7 +1323,7 @@ public:
 private:
 
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
-  constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);
+  constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_GUEST_PAGE_SIZE * sizeof(LookupCacheEntry);
   constexpr static size_t MAX_L1_SIZE = MAX_L1_ENTRIES * sizeof(LookupCacheEntry);
 
   size_t AllocateOffset {};

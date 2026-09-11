@@ -34,7 +34,7 @@ GuestToHostMap::GuestToHostMap() {
 LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   : ctx {CTX} {
 
-  TotalCacheSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE + MAX_L1_SIZE;
+  TotalCacheSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE + MAX_L1_SIZE;
 
   // Block cache ends up looking like this
   // PageMemoryMap[VirtualMemoryRegion >> 12]
@@ -57,7 +57,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
 
   FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
-                                  ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE);
+                                  ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE);
   CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
 
   // Allocate our memory backing our pages
@@ -65,7 +65,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // XXX: We can drop down to 16KB if we store 4byte offsets from the code base
   // We currently limit to 128MB of real memory for caching for the total cache size.
   // Can end up being inefficient if we compile a small number of blocks per page
-  PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
+  PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8;
 
   // L1 Cache
   L1Pointer = PageMemory + CODE_SIZE;
@@ -99,7 +99,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // is that the first touch after a scrub re-faults at huge-page granularity.
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(L1Pointer), MAX_L1_SIZE, FEXCore::Allocator::THPControl::Enable);
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer),
-                                        ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8,
+                                        ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8,
                                         FEXCore::Allocator::THPControl::Enable);
 
   VirtualMemSize = ctx->Config.VirtualMemSize;
@@ -126,7 +126,7 @@ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
   // Clear out the page memory
   // PagePointer and PageMemory are sequential with each other. Clear both at once.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
-                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, false);
+                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE, false);
   AllocateOffset = 0;
 }
 

@@ -462,12 +462,13 @@ void PPC64Dispatcher::EmitDispatcher() {
   // ==============================================================
   const int32_t deferred_refcount_off = static_cast<int32_t>(
     offsetof(FEXCore::Core::CpuStateFrame, State.DeferredSignalRefCount));
-  const int32_t deferred_fault_off = static_cast<int32_t>(
-    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
-    offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
-  static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) >=
-                offsetof(FEXCore::Core::InternalThreadState, BaseFrameState),
-                "InterruptFaultPage must lie at or after BaseFrameState");
+  // 64K port: the interrupt fault page is an mmap'd host page whose address lives in
+  // the frame, not an array embedded in InternalThreadState -- a page-sized D-form
+  // displacement is unencodable once the host page is 64K. The poke below loads the
+  // pointer and stores through it.
+  const int32_t deferred_fault_ptr_off = static_cast<int32_t>(offsetof(FEXCore::Core::CpuStateFrame, InterruptFaultPagePtr));
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, InterruptFaultPagePtr) + sizeof(void*) <= 32768,
+                "InterruptFaultPagePtr must be reachable from STATE with a signed 16-bit D-form displacement");
 
   auto EmitDeferredSignalEnter = [&]() {
     // 3-instr non-atomic thread-local increment per docs/DeferredSignals.md.
@@ -478,14 +479,18 @@ void PPC64Dispatcher::EmitDispatcher() {
     std(TMP1, deferred_refcount_off, STATE);
   };
   auto EmitDeferredSignalExit = [&]() {
-    // 4-instr decrement + fault-page byte-store. If a signal was queued
+    // 5-instr decrement + fault-page byte-store (the pointer load is the 5th;
+    // see the note above deferred_fault_ptr_off). If a signal was queued
     // while refcount > 0, the page is mprotect'd PROT_NONE and the stb
     // traps SIGSEGV; the host handler picks the queued signal off the
     // per-thread stack and dispatches the guest handler.
     ld(TMP1, deferred_refcount_off, STATE);
     addi(TMP1, TMP1, -1);
     std(TMP1, deferred_refcount_off, STATE);
-    stb(TMP1, deferred_fault_off, STATE);
+    // The refcount store has retired; TMP1 is free again. The value stored by the
+    // stb is irrelevant -- only the fault matters.
+    ld(TMP1, deferred_fault_ptr_off, STATE);
+    stb(TMP1, 0, TMP1);
   };
 
   // Entry 1: SRA still live in host registers (dispatcher-internal).

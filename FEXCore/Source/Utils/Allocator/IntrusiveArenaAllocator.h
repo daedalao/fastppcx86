@@ -79,9 +79,10 @@ public:
   IntrusiveArenaAllocator(void* Ptr, size_t _Size)
     : Begin {reinterpret_cast<uintptr_t>(Ptr)}
     , Size {_Size} {
-    uint64_t NumberOfPages = _Size / FEXCore::Utils::FEX_PAGE_SIZE;
-    uint64_t UsedBits =
-      FEXCore::AlignUp(sizeof(IntrusiveArenaAllocator) + Size / FEXCore::Utils::FEX_PAGE_SIZE / 8, FEXCore::Utils::FEX_PAGE_SIZE);
+    // HOST: the arena carves a slab that came from a host mmap; the bitmap quantum
+    // matches the host allocation granularity.
+    uint64_t NumberOfPages = _Size / FEXCore::HostPage::Size();
+    uint64_t UsedBits = FEXCore::HostPage::AlignUp(sizeof(IntrusiveArenaAllocator) + Size / FEXCore::HostPage::Size() / 8);
     for (size_t i = 0; i < UsedBits; ++i) {
       UsedPages.Set(i);
     }
@@ -115,7 +116,7 @@ private:
   void* do_allocate(std::size_t bytes, std::size_t alignment) override {
     std::scoped_lock<std::mutex> lk {AllocationMutex};
 
-    size_t NumberPages = FEXCore::AlignUp(bytes, FEXCore::Utils::FEX_PAGE_SIZE) / FEXCore::Utils::FEX_PAGE_SIZE;
+    size_t NumberPages = FEXCore::HostPage::AlignUp(bytes) / FEXCore::HostPage::Size();
 
     uintptr_t AllocatedOffset {};
 
@@ -158,7 +159,7 @@ try_again:
       LastAllocatedPageOffset = AllocatedOffset + NumberPages;
 
       // Now convert this base page to a pointer and return it
-      return reinterpret_cast<void*>(Begin + AllocatedOffset * FEXCore::Utils::FEX_PAGE_SIZE);
+      return reinterpret_cast<void*>(Begin + AllocatedOffset * FEXCore::HostPage::Size());
     }
 
     return nullptr;
@@ -167,8 +168,8 @@ try_again:
   void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
     std::scoped_lock<std::mutex> lk {AllocationMutex};
 
-    uintptr_t PageOffset = (reinterpret_cast<uintptr_t>(p) - Begin) / FEXCore::Utils::FEX_PAGE_SIZE;
-    size_t NumPages = FEXCore::AlignUp(bytes, FEXCore::Utils::FEX_PAGE_SIZE) / FEXCore::Utils::FEX_PAGE_SIZE;
+    uintptr_t PageOffset = (reinterpret_cast<uintptr_t>(p) - Begin) / FEXCore::HostPage::Size();
+    size_t NumPages = FEXCore::HostPage::AlignUp(bytes) / FEXCore::HostPage::Size();
 
     // Walk the allocation list and deallocate
     uint64_t FreedPages {};

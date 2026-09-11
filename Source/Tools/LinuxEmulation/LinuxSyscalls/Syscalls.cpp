@@ -122,7 +122,7 @@ namespace HardwareTSO {
     // CPU_FTR_SAO), so a successful SAO mapping implies SAO semantics.
     // Ordering itself was proven separately (notes/tools/sao_litmus.c).
     void* Probe =
-      ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      ::mmap(nullptr, FEXCore::HostPage::Size(), PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (Probe == MAP_FAILED) {
       fprintf(stderr,
               "FEX: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
@@ -133,7 +133,7 @@ namespace HardwareTSO {
     // Touch the page so a pathological accept-then-fault setup dies here, at
     // startup, instead of inside the guest.
     *static_cast<volatile uint32_t*>(Probe) = 1;
-    ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+    ::munmap(Probe, FEXCore::HostPage::Size());
     // The only true-store. Release-ordered so the mapping choke points, which
     // acquire-load it, cannot see Live true before Strict is initialised below.
     // (There is no concurrency here yet — this runs before the syscall handler
@@ -1055,7 +1055,7 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
       DataSpaceMappedSize = 0;
     } else {
       uint64_t NewSize = NewEnd - DataSpace;
-      uint64_t NewSizeAligned = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_PAGE_SIZE);
+      uint64_t NewSizeAligned = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
       if (NewSizeAligned < DataSpaceMappedSize) {
         // If we are shrinking the brk then munmap the ranges
@@ -1069,7 +1069,7 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
 
         DataSpaceMappedSize = NewSizeAligned;
       } else if (NewSize > DataSpaceMappedSize) {
-        uint64_t AllocateNewSize = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_PAGE_SIZE) - DataSpaceMappedSize;
+        uint64_t AllocateNewSize = FEXCore::AlignUp(NewSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE) - DataSpaceMappedSize;
         if (!Is64BitMode() && (DataSpace + DataSpaceMappedSize + AllocateNewSize > 0x1'0000'0000ULL)) {
           // If we are 32bit and we tried going about the 32bit limit then out of memory
           return DataSpace + DataSpaceSize;
@@ -1123,7 +1123,7 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   ExtendedMetaData = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(FEXCore::Config::Get_EXTENDEDVOLATILEMETADATA()());
 
   // There was a host-page-size warning here. It has moved, whole, to
-  // FEX::Kernel::PageSize::CheckHostPageSize (FEXInterpreter.cpp), which runs
+  // FEX::HostPageGate::CheckHostPageSize (Source/Common/HostPageGate.h), which runs
   // before any InternalThreadState is allocated and aborts rather than warns.
   //
   // Do not re-add a check here. The version that used to live at this spot

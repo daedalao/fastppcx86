@@ -492,6 +492,21 @@ struct CpuStateFrame {
 
   InternalThreadState* Thread;
 
+  /**
+   * @brief One host page, PROT_READ|PROT_WRITE, mmap'd per thread in
+   * ContextImpl::CreateThread and unmapped in DestroyThread.
+   *
+   * The page carries no data. It exists to be mprotect'd PROT_NONE by the
+   * signal delegator so that the JIT's deferred-signal poke (one `stb`) faults
+   * at the next guest boundary. It used to be an array embedded in
+   * InternalThreadState, which forced the whole thread state to be
+   * alignas(page) and exactly two pages; on a host whose page is larger than
+   * 4K that layout cannot be produced at all and every arming mprotect returns
+   * EINVAL. Holding a pointer instead makes the host page size a runtime
+   * quantity at the cost of one L1-resident dependent load on the poke.
+   */
+  uint8_t* InterruptFaultPagePtr {};
+
 #ifdef ARCHITECTURE_arm64ec
   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
   uint32_t SuspendDoorbell {};
@@ -553,4 +568,10 @@ static_assert(std::is_standard_layout<CpuStateFrame>::value, "This needs to be s
 static_assert(sizeof(CpuStateFrame::SynchronousFaultData) == 8, "This needs to be 8 bytes");
 static_assert(alignof(CpuStateFrame::SynchronousFaultDataStruct) == 8, "This needs to be 8 bytes");
 static_assert(offsetof(CpuStateFrame, SynchronousFaultData) % 8 == 0, "This needs to be aligned");
+// The JIT pokes the fault page with `ld TMP, off(STATE); stb r0, 0(TMP)`, and the ld is
+// a D-form load whose displacement field is a signed 16-bit immediate. The old embedded
+// array had to be within one page of BaseFrameState for the same reason; the pointer
+// has to be within signed-16-bit reach of it.
+static_assert(offsetof(CpuStateFrame, InterruptFaultPagePtr) + sizeof(void*) <= 32768,
+              "InterruptFaultPagePtr must be reachable from STATE with a signed 16-bit D-form displacement");
 } // namespace FEXCore::Core

@@ -8,10 +8,16 @@
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>
 #include <type_traits>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 namespace FEXCore {
 class LookupCache;
@@ -88,7 +94,7 @@ struct UnalignedExclusiveStore {
   uint8_t Size;
 };
 
-struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
+struct InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
   FEXCore::Core::CpuStateFrame* const CurrentFrame = &BaseFrameState;
 
   FEXCore::Context::Context* const CTX;
@@ -123,16 +129,53 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   uint64_t JITGuardOverflowArgument {};
   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 
-  // BaseFrameState should always be at the end, directly before the interrupt fault page
-  FEXCore::Core::CpuStateFrame BaseFrameState {};
+  // Result of the most recent arm/disarm mprotect of the interrupt fault page.
+  // The arming sites run in signal context, where LogMan is not async-signal-safe
+  // and errors used to be discarded outright (and a discarded EINVAL here means
+  // async signals silently never drain). They store errno here instead; anything
+  // running outside signal context can read it and complain.
+  // sig_atomic_t so the store is a single instruction with no library call.
+  volatile sig_atomic_t InterruptFaultPageProtectErrno {};
 
-  // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
-  alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
+#ifndef _WIN32
+  /**
+   * @brief Arm (PROT_NONE) or disarm (PROT_READ|PROT_WRITE) the interrupt fault page.
+   *
+   * ASYNC-SIGNAL-SAFE. Every caller but one runs inside a signal handler, so this
+   * must never log and never allocate: one mprotect, and on failure one
+   * sig_atomic_t store that somebody outside signal context can read.
+   * Returns true on success.
+   */
+  bool ProtectInterruptFaultPage(bool Arm) {
+    auto* Page = BaseFrameState.InterruptFaultPagePtr;
+    if (!Page) [[unlikely]] {
+      return false;
+    }
+    if (::mprotect(Page, FEXCore::HostPage::Size(), Arm ? PROT_NONE : (PROT_READ | PROT_WRITE)) != 0) [[unlikely]] {
+      InterruptFaultPageProtectErrno = errno;
+      return false;
+    }
+    return true;
+  }
+#endif
+
+  // BaseFrameState should always be at the end.
+  // NOTE: the interrupt fault page used to be an embedded array immediately after
+  // this member, which is why the struct was alignas(page) and asserted to be
+  // exactly two pages. It is now an mmap'd host page whose address lives in
+  // BaseFrameState.InterruptFaultPagePtr (see CoreState.h), so neither the
+  // alignment nor the size constraint applies any more.
+  FEXCore::Core::CpuStateFrame BaseFrameState {};
 };
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
-static_assert((offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState)) <
-                FEXCore::Utils::FEX_PAGE_SIZE,
-              "Fault page is outside of immediate range from CPU state");
-static_assert(sizeof(FEXCore::Core::InternalThreadState) == (FEXCore::Utils::FEX_PAGE_SIZE * 2));
+// BaseFrameState reachability: the JIT addresses everything it needs through
+// STATE == &BaseFrameState with signed 16-bit D-form displacements, so the frame
+// must still be the last member (nothing may be placed after it that the JIT
+// would have to reach) and must be 8-byte aligned for the ld/std forms.
+static_assert(offsetof(FEXCore::Core::InternalThreadState, BaseFrameState) + sizeof(FEXCore::Core::CpuStateFrame) ==
+                sizeof(FEXCore::Core::InternalThreadState),
+              "BaseFrameState must be the last member of InternalThreadState");
+static_assert(offsetof(FEXCore::Core::InternalThreadState, BaseFrameState) % 8 == 0,
+              "BaseFrameState must be 8-byte aligned for the JIT's D-form accesses");
 
 } // namespace FEXCore::Core

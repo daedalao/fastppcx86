@@ -996,6 +996,21 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
   };
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
+  // One host page for the deferred-signal interrupt fault page. It is mapped
+  // separately from the thread state precisely so that its address is host-page
+  // aligned whatever the host page size is: the arming mprotect in the signal
+  // delegator needs that, and used to get it by accident from an alignas(4096)
+  // thread state that only worked on a 4K kernel.
+  {
+    const size_t PageSize = FEXCore::HostPage::Size();
+    void* FaultPage = ::mmap(nullptr, PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (FaultPage == MAP_FAILED) {
+      ERROR_AND_DIE_FMT("Failed to allocate the interrupt fault page for a new thread");
+    }
+    FEXCore::Allocator::VirtualName("FEXMem_InterruptFaultPage", FaultPage, PageSize);
+    Thread->BaseFrameState.InterruptFaultPagePtr = static_cast<uint8_t*>(FaultPage);
+  }
+
   Thread->CurrentFrame->State.gregs[X86State::REG_RSP] = StackPointer;
   Thread->CurrentFrame->State.rip = InitialRIP;
 
@@ -1020,8 +1035,15 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 }
 
 void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
-  FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
-                                     Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+  // The page may be sitting at PROT_NONE (a deferred signal was armed and never
+  // drained). Restore it before the mapping goes away so nothing that is still
+  // unwinding takes a fault on a dangling address, then release it.
+  if (auto* FaultPage = Thread->CurrentFrame->InterruptFaultPagePtr) {
+    const size_t PageSize = FEXCore::HostPage::Size();
+    FEXCore::Allocator::VirtualProtect(FaultPage, PageSize, Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+    Thread->CurrentFrame->InterruptFaultPagePtr = nullptr;
+    ::munmap(FaultPage, PageSize);
+  }
   delete Thread;
 }
 
@@ -1770,9 +1792,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       // before MarkGuestExecutableRange below arms the page's write protection
       // -- see the ordering argument in Interface/Core/SMCCodeGranules.h.
       const bool NewPage =
-        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, StartAddr, Length);
+        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, StartAddr, Length);
       if (NewPage) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       }
       if (SMCAuditCompileFD() >= 0) {
         dprintf(SMCAuditCompileFD(), "compile rip=%lx page=%lx newpage=%d nentry=%zu\n", GuestRIP, CodePage, NewPage ? 1 : 0,
@@ -1795,11 +1817,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     // harmless here (the bridge runs SMCCHECKS=0) and correct in general:
     // the page really does hold code the guest can execute.
     fextl::set<uint64_t> Entrypoints {GuestRIP};
-    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE - 1);
+    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1);
     CodePages.push_back(Page);
-    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_PAGE_SIZE, GuestRIP, 1);
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, GuestRIP, 1);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 
@@ -1943,9 +1965,9 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     // to retain a block without one), so this is granule-precise, and it lands
     // before MarkGuestExecutableRange re-arms the protection.
     const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(
-      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
+      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 
