@@ -879,8 +879,17 @@ bool Madvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t leng
       // failure this branch exists to avoid.
       LogOnce(LoggedMadviseSkip, "a destructive madvise on part of a granule it cannot take apart", SubBase, SubEnd - SubBase);
     }
-    Hndl->TrackMadvise(Thread, GuestBase, Size, advice);
   }
+
+  // OUTSIDE the VMATracking scope, deliberately. TrackMadvise invalidates the
+  // code on destructive advice, which takes the EXCLUSIVE CodeInvalidationMutex;
+  // doing that while holding VMATracking's write lock inverts the lock order
+  // the rest of the tree keeps (compile threads hold CodeInvalidationMutex
+  // shared and take VMATracking shared inside it). With the call inside the
+  // scope, RimWorld Linux on the 64K kernel hit the invalidator's deadline
+  // here, the resulting fatal trap was delivered to the guest on top of this
+  // frame, and the write lock was leaked into guest code for good.
+  Hndl->TrackMadvise(Thread, GuestBase, Size, advice);
 
   *Result = 0;
   return true;
