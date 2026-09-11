@@ -834,6 +834,67 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 // protection with the page range, the backing path when it is already known,
 // and a running skipped-page total; plus `fileimmutable REARM` from GuestMprotect
 // when case 2b fires.
+namespace {
+// 64K (S4c) arming bookkeeping. [Start, Start+Length) is the range mtrack just
+// write-protected, expressed in GUEST pages; record which guest page of which
+// host granule is genuinely tracked code, so that
+//   * the per-granule tracked COUNT is available to a later arming heuristic
+//     ("this granule is 1/16 code and flips 4000 times a second -- stop arming
+//     it and hash it instead", design Part 2 section 5's mitigation ladder), and
+//   * the flip-rate detector has something to attribute a flip to.
+// No-op on a 4K host: SMCGranule::Enabled() is false and every entry point
+// short-circuits before touching the map or its mutex.
+void NoteGranulesArmed(uint64_t Start, uint64_t Length) {
+  if (!FEX::HLE::SMCGranule::Enabled()) {
+    return;
+  }
+  const uint64_t First = Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+  const uint64_t Last = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+  uint64_t Granule = FEX::HLE::SMCGranule::Base(First);
+  while (Granule < Last) {
+    const uint64_t GranuleTop = Granule + FEXCore::HostPage::Size();
+    uint32_t Mask = 0;
+    for (uint64_t Page = std::max(First, Granule); Page < std::min(Last, GranuleTop); Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
+      Mask |= 1u << FEX::HLE::SMCGranule::PageBit(Page);
+    }
+    FEX::HLE::SMCGranule::Table().NoteArmed(Granule, Mask);
+    Granule = GranuleTop;
+  }
+}
+
+// The guest retired or repointed this range (mmap-over / munmap / mremap), so
+// mtrack's per-granule bookkeeping for it is meaningless. Dropping it is not a
+// correctness requirement -- a stale tracked mask only over-reports to the
+// heuristic, and a stale rearm entry only soft-invalidates a dead range, which
+// is sound -- but it is what keeps the table from growing without bound across
+// a session that churns mappings. No-op on a 4K host.
+void NoteGranuleRangeGone(uint64_t Base, uint64_t Top) {
+  if (!FEX::HLE::SMCGranule::Enabled()) {
+    return;
+  }
+  FEX::HLE::SMCGranule::Table().Forget(Base, Top);
+  FEX::HLE::SMCGranule::Rearms().Drop(Base, Top);
+}
+
+// Drain the flip-rate mailbox the SIGSEGV handler fills. Called from the mark
+// path, which is NOT a signal path, which is the whole point: the detector runs
+// in the handler, the logging runs here.
+void ReportGranuleFlips() {
+  if (!FEX::HLE::SMCGranule::Enabled()) {
+    return;
+  }
+  uint64_t Granule = 0;
+  uint32_t Flips = 0;
+  if (!FEX::HLE::SMCGranule::Table().TakeFlipReport(&Granule, &Flips)) {
+    return;
+  }
+  LogMan::Msg::IFmt("SMC granule {:#x}-{:#x} flipped {} times in one second with {} of {} guest pages tracked; mtrack is paying the "
+                    "whole granule for a fraction of it (FEX_SMCGRANULEFLIPLOG)",
+                    Granule, Granule + FEXCore::HostPage::Size(), Flips, FEX::HLE::SMCGranule::Table().TrackedCount(Granule),
+                    FEX::HLE::SMCGranule::PagesPerGranule());
+}
+} // namespace
+
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   const auto Base = Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
   const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
@@ -841,6 +902,10 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
     return;
   }
+
+  // 64K (S4c): one rate-limited line per hot granule, emitted here because this
+  // is the nearest non-signal path to the detector in the fault handler.
+  ReportGranuleFlips();
 
   // Sample the VMA map version *before* looking at anything else. Used both to
   // validate a memo hit below and to stamp the memo we may publish at the end.
@@ -933,6 +998,9 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
                 FEX::HLE::SMCBackpatch::NotePagesProtected(MirrorRegion.Start, MirrorRegion.Length);
               }
 #endif
+              if (rv == 0) {
+                NoteGranulesArmed(MirroredAbsBase, MirroredSize);
+              }
               SMC_AUDIT("[%d] mark PROTECT-mirror addr=%lx size=%lx\n", FHU::Syscalls::gettid(), MirroredAbsBase, MirroredSize);
               if (rv != 0) {
                 // Protect failure — realistic trigger is ENOMEM from
@@ -1002,6 +1070,12 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           // compiled code and the mtrack write protection that goes with it.
           FEX::HLE::SMCBackpatch::NotePagesProtected(ProtectRegion.Start, ProtectRegion.Length);
 #endif
+          if (rv == 0) {
+            // Only the pages the caller actually asked for are TRACKED; the
+            // siblings the granule dragged in are collateral and must not be
+            // counted as code.
+            NoteGranulesArmed(ProtectBase, ProtectSize);
+          }
 
           SMC_AUDIT("[%d] mark PROTECT base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
           if (rv != 0) {
@@ -1941,6 +2015,9 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   // FEX_SMCFILEIMMUTABLE: whatever was mapped here is gone and the invalidation
   // below is unconditional, so the skip records for the range retire with it.
   ClearSMCImmutableSkippedRange(Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
+
+  // 64K (S4c): the mapping that owned these granules is gone.
+  NoteGranuleRangeGone(Result & FEXCore::Utils::FEX_GUEST_PAGE_MASK, FEXCore::AlignUp(Result + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   // FEX_SMCLAZYINVAL: same reasoning. The mmap retired whatever was there and
   // InvalidateCodeRangeIfNecessary below hard-invalidates the range, which is
   // strictly stronger than the soft-invalidate the record was owed, so drop it.
@@ -2023,6 +2100,10 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
   // skip records.
   ClearSMCImmutableSkippedRange(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK,
                                 FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
+
+  // 64K (S4c): the mapping that owned these granules is gone.
+  NoteGranuleRangeGone(reinterpret_cast<uint64_t>(addr) & FEXCore::Utils::FEX_GUEST_PAGE_MASK,
+                       FEXCore::AlignUp(reinterpret_cast<uint64_t>(addr) + Size, FEXCore::Utils::FEX_GUEST_PAGE_SIZE));
   // FEX_SMCLAZYINVAL: the memory is gone and the hard invalidation below is
   // unconditional; drop the lazy records so a dirty page can never outlive its
   // mapping (and so a later drain can't soft-invalidate an unmapped range).
@@ -2117,6 +2198,10 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
 
     ClearSMCImmutableSkippedRange(OldBase, OldTop);
     bool SettleNew = ClearSMCImmutableSkippedRange(NewBase, NewTop);
+
+    // 64K (S4c): both ends changed backing.
+    NoteGranuleRangeGone(OldBase, OldTop);
+    NoteGranuleRangeGone(NewBase, NewTop);
     if (SMCLazyInvalActive()) {
       ClearSMCLazyDirtyRange(OldBase, OldTop);
       SettleNew |= ClearSMCLazyDirtyRange(NewBase, NewTop);
