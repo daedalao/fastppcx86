@@ -6,6 +6,7 @@ $end_info$
 
 #pragma once
 
+#include <FEXCore/Utils/TypeDefines.h>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -135,7 +136,10 @@ inline void* MakeLow32HostTrampoline(void* Target) {
   static std::unordered_map<void*, void*> Cache;
   static uint8_t* Pool = nullptr;
   static size_t PoolOff = 0;
-  constexpr size_t PoolSize = 0x10000;
+  // HOST: the pool is one mmap, so it has to be a whole number of host pages.
+  // 0x10000 already is one on a 64K host; this only matters if the host page
+  // ever exceeds it.
+  const size_t PoolSize = std::max<size_t>(0x10000, FEXCore::HostPage::Size());
   constexpr size_t TrampSize = 24;
 
   std::lock_guard lk {Mutex};
