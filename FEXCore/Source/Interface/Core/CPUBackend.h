@@ -106,8 +106,12 @@ namespace CPU {
     ~CodeBuffer();
 
     /// Returns the number of bytes available for storing code
+    /// HOST: the trailing guard page is one host page (mprotect granularity), so on a
+    /// 64K kernel the buffer gives up 64K rather than 4K. The allocation size itself is
+    /// deliberately NOT grown: it keeps its power-of-two shape (the near-branch
+    /// placement logic reasons about buffer extents) and 4K behaviour is bit-identical.
     size_t UsableSize() const {
-      return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
+      return AllocatedSize - FEXCore::HostPage::Size();
     }
 
     // ----------------------------------------------------------------------

@@ -380,9 +380,11 @@ namespace CPU {
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
     LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
-    // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
-    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+    // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
+    // HOST: mprotect granularity, so the guard is one *host* page. UsableSize() carves
+    // the same host page off the end; see CPUBackend.h.
+    uintptr_t LastPageAddr = FEXCore::HostPage::AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1);
+    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::HostPage::Size(),
                                             FEXCore::Allocator::ProtectOptions::None)) {
       LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
     }
@@ -883,7 +885,8 @@ namespace CPU {
     auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {
       // The last page of the code buffer is protected, so we need to exclude it from the valid range
       // when checking if the address is in the code buffer.
-      uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+      // HOST: mirrors the guard carved out in the CodeBuffer constructor.
+      uintptr_t LastPageAddr = FEXCore::HostPage::AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1);
       return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr);
     };
 
