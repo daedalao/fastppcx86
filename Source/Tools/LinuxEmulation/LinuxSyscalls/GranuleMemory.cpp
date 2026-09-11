@@ -335,7 +335,19 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
   } else if (HostAligned(GuestBase) && HostAligned(GuestEnd) &&
              !FEX::HostPageMapping::RequiresFallback(GuestBase, static_cast<uint64_t>(offset), flags, fd)) {
     // Whole granules, representable offset: the normal path handles it, with
-    // all of its SMC, HWTSO and code-cache bookkeeping intact.
+    // all of its SMC, HWTSO and code-cache bookkeeping intact. MAP_FIXED replaces
+    // whatever was there, so the table's entries for these granules (if any)
+    // are stale from this point; see Munmap for what stale nibbles cost.
+    {
+      auto* Hndl = Handler::Get();
+      auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+      auto& Tracking = Hndl->VMATracking;
+      if (!Tracking.Granules.Empty()) {
+        for (uint64_t G = GuestBase; G < GuestEnd; G += FEXCore::HostPage::Size()) {
+          Tracking.Granules.Forget(G);
+        }
+      }
+    }
     return false;
   } else if (!(GuestBase & ~GuestPageMask)) {
     // Fall through to the emulation below.
@@ -474,6 +486,22 @@ bool Munmap(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t lengt
 
   if (HostAligned(GuestBase) && HostAligned(GuestEnd)) {
     // Whole granules: the normal path unmaps exactly what the guest asked for.
+    // But the table may still describe these granules from an earlier
+    // sub-granule operation, and a mapping that later lands here would inherit
+    // those stale nibbles: the union then comes out stricter than the guest's
+    // real protection, every write to it faults, and HandleSegfault (seeing a
+    // VMA that says writable) treats each one as an SMC fault -- unprotect,
+    // granule-wide invalidation, and the next rematerialisation re-protects it.
+    // RimWorld Linux on the 64K kernel spun in exactly that loop at ~5000
+    // faults/s. Forget the granules with the mapping.
+    auto* Hndl = Handler::Get();
+    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+    auto& Tracking = Hndl->VMATracking;
+    if (!Tracking.Granules.Empty()) {
+      for (uint64_t G = GuestBase; G < GuestEnd; G += FEXCore::HostPage::Size()) {
+        Tracking.Granules.Forget(G);
+      }
+    }
     return false;
   }
 
