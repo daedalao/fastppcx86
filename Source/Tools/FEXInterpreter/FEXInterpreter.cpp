@@ -405,15 +405,11 @@ namespace UnalignedAtomic {
 } // namespace UnalignedAtomic
 
 void Init(bool Is64Bit, FEXCore::Context::Context* CTX) {
-  // Must be first. This is the last point at which refusing to run is clean:
-  // no InternalThreadState exists yet (the first one is built by
-  // TM.CreateThread below, after the syscall handler), no guest mapping exists
-  // yet (the VDSO and the guest ELF both go down later, via LoadVDSOThunks and
-  // Loader.MapMemory), and no guest code has been compiled. Everything that
-  // would actually wedge on a non-4K host is downstream of here.
-  // Config is fully loaded by this point, so the gate may consult HostPageMode and may
-  // force SMCChecks in degrade mode.
-  FEX::HostPageGate::CheckHostPageSize(true);
+  // The host-page-size gate used to be called here. It moved to main(), right
+  // after the config reload and BEFORE CreateNewContext: the context caches
+  // SMCChecks (FEX_CONFIG_OPT) at construction, so a degrade-mode
+  // Config::Set made from here changed nothing and mtrack stayed armed on a
+  // 64K host despite the "forced to full" banner.
 
   // Setup TSO hardware emulation immediately after initializing the context.
   TSO::SetupTSOEmulation(CTX);
@@ -484,6 +480,12 @@ int main(int argc, char** argv, char** const envp) {
   // Reload the meta layer
   FEXCore::Config::ReloadMetaLayer();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, InterpreterInstalled ? "1" : "0");
+
+  // Host-page-size gate (64K port). Config is loaded and merged, and nothing
+  // downstream exists yet: no context (CreateNewContext below caches SMCChecks
+  // at construction, which is why degrade-mode forcing has to happen HERE), no
+  // thread state, no guest mapping, no compiled code. Refusing is still clean.
+  FEX::HostPageGate::CheckHostPageSize(true);
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");
