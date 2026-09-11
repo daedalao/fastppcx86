@@ -10,6 +10,7 @@ $end_info$
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#include <FEXCore/Utils/TypeDefines.h>
 #include <vulkan/vulkan.h>
 
 #include "common/Host.h"
@@ -967,7 +968,9 @@ static uintptr_t ReserveGuestVisibleRange(size_t Size) {
   // nothing and simply lets it see the space.
   constexpr uintptr_t ScanTop = 0xF000'0000;
   constexpr uintptr_t ScanBottom = 0x0800'0000;
-  constexpr size_t PageSize = 0x1000;
+  // HOST: this is the granularity of the mmap reservation the gap search is
+  // about to make, not anything the guest observes.
+  const size_t PageSize = FEXCore::HostPage::Size();
 
   auto TryTake = [&](uintptr_t Addr) -> uintptr_t {
     void* P = ::mmap(reinterpret_cast<void*>(Addr), Size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -1200,7 +1203,8 @@ static void ReleasePlacedRange(uintptr_t Base) {
 struct PlacedDeviceInfo {
   PFN_vkMapMemory2KHR MapMemory2 {};
   PFN_vkUnmapMemory2KHR UnmapMemory2 {};
-  size_t Alignment {4096};
+  // HOST: the placed address is an mmap address, so never below a host page.
+  size_t Alignment {FEXCore::HostPage::Size()};
   bool UnmapReserve {};
   bool RangePlaced {};
 };
@@ -1267,8 +1271,8 @@ static void EnablePlacedMapsForDevice(VkPhysicalDevice PhysicalDevice, VkDevice 
   };
   LDR_PTR(vkGetPhysicalDeviceProperties2)(PhysicalDevice, &Props2);
   // The placed address has to satisfy the driver's alignment, and the
-  // reservation is an mmap, so never go below a page either.
-  Info.Alignment = std::max<size_t>(PlacedProps.minPlacedMemoryMapAlignment, 4096);
+  // reservation is an mmap, so never go below a host page either.
+  Info.Alignment = std::max<size_t>(PlacedProps.minPlacedMemoryMapAlignment, FEXCore::HostPage::Size());
 
   VkPhysicalDeviceMapMemoryPlacedFeaturesEXT PlacedFeatures {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,

@@ -51,6 +51,12 @@ public:
     return {0, UINT64_MAX, true};
   }
 
+  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot) override {
+    // The offline compiler forces every mapping writeable so it can apply
+    // relocations; honouring a protection change would undo that.
+    return 0;
+  }
+
   void* GuestMmap(FEXCore::Core::InternalThreadState*, void* addr, size_t Size, int prot, int Flags, int fd, off_t offset) override {
     // Force writeable to allow applying relocations
     auto Ret = mmap(addr, Size, prot | PROT_WRITE, Flags, fd, offset);
