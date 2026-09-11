@@ -8,16 +8,21 @@
 // The FEX_GUEST_PAGE_* uses here are guest ELF quantities (p_offset/p_vaddr
 // congruence, AT_PAGESZ, the guest BRK base, the ASLR slide unit) and stay 4K.
 //
-// 64K-TODO(S4): MapFile's `off = p_offset - PAGE_OFFSET(p_vaddr)` is 4K-congruent by
-// construction and a host mmap requires `offset % hostpage == 0`, so FEX's own
-// loader is the first thing that fails on a 64K host (design Part 1 finding 3).
-// The anon+pread fallback, explicit BSS tail zeroing and host-granular ASLR slide
-// are stage S4. Untouched here.
+// MapFile's `off = p_offset - PAGE_OFFSET(p_vaddr)` is 4K-congruent by construction
+// and a host mmap requires `offset % hostpage == 0`, so FEX's own loader is the
+// first thing that fails on a host page larger than the guest's (design Part 1
+// finding 3). Stage S4 gives it the anon+pread fallback below
+// (Source/Common/HostPageMapping.h), explicit zeroing of the file tail that the
+// kernel would have zeroed for a real mapping, a host-granular BSS map and a
+// host-granular ASLR slide. Every one of those is behind
+// FEXCore::HostPage::MatchesGuest(), so the 4K build takes the same path it
+// always did.
 // ---------------------------------------------------------------------------
 
 #include "ArchHelpers/UContext.h"
 #include "CodeLoader.h"
 #include "Common/FDUtils.h"
+#include "Common/HostPageMapping.h"
 #include "FEXCore/Utils/Allocator.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "VDSO_Emulation.h"
@@ -88,7 +93,78 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       return 0;
     }
 
-    return FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+    // HOST: this is the size of one anonymous reservation handed to mmap, and the
+    // BRK base is carved from its top. Rounding to the guest page would leave that
+    // base only 4K-aligned, which a later MAP_FIXED cannot use on a larger host page.
+    return FEXCore::HostPage::AlignUp(max_map_address - min_map_address);
+  }
+
+  // 64K: state carried across the PT_LOAD segments of a single ELF while the host
+  // page is larger than the guest's. PT_LOADs ascend and never overlap in bytes,
+  // but at 64K two of them routinely share a host page -- a small dynamic
+  // executable's four segments all land inside one. HostMappedEnd is the end of
+  // the host span already materialised for this ELF (so the next segment neither
+  // re-maps nor re-zeroes it) and HostTailProt is the protection currently
+  // installed on that span's last host page (so the shared page can take the
+  // union of both segments' protections rather than the later one alone).
+  uintptr_t HostMappedEnd {};
+  int HostTailProt {};
+
+  // The anon+pread emulation of one PT_LOAD, used when `addr` or `off` is not
+  // host-page aligned. Design Part 2 section 3.
+  bool MapFileFallback(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, uintptr_t addr, size_t size, uint64_t off, int prot,
+                       FEX::HLE::SyscallMmapInterface* const Handler, FEXCore::Core::InternalThreadState* Thread) {
+    const uintptr_t HostStart = FEXCore::HostPage::AlignDown(addr);
+    const uintptr_t HostEnd = FEXCore::HostPage::AlignUp(addr + size);
+
+    // Only materialise what a previous segment of this same ELF has not already
+    // established. Re-mapping the shared page would throw away its contents.
+    const uintptr_t MapStart = std::max(HostStart, HostMappedEnd);
+    if (MapStart < HostEnd) {
+      void* rv = Handler->GuestMmap(Thread, (void*)MapStart, HostEnd - MapStart, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      if (FEX::HLE::HasSyscallError(rv)) {
+        LogMan::Msg::EFmt("MapFile: host-granular fallback reservation failed @ {:x}, {}\n", MapStart, errno);
+        return false;
+      }
+    }
+
+    // The shared first host page may already carry a read-only protection from
+    // the previous segment; open a write window over it for the pread.
+    const uintptr_t OverlapEnd = std::min(HostEnd, HostMappedEnd);
+    if (HostStart < OverlapEnd) {
+      Handler->GuestMprotect(Thread, (void*)HostStart, OverlapEnd - HostStart, PROT_READ | PROT_WRITE);
+    }
+
+    // Read the segment at its exact file offset. Going through p_offset/p_filesz
+    // rather than the page-rounded (off, size) sidesteps the 4K congruence
+    // entirely and never reads bytes the segment does not own.
+    const uintptr_t FileEnd = Base + Header.p_vaddr + Header.p_filesz;
+    if (Header.p_filesz && !FEX::HostPageMapping::ReadFully(file.fd, (void*)(Base + Header.p_vaddr), Header.p_filesz, Header.p_offset)) {
+      LogMan::Msg::EFmt("MapFile: pread of PT_LOAD failed, {}, fd: {}\n", errno, file.fd);
+      return false;
+    }
+
+    // A real file mapping gets the tail of its last page zeroed by the kernel;
+    // pread does not. BSS frequently starts inside this tail.
+    if (FileEnd < HostEnd) {
+      memset((void*)FileEnd, 0, HostEnd - FileEnd);
+    }
+
+    // Install the requested protection at host granularity, unioning with the
+    // previous segment's on the page they share. Union is the permissive tier:
+    // nothing the guest believes accessible may fault for granularity reasons.
+    if (HostStart < OverlapEnd) {
+      Handler->GuestMprotect(Thread, (void*)HostStart, OverlapEnd - HostStart, prot | HostTailProt);
+    }
+    if (OverlapEnd < HostEnd) {
+      Handler->GuestMprotect(Thread, (void*)OverlapEnd, HostEnd - OverlapEnd, prot);
+    }
+
+    const uintptr_t LastHostPage = HostEnd - FEXCore::HostPage::Size();
+    HostTailProt = (LastHostPage < OverlapEnd) ? (prot | HostTailProt) : prot;
+    HostMappedEnd = HostEnd;
+    return true;
   }
 
   bool MapFile(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, int prot, int flags,
@@ -105,21 +181,44 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       return true;
     }
 
-    void* rv = Handler->GuestMmap(Thread, (void*)addr, size, prot, flags, file.fd, off);
-
-    if (FEX::HLE::HasSyscallError(rv)) {
-      // uhoh, something went wrong
-      LogMan::Msg::EFmt("MapFile: Some elf mapping failed, {}, fd: {}\n", errno, file.fd);
-      return false;
+    void* rv;
+    if (FEX::HostPageMapping::RequiresFallback(addr, off, flags | MAP_FIXED, file.fd)) {
+      if (!MapFileFallback(file, Base, Header, addr, size, off, prot, Handler, Thread)) {
+        return false;
+      }
+      rv = (void*)addr;
     } else {
-      char Tmp[PATH_MAX];
-      auto PathLength = FEX::get_fdpath(file.fd, Tmp);
-      if (PathLength != -1) {
-        Sections.push_back({Base, (uintptr_t)rv, size, (off_t)off, fextl::string(Tmp, PathLength), (prot & PROT_EXEC) != 0});
+      // 64K: ask for the host-rounded length even though  is guest-rounded.
+      // The kernel maps whole host pages regardless; making that explicit keeps the
+      // tracked VMA the same shape as the real mapping, so a later segment sharing
+      // the last host page can mprotect it without straddling a tracking boundary.
+      const size_t MapLength = FEXCore::HostPage::MatchesGuest() ? size : FEXCore::HostPage::AlignUp(addr + size) - addr;
+      rv = Handler->GuestMmap(Thread, (void*)addr, MapLength, prot, flags, file.fd, off);
+
+      if (FEX::HLE::HasSyscallError(rv)) {
+        // uhoh, something went wrong
+        LogMan::Msg::EFmt("MapFile: Some elf mapping failed, {}, fd: {}\n", errno, file.fd);
+        return false;
       }
 
-      return true;
+      if (!FEXCore::HostPage::MatchesGuest()) {
+        // The kernel mapped whole host pages even though `size` is guest-rounded.
+        // Record that so the next segment (and the BSS map below) start past them
+        // instead of unmapping the tail of this one.
+        HostMappedEnd = (uintptr_t)rv + MapLength;
+        HostTailProt = prot;
+      }
     }
+
+    char Tmp[PATH_MAX];
+    auto PathLength = FEX::get_fdpath(file.fd, Tmp);
+    if (PathLength != -1) {
+      // Guest-visible address, size and file offset in both paths: /proc fiction
+      // and the code-cache file identity must not be able to tell which one ran.
+      Sections.push_back({Base, (uintptr_t)rv, size, (off_t)off, fextl::string(Tmp, PathLength), (prot & PROT_EXEC) != 0});
+    }
+
+    return true;
   }
 
   int MapFlags(const Elf64_Phdr& Header) {
@@ -145,6 +244,9 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
     uintptr_t LoadBase = 0;
     uintptr_t BrkLoadBase = 0;
+    // 64K: the shared-host-page bookkeeping is per-ELF (main ELF, then interpreter).
+    HostMappedEnd = 0;
+    HostTailProt = 0;
     const bool DynELF = Elf.ehdr.e_type == ET_DYN;
     const bool NeedsLateBRKMap = BrkBase && !DynELF;
 
@@ -186,12 +288,37 @@ class ELFCodeLoader final : public FEX::CodeLoader {
           memset((void*)BSSStart, 0, BSSPageStart - BSSStart);
         }
 
-        if (BSSPageStart != BSSPageEnd) {
-          auto bss = Handler->GuestMmap(Thread, (void*)BSSPageStart, BSSPageEnd - BSSPageStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
-          if (FEX::HLE::HasSyscallError(bss)) {
-            LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
-            return {};
+        if (FEXCore::HostPage::MatchesGuest()) {
+          if (BSSPageStart != BSSPageEnd) {
+            auto bss = Handler->GuestMmap(Thread, (void*)BSSPageStart, BSSPageEnd - BSSPageStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
+            if (FEX::HLE::HasSyscallError(bss)) {
+              LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
+              return {};
+            }
           }
+        } else {
+          // 64K: BSSPageStart is only 4K-aligned, so a MAP_FIXED anonymous map there
+          // is rejected outright -- and the host pages up to HostMappedEnd are
+          // already mapped and already zero (the kernel zeroed the tail of a real
+          // mapping, MapFileFallback memset it for a pread'd one). Only map what
+          // lies beyond them.
+          const uintptr_t AnonStart = std::max<uintptr_t>(HostMappedEnd, FEXCore::HostPage::AlignUp(BSSStart));
+          const uintptr_t AnonEnd = FEXCore::HostPage::AlignUp(BSSPageEnd);
+          if (AnonStart < AnonEnd) {
+            auto bss = Handler->GuestMmap(Thread, (void*)AnonStart, AnonEnd - AnonStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
+            if (FEX::HLE::HasSyscallError(bss)) {
+              LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
+              return {};
+            }
+            HostTailProt = MapProt;
+          } else if (HostMappedEnd > FEXCore::HostPage::AlignDown(BSSPageEnd)) {
+            // The whole BSS lives inside an already-mapped host page. It still has
+            // to be writable, which the file segment's protection may not be.
+            Handler->GuestMprotect(Thread, (void*)FEXCore::HostPage::AlignDown(BSSStart),
+                                   FEXCore::HostPage::AlignUp(BSSPageEnd) - FEXCore::HostPage::AlignDown(BSSStart), MapProt | HostTailProt);
+            HostTailProt |= MapProt;
+          }
+          HostMappedEnd = std::max(HostMappedEnd, AnonEnd);
         }
       }
 
