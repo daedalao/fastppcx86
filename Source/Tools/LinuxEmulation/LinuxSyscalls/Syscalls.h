@@ -595,7 +595,7 @@ public:
 
   void MarkSMCDeferredDirtyRange(uint64_t Base, uint64_t Top) {
     std::lock_guard lk {SMCDeferredDirtyMutex};
-    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
       SMCDeferredDirtyPages.insert(Page);
     }
     SMCDeferredDirtyCount.store(SMCDeferredDirtyPages.size(), std::memory_order_release);
@@ -646,7 +646,7 @@ public:
   uint64_t MarkSMCImmutableSkippedRange(uint64_t Base, uint64_t Top) {
     std::lock_guard lk {SMCImmutableSkippedMutex};
     uint64_t Added {};
-    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
       Added += SMCImmutableSkippedPages.insert(Page).second ? 1 : 0;
     }
     SMCImmutableSkippedCount.store(SMCImmutableSkippedPages.size(), std::memory_order_release);

@@ -180,7 +180,7 @@ void ThreadManager::StatAlloc::Initialize() {
     return;
   }
   CurrentSize = sysconf(_SC_PAGESIZE);
-  CurrentSize = CurrentSize > 0 ? CurrentSize : FEXCore::Utils::FEX_PAGE_SIZE;
+  CurrentSize = CurrentSize > 0 ? CurrentSize : static_cast<long>(FEXCore::HostPage::Size());
 
   if (ftruncate(fd, CurrentSize) == -1) {
     LogMan::Msg::EFmt("[StatAlloc] ftruncate failed");

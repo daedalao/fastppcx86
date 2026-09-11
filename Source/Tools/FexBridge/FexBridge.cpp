@@ -505,7 +505,10 @@ struct BridgeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public 
     // a PROT_NONE guard page readable), and one syscall per compiled block
     // page is noise against the compile itself.  NX stays unenforced:
     // readable data is still "executable", exactly as before.
-    const uint64_t PageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    // GUEST: this probes whether the *guest* page containing Address is readable, and
+    // the guest's page is 4K. A finer granule than the host's is always safe here: the
+    // probed base still lies inside the containing host page.
+    const uint64_t PageSize = FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
     const uint64_t Page = Address & ~(PageSize - 1);
     uint8_t Probe;
     struct iovec Local {&Probe, 1};
@@ -619,7 +622,7 @@ void ProbeAndEnable() {
   if (!HWTSOEnabled() || !TSOEnabledOpt()) {
     return;
   }
-  void* Probe = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* Probe = ::mmap(nullptr, FEXCore::HostPage::Size(), PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (Probe == MAP_FAILED) {
     fprintf(stderr,
             "fexbridge: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
@@ -629,7 +632,7 @@ void ProbeAndEnable() {
   }
   // Touch it so an accept-then-fault setup dies here, at init, not in-guest.
   *static_cast<volatile uint32_t*>(Probe) = 1;
-  ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+  ::munmap(Probe, FEXCore::HostPage::Size());
   const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
   Strict = StrictEnv && StrictEnv[0] == '1';
   Live.store(true, std::memory_order_release);
@@ -1204,6 +1207,9 @@ void fexbridge_set_log_handler(fexbridge_log_fn cb) {
 }
 
 static int process_init_common(bool Is64, uint64_t ExitPage) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   if (Initialized) {
     if (GuestIs64 != Is64) {
       EmitLog(0, Is64 ? "fexbridge: process already initialized 32-bit; 64-bit init refused" :
@@ -1218,7 +1224,9 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // memory manager can place a low page without racing whatever else owns
   // that range -- so the caller provides it, already filled with hlt and
   // executable.  Checked before any FEX state exists so a refusal is clean.
-  if (!Is64 && (!ExitPage || (ExitPage >> 32) || ((ExitPage + FEXCore::Utils::FEX_PAGE_SIZE - 1) >> 32))) {
+  // GUEST: the exit page lives in the 32-bit guest's own address space and the caller
+  // (Wine) sizes it in guest pages.
+  if (!Is64 && (!ExitPage || (ExitPage >> 32) || ((ExitPage + FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1) >> 32))) {
     EmitLog(0, "fexbridge: 32-bit init needs a caller-provided exit page below 4 GiB");
     return -4;
   }

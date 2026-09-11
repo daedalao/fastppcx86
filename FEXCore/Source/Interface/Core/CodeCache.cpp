@@ -1159,14 +1159,20 @@ bool CodeCache::SaveData(Core::InternalThreadState&, int fd, const ExecutableFil
     return false;
   }
 
-  // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load
+  // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load.
+  // GUEST (i.e. a fixed 4096) deliberately: this is an ON-DISK FORMAT quantity and must
+  // not vary with the host page size, or a cache written on one kernel is unreadable on
+  // the other.
+  // 64K-TODO(S3/S7): design section 7 wants the pad widened to a fixed 64K worst case and the
+  // host page size folded into the cache identity hash, so caches stay portable in the
+  // direction that matters (a 64K-padded cache loads fine on a 4K host).
   char Zero[64] {};
   auto Off = lseek(fd, 0, SEEK_CUR);
   if (Off < 0) {
     return false;
   }
-  while (Off != AlignUp(Off, Utils::FEX_PAGE_SIZE)) {
-    auto BytesToWrite = std::min(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off, sizeof(Zero));
+  while (Off != AlignUp(Off, Utils::FEX_GUEST_PAGE_SIZE)) {
+    auto BytesToWrite = std::min(AlignUp(Off, Utils::FEX_GUEST_PAGE_SIZE) - Off, sizeof(Zero));
     if (!WriteAll(fd, Zero, BytesToWrite)) {
       return false;
     }
@@ -1414,8 +1420,9 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   // the file offset. The padding itself has to be inside the file: a cache
   // truncated in the middle of that pad would otherwise put the cursor past the
   // end of the mapping before the code buffer read even gets a chance to check.
+  // GUEST: must match the on-disk pad written by SaveData above, which is a fixed 4096.
   const uint64_t PageAlignPadding =
-    AlignUp(reinterpret_cast<uintptr_t>(MappedCacheFile), Utils::FEX_PAGE_SIZE) - reinterpret_cast<uintptr_t>(MappedCacheFile);
+    AlignUp(reinterpret_cast<uintptr_t>(MappedCacheFile), Utils::FEX_GUEST_PAGE_SIZE) - reinterpret_cast<uintptr_t>(MappedCacheFile);
   if (PageAlignPadding > Remaining()) {
     return RejectTruncated("the page alignment padding before the code buffer", PageAlignPadding);
   }
@@ -1439,8 +1446,11 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   }
 
   auto CodeBuffer = CTX.GetLatest();
-  LOGMAN_THROW_A_FMT(reinterpret_cast<uintptr_t>(CodeBuffer->Ptr) % 0x1000 == 0, "Expected CodeBuffer base to be page-aligned");
-  const auto Delta = AlignUp(CTX.LatestOffset, 0x1000) - CTX.LatestOffset;
+  // HOST: the code buffer comes from VirtualAlloc, so its base is host-page aligned.
+  LOGMAN_THROW_A_FMT(reinterpret_cast<uintptr_t>(CodeBuffer->Ptr) % FEXCore::HostPage::Size() == 0,
+                     "Expected CodeBuffer base to be host-page-aligned");
+  // GUEST (fixed 4096): keeps the destination congruent with the 4K on-disk pad above.
+  const auto Delta = AlignUp(CTX.LatestOffset, Utils::FEX_GUEST_PAGE_SIZE) - CTX.LatestOffset;
   CTX.LatestOffset += Delta;
 
   while (CTX.LatestOffset + header.CodeBufferSize > CodeBuffer->UsableSize()) {
@@ -1686,8 +1696,8 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       // page as code. Conservative in the safe direction -- cache-loaded pages
       // simply never take the store-emulation fast path, exactly as they do
       // today.
-      if (LookupCache.AddBlockExecutableRange(Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, WriteLock)) {
-        CTX.SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      if (LookupCache.AddBlockExecutableRange(Entrypoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, WriteLock)) {
+        CTX.SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       }
     }
   }

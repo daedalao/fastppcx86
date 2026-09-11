@@ -1770,9 +1770,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       // before MarkGuestExecutableRange below arms the page's write protection
       // -- see the ordering argument in Interface/Core/SMCCodeGranules.h.
       const bool NewPage =
-        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, StartAddr, Length);
+        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, StartAddr, Length);
       if (NewPage) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       }
       if (SMCAuditCompileFD() >= 0) {
         dprintf(SMCAuditCompileFD(), "compile rip=%lx page=%lx newpage=%d nentry=%zu\n", GuestRIP, CodePage, NewPage ? 1 : 0,
@@ -1795,11 +1795,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     // harmless here (the bridge runs SMCCHECKS=0) and correct in general:
     // the page really does hold code the guest can execute.
     fextl::set<uint64_t> Entrypoints {GuestRIP};
-    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE - 1);
+    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1);
     CodePages.push_back(Page);
-    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_PAGE_SIZE, GuestRIP, 1);
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, GuestRIP, 1);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 
@@ -1943,9 +1943,9 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     // to retain a block without one), so this is granule-precise, and it lands
     // before MarkGuestExecutableRange re-arms the protection.
     const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(
-      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
+      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 

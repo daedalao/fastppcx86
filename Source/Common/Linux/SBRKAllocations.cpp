@@ -27,9 +27,12 @@ void* DisableSBRKAllocations() {
   // Now allocate the next page after the sbrk address to ensure it can't grow.
   // In most cases at the start of `main` this will already be page aligned, which means subsequent `sbrk`
   // calls won't allocate any memory through that.
-  void* AlignedBRK = reinterpret_cast<void*>(FEXCore::AlignUp(reinterpret_cast<uintptr_t>(StartingSBRK), FEXCore::Utils::FEX_PAGE_SIZE));
+  // HOST: MAP_FIXED_NOREPLACE demands a host-page-aligned hint. This runs on the first
+  // line of main, before the page-size gate, so HostPage's lazy self-initialisation is
+  // what makes it correct here.
+  void* AlignedBRK = reinterpret_cast<void*>(FEXCore::HostPage::AlignUp(reinterpret_cast<uintptr_t>(StartingSBRK)));
   void* AfterBRK =
-    ::mmap(AlignedBRK, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+    ::mmap(AlignedBRK, FEXCore::HostPage::Size(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
   if (AfterBRK == INVALID_PTR) {
     // Couldn't allocate the page after the aligned brk? This should never happen.
     // FEXCore::LogMan isn't configured yet so we just need to print the message.
@@ -52,7 +55,7 @@ void* DisableSBRKAllocations() {
 void ReenableSBRKAllocations(void* Ptr) {
   const void* INVALID_PTR = reinterpret_cast<void*>(~0ULL);
   if (Ptr != INVALID_PTR) {
-    munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
+    munmap(Ptr, FEXCore::HostPage::Size());
   }
 }
 } // namespace FEX::SBRKAllocations

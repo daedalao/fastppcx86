@@ -1032,6 +1032,9 @@ void T5_FaultRecovery() {
 } // namespace
 
 int main(int argc, char** argv) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
 

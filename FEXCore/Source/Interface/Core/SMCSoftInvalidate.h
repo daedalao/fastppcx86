@@ -171,7 +171,7 @@ inline uint64_t HashGuestBlock(const fextl::vector<uint64_t>& CodePages, uint64_
   uint64_t Hash = Length;
 
   for (uint64_t Page : CodePages) {
-    const uint64_t PageEnd = Page + FEXCore::Utils::FEX_PAGE_SIZE;
+    const uint64_t PageEnd = Page + FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
     const uint64_t ChunkStart = std::max(Page, Start);
     const uint64_t ChunkEnd = std::min(PageEnd, End);
     if (ChunkStart >= ChunkEnd) {

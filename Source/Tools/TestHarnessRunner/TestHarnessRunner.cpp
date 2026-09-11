@@ -189,6 +189,9 @@ void RegisterLongJumpHandler(FEX::DummyHandlers::DummySignalDelegator* Handler) 
 } // namespace LongJumpHandler
 
 int main(int argc, char** argv, char** const envp) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
 #ifndef _WIN32
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
 #endif
@@ -239,7 +242,7 @@ int main(int argc, char** argv, char** const envp) {
   if (!Loader.Is64BitMode()) {
     // Setup our userspace allocator
     const auto PageSize = sysconf(_SC_PAGESIZE);
-    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::HostPage::Size());
     Allocator = FEX::HLE::CreatePassthroughAllocator();
   }
 #endif

@@ -930,8 +930,11 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
         LogMan::Msg::EFmt("  {} {:#x}: <out of range>", label, addr);
         return;
       }
-      uint64_t page = addr & ~0xFFFULL;
-      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) != 0) {
+      // HOST: msync demands host-page alignment; a 4K-masked address reports
+      // "<unmapped>" for everything on a 64K kernel, i.e. it breaks exactly the
+      // diagnostics you need while bringing the port up.
+      uint64_t page = FEXCore::HostPage::AlignDown(addr);
+      if (msync(reinterpret_cast<void*>(page), FEXCore::HostPage::Size(), MS_ASYNC) != 0) {
         LogMan::Msg::EFmt("  {} {:#x}: <unmapped>", label, addr);
         return;
       }
@@ -951,8 +954,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     // Stack walk via RBP -- the guest RBP often survives RSP corruption.
     uint64_t rbp = S.gregs[FEXCore::X86State::REG_RBP];
     if (rbp >= 0x1000ULL && rbp <= 0x00007FFFFFFFFFFFULL) {
-      uint64_t page = rbp & ~0xFFFULL;
-      if (msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) == 0) {
+      // HOST: see dump_guest above.
+      uint64_t page = FEXCore::HostPage::AlignDown(rbp);
+      if (msync(reinterpret_cast<void*>(page), FEXCore::HostPage::Size(), MS_ASYNC) == 0) {
         const uint64_t* fp = reinterpret_cast<const uint64_t*>(rbp);
         LogMan::Msg::EFmt("  RBP frame: saved_RBP={:#x} return_RIP={:#x}",
                           fp[0], fp[1]);
@@ -1258,7 +1262,7 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* 
 
 #ifdef ARCHITECTURE_arm64
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr >= reinterpret_cast<void*>(Thread->JITGuardPage) &&
-      SigInfo.si_addr < reinterpret_cast<void*>(Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE)) {
+      SigInfo.si_addr < reinterpret_cast<void*>(Thread->JITGuardPage + FEXCore::HostPage::Size())) {
     FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument,
                                                     ArchHelpers::Context::GetArmGPRs(UContext), ArchHelpers::Context::GetArmFPRs(UContext),
                                                     ArchHelpers::Context::GetArmPc(UContext));

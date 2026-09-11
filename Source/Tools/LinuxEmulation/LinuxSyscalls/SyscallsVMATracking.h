@@ -255,7 +255,7 @@ struct VMATracking {
 
 private:
   static size_t MarkNoOpIndex(uint64_t PageBase) {
-    return (PageBase >> FEXCore::Utils::FEX_PAGE_SHIFT) & (MarkNoOpEntries - 1);
+    return (PageBase >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) & (MarkNoOpEntries - 1);
   }
 
   // Builds the table word for (PageBase, Gen). Fails (returns false, meaning
@@ -263,7 +263,7 @@ private:
   // only happen for guest addresses far beyond TASK_MAX_64BIT. Bailing out is
   // always safe: it just forces the locked slow path.
   static bool EncodeMarkNoOp(uint64_t PageBase, uint64_t Gen, uint64_t& Entry) {
-    const uint64_t Tag = (PageBase >> FEXCore::Utils::FEX_PAGE_SHIFT) >> MarkNoOpIndexBits;
+    const uint64_t Tag = (PageBase >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) >> MarkNoOpIndexBits;
     if (Tag >> (64 - MarkNoOpGenBits)) [[unlikely]] {
       return false;
     }

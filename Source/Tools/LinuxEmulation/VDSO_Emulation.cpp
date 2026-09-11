@@ -139,7 +139,9 @@ namespace x64 {
         // Special case querying for flags
         // Since this is the syscall implementation, we need to return valid but unused data.
         // This will cause glibc to allocate a page of memory, but it ends up being unused.
-        args->opaque_state->size_of_opaque_state = FEXCore::Utils::FEX_PAGE_SIZE;
+        // GUEST: this size is handed to guest glibc, which mmaps it through the guest
+        // mmap path. It is a guest-visible allocation size, not a host mapping length.
+        args->opaque_state->size_of_opaque_state = FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
         args->opaque_state->mmap_prot = PROT_NONE;
         args->opaque_state->mmap_flags = MAP_NORESERVE | MAP_ANONYMOUS | MAP_PRIVATE;
         args->rv = 0;
@@ -813,7 +815,7 @@ void LoadFEXGeneratedCode(FEXCore::Core::InternalThreadState* Thread, bool Is64B
 
   // Hardcoded to one page for now
   auto PageSize = sysconf(_SC_PAGESIZE);
-  PageSize = PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE;
+  PageSize = PageSize > 0 ? PageSize : static_cast<long>(FEXCore::HostPage::Size());
   Mapping->X86GeneratedCodeSize = PageSize;
 
   if (Is64Bit) {
@@ -923,7 +925,10 @@ VDSOMapping LoadVDSOThunks(FEXCore::Core::InternalThreadState* Thread, bool Is64
     if (Mapping.VDSOSize >= std::min(sizeof(Elf32_Ehdr), sizeof(Elf64_Ehdr))) {
       // Reset to beginning
       lseek(VDSOFD, 0, SEEK_SET);
-      Mapping.VDSOSize = FEXCore::AlignUp(Mapping.VDSOSize, FEXCore::Utils::FEX_PAGE_SIZE);
+      // HOST: this length reaches a real file-backed mmap through GuestMmap; the guest
+      // observes the (larger) rounded size, which is legal because a host page is always
+      // a multiple of the guest page.
+      Mapping.VDSOSize = FEXCore::HostPage::AlignUp(Mapping.VDSOSize);
 
       auto VASize = FEXCore::Allocator::DetermineVASize();
       uint64_t VDSOHint {};
@@ -940,7 +945,7 @@ VDSOMapping LoadVDSOThunks(FEXCore::Core::InternalThreadState* Thread, bool Is64
       }
 
       auto PageSize = sysconf(_SC_PAGESIZE);
-      PageSize = PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE;
+      PageSize = PageSize > 0 ? PageSize : static_cast<long>(FEXCore::HostPage::Size());
 
       // Scan top down and try to allocate a location
       void* VDSOPointerBase {};

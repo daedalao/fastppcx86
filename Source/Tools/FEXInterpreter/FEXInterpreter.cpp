@@ -158,7 +158,7 @@ fextl::vector<FEXCore::Allocator::MemoryRegion> InitMemoryRegions(bool Is64Bit) 
   const auto PageSize = sysconf(_SC_PAGESIZE);
   if (Is64Bit) {
     // Destroy the 48th bit if it exists
-    return FEXCore::Allocator::Setup48BitAllocatorIfExists(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    return FEXCore::Allocator::Setup48BitAllocatorIfExists(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
   }
 
   // Reserve [0x1_0000_0000, 0x2_0000_0000).
@@ -175,13 +175,13 @@ fextl::unique_ptr<FEX::HLE::MemAllocator> InitAllocator(bool Is64Bit) {
     // bundled allocator still has to be configured: without this rpmalloc uses
     // its own mapper, ignores FEX's placement hint, and strews its arenas
     // (~45 GiB under Unity) through the guest's address space.
-    FEXCore::Allocator::InitializeAllocator(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    FEXCore::Allocator::InitializeAllocator(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
     return {};
   }
 
 
   // Setup our userspace allocator
-  FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+  FEXCore::Allocator::SetupHooks(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
   // PassthroughAllocator delegates straight to ::mmap, which on PPC64LE
   // (and any host whose default mmap base sits above 4 GiB) returns
   // addresses outside the 32-bit guest address space. glibc i686 then
@@ -536,6 +536,9 @@ static int StealFEXFDFromEnv(const char* Env) {
 }
 
 int main(int argc, char** argv, char** const envp) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
   FEXCore::Allocator::GLIBCScopedFault GLIBFaultScope;
 

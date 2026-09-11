@@ -1244,7 +1244,7 @@ void Decoder::BranchTargetInMultiblockRange() {
   // If the target RIP is x86 code within the symbol ranges then we are golden
   // Forbid distant branches to have the cost code better match the guest code layout, avoiding massive (range-wise) code
   // blocks in highly fragmented guest code. Such branches are often not-taken branches to garbage in obfuscated code.
-  constexpr uint64_t MAX_FORWARD_BRANCH_DIST = FEXCore::Utils::FEX_PAGE_SIZE * 4;
+  constexpr uint64_t MAX_FORWARD_BRANCH_DIST = FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 4;
   bool ValidMultiblockMember = TargetRIP >= EntryPoint && TargetRIP < std::min(InstEnd + MAX_FORWARD_BRANCH_DIST, SectionMaxAddress);
 
 #ifdef ARCHITECTURE_arm64ec
@@ -1480,7 +1480,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   // Two changes. It is disabled by default, because it exists to test one
   // specific stale-compile hypothesis and should not sit on every compile. And
   // when enabled it stops at the page boundary, so it can never reach into an
-  // unmapped neighbour. Uses FEXCore::Utils::FEX_PAGE_SIZE so the clamp tracks
+  // unmapped neighbour. Uses FEXCore::Utils::FEX_GUEST_PAGE_SIZE so the clamp tracks
   // the guest page granularity.
   if constexpr (kEnableCompileByteLog) {
     constexpr uint64_t kLogBytes = sizeof(g_compile_log[0].bytes);
@@ -1496,7 +1496,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
       // Bytes remaining in the page that holds the first byte. Never zero, so
       // we always capture at least one byte when the stream is non-null.
       const uint64_t Base = reinterpret_cast<uint64_t>(_InstStream);
-      const uint64_t InPage = FEXCore::Utils::FEX_PAGE_SIZE - (Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1));
+      const uint64_t InPage = FEXCore::Utils::FEX_GUEST_PAGE_SIZE - (Base & (FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1));
       const uint64_t Count = InPage < kLogBytes ? InPage : kLogBytes;
       for (uint64_t b = 0; b < Count; ++b) {
         g_compile_log[idx].bytes[b] = _InstStream[b];
@@ -1543,7 +1543,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   // Entry is a jump target
   BlocksToDecode = {PC};
 
-  uint64_t CurrentCodePage = PC & FEXCore::Utils::FEX_PAGE_MASK;
+  uint64_t CurrentCodePage = PC & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
 
   BlockInfo.CodePages = {CurrentCodePage};
 
@@ -1610,8 +1610,8 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
       auto OpAddress = RIPToDecode + PCOffset;
       auto OpMaxAddress = OpAddress + MAX_INST_SIZE;
 
-      auto OpMinPage = OpAddress & FEXCore::Utils::FEX_PAGE_MASK;
-      auto OpMaxPage = OpMaxAddress & FEXCore::Utils::FEX_PAGE_MASK;
+      auto OpMinPage = OpAddress & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+      auto OpMaxPage = OpMaxAddress & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
 
       if (!EntryBlock && OpMinPage == OpMaxPage && PeekByte(0).value_or(0) == 0 && PeekByte(1).value_or(0) == 0) [[unlikely]] {
         // End the multiblock early if we hit 2 consecutive null bytes (add [rax], al) in the same page with the
