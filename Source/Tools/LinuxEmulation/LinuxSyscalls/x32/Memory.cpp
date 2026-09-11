@@ -75,6 +75,10 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL_X32(
     mremap, [](FEXCore::Core::CpuStateFrame* Frame, void* old_address, size_t old_size, size_t new_size, int flags, void* new_address) -> uint64_t {
+      uint64_t Emulated {};
+      if (FEX::HLE::Granule::Mremap(Frame->Thread, false, old_address, old_size, new_size, flags, new_address, &Emulated)) {
+        return Emulated;
+      }
       return FEX::HLE::_SyscallHandler->GuestMremap(false, Frame->Thread, old_address, old_size, new_size, flags, new_address);
     });
 

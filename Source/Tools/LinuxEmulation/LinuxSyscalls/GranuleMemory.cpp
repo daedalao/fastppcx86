@@ -30,6 +30,10 @@ namespace {
   constexpr uint64_t GuestPageSize = FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
   constexpr uint64_t GuestPageMask = FEXCore::Utils::FEX_GUEST_PAGE_MASK;
 
+  // Linux spells these in <linux/mman.h>, which we do not include here.
+  constexpr int FEX_MREMAP_MAYMOVE = 1;
+  constexpr int FEX_MREMAP_FIXED = 2;
+  constexpr int FEX_MREMAP_DONTUNMAP = 4;
 
   bool HostAligned(uint64_t Value) {
     return FEXCore::HostPage::IsAligned(Value);
@@ -52,6 +56,7 @@ namespace {
 
   std::atomic<bool> LoggedSharedMmap {false};
   std::atomic<bool> LoggedSharedConvert {false};
+  std::atomic<bool> LoggedMremapCorner {false};
 
   struct Handler {
     static FEX::HLE::SyscallHandler* Get() {
@@ -522,6 +527,95 @@ bool Mprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len
 
   Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, Size);
   *Result = 0;
+  return true;
+}
+
+bool Mremap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* old_address, size_t old_size, size_t new_size, int flags,
+            void* new_address, uint64_t* Result) {
+  if (!Active() || !new_size) {
+    return false;
+  }
+
+  const uint64_t OldBase = reinterpret_cast<uint64_t>(old_address);
+  const uint64_t OldSize = FEXCore::AlignUp(old_size, GuestPageSize);
+  const uint64_t NewSize = FEXCore::AlignUp(new_size, GuestPageSize);
+  const uint64_t NewBase = reinterpret_cast<uint64_t>(new_address);
+
+  const bool OldRepresentable = HostAligned(OldBase) && (OldSize == 0 || HostAligned(OldSize));
+  const bool NewRepresentable = HostAligned(NewSize);
+  const bool FixedRepresentable = !(flags & FEX_MREMAP_FIXED) || HostAligned(NewBase);
+
+  if (OldRepresentable && NewRepresentable && FixedRepresentable) {
+    // Plain grow/shrink/move on granule boundaries: the kernel does it.
+    return false;
+  }
+
+  // Everything else is decomposed into allocate-copy-free, which is the only
+  // primitive that works when the source and destination disagree about
+  // granules. The corners below cannot be expressed that way at all.
+  if (flags & FEX_MREMAP_DONTUNMAP) {
+    // MREMAP_DONTUNMAP requires the old mapping to survive with its pages
+    // *moved*, which a copy does not do -- the guest would see two independent
+    // copies where the kernel gives it one moved and one zero-filled. No
+    // representation at sub-granule alignment.
+    LogOnce(LoggedMremapCorner, "MREMAP_DONTUNMAP at sub-granule alignment", OldBase, OldSize);
+    *Result = static_cast<uint64_t>(-EINVAL);
+    return true;
+  }
+  if (OldSize == 0) {
+    // old_size == 0 duplicates a MAP_SHARED mapping. Shared, so uncopyable.
+    LogOnce(LoggedMremapCorner, "mremap(old_size=0) of a shared mapping", OldBase, NewSize);
+    *Result = static_cast<uint64_t>(-EINVAL);
+    return true;
+  }
+  if (!(flags & FEX_MREMAP_MAYMOVE)) {
+    // We can only satisfy this by moving, and the guest forbade it.
+    *Result = static_cast<uint64_t>(-ENOMEM);
+    return true;
+  }
+
+  auto* Hndl = Handler::Get();
+  {
+    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback<std::shared_lock>(Hndl->VMATracking.Mutex, Thread);
+    auto VMA = Hndl->VMATracking.FindVMAEntry(OldBase);
+    if (VMA == Hndl->VMATracking.VMAs.end()) {
+      *Result = static_cast<uint64_t>(-EFAULT);
+      return true;
+    }
+    if (VMA->second.Flags.Shared) {
+      LogOnce(LoggedMremapCorner, "mremap of a shared mapping at sub-granule alignment", OldBase, OldSize);
+      *Result = static_cast<uint64_t>(-EINVAL);
+      return true;
+    }
+  }
+
+  // Destination. MREMAP_FIXED at a sub-granule address goes through the granule
+  // mmap path; otherwise let the kernel choose, which gives a host-aligned
+  // (hence 4K-aligned, hence legal) address.
+  const int DestFlags = MAP_PRIVATE | MAP_ANONYMOUS | ((flags & FEX_MREMAP_FIXED) ? MAP_FIXED : 0);
+  void* DestHint = (flags & FEX_MREMAP_FIXED) ? new_address : nullptr;
+  uint64_t Dest {};
+  if (!Mmap(Thread, Is64Bit, DestHint, NewSize, PROT_READ | PROT_WRITE, DestFlags, -1, 0, &Dest)) {
+    Dest = reinterpret_cast<uint64_t>(Hndl->GuestMmap(Thread, DestHint, NewSize, PROT_READ | PROT_WRITE, DestFlags, -1, 0));
+  }
+  if (FEX::HLE::HasSyscallError(Dest)) {
+    *Result = Dest;
+    return true;
+  }
+
+  std::memcpy(reinterpret_cast<void*>(Dest), reinterpret_cast<const void*>(OldBase), std::min(OldSize, NewSize));
+
+  uint64_t Unmapped {};
+  if (!Munmap(Thread, old_address, OldSize, &Unmapped)) {
+    Unmapped = Hndl->GuestMunmap(Thread, old_address, OldSize);
+  }
+  if (FEX::HLE::HasSyscallError(Unmapped)) {
+    LogMan::Msg::EFmt("64K granule emulation: mremap copied [0x{:x}, 0x{:x}) to 0x{:x} but could not free the source: {}", OldBase,
+                      OldBase + OldSize, Dest, -static_cast<int64_t>(Unmapped));
+  }
+
+  Hndl->InvalidateCodeRangeIfNecessaryOnRemap(Thread, OldBase, Dest, OldSize, NewSize);
+  *Result = Dest;
   return true;
 }
 

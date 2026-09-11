@@ -42,6 +42,8 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
           uint64_t* Result);
 bool Munmap(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, uint64_t* Result);
 bool Mprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int prot, uint64_t* Result);
+bool Mremap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* old_address, size_t old_size, size_t new_size, int flags,
+            void* new_address, uint64_t* Result);
 
 ///// Guest-visible reporting (§7) /////
 
