@@ -21,11 +21,13 @@ $end_info$
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <iterator>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace FEX::HLE::Granule {
@@ -158,6 +160,32 @@ namespace {
    * Returns 0 on success or a negative errno.
    * - VMATracking::Mutex must be unique_locked.
    */
+  // Copy a granule's current bytes one guest page at a time through
+  // process_vm_readv rather than a plain memcpy. A file-backed page that lies
+  // beyond the end of its file raises SIGBUS on touch, and a guest loader
+  // produces exactly that: it maps a whole ELF span from the first segment's
+  // file offset (the tail of which is past EOF for any library whose data
+  // segment is not at the end of the file) and then MAP_FIXes the later
+  // segments into that tail at 4K-congruent addresses. Converting such a
+  // granule with memcpy took the SIGBUS on the host side and killed the process
+  // (RimWorld's libmonobdwgc-2.0.so on the 64K kernel). process_vm_readv reports
+  // EFAULT for the unreadable page instead; it then reads as zero, which is
+  // what a fresh anonymous page holds and no worse than the SIGBUS the guest
+  // itself would have taken touching it.
+  void CopyGranuleTolerant(uint8_t* Dest, uint64_t Src, size_t Size) {
+    const pid_t Self = ::getpid();
+    for (size_t Off = 0; Off < Size; Off += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
+      const size_t Chunk = std::min<size_t>(FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Size - Off);
+      struct iovec Local {Dest + Off, Chunk};
+      struct iovec Remote {reinterpret_cast<void*>(Src + Off), Chunk};
+      const ssize_t Got = ::process_vm_readv(Self, &Local, 1, &Remote, 1, 0);
+      const size_t Have = Got > 0 ? static_cast<size_t>(Got) : 0;
+      if (Have < Chunk) {
+        std::memset(Dest + Off + Have, 0, Chunk - Have);
+      }
+    }
+  }
+
   int64_t MakeGranuleFEXBacked(FEX::HLE::VMATracking::VMATracking& Tracking, uint64_t GranuleBase, uint64_t ReplaceBase, uint64_t ReplaceEnd) {
     const uint64_t HostSize = FEXCore::HostPage::Size();
 
@@ -213,7 +241,7 @@ namespace {
         }
       }
       Saved.resize(HostSize);
-      std::memcpy(Saved.data(), reinterpret_cast<const void*>(GranuleBase), HostSize);
+      CopyGranuleTolerant(Saved.data(), GranuleBase, HostSize);
     }
 
     void* Mapped = ::mmap(reinterpret_cast<void*>(GranuleBase), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(PROT_READ | PROT_WRITE),
