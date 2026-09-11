@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "Common/CPUInfo.h"
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/ThreadManager.h"
@@ -920,8 +921,26 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(write, SyscallPassthrough3<SYSCALL_DEF(write)>);
   REGISTER_SYSCALL_IMPL(lseek, SyscallPassthrough3<SYSCALL_DEF(lseek)>);
   REGISTER_SYSCALL_IMPL(sched_yield, SyscallPassthrough0<SYSCALL_DEF(sched_yield)>);
-  REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
-  REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
+  // msync and mincore are guest-4K quantities the raw passthrough gets wrong on
+  // a host with a larger page: mincore sizes its vector by the host page (so it
+  // under-fills the guest's buffer 16x at 64K) and both EINVAL on a 4K-aligned
+  // address. The shims answer from the granule table at guest granularity and
+  // return false -- i.e. take the passthrough below -- on a 4K host and for
+  // every already-representable request. See GranuleMemory.h.
+  REGISTER_SYSCALL_IMPL(msync, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t addr, uint64_t length, uint64_t flags) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Msync(Frame->Thread, reinterpret_cast<void*>(addr), length, static_cast<int>(flags), &Emulated)) {
+      return Emulated;
+    }
+    return SyscallPassthrough3<SYSCALL_DEF(msync)>(Frame, addr, length, flags);
+  });
+  REGISTER_SYSCALL_IMPL(mincore, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t addr, uint64_t length, uint64_t vec) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mincore(Frame->Thread, reinterpret_cast<void*>(addr), length, reinterpret_cast<uint8_t*>(vec), &Emulated)) {
+      return Emulated;
+    }
+    return SyscallPassthrough3<SYSCALL_DEF(mincore)>(Frame, addr, length, vec);
+  });
   REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
   // shmctl needs struct translation (powerpc64 shmid64_ds field order differs
   // from x86); registered in x64/x32 Semaphore.cpp.
