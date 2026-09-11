@@ -11,6 +11,8 @@
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include "LinuxSyscalls/GranuleTable.h"
+
 #include <elf.h>
 
 namespace FEX::HLE::VMATracking {
@@ -105,6 +107,12 @@ struct VMATracking {
 
   // Memory ranges indexed by page aligned starting address
   fextl::map<uint64_t, VMAEntry> VMAs;
+
+  // The 64K-host granule table. Covered by Mutex exactly as VMAs is, and empty
+  // by construction on a 4K host (GranuleTable::Active() is false there and
+  // every path that would populate it short-circuits first). See
+  // GranuleTable.h for the invariant.
+  GranuleTable Granules;
 
   using VMACIterator = decltype(VMAs)::const_iterator;
 
