@@ -194,6 +194,23 @@ private:
     }();
     return Enabled;
   }
+public:
+  // Diagnostic (FEX_LOCKDIAG=1 only): is the write lock currently held by the
+  // calling thread? Used by the signal delegator to report a guest signal
+  // being delivered on top of a locked host frame.
+  bool WriteHeldBySelfDiag() const {
+    return LockDiagEnabled() && AcquirerFrames > 0 && AcquirerTid == static_cast<uint32_t>(::syscall(SYS_gettid));
+  }
+  void ReportAcquirerDiag() const {
+    if (AcquirerFrames > 0) {
+      char Buf[96];
+      const int N = ::snprintf(Buf, sizeof(Buf), "write lock is held by tid %u, acquired here:\n", AcquirerTid);
+      ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+      ::backtrace_symbols_fd(AcquirerBacktrace, AcquirerFrames, STDERR_FILENO);
+    }
+  }
+
+private:
   static constexpr int AcquirerMax = 24;
   void* AcquirerBacktrace[AcquirerMax] {};
   int AcquirerFrames {};

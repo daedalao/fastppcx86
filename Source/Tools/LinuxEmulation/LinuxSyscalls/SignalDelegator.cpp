@@ -990,6 +990,16 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   uint32_t eflags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
 
   if (Is64BitMode) {
+    // FEX_LOCKDIAG=1: a guest handler is about to run on top of this host frame.
+    // If this thread holds VMATracking's write lock here, that lock is leaked.
+    if (FEX::HLE::_SyscallHandler && FEX::HLE::_SyscallHandler->VMATracking.Mutex.WriteHeldBySelfDiag()) [[unlikely]] {
+      char Buf[160];
+      const int N = ::snprintf(Buf, sizeof(Buf),
+                               "FEX: LOCKDIAG guest signal %d (code %d, addr %p, guest rip 0x%llx) delivered while this thread HOLDS the VMA write lock\n",
+                               Signal, HostSigInfo->si_code, HostSigInfo->si_addr, (unsigned long long)Frame->State.rip);
+      ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+      FEX::HLE::_SyscallHandler->VMATracking.Mutex.ReportAcquirerDiag();
+    }
     NewGuestSP = SetupFrame_x64(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
   } else {
     const bool SigInfoFrame = (GuestAction->sa_flags & SA_SIGINFO) == SA_SIGINFO;
