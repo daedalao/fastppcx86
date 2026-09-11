@@ -476,7 +476,11 @@ thread_local BridgeThread* TLSThread {};
 // BridgeThreads): the EC-target cache scrub and this invalidation walk share
 // one list and one lock.
 
-constexpr size_t CALLRET_ALLOC = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
+// HOST: one host page of guard either side; see ThreadManager.cpp for why 4096 here is
+// a crash on the first guest CALL once the host page is larger than 4K.
+static size_t CallRetAllocSize() {
+  return FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::HostPage::Size();
+}
 
 // ---------------------------------------------------------------------------
 // Embedder SyscallHandler: OS_GENERIC trap sink -> caller's trap callback.
@@ -1328,17 +1332,23 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
 
   if (Is64) {
     // One guest-visible HLT used to end runs cooperatively.
-    auto* Page = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // HOST: one host page (the kernel rounds the length up anyway; saying so keeps the
+    // memset and the invalidate below covering exactly what was mapped).
+    const size_t HltPageSize = FEXCore::HostPage::Size();
+    auto* Page = ::mmap(nullptr, HltPageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (Page == MAP_FAILED) {
       EmitLog(0, "fexbridge: HLT page mmap failed");
       return -3;
     }
-    memset(Page, 0xF4 /* hlt */, FEXCore::Utils::FEX_PAGE_SIZE);
+    memset(Page, 0xF4 /* hlt */, HltPageSize);
     HltPageAddr = reinterpret_cast<uint64_t>(Page);
   } else {
     HltPageAddr = ExitPage;
   }
-  fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
+  // GUEST: an invalidation range is a guest-code quantity. The caller-provided 32-bit
+  // exit page is a guest page, and for the 64-bit case invalidating the first 4K of the
+  // host page is all the HLT trampoline occupies.
+  fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   SpinSentinel::InitFromEnv();
   FaultLog::InitFromEnv();
@@ -1521,14 +1531,22 @@ int fexbridge_thread_init(void** thread_out) {
   }
 
   // Call-ret shadow stack, guard pages both sides.
-  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CALLRET_ALLOC, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  const size_t CallRetAlloc = CallRetAllocSize();
+  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CallRetAlloc, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   if (AllocBase == reinterpret_cast<uint64_t>(MAP_FAILED)) {
     CTX->DestroyThread(Thread);
     return -4;
   }
-  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
-  ::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
-  Frame->State.callret_sp = AllocBase + FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::HostPage::Size());
+  // CHECKED: an unchecked EINVAL here leaves the shadow stack PROT_NONE and the first
+  // guest CALL faults with no diagnosis.
+  if (::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE) != 0) {
+    EmitLog(0, "fexbridge: callret shadow stack mprotect failed");
+    ::munmap(reinterpret_cast<void*>(AllocBase), CallRetAlloc);
+    CTX->DestroyThread(Thread);
+    return -4;
+  }
+  Frame->State.callret_sp = AllocBase + FEXCore::HostPage::Size() + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
   // The JIT's shadow CALL push / RET pop (FEX_SHADOWRETSTACK) bounds-check
   // against these two mirrors, not against CallRetStackBase.  Left at zero,
   // every pop reads sp >= end(0) as "empty" (the fast path never fires) and
@@ -1577,7 +1595,7 @@ void fexbridge_thread_term(void* thread) {
     std::erase(BridgeThreads, BT);
   }
   CTX->DestroyThread(BT->Thread);
-  ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
+  ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CallRetAllocSize());
   delete BT->Sentinel;
   delete BT;
 }
@@ -2150,15 +2168,23 @@ int fexbridge_run_entry(void* entry, void* arg, unsigned long long* rax_out, cha
 
   // Guest stack: 8 MiB with a guard page below.
   constexpr size_t StackSize = 8ULL * 1024 * 1024;
-  auto* StackBase = ::mmap(nullptr, StackSize + FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  // HOST: guard page below the stack, host-granular so the mprotect past it is aligned.
+  const size_t GuardSize = FEXCore::HostPage::Size();
+  auto* StackBase = ::mmap(nullptr, StackSize + GuardSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (StackBase == MAP_FAILED) {
     if (OwnThread) {
       fexbridge_thread_term(Thread);
     }
     return Fail("fexbridge_run_entry: stack mmap failed");
   }
-  ::mprotect(reinterpret_cast<uint8_t*>(StackBase) + FEXCore::Utils::FEX_PAGE_SIZE, StackSize, PROT_READ | PROT_WRITE);
-  const uint64_t StackTop = (reinterpret_cast<uint64_t>(StackBase) + FEXCore::Utils::FEX_PAGE_SIZE + StackSize) & ~0xFULL;
+  if (::mprotect(reinterpret_cast<uint8_t*>(StackBase) + GuardSize, StackSize, PROT_READ | PROT_WRITE) != 0) {
+    ::munmap(StackBase, StackSize + GuardSize);
+    if (OwnThread) {
+      fexbridge_thread_term(Thread);
+    }
+    return Fail("fexbridge_run_entry: stack mprotect failed");
+  }
+  const uint64_t StackTop = (reinterpret_cast<uint64_t>(StackBase) + GuardSize + StackSize) & ~0xFULL;
 
   // MS-x64 call frame: caller reserves 32 bytes of shadow space, CALL pushes
   // the return address, so at entry RSP % 16 == 8 and [RSP] is the return
@@ -2187,7 +2213,7 @@ int fexbridge_run_entry(void* entry, void* arg, unsigned long long* rax_out, cha
     Ret = Fail("fexbridge_run_entry: run error %llu", (uint64_t)(int64_t)R);
   }
 
-  ::munmap(StackBase, StackSize + FEXCore::Utils::FEX_PAGE_SIZE);
+  ::munmap(StackBase, StackSize + GuardSize);
   if (OwnThread) {
     fexbridge_thread_term(Thread);
   }

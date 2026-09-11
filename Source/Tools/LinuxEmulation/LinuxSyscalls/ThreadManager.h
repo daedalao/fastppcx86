@@ -181,7 +181,9 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   CallRetStackInfo GetCallRetStackInfo() {
     uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
     // Leave some room from the base for the default location to allow for underflows without constant exceptions
-    return {Base - FEXCore::Utils::FEX_PAGE_SIZE, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::Utils::FEX_PAGE_SIZE,
+    // HOST: mirrors the guard pages placed either side of the callret stack in
+    // ThreadManager.cpp, which are one host page each.
+    return {Base - FEXCore::HostPage::Size(), Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::HostPage::Size(),
             Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
   }
 

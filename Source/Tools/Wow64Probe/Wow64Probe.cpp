@@ -219,7 +219,10 @@ ProbeSignalDelegator* SigDelegator {};
 //   - segment_arrays[] (emulated GDT/LDT)
 //   - callret_sp       (call-return shadow stack pointer)
 // ---------------------------------------------------------------------------
-constexpr size_t CALLRET_ALLOC = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
+// HOST: one host page of guard either side; see ThreadManager.cpp.
+static size_t CallRetAllocSize() {
+  return FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::HostPage::Size();
+}
 
 FEXCore::Core::InternalThreadState* ProbeThreadInit(uint64_t RIP, uint64_t RSP) {
   auto* Thread = CTX->CreateThread(RIP, RSP);
@@ -239,11 +242,13 @@ FEXCore::Core::InternalThreadState* ProbeThreadInit(uint64_t RIP, uint64_t RSP) 
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*GDT);
 
   // --- Call-ret shadow stack, guard pages both sides.
-  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CALLRET_ALLOC, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CallRetAllocSize(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   LOGMAN_THROW_A_FMT(AllocBase != (uint64_t)MAP_FAILED, "callret stack mmap failed");
-  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
-  ::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
-  Frame->State.callret_sp = AllocBase + FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::HostPage::Size());
+  if (::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE) != 0) {
+    ERROR_AND_DIE_FMT("Failed to commit the call-ret shadow stack: {}", strerror(errno));
+  }
+  Frame->State.callret_sp = AllocBase + FEXCore::HostPage::Size() + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
   // Bound mirrors for the JIT's shadow CALL push / RET pop; see the same
   // stores in FexBridge.cpp (fexbridge_thread_init) and ThreadManager.cpp.
   const uint64_t CallRetBase = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
@@ -255,9 +260,9 @@ FEXCore::Core::InternalThreadState* ProbeThreadInit(uint64_t RIP, uint64_t RSP) 
 }
 
 void ProbeThreadTerm(FEXCore::Core::InternalThreadState* Thread) {
-  auto Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase) - FEXCore::Utils::FEX_PAGE_SIZE;
+  auto Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase) - FEXCore::HostPage::Size();
   CTX->DestroyThread(Thread);
-  ::munmap(reinterpret_cast<void*>(Base), CALLRET_ALLOC);
+  ::munmap(reinterpret_cast<void*>(Base), CallRetAllocSize());
 }
 
 // ---------------------------------------------------------------------------
