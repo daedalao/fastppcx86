@@ -109,29 +109,22 @@ inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = M
   }
 
   fextl::fmt::print(stderr,
-                    "FEX: {}: host page size is {}, but FEX's guest contract and several of its own\n"
-                    "mappings still assume {}.\n"
+                    "FEX: {}: host page size is {}; the guest is told AT_PAGESZ={} and this binary\n"
+                    "emulates that contract on top of the larger host page (docs/PAGE_SIZE_64K_EXECUTION.md):\n"
+                    "  * loader, brk, ASLR and the allocators are host-granular (S2/S4a),\n"
+                    "  * guest mmap/mprotect/munmap below the host page go through the granule table\n"
+                    "    in the permissive tier: a granule is mapped/protected as the union of its\n"
+                    "    live guest pages, so a guest cannot rely on a fault inside a shared granule (S4b),\n"
+                    "  * SMC tracking (SMCChecks=mtrack) arms whole host pages and re-arms after a\n"
+                    "    write to a shared granule (S4c).\n"
                     "\n"
-                    "Structurally fixed as of stage S2 of the 64K port (docs/PAGE_SIZE_64K_EXECUTION.md):\n"
-                    "  * the deferred-signal interrupt fault page is an mmap'd host page,\n"
-                    "  * the call-ret shadow stack's guard pages are host-granular,\n"
-                    "  * the JIT code-buffer / pool / alt-stack guards are host-granular,\n"
-                    "  * the 48-bit steal allocator is parameterised on the host page.\n"
+                    "This is tested on the gaming lanes but not proven for every guest; a guest that\n"
+                    "depends on sub-granule faults (GC write barriers, guard pages) may misbehave.\n"
                     "\n"
-                    "NOT yet fixed, and these are what you will hit:\n"
-                    "  * The ELF loader maps PT_LOAD segments at their 4K-congruent file offsets.\n"
-                    "    Host mmap requires the offset to be a multiple of {}, so anything dynamically linked fails\n"
-                    "    to load. Static binaries are fine. (stage S4)\n"
-                    "  * Guest mmap/mprotect/munmap granularity. The guest is told AT_PAGESZ={} and\n"
-                    "    places MAP_FIXED mappings on {}-byte boundaries this host cannot represent.\n"
-                    "    (stage S4, the granule table)\n"
-                    "  * SMC tracking (SMCChecks=mtrack) drives host mprotect at {}-byte granularity.\n"
-                    "    (stage S5)\n"
-                    "\n"
-                    "FEX_HOSTPAGEMODE=abort (default) refuses to start; =degrade continues and forces\n"
-                    "SMCChecks=full; =force continues and forces nothing.\n",
-                    SelectedMode == Mode::Abort ? "FATAL" : "WARNING", HostPageSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, HostPageSize,
-                    FEXCore::Utils::FEX_GUEST_PAGE_SIZE, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+                    "FEX_HOSTPAGEMODE=abort (default) refuses to start; =force continues with the\n"
+                    "configured SMCChecks (recommended: mtrack, the 4K configuration); =degrade\n"
+                    "continues and forces SMCChecks=full, which is several times slower.\n",
+                    SelectedMode == Mode::Abort ? "FATAL" : "WARNING", HostPageSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   switch (SelectedMode) {
   case Mode::Degrade:
