@@ -465,6 +465,33 @@ the wine side. Also found: the 64-bit `Bin/BridgeSmoke` SIGSEGVs on op64k in
 its EC direct-transition leg with the pre-fix emitter too (`FEX_NO_EC_DIRECT=1`
 passes 254/254); never checked on op4k, open.
 
+2026-09-12 afternoon, code cache on 64K (open item 7), now ON by default in
+the `fex` launcher on the 64K boot. Two FEX changes: the host page size joins
+the cache identity hash (no format change was needed, see S3.5 above), and
+the granule layer's emulated mmap/mprotect paths now run the same tail as
+GuestMmap/GuestMprotect (`FinishTrackedMmap` / `FinishTrackedMprotect`).
+Before that, every segment ld.so maps at a 4K file offset took the emulated
+path, which dropped TrackMmap's cacheable section AND its late volatile
+metadata, and its mprotect never ran the delayed-load heuristic; measured
+python3 x3: only the vDSO ever loaded, five libraries re-translated and
+re-written per run. After: run 2 loads libpython (10221 blocks), libc, libm
+and the vDSO, writes nothing. Found on the way, both pre-existing and not
+64K-specific: (a) FEXServer's `RunOfflineCompiler` execs the bare name
+`FEXOfflineCompiler` via execvp, which is never on PATH, so every
+server-side cache generation fails with status -1 -- the server's own log
+prints it and nobody reads that log; (b) FEXOfflineCompiler loads config
+with an EMPTY envp, so its cache id (e.g. `190e75fa222be8b6`) never matches
+the interpreter's (`2187aa67e50f8900` with the same env), and the id also
+folds in the launcher's `FEX_X87REDUCEDPRECISION=1`. The runtime writer
+(`SaveCodeCaches`, scope=all) is the only generator whose id matches its
+reader, and it is the one now in use; leave the server path dead until
+(b) is designed properly (the requesting client's config has to reach the
+generator). Also: `conformance-interfaces-mmap-3-1` fails on 64K because
+the granule layer refuses an unaligned MAP_SHARED file mapping (EINVAL, the
+survey's known refusal); pre-existing, the ld.so and main-executable
+mappings placed by the ELF loader itself are not cache-loaded on either
+kernel.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
