@@ -233,10 +233,11 @@ lands in the same host page as FEX's own image slip through.
 ### Code cache file format
 
 `FEXCore/Source/Interface/Core/CodeCache.cpp:1066-1067` pads the cache file to a
-page boundary *so the code buffer can be `mmap`ed from it on load*. That is a
-host requirement written into an **on-disk format**. Decision: either pad to the
-host page (making caches non-portable between 4K and 64K hosts — the cache id
-would need the host page size hashed in) or pad to a fixed 64K worst case.
+page boundary, originally *so the code buffer could be `mmap`ed from it on load*.
+Resolved 2026-09-12: `LoadData` memcpy's the code buffer out of the mapped file,
+so the pad is a cursor alignment with no host-page requirement and stays a fixed
+4K. The host page size is hashed into the cache identity instead, so 4K and 64K
+kernels keep separate caches.
 
 ### VDSO and vsyscall
 

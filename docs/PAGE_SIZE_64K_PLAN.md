@@ -313,10 +313,10 @@ from a protection it set on a sub-granule range will not get one:
   host.** Today's host passthrough is already wrong on 4K (audit noted it);
   the 64K port makes it load-bearing because sub-granule munmap holes exist
   only in the table. Wine reads maps at startup.
-- Code cache (NCS): pad sections to a fixed 64K worst case (≤60K/section,
-  cheap) and fold the host page size into the cache identity hash — caches
-  then stay portable in the only direction that matters (a 64K-padded cache
-  loads fine on 4K).
+- Code cache (NCS): fold the host page size into the cache identity hash.
+  (Landed 2026-09-12. The padding half of the original item was withdrawn:
+  the loader memcpy's the code buffer out of the mapped file, so the 4K
+  on-disk pad is a cursor alignment, not a host mapping requirement.)
 
 ### 8. Phasing, with completion criteria
 

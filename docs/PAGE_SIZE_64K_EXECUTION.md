@@ -202,9 +202,15 @@ Dynamic binaries still fail in the loader; that is S4.
    `0x1000`/`4096` literals that mean the host page.
 4. Native `dxvk-ppc64le` and `vkd3d-proton` builds: grep-audit only; they do
    not mmap.
-5. NCS code cache: disabled on 64K until the cache format pads to 64K and
-   the identity hash includes the host page size (design §7). On 64K the
-   loss is the first-run compile cost, nothing else.
+5. NCS code cache: DONE 2026-09-12. Reading the loader settled the format
+   question: the code buffer is memcpy'd out of the mmap'ed cache file, so the
+   4K on-disk pad is only a cursor alignment and needs no widening; the JIT
+   emits nothing that depends on the host page. The host page size is folded
+   into the cache identity hash anyway (design §7's other half), so the two
+   kernels keep separate cache namespaces. Enabled by default on 64K in the
+   `fex` launcher (`FEX_ENABLECODECACHINGWIP=1`, `FEX_CODECACHESCOPE=all`,
+   both overridable); the 4K default stays off per the 08-10 launch-time
+   verdict.
 
 Verification: `wineboot` in a fresh prefix on 64K, `notepad`, then the W3 nw
 row (save-load 3/3, the 09-04 TLSF lock row) and the CP2077 nw row with
@@ -435,7 +441,7 @@ and wire `SetSMCOverlay`/`GranuleFullyBacked` between S4b and S4c; (4) HWTSO
 SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
 op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
-exists; (7) NCS code cache stays off on 64K until the cache pads to 64K; (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).
+exists; (7) DONE 09-12: NCS code cache on 64K (host page in the identity hash, no format change needed, launcher default on); (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).
 
 2026-09-12, Portal 2: the "wow64 SEH storm" every 64K run died in was not
 64K, WoW64 or ntsync. Every fault was at a guest register + 0xF3000000:
