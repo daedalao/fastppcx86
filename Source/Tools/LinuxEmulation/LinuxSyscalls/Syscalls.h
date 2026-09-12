@@ -491,6 +491,21 @@ public:
   void TrackShmat(FEXCore::Core::InternalThreadState* Thread, int shmid, uint64_t shmaddr, int shmflg, uint64_t Length);
   uint64_t TrackShmdt(FEXCore::Core::InternalThreadState* Thread, uint64_t shmaddr);
   void TrackMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot);
+
+  // The tail every mmap path owes after TrackMmap, run with NO VMATracking lock
+  // held: apply the late extended-volatile metadata (shared CodeInvalidationMutex),
+  // load the code cache for a section TrackMmap declared cacheable, and take the
+  // periodic cache checkpoint. GuestMmap and the 64K emulated-mapping path
+  // (GranuleMemory::Mmap) both call it; the latter used to drop all three, so on
+  // a 64K host no library cache ever loaded and no volatile metadata was applied
+  // for a sub-granule or offset-unrepresentable file mapping.
+  void FinishTrackedMmap(FEXCore::Core::InternalThreadState* Thread, std::optional<LateApplyExtendedVolatileMetadata>&& LateMetadata,
+                         std::optional<FEXCore::ExecutableFileSectionInfo>& CachedSection);
+
+  // The delayed code-cache load heuristic (ld.so / Wine apply relocations, then
+  // mprotect the text executable), plus the periodic checkpoint. Run with NO
+  // VMATracking lock held. GuestMprotect and GranuleMemory::Mprotect both call it.
+  void FinishTrackedMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, int prot);
   void TrackMadvise(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Size, int advice);
 
   void InvalidateCodeRangeIfNecessary(FEXCore::Core::InternalThreadState* Thread, uint64_t Base, uint64_t Length) {

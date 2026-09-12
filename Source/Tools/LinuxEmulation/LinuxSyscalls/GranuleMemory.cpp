@@ -390,6 +390,8 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
   const uint64_t GranuleStart = FEXCore::HostPage::AlignDown(GuestBase);
   const uint64_t GranuleEnd = FEXCore::HostPage::AlignUp(GuestEnd);
 
+  std::optional<FEX::HLE::SyscallHandler::LateApplyExtendedVolatileMetadata> LateMetadata;
+  std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
   {
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
     auto& Tracking = Hndl->VMATracking;
@@ -462,11 +464,15 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     // VMATracking keeps describing what the GUEST asked for, at guest
     // granularity. That is the fiction discipline of §7: the granule table is
     // the only place the host's coarser reality is recorded.
-    std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
-    Hndl->TrackMmap(Thread, GuestBase, Size, prot, flags, fd, offset, CachedSection);
+    LateMetadata = Hndl->TrackMmap(Thread, GuestBase, Size, prot, flags, fd, offset, CachedSection);
   }
 
   Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, Size);
+  // Same tail as GuestMmap, outside the VMATracking lock: late volatile
+  // metadata, the code-cache load for this section, the periodic checkpoint.
+  // Until 2026-09-12 this path dropped all three, which is why no library
+  // cache ever loaded on a 64K host (ld.so's 4K-offset segment maps land here).
+  Hndl->FinishTrackedMmap(Thread, std::move(LateMetadata), CachedSection);
   *Result = GuestBase;
   return true;
 }
@@ -630,6 +636,10 @@ bool Mprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len
   }
 
   Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, Size);
+  // Same tail as GuestMprotect: the delayed code-cache load that ld.so's
+  // post-relocation mprotect(PROT_READ|PROT_EXEC) of a sub-granule range
+  // triggers, and the periodic checkpoint. Previously skipped on this path.
+  Hndl->FinishTrackedMprotect(Thread, addr, prot);
   *Result = 0;
   return true;
 }
