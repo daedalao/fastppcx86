@@ -920,13 +920,29 @@ DEF_OP(Orlshl) {
 }
 
 DEF_OP(Orlshr) {
+  // Dst = Src1 | (Src2 >> BitShift), shifting the OPERAND-SIZE view of Src2
+  // (arm64: `orr w, w, w, lsr #n`). At i32Bit the source may be a 64-bit
+  // value whose upper half must not shift down into the result:
+  // UpdatePrefixFromSegment feeds the whole GDT qword here with a shift of
+  // 16, and a 64-bit srdi dragged descriptor byte 5 (the access byte, 0xF3
+  // for the bridge's flat data segment) into bits 24..31 of the cached
+  // ES/DS base. Every string instruction after a `pop es` then wrote to
+  // EDI + 0xF3000000 (Portal 2 / Miles Sound System, 2026-09-12).
   auto Op  = IROp->C<IR::IROp_Orlshr>();
   auto Dst = GetReg(Node);
   auto S1  = GetReg(Op->Src1);
   auto S2  = GetReg(Op->Src2);
-  srdi(TMP4, S2, Op->BitShift);
-  or_(Dst, S1, TMP4);
-  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    // srwi: rlwinm SH=32-sh, MB=sh, ME=31 also zero-extends, so sh==0 is
+    // just a 32-bit zero-extend (SH=0 encodes fine; only SH=32 would not).
+    uint32_t sh = Op->BitShift & 31;
+    rlwinm(TMP4, S2, (32 - sh) & 31, sh, 31);
+    or_(Dst, S1, TMP4);
+    Mask32Tail(Dst, Node);
+  } else {
+    srdi(TMP4, S2, Op->BitShift);
+    or_(Dst, S1, TMP4);
+  }
 }
 
 DEF_OP(Ornror) {
@@ -936,10 +952,20 @@ DEF_OP(Ornror) {
   auto Dst = GetReg(Node);
   auto S1  = GetReg(Op->Src1);
   auto S2  = GetReg(Op->Src2);
-  uint32_t sh = (64 - Op->BitShift) & 63;
-  rldicl(TMP4, S2, sh, 0);   // TMP4 = ROR(S2, BitShift)
-  orc(Dst, S1, TMP4);         // Dst = S1 | NOT(TMP4)
-  if (IROp->Size == IR::OpSize::i32Bit) Mask32Tail(Dst, Node);
+  if (IROp->Size == IR::OpSize::i32Bit) {
+    // Rotate the 32-bit view (rotrwi), not the 64-bit register: a 64-bit
+    // rotate would pull the upper half of Src2 into the result, the same
+    // defect Orlshr had. No frontend path emits this at i32Bit today
+    // (Flags.cpp uses i64Bit); fixed alongside Orlshr so the op is honest.
+    uint32_t sh = (32 - (Op->BitShift & 31)) & 31;
+    rlwinm(TMP4, S2, sh, 0, 31);   // TMP4 = ROR32(S2, BitShift), zero-extended
+    orc(Dst, S1, TMP4);            // Dst = S1 | NOT(TMP4)  (upper half all ones)
+    Mask32Tail(Dst, Node);
+  } else {
+    uint32_t sh = (64 - Op->BitShift) & 63;
+    rldicl(TMP4, S2, sh, 0);   // TMP4 = ROR(S2, BitShift)
+    orc(Dst, S1, TMP4);         // Dst = S1 | NOT(TMP4)
+  }
 }
 
 // XorShift / XornShift / AndShift: Honor the IR ShiftType field. Earlier

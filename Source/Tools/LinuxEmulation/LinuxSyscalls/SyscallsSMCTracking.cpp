@@ -2185,6 +2185,13 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
 
   InvalidateCodeRangeIfNecessary(Thread, Result, Size);
 
+  FinishTrackedMmap(Thread, std::move(LateMetadata), CachedSection);
+
+  return reinterpret_cast<void*>(Result);
+}
+
+void SyscallHandler::FinishTrackedMmap(FEXCore::Core::InternalThreadState* Thread, std::optional<LateApplyExtendedVolatileMetadata>&& LateMetadata,
+                                       std::optional<FEXCore::ExecutableFileSectionInfo>& CachedSection) {
   if (LateMetadata) {
     // ForceTSO has its own mutex; this is the SHARED side of
     // CodeInvalidationMutex, not the exclusive stop-the-world it used to be.
@@ -2195,7 +2202,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     CTX->AddForceTSOInformation(LateMetadata->VolatileValidRanges, std::move(LateMetadata->VolatileInstructions));
   }
 
-  if (EnableCodeCaching && CachedSection) {
+  if (EnableCodeCaching && CachedSection && Thread) {
     LoadCodeCache(*Thread, *CachedSection);
   }
 
@@ -2203,8 +2210,6 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
   // process reliably passes through: a real (non-signal) syscall context, with
   // every VMATracking and core lock already released.
   MaybeSaveCodeCaches(Thread);
-
-  return reinterpret_cast<void*>(Result);
 }
 
 uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, void* addr, uint64_t length) {
@@ -2560,12 +2565,18 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len);
   }
 
+  FinishTrackedMprotect(Thread, addr, prot);
+
+  return Result;
+}
+
+void SyscallHandler::FinishTrackedMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, int prot) {
   // Prepare for delayed code cache load after ld/Wine is done applying relocations.
   // Hooking into mprotect is a reliable heuristic that matches behavior of ld (for ELF) and Wine (for PE).
   // False-positives are avoided by setting RequiresDelayedCacheLoad in TrackMmap only for
   // binaries that we know will go through this path.
   fextl::vector<FEXCore::ExecutableFileSectionInfo> CachedSections;
-  if (EnableCodeCaching && (prot & PROT_EXEC) && (prot & PROT_WRITE) == 0) {
+  if (EnableCodeCaching && Thread && (prot & PROT_EXEC) && (prot & PROT_WRITE) == 0) {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
 
     auto VMAEntry = VMATracking.FindVMAEntry(reinterpret_cast<uint64_t>(addr));
@@ -2587,10 +2598,8 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     LoadCodeCache(*Thread, CachedSection);
   }
 
-  // Periodic checkpoint; see GuestMmap.
+  // Periodic checkpoint; see FinishTrackedMmap.
   MaybeSaveCodeCaches(Thread);
-
-  return Result;
 }
 
 uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, int shmid, const void* shmaddr, int shmflg) {

@@ -384,6 +384,15 @@ uint64_t ComputeCodeCacheConfigId() {
     // CALL/RET-hinted exit.
     HASH_OPT(SHADOWRETSTACK);
 
+    // Host page size (4K vs 64K kernel on the same machine). Nothing the JIT
+    // emits depends on it today, and the on-disk format does not either (the
+    // code buffer is memcpy'd out of the mapped file, see LoadData), so caches
+    // are portable in principle. Hashed anyway, as design section 7 asked: the
+    // two kernels then never share a cache namespace, and a host-page-dependent
+    // emitter change that lands later can only cause a cold miss, not a hit on
+    // code compiled for the other granule. Costs one cold run per kernel.
+    Hasher.Add(static_cast<uint64_t>(FEXCore::HostPage::Size()));
+
     // Backend env toggles that change emitted block bytes. Raw getenv switches
     // with no config plumbing, so hash their EFFECTIVE values exactly as the
     // emitters parse them (JIT.cpp Compute32MaskElision / ComputeTSOPairElision
@@ -1159,13 +1168,14 @@ bool CodeCache::SaveData(Core::InternalThreadState&, int fd, const ExecutableFil
     return false;
   }
 
-  // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load.
-  // GUEST (i.e. a fixed 4096) deliberately: this is an ON-DISK FORMAT quantity and must
-  // not vary with the host page size, or a cache written on one kernel is unreadable on
-  // the other.
-  // 64K-TODO(S3/S7): design section 7 wants the pad widened to a fixed 64K worst case and the
-  // host page size folded into the cache identity hash, so caches stay portable in the
-  // direction that matters (a 64K-padded cache loads fine on a 4K host).
+  // Pad to the next 4K boundary in the file before the code buffer. Historical:
+  // the pad exists so the code buffer COULD be mmap'ed straight out of the file,
+  // but LoadData memcpy's it into the live code buffer instead, so this is only
+  // a cursor alignment that the loader mirrors. GUEST (a fixed 4096)
+  // deliberately: it is an ON-DISK FORMAT quantity and must not vary with the
+  // host page size. It needs no widening for a 64K host for the same reason;
+  // the host page size is part of the cache identity hash instead (see
+  // CodeCacheConfigId above), which keeps the two kernels' caches apart.
   char Zero[64] {};
   auto Off = lseek(fd, 0, SEEK_CUR);
   if (Off < 0) {
@@ -1414,10 +1424,10 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   ::memcpy(Relocations.data(), MappedCacheFile, Relocations.size() * sizeof(Relocations[0]));
   MappedCacheFile += Relocations.size() * sizeof(Relocations[0]);
 
-  // Pad to next page in file, which contains CodeBuffer data.
-  // SaveData pads the file offset, and both callers map from offset 0 at a
-  // page-aligned address, so aligning the cursor is the same thing as aligning
-  // the file offset. The padding itself has to be inside the file: a cache
+  // Pad to the next 4K boundary in the file, which is where the CodeBuffer data starts.
+  // SaveData pads the file offset, and the caller maps the file from offset 0 at a
+  // host-page-aligned address (a multiple of 4K on every host), so aligning the
+  // cursor is the same thing as aligning the file offset. The padding itself has to be inside the file: a cache
   // truncated in the middle of that pad would otherwise put the cursor past the
   // end of the mapping before the code buffer read even gets a chance to check.
   // GUEST: must match the on-disk pad written by SaveData above, which is a fixed 4096.
@@ -1450,6 +1460,7 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   LOGMAN_THROW_A_FMT(reinterpret_cast<uintptr_t>(CodeBuffer->Ptr) % FEXCore::HostPage::Size() == 0,
                      "Expected CodeBuffer base to be host-page-aligned");
   // GUEST (fixed 4096): keeps the destination congruent with the 4K on-disk pad above.
+  // Only congruence, not a host-page requirement: the bytes are memcpy'd below.
   const auto Delta = AlignUp(CTX.LatestOffset, Utils::FEX_GUEST_PAGE_SIZE) - CTX.LatestOffset;
   CTX.LatestOffset += Delta;
 
