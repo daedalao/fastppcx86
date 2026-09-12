@@ -385,7 +385,7 @@ Waves 1 and 2 both landed the same day; `daedalao-wt` 562ede33d, wine fork
 | nw | Cyberpunk 2077 | runs; one cold-cache benchmark lap logged (`~/benchlogs/64k-cp2077-nw-1`, scene 14.5 fps; warm laps still owed before comparing with the 4K reference) |
 | nw | RimWorld (Windows build) | runs, loads defs (the first "black screen" was a missing `LANG` in an ssh launch, not 64K) |
 | Linux-native | `nproc`, `ls`, python3 with threads + mmap | run |
-| Linux-native | RimWorld (Linux build) | loads at 60 fps with `FEX_HOSTPAGEMODE=degrade GC_DISABLE_INCREMENTAL=1` after five fixes found by running it (below); with mtrack it still thrashes (design §5), and Mono's incremental GC write barrier is unsound under the permissive tier (§6), hence both knobs until S5 |
+| Linux-native | RimWorld (Linux build) | runs at 60 fps under **mtrack** (`FEX_HOSTPAGEMODE=force GC_DISABLE_INCREMENTAL=1`, the 4K configuration) once the guard-region and MAPERR fixes (d151ae36f) landed; the degrade tier (SMCChecks=full) also loads but was slow and painted every window fill cyan, which turned out to be a full-mode codegen bug, not 64K (3bada1c9d, below). Mono's incremental GC write barrier stays unsound under the permissive tier (§6), hence the GC knob until S5 |
 
 Fixes found only by running titles, all landed: wine dbghelp null map
 (475502aa473), bridge gate default (c6745e89a), granule copy past EOF
@@ -400,6 +400,23 @@ whole-granule munmap/MAP_FIXED that turned every write into a fake SMC fault
 when a guest signal is delivered on a thread holding the VMA write lock).
 Under Unity, FEX's stderr lands in the game's Player.log. Environment gaps found: op64k root
 drift (fmt 12.1 vs 12.2, cross gcc, MangoHud), all recorded in memory notes.
+
+Evening of 2026-09-11, the cyan window fills: RimWorld's runtime solid-colour
+textures came out (0,255,255) under the degrade tier. Native radeonsi on the
+64K kernel uploads and draws a 1x1 texture correctly (`scratch-64k/gltest`),
+the same binary under mtrack draws the fills correctly, and the JIT suite
+under `FEX_SMCCHECKS=full` failed ~170 `jit_500` tests (multi-instruction
+blocks) while every `jit_1` test passed. The IR dump of
+`Test_64Bit_OpSize/66_5B` showed it: full mode resumes each instruction in a
+fresh IR block via `SetCurrentCodeBlock` without dropping the
+`CachedNamedVectorConstants` refs, the RA ends live ranges at the block edge,
+and the second and third cvtps2dq read a clobbered cvtmax mask. Fixed by
+`StartContinuationBlock()` (3bada1c9d). Lesson: the degrade tier was never
+exercised by the test suite; `FEX_SMCCHECKS=full` needs a CI row (S6). The
+gate must be `force` for the suite on 64K (`FEX_HOSTPAGEMODE=force`, else
+every test aborts at the banner). `Test_64Bit_Displacement_Encoding` fails
+on 64K in every mode (it maps a 4K page at 0x7FFFF000; granule/loader item,
+open).
 
 Open items, in priority order: (1) a fatal trap or fault raised in FEX's own
 host code must never be delivered to the guest as a signal (it abandons the
