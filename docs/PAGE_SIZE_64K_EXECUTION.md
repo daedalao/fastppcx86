@@ -384,6 +384,7 @@ Waves 1 and 2 both landed the same day; `daedalao-wt` 562ede33d, wine fork
 | nw (native wine + bridge) | The Witcher 3 | runs, playable |
 | nw | Cyberpunk 2077 | runs; one cold-cache benchmark lap logged (`~/benchlogs/64k-cp2077-nw-1`, scene 14.5 fps; warm laps still owed before comparing with the 4K reference) |
 | nw | RimWorld (Windows build) | runs, loads defs (the first "black screen" was a missing `LANG` in an ssh launch, not 64K) |
+| nw | Portal 2 (32-bit) | runs, playable (2026-09-12, several minutes in-game); the first title to exercise 32-bit segment reloads through the bridge, see below |
 | Linux-native | `nproc`, `ls`, python3 with threads + mmap | run |
 | Linux-native | RimWorld (Linux build) | runs at 60 fps under **mtrack** (`FEX_HOSTPAGEMODE=force GC_DISABLE_INCREMENTAL=1`, the 4K configuration) once the guard-region and MAPERR fixes (d151ae36f) landed; the degrade tier (SMCChecks=full) also loads but was slow and painted every window fill cyan, which turned out to be a full-mode codegen bug, not 64K (3bada1c9d, below). Mono's incremental GC write barrier stays unsound under the permissive tier (§6), hence the GC knob until S5 |
 
@@ -435,6 +436,28 @@ SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
 op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
 exists; (7) NCS code cache stays off on 64K until the cache pads to 64K; (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).
+
+2026-09-12, Portal 2: the "wow64 SEH storm" every 64K run died in was not
+64K, WoW64 or ntsync. Every fault was at a guest register + 0xF3000000:
+`UpdatePrefixFromSegment` merges the GDT qword with `Orlshr(i32Bit, .., 16)`
+and the ppc64 backend shifted the 64-bit register, so the descriptor's access
+byte (0xF3 for the bridge's flat data segment) landed in bits 24..31 of the
+cached ES/DS base after any `pop es`/`pop ds`/`mov es,ax`; only string
+instructions consult that base, which is why the thread ran for minutes
+first. Fixed in 3f1908f77 (`Ornror` had the same shape). The 32Bit_ASM suite
+cannot see it because the Linux frontend writes descriptor bases only; the
+regression is `Bin/BridgeSmoke32`, run by hand after bridge or emitter
+changes. Diagnosed from the wine side (wine-ppc64le
+`ppc64le/docs/sessions/2026-09-12/portal2-segment-base-handoff.md`). 4K
+Portal 2 had never reached this point, so the bug was never 64K-specific.
+Second blocker behind it: the steamtool's i386 steam-bridge helper build
+refused the Arch rootfs (its preflight looks only for Debian's
+`usr/lib/i386-linux-gnu/Scrt1.o`; Arch multilib has it under `usr/lib32`).
+The helper builds and serves once the path is accepted; the artifact is
+installed, the one-line preflight fix in `build-helper.sh` is still owed on
+the wine side. Also found: the 64-bit `Bin/BridgeSmoke` SIGSEGVs on op64k in
+its EC direct-transition leg with the pre-fix emitter too (`FEX_NO_EC_DIRECT=1`
+passes 254/254); never checked on op4k, open.
 
 ### Morning kickoff checklist (orchestrator)
 
