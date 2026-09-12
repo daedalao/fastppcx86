@@ -35,3 +35,9 @@ set_target_properties(fexbridge PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_D
 add_executable(BridgeSmoke BridgeSmoke.c)
 target_include_directories(BridgeSmoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(BridgeSmoke PRIVATE dl ${PTHREAD_LIB})
+
+# 32-bit counterpart (fexbridge_process_init32): segment-reload + string-op
+# regression that only the bridge's fully-formed GDT descriptors can expose.
+add_executable(BridgeSmoke32 BridgeSmoke32.c)
+target_include_directories(BridgeSmoke32 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(BridgeSmoke32 PRIVATE dl ${PTHREAD_LIB})
