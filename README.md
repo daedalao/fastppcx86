@@ -25,8 +25,8 @@ split-lock handling) and the self-modifying-code subsystem are written for POWER
   - Wine's native ppc64le build (`wine-ppc64le`, the `nw` lane) does its own 64K handling and the
     bridge lane needs none of the above.
 
-  The 64K lane is new (2026-09-11): The Witcher 3, Cyberpunk 2077 and RimWorld run through the
-  native-wine lane, and Linux-native guests load and run. `FEX_HOSTPAGEMODE` (`abort`, the default
+  The 64K lane is new (2026-09-11): The Witcher 3, Cyberpunk 2077, RimWorld and Portal 2 (32-bit,
+  2026-09-12) run through the native-wine lane, and Linux-native guests load and run. `FEX_HOSTPAGEMODE` (`abort`, the default
   for the FEX launcher; `degrade`; `force`) gates a non-4K host. Status, measurements and open items:
   [`docs/PAGE_SIZE_64K_EXECUTION.md`](docs/PAGE_SIZE_64K_EXECUTION.md); design:
   [`docs/PAGE_SIZE_64K_PLAN.md`](docs/PAGE_SIZE_64K_PLAN.md); site audit:
