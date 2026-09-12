@@ -1392,6 +1392,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
+          // New IR block, same guest block: drop cached SSA refs (see
+          // OpDispatchBuilder::StartContinuationBlock).
+          Thread->OpDispatcher->StartContinuationBlock();
         }
 
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
