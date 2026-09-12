@@ -418,6 +418,12 @@ every test aborts at the banner). `Test_64Bit_Displacement_Encoding` fails
 on 64K in every mode (it maps a 4K page at 0x7FFFF000; granule/loader item,
 open).
 
+User note, 2026-09-11 evening: the RimWorld tutorial is "so slow". That was
+observed on the degrade instance (SMC full, ~8 fps at the menu); the mtrack
+instance did 60 fps at the menu. Before calling it a 64K problem, measure the
+tutorial under mtrack on 64K and on op4k; RimWorld's Linux lane has not been
+profiled on either kernel. Queued under (8) below.
+
 Open items, in priority order: (1) a fatal trap or fault raised in FEX's own
 host code must never be delivered to the guest as a signal (it abandons the
 host frame with its locks); (2) mtrack arming
@@ -428,7 +434,7 @@ and wire `SetSMCOverlay`/`GranuleFullyBacked` between S4b and S4c; (4) HWTSO
 SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
 op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
-exists; (7) NCS code cache stays off on 64K until the cache pads to 64K.
+exists; (7) NCS code cache stays off on 64K until the cache pads to 64K; (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).
 
 ### Morning kickoff checklist (orchestrator)
 
