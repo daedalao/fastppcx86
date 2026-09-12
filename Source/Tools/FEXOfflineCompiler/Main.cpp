@@ -9,6 +9,7 @@
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 
+#include "Common/HostPageGate.h"
 #include <Common/ArgumentLoader.h>
 #include <Common/Config.h>
 #include <Common/FEXServerClient.h>
@@ -48,6 +49,12 @@ public:
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
     return {0, UINT64_MAX, true};
+  }
+
+  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot) override {
+    // The offline compiler forces every mapping writeable so it can apply
+    // relocations; honouring a protection change would undo that.
+    return 0;
   }
 
   void* GuestMmap(FEXCore::Core::InternalThreadState*, void* addr, size_t Size, int prot, int Flags, int fd, off_t offset) override {
@@ -167,7 +174,7 @@ static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInf
   if (!Is64Bit) {
     const auto PageSize = sysconf(_SC_PAGESIZE);
     // Block upper address space
-    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::HostPage::Size());
   }
 
   auto Thread = SetupCompileThread(*CTX, Is64Bit);
@@ -321,6 +328,10 @@ static int GenerateCache(int argc, const char** argv) {
   char* envp[] = {nullptr};
   FEX::Config::LoadConfig("", envp, PortableInfo);
 
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
+
   auto NumBlocks = Data.at(ProgramName).size();
   auto GeneratedCache = GenerateSingleCache(ProgramName, Data.at(ProgramName), OutDir);
   if (GeneratedCache) {
@@ -331,6 +342,9 @@ static int GenerateCache(int argc, const char** argv) {
 }
 
 int main(int argc, char** argv) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
 

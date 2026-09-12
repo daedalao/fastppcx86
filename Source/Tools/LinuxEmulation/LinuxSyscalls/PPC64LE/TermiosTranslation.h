@@ -50,6 +50,19 @@ struct GuestTermios {
 };
 static_assert(sizeof(GuestTermios) == 36, "x86 kernel struct termios is 36 bytes");
 
+// The x86 kernel's struct termios2 (TCGETS2/TCSETS2/TCSETSW2/TCSETSF2): the
+// 36-byte termios followed by numeric input/output baud rates. 44 bytes.
+// Bun/Zig (and anything using the raw termios2 ABI instead of glibc's
+// tcgetattr) probes the tty with TCGETS2, so isatty()-style checks fail with
+// ENOTTY unless this family is marshalled too.
+struct GuestTermios2 {
+  GuestTermios base;
+  uint32_t c_ispeed;
+  uint32_t c_ospeed;
+};
+static_assert(sizeof(GuestTermios2) == 44, "x86 kernel struct termios2 is 44 bytes");
+static_assert(offsetof(GuestTermios2, c_ispeed) == 36, "");
+
 // The host buffer type is glibc's own `struct termios` from `<termios.h>`.
 // That is *by definition* the layout its ioctl wrapper writes for TCGETS on
 // this arch. Pinning the assumptions here so a future glibc change breaks

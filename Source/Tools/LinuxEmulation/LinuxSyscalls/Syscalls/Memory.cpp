@@ -5,6 +5,7 @@ tags: LinuxSyscalls|syscalls-shared
 $end_info$
 */
 
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -28,6 +29,14 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(madvise, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, size_t length, int32_t advice) -> uint64_t {
+    // 64K host: a destructive advice on part of a granule would discard a
+    // sibling page the guest still owns. The shim never rounds one out; see
+    // GranuleMemory.h. No-op on a 4K host and for granule-aligned requests.
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Madvise(Frame->Thread, addr, length, advice, &Emulated)) {
+      return Emulated;
+    }
+
     uint64_t Result = ::madvise(addr, length, advice);
 
     if (Result != -1) {

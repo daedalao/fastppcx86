@@ -6,6 +6,7 @@ desc: Glues the ELF loader, FEXCore and LinuxSyscalls to launch an elf under fex
 $end_info$
 */
 
+#include "Common/HostPageGate.h"
 #include "Common/ArgumentLoader.h"
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
@@ -158,7 +159,7 @@ fextl::vector<FEXCore::Allocator::MemoryRegion> InitMemoryRegions(bool Is64Bit) 
   const auto PageSize = sysconf(_SC_PAGESIZE);
   if (Is64Bit) {
     // Destroy the 48th bit if it exists
-    return FEXCore::Allocator::Setup48BitAllocatorIfExists(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    return FEXCore::Allocator::Setup48BitAllocatorIfExists(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
   }
 
   // Reserve [0x1_0000_0000, 0x2_0000_0000).
@@ -175,13 +176,13 @@ fextl::unique_ptr<FEX::HLE::MemAllocator> InitAllocator(bool Is64Bit) {
     // bundled allocator still has to be configured: without this rpmalloc uses
     // its own mapper, ignores FEX's placement hint, and strews its arenas
     // (~45 GiB under Unity) through the guest's address space.
-    FEXCore::Allocator::InitializeAllocator(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    FEXCore::Allocator::InitializeAllocator(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
     return {};
   }
 
 
   // Setup our userspace allocator
-  FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+  FEXCore::Allocator::SetupHooks(PageSize > 0 ? static_cast<size_t>(PageSize) : FEXCore::HostPage::Size());
   // PassthroughAllocator delegates straight to ::mmap, which on PPC64LE
   // (and any host whose default mmap base sits above 4 GiB) returns
   // addresses outside the 32-bit guest address space. glibc i686 then
@@ -287,94 +288,6 @@ bool QueryInterpreterInstalled(bool ExecutedWithFD, const FEX::Config::PortableI
 }
 
 namespace FEX::Kernel {
-namespace PageSize {
-  // FEXCore::Utils::FEX_PAGE_SIZE is a compile-time 4096 that serves two
-  // unrelated jobs: the GUEST page granularity (correct at 4096 forever — the
-  // guest is x86 and is handed AT_PAGESZ=4096) and the HOST mmap/mprotect
-  // granularity (wrong on any kernel whose page is larger). Nothing in the tree
-  // distinguishes the two, so on a 16K/64K-page host FEX does not degrade, it
-  // wedges — and it wedges without printing anything, which is the part that
-  // costs somebody a day. Refuse to start instead.
-  //
-  // This is deliberately NOT a rounding problem. The archetype is
-  // InternalThreadState: the struct is alignas(FEX_PAGE_SIZE), is exactly
-  // 2*FEX_PAGE_SIZE bytes, and parks InterruptFaultPage in its second 4K. On a
-  // 64K host that member's address is 4K-aligned but not page-aligned, so the
-  // mprotect that arms it returns EINVAL. Rounding the length up cannot save it
-  // either: a 64K-granular protection would swallow BaseFrameState — the guest
-  // register file the JIT reaches through r27/STATE — along with ~56K of
-  // whatever the allocator happened to place after the struct. The layout
-  // itself encodes a 4K host, so a real port has to change the layout. That is
-  // a project; this is the guard rail in front of it (see
-  // docs/PAGE_SIZE_AUDIT.md for the full classification and the ordered list of
-  // what a 64K port has to fix first).
-  //
-  // Written straight to stderr rather than through LogMan on purpose. FEX_SILENTLOG
-  // defaults to on, and every LogMan path — including ERROR_AND_DIE_FMT, which
-  // routes through MsgHandler — is swallowed when it is. A gate whose whole
-  // purpose is to replace a silent hang with an explanation cannot be silenceable
-  // by the default logging config. Matches the existing fatal startup paths in
-  // main() ("command not found", "Invalid or Unsupported elf file") and the
-  // PROT_SAO probe in Syscalls.cpp.
-  void CheckHostPageSize() {
-    const long HostPageSize = sysconf(_SC_PAGESIZE);
-    if (HostPageSize <= 0 || static_cast<uint64_t>(HostPageSize) == FEXCore::Utils::FEX_PAGE_SIZE) {
-      // Either the expected 4K host, or sysconf failed and there is nothing
-      // meaningful to say — the rest of FEX already treats a failed
-      // _SC_PAGESIZE as "assume FEX_PAGE_SIZE" (see FEX::Allocator::InitAllocator
-      // and ELFCodeLoader), so do not invent a second policy here.
-      return;
-    }
-
-    const char* AllowEnv = ::getenv("FEX_ALLOW_UNSUPPORTED_PAGE_SIZE");
-    const bool Allow = AllowEnv && AllowEnv[0] == '1';
-
-    fextl::fmt::print(stderr,
-                      "FEX: {}: host page size is {}, but FEX is built assuming {}.\n"
-                      "\n"
-                      "This is not a tunable. The {}-byte assumption is baked into struct layouts\n"
-                      "and into every host mprotect() FEX issues. What breaks, in the order you hit it:\n"
-                      "\n"
-                      "  * Deferred signals never arm, and the guest hangs with no diagnostic.\n"
-                      "    InternalThreadState::InterruptFaultPage sits at offset {} of a {}-byte\n"
-                      "    struct, so its address is {}-aligned but not {}-aligned and the mprotect()\n"
-                      "    that arms it returns EINVAL. Rounding the length up cannot fix it: a\n"
-                      "    {}-granular protection would also cover BaseFrameState, the guest register\n"
-                      "    file the JIT addresses through r27/STATE.\n"
-                      "  * The JIT's call-ret shadow stack is never made writable. It is placed one\n"
-                      "    {}-byte guard page into a host-aligned mapping, so the mprotect() that\n"
-                      "    commits it also returns EINVAL and the first guest CALL faults.\n"
-                      "  * SMC tracking (FEX_SMCCHECKS=mtrack) drives host mprotect() at {}-byte\n"
-                      "    granularity. Calls that are rejected abort; the ones that go through\n"
-                      "    degrade to host-page protection with re-protect races against neighbouring\n"
-                      "    guest pages that were never meant to be write-protected.\n"
-                      "  * Guest mmap/mprotect/munmap granularity. The guest is told AT_PAGESZ={} and\n"
-                      "    will place MAP_FIXED mappings on {}-byte boundaries that this host cannot\n"
-                      "    represent, so they fail with EINVAL instead of landing where the guest asked.\n"
-                      "\n"
-                      "What you can do: boot a kernel configured for {}-byte pages. On ppc64le that is\n"
-                      "CONFIG_PPC_4K_PAGES; there is no runtime switch for it.\n",
-                      Allow ? "WARNING" : "FATAL", HostPageSize, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE,
-                      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage), sizeof(FEXCore::Core::InternalThreadState),
-                      FEXCore::Utils::FEX_PAGE_SIZE, HostPageSize, HostPageSize, FEXCore::Utils::FEX_PAGE_SIZE,
-                      FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE, FEXCore::Utils::FEX_PAGE_SIZE,
-                      FEXCore::Utils::FEX_PAGE_SIZE);
-
-    if (Allow) {
-      fextl::fmt::print(stderr, "FEX: FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 -- continuing anyway. This is a debugging\n"
-                                "aid for working on host-page-size support, not a supported configuration. The\n"
-                                "expected outcome is one of the failures above: a crash on the first guest CALL,\n"
-                                "or a hang as soon as the first async signal needs delivering.\n");
-      return;
-    }
-
-    fextl::fmt::print(stderr, "\nSet FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 to downgrade this to a warning and continue\n"
-                              "anyway, if you are working on host-page-size support and want to see how far it\n"
-                              "gets. It is expected to crash or hang.\n");
-    FEX_TRAP_EXECUTION;
-  }
-} // namespace PageSize
-
 namespace TSO {
   void SetupTSOEmulation(FEXCore::Context::Context* CTX) {
     {
@@ -492,13 +405,11 @@ namespace UnalignedAtomic {
 } // namespace UnalignedAtomic
 
 void Init(bool Is64Bit, FEXCore::Context::Context* CTX) {
-  // Must be first. This is the last point at which refusing to run is clean:
-  // no InternalThreadState exists yet (the first one is built by
-  // TM.CreateThread below, after the syscall handler), no guest mapping exists
-  // yet (the VDSO and the guest ELF both go down later, via LoadVDSOThunks and
-  // Loader.MapMemory), and no guest code has been compiled. Everything that
-  // would actually wedge on a non-4K host is downstream of here.
-  PageSize::CheckHostPageSize();
+  // The host-page-size gate used to be called here. It moved to main(), right
+  // after the config reload and BEFORE CreateNewContext: the context caches
+  // SMCChecks (FEX_CONFIG_OPT) at construction, so a degrade-mode
+  // Config::Set made from here changed nothing and mtrack stayed armed on a
+  // 64K host despite the "forced to full" banner.
 
   // Setup TSO hardware emulation immediately after initializing the context.
   TSO::SetupTSOEmulation(CTX);
@@ -536,6 +447,9 @@ static int StealFEXFDFromEnv(const char* Env) {
 }
 
 int main(int argc, char** argv, char** const envp) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
   FEXCore::Allocator::GLIBCScopedFault GLIBFaultScope;
 
@@ -566,6 +480,12 @@ int main(int argc, char** argv, char** const envp) {
   // Reload the meta layer
   FEXCore::Config::ReloadMetaLayer();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, InterpreterInstalled ? "1" : "0");
+
+  // Host-page-size gate (64K port). Config is loaded and merged, and nothing
+  // downstream exists yet: no context (CreateNewContext below caches SMCChecks
+  // at construction, which is why degrade-mode forcing has to happen HERE), no
+  // thread state, no guest mapping, no compiled code. Refusing is still clean.
+  FEX::HostPageGate::CheckHostPageSize(true);
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");

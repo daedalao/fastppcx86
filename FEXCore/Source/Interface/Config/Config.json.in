@@ -16,6 +16,29 @@
           "Maximum number of instruction to store in a block"
         ]
       },
+      "CodeBufferMaxSize": {
+        "Type": "int32",
+        "Default": "1024",
+        "Desc": [
+          "Maximum JIT code buffer size in MiB (the shared buffer every translated block lives in).",
+          "When the buffer fills at this size it ROTATES: every translated block in the process is",
+          "discarded and retranslated on demand, which shows up as a multi-second compile storm on",
+          "every thread. Measured on Cyberpunk 2077 (bridge lane) at the old 128 MiB cap: the",
+          "buffer filled at +6.5s, first rotation at +29.5s discarding 383K blocks, and in-world",
+          "play rotated roughly every 2.5 minutes. Size the cap above the title's live working set.",
+          "Untouched pages cost nothing but address space. Minimum 16."
+        ]
+      },
+      "CodeBufferInitialSize": {
+        "Type": "int32",
+        "Default": "0",
+        "Desc": [
+          "Initial JIT code buffer size in MiB. 0 (default) allocates CodeBufferMaxSize up front,",
+          "so the buffer never grows. Any other value starts there and doubles up to the maximum;",
+          "each growth step discards and retranslates every block (the legacy 16->32->64->128",
+          "ladder cost Cyberpunk 2077 278K retranslations in its first 6.5 seconds)."
+        ]
+      },
       "EnableCodeCachingWIP": {
         "Type": "bool",
         "Default": "false",
@@ -511,6 +534,23 @@
           "\tfull: Validate code before every run (slow)"
         ]
       },
+      "HostPageMode": {
+        "Type": "str",
+        "Default": "abort",
+        "Desc": [
+          "What to do when the HOST kernel's page size is larger than the 4096 the",
+          "x86 guest is handed through AT_PAGESZ. See docs/PAGE_SIZE_64K_PLAN.md.",
+          "\tabort (default): explain and refuse to start. The unsupported-host",
+          "\t     failure modes are silent (deferred signals that never arm, a guest",
+          "\t     that hangs with no diagnostic), so refusing is the safe answer.",
+          "\tdegrade: continue, and force SMCChecks=full -- the one SMC mode whose",
+          "\t     correctness does not depend on host protection granularity matching",
+          "\t     the guest's. Relaxed-correctness contract, logged once.",
+          "\tforce: continue and force nothing. Bring-up aid only.",
+          "FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 is kept as an alias for force.",
+          "No effect at all on a 4K host."
+        ]
+      },
       "SMCSoftInvalidate": {
         "Type": "bool",
         "Default": "false",
@@ -993,7 +1033,7 @@
         "Type": "bool",
         "Default": "false",
         "Desc": [
-          "PPC64LE (EXPERIMENTAL, default OFF): maintain a per-thread shadow return-address stack. A guest CALL exit pushes {guest-return-RIP, host-trampoline} and a guest RET exit pops it, taking a direct branch to the recorded host code when the popped guest RIP matches the RET target -- skipping the inlined L1 probe on the hot call/ret path. A mismatch, an empty/overflowed stack, or any invalidation falls back to the L1 probe, which is the correctness net.",
+          "PPC64LE (default OFF): maintain a per-thread shadow return-address stack. A guest CALL exit ends in an LK=1 branch and pushes {guest-return-RIP, the host word after that branch}; a guest RET exit pops it and, when the popped guest RIP matches the RET target, restores that word into LR and returns with blr -- which the hardware link stack predicts. On the POWER8 this port targets the count cache predicts nothing (every bcctr to a constant target mispredicts, ~20 cycles), so this is the only predictable form a return can take. An indirect CALL exit additionally carries an inline cache: a guarded direct bl to the first target the block linker observed, filled on the first execution and undone when that target's block is erased (needs CallLinkingEnabled, i.e. not under FEX_SMCLAZYINVAL's lazy linking). A mismatch, an empty/overflowed stack, or any invalidation falls back to the L1 probe, which is the correctness net. Measured 2026-09-06 on the native-wine COM crossing: 71 -> 50 ns per call.",
           "Reuses the existing frontend-owned call-ret stack allocation and CPUState.callret_sp. Every code-buffer rotation/invalidation zeroes the stack (VirtualDontNeed), so a stale host trampoline can never be reached. Forced OFF under FEX_SMCLAZYINVAL unless FEX_SMCLAZYLINK is also set (same same-thread stale-hole reasoning as BlockLinking): the RET fast path skips ExitFunctionLink's drain, and only the LAZYLINK InterruptFaultPage poke at the return block's entry re-closes that window."
         ]
       },

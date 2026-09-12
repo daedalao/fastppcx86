@@ -206,8 +206,14 @@ struct PPC64BlockLinkRecord {
   // emission from CTX->Dispatcher->GetExitFunctionLinkerWithRecordAddress()
   // (constant over the process lifetime after dispatcher generation).
   uint64_t StubAddr;
+  // Shadow-call exits (FEX_SHADOWRETSTACK, link-stack pairing): the linked
+  // entry the caller word is patched to branch to, and the Final word the
+  // linker rewrites to `bl HostCode` / `bl ThunkStart`. Both relative to
+  // &record; both zero for a plain jump exit.
+  int64_t LinkedEntryOffset;
+  int64_t FinalOffset;
 };
-static_assert(sizeof(PPC64BlockLinkRecord) == 40, "emitted-record layout contract");
+static_assert(sizeof(PPC64BlockLinkRecord) == 56, "emitted-record layout contract");
 static_assert(offsetof(PPC64BlockLinkRecord, StubAddr) == 32, "thunk stub-addr load contract");
 static_assert(offsetof(PPC64BlockLinkRecord, HostCode) == 0, "thunk ld displacement contract");
 
@@ -309,7 +315,8 @@ private:
   // DEF_OP(CondJump) skip their trailing `b` when the edge targets this
   // block. CompileCode's block loop maintains it, and only ever sets it for a
   // non-EntryPoint successor: EntryPoint blocks emit an out-of-band prologue
-  // (InlineJITBlockHeader store, suspend poke, spill-frame stdu) BEFORE their
+  // (legacy InlineJITBlockHeader store under FEX_NOBLOCKHEADER=0, suspend
+  // poke, spill-frame stdu) BEFORE their
   // intra-unit JumpTarget label binds, and intra-unit edges must land after
   // that prologue — falling into it would run the stdu on an already-live
   // frame. A fallthrough target is by construction forward/unbound, so the
@@ -557,6 +564,27 @@ private:
   // ever coarsens — its worst case is exiting early).
   fextl::vector<bool> SpinCollapseBranchSigned;
 
+  // AnalyzeSpinLoops' per-compile scratch, hoisted out of the function so the
+  // vectors keep their capacity between compiles. As locals they cost two
+  // malloc/free pairs on every single compiled block.
+  struct SpinBlockInfo {
+    uint32_t ID = UINT32_MAX;
+    uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX}; // CodeBlock IDs
+    uint32_t OpCount = 0;
+    bool Clean = false;
+    bool HasPollLoad = false;
+    IR::Ref Node = nullptr; // for the SpinCollapse pattern re-walk
+  };
+  fextl::vector<SpinBlockInfo> SpinBlocks;
+  fextl::vector<uint32_t> SpinIdxOfID;
+
+  // Per-op live-in mask for the dynamic FPR pool, keyed by SSA node ID (see
+  // the DynVRSpillMask contract and the backward scan in CompileCode). A
+  // member for the same reason as SpinBlocks above: as a CompileCode local it
+  // was a guaranteed malloc/free of 4 * GetSSACount() bytes per compiled
+  // block, on the default path.
+  fextl::vector<uint32_t> DynVRLiveInStorage;
+
   // -------------------------------------------------------------------------
   // FEX_MEMCPYDCBZ=1 (opt-in): cache-line store tier for the forward REP MOVSB
   // fast path in DEF_OP(MemCpy). A copy loop normally moves THREE lines of
@@ -647,6 +675,8 @@ private:
     uint64_t CallerAddress; // absolute address of the in-block patch site
     uint64_t GuestRIP;      // constant destination RIP (post 32-bit masking)
     PPC64Emitter::Label LinkPath {};
+    uint64_t LinkedEntryAddress {}; // shadow call: linked leg entry (0 otherwise)
+    uint64_t FinalAddress {};       // shadow call: the word the linker writes `bl` into
   };
   fextl::list<PendingJumpThunk> PendingJumpThunks;
 
@@ -1071,18 +1101,20 @@ private:
     lvx(dst, base, off);
   }
 
-  // Store the address of the JITCodeHeader (bound at HeaderLabel) into
-  // CpuStateFrame::State.InlineJITBlockHeader so RestoreRIPFromHostPC and the
-  // other GetFrameBlockInfo consumers can find the tail. Emitted at every
-  // dispatcher-reachable entry so any signal fault into this block finds a
-  // fresh header pointer regardless of which entry point the dispatcher used.
+  // LEGACY (audit P1): store the address of the JITCodeHeader (bound at
+  // HeaderLabel) into CpuStateFrame::State.InlineJITBlockHeader. The signal
+  // path no longer reads it -- host PC -> block goes through the per-buffer
+  // block index (CPUBackend.h CodeBuffer::FindBlockHeader) -- so this is only
+  // emitted under FEX_NOBLOCKHEADER=0, for the FEX_RIPRECONLOG cross-check and
+  // for same-binary A/B of the prologue cost.
   // Uses `bcl 20,31,$+4; mflr` (LK=1 form the CPU does not push to the link
   // stack) to load PC then subtracts the emit-time delta to recover BlockBegin.
   // Clobbers TMP1 and TMP2 — safe: only called during entry-point prologue
   // before any IR op writes to SRA/spill state.
   void EmitStoreBlockBeginToInlineHeader(PPC64Emitter::Label& HeaderLabel);
 
-  // Emit a one-instruction poke of the thread's InterruptFaultPage. PPC64LE
+  // Emit a two-instruction poke of the thread's interrupt fault page (load the
+  // page pointer out of the frame, byte-store through it). PPC64LE
   // treats the whole JIT code buffer as an async-signal deferral region
   // (SignalDelegator's InJIT_ForDefer): a deferred signal mprotects the page
   // PROT_NONE and relies on this store faulting at the next guaranteed-
@@ -1162,11 +1194,34 @@ private:
   // switch: set by non-PatchSite OP_CONSTANT with a dynamic-GPR dest,
   // survives ONLY across the verified no-dynamic-GPR-write allowlist
   // (FPR-class LoadMem, the scalar-FP insert family), reset at block entry.
+  //
+  // OP_ENTRYPOINTOFFSET is a producer AND a consumer too, on the variable-
+  // width path only: the return address of every guest `call` is one of these,
+  // and consecutive calls in a basic block sit a handful of bytes apart, so
+  // the delta form applies constantly. Both directions are gated on
+  // !ExitRIPFixedWidth -- when a code cache or SMCSemanticPatch is on, that op
+  // must emit the byte-exact 20-byte LoadConstantFixed window that
+  // CodeCache::ApplyCodeRelocations re-emits RELOC_GUEST_RIP_MOVE into.
   struct {
     uint64_t Value;
     uint8_t Reg;      // GeneralRegisters[] index
     bool Valid;
   } LastConstantCache {};
+
+  // The value DEF_OP(EntrypointOffset) materialises: `(Entry + Op->Offset)`
+  // narrowed by the op's size. Shared by the emit site and CompileCode's
+  // LastConstantCache lifecycle so the cached value is byte-for-byte what was
+  // emitted -- computing that mask twice is exactly how the two would drift.
+  // Defined in ALUOps.cpp next to its emit site.
+  uint64_t EntrypointOffsetValue(const IR::IROp_Header* IROp) const;
+
+  // FEX_NOCONSTCACHE kill switch (hashed into the code-cache config id),
+  // parsed once. Both the LastConstantCache producers (CompileCode's
+  // post-handler lifecycle) and the consumers (DEF_OP(Constant),
+  // DEF_OP(EntrypointOffset)) read it through here, so one env var turns the
+  // mechanism off in both directions and cannot leave a stale entry readable.
+  // Defined in ALUOps.cpp.
+  static bool ConstCacheDisabled();
 
   // Load-and-splat fusion for FMA memory operands (both per-block, cleared at
   // block entry). CompileCode's pre-pass fills SplatCandidateLoads with node

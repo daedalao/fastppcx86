@@ -210,7 +210,7 @@
 // (d) Same-thread patch-then-execute, including patching the block you are
 //     standing in.  The legacy handler covers that case by re-running the
 //     faulting guest instruction as a single-instruction block
-//     (IsAddressInCurrentBlock at the tail of HandleSegfault); the semantic
+//     (IsAddressInCurrentBlock(HostPC, ...) at the tail of HandleSegfault); the semantic
 //     path returns before that and does not need it.  The destination RIP is
 //     loaded out of host code at exit time, so a block that has already been
 //     entered still exits to the new target, and the patching thread is the

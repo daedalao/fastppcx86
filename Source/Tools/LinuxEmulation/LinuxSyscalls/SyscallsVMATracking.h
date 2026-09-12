@@ -11,6 +11,8 @@
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include "LinuxSyscalls/GranuleTable.h"
+
 #include <elf.h>
 
 namespace FEX::HLE::VMATracking {
@@ -105,6 +107,12 @@ struct VMATracking {
 
   // Memory ranges indexed by page aligned starting address
   fextl::map<uint64_t, VMAEntry> VMAs;
+
+  // The 64K-host granule table. Covered by Mutex exactly as VMAs is, and empty
+  // by construction on a 4K host (GranuleTable::Active() is false there and
+  // every path that would populate it short-circuits first). See
+  // GranuleTable.h for the invariant.
+  GranuleTable Granules;
 
   using VMACIterator = decltype(VMAs)::const_iterator;
 
@@ -255,7 +263,7 @@ struct VMATracking {
 
 private:
   static size_t MarkNoOpIndex(uint64_t PageBase) {
-    return (PageBase >> FEXCore::Utils::FEX_PAGE_SHIFT) & (MarkNoOpEntries - 1);
+    return (PageBase >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) & (MarkNoOpEntries - 1);
   }
 
   // Builds the table word for (PageBase, Gen). Fails (returns false, meaning
@@ -263,7 +271,7 @@ private:
   // only happen for guest addresses far beyond TASK_MAX_64BIT. Bailing out is
   // always safe: it just forces the locked slow path.
   static bool EncodeMarkNoOp(uint64_t PageBase, uint64_t Gen, uint64_t& Entry) {
-    const uint64_t Tag = (PageBase >> FEXCore::Utils::FEX_PAGE_SHIFT) >> MarkNoOpIndexBits;
+    const uint64_t Tag = (PageBase >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) >> MarkNoOpIndexBits;
     if (Tag >> (64 - MarkNoOpGenBits)) [[unlikely]] {
       return false;
     }

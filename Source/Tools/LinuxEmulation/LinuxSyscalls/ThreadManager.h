@@ -24,6 +24,7 @@ $end_info$
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -181,7 +182,9 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   CallRetStackInfo GetCallRetStackInfo() {
     uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
     // Leave some room from the base for the default location to allow for underflows without constant exceptions
-    return {Base - FEXCore::Utils::FEX_PAGE_SIZE, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::Utils::FEX_PAGE_SIZE,
+    // HOST: mirrors the guard pages placed either side of the callret stack in
+    // ThreadManager.cpp, which are one host page each.
+    return {Base - FEXCore::HostPage::Size(), Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::HostPage::Size(),
             Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
   }
 
@@ -278,46 +281,62 @@ public:
     ++IdleWaitRefCount;
   }
 
-  // 2026-05-14 deadlock recovery: both overloads sweep the calling thread's
-  // PendingSharedLockStack first (defensive against the caller having an
-  // unreleased CompileBlock/ExitFunctionLink read lock in scope), and use a
-  // bounded-wait write-lock acquisition that calls StealAndDropActiveLocks()
-  // after InvalidateGuestCodeRangeStealTimeoutSec seconds.  This recovers
-  // from the phantom-reader leak family of bugs we've been hitting under
-  // Steam and FTL.  The underlying leak source(s) should still be found,
-  // but live workloads can make forward progress in the meantime.
-  static constexpr int InvalidateGuestCodeRangeStealTimeoutSec = 4;
+  // Bounded exclusive acquire of CodeInvalidationMutex from the invalidation
+  // helpers (syscall layer and the SIGSEGV handler).
+  //
+  // History: this was a try_lock() poll every 50 us for 4 s, then a steal, then
+  // (co-dev findings §1.2) a fatal instead of the steal because stealing
+  // outside fork() corrupts the mutex word. The poll itself was wrong for a
+  // different reason: try_lock() is a bare CAS from 0 that never registers as
+  // a write waiter, so the mutex's writer priority never engaged -- every
+  // CompileBlock / ExitFunctionLink on every other thread kept taking the
+  // shared side, and with a JIT worker producing code for 8+ executing threads
+  // the reader count could stay non-zero across every sample until the
+  // deadline (reader-starvation livelock, indistinguishable from the deadlock
+  // this was meant to catch). It also cost 10-20k wakeups/s per waiter.
+  //
+  // try_lock_for registers as a writer (readers then drain as designed) and
+  // sleeps on the futex with a real deadline, so the 4 s is now a deadlock
+  // detector rather than a contention detector. The fatal stays: a genuine
+  // stall here is a lock-order bug (see the VMATracking LOCK ORDER note in
+  // HandleSegfault) and must be reported, not hidden.
+  //
+  // LOCK ORDER (2026-09-08): the helpers below take the exclusive
+  // CodeInvalidationMutex FIRST and ThreadCreationMutex only around the
+  // per-thread cache walk. ThreadCreationMutex used to be held for the whole
+  // invalidation -- the wait for readers to drain, the code-buffer walk, the
+  // syscalls in the after_callback -- so every CreateThread/DestroyThread
+  // (Bun does both constantly) serialised behind every SMC fault and vice
+  // versa, and a DestroyThread doing last-thread file I/O stalled invalidation.
+  // Nothing takes CodeInvalidationMutex while holding ThreadCreationMutex
+  // (ThreadManager.cpp never touches it; fork's LockBeforeFork takes the Stat
+  // lock, not this one), so the reversal introduces no inversion. Taking
+  // ThreadCreationMutex inside the exclusive lock, rather than snapshotting
+  // the list before it, is what keeps a thread created mid-invalidation from
+  // compiling the range and then being missed by the walk.
+  // FEX_INVALIDATESTALLSEC overrides the deadline (diagnostic: a workload that
+  // survives a longer deadline is contention, one that does not is a deadlock).
+  static int InvalidateGuestCodeRangeStealTimeoutSec() {
+    static const int Seconds = [] {
+      const char* Env = ::getenv("FEX_INVALIDATESTALLSEC");
+      const int V = Env ? ::atoi(Env) : 0;
+      return V > 0 ? V : 4;
+    }();
+    return Seconds;
+  }
 
   void TakeCodeInvalidationWriteLockOrSteal(FEXCore::Utils::WritePriorityMutex::Mutex& M) {
-    if (M.try_lock()) {
+    if (M.try_lock_for(std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec()))) {
       return;
     }
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(InvalidateGuestCodeRangeStealTimeoutSec);
-    while (!M.try_lock()) {
-      if (std::chrono::steady_clock::now() > deadline) {
-        // Co-dev ISA-neutral findings §1.2 (verified): StealAndDropActiveLocks
-        // outside fork() corrupts the mutex word — the stolen-from reader's
-        // later unlock_shared underflows into phantom waiters with no wake
-        // possible, and the next lock() overflows the waiter field into the
-        // owned bit. Silent corruption, Release-only. Measured ZERO firings
-        // across ~72K invalidations on real workloads, so a fatal here costs
-        // nothing in practice and converts the corruption into an actionable
-        // report. The steal remains valid ONLY on the fork() child path.
-        // (Underlying producer to fix with this: the fork-vs-fault-handler
-        // lock inversion the steal was masking — findings §3.1.)
-        ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
-                          "(phantom reader / lock inversion). Refusing the "
-                          "corrupting steal; report this with the workload.",
-                          InvalidateGuestCodeRangeStealTimeoutSec);
-      }
-      ::usleep(50);
-    }
+    ERROR_AND_DIE_FMT("InvalidateGuestCodeRange: write-lock stalled {}s "
+                      "(phantom reader / lock inversion). Refusing the "
+                      "corrupting steal; report this with the workload.",
+                      InvalidateGuestCodeRangeStealTimeoutSec());
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -327,15 +346,20 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -345,11 +369,56 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
 
     after_callback(Start, Length);
+  }
+
+  // Several ranges under ONE exclusive acquisition. A shared mapping's SMC
+  // fault used to take (and convoy on) the exclusive lock once per mirror
+  // page; the per-range Unprotect flag preserves the "writable mirrors get the
+  // after_callback, read-only mirrors do not" split of the single-range form.
+  struct InvalidateRange {
+    uint64_t Start;
+    uint64_t Length;
+    bool Unprotect;
+  };
+
+  void InvalidateGuestCodeRanges(FEXCore::Core::InternalThreadState* CallingThread, const InvalidateRange* Ranges, size_t Count,
+                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
+    FEXCore::ReleaseAllPendingSharedLocks();
+
+    auto& InvalMutex = CTX->GetCodeInvalidationMutex();
+    TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
+    struct UniqueGuard {
+      FEXCore::Utils::WritePriorityMutex::Mutex& M;
+      ~UniqueGuard() { M.unlock(); }
+    } CodeInvalidationlk {InvalMutex};
+
+    for (size_t i = 0; i < Count; ++i) {
+      CTX->InvalidateCodeBuffersCodeRange(Ranges[i].Start, Ranges[i].Length);
+    }
+    {
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        for (size_t i = 0; i < Count; ++i) {
+          CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Ranges[i].Start, Ranges[i].Length);
+        }
+      }
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      if (Ranges[i].Unprotect) {
+        after_callback(Ranges[i].Start, Ranges[i].Length);
+      }
+    }
   }
 
   // SMC v3 (FEX_SMCSOFTINVALIDATE): identical lock protocol and call shape to
@@ -363,7 +432,6 @@ public:
   void SoftInvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                     FEXCore::Context::CodeRangeInvalidationFn after_callback) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);
@@ -373,8 +441,14 @@ public:
     } CodeInvalidationlk {InvalMutex};
 
     CTX->SoftInvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+    {
+      // ThreadCreationMutex only around the walk (see the LOCK ORDER note
+      // above): taken INSIDE the exclusive CodeInvalidationMutex so a thread
+      // created between here and the walk cannot have compiled anything.
+      std::lock_guard lk(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
     }
 
     after_callback(Start, Length);
@@ -397,7 +471,6 @@ public:
   // FEXCore/Source/Interface/Core/SMCSemanticPatch.h.
   bool SemanticPatchGuestCodeRange(uint64_t Start, uint64_t Length, const void* NewBytes, const char** Reason) {
     FEXCore::ReleaseAllPendingSharedLocks();
-    std::lock_guard lk(ThreadCreationMutex);
 
     auto& InvalMutex = CTX->GetCodeInvalidationMutex();
     TakeCodeInvalidationWriteLockOrSteal(InvalMutex);

@@ -45,13 +45,16 @@ namespace pmr {
       Buffers.clear();
 
       CurrentBufferRemaining = 0;
-      CurrentAllocationSize = FEXCore::Utils::FEX_PAGE_SIZE;
+      // HOST: the backing buffers come from VirtualAlloc (host mmap), so the
+      // growth quantum is the host page.
+      CurrentAllocationSize = FEXCore::HostPage::Size();
     }
 
   protected:
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
       LOGMAN_THROW_A_FMT(bytes != 0, "Nope");
-      LOGMAN_THROW_A_FMT(alignment <= FEXCore::Utils::FEX_PAGE_SIZE, "Nope");
+      // HOST: buffers are host-page aligned, so that is the alignment ceiling we can honour.
+      LOGMAN_THROW_A_FMT(alignment <= FEXCore::HostPage::Size(), "Nope");
 
       // Wow, an actual use case of std::align in the wild.
       void* NewPointer = std::align(alignment, bytes, CurrentBuffer, CurrentBufferRemaining);
@@ -95,7 +98,7 @@ namespace pmr {
 
       // Multiply the allocation size by 1.5 for the next allocation
       // Avoid double math because of ugly conversions.
-      CurrentAllocationSize = FEXCore::AlignUp(CurrentAllocationSize + (CurrentAllocationSize >> 1), FEXCore::Utils::FEX_PAGE_SIZE);
+      CurrentAllocationSize = FEXCore::AlignUp(CurrentAllocationSize + (CurrentAllocationSize >> 1), FEXCore::HostPage::Size());
     }
 
     // Current buffer management.
@@ -109,7 +112,7 @@ namespace pmr {
 
     fextl::list<BufferData> Buffers {};
 
-    size_t CurrentAllocationSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    size_t CurrentAllocationSize = FEXCore::HostPage::Size();
   };
 
   /**

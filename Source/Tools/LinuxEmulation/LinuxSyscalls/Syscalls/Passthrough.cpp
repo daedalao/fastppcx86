@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "Common/CPUInfo.h"
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 #include "LinuxSyscalls/ThreadManager.h"
@@ -920,8 +921,26 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(write, SyscallPassthrough3<SYSCALL_DEF(write)>);
   REGISTER_SYSCALL_IMPL(lseek, SyscallPassthrough3<SYSCALL_DEF(lseek)>);
   REGISTER_SYSCALL_IMPL(sched_yield, SyscallPassthrough0<SYSCALL_DEF(sched_yield)>);
-  REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
-  REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
+  // msync and mincore are guest-4K quantities the raw passthrough gets wrong on
+  // a host with a larger page: mincore sizes its vector by the host page (so it
+  // under-fills the guest's buffer 16x at 64K) and both EINVAL on a 4K-aligned
+  // address. The shims answer from the granule table at guest granularity and
+  // return false -- i.e. take the passthrough below -- on a 4K host and for
+  // every already-representable request. See GranuleMemory.h.
+  REGISTER_SYSCALL_IMPL(msync, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t addr, uint64_t length, uint64_t flags) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Msync(Frame->Thread, reinterpret_cast<void*>(addr), length, static_cast<int>(flags), &Emulated)) {
+      return Emulated;
+    }
+    return SyscallPassthrough3<SYSCALL_DEF(msync)>(Frame, addr, length, flags);
+  });
+  REGISTER_SYSCALL_IMPL(mincore, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t addr, uint64_t length, uint64_t vec) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mincore(Frame->Thread, reinterpret_cast<void*>(addr), length, reinterpret_cast<uint8_t*>(vec), &Emulated)) {
+      return Emulated;
+    }
+    return SyscallPassthrough3<SYSCALL_DEF(mincore)>(Frame, addr, length, vec);
+  });
   REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
   // shmctl needs struct translation (powerpc64 shmid64_ds field order differs
   // from x86); registered in x64/x32 Semaphore.cpp.
@@ -1278,6 +1297,37 @@ namespace x64 {
         }
         struct termios HostT {};
         FEX::HLE::PPC64::GuestToHost(*reinterpret_cast<const FEX::HLE::PPC64::GuestTermios*>(arg), HostT);
+        uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
+        SYSCALL_ERRNO();
+      }
+      case 0x802c542au: { // x86 TCGETS2 (_IOR(0x54, 0x2a, struct termios2))
+        // Same marshalling as TCGETS; glibc's PowerPC TCGETS wrapper already
+        // fills the numeric c_ispeed/c_ospeed, which is exactly what the
+        // guest's termios2 tail wants.
+        struct termios HostT {};
+        uint64_t Result = ::ioctl(fd, TCGETS, &HostT);
+        if (Result == 0) {
+          auto* Guest2 = reinterpret_cast<FEX::HLE::PPC64::GuestTermios2*>(arg);
+          FEX::HLE::PPC64::HostToGuest(HostT, Guest2->base);
+          Guest2->c_ispeed = HostT.c_ispeed;
+          Guest2->c_ospeed = HostT.c_ospeed;
+        }
+        SYSCALL_ERRNO();
+      }
+      case 0x402c542bu:   // x86 TCSETS2
+      case 0x402c542cu:   // x86 TCSETSW2
+      case 0x402c542du: { // x86 TCSETSF2
+        uint32_t host_cmd;
+        switch (cmd) {
+          case 0x402c542bu: host_cmd = TCSETS;  break;
+          case 0x402c542cu: host_cmd = TCSETSW; break;
+          default:          host_cmd = TCSETSF; break;
+        }
+        const auto* Guest2 = reinterpret_cast<const FEX::HLE::PPC64::GuestTermios2*>(arg);
+        struct termios HostT {};
+        FEX::HLE::PPC64::GuestToHost(Guest2->base, HostT);
+        HostT.c_ispeed = Guest2->c_ispeed;
+        HostT.c_ospeed = Guest2->c_ospeed;
         uint64_t Result = ::ioctl(fd, host_cmd, &HostT);
         SYSCALL_ERRNO();
       }

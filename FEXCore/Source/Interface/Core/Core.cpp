@@ -8,7 +8,9 @@ desc: Glues Frontend, OpDispatcher and IR Opts & Compilation, LookupCache, Dispa
 $end_info$
 */
 
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
@@ -100,6 +102,155 @@ static int SMCAuditCompileFD() {
   }();
   return fd;
 }
+
+// ---------------------------------------------------------------------------
+// FEX_COMPILELOG=<path>: compile-rate diagnostic (append-only, raw fd, one
+// dprintf per line so a SIGKILL'd game still leaves a readable timeline).
+//
+// Answers "what is the JIT compiling, how fast, and why" for a live process:
+// per ~1 s window it appends the number of blocks actually compiled (races
+// that found another thread's block are not counted), host bytes emitted,
+// compiler wall time, invalidation calls/bytes, and the busiest guest 16 MiB
+// regions since process start, so a compile storm can be attributed to a
+// module range (a PE image base is stable for the life of the process) and
+// separated from invalidation churn or a code-buffer rotation (which
+// FEX_BUFSTATS logs; point both at different files).
+//
+// Off (no env var) the cost is one relaxed load of a null pointer per
+// compile. On, the counters are relaxed atomics and the bucket table is a
+// fixed open-addressed array with atomic keys, so no lock is taken on any
+// path and nothing here may block a compiling thread.
+namespace {
+struct CompileLogState {
+  int FD {-1};
+  uint64_t BaseNS {};
+  std::atomic<uint64_t> Compiles {};
+  std::atomic<uint64_t> HostBytes {};
+  std::atomic<uint64_t> CompileNS {};
+  std::atomic<uint64_t> InvalCalls {};
+  std::atomic<uint64_t> InvalBytes {};
+  std::atomic<uint64_t> LastFlushSec {};
+  // Last flushed totals, written only by the thread that won the flush.
+  uint64_t PrevCompiles {}, PrevHostBytes {}, PrevCompileNS {}, PrevInvalCalls {}, PrevInvalBytes {};
+
+  static constexpr size_t BUCKETS = 512;
+  struct Bucket {
+    std::atomic<uint64_t> Key {}; // (GuestRIP >> 24) + 1; 0 = empty
+    std::atomic<uint64_t> Count {};
+  };
+  Bucket Buckets[BUCKETS];
+
+  static uint64_t NowNS() {
+    timespec Now {};
+    clock_gettime(CLOCK_MONOTONIC, &Now);
+    return static_cast<uint64_t>(Now.tv_sec) * 1000000000ull + static_cast<uint64_t>(Now.tv_nsec);
+  }
+
+  void RecordCompile(uint64_t GuestRIP, uint64_t Bytes, uint64_t NS) {
+    Compiles.fetch_add(1, std::memory_order_relaxed);
+    HostBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    CompileNS.fetch_add(NS, std::memory_order_relaxed);
+
+    const uint64_t Key = (GuestRIP >> 24) + 1;
+    size_t Idx = (Key * 0x9E3779B97F4A7C15ull) >> 55; // 9 bits
+    for (size_t Probe = 0; Probe < BUCKETS; ++Probe, Idx = (Idx + 1) & (BUCKETS - 1)) {
+      uint64_t Cur = Buckets[Idx].Key.load(std::memory_order_relaxed);
+      if (Cur == 0) {
+        if (!Buckets[Idx].Key.compare_exchange_strong(Cur, Key, std::memory_order_relaxed)) {
+          if (Cur != Key) {
+            continue;
+          }
+        }
+        Cur = Key;
+      }
+      if (Cur == Key) {
+        Buckets[Idx].Count.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+    }
+    MaybeFlush();
+  }
+
+  void RecordInvalidate(uint64_t Bytes) {
+    InvalCalls.fetch_add(1, std::memory_order_relaxed);
+    InvalBytes.fetch_add(Bytes, std::memory_order_relaxed);
+  }
+
+  void MaybeFlush() {
+    const uint64_t Now = NowNS();
+    const uint64_t Sec = (Now - BaseNS) / 1000000000ull;
+    uint64_t Last = LastFlushSec.load(std::memory_order_relaxed);
+    if (Sec == Last || !LastFlushSec.compare_exchange_strong(Last, Sec, std::memory_order_acq_rel)) {
+      return;
+    }
+    const uint64_t C = Compiles.load(std::memory_order_relaxed);
+    const uint64_t B = HostBytes.load(std::memory_order_relaxed);
+    const uint64_t N = CompileNS.load(std::memory_order_relaxed);
+    const uint64_t IC = InvalCalls.load(std::memory_order_relaxed);
+    const uint64_t IB = InvalBytes.load(std::memory_order_relaxed);
+    const uint64_t dC = C - PrevCompiles, dB = B - PrevHostBytes, dN = N - PrevCompileNS;
+    const uint64_t dIC = IC - PrevInvalCalls, dIB = IB - PrevInvalBytes;
+    PrevCompiles = C;
+    PrevHostBytes = B;
+    PrevCompileNS = N;
+    PrevInvalCalls = IC;
+    PrevInvalBytes = IB;
+
+    // Top 6 buckets by cumulative count.
+    struct Top {
+      uint64_t Key, Count;
+    } Tops[6] {};
+    for (auto& Bkt : Buckets) {
+      const uint64_t Key = Bkt.Key.load(std::memory_order_relaxed);
+      if (!Key) {
+        continue;
+      }
+      const uint64_t Count = Bkt.Count.load(std::memory_order_relaxed);
+      for (size_t i = 0; i < 6; ++i) {
+        if (Count > Tops[i].Count) {
+          for (size_t j = 5; j > i; --j) {
+            Tops[j] = Tops[j - 1];
+          }
+          Tops[i] = {Key, Count};
+          break;
+        }
+      }
+    }
+    char TopBuf[6 * 40];
+    int Off = 0;
+    for (auto& T : Tops) {
+      if (!T.Key) {
+        break;
+      }
+      Off += snprintf(TopBuf + Off, sizeof(TopBuf) - Off, " %#" PRIx64 ":%" PRIu64, (T.Key - 1) << 24, T.Count);
+    }
+    const uint64_t Ms = (Now - BaseNS) / 1000000ull;
+    dprintf(FD,
+            "[pid %d +%" PRIu64 ".%03" PRIu64 "s] compiles=+%" PRIu64 " (%" PRIu64 ") hostbytes=+%" PRIu64 " (%" PRIu64 ") "
+            "compile_ms=+%" PRIu64 " avg_us=%" PRIu64 " inval=+%" PRIu64 "/%" PRIu64 "B (%" PRIu64 "/%" PRIu64 "B) top16MiB:%s\n",
+            getpid(), Ms / 1000, Ms % 1000, dC, C, dB, B, dN / 1000000ull, dC ? (dN / 1000ull) / dC : 0, dIC, dIB, IC, IB, TopBuf);
+  }
+};
+
+CompileLogState* GetCompileLog() {
+  static CompileLogState* State = [] () -> CompileLogState* {
+    const char* p = getenv("FEX_COMPILELOG");
+    if (!p) {
+      return nullptr;
+    }
+    const int fd = ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+      return nullptr;
+    }
+    auto* S = new CompileLogState();
+    S->FD = fd;
+    S->BaseNS = CompileLogState::NowNS();
+    dprintf(fd, "[pid %d +0.000s] compilelog start\n", getpid());
+    return S;
+  }();
+  return State;
+}
+} // anonymous namespace
 
 namespace FEXCore::Context {
 // SpinLoopClamp spec: "0x<begin>-0x<end>:<induction>:<bound>", registers by
@@ -220,34 +371,51 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   }
 }
 
+// Maps a host PC to the JIT block containing it.
+//
+// Audit P1: this used to read CpuStateFrame::State.InlineJITBlockHeader, which
+// every JIT block's EntryPoint prologue stored on entry (5 instructions per
+// block entry on ppc64le). That store is now elided by default
+// (FEX_NOBLOCKHEADER), and the mapping instead comes from a per-CodeBuffer
+// host-PC -> block index that the compiler fills in at CompileCode time
+// (CPUBackend.h, CodeBuffer::AppendBlock / FindBlockHeader). "The current
+// block" is therefore now defined as "the block containing HostPC", which is
+// what every caller actually meant.
+//
+// ASYNC-SIGNAL-SAFE (CodeBuffer::FindBlockHeader is; this adds only a null
+// check). Returns {nullptr, nullptr} when HostPC is in no block.
 struct GetFrameBlockInfoResult {
   const CPU::CPUBackend::JITCodeHeader* InlineHeader;
   const CPU::CPUBackend::JITCodeTail* InlineTail;
 };
-static GetFrameBlockInfoResult GetFrameBlockInfo(FEXCore::Core::CpuStateFrame* Frame) {
-  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
-  auto InlineHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
-
-  if (InlineHeader) {
-    auto InlineTail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail);
-    return {InlineHeader, InlineTail};
+static GetFrameBlockInfoResult GetFrameBlockInfo(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
+  // NonMovableUniquePtr has no operator bool — .get() is the null test.
+  if (!Thread->CPUBackend.get()) {
+    return {nullptr, nullptr};
   }
 
-  return {InlineHeader, nullptr};
+  auto InlineHeader = Thread->CPUBackend->FindBlockHeader(HostPC);
+  if (!InlineHeader) {
+    return {nullptr, nullptr};
+  }
+
+  auto InlineTail =
+    reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(reinterpret_cast<uintptr_t>(InlineHeader) + InlineHeader->OffsetToBlockTail);
+  return {InlineHeader, InlineTail};
 }
 
-bool ContextImpl::IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) {
-  auto [_, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
+bool ContextImpl::IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t Address, uint64_t Size) {
+  auto [_, InlineTail] = GetFrameBlockInfo(Thread, HostPC);
   return InlineTail && (Address + Size > InlineTail->RIP && Address < InlineTail->RIP + InlineTail->GuestSize);
 }
 
-bool ContextImpl::IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) {
-  auto [_, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
+bool ContextImpl::IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
+  auto [_, InlineTail] = GetFrameBlockInfo(Thread, HostPC);
   return InlineTail && InlineTail->SingleInst;
 }
 
-uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) {
-  auto [_, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
+uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
+  auto [_, InlineTail] = GetFrameBlockInfo(Thread, HostPC);
   return InlineTail ? InlineTail->RIP : 0;
 }
 
@@ -259,10 +427,16 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
 // State.rip on block-transfer fast paths. Every exit currently spends a
 // `std RIPReg, State.rip(STATE)` -- and, on a linked constant exit, the whole
 // 3-4 instruction RIP materialisation that feeds it -- purely so this fallback
-// has something sane to return. The fallback is only reachable in-JIT during
-// the handful of instructions at the top of a target block's EntryPoint
-// prologue, before its own InlineJITBlockHeader store lands. If that window is
-// never actually observed, the store is dead weight on every block transfer.
+// has something sane to return.
+//
+// Audit P1 changed what the fallback means. Block lookup no longer depends on
+// a store the entering block performs: the host PC is resolved through the
+// per-CodeBuffer block index (CPUBackend.h), which is complete the moment
+// CompileCode returns. There is therefore no longer a prologue-shaped window
+// in which an in-JIT PC resolves to no block. What remains under kind 0 is a
+// host PC that is inside a code buffer but inside no *block*: the aux
+// allocations the SMC machinery carves out of the buffer's free tail
+// (Context::AllocateJITAuxMemory), and the free tail itself.
 //
 // Modes (parsed once):
 //   unset / "0"  off (default) -- one predictable branch on a static bool
@@ -301,9 +475,12 @@ RIPFallbackTrapMode GetRIPFallbackTrapMode() {
   return Mode;
 }
 
-// [0] = host PC inside a code buffer but outside the block InlineJITBlockHeader
-//       names (the block-transfer window -- the one that matters).
-// [1] = host PC inside the named block, but the block carries no RIP table.
+// [0] = host PC inside a code buffer but inside no indexed block (an aux SMC
+//       stub allocation, or the buffer's free tail). Post-P1 this no longer
+//       covers a block-transfer window -- there isn't one -- so a nonzero
+//       count here now means "executing outside any block", which is a real
+//       finding rather than a tolerated race.
+// [1] = host PC inside a block, but the block carries no RIP table.
 std::atomic<uint64_t> RIPFallbackHits[2] {};
 
 // Minimal fixed-buffer line builder. No allocation, no locks, no fmt; the
@@ -379,6 +556,105 @@ struct RIPFallbackInitializer {
   }
 } RIPFallbackInitializerInstance;
 
+// FEX_RIPRECONLOG -- audit P1 cross-check.
+//
+// With FEX_NOBLOCKHEADER=0 the JIT still emits the legacy
+// InlineJITBlockHeader store, so both block-lookup mechanisms are live at the
+// same time. Setting FEX_RIPRECONLOG makes every RestoreRIPFromHostPC also
+// compute the answer the OLD way (walk the block named by
+// Frame->State.InlineJITBlockHeader when the host PC is inside it, else
+// Frame->State.rip) and emit one line per call:
+//
+//   RIPRECON hostpc=0x.. tbl=0x.. hdr=0x.. same=0|1
+//
+// tbl = the per-CodeBuffer block-index answer (the new path, the one that
+// ships), hdr = the legacy header-store answer. Run a signal storm under both
+// and any `same=0` line is a divergence to explain before the store is
+// retired for good.
+//
+// Same async-signal-safety contract as the fallback trap above: getenv is
+// forced at library load, and the log arm is a fixed stack buffer plus one
+// raw write(2). No fmt, no locks, no allocation.
+bool GetRIPReconLogEnabled() {
+  static const bool Enabled = []() {
+    const char* Env = getenv("FEX_RIPRECONLOG");
+    return Env && Env[0] != '\0' && !(Env[0] == '0' && Env[1] == '\0');
+  }();
+  return Enabled;
+}
+
+void RIPReconWriteLine(uint64_t HostPC, uint64_t TableRIP, uint64_t HeaderRIP) {
+  // "RIPRECON hostpc=" + 18 + " tbl=" + 18 + " hdr=" + 18 + " same=X\n"
+  // is well under 128 bytes.
+  char Line[128];
+  size_t At = RIPFallbackAppend(Line, 0, "RIPRECON hostpc=");
+  At += RIPFallbackHex(Line + At, HostPC);
+  At = RIPFallbackAppend(Line, At, " tbl=");
+  At += RIPFallbackHex(Line + At, TableRIP);
+  At = RIPFallbackAppend(Line, At, " hdr=");
+  At += RIPFallbackHex(Line + At, HeaderRIP);
+  At = RIPFallbackAppend(Line, At, " same=");
+  Line[At++] = TableRIP == HeaderRIP ? '1' : '0';
+  Line[At++] = '\n';
+  ssize_t Ignored = ::write(STDERR_FILENO, Line, At);
+  (void)Ignored;
+}
+
+// Walks a block's vl64pair per-instruction RIP table for HostPC. The caller
+// has already established that HostPC lies inside [BlockBegin, BlockBegin +
+// Tail->Size) and that the block has at least one entry.
+uint64_t WalkBlockRIPTable(uint64_t BlockBegin, const CPU::CPUBackend::JITCodeHeader* Header,
+                           const CPU::CPUBackend::JITCodeTail* Tail, uint64_t HostPC) {
+  auto RIPEntry = reinterpret_cast<const uint8_t*>(BlockBegin + Header->OffsetToBlockTail + Tail->OffsetToRIPEntries);
+
+  uint64_t StartingHostPC = BlockBegin;
+  uint64_t StartingGuestRIP = Tail->RIP;
+
+  for (uint32_t i = 0; i < Tail->NumberOfRIPEntries; ++i) {
+    auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
+    RIPEntry += Offset.Size;
+    if (HostPC >= (StartingHostPC + Offset.IntegerARMPC)) {
+      // We are beyond this entry, keep going forward.
+      StartingHostPC += Offset.IntegerARMPC;
+      StartingGuestRIP += Offset.IntegerX86RIP;
+    } else {
+      // Passed where the Host PC is at. Break now.
+      break;
+    }
+  }
+  return StartingGuestRIP;
+}
+
+// The pre-P1 answer, computed from the legacy InlineJITBlockHeader store.
+// Only meaningful when the JIT is still emitting that store
+// (FEX_NOBLOCKHEADER=0); with the store elided the field stays whatever it
+// last was, which is exactly the staleness this cross-check is meant to
+// expose. Async-signal-safe: pure loads over JIT-owned memory.
+uint64_t LegacyRIPFromInlineHeader(FEXCore::Core::CpuStateFrame* Frame, uint64_t HostPC) {
+  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+  if (!BlockBegin) {
+    return Frame->State.rip;
+  }
+
+  auto Header = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
+  auto Tail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(BlockBegin + Header->OffsetToBlockTail);
+  if (HostPC < BlockBegin || HostPC >= BlockBegin + Tail->Size || Tail->NumberOfRIPEntries == 0) {
+    return Frame->State.rip;
+  }
+
+  return WalkBlockRIPTable(BlockBegin, Header, Tail, HostPC);
+}
+
+// Forces the FEX_RIPRECONLOG getenv at library load, before main, before any
+// guest thread and before any signal can deliver — the same reason
+// RIPFallbackInitializer exists. A function-local static initialised inside a
+// signal handler would take the guard variable's lock there.
+struct RIPReconInitializer {
+  RIPReconInitializer() {
+    GetRIPReconLogEnabled();
+  }
+} RIPReconInitializerInstance;
+
 void NoteRIPFallback(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t BlockBegin, unsigned Kind) {
   const auto Mode = GetRIPFallbackTrapMode();
   if (Mode == RIPFallbackTrapMode::Off) {
@@ -406,55 +682,47 @@ void NoteRIPFallback(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC
 
 uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
   const auto Frame = Thread->CurrentFrame;
-  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
-  auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
 
+  // Audit P1: the block containing HostPC comes from the per-CodeBuffer block
+  // index, not from a store the block made on entry. FindBlockHeader has
+  // already range-checked HostPC against [BlockBegin, BlockBegin + Tail->Size),
+  // so reaching a non-null header means the PC really is inside this block.
+  auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Thread, HostPC);
+  const uint64_t BlockBegin = reinterpret_cast<uint64_t>(InlineHeader);
+
+  uint64_t Result;
   if (InlineHeader) {
-    // Check if the host PC is currently within a code block.
-    // If it is then RIP can be reconstructed from the beginning of the code block.
-    // This is currently as close as FEX can get RIP reconstructions.
-    if (HostPC >= reinterpret_cast<uint64_t>(BlockBegin) && HostPC < reinterpret_cast<uint64_t>(BlockBegin + InlineTail->Size)) {
-
-      // If the block did not emit a per-instruction RIP table, fall through
-      // to Frame->State.rip. Without this guard the reconstruction would
-      // return the block-entry RIP, which is coarser than the syscall-site
-      // RIP that Frame->State.rip already stores today (SeccompEmulator
-      // reads .instruction_pointer via this path). Header-only blocks —
-      // e.g. blocks with no CanHaveSideEffects IR ops that would emit
-      // GuestOpcode markers — hit this branch. (Ppc64le emits entries since
-      // P3.1 landed as 244075383; the old comment claiming otherwise was
-      // stale, per P5.0 review.)
-      if (InlineTail->NumberOfRIPEntries == 0) {
-        NoteRIPFallback(Thread, HostPC, BlockBegin, 1);
-        return Frame->State.rip;
-      }
-
-      auto RIPEntry =
-        reinterpret_cast<const uint8_t*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
-
+    // If the block did not emit a per-instruction RIP table, fall through
+    // to Frame->State.rip. Without this guard the reconstruction would
+    // return the block-entry RIP, which is coarser than the syscall-site
+    // RIP that Frame->State.rip already stores today (SeccompEmulator
+    // reads .instruction_pointer via this path). Header-only blocks —
+    // e.g. blocks with no CanHaveSideEffects IR ops that would emit
+    // GuestOpcode markers — hit this branch. (Ppc64le emits entries since
+    // P3.1 landed as 244075383; the old comment claiming otherwise was
+    // stale, per P5.0 review.)
+    if (InlineTail->NumberOfRIPEntries == 0) {
+      NoteRIPFallback(Thread, HostPC, BlockBegin, 1);
+      Result = Frame->State.rip;
+    } else {
       // Reconstruct RIP from JIT entries for this block.
-      uint64_t StartingHostPC = BlockBegin;
-      uint64_t StartingGuestRIP = InlineTail->RIP;
-
-      for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
-        auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
-        RIPEntry += Offset.Size;
-        if (HostPC >= (StartingHostPC + Offset.IntegerARMPC)) {
-          // We are beyond this entry, keep going forward.
-          StartingHostPC += Offset.IntegerARMPC;
-          StartingGuestRIP += Offset.IntegerX86RIP;
-        } else {
-          // Passed where the Host PC is at. Break now.
-          break;
-        }
-      }
-      return StartingGuestRIP;
+      Result = WalkBlockRIPTable(BlockBegin, InlineHeader, InlineTail, HostPC);
     }
+  } else {
+    // Host PC is in no block: the dispatcher, a FABI stub, C++, an aux SMC
+    // stub allocation, or the code buffer's free tail. Fall back to what is
+    // stored in the RIP currently.
+    NoteRIPFallback(Thread, HostPC, BlockBegin, 0);
+    Result = Frame->State.rip;
   }
 
-  // Fallback to what is stored in the RIP currently.
-  NoteRIPFallback(Thread, HostPC, BlockBegin, 0);
-  return Frame->State.rip;
+  if (GetRIPReconLogEnabled()) {
+    // Cross-check against the legacy header-store path. Only meaningful with
+    // FEX_NOBLOCKHEADER=0, which is what keeps that store alive.
+    RIPReconWriteLine(HostPC, Result, LegacyRIPFromInlineHeader(Frame, HostPC));
+  }
+
+  return Result;
 }
 
 uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
@@ -728,6 +996,21 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
   };
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
+  // One host page for the deferred-signal interrupt fault page. It is mapped
+  // separately from the thread state precisely so that its address is host-page
+  // aligned whatever the host page size is: the arming mprotect in the signal
+  // delegator needs that, and used to get it by accident from an alignas(4096)
+  // thread state that only worked on a 4K kernel.
+  {
+    const size_t PageSize = FEXCore::HostPage::Size();
+    void* FaultPage = ::mmap(nullptr, PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (FaultPage == MAP_FAILED) {
+      ERROR_AND_DIE_FMT("Failed to allocate the interrupt fault page for a new thread");
+    }
+    FEXCore::Allocator::VirtualName("FEXMem_InterruptFaultPage", FaultPage, PageSize);
+    Thread->BaseFrameState.InterruptFaultPagePtr = static_cast<uint8_t*>(FaultPage);
+  }
+
   Thread->CurrentFrame->State.gregs[X86State::REG_RSP] = StackPointer;
   Thread->CurrentFrame->State.rip = InitialRIP;
 
@@ -752,8 +1035,15 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 }
 
 void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
-  FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
-                                     Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+  // The page may be sitting at PROT_NONE (a deferred signal was armed and never
+  // drained). Restore it before the mapping goes away so nothing that is still
+  // unwinding takes a fault on a dangling address, then release it.
+  if (auto* FaultPage = Thread->CurrentFrame->InterruptFaultPagePtr) {
+    const size_t PageSize = FEXCore::HostPage::Size();
+    FEXCore::Allocator::VirtualProtect(FaultPage, PageSize, Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+    Thread->CurrentFrame->InterruptFaultPagePtr = nullptr;
+    ::munmap(FaultPage, PageSize);
+  }
   delete Thread;
 }
 
@@ -921,6 +1211,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+    // ForceTSO metadata is read per block and the instruction iterator lives
+    // for the block loop; hold the reader side across it (see ForceTSOMutex).
+    std::shared_lock ForceTSOlk(ForceTSOMutex);
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
 
@@ -1099,6 +1392,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
+          // New IR block, same guest block: drop cached SSA refs (see
+          // OpDispatchBuilder::StartContinuationBlock).
+          Thread->OpDispatcher->StartContinuationBlock();
         }
 
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
@@ -1403,6 +1699,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
+  auto* CompileLog = GetCompileLog();
+  const uint64_t CompileStartNS = CompileLog ? CompileLogState::NowNS() : 0;
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, BranchImmSites, MovImmSites] =
     CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
@@ -1411,6 +1709,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   } else if (!DebugData) {
     // DebugData wasn't populated, indicating another thread raced us for compiling this block
     return reinterpret_cast<uintptr_t>(CodePtr);
+  }
+  if (CompileLog) {
+    CompileLog->RecordCompile(GuestRIP, CompiledCode.Size, CompileLogState::NowNS() - CompileStartNS);
   }
 
   // The core managed to compile the code.
@@ -1494,9 +1795,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       // before MarkGuestExecutableRange below arms the page's write protection
       // -- see the ordering argument in Interface/Core/SMCCodeGranules.h.
       const bool NewPage =
-        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, StartAddr, Length);
+        Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, StartAddr, Length);
       if (NewPage) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
       }
       if (SMCAuditCompileFD() >= 0) {
         dprintf(SMCAuditCompileFD(), "compile rip=%lx page=%lx newpage=%d nentry=%zu\n", GuestRIP, CodePage, NewPage ? 1 : 0,
@@ -1519,11 +1820,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     // harmless here (the bridge runs SMCCHECKS=0) and correct in general:
     // the page really does hold code the guest can execute.
     fextl::set<uint64_t> Entrypoints {GuestRIP};
-    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE - 1);
+    const uint64_t Page = GuestRIP & ~static_cast<uint64_t>(FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1);
     CodePages.push_back(Page);
-    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_PAGE_SIZE, GuestRIP, 1);
+    const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(Thread, Entrypoints, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, GuestRIP, 1);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 
@@ -1613,6 +1914,9 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   // sees the per-page churn the cheap compile tier keys off. No-op unless
   // FEX_SMCCHEAPTIER is set.
   RecordCodeRangeInvalidation(Start, Length);
+  if (auto* CompileLog = GetCompileLog()) {
+    CompileLog->RecordInvalidate(Length);
+  }
 
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
@@ -1664,9 +1968,9 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     // to retain a block without one), so this is granule-precise, and it lands
     // before MarkGuestExecutableRange re-arms the protection.
     const bool NewPage = Thread->LookupCache->AddBlockExecutableRange(
-      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
+      Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (NewPage) {
-      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
     }
   }
 
@@ -1715,7 +2019,14 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
 
     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    //
+    // One madvise per thread per invalidation, issued under the exclusive
+    // CodeInvalidationMutex. The CallRet stack is only ever written when the
+    // shadow return stack is armed (FEX_SHADOWRETSTACK); with it off the
+    // stack is empty and the syscall is pure critical-section time, so skip it.
+    if (Config.ShadowRetStack()) {
+      Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    }
   }
 }
 
@@ -1856,11 +2167,22 @@ bool ContextImpl::AddECTargetIRHandler(uintptr_t Entrypoint, const FEXCore::IR::
         emit->_Thunk(emit->Constant(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Descriptor))), ThunkNameHash);
       }
 
-      // The handler owns RIP; go look where it pointed us, through the
-      // ordinary dispatcher lookup.  This is OpDispatchBuilder::SyscallOp's
-      // OS_GENERIC block-end pattern spelled with the raw emitter.
+      // The handler owns RIP; go look where it pointed us.  This is
+      // OpDispatchBuilder::SyscallOp's OS_GENERIC block-end pattern spelled
+      // with the raw emitter, with one difference: the exit carries the
+      // Return hint.  Both the direct arm and the trampoline end by popping
+      // the guest return address into RIP, exactly as the stub's own `ret`
+      // would, so under FEX_SHADOWRETSTACK the entry the calling block's
+      // CALL pushed is this exit's to pop -- a match branches straight to
+      // the caller's continuation instead of an L1 probe at a return site
+      // shared by every caller of this slot (the count-cache-polymorphic
+      // branch in the COM crossing).  A handler that redirected RIP
+      // elsewhere simply fails the compare and takes the probe.
+      // FEX_NO_ECRETHINT=1: bisection lever, the pre-2026-09-06 plain exit.
+      static const bool NoEcRetHint = getenv("FEX_NO_ECRETHINT") != nullptr;
       auto NewRIP = emit->_LoadContext(IR::OpSize::i64Bit, IR::RegClass::GPR, offsetof(Core::CPUState, rip));
-      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+      emit->_ExitFunction(IR::OpSize::i64Bit, NewRIP, NoEcRetHint ? IR::BranchHint::None : IR::BranchHint::Return,
+                          emit->Invalid(), emit->Invalid());
     },
     &ECTargetCreatorTag, Descriptor);
 
@@ -1895,14 +2217,13 @@ void ContextImpl::RemoveECTargetIRHandler(uintptr_t Entrypoint) {
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
-  LogMan::Throw::AFmt(CodeInvalidationMutex.is_write_owned(), "CodeInvalidationMutex needs to be unique_locked here");
+  std::unique_lock lk(ForceTSOMutex);
   ForceTSOValidRanges.Insert(ValidRanges);
   ForceTSOInstructions.merge(std::move(Instructions));
 }
 
 void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
-  LogMan::Throw::AFmt(CodeInvalidationMutex.is_write_owned(), "CodeInvalidationMutex needs to be unique_locked here");
-
+  std::unique_lock lk(ForceTSOMutex);
   ForceTSOValidRanges.Remove({Address, Address + Size});
   ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
 }
@@ -1914,10 +2235,15 @@ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
 void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
   LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
 
-  std::scoped_lock lk(CustomIRMutex);
-
-  CustomIRHandlers.erase(Entrypoint);
-  HasCustomIRHandlers = !CustomIRHandlers.empty();
+  {
+    std::scoped_lock lk(CustomIRMutex);
+    CustomIRHandlers.erase(Entrypoint);
+    HasCustomIRHandlers = !CustomIRHandlers.empty();
+  }
+  // Outside CustomIRMutex: GenerateIR takes CustomIRMutex shared while
+  // holding CodeInvalidationMutex shared, so invalidating (exclusive
+  // CodeInvalidationMutex) while still holding CustomIRMutex exclusive
+  // inverted that order against every concurrent compile.
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 
@@ -1925,7 +2251,13 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
   {
-    auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
+    // Shared, not exclusive: the store is a single aligned host store and the
+    // invalidation below retires whatever any concurrent compile read. The
+    // exclusive form (the guard's default template argument) stopped every
+    // compile and L1-miss link in the process for one store, and a store
+    // that faults into HandleSegfault can only have its lock released by
+    // ReleaseAllPendingSharedLocks if it is a tracked shared hold.
+    auto lk = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
 
     if (Size == 8) {
       *reinterpret_cast<uint64_t*>(Address) = Value;

@@ -68,7 +68,8 @@ All of these change emitted code. Unless noted, presence-tested.
 | `FEX_NOHDRADDI` | off | Restores `LoadImm32`+`subf` for the inline-header delta instead of `addi` / `addis`+`addi`. The two-instruction arm only fires when `Delta > 32768`, i.e. in very large compile units (high `MaxInst`). |
 | `FEX_NOR0ELIDE` | off | Always emit `li r0,0` at block exits instead of eliding it in units that never dirty r0. |
 | `FEX_R0TRAP` | off | Emit `tdnei r0,0` in place of every *elided* re-zero. Same instruction count, traps if the invariant was ever violated. Release-usable. |
-| `FEX_SINKEXITRIP` | off | Sink the exit RIP constant and `std State.rip` below the block-link patch site. Linked exit becomes `[ResetStack] ; [li r0,0] ; b`. Retires the P5.0.1 invariant — see `FEX_RIPFALLBACKTRAP`. |
+| `FEX_NOSINKEXITRIP` | off | Kill switch for the exit-RIP sink, which is now **default ON**: the exit RIP constant and its `std State.rip` are emitted below the block-link patch site, so a linked exit is `[ResetStack] ; [li r0,0] ; b`. Setting this restores the hoisted `std State.rip` (and the constant that feeds it) above the patch site. Retired the P5.0.1 invariant — see `FEX_RIPFALLBACKTRAP`. |
+| `FEX_NOBLOCKHEADER` | **store elided** | Audit P1. By default (unset or `=1`) the 5-instruction `bcl`/`mflr`/`addi`/`std` prologue that stored the block's `JITCodeHeader` address into `CpuStateFrame::State.InlineJITBlockHeader` is **not emitted**; host PC → block now resolves through the per-`CodeBuffer` block index (`Interface/Core/CPUBackend.h`, `CodeBuffer::FindBlockHeader`). **Value-tested**: `=0` emits the legacy store, which is what `FEX_RIPRECONLOG` needs to cross-check against. `FEX_NOHDRADDI` only matters when the store is emitted. |
 | `FEX_ZEXTOPT` | on | Dead `clrldi` / 32-bit tail-mask elision. `=0` disables. |
 | `FEX_NOXERARITH` | off | Restore the old `mfspr`/`rlwimi`/`mtspr` XER round trips instead of the arithmetic generators. |
 | `FEX_NOCONSTCACHE` | off | Disable the last-constant delta cache (`addi` off a still-live constant). |
@@ -88,7 +89,8 @@ Absorb-by-default behaviours; setting these makes them loud.
 
 | Switch | Effect |
 |---|---|
-| `FEX_RIPFALLBACKTRAP` | Counts `RestoreRIPFromHostPC` fallbacks taken with an in-code-buffer host PC. Kind 0 = PC outside the block `InlineJITBlockHeader` names — the window `FEX_SINKEXITRIP` would expose. `=1` logs, `=abort` dies on first. |
+| `FEX_RIPFALLBACKTRAP` | Counts `RestoreRIPFromHostPC` fallbacks taken with an in-code-buffer host PC. Kind 0 = PC inside a code buffer but inside no *indexed block* — post-P1 that means an aux SMC stub allocation or the buffer's free tail, not the old block-transfer window (there is none: the block index is complete when `CompileCode` returns). Kind 1 = PC inside a block that carries no RIP table. `=1` logs the first 64 of each kind and dumps counts at exit, `=abort` dies on first. |
+| `FEX_RIPRECONLOG` | Audit P1 cross-check. Makes every `RestoreRIPFromHostPC` also compute the legacy answer from `State.InlineJITBlockHeader` and write `RIPRECON hostpc=0x.. tbl=0x.. hdr=0x.. same=0\|1` to stderr (raw `write(2)`, async-signal-safe). Only meaningful with `FEX_NOBLOCKHEADER=0`, which keeps that store alive; run a signal storm under both and investigate any `same=0`. Very high volume. |
 | `FEX_NOEXEC_ABORT` | Abort on the entry-block NoExec tripwire instead of absorbing. |
 | `FEX_EXITLINK_ABORT` | Abort on a suspect `ExitFunctionLink` instead of absorbing. |
 | `FEX_EXITLINK_NOBYPASS` | Disable the `ExitFunctionLink` bypass. |
@@ -99,6 +101,8 @@ Absorb-by-default behaviours; setting these makes them loud.
 | `FEX_HWTSO_STRICT` | Make a refused `PROT_SAO` range diagnosable instead of silently unordered. **Important**: under `FEX_HWTSO` the JIT emits no barriers, so a refused range has *no ordering at all*. |
 | `FEX_SMC_LOOPTRAP` | Trap on a stuck SMC fault address. Note store-emulation / semantic-patch / mono-storm workloads legitimately fault one address hundreds of thousands of times. |
 | `FEX_SMC_AUDIT` | Compile-side SMC logger, `O_APPEND` alongside the syscall-side one. |
+| `FEX_SMCGRANULEPOLICY` | 64K hosts only. What happens to the tracked SIBLINGS of a faulting guest page when the granule-wide unprotect opens them. `invalidate` (default) widens the invalidation to the granule, which discharges the soundness rule by construction; `rearm` invalidates only the faulting page and soft-invalidates the granule at the next SMC drain point, which is **unsound by construction** in exactly the way `FEX_SMCLAZYINVAL` is and exists only to measure the mixed code/data thrash against. Forced to `invalidate` on a 4K host. |
+| `FEX_SMCGRANULEFLIPLOG` | 64K hosts only. Faults per granule per second above which one rate-limited line is logged (from the next non-signal mtrack mark, never from the handler) naming the granule, its flip count and how many of its guest pages are actually tracked code. Default `64`, `0` disables. |
 | `FEX_BUFSTATS` | Code-buffer rotation log, written as it goes so a SIGKILLed Proton session still leaves it. |
 | `FEX_LOG_UNEXPECTED_FUTEX` | Log futex returns glibc treats as fatal (the "unexpected error code" panic). |
 

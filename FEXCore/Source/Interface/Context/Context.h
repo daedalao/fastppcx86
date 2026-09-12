@@ -226,9 +226,9 @@ public:
 
   void HandleCallback(FEXCore::Core::InternalThreadState* Thread, uint64_t RIP) override;
 
-  bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) override;
-  bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) override;
-  uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+  bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t Address, uint64_t Size) override;
+  bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
+  uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
 
   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
@@ -670,6 +670,16 @@ private:
     void* Data;
   };
   fextl::unordered_map<uint64_t, CustomIRHandlerEntry> CustomIRHandlers;
+  // ForceTSO metadata has its own lock. Readers are CompileBlock's per-block
+  // lookups (shared, for the length of the block loop); writers are the
+  // Add/RemoveForceTSOInformation calls from guest mmap/munmap. These used to
+  // ride on the exclusive CodeInvalidationMutex, which made every mmap and
+  // munmap of a volatile-metadata image a stop-the-world for all compiles and
+  // L1-miss links in the process. Writers still hold CodeInvalidationMutex
+  // SHARED while they hold this exclusively: that is what keeps fork (which
+  // takes CodeInvalidationMutex exclusively) from snapshotting this mutex in
+  // the locked state into the child.
+  std::shared_mutex ForceTSOMutex;
   IntervalList<uint64_t> ForceTSOValidRanges; // The ranges for which ForceTSOInstructions has populated data
   fextl::set<uint64_t> ForceTSOInstructions;
 

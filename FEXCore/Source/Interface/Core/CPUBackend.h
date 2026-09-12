@@ -48,6 +48,49 @@ namespace CodeSerialize {
 struct GuestToHostMap;
 
 namespace CPU {
+  // Header that can live at the start of a JIT block.
+  // We want the header to be quite small, with most data living in the tail object.
+  //
+  // Defined at namespace scope (rather than nested in CPUBackend as it used to
+  // be) so that CodeBuffer, which is declared before CPUBackend, can name it in
+  // its block-index accessors. CPUBackend keeps `using` aliases for both, so
+  // the `CPUBackend::JITCodeHeader` spelling used throughout the tree is
+  // unchanged.
+  struct JITCodeHeader {
+    // Offset from the start of this header to where the tail lives.
+    // Only 32-bit since the tail block won't ever be more than 4GB away.
+    uint32_t OffsetToBlockTail;
+  };
+
+  // Header that can live at the end of the JIT block.
+  // For any state reconstruction or other data, this is where it should live.
+  // Any data that is explicitly tied to the JIT code and needs to be cached with it
+  // should end up in this data structure.
+  struct JITCodeTail {
+    // The total size of the codeblock from [BlockBegin, BlockBegin+Size).
+    size_t Size;
+
+    // RIP that the block's entry comes from.
+    uint64_t RIP;
+
+    // The length of the guest code for this block.
+    size_t GuestSize;
+
+    // Number of RIP entries for this JIT Code section.
+    uint32_t NumberOfRIPEntries;
+
+    // Offset after this block to the start of the RIP entries.
+    uint32_t OffsetToRIPEntries;
+
+    // Shared-code modification spin-loop futex.
+    uint32_t SpinLockFutex;
+
+    // If this block represents a single guest instruction.
+    bool SingleInst;
+
+    uint8_t _Pad[3];
+  };
+
   struct CodeBuffer {
     uint8_t* Ptr;
     size_t AllocatedSize; // including guard page; see UsableSize()
@@ -63,9 +106,96 @@ namespace CPU {
     ~CodeBuffer();
 
     /// Returns the number of bytes available for storing code
+    /// HOST: the trailing guard page is one host page (mprotect granularity), so on a
+    /// 64K kernel the buffer gives up 64K rather than 4K. The allocation size itself is
+    /// deliberately NOT grown: it keeps its power-of-two shape (the near-branch
+    /// placement logic reasons about buffer extents) and 4K behaviour is bit-identical.
     size_t UsableSize() const {
-      return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
+      return AllocatedSize - FEXCore::HostPage::Size();
     }
+
+    // ----------------------------------------------------------------------
+    // Per-buffer block index (audit P1)
+    // ----------------------------------------------------------------------
+    // Maps a host PC back to the JITCodeHeader of the block containing it,
+    // without the JIT publishing anything at run time. This replaces the old
+    // scheme where every EntryPoint prologue stored its own header address
+    // into CpuStateFrame::State.InlineJITBlockHeader (5 instructions on every
+    // block entry, ppc64le); see FEX_NOBLOCKHEADER in the PPC64LE backend.
+    //
+    // Ownership/lifetime: the index belongs to *this* CodeBuffer, so
+    // ClearCache and code-buffer rotation (CPUBackend::GetEmptyCodeBuffer ->
+    // CodeBufferManager::StartLargerCodeBuffer -> a brand new CodeBuffer)
+    // reset it implicitly — a rotated-away buffer keeps its own, still-correct
+    // index for as long as some thread holds a shared_ptr to it (the
+    // SignalHandlerCodeBuffers list). CodeBufferGeneration semantics are
+    // unchanged; nothing here is keyed by generation.
+    //
+    // Concurrency: single writer (AppendBlock is only ever called with
+    // CodeBufferManager::CodeBufferWriteMutex held), many lock-free readers.
+    // Readers publish/consume through BlockCount with release/acquire, so a
+    // reader either does not see a block at all or sees a fully written
+    // BlockOffsets entry *and* the fully written header/tail it points at.
+
+    // Block start offsets relative to Ptr, strictly ascending.
+    // VirtualAlloc'd (mmap) rather than new[]: capacity is sized off the
+    // buffer maximum (1 GiB by default via FEX_CODEBUFFERMAXSIZE => 64 MiB of
+    // index) and the pages are only ever faulted in as blocks are appended.
+    uint32_t* BlockOffsets {};
+
+    // Number of valid entries in BlockOffsets. Release-stored by the writer,
+    // acquire-loaded by readers.
+    std::atomic<uint32_t> BlockCount {0};
+
+    // UsableSize() / MinimumBlockSize + 1. A block is at least
+    // MinimumBlockSize bytes, so this can never be exceeded.
+    uint32_t BlockCapacity {};
+
+    // Smallest possible block span: a 4-byte JITCodeHeader plus code rounded
+    // up to 16, plus a 40-byte JITCodeTail plus its RIP entries rounded up to
+    // 16 (PPC64LE JIT.cpp, Tail->Size = CodeSize + TailAndEntriesAligned).
+    // 16 (code) + 48 (tail) = 64.
+    static constexpr size_t MinimumBlockSize = 64;
+
+    // Byte size of the BlockOffsets mapping; must be identical at
+    // VirtualAlloc and VirtualFree time (BlockCapacity is fixed after
+    // construction, so recomputing is exact).
+    size_t BlockIndexBytes() const {
+      return static_cast<size_t>(BlockCapacity) * sizeof(uint32_t);
+    }
+
+    // Appends a block to the index.
+    //
+    // MUST be called at the very end of CompileCode, while
+    // CodeBufferManager::CodeBufferWriteMutex is held, and only AFTER both the
+    // JITCodeHeader at Ptr+BlockOffset (its OffsetToBlockTail) and the
+    // JITCodeTail (its Size) have been fully written — a reader that observes
+    // the published count immediately dereferences both.
+    void AppendBlock(uint32_t BlockOffset);
+
+    // Maps a host PC to the JITCodeHeader of the block containing it, or
+    // nullptr when the PC is outside this buffer or lands in no block (aux SMC
+    // stub allocations and the buffer's free tail are the two live cases).
+    //
+    // ASYNC-SIGNAL-SAFE: no locks, no allocation, no logging, no fmt. It is
+    // reached from SIGSEGV/SIGBUS handlers via ContextImpl::RestoreRIPFromHostPC.
+    const JITCodeHeader* FindBlockHeader(uintptr_t HostPC) const;
+
+    // Rebuilds the index by walking the block chain in
+    // [StartOffset, StartOffset + Bytes), which must be a contiguous run of
+    // header/tail-delimited blocks. Used for regions that arrive by memcpy
+    // rather than through CompileCode (the code-cache loader, CodeCache.cpp).
+    //
+    // StartOffset == 0 resets the index first (the fresh-buffer form the
+    // design calls for). A non-zero StartOffset *appends*, because every block
+    // below it was already registered by AppendBlock and the loader always
+    // places the cached image at the current (page-aligned) LatestOffset,
+    // which is above every existing block.
+    //
+    // Caller must hold CodeBufferWriteMutex (same single-writer rule as
+    // AppendBlock). Stops, with one EFmt, on the first structural
+    // inconsistency rather than trusting file-controlled bytes.
+    void RebuildBlockIndexByWalk(size_t Bytes, size_t StartOffset = 0);
   };
 
   /**
@@ -83,9 +213,13 @@ namespace CPU {
     // This is the only CodeBuffer that data may be written to.
     fextl::shared_ptr<CodeBuffer> GetLatest();
 
-    // Allocate a new CodeBuffer with geometric growth up to an internal maximum.
+    // Allocate a new CodeBuffer with geometric growth up to the configured maximum.
     // Subsequent calls to GetLatest will point to the returned buffer.
     fextl::shared_ptr<CodeBuffer> StartLargerCodeBuffer();
+
+    // FEX_CODEBUFFERMAXSIZE / FEX_CODEBUFFERINITIALSIZE in bytes (see CPUBackend.cpp).
+    static size_t ConfiguredMaxSize();
+    static size_t ConfiguredInitialSize();
 
     // Write offset into the latest CodeBuffer
     std::size_t LatestOffset {};
@@ -170,42 +304,11 @@ namespace CPU {
       FEXCore::SMC::MovImmWindows MovImmWindows;
     };
 
-    // Header that can live at the start of a JIT block.
-    // We want the header to be quite small, with most data living in the tail object.
-    struct JITCodeHeader {
-      // Offset from the start of this header to where the tail lives.
-      // Only 32-bit since the tail block won't ever be more than 4GB away.
-      uint32_t OffsetToBlockTail;
-    };
-
-    // Header that can live at the end of the JIT block.
-    // For any state reconstruction or other data, this is where it should live.
-    // Any data that is explicitly tied to the JIT code and needs to be cached with it
-    // should end up in this data structure.
-    struct JITCodeTail {
-      // The total size of the codeblock from [BlockBegin, BlockBegin+Size).
-      size_t Size;
-
-      // RIP that the block's entry comes from.
-      uint64_t RIP;
-
-      // The length of the guest code for this block.
-      size_t GuestSize;
-
-      // Number of RIP entries for this JIT Code section.
-      uint32_t NumberOfRIPEntries;
-
-      // Offset after this block to the start of the RIP entries.
-      uint32_t OffsetToRIPEntries;
-
-      // Shared-code modification spin-loop futex.
-      uint32_t SpinLockFutex;
-
-      // If this block represents a single guest instruction.
-      bool SingleInst;
-
-      uint8_t _Pad[3];
-    };
+    // The block header/tail live at namespace scope (see above) so CodeBuffer
+    // can name them; these aliases keep every `CPUBackend::JITCodeHeader` /
+    // `CPUBackend::JITCodeTail` spelling in the tree working unchanged.
+    using JITCodeHeader = FEXCore::CPU::JITCodeHeader;
+    using JITCodeTail = FEXCore::CPU::JITCodeTail;
 
     /**
      * @brief Tells this CPUBackend to compile code for the provided IR and DebugData
@@ -237,6 +340,16 @@ namespace CPU {
     virtual void ClearRelocations() {}
 
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
+
+    // Maps a host PC to the JITCodeHeader of the block containing it, across
+    // every code buffer this thread can still be executing in: the current one
+    // plus the rotated-away buffers pinned by SignalHandlerCodeBuffers. Same
+    // iteration (and the same lifetime argument) as IsAddressInCodeBuffer —
+    // this thread's own shared_ptrs keep those buffers alive even if another
+    // thread rotates the manager's Latest out from under it.
+    //
+    // ASYNC-SIGNAL-SAFE. Returns nullptr when the PC is in no block.
+    const JITCodeHeader* FindBlockHeader(uintptr_t HostPC) const;
 
     // Updates the CodeBuffer if needed and returns a reference to the old one.
     // The returned reference should be kept alive carefully to avoid early deletion of resources.

@@ -100,7 +100,7 @@ bool FEXCore::Context::ContextImpl::TrySemanticPatchCodeRange(uint64_t Start, ui
     *Reason = "width";
     return false;
   }
-  if ((Start & FEXCore::Utils::FEX_PAGE_MASK) != ((Start + Length - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
+  if ((Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK) != ((Start + Length - 1) & FEXCore::Utils::FEX_GUEST_PAGE_MASK)) {
     // Planning reads the guest bytes around the written range to decide whether
     // a covering store leaves them unchanged. Those reads are safe only because
     // the range lies on one live, mapped code page; a store straddling a page
@@ -177,11 +177,11 @@ void FEXCore::Context::ContextImpl::RecordCodeRangeInvalidation(uint64_t Start, 
     return;
   }
 
-  const uint64_t Base = Start & FEXCore::Utils::FEX_PAGE_MASK;
-  const uint64_t Top = FEXCore::AlignUp(Start + std::max<uint64_t>(Length, 1), FEXCore::Utils::FEX_PAGE_SIZE);
+  const uint64_t Base = Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+  const uint64_t Top = FEXCore::AlignUp(Start + std::max<uint64_t>(Length, 1), FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
-  for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
-    auto& Slot = SMCPageCounters[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) & (SMCPageCounterSlots - 1)];
+  for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
+    auto& Slot = SMCPageCounters[(Page >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) & (SMCPageCounterSlots - 1)];
     if (Slot.Page.load(std::memory_order_relaxed) != Page) {
       // Steal the slot from whichever page held it.
       Slot.Page.store(Page, std::memory_order_relaxed);
@@ -202,8 +202,8 @@ bool FEXCore::Context::ContextImpl::ShouldUseCheapTier(uint64_t GuestRIP) {
     return false;
   }
 
-  const uint64_t Page = GuestRIP & FEXCore::Utils::FEX_PAGE_MASK;
-  const auto& Slot = SMCPageCounters[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) & (SMCPageCounterSlots - 1)];
+  const uint64_t Page = GuestRIP & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
+  const auto& Slot = SMCPageCounters[(Page >> FEXCore::Utils::FEX_GUEST_PAGE_SHIFT) & (SMCPageCounterSlots - 1)];
   if (Slot.Page.load(std::memory_order_relaxed) != Page) {
     return false;
   }

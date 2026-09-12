@@ -167,6 +167,25 @@ public:
     ClearCachedNamedConstants();
   }
 
+  // Continue straight-line emission in a NEW IR block that is a fall-through
+  // continuation of the current one (CONFIG_SMC_FULL wraps every instruction
+  // in ValidateCode + CondJump and resumes in a fresh block). The guest
+  // state model carries over (MMX/x87 mode, segment telemetry, register
+  // cache already flushed by the CondJump), but every cached SSA value must
+  // be dropped: the register allocator ends live ranges at the block edge,
+  // so a Ref minted in the previous block is a dangling register here.
+  //
+  // Missed for CachedNamedVectorConstants until 2026-09-11: three cvtps2dq in
+  // one guest block shared one cvtmax_i32 / cvtmax_f32_i32 load, the second
+  // and third read whatever the RA had since put in that register, and every
+  // NaN/overflow lane came out wrong (Test_64Bit_OpSize/66_5B under
+  // FEX_SMCCHECKS=full; RimWorld's Color->byte SetPixel under the 64K degrade
+  // tier painted every window fill cyan).
+  void StartContinuationBlock() {
+    CachedNZCV = nullptr;
+    ClearCachedNamedConstants();
+  }
+
   IRPair<IROp_Jump> Jump() {
     FlushRegisterCache();
     return _Jump();

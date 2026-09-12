@@ -5,6 +5,7 @@ tags: LinuxSyscalls|syscalls-x86-32
 $end_info$
 */
 
+#include "LinuxSyscalls/GranuleMemory.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -18,10 +19,17 @@ $end_info$
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <optional>
 #include <system_error>
 #include <filesystem>
 
 namespace FEX::HLE::x32 {
+
+// 64K: a file offset or MAP_FIXED address the host page cannot represent is
+// emulated by the granule layer (LinuxSyscalls/GranuleMemory.h), which also
+// preserves any live siblings in the granule; the loader's own copy of that
+// emulation (Common/HostPageMapping.h) is not used here because it applies one
+// protection to the whole reservation.
 
 void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
   struct old_mmap_struct {
@@ -33,26 +41,50 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
     uint32_t offset;
   };
   REGISTER_SYSCALL_IMPL_X32(mmap, [](FEXCore::Core::CpuStateFrame* Frame, const old_mmap_struct* arg) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mmap(Frame->Thread, false, reinterpret_cast<void*>(arg->addr), arg->len, arg->prot, arg->flags, arg->fd,
+                                arg->offset, &Emulated)) {
+      return Emulated;
+    }
     return reinterpret_cast<uint64_t>(FEX::HLE::_SyscallHandler->GuestMmap(false, Frame->Thread, reinterpret_cast<void*>(arg->addr),
                                                                            arg->len, arg->prot, arg->flags, arg->fd, arg->offset));
   });
 
   REGISTER_SYSCALL_IMPL_X32(
     mmap2, [](FEXCore::Core::CpuStateFrame* Frame, uint32_t addr, uint32_t length, int prot, int flags, int fd, uint32_t pgoffset) -> uint64_t {
-      return reinterpret_cast<uint64_t>(FEX::HLE::_SyscallHandler->GuestMmap(false, Frame->Thread, reinterpret_cast<void*>(addr), length,
-                                                                             prot, flags, fd, (uint64_t)pgoffset * 0x1000));
+      // GUEST: the 4096 is the mmap2 ABI's offset unit and stays. Computed once so
+      // the granule layer and the normal path agree on the offset asked for.
+      const uint64_t Offset = (uint64_t)pgoffset * FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
+      uint64_t Emulated {};
+      if (FEX::HLE::Granule::Mmap(Frame->Thread, false, reinterpret_cast<void*>(addr), length, prot, flags, fd, Offset, &Emulated)) {
+        return Emulated;
+      }
+      return reinterpret_cast<uint64_t>(
+        FEX::HLE::_SyscallHandler->GuestMmap(false, Frame->Thread, reinterpret_cast<void*>(addr), length, prot, flags, fd, Offset));
     });
 
   REGISTER_SYSCALL_IMPL_X32(munmap, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, size_t length) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Munmap(Frame->Thread, addr, length, &Emulated)) {
+      return Emulated;
+    }
     return FEX::HLE::_SyscallHandler->GuestMunmap(Frame->Thread, addr, length);
   });
 
   REGISTER_SYSCALL_IMPL_X32(mprotect, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, uint32_t len, int prot) -> uint64_t {
+    uint64_t Emulated {};
+    if (FEX::HLE::Granule::Mprotect(Frame->Thread, addr, len, prot, &Emulated)) {
+      return Emulated;
+    }
     return FEX::HLE::_SyscallHandler->GuestMprotect(Frame->Thread, addr, len, prot);
   });
 
   REGISTER_SYSCALL_IMPL_X32(
     mremap, [](FEXCore::Core::CpuStateFrame* Frame, void* old_address, size_t old_size, size_t new_size, int flags, void* new_address) -> uint64_t {
+      uint64_t Emulated {};
+      if (FEX::HLE::Granule::Mremap(Frame->Thread, false, old_address, old_size, new_size, flags, new_address, &Emulated)) {
+        return Emulated;
+      }
       return FEX::HLE::_SyscallHandler->GuestMremap(false, Frame->Thread, old_address, old_size, new_size, flags, new_address);
     });
 

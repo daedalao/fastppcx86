@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <ctime>
 #include <cstdint>
 
 #if !defined(_WIN32)
@@ -282,6 +285,83 @@ public:
 #if !defined(_WIN32)
   // Initialize the internal mutex object to its default initializer state.
   // Should only ever be used in the child process when a Linux fork() has occured.
+  // Timed exclusive acquire. Unlike a try_lock() poll this REGISTERS as a
+  // write waiter, so lock_shared() holds new readers off exactly as lock()
+  // does and the in-flight readers drain; the thread then sleeps on the futex
+  // with an absolute deadline instead of waking every few microseconds.
+  //
+  // On timeout the thread withdraws from the waiter count and settles the
+  // handoff a departing writer owes: if it was the last waiting writer and
+  // readers are parked behind the writer count, those readers are woken (only
+  // when the lock is not write-owned -- an owner's unlock() does that itself
+  // and needs READ_WAITER_BIT intact to know to); and if other writers are
+  // still waiting on a currently unowned lock, one is woken in case the wake
+  // that unlock() sent was addressed to this thread and got lost to the
+  // timeout. A spurious wake is harmless, a lost one is a permanent hang.
+  //
+  // Returns true holding the lock, false on timeout holding nothing.
+  bool try_lock_for(std::chrono::nanoseconds Timeout) {
+    if (try_lock()) {
+      return true;
+    }
+
+    struct timespec Deadline {};
+    ::clock_gettime(CLOCK_MONOTONIC, &Deadline);
+    const auto Total = std::chrono::nanoseconds(Deadline.tv_sec * 1'000'000'000LL + Deadline.tv_nsec) + Timeout;
+    Deadline.tv_sec = static_cast<time_t>(Total.count() / 1'000'000'000LL);
+    Deadline.tv_nsec = static_cast<long>(Total.count() % 1'000'000'000LL);
+
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+
+    // Register as a waiting writer, same as lock().
+    uint32_t Expected = AtomicFutex.fetch_add(WRITE_WAITER_INCREMENT) + WRITE_WAITER_INCREMENT;
+    uint32_t Desired {};
+
+    while (true) {
+      bool Sleep = false;
+      do {
+        if ((Expected & WRITE_OWNED_BIT) == 0 && (Expected & READ_OWNER_COUNT_MASK) == 0) {
+          LOGMAN_THROW_A_FMT((Expected & WRITE_WAITER_COUNT_MASK) != 0, "Underflow in write-waiters!");
+          Desired = (Expected | WRITE_OWNED_BIT) - WRITE_WAITER_INCREMENT;
+          Sleep = false;
+        } else {
+          Desired = Expected;
+          Sleep = true;
+          break;
+        }
+      } while (AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire) == false);
+
+      if (!Sleep) {
+        return true;
+      }
+
+      // FUTEX_WAIT_BITSET takes an ABSOLUTE CLOCK_MONOTONIC deadline.
+      const long Result = ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAIT_BITSET, Desired, &Deadline, nullptr, FUTEX_BITSET_WAIT_WRITERS);
+      if (Result == -1 && errno == ETIMEDOUT) {
+        bool WakeReaders = false;
+        Expected = AtomicFutex.load(std::memory_order_relaxed);
+        do {
+          LOGMAN_THROW_A_FMT((Expected & WRITE_WAITER_COUNT_MASK) != 0, "Underflow in write-waiters!");
+          Desired = Expected - WRITE_WAITER_INCREMENT;
+          WakeReaders = false;
+          if ((Desired & WRITE_WAITER_COUNT_MASK) == 0 && (Desired & READ_WAITER_BIT) && (Desired & WRITE_OWNED_BIT) == 0) {
+            Desired &= ~READ_WAITER_BIT;
+            WakeReaders = true;
+          }
+        } while (AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire) == false);
+
+        if (WakeReaders) {
+          FutexWakeReaders();
+        } else if ((Desired & WRITE_WAITER_COUNT_MASK) && (Desired & WRITE_OWNED_BIT) == 0 && (Desired & READ_OWNER_COUNT_MASK) == 0) {
+          FutexWakeWriter();
+        }
+        return false;
+      }
+
+      Expected = AtomicFutex.load(std::memory_order_relaxed);
+    }
+  }
+
   void StealAndDropActiveLocks() {
     Futex = 0;
   }

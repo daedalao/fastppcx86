@@ -450,7 +450,7 @@ public:
 
   uint64_t StackSize() const override {
     const auto Page = sysconf(_SC_PAGESIZE);
-    return Page > 0 ? Page : FEXCore::Utils::FEX_PAGE_SIZE;
+    return Page > 0 ? Page : static_cast<uint64_t>(FEXCore::HostPage::Size());
   }
 
   uint64_t GetStackPointer() const override {
@@ -466,7 +466,7 @@ public:
     bool LimitedSize = true;
     auto AllocPageSize = sysconf(_SC_PAGESIZE);
     if (AllocPageSize <= 0) {
-      AllocPageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+      AllocPageSize = FEXCore::HostPage::Size();
     }
 
     if (LimitedSize) {
@@ -487,7 +487,8 @@ public:
 
     // Map in the memory region for the test file
 #ifndef _WIN32
-    size_t Length = FEXCore::AlignUp(RawASMFile.size(), FEXCore::Utils::FEX_PAGE_SIZE);
+    // HOST: length handed to a real mmap.
+    size_t Length = FEXCore::HostPage::AlignUp(RawASMFile.size());
     auto ASMPtr = DoMMap(Code_start_page, Length);
 #else
     // Special magic DOS area that starts at 0x1'0000

@@ -12,8 +12,10 @@
 namespace FEXCore {
 // Buffered JIT symbol tracking.
 struct JITSymbolBuffer {
-  // Maximum buffer size to ensure we are a page in size.
-  constexpr static size_t BUFFER_SIZE = FEXCore::Utils::FEX_PAGE_SIZE - (8 * 2);
+  // Buffer size. FEX_GUEST_PAGE_SIZE is used purely as a convenient 4KB constant here:
+  // this buffer is a plain heap object, it is never mapped or protected, so it has no
+  // relationship to the host page size.
+  constexpr static size_t BUFFER_SIZE = FEXCore::Utils::FEX_GUEST_PAGE_SIZE - (8 * 2);
   // Maximum distance until the end of the buffer to do a write.
   constexpr static size_t NEEDS_WRITE_DISTANCE = BUFFER_SIZE - 64;
   // Maximum time threshhold to wait before a buffer write occurs.
@@ -28,7 +30,7 @@ struct JITSymbolBuffer {
   size_t Offset {};
   char Buffer[BUFFER_SIZE] {};
 };
-static_assert(sizeof(JITSymbolBuffer) == FEXCore::Utils::FEX_PAGE_SIZE, "Ensure this is one page in size");
+static_assert(sizeof(JITSymbolBuffer) == FEXCore::Utils::FEX_GUEST_PAGE_SIZE, "Ensure the buffer object stays exactly 4KB in size (a buffer size, not a page)");
 
 class JITSymbols final {
 public:

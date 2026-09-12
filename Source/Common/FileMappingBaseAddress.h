@@ -38,7 +38,9 @@ InferMappingBaseAddress(std::span<const Elf64_Phdr> ProgramHeaders, uint64_t Add
     // The mapped file offset must be included at the start of the section header
     auto SegmentStartOffset = phdr.p_offset - (phdr.p_vaddr & 0xfff);
     if (FileOffset >= SegmentStartOffset && FileOffset < SegmentStartOffset + phdr.p_filesz &&
-        (FileOffset & Utils::FEX_PAGE_MASK) == (phdr.p_offset & Utils::FEX_PAGE_MASK)) {
+        // GUEST: guest ELF p_offset values are 4K-congruent by the x86 ABI; this compares
+        // a guest ELF segment offset against the offset the mapping was made with.
+        (FileOffset & Utils::FEX_GUEST_PAGE_MASK) == (phdr.p_offset & Utils::FEX_GUEST_PAGE_MASK)) {
       // Compute VA offset relative to the base mapping
       Ret.push_back(Addr - (phdr.p_vaddr - (phdr.p_offset & 0xfff)) + (ProgramHeaders[0].p_vaddr - (ProgramHeaders[0].p_offset & 0xfff)) -
                     (FileOffset - SegmentStartOffset));

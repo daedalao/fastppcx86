@@ -17,6 +17,7 @@ $end_info$
 #include "LinuxSyscalls/SignalDelegator.h"
 #endif
 
+#include "Common/HostPageGate.h"
 #include "Common/HostFeatures.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "HarnessHelpers.h"
@@ -189,6 +190,9 @@ void RegisterLongJumpHandler(FEX::DummyHandlers::DummySignalDelegator* Handler) 
 } // namespace LongJumpHandler
 
 int main(int argc, char** argv, char** const envp) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
 #ifndef _WIN32
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
 #endif
@@ -228,6 +232,11 @@ int main(int argc, char** argv, char** const envp) {
   FEXCore::Config::ReloadMetaLayer();
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode() ? "1" : "0");
+
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work.
+  FEX::HostPageGate::CheckHostPageSize(true);
+
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");
@@ -239,7 +248,7 @@ int main(int argc, char** argv, char** const envp) {
   if (!Loader.Is64BitMode()) {
     // Setup our userspace allocator
     const auto PageSize = sysconf(_SC_PAGESIZE);
-    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE);
+    FEXCore::Allocator::SetupHooks(PageSize > 0 ? PageSize : FEXCore::HostPage::Size());
     Allocator = FEX::HLE::CreatePassthroughAllocator();
   }
 #endif

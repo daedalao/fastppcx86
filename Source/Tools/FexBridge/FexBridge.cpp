@@ -22,6 +22,7 @@ $end_info$
 
 #include "fexbridge.h"
 
+#include "Common/HostPageGate.h"
 #include "Common/Config.h"
 #include "Common/HostFeatures.h"
 
@@ -475,7 +476,11 @@ thread_local BridgeThread* TLSThread {};
 // BridgeThreads): the EC-target cache scrub and this invalidation walk share
 // one list and one lock.
 
-constexpr size_t CALLRET_ALLOC = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
+// HOST: one host page of guard either side; see ThreadManager.cpp for why 4096 here is
+// a crash on the first guest CALL once the host page is larger than 4K.
+static size_t CallRetAllocSize() {
+  return FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::HostPage::Size();
+}
 
 // ---------------------------------------------------------------------------
 // Embedder SyscallHandler: OS_GENERIC trap sink -> caller's trap callback.
@@ -505,7 +510,10 @@ struct BridgeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public 
     // a PROT_NONE guard page readable), and one syscall per compiled block
     // page is noise against the compile itself.  NX stays unenforced:
     // readable data is still "executable", exactly as before.
-    const uint64_t PageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    // GUEST: this probes whether the *guest* page containing Address is readable, and
+    // the guest's page is 4K. A finer granule than the host's is always safe here: the
+    // probed base still lies inside the containing host page.
+    const uint64_t PageSize = FEXCore::Utils::FEX_GUEST_PAGE_SIZE;
     const uint64_t Page = Address & ~(PageSize - 1);
     uint8_t Probe;
     struct iovec Local {&Probe, 1};
@@ -619,7 +627,7 @@ void ProbeAndEnable() {
   if (!HWTSOEnabled() || !TSOEnabledOpt()) {
     return;
   }
-  void* Probe = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* Probe = ::mmap(nullptr, FEXCore::HostPage::Size(), PROT_READ | PROT_WRITE | PROT_SAO_BIT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (Probe == MAP_FAILED) {
     fprintf(stderr,
             "fexbridge: FEX_HWTSO requested but this kernel/CPU rejected PROT_SAO (errno=%d). "
@@ -629,7 +637,7 @@ void ProbeAndEnable() {
   }
   // Touch it so an accept-then-fault setup dies here, at init, not in-guest.
   *static_cast<volatile uint32_t*>(Probe) = 1;
-  ::munmap(Probe, FEXCore::Utils::FEX_PAGE_SIZE);
+  ::munmap(Probe, FEXCore::HostPage::Size());
   const char* StrictEnv = getenv("FEX_HWTSO_STRICT");
   Strict = StrictEnv && StrictEnv[0] == '1';
   Live.store(true, std::memory_order_release);
@@ -1204,6 +1212,9 @@ void fexbridge_set_log_handler(fexbridge_log_fn cb) {
 }
 
 static int process_init_common(bool Is64, uint64_t ExitPage) {
+  // Host page size is a runtime quantity (64K port). Latch it before anything maps
+  // memory; every accessor self-initialises too, so a missed call cannot return 0.
+  FEXCore::HostPage::Initialize();
   if (Initialized) {
     if (GuestIs64 != Is64) {
       EmitLog(0, Is64 ? "fexbridge: process already initialized 32-bit; 64-bit init refused" :
@@ -1218,7 +1229,9 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // memory manager can place a low page without racing whatever else owns
   // that range -- so the caller provides it, already filled with hlt and
   // executable.  Checked before any FEX state exists so a refusal is clean.
-  if (!Is64 && (!ExitPage || (ExitPage >> 32) || ((ExitPage + FEXCore::Utils::FEX_PAGE_SIZE - 1) >> 32))) {
+  // GUEST: the exit page lives in the 32-bit guest's own address space and the caller
+  // (Wine) sizes it in guest pages.
+  if (!Is64 && (!ExitPage || (ExitPage >> 32) || ((ExitPage + FEXCore::Utils::FEX_GUEST_PAGE_SIZE - 1) >> 32))) {
     EmitLog(0, "fexbridge: 32-bit init needs a caller-provided exit page below 4 GiB");
     return -4;
   }
@@ -1262,6 +1275,12 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // No frontend => no mprotect-based SMC tracking host. The caller reports
   // code writes through fexbridge_invalidate_code_range.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");
+
+  // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
+  // degrade-mode SMCChecks forcing both work. Bridge lane: Wine owns every guest
+  // mapping (host-granular) and SMCChecks is forced off above, so a larger host page
+  // needs only the stage-S2 fixes -- default to continuing. FEX_HOSTPAGEMODE overrides.
+  FEX::HostPageGate::CheckHostPageSize(true, FEX::HostPageGate::Mode::Force);
   // The lazy-SMC trio must fall with it.  The gaming launcher exports
   // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
   // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore
@@ -1315,17 +1334,23 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
 
   if (Is64) {
     // One guest-visible HLT used to end runs cooperatively.
-    auto* Page = ::mmap(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // HOST: one host page (the kernel rounds the length up anyway; saying so keeps the
+    // memset and the invalidate below covering exactly what was mapped).
+    const size_t HltPageSize = FEXCore::HostPage::Size();
+    auto* Page = ::mmap(nullptr, HltPageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (Page == MAP_FAILED) {
       EmitLog(0, "fexbridge: HLT page mmap failed");
       return -3;
     }
-    memset(Page, 0xF4 /* hlt */, FEXCore::Utils::FEX_PAGE_SIZE);
+    memset(Page, 0xF4 /* hlt */, HltPageSize);
     HltPageAddr = reinterpret_cast<uint64_t>(Page);
   } else {
     HltPageAddr = ExitPage;
   }
-  fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_PAGE_SIZE);
+  // GUEST: an invalidation range is a guest-code quantity. The caller-provided 32-bit
+  // exit page is a guest page, and for the 64-bit case invalidating the first 4K of the
+  // host page is all the HLT trampoline occupies.
+  fexbridge_invalidate_code_range(HltPageAddr, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   SpinSentinel::InitFromEnv();
   FaultLog::InitFromEnv();
@@ -1508,14 +1533,33 @@ int fexbridge_thread_init(void** thread_out) {
   }
 
   // Call-ret shadow stack, guard pages both sides.
-  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CALLRET_ALLOC, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  const size_t CallRetAlloc = CallRetAllocSize();
+  auto AllocBase = reinterpret_cast<uint64_t>(::mmap(nullptr, CallRetAlloc, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   if (AllocBase == reinterpret_cast<uint64_t>(MAP_FAILED)) {
     CTX->DestroyThread(Thread);
     return -4;
   }
-  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
-  ::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
-  Frame->State.callret_sp = AllocBase + FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::HostPage::Size());
+  // CHECKED: an unchecked EINVAL here leaves the shadow stack PROT_NONE and the first
+  // guest CALL faults with no diagnosis.
+  if (::mprotect(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE) != 0) {
+    EmitLog(0, "fexbridge: callret shadow stack mprotect failed");
+    ::munmap(reinterpret_cast<void*>(AllocBase), CallRetAlloc);
+    CTX->DestroyThread(Thread);
+    return -4;
+  }
+  Frame->State.callret_sp = AllocBase + FEXCore::HostPage::Size() + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+  // The JIT's shadow CALL push / RET pop (FEX_SHADOWRETSTACK) bounds-check
+  // against these two mirrors, not against CallRetStackBase.  Left at zero,
+  // every pop reads sp >= end(0) as "empty" (the fast path never fires) and
+  // every push reads new sp >= base(0) as "room", so the pointer walks down
+  // unbounded -- EC transitions pop the guest return address themselves and
+  // never balance the push, so ~64K COM calls later the store lands on the
+  // low guard page.  [MEASURED 2026-09-06: nw-witcher3 died at a guest CALL
+  // with dar == guard page + 0xff0 within a minute of launch, 3/3.]
+  const uint64_t CallRetBase = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+  Frame->State.callret_base = CallRetBase;
+  Frame->State.callret_end = CallRetBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
 
   auto* BT = new BridgeThread();
   BT->Thread = Thread;
@@ -1553,7 +1597,7 @@ void fexbridge_thread_term(void* thread) {
     std::erase(BridgeThreads, BT);
   }
   CTX->DestroyThread(BT->Thread);
-  ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CALLRET_ALLOC);
+  ::munmap(reinterpret_cast<void*>(BT->CallRetAllocBase), CallRetAllocSize());
   delete BT->Sentinel;
   delete BT;
 }
@@ -1657,6 +1701,25 @@ int fexbridge_run(void* thread, void* ctx) {
     }
   }
 
+  // A nested run is a re-entrant guest run with an OUTER block suspended on
+  // the host stack (mid EC call), and its return address lives in whatever
+  // code buffer that block was compiled into.  CPUBackend retires a buffer
+  // the moment it rotates or grows unless the frame's
+  // SignalHandlerRefCounter says a re-entrant run is in progress -- the
+  // JIT's own CallbackPtr re-entry bumps it for exactly this reason
+  // (PPC64Dispatcher.cpp, DEF_OP(CallbackReturn)); the bridge's nested run
+  // never did.  So a nested run that compiled enough to grow the buffer
+  // freed the outer block under its own caller, and the outer EC call
+  // returned into unmapped memory: nw-cp2077's libxess DllMain (a
+  // 64-deep initterm callback nest) died with a host fault whose LR == PC
+  // pointed into the retired buffer, only when FEX_SHADOWRETSTACK's larger
+  // call exits moved the growth into the nest [2026-09-06].  Hold the
+  // count for the nested run's whole life, both exit arms; the SMC
+  // redirect's r1 restore is gated on the same count and correctly treats
+  // a nested run as nesting.
+  if (Nested) {
+    ++BT->Thread->CurrentFrame->SignalHandlerRefCounter;
+  }
   int Reason;
   if (sigsetjmp(F.JB, 1) == 0) {
     CTX->ExecuteThread(BT->Thread);
@@ -1695,6 +1758,9 @@ int fexbridge_run(void* thread, void* ctx) {
     // fexbridge_fault_unwind landed here; guest state was reconstructed from
     // the host fault context before the jump.
     Reason = FEXBRIDGE_RUN_FAULT;
+  }
+  if (Nested) {
+    --BT->Thread->CurrentFrame->SignalHandlerRefCounter;
   }
   BT->RunTop = F.Prev;
 
@@ -2104,15 +2170,23 @@ int fexbridge_run_entry(void* entry, void* arg, unsigned long long* rax_out, cha
 
   // Guest stack: 8 MiB with a guard page below.
   constexpr size_t StackSize = 8ULL * 1024 * 1024;
-  auto* StackBase = ::mmap(nullptr, StackSize + FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  // HOST: guard page below the stack, host-granular so the mprotect past it is aligned.
+  const size_t GuardSize = FEXCore::HostPage::Size();
+  auto* StackBase = ::mmap(nullptr, StackSize + GuardSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (StackBase == MAP_FAILED) {
     if (OwnThread) {
       fexbridge_thread_term(Thread);
     }
     return Fail("fexbridge_run_entry: stack mmap failed");
   }
-  ::mprotect(reinterpret_cast<uint8_t*>(StackBase) + FEXCore::Utils::FEX_PAGE_SIZE, StackSize, PROT_READ | PROT_WRITE);
-  const uint64_t StackTop = (reinterpret_cast<uint64_t>(StackBase) + FEXCore::Utils::FEX_PAGE_SIZE + StackSize) & ~0xFULL;
+  if (::mprotect(reinterpret_cast<uint8_t*>(StackBase) + GuardSize, StackSize, PROT_READ | PROT_WRITE) != 0) {
+    ::munmap(StackBase, StackSize + GuardSize);
+    if (OwnThread) {
+      fexbridge_thread_term(Thread);
+    }
+    return Fail("fexbridge_run_entry: stack mprotect failed");
+  }
+  const uint64_t StackTop = (reinterpret_cast<uint64_t>(StackBase) + GuardSize + StackSize) & ~0xFULL;
 
   // MS-x64 call frame: caller reserves 32 bytes of shadow space, CALL pushes
   // the return address, so at entry RSP % 16 == 8 and [RSP] is the return
@@ -2141,7 +2215,7 @@ int fexbridge_run_entry(void* entry, void* arg, unsigned long long* rax_out, cha
     Ret = Fail("fexbridge_run_entry: run error %llu", (uint64_t)(int64_t)R);
   }
 
-  ::munmap(StackBase, StackSize + FEXCore::Utils::FEX_PAGE_SIZE);
+  ::munmap(StackBase, StackSize + GuardSize);
   if (OwnThread) {
     fexbridge_thread_term(Thread);
   }

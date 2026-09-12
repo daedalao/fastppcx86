@@ -94,9 +94,14 @@ public:
 
   FEX_DEFAULT_VISIBILITY virtual void HandleCallback(FEXCore::Core::InternalThreadState* Thread, uint64_t RIP) = 0;
 
-  FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) = 0;
-  FEX_DEFAULT_VISIBILITY virtual bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) = 0;
-  FEX_DEFAULT_VISIBILITY virtual uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) = 0;
+  ///< "The current block" is the JIT block containing HostPC, resolved through the per-CodeBuffer block index
+  ///< (Interface/Core/CPUBackend.h). HostPC is explicit because nothing in guest state names the running block any
+  ///< more: the JIT no longer stores its header address into CpuStateFrame::State.InlineJITBlockHeader on entry.
+  ///< Callers already have the host PC in hand (ArchHelpers::Context::GetPc on a ucontext, or the fault PC).
+  FEX_DEFAULT_VISIBILITY virtual bool
+  IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t Address, uint64_t Size) = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
+  FEX_DEFAULT_VISIBILITY virtual uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
 
   ///< State reconstruction helpers
   ///< Reconstructs the guest RIP from the passed in thread context and related Host PC.

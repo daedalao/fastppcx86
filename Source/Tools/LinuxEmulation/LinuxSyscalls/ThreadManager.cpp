@@ -180,7 +180,7 @@ void ThreadManager::StatAlloc::Initialize() {
     return;
   }
   CurrentSize = sysconf(_SC_PAGESIZE);
-  CurrentSize = CurrentSize > 0 ? CurrentSize : FEXCore::Utils::FEX_PAGE_SIZE;
+  CurrentSize = CurrentSize > 0 ? CurrentSize : static_cast<long>(FEXCore::HostPage::Size());
 
   if (ftruncate(fd, CurrentSize) == -1) {
     LogMan::Msg::EFmt("[StatAlloc] ftruncate failed");
@@ -351,7 +351,13 @@ void ThreadManager::SetThreadName(const char* name) {
   pthread_setname_np(pthread_self(), name);
 }
 
-constexpr size_t CALLRET_STACK_ALLOC_SIZE = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
+// HOST: a guard page either side of the call-ret shadow stack. The guard has to be one
+// HOST page: at 4096 on a 64K kernel the base below is 4K- but not host-aligned, the
+// mprotect that commits the stack returns EINVAL, the allocation stays PROT_NONE and the
+// JIT's shadow CALL push faults on the first guest CALL.
+static size_t CallRetStackAllocSize() {
+  return FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::HostPage::Size();
+}
 
 FEX::HLE::ThreadStateObject* ThreadManager::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState,
                                                          uint64_t ParentTID, FEX::HLE::ThreadStateObject* InheritThread) {
@@ -366,17 +372,29 @@ FEX::HLE::ThreadStateObject* ThreadManager::CreateThread(uint64_t InitialRIP, ui
   auto Frame = ThreadStateObject->Thread->CurrentFrame;
 
   // Allocate the call-ret stack with guard pages on both sides
+  const size_t CallRetAllocSize = CallRetStackAllocSize();
   auto AllocBase =
-    reinterpret_cast<uint64_t>(FEXCore::Allocator::mmap(nullptr, CALLRET_STACK_ALLOC_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    reinterpret_cast<uint64_t>(FEXCore::Allocator::mmap(nullptr, CallRetAllocSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
 
-  FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", reinterpret_cast<void*>(AllocBase), CALLRET_STACK_ALLOC_SIZE);
+  FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", reinterpret_cast<void*>(AllocBase), CallRetAllocSize);
 
   // Disable HUGEPAGE on callret stacks.
-  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<void*>(AllocBase), CALLRET_STACK_ALLOC_SIZE, FEXCore::Allocator::THPControl::Disable);
+  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<void*>(AllocBase), CallRetAllocSize, FEXCore::Allocator::THPControl::Disable);
 
   // Set the base used for invalidation to the start past the guard pages
-  ThreadStateObject->Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::Utils::FEX_PAGE_SIZE);
-  ::mprotect(ThreadStateObject->Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
+  ThreadStateObject->Thread->CallRetStackBase = reinterpret_cast<void*>(AllocBase + FEXCore::HostPage::Size());
+  // CHECKED (this is not signal context): an unchecked failure here leaves the shadow
+  // stack PROT_NONE and the first guest CALL dies with no diagnosis at all.
+  if (::mprotect(ThreadStateObject->Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE,
+                 PROT_READ | PROT_WRITE) != 0) {
+    // No caller of ThreadManager::CreateThread checks for nullptr (the clone path in
+    // Syscalls/Thread.cpp dereferences the result immediately), so failing here has to be
+    // fatal rather than a returned error. It is fatal in practice anyway: without a
+    // committed shadow stack the first guest CALL dies.
+    ERROR_AND_DIE_FMT("Failed to commit the call-ret shadow stack at {} ({:#x} bytes, host page {:#x}): {}",
+                      ThreadStateObject->Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE,
+                      FEXCore::HostPage::Size(), strerror(errno));
+  }
   Frame->State.callret_sp = ThreadStateObject->GetCallRetStackInfo().DefaultLocation;
   // Bound mirrors for the JIT's shadow CALL push / RET pop (see the
   // callret_end comment in CoreState.h). These are the ONLY writers besides
@@ -496,7 +514,7 @@ void ThreadManager::HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bo
   }
 
   // Free the call-ret stack
-  FEXCore::Allocator::munmap(reinterpret_cast<void*>(Thread->GetCallRetStackInfo().AllocationBase), CALLRET_STACK_ALLOC_SIZE);
+  FEXCore::Allocator::munmap(reinterpret_cast<void*>(Thread->GetCallRetStackInfo().AllocationBase), CallRetStackAllocSize());
 
   // If the LDT segment exists then deallocate it.
   if (Thread->ldt_entry_count) {

@@ -255,6 +255,13 @@ public:
 
   // does a guest munmap as if done via a guest syscall
   virtual uint64_t GuestMunmap(FEXCore::Core::InternalThreadState* Thread, void* addr, uint64_t length) = 0;
+
+  // does a guest mprotect as if done via a guest syscall.
+  // 64K: the ELF loader needs this. Its anon+pread fallback for an
+  // unrepresentable file mapping has to open a write window and then install the
+  // segment's real protection, and both have to be visible to VMA/SMC tracking
+  // the same way the mmap it replaces would have been.
+  virtual uint64_t GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) = 0;
 };
 
 class SyscallHandler : public FEXCore::HLE::SyscallHandler,
@@ -460,7 +467,7 @@ public:
 
   uint64_t GuestMremap(bool Is64Bit, FEXCore::Core::InternalThreadState*, void* old_address, size_t old_size, size_t new_size, int flags,
                        void* new_address);
-  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
+  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot) override;
   uint64_t GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState*, int shmid, const void* shmaddr, int shmflg);
   uint64_t GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState*, const void* shmaddr);
 
@@ -595,7 +602,7 @@ public:
 
   void MarkSMCDeferredDirtyRange(uint64_t Base, uint64_t Top) {
     std::lock_guard lk {SMCDeferredDirtyMutex};
-    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
       SMCDeferredDirtyPages.insert(Page);
     }
     SMCDeferredDirtyCount.store(SMCDeferredDirtyPages.size(), std::memory_order_release);
@@ -646,7 +653,7 @@ public:
   uint64_t MarkSMCImmutableSkippedRange(uint64_t Base, uint64_t Top) {
     std::lock_guard lk {SMCImmutableSkippedMutex};
     uint64_t Added {};
-    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+    for (uint64_t Page = Base; Page < Top; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
       Added += SMCImmutableSkippedPages.insert(Page).second ? 1 : 0;
     }
     SMCImmutableSkippedCount.store(SMCImmutableSkippedPages.size(), std::memory_order_release);

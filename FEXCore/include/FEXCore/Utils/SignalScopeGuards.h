@@ -5,6 +5,10 @@
 #include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <execinfo.h>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -23,6 +27,20 @@ namespace FEXCore {
 //
 // A fork() only clones the parent's calling thread. Other threads are silently dropped, which permanently leaves any mutexes owned by them locked.
 // To address this issue, ForkableUniqueMutex and ForkableSharedMutex provide a way to forcefully remove any dangling locks and reset the mutexes to their default state.
+// Diagnostic for the ownership checkers below: a caller reached a function that
+// requires the write lock without holding it. Not signal context (the checkers
+// sit in syscall-path bookkeeping), so a backtrace to stderr is affordable and
+// is the only way to name the offending caller in a release build.
+inline void ReportUnownedLockAssertion(const char* Where) {
+  void* Frames[32];
+  const int Count = ::backtrace(Frames, 32);
+  const char Msg[] = "FEX: lock-ownership assertion failed (caller does not hold the write lock); backtrace follows:\n";
+  ::write(STDERR_FILENO, Msg, sizeof(Msg) - 1);
+  ::write(STDERR_FILENO, Where, strlen(Where));
+  ::write(STDERR_FILENO, "\n", 1);
+  ::backtrace_symbols_fd(Frames, Count, STDERR_FILENO);
+}
+
 class ForkableUniqueMutex final {
 public:
   ForkableUniqueMutex()
@@ -55,9 +73,18 @@ public:
     Mutex = PTHREAD_MUTEX_INITIALIZER;
   }
 
-  // Asserts that the mutex isn't exclusively owned by the calling thread.
+  // Asserts that the mutex is already exclusively owned by the calling thread.
+  // A checker must never end up OWNING the lock: with assertions compiled out,
+  // a caller that did not hold it would otherwise acquire it here and return
+  // to the guest with it held forever (RimWorld Linux on the 64K kernel
+  // deadlocked exactly this way). Release an accidental acquisition and say
+  // where it came from.
   void check_lock_owned_by_self() {
     const auto Result = pthread_mutex_lock(&Mutex);
+    if (Result == 0) [[unlikely]] {
+      pthread_mutex_unlock(&Mutex);
+      ReportUnownedLockAssertion("ForkableUniqueMutex::check_lock_owned_by_self");
+    }
     LOGMAN_THROW_A_FMT(Result == EDEADLK, "User of unique lock must have already locked mutex as write!");
   }
 
@@ -79,17 +106,49 @@ public:
   void lock() {
     const auto Result = pthread_rwlock_wrlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
+    if (LockDiagEnabled()) [[unlikely]] {
+      // Diagnostic: remember who took the write lock so a later refusal can
+      // name the acquirer that never released it.
+      AcquirerFrames = ::backtrace(AcquirerBacktrace, AcquirerMax);
+      AcquirerTid = static_cast<uint32_t>(::syscall(SYS_gettid));
+    }
   }
   void unlock() {
+    if (LockDiagEnabled()) [[unlikely]] {
+      AcquirerFrames = 0;
+      AcquirerTid = 0;
+    }
     const auto Result = pthread_rwlock_unlock(&Mutex);
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to unlock with {}", __func__, Result);
   }
+  // A shared acquisition on a thread that already owns the lock for writing is
+  // refused by glibc with EDEADLK. Treating that as "acquired" and unlocking
+  // later ENDS THE WRITE PHASE from under the writer and, on the writer's own
+  // unlock, underflows the reader count: readers then park on a write phase
+  // nobody owns until the next writer happens by (RimWorld Linux on the 64K
+  // kernel ran at one frame per invalidation deadline this way). Remember the
+  // refusal per thread, skip the matching unlock, and say where it came from.
   void lock_shared() {
     const auto Result = pthread_rwlock_rdlock(&Mutex);
+    if (Result == EDEADLK) [[unlikely]] {
+      ++SharedRefusedDepth();
+      ReportUnownedLockAssertion("ForkableSharedMutex::lock_shared refused: caller already holds the WRITE lock");
+      if (AcquirerFrames > 0) {
+        char Buf[96];
+        const int N = ::snprintf(Buf, sizeof(Buf), "write lock was acquired by tid %u here:\n", AcquirerTid);
+        ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+        ::backtrace_symbols_fd(AcquirerBacktrace, AcquirerFrames, STDERR_FILENO);
+      }
+      return;
+    }
     LOGMAN_THROW_A_FMT(Result == 0, "{} failed to lock with {}", __func__, Result);
   }
 
   void unlock_shared() {
+    if (SharedRefusedDepth() > 0) [[unlikely]] {
+      --SharedRefusedDepth();
+      return;
+    }
     unlock();
   }
 
@@ -103,9 +162,16 @@ public:
     return Result == 0;
   }
 
-  // Asserts that the rwlock isn't exclusively owned by the calling thread.
+  // Asserts that the rwlock is already exclusively owned by the calling thread.
+  // See ForkableUniqueMutex::check_lock_owned_by_self: a checker that succeeds
+  // in taking the lock has found a caller without it, and must give the lock
+  // back rather than leak it.
   void check_lock_owned_by_self_as_write() {
     const auto Result = pthread_rwlock_wrlock(&Mutex);
+    if (Result == 0) [[unlikely]] {
+      pthread_rwlock_unlock(&Mutex);
+      ReportUnownedLockAssertion("ForkableSharedMutex::check_lock_owned_by_self_as_write");
+    }
     LOGMAN_THROW_A_FMT(Result == EDEADLK, "User of rwlock must have already locked mutex as write!");
   }
 
@@ -115,6 +181,40 @@ public:
     Mutex = PTHREAD_RWLOCK_INITIALIZER;
   }
 private:
+  static int& SharedRefusedDepth() {
+    static thread_local int Depth = 0;
+    return Depth;
+  }
+  // FEX_LOCKDIAG=1: record the write acquirer's backtrace (costs a backtrace()
+  // per write lock; diagnostic only).
+  static bool LockDiagEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = ::getenv("FEX_LOCKDIAG");
+      return Env && Env[0] == '1';
+    }();
+    return Enabled;
+  }
+public:
+  // Diagnostic (FEX_LOCKDIAG=1 only): is the write lock currently held by the
+  // calling thread? Used by the signal delegator to report a guest signal
+  // being delivered on top of a locked host frame.
+  bool WriteHeldBySelfDiag() const {
+    return LockDiagEnabled() && AcquirerFrames > 0 && AcquirerTid == static_cast<uint32_t>(::syscall(SYS_gettid));
+  }
+  void ReportAcquirerDiag() const {
+    if (AcquirerFrames > 0) {
+      char Buf[96];
+      const int N = ::snprintf(Buf, sizeof(Buf), "write lock is held by tid %u, acquired here:\n", AcquirerTid);
+      ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+      ::backtrace_symbols_fd(AcquirerBacktrace, AcquirerFrames, STDERR_FILENO);
+    }
+  }
+
+private:
+  static constexpr int AcquirerMax = 24;
+  void* AcquirerBacktrace[AcquirerMax] {};
+  int AcquirerFrames {};
+  uint32_t AcquirerTid {};
   pthread_rwlock_t Mutex;
 };
 
@@ -145,12 +245,12 @@ public:
       // X86-64 must do an additional check around the store.
       if ((Result - 1) == 0) {
         // Must happen after the refcount store
-        auto InterruptFaultPage = reinterpret_cast<Core::NonAtomicRefCounter<uint64_t>*>(&Thread->InterruptFaultPage);
+        auto InterruptFaultPage = reinterpret_cast<Core::NonAtomicRefCounter<uint64_t>*>(Thread->CurrentFrame->InterruptFaultPagePtr);
         InterruptFaultPage->Store(0);
       }
 #else
       Thread->CurrentFrame->State.DeferredSignalRefCount.Decrement(1);
-      auto InterruptFaultPage = reinterpret_cast<Core::NonAtomicRefCounter<uint64_t>*>(&Thread->InterruptFaultPage);
+      auto InterruptFaultPage = reinterpret_cast<Core::NonAtomicRefCounter<uint64_t>*>(Thread->CurrentFrame->InterruptFaultPagePtr);
       InterruptFaultPage->Store(0);
 #endif
     }
