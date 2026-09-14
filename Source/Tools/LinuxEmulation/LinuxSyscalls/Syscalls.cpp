@@ -1411,7 +1411,7 @@ uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXC
 // load so the per-syscall check is a compare against a constant.
 static const uint64_t HostFaultInjectSyscall = [] {
   const char* Env = getenv("FEX_HOSTFAULT_INJECT");
-  return Env ? strtoull(Env, nullptr, 0) : ~0ull;
+  return (Env && *Env) ? strtoull(Env, nullptr, 0) : ~0ull;
 }();
 static const bool HostFaultInjectSegv = [] {
   const char* Env = getenv("FEX_HOSTFAULT_INJECT");
