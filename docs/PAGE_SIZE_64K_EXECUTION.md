@@ -632,6 +632,95 @@ failures list, since it passes on 4K. This confirms the 09-11 state: the
 ~170 `jit_500` failures under full mode are gone after 3bada1c9d, and
 the row would now catch a regression of that class.
 
+### 2026-09-14, transparent huge pages on 64K: audit and the FEX_THP knob
+
+On a POWER8 hash MMU THP exists only with a 64K base page; op64k runs
+`/sys/kernel/mm/transparent_hugepage/enabled = madvise`, `hpage_pmd_size` =
+16 MiB. So every `MADV_HUGEPAGE` FEX ever issued was dead on the 4K box and is
+live on 64K -- but a hint only takes for a 16 MiB-aligned, 16 MiB window that
+lies entirely inside one VMA, and FEX's internal placement hint
+(`GetInternalPlacementHint`, 4K-granular, bumps by size + one 4K page) makes
+every reservation misaligned by construction. An `mprotect` or `MADV_DONTNEED`
+over part of a huge page splits it back to base pages (correct, just no longer
+huge). The table is every large anonymous reservation FEX makes, with the
+state *before* this change in the "hinted" column.
+
+| site | size / count | lifetime | 16 MiB-aligned & sized? | sub-16 MiB mprotect / DONTNEED? | hinted before | verdict |
+|---|---|---|---|---|---|---|
+| JIT code buffers, `CodeBuffer` (`FEXMemJIT`, CPUBackend.cpp) | 16 -> 32 -> 64 -> 128 MiB, geometric; starts at 128 MiB when the code cache is on; process-wide, old buffers linger while a thread still runs them | process | sized yes; aligned NO (placement hint) | the trailing guard page (`PROT_NONE`, one host page) splits the last PMD; nothing else | yes, unconditional | **can benefit**: aligned now under `code`; a 128 MiB buffer gets 7 huge pages (the guard page costs the 8th), 16 MiB gets none |
+| per-buffer block index (`FEXBlockIndex`) | AllocatedSize/64*4 = 8 MiB at 128 MiB | with its buffer | no (< 16 MiB) | no | no | cannot |
+| L2 page-pointer table (`FEXMem_Lookup` head, LookupCache.cpp) | VirtualMemSize/4K*8: 128 MiB (64-bit), 8 MiB (32-bit); **per thread** | thread | sized only for 64-bit; aligned NO | whole-table DONTNEED only (ClearL2Cache) | yes (Enable), dead by alignment | can benefit (sparse by guest VA: one huge page per 1 GiB of guest VA that has code) -- `lookup`, OFF |
+| L2 entry pool (`FEXMem_Lookup` middle) | 128 MiB per thread, bump-allocated in 32 KiB steps | thread | sized yes; aligned NO | whole-pool DONTNEED only | explicitly NOHUGEPAGE | left off: dense while it grows, but 100 threads x 16 MiB first-touch is the RSS story below |
+| L1 lookup table (`FEXMem_Lookup_L1`) | 16 MiB per thread, dynamic L1 starts at 128 KiB | thread | sized yes; aligned NO (base + 8/128 MiB) | whole-L1 DONTNEED on resize/scrub (zaps, never splits) | yes (Enable), dead by alignment | can benefit -- `lookup`, OFF: every thread's first touch faults a whole 16 MiB (100 threads: +1.6 GiB RSS) |
+| 64-bit allocator object arena (`FEXMem_Misc`, 64BitAllocator.cpp) | 64 MiB, forward-only, dense | process | sized yes; aligned by luck (a `/proc/self/maps` gap edge) | no | yes, unconditional | **can benefit**: aligned now under `alloc64` |
+| FEX-internal mappings through the 64-bit allocator (`VirtualAlloc` -> `OSAllocator_64Bit::Mmap`, MAP_FIXED into the 48-bit reservations) | the code buffers, lookup caches, block index, callret stacks land here for a 64-bit guest | varies | per site above | per site above | per site above | covered by the per-site rows; the allocator itself adds nothing |
+| 64-bit guest mappings (`SyscallHandler::GuestMmap`, straight to the host kernel, kernel-placed below the 48-bit region) | guest-sized | guest | guest's choice | guest mprotect (4K-granular via the granule layer) splits | no; guest `madvise` passes through | `guest`, OFF: hint anon-private only, measured not assumed |
+| 32-bit guest mappings (`GuestMmap` -> `LinuxAllocator.cpp`) | guest-sized | guest | guest's choice | same | no | `guest`, OFF, same site |
+| rpmalloc spans (`FEXAllocator`, AllocatorHooks.cpp `FEX_rp_mmap`) | 256 MiB span mapped as 512 MiB VA and aligned to 256 MiB, per thread heap per page class (64K / 4M / 64M) | thread heap | sized and aligned YES | DONTNEED decommit per page class splits | explicitly NOHUGEPAGE | `rpmalloc`, OFF: would take, but sparse per-heap spans make it an RSS bet |
+| granule private backing (`MakeGranuleFEXBacked`, GranuleMemory.cpp) | one 64K host page per call, MAP_FIXED | guest | no (one host page) | it *is* the sub-16 MiB unit | no | cannot |
+| thunk low-4G trampoline pool (`ThunkLibs/include/common/Host.h`) | max(64K, host page) per pool | process | no | no | no | cannot |
+| dispatcher code (`PPC64Dispatcher.cpp`) | 64 KiB | process | no | no | no | cannot |
+| callret shadow stacks (`FEXMem_CallRetStacks`, ThreadManager.cpp) | CALLRET_STACK_SIZE + 2 guard pages per thread, mapped PROT_NONE then mprotected | thread | no | guard pages | explicitly NOHUGEPAGE | cannot; keep off |
+| bridge thread stacks, HLT page, SAO probe (FexBridge.cpp) | stack-sized / one page | thread | no | guard page | no | cannot; bridge code buffers are FEXCore's `CodeBuffer` (covered by `code`) |
+| stats shm (`ThreadManager::StatAlloc`), fault page, guest-trace ring | 4 MiB shared / 1 page / file-backed | process | no / shared / file | -- | no | not anonymous-THP material |
+
+Implemented (`FEXCore/include/FEXCore/Utils/THP.h`, header-only so the
+bundled-allocator static library, FEXCore, the syscall layer and the bridge
+all read one mask): `FEX_THP=<names|mask>` with `code`=1, `lookup`=2,
+`alloc64`=4, `rpmalloc`=8, `guest`=16, `all`, `none`; **default `code,alloc64`**
+-- the two dense sites that were hinted before, now placed so the hint can
+take (over-map by one PMD and trim, or skip to the boundary in the stolen
+region; address space only, no RSS, and on a kernel without THP `PMDSize()`
+is 0 and every layout is the historical one, bit for bit). `lookup` also
+pads the L2 table up to a PMD multiple so the entry pool and L1 land on
+boundaries (`L2TableSpan`; ClearL2Cache scrubs by it). `rpmalloc` off keeps
+the historical `MADV_NOHUGEPAGE`; `guest` hints anonymous private mappings
+once, at `SyscallHandler::GuestMmap`'s success path (both widths; the first
+cut put it in the 64-bit *allocator*, which only FEX's own reservations go
+through -- the live-process `smaps` check caught the guest VMA without `hg`),
+the guest's own madvise still passing through. The interpreter applies the merged config
+(`THP`/`THPLog` rows in Config.json.in, so a config-book row can carry them)
+before `InitAllocator`; the bridge reads the environment raw, as it does for
+every knob. `FEX_THPLOG=1` prints one `[FEX THP] pid= exit= mask= pmd=
+enabled= AnonHugePages= Rss=` line from `/proc/self/smaps_rollup` at
+`exit_group`, on the fatal-signal path (open/read/write only, no allocation)
+and through `atexit` for the bridge lane; `=2` adds a per-VMA-name breakdown
+(`FEXMemJIT`, `FEXMem_Lookup_L1`, `FEXMem_Misc`, `FEXAllocator`, `[anon]`,
+library basenames) from `/proc/self/smaps`. Branch `wt/64k-thp`.
+
+Verified on op64k (`build-wt-thp`, python3 allocating and touching 200 MB
+under `FEX_HOSTPAGEMODE=force FEX_THPLOG=2`; the guest reads its own
+`smaps_rollup` while the block is live, FEX reports at `exit_group` after
+python has freed it):
+
+| FEX_THP | guest-visible AnonHugePages (block live) | FEX exit report | per name |
+|---|---|---|---|
+| `none` | 0 kB | 0 kB, Rss 65 MB | -- |
+| default (`code,alloc64`) | 32 MB | 32 MB, Rss 85 MB | FEXMem_Misc 16 MB, code buffer 16 MB (the first PMD of the 1 GiB buffer; python compiles a few MB of code, so THP rounds that up to 16 MB RSS) |
+| `guest` | 192 MB (12 of the 200 MB block's 12 aligned windows) | 0 kB (freed) | -- |
+| `all` | 256 MB | 64 MB, Rss 101 MB | + FEXAllocator 16 MB; the L1/L2 hints took (`madvise` seen in strace) but python's single thread touched less than a huge page of each |
+
+Two things the runs caught, both fixed on the branch: (1) the first cut
+tested `flags & MAP_SHARED_VALIDATE`, which is `MAP_SHARED|MAP_PRIVATE` as a
+bit pattern and so rejected every private mapping -- the `hg` flag missing
+from the guest VMA in a live `smaps` was the tell; (2) `VirtualName` latched
+"unsupported" on the first `EINVAL`, and Core.cpp's naming of the malloc'd
+`InternalThreadState` (unaligned, 4224 bytes) is always EINVAL, so
+`FEXMem_Lookup`, `FEXMemJIT`, `FEXBlockIndex` and `FEXMem_CallRetStacks`
+were never named on either kernel; unaligned requests are skipped now and
+EINVAL no longer latches. Not run: `ctest` in `build-wt-thp` (only `Bin/FEX`
+and `Bin/FEXServer` were built there, per the one-run budget); the mapping
+subset is the orchestrator's to run on the merged tree.
+
+Measurement plan (orchestrator): each lane at `FEX_THP=none` (the true
+pre-64K baseline: no hint takes), default, `code,alloc64,lookup`, `all`, with
+`FEX_THPLOG=2` to read coverage and the per-name RSS; watch Rss against the
+`none` run before reading fps. nw lane (CP2077, W3): `code` is the only site
+that matters (Wine owns guest memory, FEX's `guest` bit is inert there;
+`lookup` is the RSS question with ~100 threads). Linux lane (RimWorld,
+python): `guest` is the interesting bit -- it is the only one that can move a
+data-TLB-bound workload, and the only one that can cost real memory.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle

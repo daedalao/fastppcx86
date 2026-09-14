@@ -2,6 +2,7 @@
 #ifdef ENABLE_FEX_ALLOCATOR
 #include <rpmalloc/rpmalloc.h>
 #ifndef _WIN32
+#include <FEXCore/Utils/THP.h>
 #include <linux/prctl.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
@@ -179,8 +180,13 @@ static void* FEX_rp_mmap(size_t size, size_t alignment, size_t* offset, size_t* 
 #endif
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, map_size, global_config.page_name);
 
-    // Disable HUGEPAGE on allocation from rpmalloc.
-    madvise(ptr, map_size, MADV_NOHUGEPAGE);
+    // THP on rpmalloc's spans is a knob (FEX_THP=rpmalloc, OFF by default):
+    // every span is a 256 MiB reservation mapped with 256 MiB alignment, so a
+    // hint would take, but the spans are per-thread-heap and sparsely
+    // committed (64K / 4M / 64M page classes, decommitted with DONTNEED), so a
+    // huge page under a barely-used span is 16 MiB of RSS per heap per class.
+    // Off keeps the historical MADV_NOHUGEPAGE.
+    FEXCore::Allocator::THP::HintOrRefuse(ptr, map_size, FEXCore::Allocator::THP::RPMalloc);
   }
 
   if (ptr == nullptr) {

@@ -36,6 +36,7 @@ $end_info$
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/memory.h>
 
@@ -1281,6 +1282,10 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // mapping (host-granular) and SMCChecks is forced off above, so a larger host page
   // needs only the stage-S2 fixes -- default to continuing. FEX_HOSTPAGEMODE overrides.
   FEX::HostPageGate::CheckHostPageSize(true, FEX::HostPageGate::Mode::Force);
+  // FEX_THP / FEX_THPLOG are read raw from the environment (FEXCore/Utils/THP.h),
+  // same as every other knob in this lane. Wine exits through the host's exit(),
+  // so the coverage report rides the atexit chain here.
+  FEXCore::Allocator::THP::InstallReportAtExit();
   // The lazy-SMC trio must fall with it.  The gaming launcher exports
   // FEX_SMCLAZYINVAL/SCRUB/LINK=1 for every title, and the env layer above
   // dutifully delivers them -- but the JIT reads these RAW (PPC64JITCore

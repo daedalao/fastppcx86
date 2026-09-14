@@ -64,6 +64,7 @@ $end_info$
 #include <unistd.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
 #include <FEXHeaderUtils/Syscalls.h>
@@ -2150,6 +2151,11 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
         return reinterpret_cast<void*>(-errno);
       }
     }
+
+    // FEX_THP=guest (off by default): the one place every guest mmap of either
+    // width comes through with its host address in hand. Anonymous private
+    // only; the guest's own madvise passes through and wins.
+    FEXCore::Allocator::THP::HintGuestMapping(reinterpret_cast<void*>(Result), length, flags, fd);
 
     SMC_AUDIT("[%d] guest-mmap addr=%lx len=%lx prot=%x flags=%x fd=%d\n", FHU::Syscalls::gettid(), Result, length, prot, flags, fd);
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
