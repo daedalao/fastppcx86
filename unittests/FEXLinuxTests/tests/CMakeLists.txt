@@ -33,7 +33,10 @@ endforeach()
 
 target_link_libraries(pthread_cancel.${BITNESS} PRIVATE pthread)
 
-target_link_libraries(ptr_integrity_mt.${BITNESS} PRIVATE pthread)
+# 64-bit only (ptr_integrity_mt.64.cpp): no such target in the 32-bit project.
+if(TARGET ptr_integrity_mt.${BITNESS})
+  target_link_libraries(ptr_integrity_mt.${BITNESS} PRIVATE pthread)
+endif()
 
 target_link_options(smc-1-dynamic.${BITNESS} PRIVATE -z execstack)
 
