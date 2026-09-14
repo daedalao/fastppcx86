@@ -848,6 +848,12 @@ seeds differ per launch, so four legs per arm). `rwgran-*` stats and the
 driver use this rule from now on; the rearm A/B still needs the in-world
 rerun.
 
+2026-09-14 16:43, `FEX_SMCGRANULEPOLICY=rearm` in-world, phase-aware: rearm
+p50 26.5 / 22.8 ms (35.4 / 42.2 fps), default 35.3 / 25.2 ms (30.1 / 38.1
+fps). A lean toward rearm inside the map-to-map spread; not a default change
+on two legs each. Worth a config-book row for RimWorld once a fixed-seed
+scenario exists; otherwise closed with the item.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
