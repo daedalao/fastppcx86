@@ -274,7 +274,9 @@ struct fex_gen_config<glXQueryDrawable> {};
 template<>
 struct fex_gen_config<glXSelectEvent> {};
 template<>
-struct fex_gen_config<glXSwapBuffers> {};
+// Custom host impl: the FEX_FRAMELOG frame counter wraps the real swap
+// (libGL_Host.cpp). No marshalling difference.
+struct fex_gen_config<glXSwapBuffers> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXUseXFont> {};
 template<>

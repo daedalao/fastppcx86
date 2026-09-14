@@ -10,6 +10,7 @@ $end_info$
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <string_view>
@@ -298,6 +299,68 @@ static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t GuestTarget, ui
 
 #include "thunkgen_host_libGL.inl"
 
+// FEX_FRAMELOG=<path>: per-frame log of the host-side glXSwapBuffers cadence,
+// written as a MangoHud-shaped CSV ("fps,frametime,elapsed" header, one row per
+// swap, frametime in ms, elapsed in s since the first swap) so Scripts and
+// ~/fex-scripts/scene_stats.py read it unchanged. Exists because MangoHud's GL
+// layer lives in the guest's process image and cannot see the thunked host
+// swaps, so every GL Linux-lane title (RimWorld, Dex, ...) had no fps column;
+// the Vulkan thunk does not need this (MangoHud's Vulkan layer is host-side).
+// One clock_gettime and one fprintf per frame; the FILE* is line-buffered by
+// the kernel page cache, not by us, so a SIGKILLed session keeps its rows.
+// Off (no work at all beyond one branch) unless the variable is set.
+namespace {
+struct FrameLog {
+  FILE* File {};
+  bool Tried {};
+  struct timespec Prev {};
+  struct timespec First {};
+  std::mutex Mutex;
+
+  void Swap() {
+    if (!Tried) {
+      Tried = true;
+      const char* Path = getenv("FEX_FRAMELOG");
+      if (Path && *Path) {
+        File = fopen(Path, "a");
+        if (File) {
+          fprintf(File, "fps,frametime,elapsed\n");
+          fflush(File);
+        }
+      }
+    }
+    if (!File) {
+      return;
+    }
+    struct timespec Now {};
+    clock_gettime(CLOCK_MONOTONIC, &Now);
+    if (Prev.tv_sec == 0 && Prev.tv_nsec == 0) {
+      Prev = Now;
+      First = Now;
+      return;
+    }
+    const double FrameMs = (Now.tv_sec - Prev.tv_sec) * 1e3 + (Now.tv_nsec - Prev.tv_nsec) / 1e6;
+    const double Elapsed = (Now.tv_sec - First.tv_sec) + (Now.tv_nsec - First.tv_nsec) / 1e9;
+    Prev = Now;
+    fprintf(File, "%.2f,%.4f,%.4f\n", FrameMs > 0 ? 1000.0 / FrameMs : 0.0, FrameMs, Elapsed);
+    fflush(File);
+  }
+};
+FrameLog frame_log;
+} // namespace
+
+void fexfn_impl_libGL_glXSwapBuffers(Display* dpy, GLXDrawable drawable) {
+  fexldr_ptr_libGL_glXSwapBuffers(dpy, drawable);
+  static const bool Enabled = [] {
+    const char* Path = getenv("FEX_FRAMELOG");
+    return Path && *Path;
+  }();
+  if (Enabled) {
+    std::lock_guard lk {frame_log.Mutex};
+    frame_log.Swap();
+  }
+}
+
 #ifdef IS_32BIT_THUNK
 // Single source of truth for the pointer-relocating custom_host_impl family.
 //
@@ -451,6 +514,8 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
     return (VoidFn)fexfn_impl_libGL_glXChooseFBConfig;
   } else if (name_sv == "glXChooseFBConfigSGIX") {
     return (VoidFn)fexfn_impl_libGL_glXChooseFBConfigSGIX;
+  } else if (name_sv == "glXSwapBuffers") {
+    return (VoidFn)fexfn_impl_libGL_glXSwapBuffers;
   } else if (name_sv == "glXGetCurrentDisplay") {
     return (VoidFn)fexfn_impl_libGL_glXGetCurrentDisplay;
   } else if (name_sv == "glXGetCurrentDisplayEXT") {
