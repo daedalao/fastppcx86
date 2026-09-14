@@ -835,6 +835,19 @@ A/Bs are being redone (mixed on/off first, rearm after). Lesson for the
 harness: a scene window must be located from the frame log's phase change,
 never assumed from a wall-clock offset.
 
+2026-09-14 16:10, FEX_SMCGRANULEMIXED in-world, phase-aware (the window
+starts 20 s after each leg's own map-load stall, the last frame over 5 s;
+a fixed offset mislabels because the loading screen's length depends on the
+config under test). Heuristic on: map loaded at 394 / 401 s, in-world p50
+55.2 / 54.1 ms (17.0 / 17.6 fps). Off: map loaded at 208 / 235 s, p50 23.6 /
+31.9 ms (40.6 / 26.7 fps). The guards nearly double world generation and
+halve play. Default OFF confirmed on the right window; the mechanism stays
+under its knob for a cheaper validation form. The in-world 64K reference for
+a fresh quicktest colony is 24-32 ms p50 (27-41 fps, map-dependent; quicktest
+seeds differ per launch, so four legs per arm). `rwgran-*` stats and the
+driver use this rule from now on; the rearm A/B still needs the in-world
+rerun.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
