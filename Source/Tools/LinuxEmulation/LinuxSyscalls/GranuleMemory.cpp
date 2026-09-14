@@ -17,6 +17,7 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
@@ -469,6 +470,15 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
 
       Tracking.Granules.SetIntended(SubBase, SubEnd - SubBase, prot);
       Tracking.Granules.RematerialiseIfNeeded(G);
+    }
+
+    // FEX_THP=guest (off by default): an anonymous private request that came
+    // this way (a 4K-multiple length, glibc's usual malloc mmap) is now a run
+    // of per-granule VMAs; one hint over the whole run marks them all and lets
+    // the kernel merge them back into one huge-page-eligible VMA.
+    if (Anonymous) {
+      FEXCore::Allocator::THP::HintGuestMapping(reinterpret_cast<void*>(GranuleStart), GranuleEnd - GranuleStart,
+                                                (flags & ~(MAP_SHARED | MAP_SHARED_VALIDATE)) | MAP_ANONYMOUS | MAP_PRIVATE, -1);
     }
 
     // VMATracking keeps describing what the GUEST asked for, at guest

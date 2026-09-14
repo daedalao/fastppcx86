@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "Common/HostPageGate.h"
+#include <FEXCore/Utils/THP.h>
 #include "Common/ArgumentLoader.h"
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
@@ -486,6 +487,18 @@ int main(int argc, char** argv, char** const envp) {
   // at construction, which is why degrade-mode forcing has to happen HERE), no
   // thread state, no guest mapping, no compiled code. Refusing is still clean.
   FEX::HostPageGate::CheckHostPageSize(true);
+
+  // THP policy (FEX_THP / FEX_THPLOG, FEXCore/Utils/THP.h). The merged config
+  // layer wins over the raw environment the header falls back to, so a
+  // per-title AppConfig row can carry it; applied before anything large is
+  // reserved (the 64-bit allocator's arena comes with InitAllocator below).
+  if (auto Value = FEXCore::Config::Get(FEXCore::Config::CONFIG_THP); Value && *Value && !(*Value)->empty()) {
+    FEXCore::Allocator::THP::SetMask(FEXCore::Allocator::THP::ParseMask((*Value)->c_str()));
+  }
+  if (auto Value = FEXCore::Config::Get(FEXCore::Config::CONFIG_THPLOG); Value && *Value && !(*Value)->empty()) {
+    FEXCore::Allocator::THP::SetLogLevel(static_cast<int>(std::strtol((*Value)->c_str(), nullptr, 10)));
+  }
+  FEXCore::Allocator::THP::InstallReportAtExit();
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");

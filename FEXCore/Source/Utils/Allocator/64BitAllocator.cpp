@@ -6,6 +6,7 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -536,28 +537,41 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
   // Need to allocate the ObjectAlloc up front. Find a region that is larger than our minimum size first.
   const size_t ObjectAllocSize = 64 * 1024 * 1024;
 
+  // THP (FEX_THP=alloc64, on by default): the arena is dense and forward-only,
+  // so a huge page under it is never wasted, but the hint only takes on a
+  // PMD-aligned window. The stolen region's start is a /proc/self/maps gap
+  // edge, host-page aligned at best; skip forward to the PMD when the site is
+  // on and the kernel has THP (0 otherwise: the historical placement).
+  const size_t ThpAlign = FEXCore::Allocator::THP::AlignmentFor(FEXCore::Allocator::THP::Alloc64, ObjectAllocSize);
+
   for (auto& it : Ranges) {
-    if (ObjectAllocSize > it.Size) {
+    uintptr_t Base = reinterpret_cast<uintptr_t>(it.Ptr);
+    if (ThpAlign) {
+      Base = (Base + ThpAlign - 1) & ~(ThpAlign - 1);
+    }
+    const size_t Skip = Base - reinterpret_cast<uintptr_t>(it.Ptr);
+    if (ObjectAllocSize + Skip > it.Size) {
       continue;
     }
+    void* const ArenaPtr = reinterpret_cast<void*>(Base);
 
     // Allocate up to 64 MiB the first allocation for an intrusive allocator
-    mprotect(it.Ptr, ObjectAllocSize, PROT_READ | PROT_WRITE);
+    mprotect(ArenaPtr, ObjectAllocSize, PROT_READ | PROT_WRITE);
 
     // This enables the kernel to use transparent large pages in the allocator which can reduce memory pressure
-    ::madvise(it.Ptr, ObjectAllocSize, MADV_HUGEPAGE);
+    FEXCore::Allocator::THP::Hint(ArenaPtr, ObjectAllocSize, FEXCore::Allocator::THP::Alloc64);
 
-    FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(it.Ptr), ObjectAllocSize);
+    FEXCore::Allocator::VirtualName("FEXMem_Misc", ArenaPtr, ObjectAllocSize);
 
-    ObjectAlloc = new (it.Ptr) Alloc::ForwardOnlyIntrusiveArenaAllocator(it.Ptr, ObjectAllocSize);
+    ObjectAlloc = new (ArenaPtr) Alloc::ForwardOnlyIntrusiveArenaAllocator(ArenaPtr, ObjectAllocSize);
     ReservedRegions = ObjectAlloc->new_construct(ReservedRegions, ObjectAlloc);
     LiveRegions = ObjectAlloc->new_construct(LiveRegions, ObjectAlloc);
 
-    if (it.Size >= ObjectAllocSize) {
-      // Modify region size
-      it.Size -= ObjectAllocSize;
-      (uint8_t*&)it.Ptr += ObjectAllocSize;
-    }
+    // Hand the rest of the region on. The alignment skip (if any) stays
+    // PROT_NONE reservation like the rest of the stolen range; it is not
+    // returned to the pool, address space is not the scarce resource here.
+    it.Size -= ObjectAllocSize + Skip;
+    (uint8_t*&)it.Ptr += ObjectAllocSize + Skip;
 
     break;
   }

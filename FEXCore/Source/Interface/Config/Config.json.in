@@ -551,6 +551,34 @@
           "No effect at all on a 4K host."
         ]
       },
+      "THP": {
+        "Type": "str",
+        "Default": "",
+        "Desc": [
+          "Which of FEX's own large anonymous reservations carry MADV_HUGEPAGE",
+          "(and are placed on a huge-page boundary so the hint can take). Only",
+          "live on a kernel with transparent huge pages -- the 64K POWER8 kernel",
+          "(16 MiB huge page); a no-op on the 4K hash kernel. See",
+          "FEXCore/Utils/THP.h and the audit in docs/PAGE_SIZE_64K_EXECUTION.md.",
+          "Comma-separated names or a numeric mask:",
+          "\tcode      JIT code buffers (FEXMemJIT)",
+          "\tlookup    per-thread L1 lookup table + L2 page-pointer table",
+          "\talloc64   the 64-bit guest allocator's 64 MiB object arena",
+          "\trpmalloc  the bundled allocator's 256 MiB spans",
+          "\tguest     the guest's anonymous private mappings (Linux lane only)",
+          "\tall, none, default",
+          "Empty (default) means code,alloc64."
+        ]
+      },
+      "THPLog": {
+        "Type": "int32",
+        "Default": "0",
+        "Desc": [
+          "1: print AnonHugePages/Rss from /proc/self/smaps_rollup at exit",
+          "(exit_group, fatal signal, or the host's exit() in the bridge lane).",
+          "2: also a per-VMA-name breakdown from /proc/self/smaps."
+        ]
+      },
       "SMCSoftInvalidate": {
         "Type": "bool",
         "Default": "false",

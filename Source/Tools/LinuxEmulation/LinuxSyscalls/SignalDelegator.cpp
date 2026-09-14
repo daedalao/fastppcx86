@@ -15,6 +15,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -1718,6 +1719,8 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 #endif
 
     FEX::HLE::_SyscallHandler->TM.CleanupForExit();
+    // FEX_THPLOG: open/read/write only, no allocation, so it is safe here.
+    FEXCore::Allocator::THP::Report("signal");
 
     // Reassign back to DFL and crash
     signal(Signal, SIG_DFL);

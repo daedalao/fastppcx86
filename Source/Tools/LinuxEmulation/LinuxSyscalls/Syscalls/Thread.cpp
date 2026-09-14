@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/Event.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 
 #include <FEXHeaderUtils/Syscalls.h>
@@ -777,6 +778,8 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     // Save telemetry if we're exiting.
     FEX::HLE::_SyscallHandler->GetSignalDelegator()->SaveTelemetry();
     FEX::HLE::_SyscallHandler->TM.CleanupForExit();
+    // FEX_THPLOG: the guest's exit_group never runs the host's atexit chain.
+    FEXCore::Allocator::THP::Report("exit_group");
 
     syscall(SYSCALL_DEF(exit_group), status);
     // This will never be reached
