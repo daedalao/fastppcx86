@@ -556,6 +556,21 @@ out-of-tree `ntsync.ko` in `~/ntsync-mod-64k` had a stale vermagic after the
 kernel, installed under `/lib/modules/<ver>/extra`, `/etc/modules-load.d/
 ntsync.conf` added. `ls /dev/ntsync` is part of the pre-lap checklist now.
 
+2026-09-14, THP and TLB baseline on the 64K kernel (CP2077 nw lane, mid
+benchmark, whole process, 10 s `perf stat`). THP is `madvise` with 16 MB
+huge pages (POWER8 hash MMU has THP only with a 64K base page, so every
+`MADV_HUGEPAGE` hint in FEX is live for the first time). Coverage:
+AnonHugePages 426 MB of 5.37 GB anonymous RSS (8%); 3.3 GB resident sits in
+anonymous VMAs with no huge pages, the two largest (1.65 GB, 0.6 GB) being
+wine's own guest heap views, which FEX does not allocate. Miss rates per
+1000 instructions: DERAT 64K 0.75, DERAT 16M 0.11, IERAT 64K 0.28, IERAT
+16M 0.13, TLB 0.20, dTLB 0.09, iTLB 0.005; CPI 1.9. At tens of cycles per
+reload that is about 1% of cycles, so huge pages are bounded to roughly
+that on the nw lane; the instruction-count wall stands. Also recorded: the
+box had rebooted with `ondemand`; `/etc/default/cpupower` now pins
+`performance` and `cpupower.service` is enabled, next to the ntsync
+modules-load entry.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
