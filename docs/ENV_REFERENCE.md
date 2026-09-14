@@ -133,6 +133,7 @@ Two-stage arming where noted: set the var, then `touch` the trigger file.
 | `FEX_FUTEX_EINTR_PASSTHRU` | Escape hatch: restore always-surface `EINTR` on futex. |
 | `FEX_FUTEX_RESCUE` | Futex wedge rescue path. |
 | `FEX_HOSTFAULTTOGUEST` | Escape hatch for the host-fault gate: a synchronous fault raised in FEX's own host code (deferred-signal section, dispatcher, FABI crossing, or any SIGTRAP/SIGILL/SIGFPE outside JIT code) is reported and then delivered to the guest as before, instead of terminating with the default disposition. Bisection lever only; the delivery abandons the host frame and its locks. |
+| `FEX_SERVERCODECACHE` | `=1` re-enables the client's request for server-side code cache generation (FEXServer spawning `FEXOfflineCompiler`). Off by default: the server's staleness test never finds the cache it looks for and the offline compiler's cache id never matches a runtime reader (TASK_QUEUE T1/T3), so with `FEXOfflineCompiler` on PATH every launch spent a core recompiling caches nobody loaded. |
 | `FEX_NO_THUNK_PARTIAL_FILL` | Disable partial thunk fill. Presence-tested — `=0` enables it. |
 
 ### Paths and test hooks

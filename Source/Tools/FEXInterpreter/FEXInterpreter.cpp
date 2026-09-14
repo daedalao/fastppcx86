@@ -719,9 +719,26 @@ int main(int argc, char** argv, char** const envp) {
 
   SyscallHandler->DefaultProgramBreak(BRKInfo.Base, BRKInfo.Size);
 
-  // Request code cache generation
+  // Request server-side code cache generation. Opt-in (FEX_SERVERCODECACHE=1)
+  // until the generator can reproduce the requesting client's configuration:
+  // FEXServer's staleness test compares against a cache filename with a zero
+  // unique id that nothing ever writes, so every request schedules an offline
+  // recompile of every binary in the code map, and FEXOfflineCompiler loads
+  // its config with an empty environment, so the cache id it writes never
+  // matches the id a runtime reader computes (docs/TASK_QUEUE.md T1/T3). The
+  // path was dormant only while FEXOfflineCompiler was off PATH; the fexplay
+  // launcher puts the build's Bin on PATH, and on the 64K box every Linux-lane
+  // launch was spawning a core's worth of offline compiles whose output nobody
+  // loaded. The runtime writer (SaveCodeCaches, FEX_CODECACHESCOPE) is the
+  // generator whose id matches its reader, and it needs no server help.
   if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
-    FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    static const bool ServerCodeCache = [] {
+      const char* Env = getenv("FEX_SERVERCODECACHE");
+      return Env && *Env && *Env != '0';
+    }();
+    if (ServerCodeCache) {
+      FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    }
   }
 
   // Pull RIP and stack pointer from loader and set the thread data to it.
