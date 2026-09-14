@@ -54,7 +54,9 @@ if which("catchsegv") is None:
 for i in range(len(sys.argv) - args_start_index):
     RunnerArgs.append(sys.argv[args_start_index + i])
 
-if (disabled_tests.get(current_test)):
+# Disabled tests match the short name (every variant) or the full name
+# ("<variant>/<short name>", one variant only), like known failures below.
+if (disabled_tests.get(current_test) or disabled_tests.get(full_test_name)):
     # This error code tells ctest that the test was skipped
     sys.exit(125)
 

@@ -72,6 +72,10 @@ option(BUILD_THUNKS_32BIT "Build the 32-bit guest thunk libraries" ON)
 # unittests/, and the 32-bit tests were handed the 64-bit sysroot.
 set(X86_DEV_ROOTFS_32 "${X86_DEV_ROOTFS}" CACHE PATH
     "Sysroot used to build the 32-bit guest stub libraries and 32-bit FEXLinuxTests")
+# Second leg of the 64-bit ASM suite under FEX_SMCCHECKS=full (the tier the
+# 64K host's FEX_HOSTPAGEMODE=degrade forces). Off by default so the test
+# count on a 4K host is unchanged.
+option(ENABLE_SMC_FULL_TESTS "Add a jit_500_smcfull variant of the 64-bit ASM tests (FEX_SMCCHECKS=full)" OFF)
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 
