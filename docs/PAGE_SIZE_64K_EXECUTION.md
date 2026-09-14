@@ -545,6 +545,17 @@ DONTFORK over a sub-64K range). Pre-existing by mechanism (none of them
 reaches the mprotect path); a future madvise emulation could split the
 granule into FEX-backed private memory the way sub-granule MAP_FIXED does.
 
+2026-09-14, the 64K CP2077 reference (nw lane, `FEX_HWTSO=1`, launcher
+defaults, `~/fex-scripts/cp2077_64k_ref.sh`): laps 2-4 after a warm-up
+`64k-nts-2..4` = 23.74 / 23.61 / 23.48 fps (scene p50 37.9-38.8 ms), against
+the 4K nw references of 23.03 (lock batch) and 24.2 (pre-lock). Parity. The
+first attempt (`64k-ref-1..4`, 11.8-13.8 fps, p50 70-81 ms, GameThread at
+100% with every worker in `anon_pipe_read`) ran without ntsync: the
+out-of-tree `ntsync.ko` in `~/ntsync-mod-64k` had a stale vermagic after the
+7.2.5-books-64k kernel update and was not loaded. Rebuilt against the running
+kernel, installed under `/lib/modules/<ver>/extra`, `/etc/modules-load.d/
+ntsync.conf` added. `ls /dev/ntsync` is part of the pre-lap checklist now.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
