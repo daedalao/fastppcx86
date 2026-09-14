@@ -571,6 +571,67 @@ box had rebooted with `ondemand`; `/etc/default/cpupower` now pins
 `performance` and `cpupower.service` is enabled, next to the ntsync
 modules-load entry.
 
+2026-09-14, test infrastructure for the 64K workstream (branch
+`wt/64k-tests`, verified in `src/build-wt-tests` on op64k, a copy of
+build-smc's configuration). Two pieces.
+
+(a) FEXLinuxTests build in the gaming configuration. build-smc had
+`BUILD_FEX_LINUX_TESTS=OFF`, so `hostfault_gate` (bd60de758) had never been
+built through ctest. Turning it on hit four breaks, all fixed on the
+branch: the 32-bit tests project was handed `X86_DEV_ROOTFS` (the x86_64
+cross sysroot, no i686 crt/libgcc: `cannot open crtbeginS.o`, `-lgcc`);
+`X86_DEV_ROOTFS_32` is now declared at the top of the tree and the 32-bit
+tests use it (91591fe04). `ptr_integrity_mt` is 64-only but its
+`target_link_libraries` was unconditional (32-bit configure error);
+`greg_mutation.64` spun on a numeric `1: ... jz 1b` label that clang
+22's Intel-syntax parser reads as a binary number (e7467600a); and
+`atomics_smp.cpp` names rax/rdx in every asm block, so it is now
+`atomics_smp.64.cpp` (bed81f74c, ctest name unchanged). Nothing in the
+toolchain files needed to change: `toolchain_x86_64.cmake` autodetects
+`/usr/x86_64-pc-linux-gnu` as the sysroot and clang finds that gcc's
+libstdc++ on its own, so `X86_DEV_ROOTFS=/` is fine for the 64-bit side.
+
+To flip build-smc (its cache already carries `X86_DEV_ROOTFS_32`; merge
+`wt/64k-tests` first, then reconfigure in place):
+
+```bash
+cd ~/projects/fex-emu-ppc64le/src
+cmake -DBUILD_FEX_LINUX_TESTS=ON -DENABLE_SMC_FULL_TESTS=ON build-smc
+nice ninja -C build-smc
+```
+
+The full fresh-configure line that reproduced build-smc plus these two
+options is `~/scratch-64k/tests/configure.sh` on op64k (RelWithDebInfo,
+clang + lld, `ENABLE_LTO=False`, `ENABLE_ASSERTIONS=False`,
+`BUILD_TESTS=True`, `BUILD_THUNKS=True`, `BUILD_THUNKS_32BIT=True`,
+`BUILD_GUEST_THUNKS_32=ON`, `ENABLE_CLANG_GUEST_THUNKS_32=ON`,
+`X86_DEV_ROOTFS_32=$HOME/.local/share/fex-emu/RootFS/ArchLinux`,
+`BUILD_FEX_LINUX_TESTS=ON`, `ENABLE_SMC_FULL_TESTS=ON`). Suite census
+with both on: 13437 tests; the FEXLinuxTests binaries land in
+`unittests/FEXLinuxTests/FEXLinuxTests_{64,32}/` (58 and 50).
+
+Results on 64K (`ulimit -c 0; FEX_HOSTPAGEMODE=force ctest -R hostfault_gate`):
+`hostfault_gate.64.jit.flt` and `hostfault_gate.32.jit.flt` both pass,
+and the verbose log shows the injection firing (`FEX: FATAL host fault:
+signal 5 ... raised in a deferred-signal section ... Not delivered to the
+guest`, 4 assertions), so the pass is not the vacuous no-injection path.
+
+(b) The SMC-full CI row (229672b95). `ENABLE_SMC_FULL_TESTS` (default
+OFF, so the 4K count is unchanged) adds `jit_500_smcfull/Test_64Bit_*`:
+jit_500's configuration plus `FEX_SMCCHECKS=full`, 2019 rows, the same
+2019 as `jit_500/Test_64Bit_*`. Known failures and disabled tests apply
+per variant by full name (`jit_500_smcfull/Test_64Bit_<path>.asm`) in
+`Known_Failures_jit` / `Disabled_Tests`; `testharness_runner.py` now
+matches the disabled list by full name too. Run on 64K
+(`FEX_HOSTPAGEMODE=force ctest -j16 -R jit_500_smcfull`, 10 s wall):
+**2018/2019 pass**. The one failure, `Displacement_Encoding`, fails the
+same way under `jit_1` and `jit_500` on this host (the 4K page at
+0x7FFFF000, the open granule/loader item above), so it is a 64K-host
+failure and not an SMC-full one; it is deliberately not on a known-
+failures list, since it passes on 4K. This confirms the 09-11 state: the
+~170 `jit_500` failures under full mode are gone after 3bada1c9d, and
+the row would now catch a regression of that class.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle

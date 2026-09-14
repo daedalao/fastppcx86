@@ -61,6 +61,21 @@ set(X86_DEV_GCC_TOOLCHAIN "" CACHE FILEPATH "Optional GCC cross-toolchain root p
 # 32-bit thunks require an i686 multilib sysroot in addition to the x86_64 one. Hosts that only have
 # a 64-bit cross-toolchain can disable them; nothing 64-bit-guest-only depends on these.
 option(BUILD_THUNKS_32BIT "Build the 32-bit guest thunk libraries" ON)
+# Sysroot for everything built for the i686 guest: the 32-bit guest stub
+# libraries and the 32-bit FEXLinuxTests. The x86_64 dev sysroot generally has
+# no 32-bit libc/libgcc at all, so linking i686 objects against it fails with
+# "unable to find library -lc". The FEX RootFS does ship them (Arch:
+# usr/lib32), and it is what the guest links against at runtime anyway.
+# Defaults to X86_DEV_ROOTFS so existing configurations are unchanged.
+# Declared here, before unittests/ is added, so the FEXLinuxTests project sees
+# it; it used to live inside the BUILD_THUNKS block below, which runs after
+# unittests/, and the 32-bit tests were handed the 64-bit sysroot.
+set(X86_DEV_ROOTFS_32 "${X86_DEV_ROOTFS}" CACHE PATH
+    "Sysroot used to build the 32-bit guest stub libraries and 32-bit FEXLinuxTests")
+# Second leg of the 64-bit ASM suite under FEX_SMCCHECKS=full (the tier the
+# 64K host's FEX_HOSTPAGEMODE=degrade forces). Off by default so the test
+# count on a 4K host is unchanged.
+option(ENABLE_SMC_FULL_TESTS "Add a jit_500_smcfull variant of the 64-bit ASM tests (FEX_SMCCHECKS=full)" OFF)
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 
@@ -689,13 +704,8 @@ if (BUILD_THUNKS)
   set(ENABLE_CLANG_GUEST_THUNKS_32 ${ENABLE_CLANG_GUEST_THUNKS} CACHE BOOL
       "Build the 32-bit guest stub libraries with clang instead of gcc")
 
-  # Sysroot for the 32-bit guest stubs only. The x86_64 dev sysroot generally
-  # has no 32-bit libc/libgcc at all, so linking i686 objects against it fails
-  # with "unable to find library -lc". The FEX RootFS does ship them (Arch:
-  # usr/lib32), and it is what the guest links against at runtime anyway.
-  # Defaults to X86_DEV_ROOTFS so existing configurations are unchanged.
-  set(X86_DEV_ROOTFS_32 "${X86_DEV_ROOTFS}" CACHE PATH
-      "Sysroot used to build the 32-bit guest stub libraries")
+  # X86_DEV_ROOTFS_32 (the sysroot for the 32-bit guest stubs) is declared at
+  # the top of this file, next to X86_DEV_ROOTFS.
   if (BUILD_GUEST_THUNKS)
     # Thunk targets for guest libraries
     include(ExternalProject)

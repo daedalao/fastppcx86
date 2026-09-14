@@ -23,7 +23,12 @@ ExternalProject_Add(FEXLinuxTests_32
   "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
   "-DENABLE_CLANG_THUNKS=True"
   "-DBITNESS=32"
-  "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+  # The i686 tests link against the 32-bit sysroot (toolchain_x86_32.cmake
+  # adds its usr/lib32), the same one the 32-bit guest stubs use. On a
+  # ppc64le host X86_DEV_ROOTFS is the x86_64 cross sysroot, which has no
+  # 32-bit libc, so handing it here failed every 32-bit link with
+  # "unable to find library -lc".
+  "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS_32}"
   "-DX86_DEV_GCC_TOOLCHAIN=${X86_DEV_GCC_TOOLCHAIN}"
   INSTALL_COMMAND ""
   BUILD_ALWAYS ON)
