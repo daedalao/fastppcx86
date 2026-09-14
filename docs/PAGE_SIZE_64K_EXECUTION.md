@@ -774,6 +774,25 @@ that matters (Wine owns guest memory, FEX's `guest` bit is inert there;
 python): `guest` is the interesting bit -- it is the only one that can move a
 data-TLB-bound workload, and the only one that can cost real memory.
 
+2026-09-14, FEX_SMCGRANULEMIXED A/B on RimWorld Linux (`-quicktest`, a
+generated map straight into play, mtrack + lazy recipe, code cache on; driver
+`~/fex-scripts/rimworld_granule_ab.sh`, `perf stat` over the 20 s window
+starting 120 s after launch; MangoHud cannot see the GL thunk, so no fps
+column). Heuristic off (`FEX_SMCGRANULEMIXED=0`) vs on (default 64):
+page faults 879,368 vs 5,141 per window (44 K/s vs 260/s), kernel cycles
+28.3 G (8.7%) vs 17.7 G (4.9%), user instructions retired 68.6 G vs 141.7 G
+at 296 G vs 340 G user cycles (IPC 0.23 vs 0.42), task-clock 95 s vs 104 s.
+Flip reports 201 (storms for the whole lap) vs 77 with 75 demotions, none
+repeated. Guarded blocks add instructions, but retiring twice the user work
+for 15% more cycles is the off arm stalling in the fault storms and their
+granule-wide invalidations, not guard overhead. Verdict: default ON stands.
+Open: an in-game frame or tick counter for the Linux lane (the GL thunk
+needs a MangoHud path or a RimWorld-side TPS log) before a fps number is
+claimed. Found on the way: FEXServer's offline cache generation was live on
+the Linux lane (the fexplay launcher puts Bin on PATH) and spawned a core's
+worth of `FEXOfflineCompiler` at every launch for caches nobody loads; the
+client request is now opt-in (`FEX_SERVERCODECACHE=1`, e2a106ee3).
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
