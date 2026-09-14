@@ -789,8 +789,9 @@ granule-wide invalidations, not guard overhead. Verdict: default ON stands.
 Open: an in-game frame or tick counter for the Linux lane (the GL thunk
 needs a MangoHud path or a RimWorld-side TPS log) before a fps number is
 claimed. Found on the way: FEXServer's offline cache generation was live on
-the Linux lane (the fexplay launcher puts Bin on PATH) and spawned a core's
-worth of `FEXOfflineCompiler` at every launch for caches nobody loads; the
+the Linux lane (the fexplay launcher puts Bin on PATH) and spawned
+`FEXOfflineCompiler` runs at every launch (a second or two of a core each,
+per the ps sampler) for caches nobody loads; the
 client request is now opt-in (`FEX_SERVERCODECACHE=1`, e2a106ee3).
 
 ### Morning kickoff checklist (orchestrator)
