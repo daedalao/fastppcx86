@@ -435,11 +435,14 @@ Open items, in priority order: (1) DONE 09-14: a fatal trap or fault raised
 in FEX's own host code is no longer delivered to the guest as a signal (the
 host-fault gate in `HandleGuestSignal`, below); (2) mtrack arming
 heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
-also the flip log prints the count after clearing it); (3) DONE 09-14: the
+the flip log's count is fixed 09-14: it travels with the report instead of
+being read after the fault cleared it); (3) DONE 09-14: the
 S4b/S4c wiring (below; the raw `GuestM*` host calls are reached only for
 whole-granule ranges, whose table entries the `Granule::*` front already
-keeps in step); (4) HWTSO
-SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
+keeps in step); (4) DONE 09-14: HWTSO
+SAO refusal on an emulated granule now retries plain and revokes (the
+whole-granule file mmap inside `Granule::Mmap` was the only refusable site;
+the anonymous mmaps and the FEX-backed mprotects cannot refuse); (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
 op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
 exists; (7) DONE 09-12: NCS code cache on 64K (host page in the identity hash, no format change needed, launcher default on); (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).

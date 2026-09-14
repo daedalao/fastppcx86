@@ -245,7 +245,10 @@ public:
       // Single-slot mailbox: a second hot granule in the same window simply
       // overwrites the first. Losing a report is free; blocking or allocating
       // in a SIGSEGV handler is not.
+      // The tracked count travels with the report: the mask was just cleared
+      // above, so the mark path cannot read it back from the table.
       PendingReportFlips.store(static_cast<uint32_t>(ReportFlips), std::memory_order_relaxed);
+      PendingReportTracked.store(static_cast<uint32_t>(__builtin_popcount(Mask)), std::memory_order_relaxed);
       PendingReportGranule.store(GranuleBase | 1, std::memory_order_release);
     }
     return Mask;
@@ -293,13 +296,14 @@ public:
 
   // Drain the flip-rate mailbox. NON-signal callers only (it is the caller that
   // then logs). Returns false when there is nothing to report.
-  bool TakeFlipReport(uint64_t* GranuleBase, uint32_t* Flips) {
+  bool TakeFlipReport(uint64_t* GranuleBase, uint32_t* Flips, uint32_t* Tracked) {
     const uint64_t Slot = PendingReportGranule.exchange(0, std::memory_order_acquire);
     if (!Slot) {
       return false;
     }
     *GranuleBase = Slot & ~1ull;
     *Flips = PendingReportFlips.load(std::memory_order_relaxed);
+    *Tracked = PendingReportTracked.load(std::memory_order_relaxed);
     return true;
   }
 
@@ -335,6 +339,7 @@ private:
   // Low bit is the "slot full" flag so a granule base of 0 is representable.
   std::atomic<uint64_t> PendingReportGranule {0};
   std::atomic<uint32_t> PendingReportFlips {0};
+  std::atomic<uint32_t> PendingReportTracked {0};
 };
 
 [[nodiscard]]

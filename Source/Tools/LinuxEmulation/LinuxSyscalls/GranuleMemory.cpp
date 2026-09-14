@@ -392,6 +392,7 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
 
   std::optional<FEX::HLE::SyscallHandler::LateApplyExtendedVolatileMetadata> LateMetadata;
   std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
+  bool RevokeHWTSO = false;
   {
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
     auto& Tracking = Hndl->VMATracking;
@@ -420,8 +421,19 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
           *Result = static_cast<uint64_t>(-ENOMEM);
           return true;
         }
-        void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(prot), flags | MAP_FIXED,
-                         Anonymous ? -1 : fd, FileOffset);
+        // FEX_HWTSO: the same refusal protocol as GuestMmap. A file the kernel
+        // will not map with PROT_SAO (device memory, some filesystems) is
+        // retried exactly as the guest asked; a success on ordinary memory is
+        // an ordering hole and revokes hardware TSO below, outside the
+        // VMATracking scope. The anonymous mmaps on this path cannot refuse.
+        const int HostProt = FEX::HLE::HardwareTSO::ApplyGuestProt(prot);
+        void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, HostProt, flags | MAP_FIXED, Anonymous ? -1 : fd, FileOffset);
+        if (M == MAP_FAILED && HostProt != prot) {
+          M = ::mmap(reinterpret_cast<void*>(G), HostSize, prot, flags | MAP_FIXED, Anonymous ? -1 : fd, FileOffset);
+          if (M != MAP_FAILED) {
+            RevokeHWTSO |= FEX::HLE::HardwareTSO::OnRangeRefusedSAO("mmap", M, HostSize, Anonymous ? -1 : fd);
+          }
+        }
         if (M == MAP_FAILED) {
           *Result = static_cast<uint64_t>(-errno);
           return true;
@@ -463,6 +475,13 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     // granularity. That is the fiction discipline of §7: the granule table is
     // the only place the host's coarser reality is recorded.
     LateMetadata = Hndl->TrackMmap(Thread, GuestBase, Size, prot, flags, fd, offset, CachedSection);
+  }
+
+  // FEX_HWTSO: same placement as GuestMmap -- first thing outside the
+  // VMATracking scope (RevokeHardwareTSO takes ThreadCreationMutex and the
+  // exclusive CodeInvalidationMutex) and before the result reaches the guest.
+  if (RevokeHWTSO) {
+    Hndl->RevokeHardwareTSO(Thread, "mmap", reinterpret_cast<void*>(GuestBase), Size);
   }
 
   Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, Size);

@@ -986,13 +986,16 @@ void ReportGranuleFlips() {
   }
   uint64_t Granule = 0;
   uint32_t Flips = 0;
-  if (!FEX::HLE::SMCGranule::Table().TakeFlipReport(&Granule, &Flips)) {
+  uint32_t Tracked = 0;
+  if (!FEX::HLE::SMCGranule::Table().TakeFlipReport(&Granule, &Flips, &Tracked)) {
     return;
   }
+  // Tracked is the count at the fault that tripped the threshold; the table's
+  // own count is zero by now (NoteFault cleared the mask), which is what this
+  // line used to print.
   LogMan::Msg::IFmt("SMC granule {:#x}-{:#x} flipped {} times in one second with {} of {} guest pages tracked; mtrack is paying the "
                     "whole granule for a fraction of it (FEX_SMCGRANULEFLIPLOG)",
-                    Granule, Granule + FEXCore::HostPage::Size(), Flips, FEX::HLE::SMCGranule::Table().TrackedCount(Granule),
-                    FEX::HLE::SMCGranule::PagesPerGranule());
+                    Granule, Granule + FEXCore::HostPage::Size(), Flips, Tracked, FEX::HLE::SMCGranule::PagesPerGranule());
 }
 } // namespace
 
