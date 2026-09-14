@@ -794,6 +794,20 @@ the Linux lane (the fexplay launcher puts Bin on PATH) and spawned
 per the ps sampler) for caches nobody loads; the
 client request is now opt-in (`FEX_SERVERCODECACHE=1`, e2a106ee3).
 
+2026-09-14 13:36, FEX_SMCGRANULEMIXED verdict REVERSED by the frame log.
+With `FEX_FRAMELOG` (f74dffe96) and `vblank_mode=0`, the same quicktest A/B
+measured in-world frametimes (60-220 s in, counterbalanced, 2 laps each):
+heuristic off p50 4.30 / 4.16 ms (185.8 / 159.0 fps), on p50 8.50 / 8.45 ms
+(99.7 / 100.3 fps). The per-instruction validation on the demoted code pages
+halves the main thread's throughput; the fault storms it removes land mostly
+on worker threads. The perf-stat reading earlier today ("twice the user
+instructions retired at higher IPC") was the guards, not extra work: a
+counter A/B without a frame counter is not a verdict. Default is now 0
+(off); the knob and the mechanism stay for a cheaper validation form (per
+block entry rather than per instruction) or a hotness-aware demotion.
+Next: the same fps A/B for `FEX_SMCGRANULEPOLICY=rearm`, the other way to
+narrow the storms without guarding code.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle

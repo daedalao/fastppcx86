@@ -65,7 +65,15 @@ namespace FEX::HLE::SMCGranule {
 // FEX_SMCGRANULEMIXED's default (flips per second; 0 = off). See the block
 // comment above MixedFlipThreshold() and the 2026-09-14 smoke numbers in
 // docs/PAGE_SIZE_64K_EXECUTION.md for why it sits where it does.
-inline constexpr uint32_t kMixedFlipThresholdDefault = 64;
+// Default OFF (0) since the 2026-09-14 frame-log A/B: on RimWorld's quicktest
+// map, demoting the thrashing granules halved in-world fps (p50 4.2 -> 8.5 ms,
+// 160-186 -> 100 fps, 2 laps each, counterbalanced). The per-instruction
+// validation on the demoted code pages costs the main thread more than the
+// fault storms it removes, which land mostly on worker threads. The 20 s
+// perf-stat windows had pointed the other way ("2x instructions retired at
+// higher IPC"): that was the guards themselves. Opt in with
+// FEX_SMCGRANULEMIXED=<flips per second>.
+inline constexpr uint32_t kMixedFlipThresholdDefault = 0;
 
 // Guest pages per host granule: 1 on a 4K host, 16 on a 64K host.
 [[nodiscard]]
