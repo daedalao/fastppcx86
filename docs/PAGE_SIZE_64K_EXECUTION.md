@@ -821,6 +821,20 @@ bounds RimWorld's frame on 64K is unmeasured: the next step is a main-thread
 profile in-world (select the game with `pgrep -f "Bin/FEX .*RimWorldLinux"`,
 not `pgrep -x FEX`), and a late-game save for the load that matters.
 
+2026-09-14 14:30, CORRECTION (user caught it): every RimWorld fps number
+above was taken on the world-gen LOADING SCREEN. One long quicktest leg with
+the frame log gives the phases (seconds since launch, p50 frametime): 0-60
+menu/splash 1.2-1.4 ms; 60-210 world-gen loading screen 4.2-4.8 ms (the
+window all of today's A/Bs used); 210-240 map load, a 13 s hitch; in world
+from ~240 s at 28.6-29.3 ms (~34 fps), drifting to 31-41 ms (24-32 fps) by
+480 s as the colony ages. So: the mixed-heuristic "halves fps" and the
+"rearm no effect" verdicts are loading-screen results and are VOID for play;
+the in-world RimWorld reference on 64K is ~29 ms p50 on a fresh quicktest
+map. The driver now runs 540 s legs and reports 270-450 s only; the in-world
+A/Bs are being redone (mixed on/off first, rearm after). Lesson for the
+harness: a scene window must be located from the frame log's phase change,
+never assumed from a wall-clock offset.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
