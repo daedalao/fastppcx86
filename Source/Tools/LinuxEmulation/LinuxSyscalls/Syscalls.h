@@ -547,6 +547,7 @@ public:
   ///// VMA (Virtual Memory Area) tracking /////
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+  bool GuestCodePageValidateOnly(uint64_t Page) override;
 
   ///// Mono backpatcher hook (Linux port of Source/Windows/Common/InvalidationTracker.cpp) /////
   //

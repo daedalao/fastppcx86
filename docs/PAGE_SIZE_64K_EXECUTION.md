@@ -433,10 +433,9 @@ profiled on either kernel. Queued under (8) below.
 
 Open items, in priority order: (1) DONE 09-14: a fatal trap or fault raised
 in FEX's own host code is no longer delivered to the guest as a signal (the
-host-fault gate in `HandleGuestSignal`, below); (2) mtrack arming
-heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
-the flip log's count is fixed 09-14: it travels with the report instead of
-being read after the fault cleared it); (3) DONE 09-14: the
+host-fault gate in `HandleGuestSignal`, below); (2) DONE 09-14: mtrack arming
+heuristic for mixed code/data granules (`FEX_SMCGRANULEMIXED`, below; S4c's
+tracked count and flip rate are its inputs); (3) DONE 09-14: the
 S4b/S4c wiring (below; the raw `GuestM*` host calls are reached only for
 whole-granule ranges, whose table entries the `Granule::*` front already
 keeps in step); (4) DONE 09-14: HWTSO
@@ -631,6 +630,60 @@ failure and not an SMC-full one; it is deliberately not on a known-
 failures list, since it passes on 4K. This confirms the 09-11 state: the
 ~170 `jit_500` failures under full mode are gone after 3bada1c9d, and
 the row would now catch a regression of that class.
+
+2026-09-14, the mixed code/data granule heuristic (open item 2,
+`FEX_SMCGRANULEMIXED`, branch `wt/64k-mixed`). The measurement that framed
+it: RimWorld Linux (Mono) under mtrack on this kernel, lazy recipe, code
+cache on, 4m20s (`~/benchlogs/rimworld-64k-smoke-0914.log`): the flip log
+reported 172 times over 81 distinct granules flipping >= 64 times a second,
+103 of the reports with exactly 1 of 16 guest pages tracked (the hottest
+granule re-reported 12 times); each flip is a granule-wide unprotect, an
+invalidation across every thread and a re-arm at the next compile, and on a
+4K host none of those granules would ever flip. Design chosen: (a) from the
+prompt's three. A granule that reaches N faults inside a one-second window
+while holding at most M tracked pages is *demoted*: mtrack never arms it
+again, and every block compiled from any of its guest pages carries the
+per-instruction `ValidateCode` guard that `SMCCHECKS=full` wraps around
+every instruction -- the per-block opt-in already existed
+(`Block.ForceFullSMCDetection`, the mono tailcall block, and the 3bada1c9d
+continuation-block fix covers this path); `GuestCodePageValidateOnly` on the
+syscall handler is the page-driven input. (b) is unsound by the `rearm`
+policy's own construction; (c) is the `FEX_SMCLAZYINVAL` argument HotSpot
+disproved. Soundness (section 5's rule): an unguarded block may live on a
+page only while its granule is armed; demotion happens in `NoteFault`, on a
+fault whose service invalidates the whole granule under the exclusive
+`CodeInvalidationMutex` (forced granule-wide under `rearm` and never
+deferred by the lazy path for the demoting fault), so it orders after every
+compile that read "not demoted" and kills what they published, and every
+later compile (under the shared lock, the same hold in which
+`MarkGuestExecutableRange` reads the bit) guards. All three block publishers
+consult it: the fresh compile guards a block if any of its `CodePages` is
+demoted, `TryRelinkSoftInvalidatedBlock` refuses a retained (unguarded)
+block on a demoted page, and the code cache rejects a section whose page
+table touches a demoted granule before registering any block. `Forget`
+keeps a demoted entry while the granule is only partially retired (the mark
+path is NewPage-gated and would not run again for the surviving pages). The
+S4b contract holds: `Armed()` stays false for a demoted granule, so
+`WantedProt` keeps `PROT_WRITE` in the union. Full argument in
+`SMCHostGranule.h`. Knobs: `FEX_SMCGRANULEMIXED=<flips/s>` (default 64, 0
+off, forced off on 4K), `FEX_SMCGRANULEMIXEDMAXTRACKED` (default 4). The one
+smoke run (budget: one, the box carried a concurrent ctest run at load ~24;
+`build-wt-mixed`, same launcher env as the baseline via `fexplay-wtsmc`,
+3 minutes, `op64k:~/scratch-64k/mixed/play_rimworld_20260914-081548.log`):
+40 flip-log lines, every one a demotion of a distinct granule at its 64th
+flip (28 with 1/16 tracked, 7 with 2/16, 5 with 3/16), and no granule
+reported again after its demotion -- against the baseline's 172 reports
+with granules re-reporting up to 12 times per session. No code-cache
+rejection fired, no error, RimWorld 1.6.4850 loaded and the engine ran the
+full 3 minutes (61642 UnityPlayer blocks saved at exit). Default ON on that
+evidence. NOT verified: the invalidator's CPU share (the mid-run
+`perf record` failed to find the game pid by comm and the budget did not
+allow a second run), fps, and the cost of the guarded blocks themselves
+(28 demoted granules hold one code page each; if a hot Mono method lives
+there its block runs the full-mode guard per instruction). Next: a
+counterbalanced fps lap pair with `FEX_SMCGRANULEMIXED=0` vs default, and
+`perf` on the game pid (comm under FEX is not `RimWorldLinux`; find it by
+args).
 
 ### Morning kickoff checklist (orchestrator)
 
