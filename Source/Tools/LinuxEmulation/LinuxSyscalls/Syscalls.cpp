@@ -1407,6 +1407,17 @@ uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXC
 #endif
 }
 
+// See the FEX_HOSTFAULT_INJECT comment in HandleSyscallImpl. Resolved once at
+// load so the per-syscall check is a compare against a constant.
+static const uint64_t HostFaultInjectSyscall = [] {
+  const char* Env = getenv("FEX_HOSTFAULT_INJECT");
+  return Env ? strtoull(Env, nullptr, 0) : ~0ull;
+}();
+static const bool HostFaultInjectSegv = [] {
+  const char* Env = getenv("FEX_HOSTFAULT_INJECT");
+  return Env && strstr(Env, ",segv") != nullptr;
+}();
+
 uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args, uint64_t JITPC) {
   // Phase 3 of signal-cluster fix: defer async signals across the entire
   // host syscall body. Background:
@@ -1440,6 +1451,21 @@ uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, 
   // fault correctly. This Phase 3 closes the loop by actually arming the guard
   // at the right scope.
   FEXCore::DeferredSignalRefCountGuard SignalGuard(Frame->Thread);
+
+  // FEX_HOSTFAULT_INJECT=<guest syscall nr>[,segv]: test hook for the
+  // SignalDelegator host-fault gate. Raises a fault in FEX's own host code,
+  // inside this deferred-signal section, whenever the guest makes that
+  // syscall: a `trap` (SIGTRAP, the shape of every FEX assert) or, with
+  // ",segv", a store through a null pointer (SIGSEGV). unittests/FEXLinuxTests
+  // signal/hostfault_gate.cpp drives it with getppid. One load and one
+  // predictable compare per syscall when unset.
+  if (Args->Argument[0] == HostFaultInjectSyscall) [[unlikely]] {
+    if (HostFaultInjectSegv) {
+      *reinterpret_cast<volatile uint32_t*>(8) = 0;
+    } else {
+      FEX_TRAP_EXECUTION;
+    }
+  }
 
   // FEX_SMCLAZYINVAL drain point (b): guest syscall entry.
   //

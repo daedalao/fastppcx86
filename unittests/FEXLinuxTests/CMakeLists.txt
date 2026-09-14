@@ -118,6 +118,17 @@ if(TEST thunk_testlib.64.jit.flt)
   set_property(TEST "thunk_testlib.64.jit.flt" APPEND PROPERTY ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_INSTALL_PREFIX}/lib")
 endif()
 
+# hostfault_gate injects a trap into FEX's own syscall body on getppid
+# (x86-64 nr 110, i386 nr 64); see the test source.
+foreach(VARIANT "jit.flt" "hwtso.jit.flt")
+  if(TEST "hostfault_gate.64.${VARIANT}")
+    set_property(TEST "hostfault_gate.64.${VARIANT}" APPEND PROPERTY ENVIRONMENT "FEX_HOSTFAULT_INJECT=110")
+  endif()
+  if(TEST "hostfault_gate.32.${VARIANT}")
+    set_property(TEST "hostfault_gate.32.${VARIANT}" APPEND PROPERTY ENVIRONMENT "FEX_HOSTFAULT_INJECT=64")
+  endif()
+endforeach()
+
 # Only emulated
 add_custom_target(fex_linux_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"

@@ -31,6 +31,7 @@ $end_info$
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <functional>
 #include <linux/futex.h>
@@ -1438,6 +1439,101 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     // Postpone the remainder of signal handling logic until we process the SIGSEGV triggered by writing to InterruptFaultPage.
     return;
   }
+
+#if defined(ARCHITECTURE_ppc64le)
+  // Host-fault gate (64K execution plan, open item 1).
+  //
+  // A synchronous fatal-class signal (kernel si_code) whose host PC is not in
+  // any JIT code buffer was not raised by the guest program's instructions. If
+  // it was raised inside a deferred-signal section (a syscall body, the block
+  // linker/compiler, VMA tracking), at a dispatcher or FABI-stub PC, or is a
+  // trap-class signal that guest code cannot produce from host text at all
+  // (SIGTRAP from FEX's own `trap` asserts, SIGILL, SIGFPE), then it is FEX's
+  // fault, and building a guest signal frame on top of it is never right:
+  //
+  //   - the guest handler sees a stale block-boundary RIP and a context that
+  //     has nothing to do with the fault, so what it does is arbitrary;
+  //   - if it returns, the faulting host instruction re-executes and the same
+  //     signal fires again (a `trap` loops forever);
+  //   - if it does not return (Mono's managed-exception unwind, a longjmp), the
+  //     host frame is abandoned with every lock it held. RimWorld Linux on the
+  //     64K kernel leaked VMATracking's write lock exactly this way: the code
+  //     invalidator's deadline trap, delivered as a guest SIGTRAP on top of
+  //     Granule::Madvise (a90c5cd26), and the game ran one frame a minute.
+  //
+  // Faults the guest IS entitled to see stay on their paths: a fault inside a
+  // JIT block (IsAddressInCodeBuffer), a synthesized fault from the Break op's
+  // dispatcher stubs (FaultToTopAndGeneratedException, set by the op and
+  // cleared by StoreThreadState), the interrupt-fault-page poke and the
+  // FaultSafeUserMemAccess probes (both handled before this point), and SMC
+  // faults (HandleSegfault runs as a host handler before HandleGuestSignal).
+  // A SIGSEGV/SIGBUS in a thunk's host library with no deferred section
+  // active is deliberately NOT gated: that is a host library dereferencing a
+  // guest-supplied pointer, the outside-JIT delivery below is the historical
+  // behaviour for it, and no FEX lock is held there.
+  //
+  // What happens instead: one loud report on stderr (raw write, so the
+  // default-silent log cannot swallow it), the host backtrace, the VMA lock
+  // holder if FEX_LOCKDIAG is on, then the signal's default disposition is
+  // restored and the handler returns. The kernel re-raises the fault at the
+  // original instruction, so the coredump carries the real faulting context,
+  // not a re-raise from inside this handler. The unhandled-crash tail further
+  // down (FlushAndCloseCodeMap, telemetry, CleanupForExit) is skipped on
+  // purpose: by hypothesis this thread may hold FEX locks those paths take.
+  //
+  // FEX_HOSTFAULTTOGUEST=1 restores the old delivery after the report, as a
+  // bisection lever for a title that happened to survive it.
+  if ((Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL || Signal == SIGFPE || Signal == SIGTRAP) && !IsAsyncSignal(&SigInfo, Signal)) {
+    const uint64_t HostPC = ArchHelpers::Context::GetPc(UContext);
+    const bool Synthesized = Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException;
+    const char* Region = nullptr;
+    if (!Synthesized && !CTX->IsAddressInCodeBuffer(Thread, HostPC)) {
+      if (MustDeferSignal) {
+        Region = "a deferred-signal section (syscall body, block linker/compiler or VMA tracking)";
+      } else if (IsAddressInDispatcher(HostPC)) {
+        Region = "the dispatcher";
+      } else if (IsAddressInFABIStubs(HostPC) || InFABICrossing) {
+        Region = "an F80/vector FABI helper crossing";
+      } else if (Signal == SIGTRAP || Signal == SIGILL || Signal == SIGFPE) {
+        Region = "host code outside every generated-code region";
+      }
+    }
+    if (Region) [[unlikely]] {
+      static const bool DeliverAnyway = getenv("FEX_HOSTFAULTTOGUEST") != nullptr;
+      char Buf[640];
+      const int N = ::snprintf(Buf, sizeof(Buf),
+                               "FEX: FATAL host fault: signal %d (si_code %d, addr 0x%lx) at host nip 0x%lx lr 0x%lx, raised in %s; tid %u; "
+                               "guest rip 0x%lx (block-boundary value, may be stale); DeferredSignalRefCount %lu; InSyscallInfo 0x%lx. "
+                               "%s\n",
+                               Signal, SigInfo.si_code, reinterpret_cast<unsigned long>(SigInfo.si_addr), (unsigned long)HostPC,
+                               (unsigned long)_context->uc_mcontext.regs->link, Region, FHU::Syscalls::gettid(),
+                               (unsigned long)Thread->CurrentFrame->State.rip,
+                               (unsigned long)Thread->CurrentFrame->State.DeferredSignalRefCount.Load(),
+                               (unsigned long)Thread->CurrentFrame->InSyscallInfo,
+                               DeliverAnyway ? "FEX_HOSTFAULTTOGUEST is set: delivering it to the guest anyway." :
+                                               "Not delivered to the guest (the host frame and any locks it holds would be abandoned); "
+                                               "terminating with the default disposition. FEX_HOSTFAULTTOGUEST=1 delivers it instead.");
+      ::write(STDERR_FILENO, Buf, N > 0 ? static_cast<size_t>(N) : 0);
+      {
+        void* Frames[48];
+        const int Count = ::backtrace(Frames, 48);
+        static const char Hdr[] = "FEX: host backtrace (this handler first, the faulting frame follows the kernel sigtramp):\n";
+        ::write(STDERR_FILENO, Hdr, sizeof(Hdr) - 1);
+        ::backtrace_symbols_fd(Frames, Count, STDERR_FILENO);
+      }
+      if (FEX::HLE::_SyscallHandler && FEX::HLE::_SyscallHandler->VMATracking.Mutex.WriteHeldBySelfDiag()) {
+        FEX::HLE::_SyscallHandler->VMATracking.Mutex.ReportAcquirerDiag();
+      }
+      if (!DeliverAnyway) {
+        struct sigaction sa {};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(Signal, &sa, nullptr);
+        return;
+      }
+    }
+  }
+#endif
 
   // Diagnostic (FEX_ABORT_TRIPWIRE=1): log every guest-delivered fatal-class
   // sync signal with its si_addr/si_code and the guest RIP. Paired with the

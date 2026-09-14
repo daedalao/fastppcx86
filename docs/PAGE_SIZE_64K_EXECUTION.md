@@ -431,9 +431,9 @@ instance did 60 fps at the menu. Before calling it a 64K problem, measure the
 tutorial under mtrack on 64K and on op4k; RimWorld's Linux lane has not been
 profiled on either kernel. Queued under (8) below.
 
-Open items, in priority order: (1) a fatal trap or fault raised in FEX's own
-host code must never be delivered to the guest as a signal (it abandons the
-host frame with its locks); (2) mtrack arming
+Open items, in priority order: (1) DONE 09-14: a fatal trap or fault raised
+in FEX's own host code is no longer delivered to the guest as a signal (the
+host-fault gate in `HandleGuestSignal`, below); (2) mtrack arming
 heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
 also the flip log prints the count after clearing it); (3) route the raw
 `GuestM*` host calls in `SyscallsSMCTracking.cpp` through the granule layer
@@ -491,6 +491,23 @@ the granule layer refuses an unaligned MAP_SHARED file mapping (EINVAL, the
 survey's known refusal); pre-existing, the ld.so and main-executable
 mappings placed by the ELF loader itself are not cache-loaded on either
 kernel.
+
+2026-09-14, the host-fault gate (open item 1). `HandleGuestSignal` now
+classifies a synchronous fatal-class signal (kernel `si_code`) whose host PC
+is outside every JIT code buffer: raised in a deferred-signal section (syscall
+body, block linker/compiler, VMA tracking), at a dispatcher or FABI-stub PC or
+inside a FABI crossing, or a SIGTRAP/SIGILL/SIGFPE anywhere in host text, it is
+FEX's own fault. Such a fault is reported on stderr with the host backtrace
+(and the VMA lock holder under `FEX_LOCKDIAG`), then the signal's default
+disposition is restored and the handler returns, so the kernel re-raises it
+at the original instruction and the core carries the real context. The Break
+op's synthesized guest faults are exempt by their state marker
+(`FaultToTopAndGeneratedException`), in-JIT faults and SMC faults never reach
+the gate, and a SIGSEGV/SIGBUS inside a thunk's host library with no deferred
+section active keeps the historical outside-JIT delivery (no FEX lock is held
+there). `FEX_HOSTFAULTTOGUEST=1` restores the old delivery after the report.
+Test: `unittests/FEXLinuxTests/tests/signal/hostfault_gate.cpp`, driven by
+the `FEX_HOSTFAULT_INJECT=<syscall nr>[,segv]` hook in `HandleSyscallImpl`.
 
 ### Morning kickoff checklist (orchestrator)
 

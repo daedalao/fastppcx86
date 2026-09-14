@@ -94,6 +94,7 @@ Absorb-by-default behaviours; setting these makes them loud.
 | `FEX_NOEXEC_ABORT` | Abort on the entry-block NoExec tripwire instead of absorbing. |
 | `FEX_EXITLINK_ABORT` | Abort on a suspect `ExitFunctionLink` instead of absorbing. |
 | `FEX_EXITLINK_NOBYPASS` | Disable the `ExitFunctionLink` bypass. |
+| `FEX_HOSTFAULT_INJECT` | `=<guest syscall nr>[,segv]`. Raises a fault inside FEX's own syscall body (a `trap`, or a null store with `,segv`) whenever the guest makes that syscall; drives the host-fault gate test (`hostfault_gate`). |
 | `FEX_ABORT_TRIPWIRE` | Log every guest-delivered fatal-class sync signal with `si_addr`/`si_code` and the guest RIP. |
 | `FEX_TRIPWIRE_PROBE` | Post-mortem probe of memory pointed at by SRA-reconstructed block-entry GPRs. Written for RimWorld's UnityPlayer fault. |
 | `FEX_SIGRIPWATCH` | Signals arriving while the guest is in JIT code with static registers live; reports host PC and loop registers. |
@@ -129,6 +130,7 @@ Two-stage arming where noted: set the var, then `touch` the trigger file.
 | `FEX_SA_RESTART_TIMED` | Restart behaviour for timed syscalls. |
 | `FEX_FUTEX_EINTR_PASSTHRU` | Escape hatch: restore always-surface `EINTR` on futex. |
 | `FEX_FUTEX_RESCUE` | Futex wedge rescue path. |
+| `FEX_HOSTFAULTTOGUEST` | Escape hatch for the host-fault gate: a synchronous fault raised in FEX's own host code (deferred-signal section, dispatcher, FABI crossing, or any SIGTRAP/SIGILL/SIGFPE outside JIT code) is reported and then delivered to the guest as before, instead of terminating with the default disposition. Bisection lever only; the delivery abandons the host frame and its locks. |
 | `FEX_NO_THUNK_PARTIAL_FILL` | Disable partial thunk fill. Presence-tested — `=0` enables it. |
 
 ### Paths and test hooks
