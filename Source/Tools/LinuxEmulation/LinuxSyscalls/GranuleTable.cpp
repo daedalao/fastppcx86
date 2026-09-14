@@ -8,6 +8,8 @@ $end_info$
 */
 
 #include "LinuxSyscalls/GranuleTable.h"
+#include "LinuxSyscalls/SMCHostGranule.h"
+#include "LinuxSyscalls/Syscalls.h"
 
 #include <FEXCore/Utils/LogManager.h>
 
@@ -93,10 +95,12 @@ void GranuleTable::Forget(uint64_t GranuleBase) {
   Granules.erase(GranuleBase);
 }
 
-int GranuleTable::SetSMCOverlay(uint64_t GranuleBase, int RemovedProt) {
-  auto& Entry = FindOrCreate(GranuleBase);
-  Entry.SMCOverlay = static_cast<uint8_t>(RemovedProt & (PROT_READ | PROT_WRITE | PROT_EXEC));
-  return UnionProtOf(Entry);
+int GranuleTable::WantedProt(uint64_t GranuleBase, const GranuleEntry& Entry) {
+  int Want = UnionProtOf(Entry);
+  if (FEX::HLE::SMCGranule::Table().Armed(GranuleBase)) {
+    Want &= ~PROT_WRITE;
+  }
+  return Want;
 }
 
 bool GranuleTable::RematerialiseIfNeeded(uint64_t GranuleBase) {
@@ -105,16 +109,25 @@ bool GranuleTable::RematerialiseIfNeeded(uint64_t GranuleBase) {
     return true;
   }
 
-  const int Want = UnionProtOf(*Entry);
-  if (Want == static_cast<int>(Entry->HostProt)) {
-    // Already what the kernel has. Skipping the syscall is not just an
-    // optimisation: at 64K, mprotect walks and re-inserts hash-table entries,
-    // and the guest pthread-guard path (PAGE_SIZE_64K_PLAN finding 8) would
-    // otherwise pay for it at every pthread_create.
+  const int Want = WantedProt(GranuleBase, *Entry);
+  // The cached HostProt is only authoritative for a granule SMC tracking has
+  // never armed: its arm and fault paths mprotect the granule behind this
+  // table's back (SMCHostGranule.h, "how they stay in step"), so for those the
+  // syscall is always issued. Everywhere else, skipping it when the kernel
+  // already has Want is not just an optimisation: at 64K, mprotect walks and
+  // re-inserts hash-table entries, and the guest pthread-guard path
+  // (PAGE_SIZE_64K_PLAN finding 8) would otherwise pay for it at every
+  // pthread_create.
+  if (Want == static_cast<int>(Entry->HostProt) && !FEX::HLE::SMCGranule::Table().Known(GranuleBase)) {
     return true;
   }
 
-  if (::mprotect(reinterpret_cast<void*>(GranuleBase), FEXCore::HostPage::Size(), Want) != 0) {
+  // FEX_HWTSO: the same PROT_SAO rule as every other granule mprotect. Without
+  // it a rematerialisation stripped SAO from the granule (the kernel re-derives
+  // VM_SAO from the incoming prot). Once a refusal has revoked hardware TSO,
+  // ApplyGuestProt is the identity, so this cannot fail where the plain prot
+  // would have succeeded.
+  if (::mprotect(reinterpret_cast<void*>(GranuleBase), FEXCore::HostPage::Size(), FEX::HLE::HardwareTSO::ApplyGuestProt(Want)) != 0) {
     // Leave HostProt describing what the kernel still has, so AssertInvariant
     // reports the divergence instead of the table lying about it.
     LogMan::Msg::EFmt("granule table: mprotect(0x{:x}, {}, {}) failed: {}", GranuleBase, FEXCore::HostPage::Size(), Want, ::strerror(errno));
@@ -134,9 +147,11 @@ void GranuleTable::NoteHostProt(uint64_t GranuleBase, int Prot) {
 
 void GranuleTable::AssertInvariant() const {
   for (const auto& [Base, Entry] : Granules) {
-    [[maybe_unused]] const int Want = UnionProtOf(Entry);
-    LOGMAN_THROW_A_FMT(Want == static_cast<int>(Entry.HostProt),
-                       "granule table invariant violated at 0x{:x}: union|overlay says {} but the kernel has {}", Base, Want, Entry.HostProt);
+    [[maybe_unused]] const int Want = WantedProt(Base, Entry);
+    // Granules SMC tracking has touched are exempt: their HostProt is known
+    // to lag the kernel (see RematerialiseIfNeeded).
+    LOGMAN_THROW_A_FMT(Want == static_cast<int>(Entry.HostProt) || FEX::HLE::SMCGranule::Table().Known(Base),
+                       "granule table invariant violated at 0x{:x}: union says {} but the kernel has {}", Base, Want, Entry.HostProt);
   }
 }
 

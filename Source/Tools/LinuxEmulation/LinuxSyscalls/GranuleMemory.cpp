@@ -403,7 +403,6 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         auto& E = Tracking.Granules.FindOrCreate(G);
         E.FEXBacked = true;
         E.HostProt = PROT_READ | PROT_WRITE;
-        E.SMCOverlay = PROT_NONE;
       }
     }
 
@@ -432,7 +431,6 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         auto* E = Tracking.Granules.FindMutable(G);
         if (E) {
           E->FEXBacked = false;
-          E->SMCOverlay = PROT_NONE;
         }
         continue;
       }

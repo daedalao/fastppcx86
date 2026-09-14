@@ -25,12 +25,16 @@ namespace FEX::HLE::VMATracking {
  *   - per guest 4K page, whether it is live and the protection the guest
  *     INTENDED for it, and
  *   - per host granule, the protection FEX actually MATERIALISED with the
- *     kernel, plus the protection bits SMC/mtrack wants held back.
+ *     kernel.
  *
  * INVARIANT (AssertInvariant(), and checked at every materialisation):
  *
  *     HostProt(granule) == Union(IntendedProt(p) : p in granule, p live)
- *                          & ~SMCOverlay(granule)
+ *                          & ~(PROT_WRITE if SMC tracking has the granule armed)
+ *
+ * The armed state is read from the SMC granule table (SMCHostGranule.h); for a
+ * granule SMC tracking has ever armed, HostProt is treated as a hint only,
+ * because mtrack's own mprotects move the kernel's protection behind it.
  *
  * "Union" is the most permissive combination: nothing the guest believes
  * writable may ever fault for granularity reasons. The consequence -- a
@@ -127,9 +131,6 @@ struct GranuleTable {
     // that would be a no-op can be skipped (mprotect is not free at 64K: it
     // walks the HPT).
     uint8_t HostProt {PROT_NONE};
-    // Bits SMC/mtrack wants REMOVED from the union (PROT_WRITE, in practice).
-    // Written only through SetSMCOverlay(); see the hook contract there.
-    uint8_t SMCOverlay {PROT_NONE};
     // True once FEX has replaced this granule's backing with a private
     // anonymous mapping of its own, which is what makes sub-granule MAP_FIXED
     // and sub-granule file content possible. Once set, FEX may freely
@@ -151,8 +152,9 @@ struct GranuleTable {
 
   using ContainerType = fextl::map<uint64_t, GranuleEntry>;
 
-  /// The union of the intended protections of every live page in Entry, with
-  /// the SMC overlay applied. PROT_NONE when nothing in the granule is live.
+  /// The union of the intended protections of every live page in Entry.
+  /// PROT_NONE when nothing in the granule is live. Not what gets
+  /// materialised: see WantedProt.
   [[nodiscard]] static int UnionProtOf(const GranuleEntry& Entry) {
     uint64_t Union = 0;
     uint64_t Nibbles = Entry.Nibbles;
@@ -163,8 +165,16 @@ struct GranuleTable {
         Union |= Nibble;
       }
     }
-    return ProtFromNibble(Union) & ~static_cast<int>(Entry.SMCOverlay);
+    return ProtFromNibble(Union);
   }
+
+  /// The protection to materialise for a granule: the union of its live
+  /// pages, minus PROT_WRITE while SMC tracking (mtrack) has the granule
+  /// armed. mtrack's arm and fault paths issue their own granule-wide
+  /// mprotects without the VMATracking lock, so this table cannot be told
+  /// about them; it asks the SMC granule table instead (SMCHostGranule.h,
+  /// "how they stay in step"). Identity with UnionProtOf on a 4K host.
+  [[nodiscard]] static int WantedProt(uint64_t GranuleBase, const GranuleEntry& Entry);
 
   /// Mark [Base, Base+Length) (guest-4K quantities) live with intended
   /// protection Prot. Creates granule entries as needed. Does NOT materialise;
@@ -200,32 +210,25 @@ struct GranuleTable {
   /// - VMATracking::Mutex must be unique_locked.
   void Forget(uint64_t GranuleBase);
 
-  ///// SMC / mtrack hook -- S5 (SyscallsSMCTracking.cpp) is the only caller /////
+  ///// SMC / mtrack /////
   //
   // mtrack write-protects guest code pages. At 64K the quantum is the whole
-  // granule, so mtrack cannot simply issue its own mprotect: the next guest
-  // mprotect in that granule would rematerialise the union and silently undo
-  // the write-protection. Instead mtrack declares its intent here and lets the
-  // table own the kernel call, which keeps the invariant true by construction.
-  //
-  //   SetSMCOverlay(Granule, PROT_WRITE)  -- "hold PROT_WRITE back from this
-  //                                          granule until further notice"
-  //   SetSMCOverlay(Granule, PROT_NONE)   -- release
-  //
-  // Returns the protection that should now be materialised; the caller either
-  // passes RematerialiseIfNeeded() or performs the mprotect itself if it is
-  // already inside a fault handler with its own error handling. The soundness
-  // rule from PAGE_SIZE_64K_PLAN §5 still binds the CALLER: whatever range it
-  // unprotects, it must invalidate or re-arm every tracked guest page inside
-  // it. This table deliberately does not invalidate anything -- it has no
-  // access to the code cache and taking one here would invert the
-  // VMATracking/CodeInvalidation lock order.
-  //
-  // - VMATracking::Mutex must be unique_locked.
-  int SetSMCOverlay(uint64_t GranuleBase, int RemovedProt);
+  // granule, and mtrack's arm/unprotect mprotects run without this table's
+  // lock (SyscallsSMCTracking.cpp), so there is no hook for it to call here.
+  // RematerialiseIfNeeded keeps the invariant instead by consulting the SMC
+  // granule table (WantedProt above): PROT_WRITE stays held back while the
+  // granule is armed, and the cached HostProt is never trusted to skip the
+  // syscall for a granule mtrack has touched. The soundness rule from
+  // PAGE_SIZE_64K_PLAN section 5 binds mtrack: whatever range it unprotects,
+  // it invalidates or re-arms every tracked guest page inside it. This table
+  // deliberately never invalidates anything -- it has no access to the code
+  // cache and taking one here would invert the VMATracking/CodeInvalidation
+  // lock order.
 
   /// Bring the kernel's protection for this granule in line with the invariant.
-  /// No-op (and no syscall) when the granule is already correct. Returns true on
+  /// No-op (and no syscall) when the granule is already correct, unless SMC
+  /// tracking has ever armed the granule (its raw mprotects move the kernel's
+  /// protection behind HostProt's back, so the syscall is always issued). Returns true on
   /// success; on failure the entry's HostProt is left describing what the kernel
   /// actually has, so the invariant check reports the divergence rather than
   /// hiding it.

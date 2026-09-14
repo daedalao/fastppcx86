@@ -435,9 +435,10 @@ Open items, in priority order: (1) DONE 09-14: a fatal trap or fault raised
 in FEX's own host code is no longer delivered to the guest as a signal (the
 host-fault gate in `HandleGuestSignal`, below); (2) mtrack arming
 heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
-also the flip log prints the count after clearing it); (3) route the raw
-`GuestM*` host calls in `SyscallsSMCTracking.cpp` through the granule layer
-and wire `SetSMCOverlay`/`GranuleFullyBacked` between S4b and S4c; (4) HWTSO
+also the flip log prints the count after clearing it); (3) DONE 09-14: the
+S4b/S4c wiring (below; the raw `GuestM*` host calls are reached only for
+whole-granule ranges, whose table entries the `Granule::*` front already
+keeps in step); (4) HWTSO
 SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
 op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
@@ -508,6 +509,28 @@ section active keeps the historical outside-JIT delivery (no FEX lock is held
 there). `FEX_HOSTFAULTTOGUEST=1` restores the old delivery after the report.
 Test: `unittests/FEXLinuxTests/tests/signal/hostfault_gate.cpp`, driven by
 the `FEX_HOSTFAULT_INJECT=<syscall nr>[,segv]` hook in `HandleSyscallImpl`.
+
+2026-09-14, S4b/S4c wiring (open item 3). The hole: mtrack arms a whole
+granule with its own `mprotect(PROT_READ)` and nothing told the VMATracking
+granule table, so the next sub-granule guest mprotect that changed the
+granule's union (a JIT engine `mprotect(RWX)`-ing a data page next to
+compiled code) rematerialised the union and silently undid the arm. The
+`SetSMCOverlay` push the design sketched cannot be called from the SMC fault
+path (which holds no VMATracking lock, by the fork lock-order rule), so the
+table pulls instead: `GranuleTable::WantedProt` leaves `PROT_WRITE` out
+while `SMCGranule::Table().Armed(G)`, and `RematerialiseIfNeeded` no longer
+trusts its cached `HostProt` to skip the syscall for a granule mtrack has
+ever touched (`Known(G)`). `SMCOverlay`/`SetSMCOverlay` are gone. The arm
+side cannot race a rematerialisation (VMATracking shared vs unique); the
+fault side's losing order leaves the granule read-only with its mask
+cleared, which the next store settles with one spurious SMC fault.
+`GranuleFullyBacked` is not needed: a granule with any live page is mapped in
+full by the permissive tier's construction (recorded in SMCHostGranule.h).
+Found on the way: `RematerialiseIfNeeded` issued its mprotect without
+`ApplyGuestProt`, so under `FEX_HWTSO` every rematerialisation stripped
+`PROT_SAO` from the granule; now applied (item 4's refusal-revoke plumbing
+is still open, but a refusal there is impossible once an mmap-time refusal
+has revoked).
 
 ### Morning kickoff checklist (orchestrator)
 

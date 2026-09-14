@@ -253,6 +253,34 @@ public:
 
   // How many guest pages of this granule mtrack currently has armed. The
   // number a later arming heuristic keys off; nothing reads it yet.
+  // The two questions the S4b granule table (GranuleTable.h) asks when it
+  // rematerialises a granule's host protection, see WantedProt() there:
+  //   Armed -- mtrack currently holds PROT_WRITE back from this granule, so
+  //            the materialised protection must not include it;
+  //   Known -- mtrack has armed this granule at some point, so the raw
+  //            mprotects the arm and fault paths issue may have moved the
+  //            kernel's protection since the table last recorded it.
+  // Both are leaf reads under this table's own mutex; VMATracking.Mutex may
+  // be held by the caller (the order is VMATracking, then this mutex,
+  // everywhere: NoteArmed runs under VMATracking shared, NoteFault under no
+  // VMATracking lock at all).
+  [[nodiscard]]
+  bool Armed(uint64_t GranuleBase) {
+    if (!Enabled()) {
+      return false;
+    }
+    std::lock_guard lk {Mutex};
+    auto It = Granules.find(GranuleBase);
+    return It != Granules.end() && It->second.TrackedMask != 0;
+  }
+  [[nodiscard]]
+  bool Known(uint64_t GranuleBase) {
+    if (!Enabled()) {
+      return false;
+    }
+    std::lock_guard lk {Mutex};
+    return Granules.find(GranuleBase) != Granules.end();
+  }
   [[nodiscard]]
   uint32_t TrackedCount(uint64_t GranuleBase) {
     if (!Enabled()) {
@@ -370,31 +398,42 @@ inline RearmQueue& Rearms() {
 }
 
 // ---------------------------------------------------------------------------
-// HOOK WANTED from the VMATracking granule table (design Part 2 section 2)
+// The two granule tables (design Part 2 section 2), and how they stay in step
 // ---------------------------------------------------------------------------
-// Cover() widens an mtrack mprotect to the granule. That is unconditionally
-// required by the kernel, but it is only SAFE if the whole granule is backed:
-// `mprotect` over a range containing a hole returns ENOMEM, and the unprotect
-// leg of the SMC fault path treats a failed mprotect as fatal (it must: a
-// silent failure means the faulting store re-faults forever).
+// This table (S4c) records which guest pages mtrack has armed, per granule.
+// The VMATracking granule table (S4b, GranuleTable.h) records the guest's
+// intended per-page protections and materialises their union with one host
+// mprotect per granule. The arm and fault paths in SyscallsSMCTracking.cpp
+// issue their own granule-wide mprotects (PROT_READ to arm, R+W to unprotect)
+// without the VMATracking lock -- the fault path cannot take it (lock order
+// against fork, see HandleSegfault) -- so S4b cannot be told about them.
 //
-// On a 64K kernel the kernel itself has no sub-granule holes -- a mapping is
-// 64K-granular by construction -- so the invariant holds as long as the guest
-// syscall layer never leaves a granule PARTIALLY mapped. That is exactly what
-// the S4b granule table enforces, and the one thing this file wants from it is
-// that guarantee made checkable:
+// Instead S4b asks this table at the one moment it matters, rematerialisation
+// (GranuleTable::WantedProt): while Armed(), PROT_WRITE is left out of the
+// union so a sub-granule guest mprotect cannot silently undo the arm (a JIT
+// engine mprotect(RWX)-ing a data page in a granule that also holds compiled
+// code was the shape that did); and for a Known() granule the table's cached
+// HostProt is not trusted to skip the syscall, because the raw arm/unprotect
+// mprotects move the kernel's protection behind its back. The cost is one
+// possibly redundant mprotect per sub-granule guest mprotect in a granule
+// that has ever held code, which is rare (JIT engines protect whole regions).
 //
-//     // True when every byte of the host granule containing `Addr` is mapped,
-//     // i.e. a host mprotect over [Base(Addr), Base(Addr)+HostPage::Size())
-//     // cannot fail with ENOMEM. Callable with VMATracking.Mutex held shared;
-//     // must be lock-free or shared-lock-only, because the SMC fault path
-//     // reads it after dropping that lock is not an option.
-//     bool VMATracking::GranuleFullyBacked(uint64_t Addr) const;
+// The remaining window is the fault path's unprotect racing a concurrent
+// rematerialisation: the arm side cannot race it (it holds VMATracking
+// shared, rematerialisation needs it unique), and the losing order on the
+// fault side leaves the granule read-only with its armed mask already
+// cleared, which the next guest store settles with one more (spurious but
+// harmless) SMC fault: HandleSegfault unprotects and invalidates the granule.
 //
-// With it, the fault path can assert the invariant in debug builds and the
-// arming path can decline to widen into an unbacked granule instead of taking
-// an ENOMEM and degrading coverage. Until it exists both legs simply attempt
-// the widened mprotect and report the errno they get, which is the same
-// failure handling the 4K code already has.
+// Cover() widens an mtrack mprotect to the granule. That is only SAFE if the
+// whole granule is backed (`mprotect` over a hole returns ENOMEM, and the
+// unprotect leg treats a failed mprotect as fatal, as it must). On a 64K
+// kernel a mapping is 64K-granular by construction, and S4b never leaves a
+// granule partially mapped: a granule with any live guest page is mapped in
+// full (the permissive tier's union rule, and the private-backing conversion
+// for sub-granule MAP_FIXED). So the invariant holds by construction and no
+// GranuleFullyBacked() query is needed; both legs still report the errno of
+// a widened mprotect if it ever fails, which is the failure handling the 4K
+// code already has.
 
 } // namespace FEX::HLE::SMCGranule
