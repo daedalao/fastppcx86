@@ -45,6 +45,7 @@ $end_info$
 // kernel ignores it, exactly as before.
 
 #include <FEXCore/Utils/TypeDefines.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 
 #include <atomic>
 #include <cstddef>
@@ -307,12 +308,12 @@ inline void* TrimToAlignment(void* Base, size_t MappedSize, size_t Size, size_t 
     return nullptr;
   }
   if (Aligned > Raw) {
-    ::munmap(Base, Aligned - Raw);
+    FEXCore::Allocator::munmap(Base, Aligned - Raw);
   }
   const uintptr_t End = Aligned + Size;
   const uintptr_t RawEnd = Raw + MappedSize;
   if (RawEnd > End) {
-    ::munmap(reinterpret_cast<void*>(End), RawEnd - End);
+    FEXCore::Allocator::munmap(reinterpret_cast<void*>(End), RawEnd - End);
   }
   return reinterpret_cast<void*>(Aligned);
 #endif
