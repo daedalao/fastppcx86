@@ -808,6 +808,19 @@ block entry rather than per instruction) or a hotness-aware demotion.
 Next: the same fps A/B for `FEX_SMCGRANULEPOLICY=rearm`, the other way to
 narrow the storms without guarding code.
 
+2026-09-14 14:18, `FEX_SMCGRANULEPOLICY=rearm` vs default (`invalidate`),
+same frame-log A/B, five legs each alternating: default p50 medians 4.04,
+4.10, 4.13, 4.17, 4.24 ms (median 4.13); rearm 1.24, 4.18, 4.19, 4.24, 4.25
+(median 4.19; the 1.24 ms leg was a lighter random map, quicktest seeds
+differ per launch). No effect. Together with the mixed-heuristic reversal
+above: on a young quicktest colony the granule flip storms (44 K faults/s,
+~200 hot-granule reports per lap) do not bound the main thread, so neither
+way of suppressing them buys fps, and the guards actively cost it. Open
+item 2 is closed as "measured, not a bottleneck here"; the knobs stay. What
+bounds RimWorld's frame on 64K is unmeasured: the next step is a main-thread
+profile in-world (select the game with `pgrep -f "Bin/FEX .*RimWorldLinux"`,
+not `pgrep -x FEX`), and a late-game save for the load that matters.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
