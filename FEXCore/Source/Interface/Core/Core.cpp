@@ -1197,6 +1197,25 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
 
+    // FEX_SMCGRANULEMIXED (64K hosts): a guest page whose host granule mtrack
+    // has stopped write-protecting gets the SMCCHECKS=full treatment per block
+    // instead -- every instruction validated against its decoded bytes. The
+    // answer is read here, under this function's shared CodeInvalidationMutex,
+    // and MarkGuestExecutableRange below reads the same bit under the same
+    // hold; a demotion in between is followed by an exclusive invalidation of
+    // the granule that kills whatever this compile publishes. Decided over all
+    // of the decode's pages: a multiblock that touches one demoted page is
+    // guarded in full. See LinuxSyscalls/SMCHostGranule.h.
+    bool CodePagesValidateOnly = false;
+    if (SyscallHandler && Config.SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+      for (auto CodePage : BlockInfo->CodePages) {
+        if (SyscallHandler->GuestCodePageValidateOnly(CodePage)) {
+          CodePagesValidateOnly = true;
+          break;
+        }
+      }
+    }
+
     Thread->OpDispatcher->BeginFunction(GuestRIP, CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
 
@@ -1216,6 +1235,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     std::shared_lock ForceTSOlk(ForceTSOMutex);
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
+      // Per-instruction ValidateCode guards: the whole process (SMCCHECKS=full),
+      // the mono tailcall block (Frontend), or a demoted mixed granule.
+      const bool FullSMCValidation =
+        Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || CodePagesValidateOnly;
 
 #ifdef ZYDIS_DISASSEMBLER
       if (FEXCore::Config::Get_X86DISASSEMBLE() && CodeBlocks->size() > 1) {
@@ -1347,7 +1370,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // (DEF_OP(GuestOpcode) only records the cursor).
         Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        if (FullSMCValidation) {
           // Evidence gate for the accumulator-vs-decoder-PC audit: use
           // DecodedInfo->PC (the address the decoder actually decoded from)
           // as the validated address, not InstAddress (a running total
@@ -1454,7 +1477,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           //     instruction, which swallowed instructions would not get.
           // Both are rare/one-off modes, so refusing to fuse in them costs
           // nothing and removes two whole classes of interaction.
-          const bool FusionWindowSafe = !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !Block.ForceFullSMCDetection;
+          const bool FusionWindowSafe = !ExtendedDebugInfo && !FullSMCValidation;
           Thread->OpDispatcher->SetDecodeWindow(FusionWindowSafe ? &Block : nullptr, i);
 
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
@@ -1956,6 +1979,21 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
       dprintf(SMCAuditCompileFD(), "relink-miss rip=%lx\n", GuestRIP);
     }
     return 0;
+  }
+
+  // FEX_SMCGRANULEMIXED: a retained block was compiled without per-instruction
+  // guards, and the re-arm below is skipped for a demoted granule, so a
+  // retained block on a demoted page has nothing keeping it sound. Refuse the
+  // relink; the fresh compile that follows reads the demoted bit and guards.
+  if (SyscallHandler) {
+    for (auto CodePage : Retained->CodePages) {
+      if (SyscallHandler->GuestCodePageValidateOnly(CodePage)) {
+        if (SMCAuditCompileFD() >= 0) {
+          dprintf(SMCAuditCompileFD(), "relink-refused-demoted rip=%lx page=%lx\n", GuestRIP, CodePage);
+        }
+        return 0;
+      }
+    }
   }
 
   // Unchanged: re-publish. Registering the code pages again re-arms mtrack's

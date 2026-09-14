@@ -1515,6 +1515,22 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
         return false;
       }
 
+      // FEX_SMCGRANULEMIXED (64K hosts): cached blocks carry no per-instruction
+      // validation guards and the load's MarkGuestExecutableRange would not
+      // arm a demoted granule, so a section touching one cannot be loaded
+      // soundly. Rare by construction (the granule must have been demoted
+      // while this image was mapped but before its cache loaded); the cost is
+      // a recompile of the section, which then guards where it must.
+      uint64_t CodePage;
+      ::memcpy(&CodePage, Cursor, sizeof(CodePage));
+      if (CTX.SyscallHandler && CTX.SyscallHandler->GuestCodePageValidateOnly(CodePage + BinarySection.FileStartVA)) {
+        LogMan::Msg::IFmt("Rejecting code cache for {}: guest page {:#x} lies in a demoted mixed code/data granule (FEX_SMCGRANULEMIXED) "
+                          "and cached blocks carry no validation guards",
+                          BinarySection.FileInfo.Filename, CodePage + BinarySection.FileStartVA);
+        CTX.LatestOffset -= header.CodeBufferSize;
+        return false;
+      }
+
       uint64_t NumEntrypoints;
       ::memcpy(&NumEntrypoints, Cursor + sizeof(uint64_t), sizeof(NumEntrypoints));
       Cursor += MinCodePageEntrySize;

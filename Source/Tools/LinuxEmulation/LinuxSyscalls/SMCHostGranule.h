@@ -35,7 +35,11 @@
 //
 // SIGNAL SAFETY
 // -------------
-// NoteFault()/QueueRearm() run inside the SIGSEGV handler.  They never log and
+// NoteFault()/QueueRearm() run inside the SIGSEGV handler. The one signal that
+// reaches them is a synchronous store fault raised by JIT'd guest code, which
+// cannot interrupt host code holding this table's leaf mutex (NoteArmed and
+// the S4b queries run under VMATracking, a signal-deferring section; the
+// compile-side ValidateOnly() reads run inside CompileBlock, host code).  They never log and
 // never allocate: NoteFault is a hash lookup plus scalar updates on an entry
 // that arming already inserted, and the flip-rate *report* is a two-word
 // mailbox that the non-signal mark path drains and prints.  QueueRearm inserts
@@ -43,6 +47,7 @@
 // from the same handler, and it only runs under the opt-in Rearm policy.
 // ===========================================================================
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -56,6 +61,11 @@
 #include <FEXCore/Utils/TypeDefines.h>
 
 namespace FEX::HLE::SMCGranule {
+
+// FEX_SMCGRANULEMIXED's default (flips per second; 0 = off). See the block
+// comment above MixedFlipThreshold() and the 2026-09-14 smoke numbers in
+// docs/PAGE_SIZE_64K_EXECUTION.md for why it sits where it does.
+inline constexpr uint32_t kMixedFlipThresholdDefault = 64;
 
 // Guest pages per host granule: 1 on a 4K host, 16 on a 64K host.
 [[nodiscard]]
@@ -176,15 +186,101 @@ inline uint32_t FlipLogThreshold() {
 }
 
 // ---------------------------------------------------------------------------
+// FEX_SMCGRANULEMIXED -- the arming heuristic for MIXED code/data granules
+// (execution plan open item 2, design Part 2 section 5's "anything clever").
+//
+// The shape it answers, measured on RimWorld (Mono) under mtrack on the 64K
+// kernel, 2026-09-14: 170 granules flipping >= 64 times a second, 101 of them
+// with exactly ONE of their 16 guest pages holding code and the other 15 being
+// data the game writes constantly. Every flip is a granule-wide unprotect, an
+// InvalidateCodeRangeIfNecessary across every thread, and a re-arm at the next
+// compile; on a 4K host that granule would never flip at all, because the
+// protection quantum would be the one code page.
+//
+// The heuristic: a granule that reaches N faults inside one window while
+// holding at most M tracked pages is DEMOTED -- mtrack stops arming it for the
+// rest of the granule's life (until the guest retires the whole granule, see
+// Forget), and every block compiled from any of its guest pages from then on
+// carries the per-instruction ValidateCode guard that SMCCHECKS=full wraps
+// around every instruction (Core.cpp, Block.ForceFullSMCDetection's path).
+// The guard compares the instruction's bytes against the snapshot the decoder
+// consumed before the instruction runs and exits to recompile on a mismatch,
+// so a demoted page is exactly as sound as SMCCHECKS=full is, which is the
+// correctness fallback the design names -- applied to the pages that need it
+// instead of to the whole process.
+//
+// SOUNDNESS ARGUMENT, in full, because the rule is non-negotiable:
+//   invariant  an UNGUARDED block may be live on guest page P only while P's
+//              granule is armed (write -> fault -> that block is invalidated).
+//   demotion   happens inside NoteFault, i.e. on a fault whose service already
+//              unprotects the granule AND invalidates every block on it (the
+//              default policy; the handler forces the granule-wide
+//              invalidation on the demoting fault under `rearm` and bypasses
+//              FEX_SMCLAZYINVAL's deferral for it). That invalidation takes the
+//              exclusive CodeInvalidationMutex, so it orders after every
+//              compile that read "not demoted" (they run under the shared
+//              lock and publish inside it) and kills the unguarded blocks they
+//              published; every compile ordered after it reads "demoted" and
+//              emits guards.
+//   the three  fresh compile: Core.cpp asks GuestCodePageValidateOnly for
+//   publishers every CodePage of the decode and guards the whole block if any
+//              says yes. Soft relink (TryRelinkSoftInvalidatedBlock): a
+//              retained block was compiled unguarded, so a retained block on a
+//              demoted page is refused and recompiled. Code cache load: a
+//              section whose code-page table touches a demoted granule is
+//              rejected before any of its blocks is registered.
+//   the arm    MarkGuestExecutableRange skips the mprotect for a page whose
+//              granule is demoted, and never calls NoteArmed for it, so the
+//              S4b table's Armed() stays false and its union keeps PROT_WRITE
+//              (the granule IS writable, and must stay so).
+//   NewPage    MarkGuestExecutableRange only runs for the first block on a
+//   gating     page since its last invalidation, so a granule must not lose
+//              its demoted bit while blocks may still be live on it: Forget
+//              keeps a demoted entry when the retired range covers the granule
+//              only partially, and drops it only when the whole granule goes
+//              (whose munmap/mmap-over invalidation makes every page in it
+//              NewPage again).
+//
+// Off means the pre-heuristic behaviour, byte for byte. Meaningless (and
+// forced off) on a 4K host, where a granule is one page and has no siblings.
+// ---------------------------------------------------------------------------
+
+// FEX_SMCGRANULEMIXED: faults per granule per second at which a mixed granule is
+// demoted. 0 disables the heuristic.
+[[nodiscard]]
+inline uint32_t MixedFlipThreshold() {
+  static const uint32_t Threshold = [] {
+    if (!Enabled()) {
+      return 0u;
+    }
+    const char* Env = ::getenv("FEX_SMCGRANULEMIXED");
+    return Env ? static_cast<uint32_t>(::strtoul(Env, nullptr, 0)) : kMixedFlipThresholdDefault;
+  }();
+  return Threshold;
+}
+
+// FEX_SMCGRANULEMIXEDMAXTRACKED: a granule with more tracked pages than this is
+// never demoted however often it flips -- it is code, and per-instruction
+// validation on all of it would cost more than the flips do. Default 4 of 16.
+[[nodiscard]]
+inline uint32_t MixedMaxTracked() {
+  static const uint32_t Max = [] {
+    const char* Env = ::getenv("FEX_SMCGRANULEMIXEDMAXTRACKED");
+    return Env ? static_cast<uint32_t>(::strtoul(Env, nullptr, 0)) : 4u;
+  }();
+  return Max;
+}
+
+// ---------------------------------------------------------------------------
 // The per-granule tracked-page table.
 //
-// Purely observability and policy input: correctness does NOT depend on it.
-// The `invalidate` policy is sound because the range it hands the invalidator
-// IS the range it unprotects, whatever this table says. What the table adds is
-// the per-granule tracked COUNT (how many of the 16 guest pages mtrack actually
-// armed, i.e. how much of the granule is really code) and the flip rate, which
-// is what a future "this granule is not worth arming, hash it instead" heuristic
-// needs and cannot get from the kernel.
+// Observability and policy input for the `invalidate`/`rearm` policies, whose
+// correctness does NOT depend on it: the range they hand the invalidator IS the
+// range they unprotect, whatever this table says. What the table adds is the
+// per-granule tracked COUNT (how many of the 16 guest pages mtrack actually
+// armed, i.e. how much of the granule is really code) and the flip rate --
+// the two inputs of the FEX_SMCGRANULEMIXED demotion above, whose ValidateOnly
+// bit IS correctness-bearing: it is what tells the compile paths to guard.
 //
 // LOCK ORDER: Mutex is a LEAF. It is taken only around scalar updates to one
 // entry and is never held across any other lock, any syscall, or any callback.
@@ -197,6 +293,7 @@ public:
     uint32_t TrackedMask {}; // bit i: guest page i of this granule is mtrack-armed
     uint32_t Flips {};       // faults serviced in the window starting at WindowStart
     uint64_t WindowStart {}; // CLOCK_MONOTONIC_COARSE nanoseconds
+    bool ValidateOnly {};    // demoted by FEX_SMCGRANULEMIXED: never armed again, blocks on it carry ValidateCode guards
   };
 
   // Arming. NOT a signal path (MarkGuestExecutableRange, holding VMATracking
@@ -206,7 +303,14 @@ public:
       return;
     }
     std::lock_guard lk {Mutex};
-    Granules[GranuleBase].TrackedMask |= PageMask;
+    auto& Entry = Granules[GranuleBase];
+    if (Entry.ValidateOnly) {
+      // The mark path does not arm a demoted granule, so this is unreachable
+      // in practice; keep the mask at zero regardless so Armed() can never
+      // make the S4b table hold PROT_WRITE back from a granule nobody protects.
+      return;
+    }
+    Entry.TrackedMask |= PageMask;
   }
 
   // A write fault forced this granule open. Returns the tracked mask as it was
@@ -216,11 +320,18 @@ public:
   // SIGNAL PATH. No allocation (the entry was inserted by arming; a fault on a
   // granule with no entry simply finds nothing), no logging -- a flip rate over
   // the threshold is parked in the one-slot mailbox for the mark path to print.
-  uint32_t NoteFault(uint64_t GranuleBase) {
+  //
+  // *Demoted is set when THIS fault tripped FEX_SMCGRANULEMIXED: the granule is
+  // now ValidateOnly and the caller must make sure every block on it is
+  // invalidated by the service of this fault (see the soundness argument
+  // above MixedFlipThreshold).
+  uint32_t NoteFault(uint64_t GranuleBase, bool* Demoted) {
+    *Demoted = false;
     if (!Enabled()) {
       return 0;
     }
-    uint64_t ReportFlips = 0;
+    uint32_t ReportFlips = 0;
+    bool ReportDemoted = false;
     uint32_t Mask = 0;
     {
       std::lock_guard lk {Mutex};
@@ -231,12 +342,26 @@ public:
       Mask = It->second.TrackedMask;
       It->second.TrackedMask = 0;
 
-      if (FlipLogThreshold() != 0) {
+      if (FlipLogThreshold() != 0 || MixedFlipThreshold() != 0) {
         const uint64_t Now = CoarseNanoseconds();
         if (Now - It->second.WindowStart >= 1'000'000'000ull) {
           It->second.WindowStart = Now;
           It->second.Flips = 1;
-        } else if (++It->second.Flips == FlipLogThreshold()) {
+        } else {
+          ++It->second.Flips;
+        }
+        if (FlipLogThreshold() != 0 && It->second.Flips == FlipLogThreshold()) {
+          ReportFlips = It->second.Flips;
+        }
+        // Demotion: N flips in the window, and few enough tracked pages that
+        // guarding them beats protecting the granule. A granule whose mask is
+        // already empty at this fault (a fault that raced the arm) carries no
+        // tracked count to judge by; it is judged on the next one.
+        if (MixedFlipThreshold() != 0 && !It->second.ValidateOnly && It->second.Flips >= MixedFlipThreshold() && Mask != 0 &&
+            static_cast<uint32_t>(__builtin_popcount(Mask)) <= MixedMaxTracked()) {
+          It->second.ValidateOnly = true;
+          *Demoted = true;
+          ReportDemoted = true;
           ReportFlips = It->second.Flips;
         }
       }
@@ -247,11 +372,41 @@ public:
       // in a SIGSEGV handler is not.
       // The tracked count travels with the report: the mask was just cleared
       // above, so the mark path cannot read it back from the table.
-      PendingReportFlips.store(static_cast<uint32_t>(ReportFlips), std::memory_order_relaxed);
+      PendingReportFlips.store(ReportFlips, std::memory_order_relaxed);
       PendingReportTracked.store(static_cast<uint32_t>(__builtin_popcount(Mask)), std::memory_order_relaxed);
+      PendingReportDemoted.store(ReportDemoted ? 1u : 0u, std::memory_order_relaxed);
       PendingReportGranule.store(GranuleBase | 1, std::memory_order_release);
     }
+    if (*Demoted) {
+      DemotedCount.fetch_add(1, std::memory_order_relaxed);
+    }
     return Mask;
+  }
+
+  // FEX_SMCGRANULEMIXED: has this granule been demoted, i.e. must every block
+  // compiled from any of its guest pages carry per-instruction validation, and
+  // must the arm path leave it alone. Read by the compile, relink and cache
+  // load paths (all under CodeInvalidationMutex shared -- host code, where no
+  // guest store fault can interrupt the holder of this leaf mutex) and by the
+  // mark path.
+  [[nodiscard]]
+  bool ValidateOnly(uint64_t GranuleBase) {
+    if (!Enabled() || DemotedCount.load(std::memory_order_relaxed) == 0) {
+      // The common case for every run that never demotes: one relaxed load,
+      // no lock, no lookup.
+      return false;
+    }
+    std::lock_guard lk {Mutex};
+    auto It = Granules.find(GranuleBase);
+    return It != Granules.end() && It->second.ValidateOnly;
+  }
+
+  // Granules demoted so far in this process (monotonic: a Forget of a whole
+  // demoted granule does not decrement it; the count gates the fast path
+  // above and feeds the report).
+  [[nodiscard]]
+  uint32_t Demoted() const {
+    return DemotedCount.load(std::memory_order_relaxed);
   }
 
   // How many guest pages of this granule mtrack currently has armed. The
@@ -296,7 +451,7 @@ public:
 
   // Drain the flip-rate mailbox. NON-signal callers only (it is the caller that
   // then logs). Returns false when there is nothing to report.
-  bool TakeFlipReport(uint64_t* GranuleBase, uint32_t* Flips, uint32_t* Tracked) {
+  bool TakeFlipReport(uint64_t* GranuleBase, uint32_t* Flips, uint32_t* Tracked, bool* Demoted) {
     const uint64_t Slot = PendingReportGranule.exchange(0, std::memory_order_acquire);
     if (!Slot) {
       return false;
@@ -304,6 +459,7 @@ public:
     *GranuleBase = Slot & ~1ull;
     *Flips = PendingReportFlips.load(std::memory_order_relaxed);
     *Tracked = PendingReportTracked.load(std::memory_order_relaxed);
+    *Demoted = PendingReportDemoted.load(std::memory_order_relaxed) != 0;
     return true;
   }
 
@@ -311,6 +467,14 @@ public:
   // Not a correctness requirement -- a stale mask only over-reports tracking to
   // the heuristic -- but it keeps the map from growing without bound across a
   // long session that churns mappings.
+  //
+  // Except a DEMOTED granule the range covers only partially: its live pages
+  // may still hold blocks, and MarkGuestExecutableRange (NewPage-gated) will
+  // not run again for them, so the demoted bit must outlive the retirement of
+  // its siblings (soundness argument above MixedFlipThreshold). Such an entry
+  // only drops the retired pages from its mask; the whole-granule case erases
+  // as before, because the munmap/mmap-over invalidation of a whole granule
+  // makes every page in it NewPage again.
   void Forget(uint64_t Start, uint64_t Top) {
     if (!Enabled()) {
       return;
@@ -319,8 +483,22 @@ public:
     if (Granules.empty()) {
       return;
     }
-    for (uint64_t G = Base(Start); G < Top; G += FEXCore::HostPage::Size()) {
-      Granules.erase(G);
+    const uint64_t GranuleSize = FEXCore::HostPage::Size();
+    for (uint64_t G = Base(Start); G < Top; G += GranuleSize) {
+      auto It = Granules.find(G);
+      if (It == Granules.end()) {
+        continue;
+      }
+      const bool Whole = G >= Start && G + GranuleSize <= Top;
+      if (Whole || !It->second.ValidateOnly) {
+        Granules.erase(It);
+        continue;
+      }
+      const uint64_t First = std::max(Start, G);
+      const uint64_t Last = std::min(Top, G + GranuleSize);
+      for (uint64_t Page = First; Page < Last; Page += FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
+        It->second.TrackedMask &= ~(1u << PageBit(Page));
+      }
     }
   }
 
@@ -340,6 +518,8 @@ private:
   std::atomic<uint64_t> PendingReportGranule {0};
   std::atomic<uint32_t> PendingReportFlips {0};
   std::atomic<uint32_t> PendingReportTracked {0};
+  std::atomic<uint32_t> PendingReportDemoted {0};
+  std::atomic<uint32_t> DemotedCount {0};
 };
 
 [[nodiscard]]
