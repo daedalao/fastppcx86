@@ -532,6 +532,16 @@ Found on the way: `RematerialiseIfNeeded` issued its mprotect without
 is still open, but a refusal there is impossible once an mmap-time refusal
 has revoked).
 
+64K survey items seen 2026-09-14 while running the mapping subset of ctest
+(26 rows, `-R "granule|mmap|mprotect|madvise|mremap"`): besides the known
+`conformance-interfaces-mmap-3-1` refusal, `madvise_test.jit.gvisor` fails
+three cases that need sub-granule madvise semantics the granule layer cannot
+express (`CleansPrivateFilePage`: DONTNEED on a private file page must
+refill from the file, not zero; `DontforkShared`/`DontforkAnonPrivate`:
+DONTFORK over a sub-64K range). Pre-existing by mechanism (none of them
+reaches the mprotect path); a future madvise emulation could split the
+granule into FEX-backed private memory the way sub-granule MAP_FIXED does.
+
 ### Morning kickoff checklist (orchestrator)
 
 1. `ssh op64k`: confirm the box is on the 64K kernel, idle
