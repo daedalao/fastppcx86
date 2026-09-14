@@ -241,35 +241,43 @@ void OpDispatchBuilder::CallbackReturnOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::SecondaryALUOp(OpcodeArgs) {
+  // Opcode 0x82 is the 32-bit-only alias of 0x80 (group 1, r/m8, imm8); the
+  // decoder gives it its own OpToIndex slot (2). Dex (Windows, 32-bit) hits it
+  // through the bridge: "Unknown ALU Op: 0x15" was 0x82 /5, sub r/m8, imm8.
   FEXCore::IR::IROps IROp, AtomicIROp;
 #define OPD(group, prefix, Reg) (((group - FEXCore::X86Tables::TYPE_GROUP_1) << 6) | (prefix) << 3 | (Reg))
   switch (Op->OP) {
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 0):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 0):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 0):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 0):
     IROp = FEXCore::IR::IROps::OP_ADD;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHADD;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 1):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 1):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 1):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 1):
     IROp = FEXCore::IR::IROps::OP_OR;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHOR;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 4):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 4):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 4):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 4):
     IROp = FEXCore::IR::IROps::OP_ANDWITHFLAGS;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHAND;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 5):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 5):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 5):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 5):
     IROp = FEXCore::IR::IROps::OP_SUB;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHSUB;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 6):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 6):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 6):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 6):
     IROp = FEXCore::IR::IROps::OP_XOR;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHXOR;
