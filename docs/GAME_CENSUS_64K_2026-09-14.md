@@ -114,3 +114,26 @@ fexproton-lane default on the 64K boot until the ntsync wedge is root-caused.
 - **Arcanum** draws a uniform dark-grey fill (screenshot mean 0.25, spread 0) behind a full-screen window after Escape presses: its DirectDraw path renders nothing. Not diagnosed.
 - The guest-fault tripwire now prints the code bytes at RIP and the mapping that holds it (c9a810203, 463abb483); both were what found stage 1.
 
+### The ntsync park, characterized (23:15)
+
+`FEX_NTSYNC_TRACE` now writes an ENTER line per wait with the arguments
+and each object's live state through the `*_READ` ioctls (which also types
+the object; wine's server creates them, so the client has no CREATE lines).
+CP2077 parked with ntsync on, 100 s in, in the game process (53 threads):
+
+- 15 worker threads: `WAIT_ANY` forever on semaphore fd 38, count 0 of
+  2147483647. An idle pool waiting for work.
+- 3 threads: forever on manual-reset events that read unsignalled: fd 24;
+  fd 295; and a `WAIT_ANY` on 194/196/197 (unsignalled) + 191 (signalled=0).
+- 2 threads (futex trace): `FUTEX_WAIT` with a 1 ms timeout, ~920/s each, on
+  words 0x7fff633c01c0 / 0x7fff633c01e8 whose value stays 0.
+
+No thread parks on an object that reads signalled, so the ntsync module is
+not losing wakes. The deadlock is between the pollers and the event waiters:
+whoever should set the events or the words is itself among the parked. With
+ntsync off the same waits go through wineserver and the game runs, so the
+difference is in how one of these waits is satisfied there. Next: the two
+pollers' guest call sites (RIP of tids in FUTEX_WAIT with the 1 ms deadline)
+to see what WaitOnAddress loop they are, and what sets fd 24 / 295 in a
+run with ntsync off (trace both mechanisms in the working configuration).
+
