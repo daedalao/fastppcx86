@@ -107,3 +107,10 @@ rimworldwin), VtMB x2 intermittent, Arcanum black. Native wine: 3 of 4 pass
 (nw-dexwin is the known 32-bit gap). Launcher: `PROTON_NO_NTSYNC=1` is the
 fexproton-lane default on the 64K boot until the ntsync wedge is root-caused.
 
+## Evening, after Skyrim SE played (user report, clocks fixed)
+
+- **ntsync under emulation** (retested with working clocks, `PROTON_NO_NTSYNC=0`): CP2077 asserts "Watchdog timeout (120 seconds)" (its own hang detector; the small window in the first census was the crash reporter) and VtMB parks behind IME stubs, 2 of 2. The ntsync trace shows every setter succeeding; the 235 `MUTEX_KILL` EPERMs are wine killing mutexes it does not own on thread exit (on PowerPC `_IOW` is 4<<29, so 0x80044e86 IS MUTEX_KILL). The futex trace on CP2077's park: two threads poll a futex word every ms (36 K timed-out waits each in 40 s, the word never changes) while 18 threads sit in ntsync waits, so the setter of that word is itself blocked in ntsync: a cross-mechanism deadlock. Next: the two pollers' guest call sites (`/proc/PID/task/*/syscall` + RIP reconstruction) and what ntsync object the 18 wait on. Lane default stays `PROTON_NO_NTSYNC=1`.
+- **Stardew** has two stages: (1) a crash in the rootfs `libudev.so.1` (SDL's joystick enumeration through FEX's filtered sysfs) with a garbage pointer; `SDL_JOYSTICK_DISABLE_UDEV=1` gets past it; (2) then a .NET `AccessViolationException` in `XmlSerializer.GenerateTempAssembly` (dynamic assembly emission), unchanged with `DOTNET_EnableWriteXorExecute=0`. The "Missing LOCK HANDLER" noise belonged to stage 1.
+- **Arcanum** draws a uniform dark-grey fill (screenshot mean 0.25, spread 0) behind a full-screen window after Escape presses: its DirectDraw path renders nothing. Not diagnosed.
+- The guest-fault tripwire now prints the code bytes at RIP and the mapping that holds it (c9a810203, 463abb483); both were what found stage 1.
+
