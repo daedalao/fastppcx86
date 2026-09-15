@@ -75,7 +75,7 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 | cp2077 | WEDGE then PASS | alive, no window with ntsync; rendering (15 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
 | outward | FAIL then PASS | exit 3 at boot with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
 | tombraider | PASS (dark) | window at 0.0195 pixel stddev against the 0.02 bar: a dark loading screen |
-| vtmb, vtmbup | INTERMITTENT WEDGE | five VtMB runs: two opened the full 1920x1080 window within 210 s (one with ntsync, one without), three parked for 6+ minutes behind a 9x9 stub window with ~75 s of CPU. Not settled by ntsync alone; the wedge is a race. Open |
+| vtmb, vtmbup | **RESOLVED 09-15 (nw lane)** | Native-wine `nw-vtmbup` with the Unofficial Patch + `-game Unofficial_Patch -dxlevel 90 -w 1920 -h 1080 -fullscreen`. Two bugs fixed, both general nw-lane wins: the loading-into-level CRASH was the winecom COM-proxy use-after-free (wine-ppc64le `8b90cf6cd72`, a proxy must outlive its last guest ref); the ~4 fps was the d3d9 32-bit-lock readback bouncing write-only VRAM through ucrtbase + O(n) list walks (wine-ppc64le `70ee2ccb024`: DXVK `cachedWriteOnlyBuffers` + a hashed bounce cache). Now ~24-25 fps IN-LEVEL (user-confirmed 09-15), no crash. The earlier intermittent stub-window wedge did not recur once the patch + resolution launch args were in place. Lane default stays `PROTON_NO_NTSYNC=1`. |
 | arcanum | WEDGE | window present, pixel stddev 0: truly black (D3D8 path); not diagnosed |
 | rimworldwin | FAIL then PASS | died in the play window with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1`. Its "Failed to get home directory" / PulseAudio lines are noise (present in the passing run) |
 
@@ -215,13 +215,34 @@ independent causes, both about the guest being a self-modifying JIT:
    SDL's joystick init runs early, concurrent with the first tiering pass).
 
 Shipped as a per-title block in `fexplay-wtsmc` (fex-scripts commit 5985a7d).
-**OPEN FEX root cause (core, not per-title):** the 64K granule SMC is not
-fully sound under concurrent guest self-modification -- a granule holding
-both JIT'd code and frequently re-patched call sites can execute a stale
-translation under load. Same territory as the FEX_SMCGRANULEMIXED work. The
-strict recipe narrows it (no deferral) but tiering-off is still needed, so
-there is a residual race in the mtrack granule path itself. This is the bug
-to fix upstream; the config is the interim.
+
+**FEX root cause (core, not per-title) -- RELINK HALF FIXED 2026-09-15
+(`000852dc8`):** the 64K granule SMC was not sound under concurrent guest
+self-modification -- a granule holding both JIT'd code and frequently
+re-patched call sites could execute a stale translation under load. Root-caused
+to the relink path: `TryRelinkSoftInvalidatedBlock` hashed the guest bytes
+while the granule was still WRITABLE (the strict fault handler unprotects to
+R+W and returns; the faulting store retires only after sigreturn), so a store
+the handler had admitted but not yet retired matched the stale bytes and the
+relink republished a translation of code about to change. Fixed by a
+verify-after-arm re-hash: `MarkGuestExecutableRange` re-arms each page with
+`mprotect(PROT_READ)` (a full barrier), the block is hashed again after that
+and dropped on mismatch, so a racing store either lands before the arm (caught
+by the re-hash) or after it (faults on the armed page). Built + regression-clean
+(the SMC/granule suite is byte-identical with and without the change; the
+concurrent-SMC tests `smc-mt-*`, `smc-granule-siblings`, `smc-shared-2`,
+`smc-in-block` pass under strict). Direct game A/B still owed: Stardew strict +
+tiering ON (the config that crashed ~1/3) with `FEX_SMC_AUDIT` set should now
+survive and log `relink-miss-postarm` hits. The per-title strict + tiering-off
+config stays as-is until that A/B confirms it can be relaxed.
+
+**Still open -- fresh-compile half:** the first-compile path
+(`ContextImpl::CompileBlock`) hashes after the arm too, but decodes much
+earlier; a store in the decode->arm window yields translation(old-bytes) with
+hash(new-bytes), which a later relink validates as unchanged -- permanently
+stale. Needs a decode-time hash carried to the post-arm compare and a recompile
+on mismatch. Tracked in `SMCSoftInvalidate.h`. Same territory as the
+FEX_SMCGRANULEMIXED work.
 
 Verification note: the test host runs Wayland; the game renders into
 Xwayland `:1`, and the X11 grab tools (`import`, `spectacle`) capture the
