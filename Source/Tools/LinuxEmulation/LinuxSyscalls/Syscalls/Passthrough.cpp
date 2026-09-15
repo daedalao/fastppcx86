@@ -1421,11 +1421,18 @@ namespace x64 {
             // fault-free, so a park shows WHICH objects the waiters block on
             // (the fd -> type map comes from the CREATE_* lines above them).
             if (n > 0 && NtsyncWait) {
-              struct {
+              // Inside a registration macro: no commas in declarations.
+              struct WaitArgs {
                 uint64_t timeout;
                 uint64_t objs;
-                uint32_t count, owner, index, alert, flags, pad;
-              } WA {};
+                uint32_t count;
+                uint32_t owner;
+                uint32_t index;
+                uint32_t alert;
+                uint32_t flags;
+                uint32_t pad;
+              };
+              WaitArgs WA {};
               struct iovec L {&WA, sizeof(WA)};
               struct iovec R {reinterpret_cast<void*>(arg), sizeof(WA)};
               if (process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
