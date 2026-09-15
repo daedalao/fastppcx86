@@ -137,3 +137,14 @@ pollers' guest call sites (RIP of tids in FUTEX_WAIT with the 1 ms deadline)
 to see what WaitOnAddress loop they are, and what sets fd 24 / 295 in a
 run with ntsync off (trace both mechanisms in the working configuration).
 
+Follow-up (23:30): the futex pollers are wine's `NtWaitForAlertByThreadId`
+(futex path; this build's alerting is futex-only), i.e. the game re-arming
+a 1 ms wait until a job completes. The trace shows no alert fd and no
+object of any parked thread being signalled after it parked, so neither the
+ntsync module nor FEX's passthrough loses a wake: under ntsync the game never
+produces the signal it produces under server sync. Raising the unit's
+open-files limit (1024 by default under systemd-run, 65536 in a shell; now
+524288 in the harness) does not change it. Next session: trace the working
+configuration (ntsync off) for which wait returns differently, starting with
+the events fd 24 / 295 and the pool semaphore's producer.
+
