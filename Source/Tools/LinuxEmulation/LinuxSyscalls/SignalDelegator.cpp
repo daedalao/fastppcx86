@@ -1599,6 +1599,20 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
           }
         }
       }
+      // The code bytes at the faulting guest RIP, read fault-free, so a crash
+      // in freshly JIT'd guest code (CoreCLR, Mono) names its instruction
+      // without a debugger attached at the right moment.
+      {
+        uint8_t Code[32] = {};
+        struct iovec Local {Code, sizeof(Code)};
+        struct iovec Remote {reinterpret_cast<void*>(St.rip), sizeof(Code)};
+        const ssize_t Got = process_vm_readv(::getpid(), &Local, 1, &Remote, 1, 0);
+        n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  code@rip:");
+        for (ssize_t i = 0; i < Got && n < static_cast<int>(sizeof(buf)) - 4; ++i) {
+          n += snprintf(buf + n, sizeof(buf) - n, " %02x", Code[i]);
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "%s\n", Got <= 0 ? " <unreadable>" : "");
+      }
       // 32-bit guests keep a walkable EBP chain: ebp -> {saved ebp, ret}.
       // Reads are within our own address space; bound them to the low 4GB and
       // require monotonically increasing frame pointers to stay fault-free.
