@@ -1364,6 +1364,31 @@ namespace x64 {
         return static_cast<uint64_t>(-EINTR);
       }
 
+      // FEX_NTSYNC_TRACE entry line for waits: the return-side line below
+      // cannot exist for a thread that is parked in its wait right now, which
+      // is exactly the thread a wedge investigation needs to see. Same arming
+      // and file as the return-side trace (opened there on first use; here we
+      // only write if it is already open).
+      if (NtsyncWait) {
+        static const bool trace_ntsync_entry = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        if (trace_ntsync_entry && access("/tmp/nts_on", F_OK) == 0) {
+          char path[64];
+          snprintf(path, sizeof(path), "/tmp/nts.%d.log", static_cast<int>(::getpid()));
+          const int efd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+          if (efd >= 0) {
+            struct timespec ts {};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            char line[256];
+            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d ENTER nr=0x%x arg=0x%lx\n", static_cast<long>(ts.tv_sec),
+                                   static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(::syscall(SYS_gettid)), IoctlNr, arg);
+            if (n > 0) {
+              [[maybe_unused]] auto _ = ::write(efd, line, static_cast<size_t>(n));
+            }
+            ::close(efd);
+          }
+        }
+      }
+
       uint64_t Result = ::ioctl(fd, cmd, arg);
       if (NtsyncWait) {
         while (Result == static_cast<uint64_t>(-1) && errno == EINTR && !HasGuestDeliverableSignal(Frame)) {
