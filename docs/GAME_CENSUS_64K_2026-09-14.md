@@ -66,7 +66,7 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 | tombraider | PASS (dark) | window at 0.0195 pixel stddev against the 0.02 bar: a dark loading screen |
 | vtmb, vtmbup | WEDGE then FIXED | alive, no window, 75 s CPU. With `PROTON_NO_NTSYNC=1` VtMB opens its 1920x1080 window in 200 s. The ntsync wedge (memory: FreeInfantry, Portal 2-proton) is the open root cause; the launcher now defaults `PROTON_NO_NTSYNC=1` for the fexproton lane on the 64K boot |
 | arcanum | WEDGE | window present, pixel stddev 0: truly black (D3D8 path); not diagnosed |
-| rimworldwin | FAIL | boots, dies in the play window (exit 1); log read pending |
+| rimworldwin | FAIL then PASS | died in the play window with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1`. Its "Failed to get home directory" / PulseAudio lines are noise (present in the passing run) |
 
 
 ## Native wine + bridge lane
