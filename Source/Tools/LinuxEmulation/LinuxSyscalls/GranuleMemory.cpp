@@ -244,7 +244,9 @@ namespace {
 
     const bool Preserve = HasLiveSiblings(Tracking, GranuleBase, ReplaceBase, ReplaceEnd);
     if (Preserve && GranuleHasSharedMapping(Tracking, GranuleBase)) {
-      LogOnce(LoggedSharedConvert, "conversion of a MAP_SHARED granule to private backing", GranuleBase, HostSize);
+      LogMan::Msg::EFmt("64K granule emulation: refusing conversion of a MAP_SHARED granule to private backing: granule [{:#x}, {:#x}) for a "
+                        "sub-granule request over [{:#x}, {:#x})",
+                        GranuleBase, GranuleBase + HostSize, ReplaceBase, ReplaceEnd);
       return -EINVAL;
     }
 
