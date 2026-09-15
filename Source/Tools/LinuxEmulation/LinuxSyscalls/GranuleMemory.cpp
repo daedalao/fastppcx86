@@ -376,8 +376,16 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
       auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
       auto& Tracking = Hndl->VMATracking;
       for (uint64_t Page = GuestEnd; Page < GuestBase + HostSize; Page += GuestPageSize) {
-        if (Tracking.FindVMAEntry(Page) != Tracking.VMAs.end() || Tracking.Granules.LookupPage(Page, nullptr)) {
+        // A PROT_NONE reservation in the tail does not block: wine maps its
+        // shared pages INTO its own reserved address space, and at the
+        // permissive tier a reservation is tracked, not enforced.
+        auto It = Tracking.FindVMAEntry(Page);
+        const bool LiveVMA = It != Tracking.VMAs.end() && (It->second.Prot.Readable || It->second.Prot.Writable || It->second.Prot.Executable);
+        int GranProt = PROT_NONE;
+        const bool LiveGranule = Tracking.Granules.LookupPage(Page, &GranProt) && GranProt != PROT_NONE;
+        if (LiveVMA || LiveGranule) {
           TailFree = false;
+          LogOnce(LoggedSharedMmap, "shared sub-granule mapping refused: the granule's tail is live", Page, GuestPageSize);
           break;
         }
       }
@@ -424,7 +432,9 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     // copy does not exist. Refuse loudly rather than silently desynchronise.
     // Survey (PAGE_SIZE_64K_PLAN §2): rare, because X SHM segments and GL
     // buffers arrive host-aligned -- FEX allocates them.
-    LogOnce(LoggedSharedMmap, Anonymous ? "unaligned MAP_SHARED anonymous mmap" : "unaligned MAP_SHARED file mmap", GuestBase, Size);
+    LogMan::Msg::EFmt("64K granule emulation: refusing {} at [{:#x}, {:#x}) flags={:#x} prot={:#x} fd={} offset={:#x} (base aligned={}, offset aligned={})",
+                      Anonymous ? "unaligned MAP_SHARED anonymous mmap" : "unaligned MAP_SHARED file mmap", GuestBase, GuestEnd, flags, prot, fd,
+                      static_cast<uint64_t>(offset), HostAligned(GuestBase), HostAligned(static_cast<uint64_t>(offset)));
     *Result = static_cast<uint64_t>(-EINVAL);
     return true;
   }
