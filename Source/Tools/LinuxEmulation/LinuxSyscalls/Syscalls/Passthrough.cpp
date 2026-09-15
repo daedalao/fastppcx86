@@ -670,10 +670,10 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       }
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
-      char buf[192];
-      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
+      char buf[256];
+      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x rip=0x%lx\n",
                        (long)now.tv_sec, now.tv_nsec / 1000000, static_cast<int>(tls_tid), (unsigned long)futex_op,
-                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur);
+                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur, static_cast<unsigned long>(Frame->State.rip));
       [[maybe_unused]] auto _ = write(trace_fd, buf, n);
       }
     }
