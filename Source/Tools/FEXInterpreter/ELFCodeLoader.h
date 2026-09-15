@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #pragma once
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // Host page size (64K port, stage S2)
@@ -131,7 +132,16 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
     // The shared first host page may already carry a read-only protection from
     // the previous segment; open a write window over it for the pread.
-    const uintptr_t OverlapEnd = std::min(HostEnd, HostMappedEnd);
+    // Clamped to [HostStart, HostEnd]: for the first segment of a file (or any
+    // segment not adjoining the previous one) HostMappedEnd lies below
+    // HostStart and there is no overlap at all. Unclamped, OverlapEnd was 0 for
+    // a file whose FIRST segment needs the fallback, so the final protection
+    // below became mprotect(0, HostEnd, prot), failed on the unmapped low
+    // range, and the segment kept its PROT_READ|PROT_WRITE write window: every
+    // non-PIE i386 executable (text at 0x8048000, never 64K-aligned) ran with
+    // a read-write, non-executable text and died at its entry block with
+    // "NoExec instruction" on the 64K host (Dex, 2026-09-14).
+    const uintptr_t OverlapEnd = std::clamp(HostMappedEnd, HostStart, HostEnd);
     if (HostStart < OverlapEnd) {
       Handler->GuestMprotect(Thread, (void*)HostStart, OverlapEnd - HostStart, PROT_READ | PROT_WRITE);
     }
