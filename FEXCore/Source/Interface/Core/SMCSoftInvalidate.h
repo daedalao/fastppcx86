@@ -120,12 +120,31 @@
 //     code pages, or with an implausibly large span, are simply not eligible
 //     for retention and take the legacy hard-invalidate path.
 //
-// RESIDUAL RISK (identical to legacy, called out for review)
-//   Between hashing the guest bytes at compile/relink time and re-arming the
-//   page's write protection, a concurrent guest store on another thread is
-//   invisible.  Legacy has exactly the same window (it decodes, compiles, then
-//   protects) and x86 requires a serializing event for cross-modifying code,
-//   so this is unchanged, not newly introduced.
+// VERIFY-AFTER-ARM (the relink half, closed)
+//   Between hashing the guest bytes and re-arming the page's write protection,
+//   a concurrent guest store on another thread is invisible to the hash.  This
+//   was dismissed as "identical to legacy" -- but on the 64K granule path it is
+//   a live crash: a self-modifying guest (CoreCLR tiering, JVM re-JIT) patches a
+//   call site on a background thread while a mutator relinks the same granule,
+//   and the store the fault handler has already ADMITTED but not yet retired
+//   matches the stale bytes at hash time.  The relink then republishes a
+//   translation of code that is about to change.
+//
+//   Closed for the relink path in ContextImpl::TryRelinkSoftInvalidatedBlock:
+//   after MarkGuestExecutableRange re-arms the pages (mprotect PROT_READ -- a
+//   full barrier with a TLB shootdown), the block is hashed a SECOND time before
+//   it is published.  Any racing store now either landed before the arm (the
+//   re-hash sees it -> mismatch -> recompile) or lands after it (faults on the
+//   armed page -> soft-invalidate).  Neither can leave a stale translation
+//   published.  Cost: one extra hash per relink, nothing in steady state.
+//
+// RESIDUAL RISK (the fresh-compile half, follow-up)
+//   The first-compile path (ContextImpl::CompileBlock) hashes AFTER the arm
+//   too, but its translation was decoded much earlier: a store landing between
+//   decode and arm yields translation(old-bytes) carrying hash(new-bytes),
+//   which a later relink then validates as unchanged -- permanently stale.
+//   Closing this needs a decode-time hash carried to the post-arm compare and a
+//   recompile on mismatch; tracked as the fresh-compile hardening follow-up.
 //
 // POWER8: no codegen is involved.  This is pure C++ runtime code.
 // ===========================================================================

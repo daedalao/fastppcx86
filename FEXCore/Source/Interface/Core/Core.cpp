@@ -2012,6 +2012,36 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     }
   }
 
+  // SMC soundness -- VERIFY-AFTER-ARM.  The CurrentHash compare at the top of
+  // this function ran with the granule still WRITABLE: on the strict/mtrack
+  // path the fault handler unprotects the granule to R+W and returns, and the
+  // faulting guest store retires only after sigreturn.  A store the handler had
+  // already admitted but that had not yet retired was therefore invisible to
+  // that first hash -- it matched the stale bytes, and we arrived here about to
+  // republish a translation of code that is about to change.  This is the 64K
+  // concurrent-self-modification race (CoreCLR tiering / JVM re-JIT patch a call
+  // site on a background thread while a mutator relinks the same granule).
+  //
+  // MarkGuestExecutableRange above re-armed every code page with an
+  // mprotect(PROT_READ) -- a full barrier with a TLB shootdown -- so the racing
+  // store now either landed BEFORE the arm (and a re-hash sees it) or lands
+  // AFTER it (and faults, soft-invalidating this block).  Re-hash under the arm;
+  // a mismatch means the bytes moved out from under this translation, so drop it
+  // and let the caller compile fresh, exactly as the first-hash miss does.  The
+  // re-hash costs one XXH3 over the retained span, only on the relink path.
+  // See Interface/Core/SMCSoftInvalidate.h, "VERIFY-AFTER-ARM".
+  {
+    const uint64_t ArmedHash =
+      FEXCore::SMC::HashGuestBlock(Retained->CodePages, Retained->GuestRangeStart, Retained->GuestRangeLength);
+    if (ArmedHash != Retained->GuestHash) {
+      RecordCodeRangeInvalidation(Retained->GuestRangeStart, Retained->GuestRangeLength);
+      if (SMCAuditCompileFD() >= 0) {
+        dprintf(SMCAuditCompileFD(), "relink-miss-postarm rip=%lx\n", GuestRIP);
+      }
+      return 0;
+    }
+  }
+
   // SMC Idea 4: carry the semantic-patch metadata across the relink. A relink
   // only happens when the guest bytes hashed identical, and the host code is
   // the same code that was compiled from them -- so every recorded guest field
