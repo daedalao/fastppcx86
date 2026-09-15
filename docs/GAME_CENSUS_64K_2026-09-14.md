@@ -22,7 +22,7 @@ shell whose command line carries the pattern kills that shell (kill by pid).
 | ziggurat | PASS | |
 | rimworld | FAIL then FIXED | host SIGSEGV in `CodeCacheFilename`: the delayed code-cache load ran after the VMATracking lock was released with a *reference* into a `MappedResource` that Mono's unmap had freed. `MappedFile` is a `shared_ptr` now and `ExecutableFileSectionInfo` carries a keep-alive (8d064877a). Menu path 150 s clean after the fix. |
 | grimrock | PASS | leaks guest procs past the cgroup stop |
-| stardew | FAIL, OPEN | CoreCLR. A maps snapshot two seconds before the crash shows the faulting guest RIP (0x7ffecc702cc0) in unmapped space between the heap and FEX's allocator: a jump through a corrupted pointer. Guest SIGSEGV within ~60 s in every SMC mode (mtrack, lazy trio off, file-immutable off, full validation) and with `DOTNET_EnableWriteXorExecute=0`; decoder reports "Missing LOCK HANDLER" on ADD/FILD/JLE and a GS selector write in 64-bit mode before it, i.e. it executes garbage bytes. No granule refusals except benign guard regions. Ran on 4K (2026-07-30 fix). Needs a debugging session: map the guest RIP (0x7fff4f072cc0 in the tripwire run) to its library and diff the loaded bytes against the file. The launcher rule that put it on the full tier is retracted (that tier crashes too). |
+| stardew | **RESOLVED 09-15** | CoreCLR. Works with the launcher config `SMC_RECIPE=strict` + `DOTNET_TieredCompilation=0`/`DOTNET_TieredPGO=0` + `SDL_JOYSTICK_DISABLE_UDEV=1` (4/4 via `fex stardew`, confirmed by title-screen music). See the 09-15 section. Guest SIGSEGV within ~60 s in every SMC mode (mtrack, lazy trio off, file-immutable off, full validation) and with `DOTNET_EnableWriteXorExecute=0`; decoder reports "Missing LOCK HANDLER" on ADD/FILD/JLE and a GS selector write in 64-bit mode before it, i.e. it executes garbage bytes. No granule refusals except benign guard regions. Ran on 4K (2026-07-30 fix). Needs a debugging session: map the guest RIP (0x7fff4f072cc0 in the tripwire run) to its library and diff the loaded bytes against the file. The launcher rule that put it on the full tier is retracted (that tier crashes too). |
 | hardwest | PASS | |
 | moonlighter | PASS | |
 | amongthesleep | PASS | |
@@ -185,4 +185,50 @@ guest-fault tripwire prints the code bytes at RIP and the mapping holding it;
 `FEX_NTSYNC_TRACE` gained ENTER lines with wait arguments and each object's
 live state via the `*_READ` ioctls; `FEX_FUTEX_TRACE` gained the guest RIP and
 caller return address.
+
+## 2026-09-15: Stardew resolved (CoreCLR self-modification under the 64K granule SMC)
+
+Stardew (native Linux, CoreCLR) never launched on 64K; it works now. Two
+independent causes, both about the guest being a self-modifying JIT:
+
+1. **The default `lazy` SMC recipe is unsound for CoreCLR.** With lazy
+   (deferred) invalidation + the code cache, CoreCLR's dynamic-assembly
+   emission (XmlSerializer.GenerateTempAssembly, Reflection.Emit) executes a
+   stale translation of code it just emitted and takes a SIGSEGV
+   (surfaced as a .NET AccessViolationException). `SMC_RECIPE=strict` (mtrack
+   + soft-invalidate, no lazy deferral) fixes it -- the same class the JVM
+   (zomboid) hit. Established by matrix: lazy crashes; strict, code-cache-off,
+   and lazy-options-off all reach the window. No single lazy option is the
+   culprit; the whole deferred path is.
+
+2. **CoreCLR tiered compilation races the 64K granule SMC.** Even with strict,
+   startup crashed ~1 in 3 with a SIGSEGV in the rootfs libudev
+   (`udev_monitor_filter_add_match_subsystem_devtype`, dereferencing a small
+   garbage value ~0xa23). libudev is a bystander: it runs cleanly in a minimal
+   harness under FEX-64K, and the crash needs CoreCLR alongside it. Tiered
+   compilation re-JITs hot methods and PATCHES their call sites in background
+   threads -- self-modifying code -- and that racing self-modification under
+   the 64K granule SMC intermittently corrupts execution in code sharing a
+   granule. `DOTNET_TieredCompilation=0` + `DOTNET_TieredPGO=0` removes the
+   background re-patching: 4/4 stable. `SDL_JOYSTICK_DISABLE_UDEV=1` keeps SDL
+   off the udev path as belt-and-suspenders (the crash lands there because
+   SDL's joystick init runs early, concurrent with the first tiering pass).
+
+Shipped as a per-title block in `fexplay-wtsmc` (fex-scripts commit 5985a7d).
+**OPEN FEX root cause (core, not per-title):** the 64K granule SMC is not
+fully sound under concurrent guest self-modification -- a granule holding
+both JIT'd code and frequently re-patched call sites can execute a stale
+translation under load. Same territory as the FEX_SMCGRANULEMIXED work. The
+strict recipe narrows it (no deferral) but tiering-off is still needed, so
+there is a residual race in the mtrack granule path itself. This is the bug
+to fix upstream; the config is the interim.
+
+Verification note: the test host runs Wayland; the game renders into
+Xwayland `:1`, and the X11 grab tools (`import`, `spectacle`) capture the
+wrong surface, so pixel-render screenshots were unreliable all session. The
+reliable signals were window-present (xwininfo) + process-alive + no-crash,
+plus, for Stardew, the user hearing the title-screen music.
+
+Tally update: Linux-native 13 of 14 (Stardew resolved; Psychonauts still a
+dark loading screen).
 
