@@ -16,6 +16,7 @@ $end_info$
 #include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace FEX::HLE::VMATracking {
 
@@ -92,7 +93,14 @@ GranuleTable::GranuleEntry& GranuleTable::FindOrCreate(uint64_t GranuleBase) {
 }
 
 void GranuleTable::Forget(uint64_t GranuleBase) {
-  Granules.erase(GranuleBase);
+  auto it = Granules.find(GranuleBase);
+  if (it == Granules.end()) {
+    return;
+  }
+  if (it->second.SharedFd >= 0) {
+    ::close(it->second.SharedFd);
+  }
+  Granules.erase(it);
 }
 
 int GranuleTable::WantedProt(uint64_t GranuleBase, const GranuleEntry& Entry) {

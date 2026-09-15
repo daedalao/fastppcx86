@@ -137,6 +137,15 @@ struct GranuleTable {
     // mprotect/pwrite the granule; before it is set, the granule's backing is
     // whatever the guest's own (host-aligned) mapping put there.
     bool FEXBacked {false};
+    // Set by the shared-file passthrough (GranuleMemory.cpp, Granule::Mmap):
+    // the whole granule is one MAP_SHARED mapping of SharedFd at SharedOffset
+    // and FEX keeps a dup of the fd, so that a later private sub-granule
+    // request in the same granule can be represented by re-mapping the
+    // granule MAP_PRIVATE from the same file (wine's KUSER_SHARED_DATA page at
+    // 0x7ffe0000 next to its private syscall-dispatcher page at 0x7ffe1000).
+    // Closed by Forget().
+    int SharedFd {-1};
+    uint64_t SharedOffset {0};
 
     [[nodiscard]] uint64_t NibbleAt(uint64_t Index) const {
       return (Nibbles >> (Index * 4)) & PageNibbleMask;

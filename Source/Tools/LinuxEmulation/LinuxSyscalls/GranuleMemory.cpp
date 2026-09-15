@@ -28,6 +28,8 @@ $end_info$
 #include <cstring>
 #include <iterator>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -417,6 +419,14 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         // does not try to re-back it privately.
         auto& E = Hndl->VMATracking.Granules.FindOrCreate(GuestBase);
         E.FEXBacked = false;
+        if (E.SharedFd >= 0) {
+          ::close(E.SharedFd);
+          E.SharedFd = -1;
+        }
+        if (!Anonymous) {
+          E.SharedFd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+          E.SharedOffset = static_cast<uint64_t>(offset);
+        }
         Hndl->VMATracking.Granules.SetIntended(GuestBase, GuestEnd - GuestBase, prot);
         Hndl->VMATracking.Granules.NoteHostProt(GuestBase, prot);
         LateMetadata = Hndl->TrackMmap(Thread, GuestBase, GuestEnd - GuestBase, prot, flags, fd, offset, CachedSection);
@@ -520,6 +530,33 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         continue;
       }
 
+      // A granule the shared-file passthrough owns: re-map it MAP_PRIVATE from
+      // the same file and offset. Pages the guest never writes keep tracking
+      // the file through the page cache (the live KUSER_SHARED_DATA page),
+      // pages it writes are copied on that write and become private (the
+      // dispatcher-pointer page), which is what the anonymous request asked
+      // for. The file is extended to cover the granule so the tail pages
+      // exist; if it cannot be, the request is refused as before.
+      if (auto* SE = Tracking.Granules.FindMutable(G); SE && !SE->FEXBacked && SE->SharedFd >= 0) {
+        struct stat st {};
+        const uint64_t Need = SE->SharedOffset + HostSize;
+        if (::fstat(SE->SharedFd, &st) == 0 && static_cast<uint64_t>(st.st_size) < Need && ::ftruncate(SE->SharedFd, Need) != 0) {
+          LogMan::Msg::EFmt("64K granule emulation: shared-file granule {:#x} cannot be extended for a private sub-granule request ({})", G,
+                            ::strerror(errno));
+        } else {
+          void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(PROT_READ | PROT_WRITE),
+                           MAP_FIXED | MAP_PRIVATE, SE->SharedFd, static_cast<off_t>(SE->SharedOffset));
+          if (M != MAP_FAILED) {
+            ::close(SE->SharedFd);
+            SE->SharedFd = -1;
+            SE->FEXBacked = true;
+            SE->HostProt = PROT_READ | PROT_WRITE;
+            LogMan::Msg::IFmt("64K granule emulation: granule {:#x} re-mapped MAP_PRIVATE from its shared file for a private request at [{:#x}, {:#x}); "
+                              "guest writes to the formerly shared pages no longer propagate (none expected)",
+                              G, SubBase, SubEnd);
+          }
+        }
+      }
       const int64_t Prepared = MakeGranuleFEXBacked(Tracking, G, SubBase, SubEnd);
       if (Prepared < 0) {
         LogMan::Msg::EFmt("64K granule emulation: sub-granule mmap refused ({}): [{:#x}, {:#x}) flags={:#x} prot={:#x} fd={} offset={:#x} in granule {:#x}",
