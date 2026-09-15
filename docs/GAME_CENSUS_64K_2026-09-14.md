@@ -148,3 +148,41 @@ open-files limit (1024 by default under systemd-run, 65536 in a shell; now
 configuration (ntsync off) for which wait returns differently, starting with
 the events fd 24 / 295 and the pool semaphore's producer.
 
+## 2026-09-15: the CP2077 "ntsync wedge" was a misread; it is slow startup
+
+Resolved. CP2077 under full emulation asserts **"Watchdog timeout! (120
+seconds)"** (CD Projekt's own engine watchdog, `engineWatchdog.cpp:198`) with
+ntsync BOTH on and off, spawning `REDEngineErrorReporter.exe`. But the assert
+is non-fatal: the game keeps loading and its real window
+("Cyberpunk 2077 (C) 2020 by CD Projekt RED", >=1280 wide) comes up around
+t=180s. The earlier census PASS/WEDGE verdicts matched the crash-reporter
+window (the render check's grep included `REDEngine`), never gameplay.
+
+So ntsync is not the CP2077 discriminator, and the "cross-mechanism deadlock"
+framing was wrong: the wait/futex traffic is the game's normal idle-pool and
+alert-by-thread-id polling while its main thread is still doing cold-start
+work (JIT translation + DXVK/vkd3d shader compile) slower than the 120s
+watchdog. Established firmly this session:
+
+- The ntsync module is not losing wakes: no parked object is ever signalled
+  after a thread parks on it (verified by kcmp-matching every parked game fd
+  to its wineserver peer and checking the server's setter calls).
+- Signalling call counts are near-identical ntsync-on vs off (NtSetEvent
+  341 vs 343, NtReleaseSemaphore 23 vs 25, NtReleaseMutant 50 vs 51), and the
+  main thread's sync-call *sequence* is the same shape, only longer.
+- The decode of `ntsync_wait_args` in the FEX trace had `owner`/`index`/
+  `flags`/`alert` mis-ordered vs the uapi; fixed. `alert` is 0 on every
+  CP2077 wait (the game does no alertable waits here), so the alert path is
+  not involved either.
+
+Real lever for CP2077 under emulation: startup speed (so the watchdog does
+not fire) and a warm shader cache. Same instruction-count story as the rest.
+The lane default stays `PROTON_NO_NTSYNC=1` only because **VtMB** is a real
+intermittent window wedge (2 of 5 runs), independent of CP2077.
+
+Diagnostics landed this session (all env-gated, off by default): the
+guest-fault tripwire prints the code bytes at RIP and the mapping holding it;
+`FEX_NTSYNC_TRACE` gained ENTER lines with wait arguments and each object's
+live state via the `*_READ` ioctls; `FEX_FUTEX_TRACE` gained the guest RIP and
+caller return address.
+
