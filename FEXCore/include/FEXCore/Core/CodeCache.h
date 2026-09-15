@@ -98,6 +98,12 @@ struct ExecutableFileSectionInfo {
 
   // End address that of the section mapping
   uintptr_t EndVA;
+
+  // Optional owner of FileInfo. A frontend whose file infos can be retired
+  // by another thread while a section is in flight (the Linux frontend's
+  // MappedResource, freed by munmap) sets it so FileInfo stays valid for the
+  // section's lifetime; aggregate initialisers that omit it are unchanged.
+  fextl::shared_ptr<const ExecutableFileInfo> Keepalive {};
 };
 
 using CodeMapFileId = uint64_t;

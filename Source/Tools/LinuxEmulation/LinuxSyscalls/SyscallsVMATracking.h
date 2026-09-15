@@ -48,7 +48,12 @@ struct VMAEntry;
 struct MappedResource {
   using ContainerType = fextl::multimap<MRID, MappedResource>;
 
-  fextl::unique_ptr<FEXCore::ExecutableFileInfo> MappedFile;
+  // Shared, not unique: an ExecutableFileSectionInfo built from this resource
+  // carries a keep-alive (CodeCache.h), because the delayed code-cache load
+  // runs after the VMATracking lock is released and a concurrent munmap can
+  // retire the resource meanwhile (RimWorld at its main menu, 2026-09-14: the
+  // loader read a freed Filename and FEX died on 0xffeadd33).
+  fextl::shared_ptr<FEXCore::ExecutableFileInfo> MappedFile;
   // Pointer to lowest memory range this file is mapped to
   VMAEntry* FirstVMA;
   uint64_t Length; // 0 if not fixed size

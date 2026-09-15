@@ -358,7 +358,67 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     return true;
   }
 
-  if ((flags & MAP_SHARED) || (flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE) {
+  const bool SharedRequest = (flags & MAP_SHARED) || (flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE;
+  if (const uint64_t HostSize = FEXCore::HostPage::Size();
+      SharedRequest && (flags & MAP_FIXED) && HostAligned(GuestBase) && (Anonymous || HostAligned(static_cast<uint64_t>(offset))) &&
+      GuestEnd - GuestBase < HostSize) {
+    // A shared mapping whose ONLY sub-granule dimension is its length, at a
+    // host-aligned address and file offset: wine's KUSER_SHARED_DATA page
+    // (MAP_SHARED, 4K, fixed at 0x7ffe0000, offset 0) is the production case
+    // and the first thing wine does under full emulation. Mapping the whole
+    // granule from the same offset is exact for every byte the guest asked
+    // for; the tail past the file's end SIGBUSes if touched, which the guest
+    // never does, and a shorter file is a legal mmap. Only when the rest of
+    // the granule holds nothing the guest already owns.
+    auto* Hndl = Handler::Get();
+    bool TailFree = true;
+    {
+      auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+      auto& Tracking = Hndl->VMATracking;
+      for (uint64_t Page = GuestEnd; Page < GuestBase + HostSize; Page += GuestPageSize) {
+        if (Tracking.FindVMAEntry(Page) != Tracking.VMAs.end() || Tracking.Granules.LookupPage(Page, nullptr)) {
+          TailFree = false;
+          break;
+        }
+      }
+      if (TailFree) {
+        for (uint64_t G = GuestBase; G < GuestBase + HostSize; G += HostSize) {
+          Tracking.Granules.Forget(G);
+        }
+      }
+    }
+    if (TailFree) {
+      if (HostOwnedRanges::Overlaps(GuestBase, HostSize)) {
+        HostOwnedRanges::ReportRefusal("mmap", GuestBase, HostSize);
+        *Result = static_cast<uint64_t>(-ENOMEM);
+        return true;
+      }
+      void* M = ::mmap(reinterpret_cast<void*>(GuestBase), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(prot), flags, fd, offset);
+      if (M == MAP_FAILED) {
+        *Result = static_cast<uint64_t>(-errno);
+        return true;
+      }
+      std::optional<FEX::HLE::SyscallHandler::LateApplyExtendedVolatileMetadata> LateMetadata;
+      std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
+      {
+        auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+        // VMATracking keeps the guest's own length; the granule is what the
+        // kernel has, recorded as such so a later sub-granule operation in it
+        // does not try to re-back it privately.
+        auto& E = Hndl->VMATracking.Granules.FindOrCreate(GuestBase);
+        E.FEXBacked = false;
+        Hndl->VMATracking.Granules.SetIntended(GuestBase, GuestEnd - GuestBase, prot);
+        Hndl->VMATracking.Granules.NoteHostProt(GuestBase, prot);
+        LateMetadata = Hndl->TrackMmap(Thread, GuestBase, GuestEnd - GuestBase, prot, flags, fd, offset, CachedSection);
+      }
+      Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, GuestEnd - GuestBase);
+      Hndl->FinishTrackedMmap(Thread, std::move(LateMetadata), CachedSection);
+      *Result = GuestBase;
+      return true;
+    }
+  }
+
+  if (SharedRequest) {
     // Emulating an unrepresentable mapping means copying its contents into a
     // private anonymous granule. A shared mapping's whole contract is that the
     // copy does not exist. Refuse loudly rather than silently desynchronise.

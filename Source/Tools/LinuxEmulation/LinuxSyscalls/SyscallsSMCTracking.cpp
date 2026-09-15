@@ -1649,7 +1649,10 @@ void SyscallHandler::InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState
 }
 
 static FEXCore::ExecutableFileSectionInfo BuildSectionInfo(const VMATracking::MappedResource& Resource, uint64_t Base, uint64_t Size) {
-  return FEXCore::ExecutableFileSectionInfo {*Resource.MappedFile, Resource.FirstVMA->Base, Base, Base + Size};
+  // The section keeps the file info alive: it is consumed after the
+  // VMATracking lock is released (FinishTrackedMmap/FinishTrackedMprotect ->
+  // LoadCodeCache), when the resource may already be gone.
+  return FEXCore::ExecutableFileSectionInfo {*Resource.MappedFile, Resource.FirstVMA->Base, Base, Base + Size, Resource.MappedFile};
 }
 
 std::optional<FEXCore::ExecutableFileSectionInfo>
@@ -2812,7 +2815,7 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
     if (PathLength != -1 && S_ISREG(buf.st_mode) && (buf.st_mode & S_IXUSR)) {
       // ELF files that are mapped multiple times get a separate MappedResource for each base virtual address
       if ((prot & PROT_READ) && Inserted) {
-        Resource->MappedFile = fextl::make_unique<FEXCore::ExecutableFileInfo>();
+        Resource->MappedFile = fextl::make_shared<FEXCore::ExecutableFileInfo>();
         Resource->MappedFile->Filename = fextl::string(Tmp, PathLength);
         Resource->MappedFile->FileId = CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd);
 
