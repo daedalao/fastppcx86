@@ -1416,7 +1416,9 @@ namespace x64 {
               n += snprintf(line + n, sizeof(line) - n, " to=%lx count=%u owner=%u alert=%u objs=", static_cast<unsigned long>(WA.timeout),
                             WA.count, WA.owner, WA.alert);
               for (uint32_t i = 0; i < Count && n < static_cast<int>(sizeof(line)) - 64; ++i) {
-                uint32_t St[2] = {0, 0};
+                uint32_t St[2];
+                St[0] = 0;
+                St[1] = 0;
                 const char* Type = "?";
                 // PPC encodings of _IOR('N', 0x8d/0x8b/0x8c, 8-byte struct).
                 if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8d, St) == 0) {
