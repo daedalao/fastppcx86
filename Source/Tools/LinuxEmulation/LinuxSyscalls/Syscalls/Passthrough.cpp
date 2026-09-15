@@ -1413,10 +1413,36 @@ namespace x64 {
             struct timespec ts {};
             clock_gettime(CLOCK_MONOTONIC, &ts);
             const int64_t sr = static_cast<int64_t>(Result);
-            char line[192];
-            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
+            char line[512];
+            int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
                                    static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
                                    IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? saved_errno : 0);
+            // WAIT_ANY/WAIT_ALL: the wait arguments and the object fds, read
+            // fault-free, so a park shows WHICH objects the waiters block on
+            // (the fd -> type map comes from the CREATE_* lines above them).
+            if (n > 0 && NtsyncWait) {
+              struct {
+                uint64_t timeout;
+                uint64_t objs;
+                uint32_t count, owner, index, alert, flags, pad;
+              } WA {};
+              struct iovec L {&WA, sizeof(WA)};
+              struct iovec R {reinterpret_cast<void*>(arg), sizeof(WA)};
+              if (process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
+                uint32_t Objs[16] = {};
+                const uint32_t Count = WA.count > 16 ? 16 : WA.count;
+                struct iovec L2 {Objs, Count * sizeof(uint32_t)};
+                struct iovec R2 {reinterpret_cast<void*>(WA.objs), Count * sizeof(uint32_t)};
+                process_vm_readv(::getpid(), &L2, 1, &R2, 1, 0);
+                int m = snprintf(line + n - 1, sizeof(line) - n + 1, " wait{to=%lx count=%u owner=%u alert=%u idx=%u objs=",
+                                 static_cast<unsigned long>(WA.timeout), WA.count, WA.owner, WA.alert, WA.index);
+                for (uint32_t i = 0; i < Count && m > 0 && n - 1 + m < static_cast<int>(sizeof(line)) - 8; ++i) {
+                  m += snprintf(line + n - 1 + m, sizeof(line) - n + 1 - m, "%s%u", i ? "," : "", Objs[i]);
+                }
+                m += snprintf(line + n - 1 + m, sizeof(line) - n + 1 - m, "}\n");
+                n = n - 1 + m;
+              }
+            }
             if (n > 0) {
               [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
             }
