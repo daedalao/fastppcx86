@@ -22,7 +22,7 @@ shell whose command line carries the pattern kills that shell (kill by pid).
 | ziggurat | PASS | |
 | rimworld | FAIL then FIXED | host SIGSEGV in `CodeCacheFilename`: the delayed code-cache load ran after the VMATracking lock was released with a *reference* into a `MappedResource` that Mono's unmap had freed. `MappedFile` is a `shared_ptr` now and `ExecutableFileSectionInfo` carries a keep-alive (8d064877a). Menu path 150 s clean after the fix. |
 | grimrock | PASS | leaks guest procs past the cgroup stop |
-| stardew | FAIL, OPEN | CoreCLR. Guest SIGSEGV within ~60 s in every SMC mode (mtrack, lazy trio off, file-immutable off, full validation) and with `DOTNET_EnableWriteXorExecute=0`; decoder reports "Missing LOCK HANDLER" on ADD/FILD/JLE and a GS selector write in 64-bit mode before it, i.e. it executes garbage bytes. No granule refusals except benign guard regions. Ran on 4K (2026-07-30 fix). Needs a debugging session: map the guest RIP (0x7fff4f072cc0 in the tripwire run) to its library and diff the loaded bytes against the file. The launcher rule that put it on the full tier is retracted (that tier crashes too). |
+| stardew | FAIL, OPEN | CoreCLR. A maps snapshot two seconds before the crash shows the faulting guest RIP (0x7ffecc702cc0) in unmapped space between the heap and FEX's allocator: a jump through a corrupted pointer. Guest SIGSEGV within ~60 s in every SMC mode (mtrack, lazy trio off, file-immutable off, full validation) and with `DOTNET_EnableWriteXorExecute=0`; decoder reports "Missing LOCK HANDLER" on ADD/FILD/JLE and a GS selector write in 64-bit mode before it, i.e. it executes garbage bytes. No granule refusals except benign guard regions. Ran on 4K (2026-07-30 fix). Needs a debugging session: map the guest RIP (0x7fff4f072cc0 in the tripwire run) to its library and diff the loaded bytes against the file. The launcher rule that put it on the full tier is retracted (that tier crashes too). |
 | hardwest | PASS | |
 | moonlighter | PASS | |
 | amongthesleep | PASS | |
@@ -64,7 +64,7 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 | cp2077 | WEDGE then PASS | alive, no window with ntsync; rendering (15 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
 | outward | FAIL then PASS | exit 3 at boot with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
 | tombraider | PASS (dark) | window at 0.0195 pixel stddev against the 0.02 bar: a dark loading screen |
-| vtmb, vtmbup | WEDGE then FIXED | alive, no window, 75 s CPU. With `PROTON_NO_NTSYNC=1` VtMB opens its 1920x1080 window in 200 s. The ntsync wedge (memory: FreeInfantry, Portal 2-proton) is the open root cause; the launcher now defaults `PROTON_NO_NTSYNC=1` for the fexproton lane on the 64K boot |
+| vtmb, vtmbup | INTERMITTENT WEDGE | five VtMB runs: two opened the full 1920x1080 window within 210 s (one with ntsync, one without), three parked for 6+ minutes behind a 9x9 stub window with ~75 s of CPU. Not settled by ntsync alone; the wedge is a race. Open |
 | arcanum | WEDGE | window present, pixel stddev 0: truly black (D3D8 path); not diagnosed |
 | rimworldwin | FAIL then PASS | died in the play window with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1`. Its "Failed to get home directory" / PulseAudio lines are noise (present in the passing run) |
 
@@ -87,3 +87,12 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
   from a crash; a title that dies through the silent SIGSEGV stub reads as
   a clean exit. The host-fault gate's report lands in Unity's Player.log,
   which captures FEX's stderr.
+
+## Tally at 20:05
+
+Linux-native: 12 of 14 pass (Stardew open; Psychonauts dark). fexproton, full
+emulation: 6 of 9 pass (witcher3, dexwin, cp2077, outward, tombraider dark,
+rimworldwin), VtMB x2 intermittent, Arcanum black. Native wine: 3 of 4 pass
+(nw-dexwin is the known 32-bit gap). Launcher: `PROTON_NO_NTSYNC=1` is the
+fexproton-lane default on the 64K boot until the ntsync wedge is root-caused.
+
