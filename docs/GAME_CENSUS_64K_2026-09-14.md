@@ -62,7 +62,7 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 | witcher3 | PASS | rendering, 15 procs |
 | dexwin | PASS | its registry row carries `PROTON_NO_NTSYNC=1` |
 | cp2077 | WEDGE then PASS | alive, no window with ntsync; rendering (15 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
-| outward | FAIL | exit 3 at boot; guest-side "Failed to get home directory" x2 and an ALSA "PulseAudio: Unable to connect"; the unit's own HOME and pulse socket are fine; needs its own session |
+| outward | FAIL then PASS | exit 3 at boot with ntsync; rendering (16 procs) in round 3 with `PROTON_NO_NTSYNC=1` |
 | tombraider | PASS (dark) | window at 0.0195 pixel stddev against the 0.02 bar: a dark loading screen |
 | vtmb, vtmbup | WEDGE then FIXED | alive, no window, 75 s CPU. With `PROTON_NO_NTSYNC=1` VtMB opens its 1920x1080 window in 200 s. The ntsync wedge (memory: FreeInfantry, Portal 2-proton) is the open root cause; the launcher now defaults `PROTON_NO_NTSYNC=1` for the fexproton lane on the 64K boot |
 | arcanum | WEDGE | window present, pixel stddev 0: truly black (D3D8 path); not diagnosed |
@@ -75,7 +75,8 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 |---|---|---|
 | nw-dexwin (32-bit) | WEDGE | first pass died with `Unknown ALU Op: 0x15`: opcode 0x82, the 32-bit-only alias of 0x80, was missing from `SecondaryALUOp` (e7c26503e, 32-bit ASM test). After the fix it parks with a 1x1 window, which is the known nw-lane 32-bit Windows gap (nested exception on the signal stack; memory notes). |
 | nw-witcher3 | PASS | 12 procs, rendering |
-| nw-cp2077, nw-rimworldwin | redo pending | their first legs ran through a launcher I had just broken (a retracted Stardew rule took a newline with it); rerun queued in `~/benchlogs/smoke64k-nwredo-*` |
+| nw-cp2077 | PASS | rendering, 15 procs (its first leg had run through a launcher I had just broken) |
+| nw-rimworldwin | redo pending | same launcher incident; rerun in `~/benchlogs/smoke64k-nwredo2-*` |
 
 ## Also found on the way
 
