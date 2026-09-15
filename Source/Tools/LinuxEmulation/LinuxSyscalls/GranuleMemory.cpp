@@ -522,6 +522,8 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
 
       const int64_t Prepared = MakeGranuleFEXBacked(Tracking, G, SubBase, SubEnd);
       if (Prepared < 0) {
+        LogMan::Msg::EFmt("64K granule emulation: sub-granule mmap refused ({}): [{:#x}, {:#x}) flags={:#x} prot={:#x} fd={} offset={:#x} in granule {:#x}",
+                          -Prepared, SubBase, SubEnd, flags, prot, fd, static_cast<uint64_t>(FileOffset), G);
         *Result = static_cast<uint64_t>(Prepared);
         return true;
       }
