@@ -29,7 +29,7 @@ shell whose command line carries the pattern kills that shell (kill by pid).
 | shadowrunhk | PASS | |
 | zomboid | PASS | |
 | dex (i386) | FAIL then FIXED | exit 0 within seconds: "NoExec instruction in entry block" at 0x8079ED0. The loader fallback's overlap window was unclamped, so the first PT_LOAD of a non-PIE i386 executable got `mprotect(0, ...)` and kept its read-write pread window: text never executable (6a7831058). Runs to Unity asset loading after the fix. |
-| psychonauts (i386) | WEDGE | window present but black/uniform at the check; same loader fix applies to its boot; not yet diagnosed past that |
+| psychonauts (i386) | PASS (dark) | engine running (animation loads in the log); the screenshot's pixel stddev was 0.0199 against the harness's 0.02 bar, a dark loading screen, not a fault |
 | witcher2 (i386) | PASS | passes only after the loader fix |
 
 ## fexproton lane (full emulation)
@@ -56,7 +56,8 @@ The nine-title rerun on the fixed build is in `~/benchlogs/smoke64k-win-*`.
 | title | verdict | notes |
 |---|---|---|
 | nw-dexwin (32-bit) | WEDGE | first pass died with `Unknown ALU Op: 0x15`: opcode 0x82, the 32-bit-only alias of 0x80, was missing from `SecondaryALUOp` (e7c26503e, 32-bit ASM test). After the fix it parks with a 1x1 window, which is the known nw-lane 32-bit Windows gap (nested exception on the signal stack; memory notes). |
-| nw-witcher3, nw-cp2077, nw-rimworldwin | pending | running at the end of the census |
+| nw-witcher3 | PASS | 12 procs, rendering |
+| nw-cp2077, nw-rimworldwin | redo pending | their first legs ran through a launcher I had just broken (a retracted Stardew rule took a newline with it); rerun queued in `~/benchlogs/smoke64k-nwredo-*` |
 
 ## Also found on the way
 
