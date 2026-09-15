@@ -55,7 +55,19 @@ All nine titles died at boot in the first pass: wine 11 stopped at
    `FileStartVA`, which wine's multi-view PE mappings produce. Fatal for an
    optimisation; it skips the block now (f3d00249f).
 
-The nine-title rerun on the fixed build is in `~/benchlogs/smoke64k-win-*`.
+Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
+
+| title | verdict | notes |
+|---|---|---|
+| witcher3 | PASS | rendering, 15 procs |
+| dexwin | PASS | its registry row carries `PROTON_NO_NTSYNC=1` |
+| cp2077 | WEDGE | alive, no window, ~105 s CPU: the ntsync-wedge shape (below) |
+| outward | FAIL | exit 3 at boot; guest-side "Failed to get home directory" x2 and an ALSA "PulseAudio: Unable to connect"; the unit's own HOME and pulse socket are fine; needs its own session |
+| tombraider | PASS (dark) | window at 0.0195 pixel stddev against the 0.02 bar: a dark loading screen |
+| vtmb, vtmbup | WEDGE then FIXED | alive, no window, 75 s CPU. With `PROTON_NO_NTSYNC=1` VtMB opens its 1920x1080 window in 200 s. The ntsync wedge (memory: FreeInfantry, Portal 2-proton) is the open root cause; the launcher now defaults `PROTON_NO_NTSYNC=1` for the fexproton lane on the 64K boot |
+| arcanum | WEDGE | window present, pixel stddev 0: truly black (D3D8 path); not diagnosed |
+| rimworldwin | FAIL | boots, dies in the play window (exit 1); log read pending |
+
 
 ## Native wine + bridge lane
 
