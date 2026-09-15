@@ -1613,6 +1613,42 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
         }
         n += snprintf(buf + n, sizeof(buf) - n, "%s\n", Got <= 0 ? " <unreadable>" : "");
       }
+      // The mapping that holds the guest RIP, from /proc/self/maps (open/read
+      // only): names the library or JIT heap without a maps snapshot taken
+      // at exactly the right moment.
+      {
+        const int MapsFD = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        if (MapsFD >= 0) {
+          static char Maps[1 << 20];
+          ssize_t Total = 0;
+          for (;;) {
+            const ssize_t R = ::read(MapsFD, Maps + Total, sizeof(Maps) - 1 - Total);
+            if (R <= 0 || Total + R >= static_cast<ssize_t>(sizeof(Maps)) - 1) {
+              break;
+            }
+            Total += R;
+          }
+          ::close(MapsFD);
+          Maps[Total] = 0;
+          const char* Line = Maps;
+          bool Found = false;
+          while (*Line && !Found) {
+            const char* End = strchr(Line, '\n');
+            const size_t Len = End ? static_cast<size_t>(End - Line) : strlen(Line);
+            char* Dash = nullptr;
+            const uint64_t Lo = strtoull(Line, &Dash, 16);
+            const uint64_t Hi = (Dash && *Dash == '-') ? strtoull(Dash + 1, nullptr, 16) : 0;
+            if (Lo <= St.rip && St.rip < Hi) {
+              n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  rip in: %.*s\n", static_cast<int>(Len > 200 ? 200 : Len), Line);
+              Found = true;
+            }
+            Line = End ? End + 1 : Line + Len;
+          }
+          if (!Found) {
+            n += snprintf(buf + n, sizeof(buf) - n, "[GSIG]  rip in: <no mapping>\n");
+          }
+        }
+      }
       // 32-bit guests keep a walkable EBP chain: ebp -> {saved ebp, ret}.
       // Reads are within our own address space; bound them to the low 4GB and
       // require monotonically increasing frame pointers to stay fault-free.
