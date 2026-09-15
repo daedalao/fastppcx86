@@ -76,7 +76,7 @@ Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 | nw-dexwin (32-bit) | WEDGE | first pass died with `Unknown ALU Op: 0x15`: opcode 0x82, the 32-bit-only alias of 0x80, was missing from `SecondaryALUOp` (e7c26503e, 32-bit ASM test). After the fix it parks with a 1x1 window, which is the known nw-lane 32-bit Windows gap (nested exception on the signal stack; memory notes). |
 | nw-witcher3 | PASS | 12 procs, rendering |
 | nw-cp2077 | PASS | rendering, 15 procs (its first leg had run through a launcher I had just broken) |
-| nw-rimworldwin | redo pending | same launcher incident; rerun in `~/benchlogs/smoke64k-nwredo2-*` |
+| nw-rimworldwin | PASS | rendering, 14 procs (first leg had hit the same launcher incident) |
 
 ## Also found on the way
 
