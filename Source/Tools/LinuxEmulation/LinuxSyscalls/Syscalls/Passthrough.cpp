@@ -1378,9 +1378,58 @@ namespace x64 {
           if (efd >= 0) {
             struct timespec ts {};
             clock_gettime(CLOCK_MONOTONIC, &ts);
-            char line[256];
-            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d ENTER nr=0x%x arg=0x%lx\n", static_cast<long>(ts.tv_sec),
-                                   static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(::syscall(SYS_gettid)), IoctlNr, arg);
+            char line[768];
+            int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d ENTER nr=0x%x arg=0x%lx", static_cast<long>(ts.tv_sec),
+                             static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(::syscall(SYS_gettid)), IoctlNr, arg);
+            // The wait arguments, and each object's live state through the
+            // *_READ ioctls (the one that succeeds also names the type: wine's
+            // server creates the objects, so the client trace has no CREATE
+            // lines to type them from). A thread parking on an object that
+            // reads as signalled is a lost wake.
+            struct WaitArgsE {
+              uint64_t timeout;
+              uint64_t objs;
+              uint32_t count;
+              uint32_t owner;
+              uint32_t index;
+              uint32_t alert;
+              uint32_t flags;
+              uint32_t pad;
+            };
+            WaitArgsE WA {};
+            struct iovec L;
+            L.iov_base = &WA;
+            L.iov_len = sizeof(WA);
+            struct iovec R;
+            R.iov_base = reinterpret_cast<void*>(arg);
+            R.iov_len = sizeof(WA);
+            if (n > 0 && process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
+              uint32_t Objs[16] = {};
+              const uint32_t Count = WA.count > 16 ? 16 : WA.count;
+              struct iovec L2;
+              L2.iov_base = Objs;
+              L2.iov_len = Count * sizeof(uint32_t);
+              struct iovec R2;
+              R2.iov_base = reinterpret_cast<void*>(WA.objs);
+              R2.iov_len = Count * sizeof(uint32_t);
+              process_vm_readv(::getpid(), &L2, 1, &R2, 1, 0);
+              n += snprintf(line + n, sizeof(line) - n, " to=%lx count=%u owner=%u alert=%u objs=", static_cast<unsigned long>(WA.timeout),
+                            WA.count, WA.owner, WA.alert);
+              for (uint32_t i = 0; i < Count && n < static_cast<int>(sizeof(line)) - 64; ++i) {
+                uint32_t St[2] = {0, 0};
+                const char* Type = "?";
+                // PPC encodings of _IOR('N', 0x8d/0x8b/0x8c, 8-byte struct).
+                if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8d, St) == 0) {
+                  Type = "event";
+                } else if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8b, St) == 0) {
+                  Type = "sem";
+                } else if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8c, St) == 0) {
+                  Type = "mutex";
+                }
+                n += snprintf(line + n, sizeof(line) - n, "%s%u:%s(%u,%u)", i ? "," : "", Objs[i], Type, St[0], St[1]);
+              }
+            }
+            n += snprintf(line + n, sizeof(line) - n, "\n");
             if (n > 0) {
               [[maybe_unused]] auto _ = ::write(efd, line, static_cast<size_t>(n));
             }
