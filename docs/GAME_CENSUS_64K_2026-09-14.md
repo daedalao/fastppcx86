@@ -55,6 +55,17 @@ All nine titles died at boot in the first pass: wine 11 stopped at
    `FileStartVA`, which wine's multi-view PE mappings produce. Fatal for an
    optimisation; it skips the block now (f3d00249f).
 
+4. Found by the user in Skyrim SE that evening (lockpicking minigame never
+   closing after a successful pick): the USD page in the converted granule is
+   dirtied in practice (Private_Dirty 64K in the live process) and the
+   process's InterruptTime, SystemTime and TickCount were frozen. A hidden
+   live view of the memfd plus a 1 kHz host refresher thread copying the
+   three KSYSTEM_TIME clocks through `process_vm_writev` restores them
+   (54e7cf520; verified +1500 ms TickCount per 1.5 s in a live wine
+   process). Every timer-driven behaviour in every fexproton title before
+   this commit was affected; the census passes above were taken with frozen
+   clocks and stand only as "boots and renders".
+
 Rerun on the fixed build (`~/benchlogs/smoke64k-win-*`):
 
 | title | verdict | notes |
