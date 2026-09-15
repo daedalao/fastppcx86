@@ -157,10 +157,21 @@ void CodeMapWriter::AppendBlock(const FEXCore::ExecutableFileSectionInfo& Sectio
     return;
   }
 
-  BlockEntry -= SectionInfo.FileStartVA;
-  if (BlockEntry > std::numeric_limits<uint32_t>::max()) {
-    ERROR_AND_DIE_FMT("Cannot write code map");
+  // A block outside the 4 GiB window above the section's FileStartVA has no
+  // code-map representation. That used to be fatal, which killed every
+  // fexproton title on the 64K host: wine maps a PE image in several views
+  // and FirstVMA is not always the lowest one, so a block from a view below
+  // it went negative here. The code map is an optimisation; skip the block.
+  const uint64_t Offset = BlockEntry - SectionInfo.FileStartVA;
+  if (Offset > std::numeric_limits<uint32_t>::max()) {
+    static std::atomic<bool> Logged {false};
+    if (!Logged.exchange(true)) {
+      LogMan::Msg::EFmt("Code map: block {:#x} lies outside the 4 GiB window of {} (FileStartVA {:#x}); not recorded (reported once)",
+                        BlockEntry, SectionInfo.FileInfo.Filename, SectionInfo.FileStartVA);
+    }
+    return;
   }
+  BlockEntry = Offset;
 
   // Register new library if not already known
   bool NewLibraryLoad = false;
