@@ -1433,13 +1433,21 @@ namespace x64 {
                 uint32_t pad;
               };
               WaitArgs WA {};
-              struct iovec L {&WA, sizeof(WA)};
-              struct iovec R {reinterpret_cast<void*>(arg), sizeof(WA)};
+              struct iovec L;
+              L.iov_base = &WA;
+              L.iov_len = sizeof(WA);
+              struct iovec R;
+              R.iov_base = reinterpret_cast<void*>(arg);
+              R.iov_len = sizeof(WA);
               if (process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
                 uint32_t Objs[16] = {};
                 const uint32_t Count = WA.count > 16 ? 16 : WA.count;
-                struct iovec L2 {Objs, Count * sizeof(uint32_t)};
-                struct iovec R2 {reinterpret_cast<void*>(WA.objs), Count * sizeof(uint32_t)};
+                struct iovec L2;
+                L2.iov_base = Objs;
+                L2.iov_len = Count * sizeof(uint32_t);
+                struct iovec R2;
+                R2.iov_base = reinterpret_cast<void*>(WA.objs);
+                R2.iov_len = Count * sizeof(uint32_t);
                 process_vm_readv(::getpid(), &L2, 1, &R2, 1, 0);
                 int m = snprintf(line + n - 1, sizeof(line) - n + 1, " wait{to=%lx count=%u owner=%u alert=%u idx=%u objs=",
                                  static_cast<unsigned long>(WA.timeout), WA.count, WA.owner, WA.alert, WA.index);
