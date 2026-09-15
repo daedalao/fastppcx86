@@ -1403,10 +1403,10 @@ namespace x64 {
               uint64_t timeout;
               uint64_t objs;
               uint32_t count;
-              uint32_t owner;
               uint32_t index;
-              uint32_t alert;
               uint32_t flags;
+              uint32_t owner;
+              uint32_t alert;
               uint32_t pad;
             };
             WaitArgsE WA {};
@@ -1515,10 +1515,10 @@ namespace x64 {
                 uint64_t timeout;
                 uint64_t objs;
                 uint32_t count;
-                uint32_t owner;
                 uint32_t index;
-                uint32_t alert;
                 uint32_t flags;
+                uint32_t owner;
+                uint32_t alert;
                 uint32_t pad;
               };
               WaitArgs WA {};
