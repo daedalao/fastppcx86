@@ -28,6 +28,9 @@ $end_info$
 #include <cstring>
 #include <iterator>
 #include <sys/mman.h>
+#include <mutex>
+#include <time.h>
+#include <FEXCore/Utils/Threads.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/uio.h>
@@ -315,6 +318,96 @@ namespace {
   }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// wine's KUSER_SHARED_DATA on a 64K host
+// ---------------------------------------------------------------------------
+// Windows fixes KUSER_SHARED_DATA at 0x7ffe0000 and wine maps it there as a
+// 4K MAP_SHARED view of a wineserver memfd; the server writes the three
+// KSYSTEM_TIME clocks in it (InterruptTime, SystemTime, TickCount) and every
+// Windows timer, GetTickCount and Sleep-with-deadline in the process reads
+// them. One page above it wine keeps a private per-process page (the syscall
+// dispatcher pointer), so on a 64K host the granule ends up MAP_PRIVATE of the
+// memfd (see Mmap): a page the guest never writes keeps tracking the server
+// through the page cache, but the moment anything dirties page 0 it becomes a
+// private copy and the process's clocks freeze. Skyrim SE's lockpicking
+// minigame never closing after a successful pick was exactly that
+// (2026-09-14: TickCount and InterruptTime unchanged over 1.5 s in the live
+// process, the granule 64K Private_Dirty).
+//
+// So the conversion keeps a hidden live MAP_SHARED view of the memfd and a
+// host thread copies the three clocks into the guest's page every
+// millisecond, in the server's own store order (High2, Low, High1, so a
+// reader's High1==High2 check still detects a torn read). The copy goes
+// through process_vm_writev: it honours the page's protection and returns
+// EFAULT instead of faulting if the guest has made the page read-only or
+// unmapped it, and it is one syscall per tick. Only the fixed Windows
+// address is treated this way; any other shared-file granule converted to
+// private keeps plain copy-on-write semantics.
+namespace {
+constexpr uint64_t kWineUserSharedData = 0x7ffe0000;
+constexpr size_t kKSystemTimeOffsets[] = {0x8, 0x14, 0x320}; // InterruptTime, SystemTime, TickCount
+
+struct UsdMirror {
+  uint64_t GuestPage;
+  const uint8_t* Live;
+};
+std::mutex UsdMirrorMutex;
+fextl::vector<UsdMirror> UsdMirrors;
+fextl::unique_ptr<FEXCore::Threads::Thread> UsdThread;
+pid_t UsdThreadPid = 0;
+
+void* UsdRefreshThread(void*) {
+  FEX::HLE::ThreadManager::SetThreadName("FEX:usdrefresh");
+  const pid_t Self = ::getpid();
+  for (;;) {
+    {
+      std::lock_guard lk {UsdMirrorMutex};
+      for (const auto& M : UsdMirrors) {
+        // Nine words per page: for each clock High2Time, LowPart, High1Time.
+        uint32_t Words[9];
+        struct iovec Local[9];
+        struct iovec Remote[9];
+        size_t N = 0;
+        for (size_t Off : kKSystemTimeOffsets) {
+          uint32_t H1, Lo, H2;
+          do {
+            H1 = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off + 4), __ATOMIC_ACQUIRE);
+            Lo = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off), __ATOMIC_ACQUIRE);
+            H2 = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off + 8), __ATOMIC_ACQUIRE);
+          } while (H1 != H2);
+          const size_t Order[3] = {Off + 8, Off, Off + 4};
+          const uint32_t Vals[3] = {H2, Lo, H1};
+          for (int i = 0; i < 3; ++i, ++N) {
+            Words[N] = Vals[i];
+            Local[N] = {&Words[N], sizeof(uint32_t)};
+            Remote[N] = {reinterpret_cast<void*>(M.GuestPage + Order[i]), sizeof(uint32_t)};
+          }
+        }
+        // iovecs are written in order, which preserves the server's store order.
+        ::process_vm_writev(Self, Local, N, Remote, N, 0);
+      }
+    }
+    struct timespec TS {0, 1'000'000};
+    ::nanosleep(&TS, nullptr);
+  }
+  return nullptr;
+}
+
+// Registers the live mirror for a converted granule and makes sure this
+// process (not a forked parent's) has the refresher running. Called with the
+// VMATracking lock held; the thread creation is short and takes no FEX lock.
+void RegisterUsdMirror(uint64_t GuestPage, const uint8_t* Live) {
+  std::lock_guard lk {UsdMirrorMutex};
+  UsdMirrors.push_back({GuestPage, Live});
+  if (!UsdThread || UsdThreadPid != ::getpid()) {
+    const uint64_t OldMask = FEX::HLE::ThreadManager::SetSignalMask(~0ULL);
+    UsdThread = FEXCore::Threads::Thread::Create(UsdRefreshThread, nullptr);
+    FEX::HLE::ThreadManager::SetSignalMask(OldMask);
+    UsdThreadPid = ::getpid();
+  }
+}
+} // namespace
+
 bool Active() {
   return GranuleTable::Active();
 }
@@ -547,6 +640,19 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
           void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(PROT_READ | PROT_WRITE),
                            MAP_FIXED | MAP_PRIVATE, SE->SharedFd, static_cast<off_t>(SE->SharedOffset));
           if (M != MAP_FAILED) {
+            if (G == kWineUserSharedData) {
+              void* Live = ::mmap(nullptr, HostSize, PROT_READ, MAP_SHARED, SE->SharedFd, static_cast<off_t>(SE->SharedOffset));
+              if (Live != MAP_FAILED) {
+                RegisterUsdMirror(G, static_cast<const uint8_t*>(Live));
+                LogMan::Msg::IFmt("64K granule emulation: KUSER_SHARED_DATA at {:#x} is a private copy now; its clocks are refreshed from the live "
+                                  "mapping every millisecond",
+                                  G);
+              } else {
+                LogMan::Msg::EFmt("64K granule emulation: could not map the live KUSER_SHARED_DATA mirror ({}); this process's Windows clocks will "
+                                  "freeze",
+                                  ::strerror(errno));
+              }
+            }
             ::close(SE->SharedFd);
             SE->SharedFd = -1;
             SE->FEXBacked = true;
