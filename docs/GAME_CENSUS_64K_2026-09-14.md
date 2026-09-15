@@ -49,6 +49,12 @@ All nine titles died at boot in the first pass: wine 11 stopped at
    through the page cache (the live USD), written pages are copied on write
    (the dispatcher page). The file is extended to cover the granule.
 
+3. The first rerun then died in the JIT's link path on every title: the
+   code-cache writer (on by default on 64K) asserted in
+   `CodeMapWriter::AppendBlock` when a block lay below its section's
+   `FileStartVA`, which wine's multi-view PE mappings produce. Fatal for an
+   optimisation; it skips the block now (f3d00249f).
+
 The nine-title rerun on the fixed build is in `~/benchlogs/smoke64k-win-*`.
 
 ## Native wine + bridge lane
