@@ -670,10 +670,23 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       }
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
+      // The guest return address ([rsp] at the syscall instruction), read
+      // fault-free: the RIP is always libc's syscall wrapper, the caller is
+      // the thing to name (wine's ntdll.so for a Proton title).
+      uint64_t RetAddr = 0;
+      {
+        struct iovec RL;
+        RL.iov_base = &RetAddr;
+        RL.iov_len = sizeof(RetAddr);
+        struct iovec RR;
+        RR.iov_base = reinterpret_cast<void*>(Frame->State.gregs[FEXCore::X86State::REG_RSP]);
+        RR.iov_len = sizeof(RetAddr);
+        process_vm_readv(::getpid(), &RL, 1, &RR, 1, 0);
+      }
       char buf[256];
-      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x rip=0x%lx\n",
+      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x rip=0x%lx ret=0x%lx\n",
                        (long)now.tv_sec, now.tv_nsec / 1000000, static_cast<int>(tls_tid), (unsigned long)futex_op,
-                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur, static_cast<unsigned long>(Frame->State.rip));
+                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur, static_cast<unsigned long>(Frame->State.rip), static_cast<unsigned long>(RetAddr));
       [[maybe_unused]] auto _ = write(trace_fd, buf, n);
       }
     }
