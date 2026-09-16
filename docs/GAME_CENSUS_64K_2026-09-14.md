@@ -236,6 +236,8 @@ tiering ON (the config that crashed ~1/3) with `FEX_SMC_AUDIT` set should now
 survive and log `relink-miss-postarm` hits. The per-title strict + tiering-off
 config stays as-is until that A/B confirms it can be relaxed.
 
+**Soak evidence 09-15:** Stardew tiering ON (the ~1/3-crash config) 4 runs = survived 3/4, 18 `relink-miss-postarm` races caught; run 4 SIGSEGV'd -- the fresh-compile variant. So the relink fix is necessary but not sufficient; tiering-off stays shipped until the fresh-compile half lands.
+
 **Still open -- fresh-compile half:** the first-compile path
 (`ContextImpl::CompileBlock`) hashes after the arm too, but decodes much
 earlier; a store in the decode->arm window yields translation(old-bytes) with
