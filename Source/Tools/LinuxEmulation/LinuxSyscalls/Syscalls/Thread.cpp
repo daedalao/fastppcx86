@@ -766,6 +766,9 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(exit_group, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    if ((status & 0xff) != 0 && FEX::HLE::GuestErrorExitHook) {
+      FEX::HLE::GuestErrorExitHook();
+    }
     // Release this thread's shared-lock holdings before the kernel kills it
     // and every sibling thread.  Sibling threads can't sweep their own TLS
     // from here, but if this thread happened to be the one holding the

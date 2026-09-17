@@ -3,6 +3,7 @@
 #include "Common/Config.h"
 #include "FDUtils.h"
 #include "Common/FEXServerClient.h"
+#include "Common/FileFormatCheck.h"
 
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/FileLoading.h>
@@ -232,6 +233,7 @@ bool SetupClient(std::string_view InterpreterPath) {
   // If we were started in a container then we want to use the rootfs that they provided.
   // In the pressure-vessel case this is a combination of our rootfs and the steam soldier runtime.
   if (FEXCore::Config::FindContainer() != "pressure-vessel") {
+    FEX_CONFIG_OPT(LDPath, ROOTFS);
     fextl::string RootFSPath = FEXServerClient::RequestRootFSPath(ServerFD);
 
     // Only overwrite the configured rootfs if the server returned a non-empty path. An empty response
@@ -239,7 +241,11 @@ bool SetupClient(std::string_view InterpreterPath) {
     // and clobbering CONFIG_ROOTFS with "" makes every subsequent guest ELF fail to load.
     if (!RootFSPath.empty()) {
       FEXCore::Config::Set(FEXCore::Config::CONFIG_ROOTFS, RootFSPath);
-    } else {
+    } else if (FEX::FormatCheck::IsSquashFS(LDPath()) || FEX::FormatCheck::IsEroFS(LDPath())) {
+      // Only an error when the configured rootfs is an image the server should
+      // have mounted. With no rootfs (static programs) or a directory, an empty
+      // answer is normal; logging it at error level would print it after every
+      // guest that exits with a nonzero status.
       LogMan::Msg::EFmt("FEXServer returned empty rootfs path; keeping configured value");
     }
   }
@@ -307,10 +313,14 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
       uint64_t error {1};
       write(fds[1], &error, sizeof(error));
 
-      // Give a hopefully helpful error message for users
-      LogMan::Msg::EFmt("Couldn't execute: {}", argv[0]);
-      LogMan::Msg::EFmt("This means the squashFS rootfs won't be mounted.");
-      LogMan::Msg::EFmt("Expect errors!");
+      // Give a hopefully helpful error message for users. Straight to stderr:
+      // this child exits right away, so a message the log handler holds until
+      // the log destination is known would be lost with it, and the parent
+      // fails client setup, so the guest never runs.
+      fextl::fmt::print(stderr, "E Couldn't execute: {}\n", argv[0]);
+      fextl::fmt::print(stderr, "E This means the squashFS rootfs won't be mounted.\n");
+      fextl::fmt::print(stderr, "E Expect errors!\n");
+      fflush(stderr);
       // Destroy this fork
       exit(1);
     }

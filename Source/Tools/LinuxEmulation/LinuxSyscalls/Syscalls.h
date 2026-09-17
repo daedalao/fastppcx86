@@ -81,6 +81,11 @@ class SyscallHandler;
 class SignalDelegator;
 class ThunkHandler;
 
+// Called by exit_group with a nonzero status, before the process ends. The
+// frontend uses it to report errors it held back while the log destination was
+// unknown (FEXInterpreter's FlushHeldErrorsToStderr).
+inline void (*GuestErrorExitHook)() {};
+
 void RegisterEpoll(FEX::HLE::SyscallHandler* Handler);
 void RegisterFD(FEX::HLE::SyscallHandler* Handler);
 void RegisterFS(FEX::HLE::SyscallHandler* Handler);
