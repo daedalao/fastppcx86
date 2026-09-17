@@ -729,7 +729,10 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   ExecveArgs.emplace_back(nullptr);
 
   if (PreserveArgv0 && !IsFDExec) {
-    if (EnvpPtr != const_cast<char* const*>(EnvpArgs.data())) {
+    // Key this on NeedsEnvpCopy, not on pointer identity: a guest execve with
+    // envp == NULL and no copy leaves both EnvpPtr and EnvpArgs.data() null,
+    // and the pop_back below would then underflow an empty vector.
+    if (!NeedsEnvpCopy) {
       EnvpArgs.clear();
       for (auto OldEnvp = envp; OldEnvp && *OldEnvp; ++OldEnvp) {
         EnvpArgs.emplace_back(*OldEnvp);
