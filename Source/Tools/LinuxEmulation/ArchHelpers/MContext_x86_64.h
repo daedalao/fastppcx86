@@ -11,6 +11,8 @@ struct X86ContextBackup {
   uint64_t GPRs[23];
   FEXCore::x86_64::_libc_fpstate FPRState;
   uint64_t sa_mask;
+  // The guest signal mask before the delivery that built this backup.
+  uint64_t GuestSignalMask;
   uint16_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 

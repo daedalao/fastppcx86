@@ -183,6 +183,8 @@ struct PPC64ContextBackup {
   uint64_t StackCookie;
 #endif
   uint64_t sa_mask;
+  // The guest signal mask before the delivery that built this backup.
+  uint64_t GuestSignalMask;
   uint16_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
