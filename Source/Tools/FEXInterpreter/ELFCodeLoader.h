@@ -829,7 +829,9 @@ public:
     AuxVariables.emplace_back(auxv_t {16, HWCap});                        // AT_HWCAP
     AuxVariables.emplace_back(auxv_t {26, HWCap2});                       // AT_HWCAP2
     AuxVariables.emplace_back(auxv_t {51, CalculateSignalStackSize()});   // AT_MINSIGSTKSZ
-    AuxPlatform = &AuxVariables.emplace_back(auxv_t {24, ~0ULL});         // AT_PLATFORM
+    // AT_PLATFORM is 15; 24 is AT_BASE_PLATFORM, which the kernel does not set
+    // on x86. glibc reads its platform (and getauxval(AT_PLATFORM)) from 15.
+    AuxPlatform = &AuxVariables.emplace_back(auxv_t {AT_PLATFORM, ~0ULL}); // AT_PLATFORM
     AuxExecFN = &AuxVariables.emplace_back(auxv_t {AT_EXECFN, ~0ULL});    // AT_EXECFN
 
     if (Is64BitMode()) {
