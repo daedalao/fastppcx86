@@ -2843,7 +2843,9 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
         // for every shared library in every process). Without the code cache
         // nothing reads it.
         Resource->MappedFile->FileId =
-          EnableCodeCaching() ? CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd) : 0xffff'ffff'ffff'ffffULL;
+          (EnableCodeCaching() || FEXCore::Config::Get_GDBSYMBOLS()) ?
+            CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd) :
+            0xffff'ffff'ffff'ffffULL;
 
         // Read ELF headers if applicable and needed for code caching.
         // For performance, skip ELF checks if we're not mapping the file header
