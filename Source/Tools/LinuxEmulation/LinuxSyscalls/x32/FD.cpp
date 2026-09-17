@@ -334,8 +334,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(oldstat, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, oldstat32* buf) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(Guest_pathname.c_str(), &host_stat);
     if (Result != -1) {
       if (host_stat.st_ino > std::numeric_limits<decltype(buf->st_ino)>::max()) {
         return -EOVERFLOW;
@@ -368,8 +372,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(oldlstat, [](FEXCore::Core::CpuStateFrame* Frame, const char* path, oldstat32* buf) -> uint64_t {
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(path, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(Guest_path.c_str(), &host_stat);
     if (Result != -1) {
       if (host_stat.st_ino > std::numeric_limits<decltype(buf->st_ino)>::max()) {
         return -EOVERFLOW;
@@ -385,8 +393,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(stat, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, stat32* buf) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(Guest_pathname.c_str(), &host_stat);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;
@@ -405,8 +417,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(lstat, [](FEXCore::Core::CpuStateFrame* Frame, const char* path, stat32* buf) -> uint64_t {
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(path, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(Guest_path.c_str(), &host_stat);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;
@@ -415,8 +431,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(stat64, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, stat64_32* buf) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(Guest_pathname.c_str(), &host_stat);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;
@@ -425,8 +445,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(lstat64, [](FEXCore::Core::CpuStateFrame* Frame, const char* path, stat64_32* buf) -> uint64_t {
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
     struct stat host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(path, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(Guest_path.c_str(), &host_stat);
 
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
@@ -446,8 +470,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(statfs, [](FEXCore::Core::CpuStateFrame* Frame, const char* path, statfs32_32* buf) -> uint64_t {
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
     struct statfs host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statfs(path, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statfs(Guest_path.c_str(), &host_stat);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;
@@ -478,10 +506,14 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL_X32(statfs64, [](FEXCore::Core::CpuStateFrame* Frame, const char* path, size_t sz, struct statfs64_32* buf) -> uint64_t {
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
     LOGMAN_THROW_A_FMT(sz == sizeof(struct statfs64_32), "This needs to match");
 
     struct statfs host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statfs(path, &host_stat);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statfs(Guest_path.c_str(), &host_stat);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;
@@ -589,8 +621,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
                             });
 
   REGISTER_SYSCALL_IMPL_X32(fstatat_64, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, stat64_32* buf, int flag) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     struct stat64 host_stat;
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.NewFSStatAt64(dirfd, pathname, &host_stat, flag);
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.NewFSStatAt64(dirfd, Guest_pathname.c_str(), &host_stat, flag);
     if (Result != -1) {
       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
       *buf = host_stat;

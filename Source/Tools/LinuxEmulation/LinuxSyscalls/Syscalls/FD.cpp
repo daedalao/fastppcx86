@@ -41,9 +41,13 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(open, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, int flags, uint32_t mode) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     flags = FEX::HLE::RemapFromX86Flags(flags);
-    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Open(pathname, flags, mode);
+    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(Guest_pathname.c_str());
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Open(Guest_pathname.c_str(), flags, mode);
     SYSCALL_ERRNO();
   });
 
@@ -53,22 +57,38 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(chown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chown(pathname, owner, group);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chown(Guest_pathname.c_str(), owner, group);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(lchown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lchown(pathname, owner, group);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lchown(Guest_pathname.c_str(), owner, group);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(access, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, int mode) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Access(pathname, mode);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Access(Guest_pathname.c_str(), mode);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(chdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* path) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chdir(path);
+    GuestPath Guest_path(path);
+    if (Guest_path.error()) {
+      return Guest_path.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Chdir(Guest_path.c_str());
     SYSCALL_ERRNO();
   });
 
@@ -89,38 +109,58 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(openat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfs, const char* pathname, int flags, uint32_t mode) -> uint64_t {
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
     flags = FEX::HLE::RemapFromX86Flags(flags);
-    FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(pathname);
-    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat(dirfs, pathname, flags, mode);
+    FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(Guest_pathname.c_str());
+    FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(Guest_pathname.c_str());
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat(dirfs, Guest_pathname.c_str(), flags, mode);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(readlinkat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, char* buf, size_t bufsiz) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Readlinkat(dirfd, pathname, buf, bufsiz);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Readlinkat(dirfd, Guest_pathname.c_str(), buf, bufsiz);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(faccessat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, int mode) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.FAccessat(dirfd, pathname, mode);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.FAccessat(dirfd, Guest_pathname.c_str(), mode);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(faccessat2, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, int mode, int flags) -> uint64_t {
-    uint64_t Result = FEX::HLE::_SyscallHandler->FM.FAccessat2(dirfd, pathname, mode, flags);
+    GuestPath Guest_pathname(pathname);
+    if (Guest_pathname.error()) {
+      return Guest_pathname.error();
+    }
+    uint64_t Result = FEX::HLE::_SyscallHandler->FM.FAccessat2(dirfd, Guest_pathname.c_str(), mode, flags);
     SYSCALL_ERRNO();
   });
 
   REGISTER_SYSCALL_IMPL(
     openat2, [](FEXCore::Core::CpuStateFrame* Frame, int dirfs, const char* pathname, struct open_how* how, size_t usize) -> uint64_t {
+      GuestPath Guest_pathname(pathname);
+      if (Guest_pathname.error()) {
+        return Guest_pathname.error();
+      }
       open_how HostHow {};
       size_t HostSize = std::min(sizeof(open_how), usize);
       memcpy(&HostHow, how, HostSize);
 
       HostHow.flags = FEX::HLE::RemapFromX86Flags(HostHow.flags);
-      FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(pathname);
-      FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(pathname);
-      uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat2(dirfs, pathname, &HostHow, HostSize);
+      FEX::HLE::_SyscallHandler->MaybeDetectMonoFromPath(Guest_pathname.c_str());
+      FEX::HLE::_SyscallHandler->MaybeDetectMonoFallbackFromPath(Guest_pathname.c_str());
+      uint64_t Result = FEX::HLE::_SyscallHandler->FM.Openat2(dirfs, Guest_pathname.c_str(), &HostHow, HostSize);
       SYSCALL_ERRNO();
     });
 
@@ -137,8 +177,12 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL(
     statx, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, int flags, uint32_t mask, struct statx* statxbuf) -> uint64_t {
+      GuestPath Guest_pathname(pathname, true);
+      if (Guest_pathname.error()) {
+        return Guest_pathname.error();
+      }
       // Flags don't need remapped
-      uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statx(dirfd, pathname, flags, mask, statxbuf);
+      uint64_t Result = FEX::HLE::_SyscallHandler->FM.Statx(dirfd, Guest_pathname.c_str(), flags, mask, statxbuf);
       SYSCALL_ERRNO();
     });
 

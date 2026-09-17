@@ -1207,8 +1207,13 @@ uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {
 
   if (strcmp(pathname, "/proc/self/exe") == 0 || strcmp(pathname, "/proc/thread-self/exe") == 0 || strcmp(pathname, PidSelfPath) == 0) {
     const auto& App = Filename();
-    strncpy(buf, App.c_str(), bufsiz);
-    return std::min(bufsiz, App.size());
+    // readlink doesn't NUL-terminate; a bad buffer is EFAULT.
+    const size_t Len = std::min(bufsiz, App.size());
+    if (FaultSafeUserMemAccess::CopyToUser(buf, App.c_str(), Len) != 0) {
+      errno = EFAULT;
+      return -1;
+    }
+    return Len;
   }
 
   FDPathTmpData TmpFilename;
@@ -1322,8 +1327,13 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
 
   if (Path == "/proc/self/exe" || Path == "/proc/thread-self/exe" || Path == PidSelfPath) {
     const auto& App = Filename();
-    strncpy(buf, App.c_str(), bufsiz);
-    return std::min(bufsiz, App.size());
+    // readlink doesn't NUL-terminate; a bad buffer is EFAULT.
+    const size_t Len = std::min(bufsiz, App.size());
+    if (FaultSafeUserMemAccess::CopyToUser(buf, App.c_str(), Len) != 0) {
+      errno = EFAULT;
+      return -1;
+    }
+    return Len;
   }
 
   FDPathTmpData TmpFilename;

@@ -37,13 +37,13 @@ using cap_user_data_t = void*;
 void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
 
-  REGISTER_SYSCALL_IMPL(uname, [](FEXCore::Core::CpuStateFrame* Frame, struct utsname* buf) -> uint64_t {
+  REGISTER_SYSCALL_IMPL(uname, [](FEXCore::Core::CpuStateFrame* Frame, struct utsname* GuestBuf) -> uint64_t {
     auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
-    // Verify writability before doing any strcpy/memcpy into the guest buffer.
-    // A bad guest pointer would otherwise cause a host SEGV in the first write
-    // (the kernel returns -EFAULT in that case, which is what we want to mimic).
-    FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
+    // Filled in host memory and copied out once, so a bad guest pointer is
+    // EFAULT as on the kernel. VerifyIsWritable is a no-op in release builds.
+    struct utsname LocalBuf {};
+    auto* buf = &LocalBuf;
 
     struct utsname Local {};
     if (::uname(&Local) == 0) {
@@ -73,6 +73,9 @@ void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
     } else {
       // Tell the guest that we are a 64bit kernel
       strcpy(buf->machine, "x86_64");
+    }
+    if (FaultSafeUserMemAccess::CopyToUser(GuestBuf, buf, sizeof(*buf)) != 0) {
+      return -EFAULT;
     }
     return 0;
   });
