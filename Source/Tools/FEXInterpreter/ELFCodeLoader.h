@@ -177,6 +177,58 @@ class ELFCodeLoader final : public FEX::CodeLoader {
     return true;
   }
 
+  // 64K: back [BSSStart, BSSPageEnd) when the host page is larger than 4K.
+  // BSSStart is wherever p_filesz ends and BSSPageEnd is only 4K-aligned, so the
+  // BSS can begin inside a host page that is
+  //   (a) already materialised by this ELF: the file-backed tail of this
+  //       segment's own mapping, or a previous segment's last host page (text
+  //       and a p_filesz == 0 RW segment share one when p_align < host page), or
+  //   (b) not mapped at all, when p_filesz == 0 and no earlier segment reaches
+  //       that host page.
+  // Case (b) used to be skipped: the anonymous map started at the host page
+  // ABOVE BSSStart, so the first host page of .bss stayed unmapped and a write
+  // to it faulted. Case (a) could leave the BSS read-only (the previous
+  // segment's protection) and, for a real file mapping, full of file bytes:
+  // the kernel only zeroes past EOF, and on a 4K kernel everything past
+  // p_filesz up to the next 4K page is zeroed by the ELF loader and the rest is
+  // fresh anonymous memory.
+  bool MapBSSHostGranular(const Elf64_Phdr& Header, uintptr_t BSSStart, uintptr_t BSSPageEnd, int MapProt, int MapType,
+                          FEX::HLE::SyscallMmapInterface* const Handler, FEXCore::Core::InternalThreadState* Thread) {
+    const uintptr_t HostPage = FEXCore::HostPage::Size();
+    const uintptr_t HostBSSStart = FEXCore::HostPage::AlignDown(BSSStart);
+    const uintptr_t HostBSSEnd = FEXCore::HostPage::AlignUp(BSSPageEnd);
+
+    // (a) Host pages this ELF has already materialised.
+    const uintptr_t SharedEnd = std::min(HostMappedEnd, HostBSSEnd);
+    if (HostBSSStart < SharedEnd) {
+      // Only the last materialised host page can carry a protection other than
+      // this segment's; everything below it is this segment's own file mapping.
+      const uintptr_t TailPage = HostMappedEnd - HostPage;
+      if (TailPage < SharedEnd && (HostTailProt & MapProt) != MapProt) {
+        const uintptr_t ProtStart = std::max(HostBSSStart, TailPage);
+        Handler->GuestMprotect(Thread, (void*)ProtStart, SharedEnd - ProtStart, MapProt | HostTailProt);
+        HostTailProt |= MapProt;
+      }
+      if (Header.p_flags & PF_W) {
+        memset((void*)BSSStart, 0, std::min(SharedEnd, BSSPageEnd) - BSSStart);
+      }
+    }
+
+    // (b) Everything above them is fresh anonymous memory, starting at the host
+    // page that contains BSSStart when no segment has reached it.
+    const uintptr_t AnonStart = std::max(HostMappedEnd, HostBSSStart);
+    if (AnonStart < HostBSSEnd) {
+      auto bss = Handler->GuestMmap(Thread, (void*)AnonStart, HostBSSEnd - AnonStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
+      if (FEX::HLE::HasSyscallError(bss)) {
+        LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
+        return false;
+      }
+      HostTailProt = MapProt;
+      HostMappedEnd = HostBSSEnd;
+    }
+    return true;
+  }
+
   bool MapFile(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, int prot, int flags,
                FEX::HLE::SyscallMmapInterface* const Handler, FEXCore::Core::InternalThreadState* Thread) {
 
@@ -293,12 +345,12 @@ class ELFCodeLoader final : public FEX::CodeLoader {
         auto BSSPageStart = PAGE_ALIGN(BSSStart);
         auto BSSPageEnd = PAGE_ALIGN(LoadBase + Header.p_vaddr + Header.p_memsz);
 
-        // Only clear padding bytes if the section is writable
-        if (Header.p_flags & PF_W) {
-          memset((void*)BSSStart, 0, BSSPageStart - BSSStart);
-        }
-
         if (FEXCore::HostPage::MatchesGuest()) {
+          // Only clear padding bytes if the section is writable
+          if (Header.p_flags & PF_W) {
+            memset((void*)BSSStart, 0, BSSPageStart - BSSStart);
+          }
+
           if (BSSPageStart != BSSPageEnd) {
             auto bss = Handler->GuestMmap(Thread, (void*)BSSPageStart, BSSPageEnd - BSSPageStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
             if (FEX::HLE::HasSyscallError(bss)) {
@@ -306,29 +358,8 @@ class ELFCodeLoader final : public FEX::CodeLoader {
               return {};
             }
           }
-        } else {
-          // 64K: BSSPageStart is only 4K-aligned, so a MAP_FIXED anonymous map there
-          // is rejected outright -- and the host pages up to HostMappedEnd are
-          // already mapped and already zero (the kernel zeroed the tail of a real
-          // mapping, MapFileFallback memset it for a pread'd one). Only map what
-          // lies beyond them.
-          const uintptr_t AnonStart = std::max<uintptr_t>(HostMappedEnd, FEXCore::HostPage::AlignUp(BSSStart));
-          const uintptr_t AnonEnd = FEXCore::HostPage::AlignUp(BSSPageEnd);
-          if (AnonStart < AnonEnd) {
-            auto bss = Handler->GuestMmap(Thread, (void*)AnonStart, AnonEnd - AnonStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
-            if (FEX::HLE::HasSyscallError(bss)) {
-              LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
-              return {};
-            }
-            HostTailProt = MapProt;
-          } else if (HostMappedEnd > FEXCore::HostPage::AlignDown(BSSPageEnd)) {
-            // The whole BSS lives inside an already-mapped host page. It still has
-            // to be writable, which the file segment's protection may not be.
-            Handler->GuestMprotect(Thread, (void*)FEXCore::HostPage::AlignDown(BSSStart),
-                                   FEXCore::HostPage::AlignUp(BSSPageEnd) - FEXCore::HostPage::AlignDown(BSSStart), MapProt | HostTailProt);
-            HostTailProt |= MapProt;
-          }
-          HostMappedEnd = std::max(HostMappedEnd, AnonEnd);
+        } else if (!MapBSSHostGranular(Header, BSSStart, BSSPageEnd, MapProt, MapType, Handler, Thread)) {
+          return {};
         }
       }
 
