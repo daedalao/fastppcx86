@@ -2155,6 +2155,21 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
   for (uint32_t Signal = 0; Signal <= SignalDelegator::MAX_SIGNALS; ++Signal) {
     RegisterHostSignalHandlerForGuest(Signal, GuestSignalHandler);
   }
+
+  // execve keeps ignored signals ignored (the kernel only resets caught ones
+  // to SIG_DFL), and this process is the guest's execve: seed the guest view
+  // from the dispositions it inherited. Nothing has installed a host handler
+  // for the non-required signals yet, so the host still holds exactly what the
+  // exec'ing process left.
+  for (uint32_t Signal = 1; Signal <= SignalDelegator::MAX_SIGNALS; ++Signal) {
+    if (Signal == SIGKILL || Signal == SIGSTOP || HostHandlers[Signal].Required.load(std::memory_order_relaxed)) {
+      continue;
+    }
+    GuestSigAction Inherited {};
+    if (::syscall(SYS_rt_sigaction, Signal, nullptr, &Inherited, 8) == 0 && Inherited.sigaction_handler.handler == SIG_IGN) {
+      HostHandlers[Signal].GuestAction.sigaction_handler.handler = SIG_IGN;
+    }
+  }
 }
 
 SignalDelegator::~SignalDelegator() {
