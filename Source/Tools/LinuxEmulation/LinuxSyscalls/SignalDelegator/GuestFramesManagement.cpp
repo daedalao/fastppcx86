@@ -571,13 +571,17 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
   }
 }
 
-uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* ContextBackup,
-                                         FEXCore::Core::CpuStateFrame* Frame, int Signal, siginfo_t* HostSigInfo, void* ucontext,
-                                         GuestSigAction* GuestAction, stack_t* GuestStack, uint64_t NewGuestSP, const uint32_t eflags) {
-
+// Frame layout, shared by the frame builders below and by StoreThreadState's
+// abandoned-frame reclaim (which needs the extent of the frame BEFORE it is
+// written). Keep the arithmetic here in one place: RestoreThreadState walks
+// the same sizes back up from the sigreturn RSP to find the host-stack slot,
+// which only works because every size involved is a multiple of 8 and every
+// alignment is <= 8 (the guest structs are FEX_PACKED).
+SignalDelegator::GuestFrameLayout SignalDelegator::LayoutFrame_x64(uint64_t GuestSP) const {
+  GuestFrameLayout L {};
   // Back up past the redzone, which is 128bytes
   // 32-bit doesn't have a redzone
-  NewGuestSP -= 128;
+  L.Top = GuestSP - 128;
 
   // On 64-bit the kernel sets up the siginfo_t and ucontext_t regardless of SA_SIGINFO set.
   // This allows the application to /always/ get the siginfo and ucontext even if it didn't set this flag.
@@ -587,29 +591,87 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
   // ucontext_t
   // siginfo_t
   // FP state
-  // Host stack location
-  NewGuestSP -= sizeof(uint64_t);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(uint64_t));
-
-  uint64_t HostStackLocation = NewGuestSP;
+  // Host stack location: {ContextBackup*, Cookie}
+  uint64_t SP = L.Top - HostStackSlotSize;
+  SP = FEXCore::AlignDown(SP, alignof(uint64_t));
+  L.HostStackLocation = SP;
 
   if (SupportsAVX) {
-    NewGuestSP -= sizeof(FEXCore::x86_64::xstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86_64::xstate));
+    SP -= sizeof(FEXCore::x86_64::xstate);
+    SP = FEXCore::AlignDown(SP, alignof(FEXCore::x86_64::xstate));
   } else {
-    NewGuestSP -= sizeof(FEXCore::x86_64::_libc_fpstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86_64::_libc_fpstate));
+    SP -= sizeof(FEXCore::x86_64::_libc_fpstate);
+    SP = FEXCore::AlignDown(SP, alignof(FEXCore::x86_64::_libc_fpstate));
   }
+  L.FPStateLocation = SP;
 
-  uint64_t FPStateLocation = NewGuestSP;
+  SP -= sizeof(siginfo_t);
+  SP = FEXCore::AlignDown(SP, alignof(siginfo_t));
+  L.SigInfoLocation = SP;
 
-  NewGuestSP -= sizeof(siginfo_t);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(siginfo_t));
-  uint64_t SigInfoLocation = NewGuestSP;
+  SP -= sizeof(FEXCore::x86_64::ucontext_t);
+  SP = FEXCore::AlignDown(SP, alignof(FEXCore::x86_64::ucontext_t));
+  L.UContextLocation = SP;
 
-  NewGuestSP -= sizeof(FEXCore::x86_64::ucontext_t);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86_64::ucontext_t));
-  uint64_t UContextLocation = NewGuestSP;
+  // The restorer return address the handler `ret`s to.
+  L.Bottom = SP - 8;
+  return L;
+}
+
+SignalDelegator::GuestFrameLayout SignalDelegator::LayoutFrame_ia32(uint64_t GuestSP, bool SigInfoFrame) const {
+  GuestFrameLayout L {};
+  L.Top = GuestSP;
+
+  // Signal frame layout on stack needs to be as follows
+  // (RT)SigFrame_i32
+  // FPState
+  // Host stack location: {ContextBackup*, Cookie}
+  uint64_t SP = L.Top - HostStackSlotSize;
+  SP = FEXCore::AlignDown(SP, alignof(uint64_t));
+  L.HostStackLocation = SP;
+
+  if (SupportsAVX) {
+    SP -= sizeof(FEXCore::x86::xstate);
+    SP = FEXCore::AlignDown(SP, alignof(FEXCore::x86::xstate));
+  } else {
+    SP -= sizeof(FEXCore::x86::_libc_fpstate);
+    SP = FEXCore::AlignDown(SP, alignof(FEXCore::x86::_libc_fpstate));
+  }
+  L.FPStateLocation = SP;
+
+  if (SigInfoFrame) {
+    SP -= sizeof(RTSigFrame_i32);
+    SP = FEXCore::AlignDown(SP, alignof(RTSigFrame_i32));
+  } else {
+    SP -= sizeof(SigFrame_i32);
+    SP = FEXCore::AlignDown(SP, alignof(SigFrame_i32));
+  }
+  L.UContextLocation = SP;
+  L.SigInfoLocation = 0; // Part of the frame struct.
+  // ESP at handler entry points at the frame's pretcode.
+  L.Bottom = SP;
+  return L;
+}
+
+// Store where the host context lives in the guest stack, with the cookie the
+// backup was issued: RestoreThreadState matches the pair against the thread's
+// OutstandingBackups.
+static void WriteHostStackSlot(uint64_t HostStackLocation, const ArchHelpers::Context::ContextBackup* ContextBackup) {
+  reinterpret_cast<uint64_t*>(HostStackLocation)[0] = reinterpret_cast<uint64_t>(ContextBackup);
+  reinterpret_cast<uint64_t*>(HostStackLocation)[1] = ContextBackup->Cookie;
+}
+
+uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* ContextBackup,
+                                         FEXCore::Core::CpuStateFrame* Frame, int Signal, siginfo_t* HostSigInfo, void* ucontext,
+                                         GuestSigAction* GuestAction, stack_t* GuestStack, uint64_t NewGuestSP, const uint32_t eflags) {
+
+  // See LayoutFrame_x64 for the frame layout.
+  const GuestFrameLayout Layout = LayoutFrame_x64(NewGuestSP);
+  const uint64_t HostStackLocation = Layout.HostStackLocation;
+  const uint64_t FPStateLocation = Layout.FPStateLocation;
+  const uint64_t SigInfoLocation = Layout.SigInfoLocation;
+  const uint64_t UContextLocation = Layout.UContextLocation;
+  NewGuestSP = UContextLocation;
 
   ContextBackup->FPStateLocation = FPStateLocation;
   ContextBackup->UContextLocation = UContextLocation;
@@ -617,8 +679,7 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
 
   FEXCore::x86_64::ucontext_t* guest_uctx = reinterpret_cast<FEXCore::x86_64::ucontext_t*>(UContextLocation);
   siginfo_t* guest_siginfo = reinterpret_cast<siginfo_t*>(SigInfoLocation);
-  // Store where the host context lives in the guest stack.
-  *(uint64_t*)HostStackLocation = (uint64_t)ContextBackup;
+  WriteHostStackSlot(HostStackLocation, ContextBackup);
 
   // Advertise UC_FP_XSTATE only when the fpstate area actually carries the
   // extended xstate blob. Without AVX, the frame allocation above reserved a
@@ -751,32 +812,19 @@ uint64_t SignalDelegator::SetupFrame_ia32(FEXCore::Core::InternalThreadState* Th
 
   const uint64_t SignalReturn = reinterpret_cast<uint64_t>(VDSOPointers.VDSO_kernel_sigreturn);
 
-  NewGuestSP -= sizeof(uint64_t);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(uint64_t));
-
-  uint64_t HostStackLocation = NewGuestSP;
-
-  if (SupportsAVX) {
-    NewGuestSP -= sizeof(FEXCore::x86::xstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86::xstate));
-  } else {
-    NewGuestSP -= sizeof(FEXCore::x86::_libc_fpstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86::_libc_fpstate));
-  }
-
-  uint64_t FPStateLocation = NewGuestSP;
-
-  NewGuestSP -= sizeof(SigFrame_i32);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(SigFrame_i32));
-  uint64_t SigFrameLocation = NewGuestSP;
+  // See LayoutFrame_ia32 for the frame layout.
+  const GuestFrameLayout Layout = LayoutFrame_ia32(NewGuestSP, false);
+  const uint64_t HostStackLocation = Layout.HostStackLocation;
+  const uint64_t FPStateLocation = Layout.FPStateLocation;
+  const uint64_t SigFrameLocation = Layout.UContextLocation;
+  NewGuestSP = SigFrameLocation;
 
   ContextBackup->FPStateLocation = FPStateLocation;
   ContextBackup->UContextLocation = SigFrameLocation;
   ContextBackup->SigInfoLocation = 0;
 
   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(SigFrameLocation);
-  // Store where the host context lives in the guest stack.
-  *(uint64_t*)HostStackLocation = (uint64_t)ContextBackup;
+  WriteHostStackSlot(HostStackLocation, ContextBackup);
 
   // Pointer to where the fpreg memory is
   guest_uctx->sc.fpstate = static_cast<uint32_t>(FPStateLocation);
@@ -882,28 +930,15 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
 
   const uint64_t SignalReturn = reinterpret_cast<uint64_t>(VDSOPointers.VDSO_kernel_rt_sigreturn);
 
-  NewGuestSP -= sizeof(uint64_t);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(uint64_t));
+  // See LayoutFrame_ia32 for the frame layout.
+  const GuestFrameLayout FrameLayout = LayoutFrame_ia32(NewGuestSP, true);
+  const uint64_t HostStackLocation = FrameLayout.HostStackLocation;
+  const uint64_t FPStateLocation = FrameLayout.FPStateLocation;
+  const uint64_t SigFrameLocation = FrameLayout.UContextLocation;
+  NewGuestSP = SigFrameLocation;
 
-  uint64_t HostStackLocation = NewGuestSP;
-
-  if (SupportsAVX) {
-    NewGuestSP -= sizeof(FEXCore::x86::xstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86::xstate));
-  } else {
-    NewGuestSP -= sizeof(FEXCore::x86::_libc_fpstate);
-    NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(FEXCore::x86::_libc_fpstate));
-  }
-
-  uint64_t FPStateLocation = NewGuestSP;
-
-  NewGuestSP -= sizeof(RTSigFrame_i32);
-  NewGuestSP = FEXCore::AlignDown(NewGuestSP, alignof(RTSigFrame_i32));
-
-  uint64_t SigFrameLocation = NewGuestSP;
   RTSigFrame_i32* guest_uctx = reinterpret_cast<RTSigFrame_i32*>(SigFrameLocation);
-  // Store where the host context lives in the guest stack.
-  *(uint64_t*)HostStackLocation = (uint64_t)ContextBackup;
+  WriteHostStackSlot(HostStackLocation, ContextBackup);
 
   ContextBackup->FPStateLocation = FPStateLocation;
   ContextBackup->UContextLocation = SigFrameLocation;

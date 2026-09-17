@@ -194,6 +194,12 @@ struct PPC64ContextBackup {
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
+  // Per-delivery cookie, written next to the backup pointer in the guest
+  // frame's host-stack slot. A guest rt_sigreturn is matched against the
+  // thread's OutstandingBackups by {address, Cookie}; a frame whose slot no
+  // longer holds the pair was overwritten or unmapped and can never return.
+  // See SignalDelegator::StoreThreadState (abandoned-frame reclaim).
+  uint64_t Cookie;
   FEXCore::Core::CPUState GuestState;
 
   // ELFv2 ABI §2.2.2.4 mandates a 288-byte red zone below the stack
@@ -214,6 +220,20 @@ struct PPC64ContextBackup {
   // zone. MContext_arm64.h:49 correctly sets 0 (AArch64 Linux has no
   // red zone) -- ppc64le originally copied that.
   static constexpr int RedZoneSize = 288;
+
+  // Bytes at the head of this backup that the interrupted context may still
+  // write while the handler is outstanding: the dispatcher runs the handler's
+  // continuation with r1 == &Backup, so a callee it bctrl's to is entitled to
+  // spill into [r1, r1+96) -- LinkageArea, above. Reclaim placement (see
+  // SignalDelegator::StoreThreadState) never hands those bytes out.
+  static constexpr size_t LinkagePadSize = sizeof(LinkageArea);
+
+  // Extra space reserved under every backup so that ONE abandoned backup's
+  // region is big enough to host its successor entirely: the successor needs
+  // RedZoneSize of JIT scratch below itself and must stay above the
+  // predecessor's LinkagePadSize; with the 16-byte placement alignment that
+  // needs RedZoneSize + LinkagePadSize + 15 < RedZoneSize + ReclaimSlack.
+  static constexpr size_t ReclaimSlack = 160;
 };
 
 using ContextBackup = PPC64ContextBackup;

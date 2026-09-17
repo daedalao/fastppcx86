@@ -76,6 +76,20 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     uint64_t robust_list_head {0};
   } ThreadInfo {};
 
+  // One outstanding guest-signal ContextBackup; see SignalInfo.OutstandingBackups.
+  struct OutstandingBackupType {
+    uint64_t Backup;    ///< Host address of the ContextBackup; the handler's dispatcher runs with r1 == Backup.
+    uint64_t Parent;    ///< The level (Backup of the then-newest entry) the interrupted context ran under; 0 if unknown.
+    uint64_t Ceiling;   ///< Top (exclusive) of the host-stack region this entry owns once abandoned.
+    uint64_t GuestSlot; ///< Guest address of the frame's {Backup, Cookie} slot.
+    uint64_t Cookie;    ///< The cookie written into that slot.
+    bool Abandoned;     ///< The slot no longer holds {Backup, Cookie}: the handler can never sigreturn.
+  };
+  // Fixed capacity: the list is written from signal context. Nested guest
+  // signal handlers a hundred deep are already pathological; on overflow the
+  // OLDEST entry is forgotten, which only costs its reclaim.
+  static constexpr uint32_t MaxOutstandingBackups = 128;
+
   struct {
     SignalDelegator* Delegator {};
 
@@ -116,6 +130,23 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     // Queue of thread local signal frames that have been deferred.
     // Async signals aren't guaranteed to be delivered in any particular order, but FEX treats them as FILO.
     fextl::vector<DeferredSignalState> DeferredSignalFrames;
+
+    // Guest-signal ContextBackups still outstanding on this thread's HOST
+    // stack, oldest first. Every guest signal delivery carves a ContextBackup
+    // out of the host stack under the interrupted SP and only that handler's
+    // rt_sigreturn gives the space back; a handler left with siglongjmp (or
+    // any other non-local exit) never returns it. This list is what lets
+    // StoreThreadState recognise such abandoned backups and reuse their
+    // space instead of sinking lower forever. Lives here, NOT on the host
+    // stack: a host-side unwind (FexBridge nested runs, thunk callbacks)
+    // can invalidate a backup without telling anyone, and a chain threaded
+    // through the backups themselves would then be walked through garbage.
+    // Nothing here is dereferenced as a pointer; entries are validated
+    // against the guest frame they describe. See SignalDelegator.cpp,
+    // "Abandoned-frame reclaim".
+    OutstandingBackupType OutstandingBackups[MaxOutstandingBackups] {};
+    uint32_t OutstandingBackupCount {};
+    uint64_t BackupCookieSeq {};
   } SignalInfo {};
 
   // Seccomp thread specific data.

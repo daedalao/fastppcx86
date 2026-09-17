@@ -632,23 +632,242 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
 #endif
 }
 
-ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext) {
+// ---------------------------------------------------------------------------
+// Abandoned-frame reclaim
+//
+// A guest signal delivery carves its ContextBackup out of the HOST stack below
+// the interrupted SP and lowers the ucontext SP under it, so the dispatcher
+// runs the guest handler underneath the saved context. The handler's
+// rt_sigreturn (RestoreThreadState) puts the old SP back. A handler the guest
+// leaves any other way -- siglongjmp/longjmp out of it, a swapcontext that
+// never comes back, Mono's managed-exception unwind -- never sigreturns, and
+// the host SP stays lowered by one backup (several KB on ppc64le) for good.
+// Programs that exit handlers with siglongjmp (interpreters, test harnesses,
+// crash handlers in games) sank through an 8 MB host stack in ~2,500
+// deliveries; reported by the co-dev against upstream FEX, 2026-09-17.
+//
+// The kernel has no such problem because its frame lives on the USER stack:
+// the guest frame is the only thing that outlives the handler, and if the
+// guest reuses that stack space the frame is gone. That is the rule used
+// here. Every delivery records {backup address, host SP, guest slot, cookie}
+// in the thread's OutstandingBackups and writes {backup, cookie} into the
+// frame's host-stack slot. A backup whose slot no longer holds the pair, or
+// whose slot lies where the frame now being built will be written, belongs
+// to a handler that can never sigreturn (a sigreturn on that frame would
+// already be undefined behaviour on real Linux), so its host-stack region is
+// dead and the new backup is placed INSIDE it instead of under the current
+// SP. With ReclaimSlack sized so one backup's region fits its successor, a
+// storm of longjmp'd handlers oscillates within a single backup's worth of
+// stack instead of descending.
+//
+// What is provably free. Each entry records the LEVEL its interrupted context
+// ran under (Parent: the then-newest entry's Backup, verified by walking the
+// ELFv2 back chain from the interrupted SP -- BackChainReaches) and the top
+// of the region it will own once abandoned (Ceiling: that parent level for a
+// classic placement, or the dead region it was itself placed into). Take the
+// newest run of abandoned entries R0 (newest) .. Rk whose parent links chain
+// together and which the current context runs under (its back chain reaches
+// R0). Then [R0 + LinkagePad, Ceiling(Rk)) holds only abandoned backups, the
+// dead frames of the contexts they interrupted and the red zones under them.
+// R0's linkage pad stays out: the current context's r1 is &R0 and its
+// callees may still spill there. A host-side unwind (FexBridge nested run,
+// thunk callback) breaks the chain, and the code then falls back to the
+// classic placement, which is always safe because everything under
+// SP - RedZone is free. A backup placed by reclaim sits at the top of its
+// region, so it alone is too small for a successor; the successor goes under
+// the current SP and the pair is reclaimed together at the delivery after
+// that -- the storm oscillates with period two inside one backup's worth of
+// stack plus one classic offset.
+//
+// Detection cost: entries are probed with process_vm_readv (never faults,
+// works with SIGSEGV blocked) only while the list is non-empty, i.e. only
+// when a handler is nested or was abandoned; a program whose handlers return
+// pays one arithmetic loop over an empty list.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Read the 16-byte {backup, cookie} slot of an outstanding frame without
+// faulting. EFAULT (unmapped, PROT_NONE) counts as "gone": the frame cannot
+// be sigreturned either. Any other failure counts as intact -- a probe that
+// cannot run must never free a live backup.
+bool GuestSlotIntact(const FEX::HLE::ThreadStateObject::OutstandingBackupType& E) {
+  uint64_t Slot[2] {};
+  struct iovec Local {
+    .iov_base = Slot,
+    .iov_len = sizeof(Slot),
+  };
+  struct iovec Remote {
+    .iov_base = reinterpret_cast<void*>(E.GuestSlot),
+    .iov_len = sizeof(Slot),
+  };
+  const long N = ::syscall(SYS_process_vm_readv, ::syscall(SYS_getpid), &Local, 1UL, &Remote, 1UL, 0UL);
+  if (N == static_cast<long>(sizeof(Slot))) {
+    return Slot[0] == E.Backup && Slot[1] == E.Cookie;
+  }
+  if (N >= 0 || errno == EFAULT) {
+    // Short read or unreadable: the slot is (partly) gone.
+    return false;
+  }
+  return true;
+}
+
+// Does the host stack from SP upward reach Level as a frame boundary? Follows
+// the ELFv2 back chain (every frame's first doubleword is the caller's SP;
+// the dispatcher's bctrl into C stores the dispatcher's r1 there), so a
+// context interrupted inside host C code proves it runs under Level, and a
+// context interrupted in JIT code sits at Level itself. A host-side unwind
+// between deliveries (FexBridge nested run, thunk callback) leaves a chain
+// that skips the level, which is the point: reclaim is only permitted when
+// the layout is the one delivery built. Reads stay within the live stack.
+bool BackChainReaches(uintptr_t SP, uintptr_t Level) {
+  for (int Hops = 0; Hops < 1024 && SP < Level; ++Hops) {
+    const uintptr_t Next = *reinterpret_cast<const uintptr_t*>(SP);
+    // Frames grow up the chain; a hop over a megabyte is not a frame.
+    if (Next <= SP || Next - SP > (1U << 20)) {
+      return false;
+    }
+    SP = Next;
+  }
+  return SP == Level;
+}
+} // namespace
+
+void SignalDelegator::MarkAbandonedBackups(FEX::HLE::ThreadStateObject* ThreadObject, const GuestFrameExtent& Extent) const {
+  auto& SI = ThreadObject->SignalInfo;
+  // Only the newest run is probed (that is the run reclaim can use); the
+  // overwrite test is arithmetic and runs over everything.
+  bool InNewestRun = true;
+  for (uint32_t i = SI.OutstandingBackupCount; i-- > 0;) {
+    auto& E = SI.OutstandingBackups[i];
+    if (E.Abandoned) {
+      continue;
+    }
+    const bool Overwritten = E.GuestSlot < Extent.Hi && E.GuestSlot + HostStackSlotSize > Extent.Lo;
+    if (Overwritten || (InNewestRun && !GuestSlotIntact(E))) {
+      E.Abandoned = true;
+      SIGTRACE("ABANDON backup=0x%lx slot=0x%lx %s", (unsigned long)E.Backup, (unsigned long)E.GuestSlot,
+               Overwritten ? "overwritten-by-new-frame" : "slot-mismatch");
+      continue;
+    }
+    InNewestRun = false;
+  }
+}
+
+ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext,
+                                                                       FEX::HLE::ThreadStateObject* ThreadObject,
+                                                                       const GuestFrameExtent* Extent, uint64_t SlotAddress) {
+  using ContextBackup = ArchHelpers::Context::ContextBackup;
   // We can end up getting a signal at any point in our host state
   // Jump to a handler that saves all state so we can safely return
   uint64_t OldSP = ArchHelpers::Context::GetSp(ucontext);
   uintptr_t NewSP = OldSP;
 
-  size_t StackOffset = sizeof(ArchHelpers::Context::ContextBackup);
+  size_t StackOffset = sizeof(ContextBackup);
 
   // We need to back up behind the host's red zone
   // We do this on the guest side as well
   // (does nothing on arm hosts)
-  NewSP -= ArchHelpers::Context::ContextBackup::RedZoneSize;
+  NewSP -= ContextBackup::RedZoneSize;
 
   NewSP -= StackOffset;
+  NewSP -= ContextBackup::ReclaimSlack;
   NewSP = FEXCore::AlignDown(NewSP, 16);
 
-  auto Context = reinterpret_cast<ArchHelpers::Context::ContextBackup*>(NewSP);
+  const bool Tracked = ThreadObject && Extent;
+  // The level the interrupted context runs under: the newest entry's Backup
+  // if the host stack between here and there is the delivery-built one, else
+  // 0 (nothing outstanding, or a host-side unwind changed the layout).
+  uint64_t ParentLevel = 0;
+  uint64_t Ceiling = OldSP; // classic placement owns up to the interrupted SP
+  if (Tracked) {
+    auto& SI = ThreadObject->SignalInfo;
+    MarkAbandonedBackups(ThreadObject, *Extent);
+
+    if (SI.OutstandingBackupCount != 0) {
+      const auto& Head = SI.OutstandingBackups[SI.OutstandingBackupCount - 1];
+      if (BackChainReaches(OldSP, Head.Backup)) {
+        ParentLevel = Head.Backup;
+        Ceiling = Head.Backup;
+      }
+    }
+
+    // The run of abandoned entries to reclaim: R0 is the newest abandoned
+    // entry, and every entry newer than it must be live and chain under it
+    // (each one's interrupted context ran under the next older one's level,
+    // the current context under the newest) -- a nested handler that is
+    // still running below a pile of abandoned backups is the shape the
+    // "inner longjmps out of both" pattern leaves behind, and the pile is
+    // dead space above everything live. The run then extends upward while
+    // the entries are abandoned and their parent links chain: that makes
+    // [R0 + LinkagePad, Ceiling(Rk)) provably dead -- the entries, the frames
+    // of the contexts they interrupted and the red zones under them, and
+    // nothing else. An entry placed by a previous reclaim has a parent that
+    // is no longer listed, which simply ends the run at it (its own region is
+    // what it was given).
+    const uint32_t Count = SI.OutstandingBackupCount;
+    uint32_t Newer = 0; // live entries newer than R0
+    uint32_t Run = 0;
+    if (ParentLevel != 0) {
+      bool Chained = true;
+      while (Newer < Count && !SI.OutstandingBackups[Count - 1 - Newer].Abandoned) {
+        const auto& L = SI.OutstandingBackups[Count - 1 - Newer];
+        if (Newer + 1 >= Count || L.Parent != SI.OutstandingBackups[Count - 2 - Newer].Backup) {
+          Chained = false;
+          break;
+        }
+        ++Newer;
+      }
+      if (Chained && Newer < Count) {
+        while (Newer + Run < Count) {
+          const auto& E = SI.OutstandingBackups[Count - 1 - Newer - Run];
+          if (!E.Abandoned) {
+            break;
+          }
+          ++Run;
+          const bool HasOlder = Newer + Run < Count;
+          if (!HasOlder || E.Parent != SI.OutstandingBackups[Count - 1 - Newer - Run].Backup) {
+            break;
+          }
+        }
+      }
+    }
+    if (Run != 0) {
+      const auto& R0 = SI.OutstandingBackups[Count - 1 - Newer];
+      const auto& Rk = SI.OutstandingBackups[Count - Newer - Run];
+      const uintptr_t DeadTop = Rk.Ceiling;
+      const uintptr_t DeadFloor = R0.Backup + ContextBackup::LinkagePadSize;
+      bool Sound = DeadTop > DeadFloor;
+      if (Sound && Newer + Run < Count) {
+        // Everything older is at or above the region.
+        Sound = DeadTop <= SI.OutstandingBackups[Count - 1 - Newer - Run].Backup;
+      }
+      const uintptr_t Candidate = Sound ? FEXCore::AlignDown(DeadTop - StackOffset, 16) : 0;
+      // The handler's JIT scratch (RedZoneSize under its r1) must stay inside
+      // the dead region too.
+      if (Sound && Candidate >= DeadFloor + ContextBackup::RedZoneSize && Candidate + StackOffset <= DeadTop) {
+        // A live entry placed by an earlier reclaim can sit far ABOVE the
+        // parent level it chains to, so a sound run can lie below the current
+        // SP: free space already, worth nothing. Use the region only when it
+        // beats the classic spot; drop the run either way.
+        if (Candidate > NewSP) {
+          SIGTRACE("RECLAIM run=%u under=%u dead=[0x%lx,0x%lx) backup=0x%lx (classic would be 0x%lx)", Run, Newer,
+                   (unsigned long)DeadFloor, (unsigned long)DeadTop, (unsigned long)Candidate, (unsigned long)NewSP);
+          NewSP = Candidate;
+          Ceiling = DeadTop;
+        } else {
+          SIGTRACE("RECLAIM run=%u under=%u dead=[0x%lx,0x%lx) below the classic spot 0x%lx: dropped", Run, Newer,
+                   (unsigned long)DeadFloor, (unsigned long)DeadTop, (unsigned long)NewSP);
+        }
+        // Drop the run; the live entries newer than it slide down.
+        memmove(&SI.OutstandingBackups[Count - Newer - Run], &SI.OutstandingBackups[Count - Newer], sizeof(SI.OutstandingBackups[0]) * Newer);
+        SI.OutstandingBackupCount -= Run;
+        // Those handlers will never sigreturn; balance their delivery increments.
+        Thread->CurrentFrame->SignalHandlerRefCounter -= Run;
+      }
+    }
+  }
+
+  auto Context = reinterpret_cast<ContextBackup*>(NewSP);
   ArchHelpers::Context::BackupContext(ucontext, Context);
 
   // Retain the action pointer so we can see it when we return
@@ -667,10 +886,30 @@ ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::
   Context->UContextLocation = 0;
   Context->SigInfoLocation = 0;
   Context->InSyscallInfo = 0;
+  Context->Cookie = 0;
 
   // Store fault to top status and then reset it
   Context->FaultToTopAndGeneratedException = Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException;
   Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException = false;
+
+  if (Tracked) {
+    auto& SI = ThreadObject->SignalInfo;
+    Context->Cookie = (++SI.BackupCookieSeq) ^ BackupCookieSalt;
+    if (SI.OutstandingBackupCount == FEX::HLE::ThreadStateObject::MaxOutstandingBackups) {
+      // Forget the oldest; it can still sigreturn (RestoreThreadState then
+      // trusts the slot's pointer as it always did), it just can't be reclaimed.
+      memmove(&SI.OutstandingBackups[0], &SI.OutstandingBackups[1], sizeof(SI.OutstandingBackups[0]) * (SI.OutstandingBackupCount - 1));
+      --SI.OutstandingBackupCount;
+    }
+    SI.OutstandingBackups[SI.OutstandingBackupCount++] = {
+      .Backup = reinterpret_cast<uint64_t>(Context),
+      .Parent = ParentLevel,
+      .Ceiling = Ceiling,
+      .GuestSlot = SlotAddress,
+      .Cookie = Context->Cookie,
+      .Abandoned = false,
+    };
+  }
 
   return Context;
 }
@@ -745,6 +984,37 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
     }
 
     OldSP = *reinterpret_cast<uint64_t*>(GuestSP);
+    const uint64_t Cookie = reinterpret_cast<uint64_t*>(GuestSP)[1];
+
+    // Match the returning frame against the outstanding list and drop every
+    // newer entry: a handler nested inside this one that has not returned by
+    // the time this one does was left by a non-local exit and its backup
+    // (below this one on the host stack) is being unwound right now.
+    auto* ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
+    auto& SI = ThreadObject->SignalInfo;
+    bool Found = false;
+    for (uint32_t i = SI.OutstandingBackupCount; i-- > 0;) {
+      const auto& E = SI.OutstandingBackups[i];
+      if (E.Backup == OldSP && E.Cookie == Cookie) {
+        const uint32_t Dropped = SI.OutstandingBackupCount - 1 - i;
+        SI.OutstandingBackupCount = i;
+        Thread->CurrentFrame->SignalHandlerRefCounter -= Dropped;
+        Found = true;
+        if (Dropped != 0) {
+          SIGTRACE("RESTORE dropped %u abandoned nested backup(s) above 0x%lx", Dropped, (unsigned long)OldSP);
+        }
+        break;
+      }
+    }
+    if (!Found) {
+      // Not tracked (list overflow) or a frame the guest resurrected after
+      // its backup was reclaimed. The latter was undefined behaviour before
+      // this list existed too (the backup would have been whatever the host
+      // stack held by then); keep the historical behaviour of trusting the
+      // pointer, but say so.
+      SIGTRACE("RESTORE untracked frame: backup=0x%lx cookie=0x%lx outstanding=%u", (unsigned long)OldSP, (unsigned long)Cookie,
+               SI.OutstandingBackupCount);
+    }
   }
 
   uintptr_t NewSP = OldSP;
@@ -809,14 +1079,8 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
 
 bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext,
                                                   GuestSigAction* GuestAction, stack_t* GuestStack) {
-  auto ContextBackup = StoreThreadState(Thread, Signal, ucontext);
-  ContextBackup->GuestSignalMask = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread)->SignalInfo.CurrentSignalMask.Val;
-
   auto Frame = Thread->CurrentFrame;
-
-  // Ref count our faults
-  // We use this to track if it is safe to clear cache
-  ++Thread->CurrentFrame->SignalHandlerRefCounter;
+  auto* ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
 
   uint64_t OldPC = ArchHelpers::Context::GetPc(ucontext);
   const bool WasInJIT = CTX->IsAddressInCodeBuffer(Thread, OldPC);
@@ -824,6 +1088,12 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // Spill the SRA regardless of signal handler type
   // We are going to be returning to the top of the dispatcher which will fill again
   // Otherwise we might load garbage
+  //
+  // This runs BEFORE StoreThreadState (it used to run after, with the backup
+  // re-capturing GuestState afterwards): the frame layout, which the backup
+  // placement needs (abandoned-frame reclaim), starts from the guest RSP,
+  // and a mid-block interrupt only has the current RSP in a host register
+  // until the spill commits it.
   if (WasInJIT) {
     uint32_t IgnoreMask {};
 #if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_ppc64le)
@@ -841,57 +1111,6 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 
     // We are in jit, SRA must be spilled
     SpillSRA(Thread, ucontext, IgnoreMask);
-
-#if defined(ARCHITECTURE_ppc64le)
-    // StoreThreadState captured GuestState BEFORE SpillSRA ran. SpillSRA has
-    // now committed the correct x86 state (gregs, rip, xmm) from the actual
-    // signal-arrival register file into Thread->CurrentFrame->State. Re-capture
-    // so that RestoreThreadState's memcpy(State, GuestState) restores the
-    // authoritative pre-signal values rather than a stale one-block-behind copy.
-    memcpy(&ContextBackup->GuestState, &Thread->CurrentFrame->State,
-           sizeof(FEXCore::Core::CPUState));
-#endif
-
-    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-
-    // We are leaving the syscall information behind. Make sure to store the previous state.
-    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
-    Thread->CurrentFrame->InSyscallInfo = 0;
-    SIGTRACE("DELIVER sig=%d injit pc=0x%lx rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
-             (unsigned long)Frame->State.rip, (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP],
-             (unsigned long)(uintptr_t)ContextBackup, (unsigned)ContextBackup->InSyscallInfo);
-  } else {
-    // The interrupted context can still be mid-syscall even though the host
-    // PC is outside the JIT: DEF_OP(Syscall) sets Frame->InSyscallInfo=0xFFFF
-    // (and, since the partial-refill port, DEF_OP(Thunk) and the FABI bridge
-    // stubs arm the same field around their host calls — see
-    // kInSyscallSentinel in FEXCore ArchHelpers/PPC64Emitter.h)
-    // before bctrl'ing into C, so a thread blocked in e.g. sigsuspend carries
-    // the in-syscall spill mask while it waits. The guest handler we are about
-    // to dispatch runs fresh JIT blocks; if the stale mask is left set, any
-    // nested mid-JIT delivery (deferred-signal drain at a poke, another GC
-    // suspend) takes SpillSRA's partial-spill path at a boundary that is NOT
-    // the syscall window and freezes guest RAX..RDI at stale memory values.
-    // That was the Ziggurat "SRA corruption" wedge: Boehm GC's SIGPWR/SIGXCPU
-    // storm nests exactly this way (stop handler parked in sigsuspend).
-    // Scope it like the InJIT branch does: stash in the backup, clear for the
-    // handler, and RestoreThreadState reinstates it with the resumed context.
-    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
-    Thread->CurrentFrame->InSyscallInfo = 0;
-    SIGTRACE("DELIVER sig=%d outside pc=0x%lx indisp=%d rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
-             IsAddressInDispatcher(OldPC) ? 1 : 0, (unsigned long)Frame->State.rip,
-             (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP], (unsigned long)(uintptr_t)ContextBackup,
-             (unsigned)ContextBackup->InSyscallInfo);
-    if (!IsAddressInDispatcher(OldPC)) {
-      // This is likely to cause issues but in some cases it isn't fatal
-      // This can also happen if we have put a signal on hold, then we just reenabled the signal
-      // So we are in the syscall handler
-      // Only throw a log message in this case
-      if constexpr (false) {
-        // XXX: Messages in the signal handler can cause us to crash
-        LogMan::Msg::EFmt("Signals in dispatcher have unsynchronized context");
-      }
-    }
   }
 
   uint64_t OldGuestSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
@@ -992,6 +1211,55 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     }
   }
 
+  // Lay the frame out before anything is written: StoreThreadState uses the
+  // extent to recognise outstanding frames this one will overwrite.
+  const bool SigInfoFrame = (GuestAction->sa_flags & SA_SIGINFO) == SA_SIGINFO;
+  const GuestFrameLayout Layout = Is64BitMode ? LayoutFrame_x64(NewGuestSP) : LayoutFrame_ia32(NewGuestSP, SigInfoFrame);
+  const GuestFrameExtent Extent {
+    .Lo = Layout.Bottom,
+    .Hi = Layout.HostStackLocation + HostStackSlotSize,
+  };
+
+  auto ContextBackup = StoreThreadState(Thread, Signal, ucontext, ThreadObject, &Extent, Layout.HostStackLocation);
+  ContextBackup->GuestSignalMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+
+  // Ref count our faults
+  // We use this to track if it is safe to clear cache
+  ++Thread->CurrentFrame->SignalHandlerRefCounter;
+
+  if (WasInJIT) {
+    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
+
+    // We are leaving the syscall information behind. Make sure to store the previous state.
+    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
+    Thread->CurrentFrame->InSyscallInfo = 0;
+    SIGTRACE("DELIVER sig=%d injit pc=0x%lx rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
+             (unsigned long)Frame->State.rip, (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP],
+             (unsigned long)(uintptr_t)ContextBackup, (unsigned)ContextBackup->InSyscallInfo);
+  } else {
+    // The interrupted context can still be mid-syscall even though the host
+    // PC is outside the JIT: DEF_OP(Syscall) sets Frame->InSyscallInfo=0xFFFF
+    // (and, since the partial-refill port, DEF_OP(Thunk) and the FABI bridge
+    // stubs arm the same field around their host calls — see
+    // kInSyscallSentinel in FEXCore ArchHelpers/PPC64Emitter.h)
+    // before bctrl'ing into C, so a thread blocked in e.g. sigsuspend carries
+    // the in-syscall spill mask while it waits. The guest handler we are about
+    // to dispatch runs fresh JIT blocks; if the stale mask is left set, any
+    // nested mid-JIT delivery (deferred-signal drain at a poke, another GC
+    // suspend) takes SpillSRA's partial-spill path at a boundary that is NOT
+    // the syscall window and freezes guest RAX..RDI at stale memory values.
+    // That was the Ziggurat "SRA corruption" wedge: Boehm GC's SIGPWR/SIGXCPU
+    // storm nests exactly this way (stop handler parked in sigsuspend).
+    // Scope it like the InJIT branch does: stash in the backup, clear for the
+    // handler, and RestoreThreadState reinstates it with the resumed context.
+    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
+    Thread->CurrentFrame->InSyscallInfo = 0;
+    SIGTRACE("DELIVER sig=%d outside pc=0x%lx indisp=%d rip=0x%lx rsp=0x%lx backup=0x%lx isi=0x%x", Signal, OldPC,
+             IsAddressInDispatcher(OldPC) ? 1 : 0, (unsigned long)Frame->State.rip,
+             (unsigned long)Frame->State.gregs[FEXCore::X86State::REG_RSP], (unsigned long)(uintptr_t)ContextBackup,
+             (unsigned)ContextBackup->InSyscallInfo);
+  }
+
   // siginfo_t
   siginfo_t* HostSigInfo = reinterpret_cast<siginfo_t*>(info);
 
@@ -1011,7 +1279,6 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     }
     NewGuestSP = SetupFrame_x64(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
   } else {
-    const bool SigInfoFrame = (GuestAction->sa_flags & SA_SIGINFO) == SA_SIGINFO;
     if (SigInfoFrame) {
       NewGuestSP = SetupRTFrame_ia32(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
     } else {
@@ -2157,6 +2424,14 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
   for (uint32_t Signal = 0; Signal <= SignalDelegator::MAX_SIGNALS; ++Signal) {
     RegisterHostSignalHandlerForGuest(Signal, GuestSignalHandler);
   }
+
+  // Salt for the guest-frame cookies (abandoned-frame reclaim). Randomness is
+  // a nicety, not a requirement: the cookie only has to differ from whatever
+  // an overwritten slot happens to hold, and the sequence number does that.
+  if (::syscall(SYS_getrandom, &BackupCookieSalt, sizeof(BackupCookieSalt), 0) != static_cast<long>(sizeof(BackupCookieSalt))) {
+    BackupCookieSalt = (static_cast<uint64_t>(::getpid()) << 32) ^ reinterpret_cast<uint64_t>(this);
+  }
+  BackupCookieSalt |= 1ULL << 63; // never 0, so an all-zero slot cannot validate
 
   // execve keeps ignored signals ignored (the kernel only resets caught ones
   // to SIG_DFL), and this process is the guest's execve: seed the guest view
