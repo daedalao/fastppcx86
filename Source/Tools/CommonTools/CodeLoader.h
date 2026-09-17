@@ -46,6 +46,18 @@ public:
     return {};
   }
 
+  // The guest's argument strings (argv[0] to the end of the last one), and
+  // whether the kernel's /proc/<pid>/cmdline was pointed at them.
+  struct ArgumentDataResult {
+    uint64_t address;
+    uint64_t size;
+    bool KernelRemapped;
+  };
+
+  virtual ArgumentDataResult GetArgumentData() const {
+    return {};
+  }
+
   virtual uint64_t GetBaseOffset() const {
     return 0;
   }

@@ -993,17 +993,22 @@ public:
 
   // Point the OS to our new stack's argument data
   void RemapArgumentData(uintptr_t NewArgStart, uint64_t ArgSize) {
+    ArgumentDataStart = NewArgStart;
+    ArgumentDataSize = ArgSize;
     struct prctl_mm_map map {};
     if (GetCurrentMap(map)) {
       map.arg_start = NewArgStart;
       map.arg_end = NewArgStart + ArgSize;
 
       int r = prctl(PR_SET_MM, PR_SET_MM_MAP, &map, sizeof(map), 0L);
+      ArgumentDataRemapped = r == 0;
       if (r != 0) {
-        LogMan::Msg::EFmt("Failed to remap /proc/pid/cmdline data (prctl failed: result {}, errno {})", r, errno);
+        // PR_SET_MM_MAP needs CONFIG_CHECKPOINT_RESTORE (EPERM without it).
+        // Not an error: /proc/self/cmdline is emulated instead.
+        LogMan::Msg::IFmt("/proc/pid/cmdline not remapped (prctl errno {}); emulating /proc/self/cmdline", errno);
       }
     } else {
-      LogMan::Msg::EFmt("Failed to remap /proc/pid/cmdline data (GetCurrentMap failed)");
+      LogMan::Msg::IFmt("/proc/pid/cmdline not remapped (no current map); emulating /proc/self/cmdline");
     }
   }
 
@@ -1127,6 +1132,14 @@ public:
     return LoaderArgs;
   }
 
+  ArgumentDataResult GetArgumentData() const override {
+    return {
+      .address = ArgumentDataStart,
+      .size = ArgumentDataSize,
+      .KernelRemapped = ArgumentDataRemapped,
+    };
+  }
+
   AuxvResult GetAuxv() const override {
     return {
       .address = AuxTabBase,
@@ -1231,6 +1244,9 @@ public:
   uint64_t AuxTabBase {}, AuxTabSize {};
   uint64_t ArgumentBackingSize {};
   uint64_t ArgumentOffset {};
+  uint64_t ArgumentDataStart {};
+  uint64_t ArgumentDataSize {};
+  bool ArgumentDataRemapped {};
   uint64_t EnvironmentBackingSize {};
   uint64_t BaseOffset {};
   void* VDSOBase {};
