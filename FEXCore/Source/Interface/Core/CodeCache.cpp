@@ -12,6 +12,7 @@
 #include <Interface/Core/OpcodeDispatcher.h>
 #include <Interface/IR/PassManager.h>
 
+#include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -28,10 +29,13 @@
 // ComputeCodeMapId streams the mapped file to derive a content-based cache
 // identity. close() was already used unguarded in this file, so POSIX is
 // assumed here rather than newly introduced.
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sys/stat.h>
 #include <time.h>
@@ -267,7 +271,21 @@ uint64_t SanitizeId(uint64_t Id) {
   }
   return Id;
 }
+
+// Detected host features, registered by the context before the id is first
+// computed. See SetCodeCacheHostFeatures.
+std::atomic<const HostFeatures*> CodeCacheHostFeatures {nullptr};
 } // namespace
+
+void SetCodeCacheHostFeatures(const HostFeatures& Features) {
+  // The first context's features win; later contexts in the process are built
+  // from the same detection.
+  static std::once_flag Once;
+  std::call_once(Once, [&Features] {
+    static const HostFeatures Copy = Features;
+    CodeCacheHostFeatures.store(&Copy, std::memory_order_release);
+  });
+}
 
 uint64_t ComputeCodeCacheConfigId() {
   // Computed once: config is loaded before any mapping is tracked and does not
@@ -578,22 +596,40 @@ uint64_t ComputeCodeCacheConfigId() {
     // provably cannot change the bytes of a cache-mode compile. Do not "fix"
     // this by enabling linking under caching.
 
-    // NOT hashed, and this one IS a gap — flagged deliberately, scoped
-    // separately, do not bolt a fix on here. Everything above is requested
-    // config or an env switch. NOT ONE detected host capability is hashed, and
-    // several of them decide which instructions get emitted:
-    //   * HostFeatures::SupportsISA30 (Source/Common/HostFeatures.cpp:746, from
-    //     HWCAP2 & PPC_FEATURE2_ARCH_3_00_) gates lxvx / stxvx / lxsibzx /
-    //     lxsihzx / mcrxrx. A POWER9-generated cache loaded on POWER8 is a
-    //     SIGILL on the first lxvx, not a slowdown.
-    //   * HostFeatures::DCacheLineSize (:729/:796) is baked into the dcbz block
-    //     shift, so a cache from a host with a different line size zeroes the
-    //     wrong span.
-    // The effective-HWTSO hash above is one instance of this class that had a
-    // live consequence, which is why it was fixed on its own. Closing the rest
-    // needs a decision on how host capability is canonicalised (the detected
-    // set, or the subset the emitters actually branch on) and belongs in its own
-    // change.
+    // 3. Detected host capabilities. Several decide which instructions are
+    //    emitted: SupportsISA30 gates lxvx / stxvx / lxsibzx / lxsihzx / mcrxrx
+    //    (a POWER9 cache on POWER8 is a SIGILL), and DCacheLineSize is baked
+    //    into the dcbz block shift. Every field is hashed; the size assert
+    //    catches a new one. MIDRs as distinct values, since their count follows
+    //    the CPU affinity.
+    {
+      const auto* Features = CodeCacheHostFeatures.load(std::memory_order_acquire);
+      if (!Features) {
+        XXH3_freeState(State);
+        return InvalidFileId;
+      }
+      static_assert(sizeof(HostFeatures) == 72, "HostFeatures changed: hash the new field below");
+      const auto& F = *Features;
+      for (uint64_t V : {uint64_t {F.DCacheLineSize}, uint64_t {F.ICacheLineSize}}) {
+        Hasher.Add(V);
+      }
+      for (bool B : {F.SupportsCacheMaintenanceOps, F.SupportsAES, F.SupportsCRC, F.SupportsCLZERO, F.SupportsAtomics, F.SupportsRCPC,
+                     F.SupportsTSOImm9, F.SupportsTSODisp16, F.SupportsRAND, F.SupportsAVX, F.SupportsAVX2, F.SupportsSVE128, F.SupportsSVE256,
+                     F.SupportsSHA, F.SupportsPMULL_128Bit, F.SupportsCSSC, F.SupportsFCMA, F.SupportsFlagM, F.SupportsFlagM2, F.SupportsFCmpX86,
+                     F.SupportsRPRES, F.SupportsPreserveAllABI, F.SupportsAES256, F.SupportsSVEBitPerm, F.SupportsCPUIndexInTPIDRRO,
+                     F.SupportsFRINTTS, F.SupportsECV, F.SupportsWFXT, F.Supports3DNow, F.SupportsSSE4a, F.SupportsMOPS, F.SupportsISA30,
+                     F.SupportsVCmpFlagBranch, F.SupportsFlagTransparentSelect, F.SupportsAFP, F.SupportsFloatExceptions, F.IsInstCountCI}) {
+        Hasher.Add(uint64_t {B});
+      }
+      fextl::vector<uint32_t> MIDRs = F.CPUMIDRs;
+      std::sort(MIDRs.begin(), MIDRs.end());
+      MIDRs.erase(std::unique(MIDRs.begin(), MIDRs.end()), MIDRs.end());
+      Hasher.Add(uint64_t {MIDRs.size()});
+      for (uint32_t MIDR : MIDRs) {
+        Hasher.Add(uint64_t {MIDR});
+      }
+    }
+
 #undef HASH_OPT
 #undef HASH_STR_OPT
 
