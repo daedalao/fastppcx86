@@ -595,6 +595,18 @@ int main(int argc, char** argv, char** const envp) {
   FEXCore::Config::ReloadMetaLayer();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, InterpreterInstalled ? "1" : "0");
 
+  // SMC store backpatching and the code cache do not mix: the cache replays the
+  // code buffer, and backpatch stubs (absolute helper addresses, PC-relative
+  // branches to store sites) do not survive that, so
+  // CodeBufferManager::TryAllocateAuxMemory refuses every stub while
+  // EnableCodeCachingWIP is set. With the cache only loading (CodeCacheScope
+  // off) the syscall handler still enabled backpatching, which then silently
+  // placed no stub at all. The explicit SMC mode wins: turn the cache off here,
+  // before anything has read the option.
+  if (FEXCore::Config::Get_SMCSTOREBACKPATCH() && FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "0");
+  }
+
   // Host-page-size gate (64K port). Config is loaded and merged, and nothing
   // downstream exists yet: no context (CreateNewContext below caches SMCChecks
   // at construction, which is why degrade-mode forcing has to happen HERE), no
