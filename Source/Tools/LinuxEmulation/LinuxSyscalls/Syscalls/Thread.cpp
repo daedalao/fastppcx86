@@ -446,7 +446,14 @@ namespace {
     const int MemFD = open("/proc/self/mem", O_WRONLY | O_CLOEXEC);
     // Pages written through MemFD, merged, for invalidation.
     fextl::vector<Range> Written;
+    // Set when the child's memory cannot be read at all; ends the walk. (An
+    // earlier form cleared Mappings from inside this range-for, which leaves
+    // the loop iterating storage it no longer owns.)
+    bool Unreadable = false;
     for (const auto& M : Mappings) {
+      if (Unreadable) {
+        break;
+      }
       for (uint64_t Addr = M.Start; Addr < M.End;) {
         const size_t Len = std::min<uint64_t>(Buffer.size(), M.End - Addr);
         iovec Local {Buffer.data(), Len};
@@ -455,7 +462,7 @@ namespace {
         if (Got <= 0) {
           if (Got < 0 && errno != EFAULT) {
             LogMan::Msg::IFmt("vfork: can't read the child's memory ({}); its writes stay invisible", errno);
-            Mappings.clear();
+            Unreadable = true;
             break;
           }
           // An unreadable host page in the child; skip it.
@@ -579,6 +586,16 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
   const bool IsChild = Result == 0;
 
   if (IsChild) {
+    if (!CopyBack && VForkSyncFD != -1) {
+      // This child is not the copy-back child, but it inherited the sync pipe
+      // from a vfork child that forked. Left open, its exit would signal the
+      // grandparent to copy the wrong process image back, and the two ack
+      // bytes could be consumed by the wrong reader. Drop the inheritance.
+      close(VForkSyncFD);
+      close(VForkAckFD);
+      VForkSyncFD = -1;
+      VForkAckFD = -1;
+    }
     auto ThreadObject = static_cast<FEX::HLE::ThreadStateObject*>(Thread->FrontendPtr);
     // Unlock the mutexes on both sides of the fork
     FEX::HLE::_SyscallHandler->UnlockAfterFork(Frame->Thread, IsChild);
