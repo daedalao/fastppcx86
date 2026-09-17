@@ -2817,7 +2817,12 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
       if ((prot & PROT_READ) && Inserted) {
         Resource->MappedFile = fextl::make_shared<FEXCore::ExecutableFileInfo>();
         Resource->MappedFile->Filename = fextl::string(Tmp, PathLength);
-        Resource->MappedFile->FileId = CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd);
+        // The id names code cache and code map files only, and it streams the
+        // whole file through XXH3 (tens of MB for a compiler binary, repeated
+        // for every shared library in every process). Without the code cache
+        // nothing reads it.
+        Resource->MappedFile->FileId =
+          EnableCodeCaching() ? CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd) : 0xffff'ffff'ffff'ffffULL;
 
         // Read ELF headers if applicable and needed for code caching.
         // For performance, skip ELF checks if we're not mapping the file header
