@@ -485,9 +485,18 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
       Filename = pathname;
     }
 
-    bool exists = FHU::Filesystem::Exists(Filename);
-    if (!exists) {
-      return -ENOENT;
+    // The kernel's order (do_open_execat): lookup errors (ENOENT, ENOTDIR,
+    // ELOOP, ...), then EACCES for anything but a regular file or without
+    // execute permission. Only after that does the format matter (ENOEXEC).
+    struct stat ExecStat {};
+    if (stat(Filename.c_str(), &ExecStat) == -1) {
+      return -errno;
+    }
+    if (!S_ISREG(ExecStat.st_mode)) {
+      return -EACCES;
+    }
+    if (faccessat(AT_FDCWD, Filename.c_str(), X_OK, AT_EACCESS) == -1) {
+      return -errno;
     }
 
     int pid = getpid();
@@ -511,6 +520,20 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   const bool IsShebang = !ShebangInterpreter.empty();
   if (IsShebang) {
     InterpreterType = ELFLoader::ELFContainer::GetELFType(ShebangInterpreter);
+  }
+
+  if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE && !IsFDExec) {
+    // A script whose interpreter can't be found: binfmt_script fails to open
+    // the interpreter, which is ENOENT, not ENOEXEC.
+    char Magic[2] {};
+    int FD = open(Filename.c_str(), O_RDONLY | O_CLOEXEC);
+    if (FD != -1) {
+      const bool IsScript = pread(FD, Magic, sizeof(Magic), 0) == sizeof(Magic) && Magic[0] == '#' && Magic[1] == '!';
+      close(FD);
+      if (IsScript) {
+        return -ENOENT;
+      }
+    }
   }
 
   if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE) {
