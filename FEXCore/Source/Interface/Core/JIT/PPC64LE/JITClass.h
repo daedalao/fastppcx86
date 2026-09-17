@@ -584,6 +584,11 @@ private:
   // was a guaranteed malloc/free of 4 * GetSSACount() bytes per compiled
   // block, on the default path.
   fextl::vector<uint32_t> DynVRLiveInStorage;
+  // Set by the shared elision walk (ComputeHighZeroElision): some op in the
+  // compile unit has an FPR or FPRFixed destination or is a VF*ML*ScalarInsert.
+  // Without one, CompileCode's per-block FPR liveness and splat scan has
+  // nothing to find. True whenever the walk does not run.
+  bool UnitHasFPRWork {true};
 
   // -------------------------------------------------------------------------
   // FEX_MEMCPYDCBZ=1 (opt-in): cache-line store tier for the forward REP MOVSB

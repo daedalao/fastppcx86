@@ -4038,9 +4038,12 @@ void PPC64JITCore::ComputeHighZeroElision() {
   HighZeroElideSet.assign(IR->GetSSACount(), false);
   const bool ConsumerOff = ZExtConsumerOff();
   const bool PairOff = TSOPairElideOff();
+  // See UnitHasFPRWork in JITClass.h. Conservative unless the walk runs.
+  UnitHasFPRWork = true;
   if (ZExtOff && ConsumerOff && PairOff) {
     return;
   }
+  UnitHasFPRWork = false;
 
   // Bit i == "host GPR r(i) has bits 63:32 == 0".
   uint32_t HighZeroRegs = 0;
@@ -4689,6 +4692,21 @@ void PPC64JITCore::ComputeHighZeroElision() {
       // elision — which is all of them.
       case IR::OP_GUESTOPCODE: continue;
       default: break;
+      }
+
+      if (!UnitHasFPRWork) {
+        switch (IROp->Op) {
+        case IR::OP_VFMLASCALARINSERT:
+        case IR::OP_VFMLSSCALARINSERT:
+        case IR::OP_VFNMLASCALARINSERT:
+        case IR::OP_VFNMLSSCALARINSERT: UnitHasFPRWork = true; break;
+        default:
+          if (IR::GetHasDest(IROp->Op)) {
+            const auto C = IR::PhysicalRegister(CodeNode).AsRegClass();
+            UnitHasFPRWork = C == IR::RegClass::FPR || C == IR::RegClass::FPRFixed;
+          }
+          break;
+        }
       }
 
       const IR::Ref DefNode = PrevNode;
@@ -5817,9 +5835,6 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // a local this assign() was a malloc + free on every compiled block.
   auto& DynVRLiveIn = DynVRLiveInStorage;
   DynVRLiveIn.clear();
-  if (!DisableABILiveMask) {
-    DynVRLiveIn.assign(IRView->GetSSACount(), ~0u);
-  }
 
   Compute32MaskElision();
   // Producer-side half, OR'd into the same set. Must run AFTER the consumer
@@ -5828,6 +5843,14 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
   // "emits zero memory-access host instructions" whitelist is unaffected.
   ComputeHighZeroElision();
   // ComputeTSOPairElision's walk is folded into Compute32MaskElision above.
+
+  // A unit without FPR-class values or FMA ops (UnitHasFPRWork, set by the
+  // walk above) has an all-zero FPR live mask at every op and no splat
+  // candidates, so its per-block backward scan below is skipped and the masks
+  // are filled with the zeros it would have computed.
+  if (!DisableABILiveMask) {
+    DynVRLiveIn.assign(IRView->GetSSACount(), UnitHasFPRWork ? ~0u : 0u);
+  }
 
   // Emission-order prepass for fallthrough elision: {CodeBlock ID, EntryPoint}
   // per block, in the exact order the loop below emits them. See the
@@ -5878,7 +5901,7 @@ CPUBackend::CompiledCode PPC64JITCore::CompileCode(
     // discovers its candidates in reverse order, and every consumer of
     // SplatCandidateLoads is a membership test (IdInVec), never an index.
     const bool WantLiveMask = !DynVRLiveIn.empty();
-    if (WantLiveMask || !DisableSplatFusion) {
+    if (UnitHasFPRWork && (WantLiveMask || !DisableSplatFusion)) {
       // Backward scan: Live holds the live-after set of the op under the
       // cursor; live-before = (live-after − def) ∪ uses. Args of inline
       // constants and other non-RA'd references carry an Invalid class byte
