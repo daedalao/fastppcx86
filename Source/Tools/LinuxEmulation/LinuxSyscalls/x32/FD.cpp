@@ -621,7 +621,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
                             });
 
   REGISTER_SYSCALL_IMPL_X32(fstatat_64, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, stat64_32* buf, int flag) -> uint64_t {
-    GuestPath Guest_pathname(pathname);
+    // NULL is legal with AT_EMPTY_PATH (Linux >= 6.11), as x64 newfstatat allows.
+    GuestPath Guest_pathname(pathname, true);
     if (Guest_pathname.error()) {
       return Guest_pathname.error();
     }
