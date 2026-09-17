@@ -1276,7 +1276,9 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* 
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   if (FaultSafeUserMemAccess::TryHandleSafeFault(Signal, SigInfo, UContext)) {
-    ERROR_AND_DIE_FMT("Received invalid data to syscall. Crashing now!");
+    // TryHandleSafeFault has already made the copy helper return EFAULT to its
+    // caller; resume there so the syscall fails with EFAULT like the kernel.
+    return true;
   }
 
 #ifdef ARCHITECTURE_arm64
