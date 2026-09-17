@@ -1094,14 +1094,9 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
     // Allocating out data space
     uint64_t NewEnd = reinterpret_cast<uint64_t>(Addr);
     if (NewEnd < DataSpace) {
-      // Not allowed to move brk end below original start
-      // Set the size to zero
-      DataSpaceSize = 0;
-
-      // Munmap the whole space.
-      [[maybe_unused]] auto ok = GuestMunmap(Frame->Thread, reinterpret_cast<void*>(DataSpace), DataSpaceMappedSize);
-      LOGMAN_THROW_A_FMT(ok != -1, "Munmap failed");
-      DataSpaceMappedSize = 0;
+      // mm/mmap.c brk: a break below the start of the data segment is refused
+      // and the current break is returned, with nothing unmapped. This used to
+      // unmap the whole break area, taking a live malloc heap with it.
     } else {
       uint64_t NewSize = NewEnd - DataSpace;
       // HOST: DataSpaceMappedSize describes real mappings, so the emulated break
