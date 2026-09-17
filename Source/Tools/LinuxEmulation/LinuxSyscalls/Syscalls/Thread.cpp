@@ -22,6 +22,7 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -42,6 +43,7 @@ $end_info$
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/fsuid.h>
@@ -388,6 +390,118 @@ static int CloneFork(uint32_t flags, uint64_t exit_signal) {
 //      child leaves the process debuggable instead of frozen.  Child-writes-
 //      through-shared-VM semantics remain unimplemented (see
 //      vfork-no-vm-sharing notes); exit-status/ordering semantics hold.
+namespace {
+  // Child side of the CLONE_VM copy-back: the write end of the pipe the parent
+  // waits on, and the read end of the parent's acknowledgement pipe. Both are
+  // close-on-exec, so a successful execve ends the parent's wait.
+  int VForkSyncFD = -1;
+  int VForkAckFD = -1;
+
+  // Parent side: copy every guest page the child changed into this process.
+  // The parent has been blocked since the clone, so a page that differs from
+  // the child's copy was written by the child. Private, writable guest
+  // mappings are copied (shared mappings are already shared). Mappings the
+  // child created or removed are not reflected.
+  //
+  // A host page the SMC tracker has write-protected is read-only while its VMA
+  // still says writable: an executable page with translated code, or on a 64K
+  // host any page sharing a granule with one. A memcpy into it faults, and with
+  // every signal blocked here the kernel kills the process. So a changed page
+  // is written through /proc/self/mem first, which (FOLL_FORCE) goes through
+  // the protection and leaves it armed, and its translated code is invalidated.
+  // Kernels that refuse forced /proc/pid/mem writes (proc_mem.force_override)
+  // fail that write; the page is then disarmed and unprotected the way a guest
+  // write fault would do it (UnprotectGuestRangeForHostWrite, which also
+  // invalidates) and copied directly.
+  void VForkCopyBack(FEXCore::Core::InternalThreadState* Thread, pid_t Child) {
+    const size_t HostPage = FEXCore::HostPage::Size();
+    constexpr size_t Chunk = 1ULL << 20;
+    fextl::vector<char> Buffer(FEXCore::AlignUp(Chunk, HostPage));
+    struct Range {
+      uint64_t Start;
+      uint64_t End;
+    };
+    auto* Handler = FEX::HLE::_SyscallHandler;
+
+    // The parent is single-threaded and blocked, so the mappings cannot change
+    // underneath; take them out of the tracker and drop its lock, which ranks
+    // after the CodeInvalidationMutex the invalidation below takes.
+    fextl::vector<Range> Mappings;
+    {
+      std::shared_lock lk(Handler->VMATracking.Mutex);
+      for (const auto& [Base, VMA] : Handler->VMATracking.VMAs) {
+        if (!VMA.Prot.Readable || !VMA.Prot.Writable || VMA.Flags.Shared) {
+          continue;
+        }
+        const uint64_t Start = FEXCore::HostPage::AlignDown(VMA.Base);
+        const uint64_t End = FEXCore::HostPage::AlignUp(VMA.Base + VMA.Length);
+        if (!Mappings.empty() && Mappings.back().End >= Start) {
+          Mappings.back().End = std::max(Mappings.back().End, End);
+        } else {
+          Mappings.push_back({Start, End});
+        }
+      }
+    }
+
+    const int MemFD = open("/proc/self/mem", O_WRONLY | O_CLOEXEC);
+    // Pages written through MemFD, merged, for invalidation.
+    fextl::vector<Range> Written;
+    for (const auto& M : Mappings) {
+      for (uint64_t Addr = M.Start; Addr < M.End;) {
+        const size_t Len = std::min<uint64_t>(Buffer.size(), M.End - Addr);
+        iovec Local {Buffer.data(), Len};
+        iovec Remote {reinterpret_cast<void*>(Addr), Len};
+        const ssize_t Got = process_vm_readv(Child, &Local, 1, &Remote, 1, 0);
+        if (Got <= 0) {
+          if (Got < 0 && errno != EFAULT) {
+            LogMan::Msg::IFmt("vfork: can't read the child's memory ({}); its writes stay invisible", errno);
+            Mappings.clear();
+            break;
+          }
+          // An unreadable host page in the child; skip it.
+          Addr += HostPage;
+          continue;
+        }
+        const size_t Whole = FEXCore::AlignDown(static_cast<uint64_t>(Got), HostPage);
+        for (size_t Off = 0; Off < Whole; Off += HostPage) {
+          const uint64_t Page = Addr + Off;
+          const char* Theirs = Buffer.data() + Off;
+          if (memcmp(reinterpret_cast<const char*>(Page), Theirs, HostPage) == 0) {
+            continue;
+          }
+          if (MemFD != -1 && pwrite(MemFD, Theirs, HostPage, static_cast<off_t>(Page)) == static_cast<ssize_t>(HostPage)) {
+            if (!Written.empty() && Written.back().End == Page) {
+              Written.back().End = Page + HostPage;
+            } else {
+              Written.push_back({Page, Page + HostPage});
+            }
+            continue;
+          }
+          Handler->UnprotectGuestRangeForHostWrite(Thread, Page, HostPage);
+          memcpy(reinterpret_cast<char*>(Page), Theirs, HostPage);
+        }
+        Addr += Whole ? Whole : HostPage;
+      }
+    }
+    if (MemFD != -1) {
+      close(MemFD);
+    }
+    for (const auto& R : Written) {
+      Handler->TM.InvalidateGuestCodeRange(Thread, R.Start, R.End - R.Start);
+    }
+  }
+} // namespace
+
+void VForkChildSync() {
+  if (VForkSyncFD == -1) {
+    return;
+  }
+  char Byte = 's';
+  if (write(VForkSyncFD, &Byte, 1) == 1) {
+    while (read(VForkAckFD, &Byte, 1) == -1 && errno == EINTR)
+      ;
+  }
+}
 
 uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
   const uint64_t flags = args->args.flags;
@@ -413,13 +527,25 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
   FEX::HLE::_SyscallHandler->LockBeforeFork(Frame->Thread);
 
   const bool IsVFork = flags & CLONE_VFORK;
+  // clone(CLONE_VM|CLONE_VFORK) still runs the child in a copy of the address
+  // space (see the history above), but the parent copies the child's guest
+  // memory back whenever the child is about to execve or exit, so writes the
+  // child makes before that (glibc posix_spawn's exec errno, vfork children
+  // setting variables) reach the parent as they would through a shared VM. Only
+  // while the parent has a single guest thread: another thread could write the
+  // same pages meanwhile, and the copy would undo that.
+  const bool CopyBack = IsVFork && (flags & CLONE_VM) && FEX::HLE::_SyscallHandler->TM.GetThreads()->size() == 1;
   pid_t Result {};
   int VForkFDs[2];
+  int AckFDs[2] {-1, -1};
   if (IsVFork) {
     // Use pipes as a mechanism for knowing when the child process is exiting.
     // FEX can't use `waitpid` for this since the child process may want to use it.
     // If we use `waitpid` then the kernel won't return the same data if asked again.
     pipe2(VForkFDs, O_CLOEXEC);
+    if (CopyBack) {
+      pipe2(AckFDs, O_CLOEXEC);
+    }
 
     // Strip CLONE_VFORK from the host clone: since CLONE_VM cannot be
     // honored, a kernel-level vfork suspension would park the parent —
@@ -435,9 +561,17 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
       // Close the read end of the pipe.
       // Keep the write end open so the parent can poll it.
       close(VForkFDs[0]);
+      if (CopyBack) {
+        close(AckFDs[1]);
+        VForkSyncFD = VForkFDs[1];
+        VForkAckFD = AckFDs[0];
+      }
     } else {
       // Close the write end of the pipe.
       close(VForkFDs[1]);
+      if (CopyBack) {
+        close(AckFDs[0]);
+      }
     }
   } else {
     Result = CloneFork(flags, exit_signal);
@@ -545,8 +679,31 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
       // Mask all signals until the child process returns.
       sigset_t SignalMask {};
       sigfillset(&SignalMask);
-      while (ppoll(&PollFD, 1, nullptr, &SignalMask) == -1 && errno == EINTR)
-        ;
+      if (!CopyBack) {
+        while (ppoll(&PollFD, 1, nullptr, &SignalMask) == -1 && errno == EINTR)
+          ;
+      } else {
+        // Each byte is a copy-back request from VForkChildSync; EOF means the
+        // child has execve'd or exited.
+        sigset_t Old {};
+        sigprocmask(SIG_SETMASK, &SignalMask, &Old);
+        char Byte {};
+        for (;;) {
+          const ssize_t Got = read(VForkFDs[0], &Byte, 1);
+          if (Got == -1 && errno == EINTR) {
+            continue;
+          }
+          if (Got != 1) {
+            break;
+          }
+          if (Result > 0) {
+            VForkCopyBack(Thread, Result);
+          }
+          (void)!write(AckFDs[1], &Byte, 1);
+        }
+        sigprocmask(SIG_SETMASK, &Old, nullptr);
+        close(AckFDs[1]);
+      }
 
       // Close the read end now.
       close(VForkFDs[0]);
@@ -587,7 +744,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(vfork, ([](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t {
                           FEX::HLE::clone3_args args {.Type = TypeOfClone::TYPE_CLONE2,
                                                       .args = {
-                                                        .flags = CLONE_VFORK,
+                                                        .flags = CLONE_VFORK | CLONE_VM,
                                                         .pidfd = 0,
                                                         .child_tid = 0,
                                                         .parent_tid = 0,
@@ -626,6 +783,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                         }));
 
   REGISTER_SYSCALL_IMPL(exit, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    FEX::HLE::VForkChildSync();
     // Release any WritePriorityMutex shared locks this thread is still
     // registered for.  The exit path below either longjmps out (which skips
     // C++ stack unwinding) or hard-kills via the kernel without running
@@ -766,6 +924,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(exit_group, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+    FEX::HLE::VForkChildSync();
     if ((status & 0xff) != 0 && FEX::HLE::GuestErrorExitHook) {
       FEX::HLE::GuestErrorExitHook();
     }

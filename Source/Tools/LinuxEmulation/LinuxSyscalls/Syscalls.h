@@ -552,6 +552,13 @@ public:
 
   ///// VMA (Virtual Memory Area) tracking /////
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
+  // For the emulator's own writes into guest memory that may be SMC-protected
+  // (the vfork copy-back): does what a guest write fault on [Start, Start +
+  // Length) does, outside a signal handler. Every granule the range touches is
+  // disarmed, its translated code invalidated, and its protection lifted to
+  // read/write, so a host write to it cannot fault. The caller must not hold
+  // VMATracking.Mutex, and the range must lie in writable guest mappings.
+  void UnprotectGuestRangeForHostWrite(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   bool GuestCodePageValidateOnly(uint64_t Page) override;
 

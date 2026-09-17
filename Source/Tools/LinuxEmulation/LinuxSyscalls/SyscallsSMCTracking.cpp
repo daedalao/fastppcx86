@@ -203,6 +203,27 @@ bool DecodePPCStore(void* ucontext, uint64_t PC, DecodedStore* Out) {
 } // anonymous namespace
 #endif // ARCHITECTURE_ppc64le
 
+void SyscallHandler::UnprotectGuestRangeForHostWrite(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  const auto Region = FEX::HLE::SMCGranule::Cover(Start, Length);
+  // Like a fault's service under the default `invalidate` policy: every armed
+  // bit in each granule is cleared (MarkGuestExecutableRange re-arms on the next
+  // compile) and the invalidation covers the whole granule, so no block is left
+  // live on a page whose protection is gone.
+  const uint64_t HostPage = FEXCore::HostPage::Size();
+  for (uint64_t Granule = FEXCore::HostPage::AlignDown(Region.Start); Granule < Region.Start + Region.Length; Granule += HostPage) {
+    bool Demoted = false;
+    (void)FEX::HLE::SMCGranule::Table().NoteFault(Granule, &Demoted);
+  }
+  TM.InvalidateGuestCodeRange(Thread, Region.Start, Region.Length, [](uintptr_t Start, uintptr_t Length) {
+    if (mprotect(reinterpret_cast<void*>(Start), Length, PROT_READ | PROT_WRITE) != 0) {
+      ERROR_AND_DIE_FMT("SMC unprotect for a host write: mprotect({:#x}, {:#x}, R+W) failed errno={}", Start, Length, errno);
+    }
+#ifdef ARCHITECTURE_ppc64le
+    FEX::HLE::SMCBackpatch::NotePagesUnprotected(Start, Length);
+#endif
+  });
+}
+
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
 
