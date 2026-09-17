@@ -3872,6 +3872,19 @@ static void RecordBlockAndMaybeDump(uint64_t Entry, uint64_t SSACount, uint64_t 
 //    the value. Only the Value operand qualifies — Addr/Offset feed address
 //    arithmetic that reads all 64 bits.
 // -------------------------------------------------------------------------
+static bool ZExtConsumerOff() {
+  static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
+  static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
+  static const bool Off = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
+  return Off;
+}
+
+static bool TSOPairElideOff() {
+  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
+  static const bool Off = PairEnv && PairEnv[0] == '0';
+  return Off;
+}
+
 void PPC64JITCore::Compute32MaskElision() {
   // FEX_ZEXTOPT=0 turns BOTH elision passes off; FEX_ZEXTOPT_CONSUMER=0 turns
   // off only this one. The pair exists because the two passes reach the same
@@ -3880,11 +3893,9 @@ void PPC64JITCore::Compute32MaskElision() {
   // fault the moment the value is used as a pointer -- cannot be attributed to
   // one of them with a single switch. Bisect with the sub-switches, not by
   // rebuilding.
-  static const char* ZExtEnv = getenv("FEX_ZEXTOPT");
-  static const char* ConsumerEnv = getenv("FEX_ZEXTOPT_CONSUMER");
-  static const bool ZExtOff = (ZExtEnv && ZExtEnv[0] == '0') || (ConsumerEnv && ConsumerEnv[0] == '0');
-  static const char* PairEnv = getenv("FEX_TSOPAIRELIDE");
-  static const bool PairOff = PairEnv && PairEnv[0] == '0';
+  // (Runs the setup only. The consumer walk, the folded TSO-pair walk and
+  // ComputeHighZeroElision's producer walk share one traversal, which lives
+  // in ComputeHighZeroElision; see the note there.)
   Elide32MaskSet.assign(IR->GetSSACount(), false);
   // ComputeTSOPairElision's per-block scan is folded into this walk (it needs
   // exactly the same block/code iteration and shares nothing else with it), so
@@ -3894,224 +3905,6 @@ void PPC64JITCore::Compute32MaskElision() {
   // their own kill switch, and the walk is skipped entirely only when both
   // are off.
   TSOPairElideSet.assign(IR->GetSSACount(), false);
-  if (ZExtOff && PairOff) {
-    return;
-  }
-
-  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    IR::Ref PrevNode = nullptr;
-    const IR::IROp_Header* PrevOp = nullptr;
-    // Reset per block: a block can be entered from anywhere, so nothing about
-    // the previously emitted block's trailing barrier state may be assumed.
-    bool Fresh = false;
-
-    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-      if (!PairOff) {
-        switch (IROp->Op) {
-        case IR::OP_LOADMEMTSO:
-          Fresh = true;
-          break;
-
-        case IR::OP_STOREMEMTSO:
-          if (Fresh) {
-            TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
-          }
-          Fresh = false;
-          break;
-
-        // Whitelist -- see the verification table at ComputeTSOPairElision.
-        case IR::OP_DUMMY:
-        case IR::OP_IRHEADER:
-        case IR::OP_CODEBLOCK:
-        case IR::OP_BEGINBLOCK:
-        case IR::OP_ENDBLOCK:
-        case IR::OP_INVALIDATEFLAGS:
-        case IR::OP_INLINECONSTANT:
-        case IR::OP_INLINEENTRYPOINTOFFSET:
-        case IR::OP_GUESTOPCODE:
-        case IR::OP_SETSMALLNZV:
-        case IR::OP_TELEMETRYSETVALUE:
-        case IR::OP_WFET:
-        case IR::OP_CONSTANT:
-        case IR::OP_ENTRYPOINTOFFSET:
-        case IR::OP_COPY:
-        case IR::OP_BFE:
-        case IR::OP_SBFE:
-        case IR::OP_ADD:
-        case IR::OP_SUB:
-        case IR::OP_NEG:
-        case IR::OP_NOT:
-        case IR::OP_OR:
-        case IR::OP_AND:
-        case IR::OP_XOR:
-        case IR::OP_ANDN:
-        case IR::OP_LSHL:
-        case IR::OP_LSHR:
-        case IR::OP_ASHR:
-        case IR::OP_ADDWITHFLAGS:
-        case IR::OP_SUBWITHFLAGS:
-        case IR::OP_ADDNZCV:
-        case IR::OP_SUBNZCV:
-        case IR::OP_TESTNZ:
-        case IR::OP_TESTZ:
-        case IR::OP_ANDWITHFLAGS:
-          break;
-
-        default:
-          Fresh = false;
-          break;
-        }
-      }
-
-      if (ZExtOff) {
-        continue;
-      }
-
-      // Emission no-ops (Op_NoOp table entries) are transparent to the
-      // "immediately next op" adjacency test: they emit no host code and, as
-      // non-uses, cannot spill or observe the pending def. Without this the
-      // inline-constant node between a def and its compare-with-immediate
-      // consumer (the LZMA hot-loop shape) defeats every elision.
-      switch (IROp->Op) {
-      case IR::OP_DUMMY:
-      case IR::OP_BEGINBLOCK:
-      case IR::OP_ENDBLOCK:
-      case IR::OP_INVALIDATEFLAGS:
-      case IR::OP_INLINECONSTANT:
-      case IR::OP_INLINEENTRYPOINTOFFSET:
-      // GuestOpcode markers only record (guest RIP, host PC) table entries —
-      // zero host instructions (see DEF_OP(GuestOpcode)). A marker between
-      // def and consumer relabels the guest boundary but adds nothing
-      // observable: async signals defer to drain points, and the window
-      // still contains no faulting host instruction (register-writing
-      // consumers cannot fault; faulting consumers like stores have no dest
-      // and are excluded for GPRFixed defs). Without this skip, the marker
-      // in front of every guest instruction defeats every cross-instruction
-      // elision — which is all of them.
-      case IR::OP_GUESTOPCODE: continue;
-      default: break;
-      }
-
-      const IR::Ref DefNode = PrevNode;
-      const IR::IROp_Header* DefOp = PrevOp;
-      PrevNode = CodeNode;
-      PrevOp = IROp;
-
-      if (!DefOp || !IR::GetHasDest(DefOp->Op)) {
-        continue;
-      }
-      // Two def shapes qualify: an i32-sized ALU op (its handler emits the
-      // rldicl tail via Mask32Tail — the 32-bit-guest idiom), or the 64-bit
-      // frontend's canonicalizing Bfe(#32,#0) itself (the whole op IS the
-      // mask; DEF_OP(Bfe) degenerates it to mr/nothing when elided).
-      bool DefIsMask = DefOp->Size == IR::OpSize::i32Bit;
-      if (!DefIsMask && DefOp->Op == IR::OP_BFE && DefOp->Size == IR::OpSize::i64Bit) {
-        auto B = DefOp->C<IR::IROp_Bfe>();
-        DefIsMask = B->Width == 32 && B->lsb == 0;
-      }
-      if (!DefIsMask) {
-        continue;
-      }
-      const IR::PhysicalRegister DefPR(DefNode);
-      const auto DefClass = DefPR.AsRegClass();
-      if (DefClass != IR::RegClass::GPR && DefClass != IR::RegClass::GPRFixed) {
-        continue;
-      }
-      if (DefNode->GetUses() != 1) {
-        continue;
-      }
-      const auto DefID = IR->GetID(DefNode);
-      // Post-RA, consumer args are usually immediate-encoded PhysicalRegisters
-      // (see GetReg(OrderedNodeWrapper)) — node identity is gone. Matching by
-      // register is exact here BECAUSE of the adjacency precondition: no host
-      // instruction is emitted between the def and this consumer, so the
-      // register still holds precisely the def's value. Node-ref args (e.g.
-      // wrappers to InlineConstant nodes) keep the ID comparison.
-      const auto IsDef = [&DefPR, DefID, this](IR::OrderedNodeWrapper Arg) {
-        if (Arg.IsInvalid()) {
-          return false;
-        }
-        if (Arg.IsImmediate()) {
-          return IR::PhysicalRegister(Arg).Raw == DefPR.Raw;
-        }
-        return IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
-      };
-
-      bool Elide = false;
-      switch (IROp->Op) {
-      case IR::OP_CONDJUMP: {
-        auto Op = IROp->C<IR::IROp_CondJump>();
-        if (!Op->FromNZCV && Op->VCmpElementSize == IR::OpSize::iInvalid &&
-            Op->Cond != IR::CondClass::TSTZ && Op->Cond != IR::CondClass::TSTNZ &&
-            Op->CompareSize == IR::OpSize::i32Bit) {
-          Elide = IsDef(Op->Cmp1) || IsDef(Op->Cmp2);
-        }
-        break;
-      }
-      case IR::OP_LSHL:
-      case IR::OP_LSHR:
-      case IR::OP_ASHR: {
-        if (IROp->Size <= IR::OpSize::i32Bit) {
-          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
-        }
-        break;
-      }
-      case IR::OP_MUL:
-      case IR::OP_UMUL: {
-        if (IROp->Size <= IR::OpSize::i32Bit) {
-          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
-        }
-        break;
-      }
-      case IR::OP_STOREMEM: {
-        auto Op = IROp->C<IR::IROp_StoreMem>();
-        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
-          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
-        }
-        break;
-      }
-      case IR::OP_STOREMEMTSO: {
-        // Same narrow-store value path as StoreMem (GetReg(Op->Value) into
-        // stw/sth/stb); the lwsync release barrier reads no register.
-        auto Op = IROp->C<IR::IROp_StoreMemTSO>();
-        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
-          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
-        }
-        break;
-      }
-      default: break;
-      }
-
-      // A GPRFixed def IS an architectural guest register (RA coalesced the
-      // write onto the SRA slot — this is the common case in hot loops). The
-      // single-use/next-op argument alone is not enough there: the SRA
-      // register would keep the unmasked value until something overwrites
-      // it, and a synchronous fault in a LATER guest instruction would
-      // present garbage high bits as architectural state. Sound iff the
-      // consumer overwrites the SAME fixed register in the very next op
-      // (the x86 read-modify-write chain shape, e.g. sub edi,X / shr edi,N)
-      // — the window between the two host instructions contains no
-      // observation point: async signals defer to drain points, and no
-      // faulting instruction sits between def and overwrite. Every table
-      // consumer with a dest writes it canonically or re-masks (rlwinm/
-      // slw/srw are low-32 by construction; mullw keeps its own tail mask
-      // unless ITS consumer also passed this same test — induction holds).
-      if (Elide && DefClass == IR::RegClass::GPRFixed) {
-        if (!IR::GetHasDest(IROp->Op)) {
-          Elide = false;
-        } else {
-          const IR::PhysicalRegister UsePR(CodeNode);
-          if (UsePR.Raw != DefPR.Raw) {
-            Elide = false;
-          }
-        }
-      }
-
-      if (Elide) {
-        Elide32MaskSet[DefID.Value] = true;
-      }
-    }
-  }
 }
 
 // -------------------------------------------------------------------------
@@ -4243,8 +4036,9 @@ void PPC64JITCore::ComputeHighZeroElision() {
   // Compute32MaskElision so it is empty when this pass is off, which makes the
   // trap a no-op instead of firing on the consumer pass's elisions.
   HighZeroElideSet.assign(IR->GetSSACount(), false);
-  if (ZExtOff) {
-    // Compute32MaskElision already sized and cleared Elide32MaskSet.
+  const bool ConsumerOff = ZExtConsumerOff();
+  const bool PairOff = TSOPairElideOff();
+  if (ZExtOff && ConsumerOff && PairOff) {
     return;
   }
 
@@ -4304,11 +4098,12 @@ void PPC64JITCore::ComputeHighZeroElision() {
     Write,       // writes exactly WriteReg, with the fact in WriteZero
   };
 
-  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    // Entry state: nothing known. See the SOUNDNESS SHAPE note above.
-    HighZeroRegs = 0;
-
-    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+  // One op's producer-side step. It reads Elide32MaskSet[ID] for its own op,
+  // which the consumer step decides when it reaches the NEXT op that is not
+  // an emission no-op, so the shared walk below runs it one such op behind.
+  // The no-ops skipped there are exactly the ops this step treats as
+  // Transparent, so skipping them here changes nothing.
+  const auto HighZeroStep = [&](IR::Ref CodeNode, const IR::IROp_Header* IROp) {
       const auto ID = IR->GetID(CodeNode).Value;
       // Elide32MaskSet is sized to GetSSACount() by Compute32MaskElision; the
       // bound is belt-and-braces, matching Mask32Tail's own guard at the
@@ -4683,6 +4478,233 @@ void PPC64JITCore::ComputeHighZeroElision() {
         HighZeroRegs = 0;
         break;
       }
+  };
+
+  // Consumer step for the def/consumer pair (DefNode, CodeNode): see
+  // Compute32MaskElision.
+  const auto ConsumerStep = [&](IR::Ref DefNode, const IR::IROp_Header* DefOp, IR::Ref CodeNode, const IR::IROp_Header* IROp) {
+      if (!DefOp || !IR::GetHasDest(DefOp->Op)) {
+        return;
+      }
+      // Two def shapes qualify: an i32-sized ALU op (its handler emits the
+      // rldicl tail via Mask32Tail — the 32-bit-guest idiom), or the 64-bit
+      // frontend's canonicalizing Bfe(#32,#0) itself (the whole op IS the
+      // mask; DEF_OP(Bfe) degenerates it to mr/nothing when elided).
+      bool DefIsMask = DefOp->Size == IR::OpSize::i32Bit;
+      if (!DefIsMask && DefOp->Op == IR::OP_BFE && DefOp->Size == IR::OpSize::i64Bit) {
+        auto B = DefOp->C<IR::IROp_Bfe>();
+        DefIsMask = B->Width == 32 && B->lsb == 0;
+      }
+      if (!DefIsMask) {
+        return;
+      }
+      const IR::PhysicalRegister DefPR(DefNode);
+      const auto DefClass = DefPR.AsRegClass();
+      if (DefClass != IR::RegClass::GPR && DefClass != IR::RegClass::GPRFixed) {
+        return;
+      }
+      if (DefNode->GetUses() != 1) {
+        return;
+      }
+      const auto DefID = IR->GetID(DefNode);
+      // Post-RA, consumer args are usually immediate-encoded PhysicalRegisters
+      // (see GetReg(OrderedNodeWrapper)) — node identity is gone. Matching by
+      // register is exact here BECAUSE of the adjacency precondition: no host
+      // instruction is emitted between the def and this consumer, so the
+      // register still holds precisely the def's value. Node-ref args (e.g.
+      // wrappers to InlineConstant nodes) keep the ID comparison.
+      const auto IsDef = [&DefPR, DefID, this](IR::OrderedNodeWrapper Arg) {
+        if (Arg.IsInvalid()) {
+          return false;
+        }
+        if (Arg.IsImmediate()) {
+          return IR::PhysicalRegister(Arg).Raw == DefPR.Raw;
+        }
+        return IR->GetID(IR->GetNode(Arg)).Value == DefID.Value;
+      };
+
+      bool Elide = false;
+      switch (IROp->Op) {
+      case IR::OP_CONDJUMP: {
+        auto Op = IROp->C<IR::IROp_CondJump>();
+        if (!Op->FromNZCV && Op->VCmpElementSize == IR::OpSize::iInvalid &&
+            Op->Cond != IR::CondClass::TSTZ && Op->Cond != IR::CondClass::TSTNZ &&
+            Op->CompareSize == IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Cmp1) || IsDef(Op->Cmp2);
+        }
+        break;
+      }
+      case IR::OP_LSHL:
+      case IR::OP_LSHR:
+      case IR::OP_ASHR: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_MUL:
+      case IR::OP_UMUL: {
+        if (IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(IROp->Args[0]) || IsDef(IROp->Args[1]);
+        }
+        break;
+      }
+      case IR::OP_STOREMEM: {
+        auto Op = IROp->C<IR::IROp_StoreMem>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      case IR::OP_STOREMEMTSO: {
+        // Same narrow-store value path as StoreMem (GetReg(Op->Value) into
+        // stw/sth/stb); the lwsync release barrier reads no register.
+        auto Op = IROp->C<IR::IROp_StoreMemTSO>();
+        if (Op->Class == IR::RegClass::GPR && IROp->Size <= IR::OpSize::i32Bit) {
+          Elide = IsDef(Op->Value) && !IsDef(Op->Addr) && !IsDef(Op->Offset);
+        }
+        break;
+      }
+      default: break;
+      }
+
+      // A GPRFixed def IS an architectural guest register (RA coalesced the
+      // write onto the SRA slot — this is the common case in hot loops). The
+      // single-use/next-op argument alone is not enough there: the SRA
+      // register would keep the unmasked value until something overwrites
+      // it, and a synchronous fault in a LATER guest instruction would
+      // present garbage high bits as architectural state. Sound iff the
+      // consumer overwrites the SAME fixed register in the very next op
+      // (the x86 read-modify-write chain shape, e.g. sub edi,X / shr edi,N)
+      // — the window between the two host instructions contains no
+      // observation point: async signals defer to drain points, and no
+      // faulting instruction sits between def and overwrite. Every table
+      // consumer with a dest writes it canonically or re-masks (rlwinm/
+      // slw/srw are low-32 by construction; mullw keeps its own tail mask
+      // unless ITS consumer also passed this same test — induction holds).
+      if (Elide && DefClass == IR::RegClass::GPRFixed) {
+        if (!IR::GetHasDest(IROp->Op)) {
+          Elide = false;
+        } else {
+          const IR::PhysicalRegister UsePR(CodeNode);
+          if (UsePR.Raw != DefPR.Raw) {
+            Elide = false;
+          }
+        }
+      }
+
+      if (Elide) {
+        Elide32MaskSet[DefID.Value] = true;
+      }
+  };
+
+  // The shared walk: TSO pairs, consumer-side masks, producer-side lattice.
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    // Entry state: nothing known. See the SOUNDNESS SHAPE note above.
+    HighZeroRegs = 0;
+    IR::Ref PrevNode = nullptr;
+    const IR::IROp_Header* PrevOp = nullptr;
+    // Reset per block: a block can be entered from anywhere, so nothing about
+    // the previously emitted block's trailing barrier state may be assumed.
+    bool Fresh = false;
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      if (!PairOff) {
+        switch (IROp->Op) {
+        case IR::OP_LOADMEMTSO:
+          Fresh = true;
+          break;
+
+        case IR::OP_STOREMEMTSO:
+          if (Fresh) {
+            TSOPairElideSet[IR->GetID(CodeNode).Value] = true;
+          }
+          Fresh = false;
+          break;
+
+        // Whitelist -- see the verification table at ComputeTSOPairElision.
+        case IR::OP_DUMMY:
+        case IR::OP_IRHEADER:
+        case IR::OP_CODEBLOCK:
+        case IR::OP_BEGINBLOCK:
+        case IR::OP_ENDBLOCK:
+        case IR::OP_INVALIDATEFLAGS:
+        case IR::OP_INLINECONSTANT:
+        case IR::OP_INLINEENTRYPOINTOFFSET:
+        case IR::OP_GUESTOPCODE:
+        case IR::OP_SETSMALLNZV:
+        case IR::OP_TELEMETRYSETVALUE:
+        case IR::OP_WFET:
+        case IR::OP_CONSTANT:
+        case IR::OP_ENTRYPOINTOFFSET:
+        case IR::OP_COPY:
+        case IR::OP_BFE:
+        case IR::OP_SBFE:
+        case IR::OP_ADD:
+        case IR::OP_SUB:
+        case IR::OP_NEG:
+        case IR::OP_NOT:
+        case IR::OP_OR:
+        case IR::OP_AND:
+        case IR::OP_XOR:
+        case IR::OP_ANDN:
+        case IR::OP_LSHL:
+        case IR::OP_LSHR:
+        case IR::OP_ASHR:
+        case IR::OP_ADDWITHFLAGS:
+        case IR::OP_SUBWITHFLAGS:
+        case IR::OP_ADDNZCV:
+        case IR::OP_SUBNZCV:
+        case IR::OP_TESTNZ:
+        case IR::OP_TESTZ:
+        case IR::OP_ANDWITHFLAGS:
+          break;
+
+        default:
+          Fresh = false;
+          break;
+        }
+      }
+
+      // Emission no-ops (Op_NoOp table entries) are transparent to the
+      // "immediately next op" adjacency test: they emit no host code and, as
+      // non-uses, cannot spill or observe the pending def. Without this the
+      // inline-constant node between a def and its compare-with-immediate
+      // consumer (the LZMA hot-loop shape) defeats every elision.
+      switch (IROp->Op) {
+      case IR::OP_DUMMY:
+      case IR::OP_BEGINBLOCK:
+      case IR::OP_ENDBLOCK:
+      case IR::OP_INVALIDATEFLAGS:
+      case IR::OP_INLINECONSTANT:
+      case IR::OP_INLINEENTRYPOINTOFFSET:
+      // GuestOpcode markers only record (guest RIP, host PC) table entries —
+      // zero host instructions (see DEF_OP(GuestOpcode)). A marker between
+      // def and consumer relabels the guest boundary but adds nothing
+      // observable: async signals defer to drain points, and the window
+      // still contains no faulting host instruction (register-writing
+      // consumers cannot fault; faulting consumers like stores have no dest
+      // and are excluded for GPRFixed defs). Without this skip, the marker
+      // in front of every guest instruction defeats every cross-instruction
+      // elision — which is all of them.
+      case IR::OP_GUESTOPCODE: continue;
+      default: break;
+      }
+
+      const IR::Ref DefNode = PrevNode;
+      const IR::IROp_Header* DefOp = PrevOp;
+      PrevNode = CodeNode;
+      PrevOp = IROp;
+
+      if (!ConsumerOff && DefOp) {
+        ConsumerStep(DefNode, DefOp, CodeNode, IROp);
+      }
+      if (!ZExtOff && DefOp) {
+        HighZeroStep(DefNode, DefOp);
+      }
+    }
+    if (!ZExtOff && PrevOp) {
+      HighZeroStep(PrevNode, PrevOp);
     }
   }
 }
@@ -4746,6 +4768,77 @@ void PPC64JITCore::AnalyzeSpinLoops() {
   // SpinIdxOfID in JITClass.h) so their storage is reused across compiles
   // instead of being malloc'd and freed once per compiled block.
   using BlockInfo = SpinBlockInfo;
+
+  // Every hint edge and collapse mark below belongs to a region closed by a
+  // backedge: a Jump/CondJump terminator of layout block bi targeting a block
+  // at layout index <= bi. Most compile units have none, and finding the
+  // terminators only takes a short backward walk per block, so check that
+  // before the full per-op classification walk. The terminator is found the
+  // way that walk finds it: the last STOREREGISTER/STORECONTEXT/STORENZCV/
+  // CONDJUMP/JUMP in the block. With no backedge the marks are left empty,
+  // which every accessor reads as "not marked".
+  {
+    const uint32_t NumBlocks = IR->GetHeader()->BlockCount;
+    auto& IdxOfID = SpinIdxOfID;
+    IdxOfID.clear();
+    IdxOfID.resize(NumBlocks, UINT32_MAX);
+    uint32_t Idx = 0;
+    for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+      const auto ID = BlockHeader->C<FEXCore::IR::IROp_CodeBlock>()->ID;
+      if (ID < NumBlocks) {
+        IdxOfID[ID] = Idx;
+      }
+      ++Idx;
+    }
+
+    bool AnyBackedge = false;
+    Idx = 0;
+    for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+      auto BlockIROp = BlockHeader->C<FEXCore::IR::IROp_CodeBlock>();
+      const FEXCore::IR::IROp_Header* Term = nullptr;
+      auto CodeBegin = IR->at(BlockIROp->Begin);
+      auto CodeLast = IR->at(BlockIROp->Last);
+      while (1) {
+        auto [CodeNode, IROp] = CodeLast();
+        const auto Op = IROp->Op;
+        if (Op == IR::OP_STOREREGISTER || Op == IR::OP_STORECONTEXT || Op == IR::OP_STORENZCV || Op == IR::OP_CONDJUMP ||
+            Op == IR::OP_JUMP) {
+          Term = IROp;
+          break;
+        }
+        if (CodeLast == CodeBegin) {
+          break;
+        }
+        --CodeLast;
+      }
+
+      uint32_t Targets[2] = {UINT32_MAX, UINT32_MAX};
+      if (Term != nullptr && Term->Op == IR::OP_CONDJUMP) {
+        auto Op = Term->C<IR::IROp_CondJump>();
+        Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock)->ID;
+        Targets[1] = IR->GetOp<IR::IROp_CodeBlock>(Op->FalseBlock)->ID;
+      } else if (Term != nullptr && Term->Op == IR::OP_JUMP) {
+        Targets[0] = IR->GetOp<IR::IROp_CodeBlock>(Term->C<IR::IROp_Jump>()->TargetBlock)->ID;
+      }
+      for (const uint32_t TargetID : Targets) {
+        if (TargetID < NumBlocks && IdxOfID[TargetID] != UINT32_MAX && IdxOfID[TargetID] <= Idx) {
+          AnyBackedge = true;
+        }
+      }
+      if (AnyBackedge) {
+        break;
+      }
+      ++Idx;
+    }
+
+    if (!AnyBackedge) {
+      SpinCollapseSubs.clear();
+      SpinCollapseBranches.clear();
+      SpinCollapseBranchSigned.clear();
+      SpinBlocks.clear();
+      return;
+    }
+  }
 
   // SpinCollapse marks are per-compile; reset before any region matching so
   // a block that stops qualifying can never inherit a stale mark. Bounds
