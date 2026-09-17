@@ -240,10 +240,16 @@ void Init() {
       // O_APPEND (accumulate across runs), but the historical shape here is
       // "one log per run" — matches the stderr/stdout paths above.
       LogFD = FEX::MoveFDOutOfGuestRange(open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS));
+      if (LogFD == -1) {
+        // A real error: the user named a file. (A server without a log fd is
+        // the silent case by design and logs nothing; this message used to
+        // fire for it too, and being logged before Initialized it was held
+        // and replayed on every nonzero guest exit.)
+        LogMan::Msg::EFmt("Couldn't open log file {}. Going Silent.", LogFile);
+      }
     }
 
     if (LogFD == -1) {
-      LogMan::Msg::EFmt("Couldn't open log file. Going Silent.");
       Logging::SilentLog = true;
     } else {
       OutputFD = LogFD;
@@ -603,8 +609,13 @@ int main(int argc, char** argv, char** const envp) {
   // off) the syscall handler still enabled backpatching, which then silently
   // placed no stub at all. The explicit SMC mode wins: turn the cache off here,
   // before anything has read the option.
-  if (FEXCore::Config::Get_SMCSTOREBACKPATCH() && FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+  // Key on the EFFECTIVE mode: backpatching only arms with SMCStoreEmulation
+  // under SMCChecks=mtrack (Syscalls.cpp), so a stray FEX_SMCSTOREBACKPATCH=1
+  // without those must not cost the cache.
+  if (FEXCore::Config::Get_SMCSTOREBACKPATCH() && FEXCore::Config::Get_SMCSTOREEMULATION() &&
+      FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK && FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
     FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "0");
+    LogMan::Msg::IFmt("SMC store backpatching is on: code caching turned off (the cache cannot hold backpatch stubs)");
   }
 
   // Host-page-size gate (64K port). Config is loaded and merged, and nothing
