@@ -2439,6 +2439,24 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
   // Spin this in a loop until we aren't sigsuspended
   // This can happen in the case that the guest has sent signal that we can't block
   uint64_t Result = sigsuspend(&HostSet);
+  const int SuspendErrno = errno;
+
+  // The signal that ended the suspend was only queued: the whole syscall body
+  // is a deferred-signal section (HandleSyscallImpl), and the queue normally
+  // drains when that section ends. By then the mask below has been restored,
+  // so a signal the caller blocks outside sigsuspend (the usual pattern, e.g.
+  // a shell's `wait`) went back to pending and its handler did not run
+  // before sigsuspend returned, as Linux guarantees. Drain it here instead,
+  // with the suspend mask still in effect. Only the outermost section may
+  // drain, which is the case unless FEX itself is nested around this call.
+  auto* CurrentFrame = Thread->Thread->CurrentFrame;
+  if (!Thread->SignalInfo.DeferredSignalFrames.empty() && CurrentFrame->State.DeferredSignalRefCount.Load() == 1) {
+    CurrentFrame->State.DeferredSignalRefCount.Decrement(1);
+    // Faults while any deferred frame is queued; each guest handler's
+    // rt_sigreturn resumes this store, which faults again for the next frame.
+    reinterpret_cast<FEXCore::Core::NonAtomicRefCounter<uint64_t>*>(CurrentFrame->InterruptFaultPagePtr)->Store(0);
+    CurrentFrame->State.DeferredSignalRefCount.Increment(1);
+  }
 
   // Restore Previous signal mask we are emulating
   // XXX: Might be unsafe if the signal handler adjusted the thread's signal mask
@@ -2448,7 +2466,7 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
 
   CheckForPendingSignals(Thread);
 
-  return Result == -1 ? -errno : Result;
+  return Result == -1 ? -SuspendErrno : Result;
 }
 
 uint64_t SignalDelegator::GuestSigTimedWait(uint64_t* set, siginfo_t* info, const struct timespec* timeout, size_t sigsetsize) {
