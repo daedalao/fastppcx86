@@ -11,6 +11,7 @@ $end_info$
 #include "Common/ArgumentLoader.h"
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
+#include "Common/FDUtils.h"
 #include "Common/HostFeatures.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "PortabilityInfo.h"
@@ -126,7 +127,7 @@ void Init() {
     // can run in to problems of writing to some file
     auto LogFD = OutputFD;
     if (LogFile == "stderr") {
-      LogFD = dup(STDERR_FILENO);
+      LogFD = FEX::MoveFDOutOfGuestRange(dup(STDERR_FILENO));
     } else if (LogFile == "server") {
       Logging::FEXServer::FEXServerFD = FEXServerClient::RequestLogFD(FEXServerClient::GetServerFD());
       if (FEXServer::FEXServerFD != -1) {
@@ -139,7 +140,7 @@ void Init() {
       // run writes fewer bytes than the previous one. Alternative would be
       // O_APPEND (accumulate across runs), but the historical shape here is
       // "one log per run" — matches the stderr/stdout paths above.
-      LogFD = open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS);
+      LogFD = FEX::MoveFDOutOfGuestRange(open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS));
     }
 
     if (LogFD == -1) {

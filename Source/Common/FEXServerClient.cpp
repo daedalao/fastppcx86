@@ -199,7 +199,7 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
       LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketName, errno);
     }
   } else {
-    return SocketFD;
+    return FEX::MoveFDOutOfGuestRange(SocketFD);
   }
 #endif
 
@@ -216,7 +216,7 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
       LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketPath, errno);
     }
   } else {
-    return SocketFD;
+    return FEX::MoveFDOutOfGuestRange(SocketFD);
   }
 
   close(SocketFD);
@@ -392,7 +392,7 @@ void RequestServerKill(int ServerSocket) {
 }
 
 int RequestLogFD(int ServerSocket) {
-  return RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_LOG_FD);
+  return FEX::MoveFDOutOfGuestRange(RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_LOG_FD));
 }
 
 fextl::string RequestRootFSPath(int ServerSocket) {

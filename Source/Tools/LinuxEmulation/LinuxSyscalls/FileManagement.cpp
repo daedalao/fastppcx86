@@ -286,7 +286,7 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
   }
 
   if (!LDPath().empty()) {
-    RootFSFD = open(LDPath().c_str(), O_DIRECTORY | O_PATH | O_CLOEXEC);
+    RootFSFD = FEX::MoveFDOutOfGuestRange(open(LDPath().c_str(), O_DIRECTORY | O_PATH | O_CLOEXEC));
     if (RootFSFD == -1) {
       RootFSFD = AT_FDCWD;
     } else {
@@ -411,7 +411,7 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
   }
 
   // Keep an fd open for /proc, to bypass chroot-style sandboxes
-  ProcFD = open("/proc", O_RDONLY | O_CLOEXEC);
+  ProcFD = FEX::MoveFDOutOfGuestRange(open("/proc", O_RDONLY | O_CLOEXEC));
   if (ProcFD != -1) {
     // Track the st_dev of /proc, to check for inode equality
     struct stat Buffer;
