@@ -13,6 +13,8 @@
 #include <FEXHeaderUtils/Filesystem.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <linux/limits.h>
@@ -336,14 +338,24 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
       return -1;
     }
 
-    for (size_t i = 0; i < 5; ++i) {
-      LocalServerFD = ConnectToServer(ConnectionOption::Default);
+    // The pipe also closes when the child loses the lock to a server another
+    // client started at the same moment; that server may not be listening yet.
+    // Refused and missing sockets are expected until it is, so retry quietly
+    // with a short backoff (up to about 5 s in total) instead of logging each
+    // miss and sleeping a whole second.
+    auto Delay = std::chrono::milliseconds(1);
+    auto Waited = std::chrono::milliseconds(0);
+    const auto Limit = std::chrono::milliseconds(5000);
+    for (;;) {
+      LocalServerFD = ConnectToServer(ConnectionOption::NoPrintConnectionError);
 
-      if (LocalServerFD != -1) {
+      if (LocalServerFD != -1 || Waited >= Limit) {
         break;
       }
 
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      std::this_thread::sleep_for(Delay);
+      Waited += Delay;
+      Delay = std::min(Delay * 2, std::chrono::milliseconds(100));
     }
 
     if (LocalServerFD == -1) {
