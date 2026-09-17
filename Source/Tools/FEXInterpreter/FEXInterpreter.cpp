@@ -460,6 +460,9 @@ int main(int argc, char** argv, char** const envp) {
 
   int FEXFD {StealFEXFDFromEnv("FEX_EXECVEFD")};
   int FEXSeccompFD {StealFEXFDFromEnv("FEX_SECCOMPFD")};
+  // Set by ExecveHandler: the argument after the program path is the guest's
+  // own argv[0].
+  const bool ExecveArgv0 {StealFEXFDFromEnv("FEX_EXECVEARGV0") == 1};
 
   // Early init trivial handlers.
   LogMan::Throw::InstallHandler(FEX::Logging::AssertHandler);
@@ -572,6 +575,10 @@ int main(int argc, char** argv, char** const envp) {
     // We are going to keep these alive in memory.
     // No need to split the string with setenv
     putenv(HostEnv.data());
+  }
+
+  if (ExecveArgv0 && Args.size() > 1) {
+    Args.erase(Args.begin());
   }
 
   ELFCodeLoader Loader {Program.ProgramPath, FEXFD, LDPath(), Args, ParsedArgs, envp, &Environment};

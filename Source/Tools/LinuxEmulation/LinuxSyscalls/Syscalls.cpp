@@ -694,28 +694,54 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   const char NullString[] = "";
   fextl::vector<const char*> ExecveArgs = SyscallHandler->GetCodeLoader()->GetExecveArguments();
 
-  if (argv) {
-    // Overwrite the filename with the new one we are redirecting to
-    ExecveArgs.emplace_back(Filename.c_str());
+  // The loader takes the program to load as its first argument. The kernel
+  // hands an ELF the argv it was given, argv[0] included (multi-call binaries
+  // like busybox dispatch on it), while a script's argv[0] is replaced by the
+  // interpreter and the script path. So for an ELF the guest's argv[0] is
+  // passed after the program path, and the loader drops the path: through
+  // FEX_EXECVEARGV0 for a path exec, and implicitly for an FD exec, where the
+  // loader already skips its first argument.
+  const bool PreserveArgv0 = !IsShebang;
+  fextl::string PreserveArgv0Env;
 
-    auto OldArgv = argv;
+  // Overwrite the filename with the new one we are redirecting to
+  ExecveArgs.emplace_back(Filename.c_str());
 
-    // It is valid to provide nullptr first argument.
-    if (*OldArgv) {
-      // Skip filename argument
+  // It is valid to provide a NULL or empty argv. Linux sticks an empty
+  // argument in to the argv list if none are provided.
+  auto OldArgv = argv;
+  if (OldArgv && *OldArgv) {
+    if (PreserveArgv0) {
+      ExecveArgs.emplace_back(*OldArgv);
+    }
+    // Skip filename argument
+    ++OldArgv;
+    while (*OldArgv) {
+      // Append the arguments together
+      ExecveArgs.emplace_back(*OldArgv);
       ++OldArgv;
-      while (*OldArgv) {
-        // Append the arguments together
-        ExecveArgs.emplace_back(*OldArgv);
-        ++OldArgv;
+    }
+  } else {
+    ExecveArgs.emplace_back(NullString);
+  }
+
+  // Emplace nullptr at the end to stop
+  ExecveArgs.emplace_back(nullptr);
+
+  if (PreserveArgv0 && !IsFDExec) {
+    if (EnvpPtr != const_cast<char* const*>(EnvpArgs.data())) {
+      EnvpArgs.clear();
+      for (auto OldEnvp = envp; OldEnvp && *OldEnvp; ++OldEnvp) {
+        EnvpArgs.emplace_back(*OldEnvp);
       }
     } else {
-      // Linux kernel will stick an empty argument in to the argv list if none are provided.
-      ExecveArgs.emplace_back(NullString);
+      // Drop the terminator; it is added back below.
+      EnvpArgs.pop_back();
     }
-
-    // Emplace nullptr at the end to stop
-    ExecveArgs.emplace_back(nullptr);
+    PreserveArgv0Env = "FEX_EXECVEARGV0=1";
+    EnvpArgs.emplace_back(PreserveArgv0Env.data());
+    EnvpArgs.emplace_back(nullptr);
+    EnvpPtr = const_cast<char* const*>(EnvpArgs.data());
   }
 
   Result = ::syscall(SYS_execveat, Args.dirfd, "/proc/self/exe", const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);

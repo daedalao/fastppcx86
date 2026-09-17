@@ -286,7 +286,6 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   // launch a new process under fex
-  // currently does not propagate argv[0] correctly
   REGISTER_SYSCALL_IMPL_X64(execve, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, char* const argv[], char* const envp[]) -> uint64_t {
     fextl::vector<const char*> Args;
     fextl::vector<const char*> Envp;
