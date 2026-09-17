@@ -123,8 +123,11 @@ FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
     return HostVASize;
   }
 
-  static constexpr std::array<uintptr_t, 7> TLBSizes = {
-    57, 52, 48, 47, 42, 39, 36,
+  // 46 is the ppc64 4K-page user VA ceiling (arch/powerpc/include/asm/task_size_64.h).
+  // Without it a 4K ppc64le kernel probes as 42 bits, which puts the guest stack and
+  // interpreter hints inside the emulator's own allocation window.
+  static constexpr std::array<uintptr_t, 8> TLBSizes = {
+    57, 52, 48, 47, 46, 42, 39, 36,
   };
 
   for (auto Bits : TLBSizes) {
