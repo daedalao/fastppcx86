@@ -873,6 +873,28 @@
           "Only affects REP MOVS and REP STOS instructions"
         ]
       },
+      "ERMS": {
+        "Type": "int32",
+        "Default": "-1",
+        "Desc": [
+          "CPUID leaf 7 EBX bit 9 (Enhanced REP MOVSB/STOSB) as seen by the guest.",
+          "-1 (default): advertised unless atomic memcpy/memset TSO emulation is active.",
+          "0: never advertised, 1: always advertised.",
+          "Statically linked MSVC vcruntime (Cyberpunk 2077, Witcher 3) sets __favor",
+          "ENFSTRG from exactly this bit and then routes memcpy > 2 KiB (SSE path;",
+          "8 KiB..1.5 MiB on the AVX path) and memset > 128 B (CP2077) / > 32 KiB (W3)",
+          "to rep movsb/stosb, i.e. into the host MemCpy/MemSet loops instead of the",
+          "translated SSE loops. Hashed into the code cache id."
+        ]
+      },
+      "FSRM": {
+        "Type": "int32",
+        "Default": "-1",
+        "Desc": [
+          "CPUID leaf 7 EDX bit 4 (Fast Short REP MOV) as seen by the guest.",
+          "-1 (default): advertised. 0: hidden, 1: advertised. Hashed into the code cache id."
+        ]
+      },
       "HalfBarrierTSOEnabled": {
         "Type": "bool",
         "Default": "true",

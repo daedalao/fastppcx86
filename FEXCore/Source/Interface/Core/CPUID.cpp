@@ -755,7 +755,13 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
     // vcruntime140 memmove will use `rep movsb` in this case which completely destroys perf in Hades(appId 1145360)
     // This is due to LRCPC performance on Cortex being abysmal.
     // Only enable EnhancedREPMOVS if atomic memcpy tso emulation isn't enabled.
-    const uint32_t SupportsEnhancedREPMOVS = CTX->IsMemcpyAtomicTSOEnabled() == false;
+    // FEX_ERMS / FEX_FSRM override the advertised bits independently of the
+    // TSO mode (-1 = the rule above). MSVC's static vcruntime steers memcpy
+    // and memset between rep movsb/stosb and its SSE/AVX loops from ERMS only.
+    const int32_t ERMSOverride = CTX->Config.ERMS();
+    const int32_t FSRMOverride = CTX->Config.FSRM();
+    const uint32_t SupportsEnhancedREPMOVS = ERMSOverride < 0 ? (CTX->IsMemcpyAtomicTSOEnabled() == false) : (ERMSOverride != 0);
+    const uint32_t SupportsFSRM = FSRMOverride < 0 ? 1 : (FSRMOverride != 0);
     const uint32_t SupportsVPCLMULQDQ = CTX->HostFeatures.SupportsPMULL_128Bit && SupportsAVX();
     const uint32_t SupportsWFXT = CTX->HostFeatures.SupportsWFXT;
 
@@ -843,7 +849,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
               (0 << 1) |                   // SGX-KEYS
               (0 << 2) |                   // AVX512-4VNNIW
               (0 << 3) |                   // AVX512-4FMAPS
-              (1 << 4) |                   // Fast Short Rep Mov
+              (SupportsFSRM << 4) |        // Fast Short Rep Mov (FEX_FSRM)
               (0 << 5) |                   // UINTR
               (0 << 6) |                   // Reserved
               (0 << 7) |                   // Reserved

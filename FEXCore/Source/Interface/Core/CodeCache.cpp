@@ -339,6 +339,10 @@ uint64_t ComputeCodeCacheConfigId() {
     HASH_OPT(LOCKONLYTSO);
     HASH_OPT(VECTORTSOENABLED);
     HASH_OPT(MEMCPYSETTSOENABLED);
+    // Advertised CPUID bits: the RA pass constant-folds CPUID for constant
+    // leaves, so a block can bake leaf-7 results. Hash the overrides.
+    HASH_OPT(ERMS);
+    HASH_OPT(FSRM);
     HASH_OPT(HALFBARRIERTSOENABLED);
     // HWTSO compiles with NO TSO barriers at all (hardware SAO pages carry the
     // ordering); a cache built with it on is unsound in any session with it off.
