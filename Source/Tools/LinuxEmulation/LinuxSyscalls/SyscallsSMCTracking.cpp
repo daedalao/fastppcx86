@@ -64,6 +64,7 @@ $end_info$
 #include <unistd.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
 #include <FEXHeaderUtils/Syscalls.h>
@@ -202,6 +203,27 @@ bool DecodePPCStore(void* ucontext, uint64_t PC, DecodedStore* Out) {
 } // anonymous namespace
 #endif // ARCHITECTURE_ppc64le
 
+void SyscallHandler::UnprotectGuestRangeForHostWrite(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  const auto Region = FEX::HLE::SMCGranule::Cover(Start, Length);
+  // Like a fault's service under the default `invalidate` policy: every armed
+  // bit in each granule is cleared (MarkGuestExecutableRange re-arms on the next
+  // compile) and the invalidation covers the whole granule, so no block is left
+  // live on a page whose protection is gone.
+  const uint64_t HostPage = FEXCore::HostPage::Size();
+  for (uint64_t Granule = FEXCore::HostPage::AlignDown(Region.Start); Granule < Region.Start + Region.Length; Granule += HostPage) {
+    bool Demoted = false;
+    (void)FEX::HLE::SMCGranule::Table().NoteFault(Granule, &Demoted);
+  }
+  TM.InvalidateGuestCodeRange(Thread, Region.Start, Region.Length, [](uintptr_t Start, uintptr_t Length) {
+    if (mprotect(reinterpret_cast<void*>(Start), Length, PROT_READ | PROT_WRITE) != 0) {
+      ERROR_AND_DIE_FMT("SMC unprotect for a host write: mprotect({:#x}, {:#x}, R+W) failed errno={}", Start, Length, errno);
+    }
+#ifdef ARCHITECTURE_ppc64le
+    FEX::HLE::SMCBackpatch::NotePagesUnprotected(Start, Length);
+#endif
+  });
+}
+
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
 
@@ -290,8 +312,10 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     const bool RearmSiblings = FEX::HLE::SMCGranule::Policy() == FEX::HLE::SMCGranule::SiblingPolicy::Rearm;
     // Under `rearm` the invalidation stays narrow and the granule's siblings are
     // settled at the next drain point; the unprotect is granule-wide either way.
-    const uint64_t InvalidateBase = RearmSiblings ? FaultBase : FaultRegion.Start;
-    const uint64_t InvalidateLength = RearmSiblings ? FEXCore::Utils::FEX_GUEST_PAGE_SIZE : FaultRegion.Length;
+    // Not const: a demoting fault (FEX_SMCGRANULEMIXED, below) widens them
+    // back to the granule whatever the policy says.
+    uint64_t InvalidateBase = RearmSiblings ? FaultBase : FaultRegion.Start;
+    uint64_t InvalidateLength = RearmSiblings ? FEXCore::Utils::FEX_GUEST_PAGE_SIZE : FaultRegion.Length;
 
     // LOCK ORDER. Everything below that touches compiled code -- the hard and
     // soft invalidations, the semantic patch, the overlap query -- takes
@@ -563,8 +587,23 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     // be gone from the whole granule) and feeds the flip-rate detector, whose
     // report is printed later from the mark path, never from here. Returns 0 and
     // touches nothing on a 4K host.
-    const uint32_t TrackedInGranule = FEX::HLE::SMCGranule::Table().NoteFault(FaultRegion.Start);
-    if (RearmSiblings) {
+    //
+    // FEX_SMCGRANULEMIXED: NoteFault is also where a granule is DEMOTED (this
+    // fault tripped the flip threshold on a mostly-data granule). From now on
+    // nothing arms it and every block compiled from it is guarded; the
+    // soundness of that hand-over rests on THIS fault's service invalidating
+    // every block already on the granule (SMCHostGranule.h, "demotion"), so a
+    // demoting fault takes the granule-wide invalidation whatever the sibling
+    // policy is, and never the lazy deferral.
+    bool Demoted = false;
+    const uint32_t TrackedInGranule = FEX::HLE::SMCGranule::Table().NoteFault(FaultRegion.Start, &Demoted);
+    if (Demoted) {
+      InvalidateBase = FaultRegion.Start;
+      InvalidateLength = FaultRegion.Length;
+      SMC_AUDIT("[%d] fault addr=%lx DEMOTE-GRANULE granule=%lx tracked=%u\n", FHU::Syscalls::gettid(), FaultAddress, FaultRegion.Start,
+                TrackedInGranule);
+    }
+    if (RearmSiblings && !Demoted) {
       // Siblings other than the faulting page still hold live blocks and have
       // just lost their protection. Queue the granule; the next drain point
       // soft-invalidates it, which drops its CodePages entries so the next
@@ -623,7 +662,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         MirrorsRemaining = CollectMirrors(Entry, Done);
         lk.lock.unlock();
       }
-    } else if (_SyscallHandler->SMCLazyInvalActive()) {
+    } else if (!Demoted && _SyscallHandler->SMCLazyInvalActive()) {
       // FEX_SMCLAZYINVAL: unprotect and record, invalidate NOTHING. The writer
       // returns to native speed immediately; the page's blocks stay live (and
       // therefore possibly stale) in every lookup structure until a drain
@@ -986,15 +1025,54 @@ void ReportGranuleFlips() {
   }
   uint64_t Granule = 0;
   uint32_t Flips = 0;
-  if (!FEX::HLE::SMCGranule::Table().TakeFlipReport(&Granule, &Flips)) {
+  uint32_t Tracked = 0;
+  bool Demoted = false;
+  if (!FEX::HLE::SMCGranule::Table().TakeFlipReport(&Granule, &Flips, &Tracked, &Demoted)) {
+    return;
+  }
+  // Tracked is the count at the fault that tripped the threshold; the table's
+  // own count is zero by now (NoteFault cleared the mask), which is what this
+  // line used to print.
+  if (Demoted) {
+    LogMan::Msg::IFmt("SMC granule {:#x}-{:#x} flipped {} times in one second with {} of {} guest pages tracked; demoted (#{}): no longer "
+                      "armed, its blocks carry per-instruction validation (FEX_SMCGRANULEMIXED)",
+                      Granule, Granule + FEXCore::HostPage::Size(), Flips, Tracked, FEX::HLE::SMCGranule::PagesPerGranule(),
+                      FEX::HLE::SMCGranule::Table().Demoted());
     return;
   }
   LogMan::Msg::IFmt("SMC granule {:#x}-{:#x} flipped {} times in one second with {} of {} guest pages tracked; mtrack is paying the "
                     "whole granule for a fraction of it (FEX_SMCGRANULEFLIPLOG)",
-                    Granule, Granule + FEXCore::HostPage::Size(), Flips, FEX::HLE::SMCGranule::Table().TrackedCount(Granule),
-                    FEX::HLE::SMCGranule::PagesPerGranule());
+                    Granule, Granule + FEXCore::HostPage::Size(), Flips, Tracked, FEX::HLE::SMCGranule::PagesPerGranule());
+}
+
+// FEX_SMCGRANULEMIXED: true when every host granule covering [Start,
+// Start+Length) has been demoted, i.e. the arm for this range must be skipped
+// because the blocks compiled from it are guarded instead. Every caller passes
+// one guest page (Core.cpp, CodeCache.cpp), so this is one granule in practice;
+// a range straddling a demoted and a live granule is armed in full, which is
+// merely redundant on the demoted half. No-op (false) on a 4K host.
+bool GranuleRangeDemoted(uint64_t Start, uint64_t Length) {
+  if (!FEX::HLE::SMCGranule::Enabled()) {
+    return false;
+  }
+  const auto Region = FEX::HLE::SMCGranule::Cover(Start, Length);
+  for (uint64_t G = Region.Start; G < Region.Start + Region.Length; G += FEXCore::HostPage::Size()) {
+    if (!FEX::HLE::SMCGranule::Table().ValidateOnly(G)) {
+      return false;
+    }
+  }
+  return true;
 }
 } // namespace
+
+bool SyscallHandler::GuestCodePageValidateOnly(uint64_t Page) {
+  if (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
+    // Only mtrack demotes; under `full` every block is guarded already and
+    // under `none` nothing is tracked.
+    return false;
+  }
+  return FEX::HLE::SMCGranule::Table().ValidateOnly(FEX::HLE::SMCGranule::Base(Page));
+}
 
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   const auto Base = Start & FEXCore::Utils::FEX_GUEST_PAGE_MASK;
@@ -1069,6 +1147,13 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           // every mirror of its resource, so don't memoise it -- the mirror
           // list is walked below anyway.
           NoActionNeeded = false;
+
+          // FEX_SMCGRANULEMIXED: the blocks compiled from a demoted page are
+          // guarded, so none of its mirrors needs protecting on their behalf.
+          if (GranuleRangeDemoted(ProtectBase, ProtectSize)) {
+            SMC_AUDIT("[%d] mark SKIP-demoted-shared base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
+            continue;
+          }
 
           LOGMAN_THROW_A_FMT(Mapping->second.Resource, "VMA tracking error");
 
@@ -1162,8 +1247,16 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           // 64K (S4c): host-granular. On a 64K host this write-protects up to 15
           // sibling guest pages that may be plain data the guest writes
           // constantly -- that thrash is inherent to a 16x quantum, is what
-          // FEX_SMCGRANULEFLIPLOG surfaces, and is why the per-granule tracked
-          // count below exists. Identity on a 4K host.
+          // FEX_SMCGRANULEFLIPLOG surfaces, and is what FEX_SMCGRANULEMIXED
+          // answers: a granule that thrashed enough while holding little code
+          // has been demoted, is never armed again, and the blocks compiled
+          // from it carry per-instruction validation instead (the compile path
+          // asked GuestCodePageValidateOnly for the same page before it
+          // published them). Identity on a 4K host.
+          if (GranuleRangeDemoted(ProtectBase, ProtectSize)) {
+            SMC_AUDIT("[%d] mark SKIP-demoted base=%lx size=%lx\n", FHU::Syscalls::gettid(), ProtectBase, ProtectSize);
+            continue;
+          }
           const auto ProtectRegion = FEX::HLE::SMCGranule::Cover(ProtectBase, ProtectSize);
           int rv = mprotect((void*)ProtectRegion.Start, ProtectRegion.Length, PROT_READ);
 #ifdef ARCHITECTURE_ppc64le
@@ -1577,7 +1670,10 @@ void SyscallHandler::InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState
 }
 
 static FEXCore::ExecutableFileSectionInfo BuildSectionInfo(const VMATracking::MappedResource& Resource, uint64_t Base, uint64_t Size) {
-  return FEXCore::ExecutableFileSectionInfo {*Resource.MappedFile, Resource.FirstVMA->Base, Base, Base + Size};
+  // The section keeps the file info alive: it is consumed after the
+  // VMATracking lock is released (FinishTrackedMmap/FinishTrackedMprotect ->
+  // LoadCodeCache), when the resource may already be gone.
+  return FEXCore::ExecutableFileSectionInfo {*Resource.MappedFile, Resource.FirstVMA->Base, Base, Base + Size, Resource.MappedFile};
 }
 
 std::optional<FEXCore::ExecutableFileSectionInfo>
@@ -2147,6 +2243,11 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
         return reinterpret_cast<void*>(-errno);
       }
     }
+
+    // FEX_THP=guest (off by default): the one place every guest mmap of either
+    // width comes through with its host address in hand. Anonymous private
+    // only; the guest's own madvise passes through and wins.
+    FEXCore::Allocator::THP::HintGuestMapping(reinterpret_cast<void*>(Result), length, flags, fd);
 
     SMC_AUDIT("[%d] guest-mmap addr=%lx len=%lx prot=%x flags=%x fd=%d\n", FHU::Syscalls::gettid(), Result, length, prot, flags, fd);
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
@@ -2735,9 +2836,16 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
     if (PathLength != -1 && S_ISREG(buf.st_mode) && (buf.st_mode & S_IXUSR)) {
       // ELF files that are mapped multiple times get a separate MappedResource for each base virtual address
       if ((prot & PROT_READ) && Inserted) {
-        Resource->MappedFile = fextl::make_unique<FEXCore::ExecutableFileInfo>();
+        Resource->MappedFile = fextl::make_shared<FEXCore::ExecutableFileInfo>();
         Resource->MappedFile->Filename = fextl::string(Tmp, PathLength);
-        Resource->MappedFile->FileId = CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd);
+        // The id names code cache and code map files only, and it streams the
+        // whole file through XXH3 (tens of MB for a compiler binary, repeated
+        // for every shared library in every process). Without the code cache
+        // nothing reads it.
+        Resource->MappedFile->FileId =
+          (EnableCodeCaching() || FEXCore::Config::Get_GDBSYMBOLS()) ?
+            CTX->GetCodeCache().ComputeCodeMapId(Resource->MappedFile->Filename, fd) :
+            0xffff'ffff'ffff'ffffULL;
 
         // Read ELF headers if applicable and needed for code caching.
         // For performance, skip ELF checks if we're not mapping the file header

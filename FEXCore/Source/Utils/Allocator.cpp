@@ -62,12 +62,25 @@ void* FEX_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t off
 
 void VirtualName(const char* Name, void* Ptr, size_t Size) {
   static bool Supports {true};
-  if (Supports) {
-    auto Result = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, Ptr, Size, Name);
-    if (Result == -1) {
-      // Disable any additional attempts.
-      Supports = false;
-    }
+  if (!Supports) {
+    return;
+  }
+  // PR_SET_VMA_ANON_NAME wants a host-page-aligned range that anonymous VMAs
+  // cover exactly. A caller naming a heap object (Core.cpp names the
+  // InternalThreadState, a malloc'd 4 KiB-odd block at an unaligned address)
+  // gets EINVAL, and that used to trip the "unsupported" latch below, after
+  // which FEXMem_Lookup, FEXMemJIT, FEXBlockIndex and FEXMem_CallRetStacks
+  // were never named in /proc/self/smaps (seen 2026-09-14 while reading THP
+  // coverage per VMA name). Skip such calls instead of poisoning the latch.
+  if (!FEXCore::HostPage::IsAligned(reinterpret_cast<uint64_t>(Ptr)) || !FEXCore::HostPage::IsAligned(Size) || Size == 0) {
+    return;
+  }
+  auto Result = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, Ptr, Size, Name);
+  if (Result == -1 && errno != EINVAL) {
+    // Disable any additional attempts. EINVAL on a well-formed range means the
+    // range is not (only) anonymous memory right now, not that the kernel
+    // lacks the feature; keep trying for the next site.
+    Supports = false;
   }
 }
 
@@ -110,8 +123,11 @@ FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
     return HostVASize;
   }
 
-  static constexpr std::array<uintptr_t, 7> TLBSizes = {
-    57, 52, 48, 47, 42, 39, 36,
+  // 46 is the ppc64 4K-page user VA ceiling (arch/powerpc/include/asm/task_size_64.h).
+  // Without it a 4K ppc64le kernel probes as 42 bits, which puts the guest stack and
+  // interpreter hints inside the emulator's own allocation window.
+  static constexpr std::array<uintptr_t, 8> TLBSizes = {
+    57, 52, 48, 47, 46, 42, 39, 36,
   };
 
   for (auto Bits : TLBSizes) {

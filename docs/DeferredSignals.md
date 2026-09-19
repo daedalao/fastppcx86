@@ -104,6 +104,21 @@ Then, FEX will check if any further deferred signals need to be handled.
 
 Once FEX gets back to the page store, it will trampoline back to the SIGSEGV handler if it has more signals to handle.
 
+## Synchronous faults inside a deferred section
+
+Deferral only applies to asynchronous signals. A synchronous fault (SIGSEGV,
+SIGBUS, SIGILL, SIGFPE, SIGTRAP with a kernel `si_code`) raised while the
+refcount is non-zero was raised by FEX's own host code, not by the guest: the
+guest is not executing. Delivering it to the guest would build the guest
+signal frame on top of the host frame, with the stale block-boundary RIP and
+whatever locks the host code holds; if the guest handler unwinds instead of
+returning, those locks are never released. `SignalDelegator::HandleGuestSignal`
+therefore refuses such faults (the host-fault gate): it prints the fault, the
+host backtrace and the lock holder, restores the default disposition and lets
+the kernel re-raise the fault at the original instruction. The same rule covers
+faults at dispatcher and FABI-stub PCs and trap-class signals anywhere outside
+JIT code. `FEX_HOSTFAULTTOGUEST=1` restores the old delivery.
+
 ## Disadvantages of cooperative signal deferring
 - How do we handle the guest doing a longjmp out of a signal frame and still receiving signals?
    - FEX relies on guest signal handlers returning via `sigreturn` to handle stacked deferred signals, so a longjmp would interfere with this

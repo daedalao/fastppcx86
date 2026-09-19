@@ -14,19 +14,13 @@
  * demanded it would be asserting the tier we have not built yet.
  *
  * Written to compile both as C++ (it joins FEXLinuxTests) and as C with
- * `x86_64-pc-linux-gnu-gcc -static -x c`, because until the stage-S4a loader
- * work lands nothing dynamic loads on a 64K host and the only way to run this
- * there is a static binary.
- *
- * Building it standalone for a 64K host, until the stage-S4a loader work
- * lands: the ELF loader still maps PT_LOAD segments at their 4K-congruent file
- * offsets, so even a static binary has to be linked with every LOAD segment,
- * and the bss ends, on 64K boundaries. Scripts/granule_page_64k.sh does that;
- * the short version is a copy of ld's default script with
- *   . = ALIGN(0x10000);                             before the data segment,
- *   .fexfilepad : { BYTE(0); . = ALIGN(0x10000); }  before __bss_start,
- *   . = ALIGN(0x10000);                             at the end of .bss,
- * plus -static -z max-page-size=0x10000 -z norelro --build-id=none.
+ * `x86_64-pc-linux-gnu-gcc -static -x c`. Before the stage-S4a loader fallback
+ * (HostPageMapping.h: anonymous map + pread for segments at 4K-congruent file
+ * offsets) nothing dynamic loaded on a 64K host, and a standalone build needed
+ * a linker script aligning every LOAD segment and the end of .bss to 64K
+ * (Scripts/granule_page_64k.sh, deleted 2026-09-14). Any x86-64 binary loads
+ * now; the C form is kept because it is the quickest way to run this on a
+ * host without the FEXLinuxTests cross toolchain.
  */
 
 #ifndef _GNU_SOURCE

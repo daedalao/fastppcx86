@@ -312,6 +312,26 @@ void ScalarSplatChain::Run(IREmitter* IREmit) {
 
   auto CurrentIR = IREmit->ViewIR();
 
+  // Most compile units (all integer code) hold no eligible producer. Without
+  // one nothing below can mark, forward or retarget anything, so a scan of
+  // opcodes alone decides it, before the per-block walks and the SSA-sized
+  // map.
+  bool AnyEligible = false;
+  for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
+    for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+      if (IsSplattableProducer(IROp->Op)) {
+        AnyEligible = true;
+        break;
+      }
+    }
+    if (AnyEligible) {
+      break;
+    }
+  }
+  if (!AnyEligible) {
+    return;
+  }
+
   TrackedOf.clear();
   TrackedOf.resize(CurrentIR.GetSSACount(), kNone);
 

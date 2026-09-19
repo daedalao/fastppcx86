@@ -12,6 +12,7 @@
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/PrctlUtils.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/Utils/Telemetry.h>
 
 #include <FEXCore/Utils/LogManager.h>
@@ -377,7 +378,28 @@ namespace CPU {
 
   CodeBuffer::CodeBuffer(size_t Size)
     : AllocatedSize(Size) {
-    Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+    // THP (FEX_THP=code): a MADV_HUGEPAGE hint only takes for a PMD-aligned,
+    // PMD-sized window inside the VMA, and the internal placement hint hands
+    // out 4K-granular addresses, so an unaligned 16 MiB buffer got no huge page
+    // at all and a 128 MiB one got 7 of a possible 8. Over-map by one PMD and
+    // trim to the first aligned window; address space only, no RSS. The guard
+    // page still splits the last PMD of the buffer (the size is deliberately
+    // not grown: the near-branch placement reasons about power-of-two extents).
+    // PMD is 0 on a kernel without THP (the 4K hash kernel): the old path, unchanged.
+    const size_t Align = FEXCore::Allocator::THP::AlignmentFor(FEXCore::Allocator::THP::Code, Size);
+    if (Align) {
+      void* Raw = FEXCore::Allocator::VirtualAlloc(Size + Align, true);
+      Ptr = static_cast<uint8_t*>(Raw ? FEXCore::Allocator::THP::TrimToAlignment(Raw, Size + Align, Size, Align) : nullptr);
+      if (!Ptr && Raw) {
+        // Trim refused (cannot happen for an over-mapping of exactly one PMD,
+        // but keep the accounting honest): use the raw mapping and drop the
+        // slack so VirtualFree's AllocatedSize matches what stays mapped.
+        Ptr = static_cast<uint8_t*>(Raw);
+        FEXCore::Allocator::VirtualFree(static_cast<uint8_t*>(Raw) + Size, Align);
+      }
+    } else {
+      Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+    }
     LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
     // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
@@ -392,7 +414,8 @@ namespace CPU {
     FEXCore::Allocator::VirtualName("FEXMemJIT", reinterpret_cast<void*>(Ptr), Size);
 
     // Huge-pages reduce the amount of iTLB misses dramatically when it works.
-    FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<void*>(Ptr), Size, FEXCore::Allocator::THPControl::Enable);
+    // Knob-gated (FEX_THP=code, on by default); see FEXCore/Utils/THP.h.
+    FEXCore::Allocator::THP::Hint(Ptr, Size, FEXCore::Allocator::THP::Code);
 
     LookupCache = fextl::make_unique<GuestToHostMap>();
 

@@ -17,6 +17,7 @@ $end_info$
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
@@ -27,6 +28,11 @@ $end_info$
 #include <cstring>
 #include <iterator>
 #include <sys/mman.h>
+#include <mutex>
+#include <time.h>
+#include <FEXCore/Utils/Threads.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -243,7 +249,9 @@ namespace {
 
     const bool Preserve = HasLiveSiblings(Tracking, GranuleBase, ReplaceBase, ReplaceEnd);
     if (Preserve && GranuleHasSharedMapping(Tracking, GranuleBase)) {
-      LogOnce(LoggedSharedConvert, "conversion of a MAP_SHARED granule to private backing", GranuleBase, HostSize);
+      LogMan::Msg::EFmt("64K granule emulation: refusing conversion of a MAP_SHARED granule to private backing: granule [{:#x}, {:#x}) for a "
+                        "sub-granule request over [{:#x}, {:#x})",
+                        GranuleBase, GranuleBase + HostSize, ReplaceBase, ReplaceEnd);
       return -EINVAL;
     }
 
@@ -310,6 +318,96 @@ namespace {
   }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// wine's KUSER_SHARED_DATA on a 64K host
+// ---------------------------------------------------------------------------
+// Windows fixes KUSER_SHARED_DATA at 0x7ffe0000 and wine maps it there as a
+// 4K MAP_SHARED view of a wineserver memfd; the server writes the three
+// KSYSTEM_TIME clocks in it (InterruptTime, SystemTime, TickCount) and every
+// Windows timer, GetTickCount and Sleep-with-deadline in the process reads
+// them. One page above it wine keeps a private per-process page (the syscall
+// dispatcher pointer), so on a 64K host the granule ends up MAP_PRIVATE of the
+// memfd (see Mmap): a page the guest never writes keeps tracking the server
+// through the page cache, but the moment anything dirties page 0 it becomes a
+// private copy and the process's clocks freeze. Skyrim SE's lockpicking
+// minigame never closing after a successful pick was exactly that
+// (2026-09-14: TickCount and InterruptTime unchanged over 1.5 s in the live
+// process, the granule 64K Private_Dirty).
+//
+// So the conversion keeps a hidden live MAP_SHARED view of the memfd and a
+// host thread copies the three clocks into the guest's page every
+// millisecond, in the server's own store order (High2, Low, High1, so a
+// reader's High1==High2 check still detects a torn read). The copy goes
+// through process_vm_writev: it honours the page's protection and returns
+// EFAULT instead of faulting if the guest has made the page read-only or
+// unmapped it, and it is one syscall per tick. Only the fixed Windows
+// address is treated this way; any other shared-file granule converted to
+// private keeps plain copy-on-write semantics.
+namespace {
+constexpr uint64_t kWineUserSharedData = 0x7ffe0000;
+constexpr size_t kKSystemTimeOffsets[] = {0x8, 0x14, 0x320}; // InterruptTime, SystemTime, TickCount
+
+struct UsdMirror {
+  uint64_t GuestPage;
+  const uint8_t* Live;
+};
+std::mutex UsdMirrorMutex;
+fextl::vector<UsdMirror> UsdMirrors;
+fextl::unique_ptr<FEXCore::Threads::Thread> UsdThread;
+pid_t UsdThreadPid = 0;
+
+void* UsdRefreshThread(void*) {
+  FEX::HLE::ThreadManager::SetThreadName("FEX:usdrefresh");
+  const pid_t Self = ::getpid();
+  for (;;) {
+    {
+      std::lock_guard lk {UsdMirrorMutex};
+      for (const auto& M : UsdMirrors) {
+        // Nine words per page: for each clock High2Time, LowPart, High1Time.
+        uint32_t Words[9];
+        struct iovec Local[9];
+        struct iovec Remote[9];
+        size_t N = 0;
+        for (size_t Off : kKSystemTimeOffsets) {
+          uint32_t H1, Lo, H2;
+          do {
+            H1 = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off + 4), __ATOMIC_ACQUIRE);
+            Lo = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off), __ATOMIC_ACQUIRE);
+            H2 = __atomic_load_n(reinterpret_cast<const uint32_t*>(M.Live + Off + 8), __ATOMIC_ACQUIRE);
+          } while (H1 != H2);
+          const size_t Order[3] = {Off + 8, Off, Off + 4};
+          const uint32_t Vals[3] = {H2, Lo, H1};
+          for (int i = 0; i < 3; ++i, ++N) {
+            Words[N] = Vals[i];
+            Local[N] = {&Words[N], sizeof(uint32_t)};
+            Remote[N] = {reinterpret_cast<void*>(M.GuestPage + Order[i]), sizeof(uint32_t)};
+          }
+        }
+        // iovecs are written in order, which preserves the server's store order.
+        ::process_vm_writev(Self, Local, N, Remote, N, 0);
+      }
+    }
+    struct timespec TS {0, 1'000'000};
+    ::nanosleep(&TS, nullptr);
+  }
+  return nullptr;
+}
+
+// Registers the live mirror for a converted granule and makes sure this
+// process (not a forked parent's) has the refresher running. Called with the
+// VMATracking lock held; the thread creation is short and takes no FEX lock.
+void RegisterUsdMirror(uint64_t GuestPage, const uint8_t* Live) {
+  std::lock_guard lk {UsdMirrorMutex};
+  UsdMirrors.push_back({GuestPage, Live});
+  if (!UsdThread || UsdThreadPid != ::getpid()) {
+    const uint64_t OldMask = FEX::HLE::ThreadManager::SetSignalMask(~0ULL);
+    UsdThread = FEXCore::Threads::Thread::Create(UsdRefreshThread, nullptr);
+    FEX::HLE::ThreadManager::SetSignalMask(OldMask);
+    UsdThreadPid = ::getpid();
+  }
+}
+} // namespace
+
 bool Active() {
   return GranuleTable::Active();
 }
@@ -357,13 +455,91 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
     return true;
   }
 
-  if ((flags & MAP_SHARED) || (flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE) {
+  const bool SharedRequest = (flags & MAP_SHARED) || (flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE;
+  if (const uint64_t HostSize = FEXCore::HostPage::Size();
+      SharedRequest && (flags & MAP_FIXED) && HostAligned(GuestBase) && (Anonymous || HostAligned(static_cast<uint64_t>(offset))) &&
+      GuestEnd - GuestBase < HostSize) {
+    // A shared mapping whose ONLY sub-granule dimension is its length, at a
+    // host-aligned address and file offset: wine's KUSER_SHARED_DATA page
+    // (MAP_SHARED, 4K, fixed at 0x7ffe0000, offset 0) is the production case
+    // and the first thing wine does under full emulation. Mapping the whole
+    // granule from the same offset is exact for every byte the guest asked
+    // for; the tail past the file's end SIGBUSes if touched, which the guest
+    // never does, and a shorter file is a legal mmap. Only when the rest of
+    // the granule holds nothing the guest already owns.
+    auto* Hndl = Handler::Get();
+    bool TailFree = true;
+    {
+      auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+      auto& Tracking = Hndl->VMATracking;
+      for (uint64_t Page = GuestEnd; Page < GuestBase + HostSize; Page += GuestPageSize) {
+        // A PROT_NONE reservation in the tail does not block: wine maps its
+        // shared pages INTO its own reserved address space, and at the
+        // permissive tier a reservation is tracked, not enforced.
+        auto It = Tracking.FindVMAEntry(Page);
+        const bool LiveVMA = It != Tracking.VMAs.end() && (It->second.Prot.Readable || It->second.Prot.Writable || It->second.Prot.Executable);
+        int GranProt = PROT_NONE;
+        const bool LiveGranule = Tracking.Granules.LookupPage(Page, &GranProt) && GranProt != PROT_NONE;
+        if (LiveVMA || LiveGranule) {
+          TailFree = false;
+          LogOnce(LoggedSharedMmap, "shared sub-granule mapping refused: the granule's tail is live", Page, GuestPageSize);
+          break;
+        }
+      }
+      if (TailFree) {
+        for (uint64_t G = GuestBase; G < GuestBase + HostSize; G += HostSize) {
+          Tracking.Granules.Forget(G);
+        }
+      }
+    }
+    if (TailFree) {
+      if (HostOwnedRanges::Overlaps(GuestBase, HostSize)) {
+        HostOwnedRanges::ReportRefusal("mmap", GuestBase, HostSize);
+        *Result = static_cast<uint64_t>(-ENOMEM);
+        return true;
+      }
+      void* M = ::mmap(reinterpret_cast<void*>(GuestBase), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(prot), flags, fd, offset);
+      if (M == MAP_FAILED) {
+        *Result = static_cast<uint64_t>(-errno);
+        return true;
+      }
+      std::optional<FEX::HLE::SyscallHandler::LateApplyExtendedVolatileMetadata> LateMetadata;
+      std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
+      {
+        auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
+        // VMATracking keeps the guest's own length; the granule is what the
+        // kernel has, recorded as such so a later sub-granule operation in it
+        // does not try to re-back it privately.
+        auto& E = Hndl->VMATracking.Granules.FindOrCreate(GuestBase);
+        E.FEXBacked = false;
+        if (E.SharedFd >= 0) {
+          ::close(E.SharedFd);
+          E.SharedFd = -1;
+        }
+        if (!Anonymous) {
+          E.SharedFd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+          E.SharedOffset = static_cast<uint64_t>(offset);
+        }
+        Hndl->VMATracking.Granules.SetIntended(GuestBase, GuestEnd - GuestBase, prot);
+        Hndl->VMATracking.Granules.NoteHostProt(GuestBase, prot);
+        LateMetadata = Hndl->TrackMmap(Thread, GuestBase, GuestEnd - GuestBase, prot, flags, fd, offset, CachedSection);
+      }
+      Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, GuestEnd - GuestBase);
+      Hndl->FinishTrackedMmap(Thread, std::move(LateMetadata), CachedSection);
+      *Result = GuestBase;
+      return true;
+    }
+  }
+
+  if (SharedRequest) {
     // Emulating an unrepresentable mapping means copying its contents into a
     // private anonymous granule. A shared mapping's whole contract is that the
     // copy does not exist. Refuse loudly rather than silently desynchronise.
     // Survey (PAGE_SIZE_64K_PLAN §2): rare, because X SHM segments and GL
     // buffers arrive host-aligned -- FEX allocates them.
-    LogOnce(LoggedSharedMmap, Anonymous ? "unaligned MAP_SHARED anonymous mmap" : "unaligned MAP_SHARED file mmap", GuestBase, Size);
+    LogMan::Msg::EFmt("64K granule emulation: refusing {} at [{:#x}, {:#x}) flags={:#x} prot={:#x} fd={} offset={:#x} (base aligned={}, offset aligned={})",
+                      Anonymous ? "unaligned MAP_SHARED anonymous mmap" : "unaligned MAP_SHARED file mmap", GuestBase, GuestEnd, flags, prot, fd,
+                      static_cast<uint64_t>(offset), HostAligned(GuestBase), HostAligned(static_cast<uint64_t>(offset)));
     *Result = static_cast<uint64_t>(-EINVAL);
     return true;
   }
@@ -392,6 +568,7 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
 
   std::optional<FEX::HLE::SyscallHandler::LateApplyExtendedVolatileMetadata> LateMetadata;
   std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
+  bool RevokeHWTSO = false;
   {
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(Hndl->VMATracking.Mutex, Thread);
     auto& Tracking = Hndl->VMATracking;
@@ -403,7 +580,6 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         auto& E = Tracking.Granules.FindOrCreate(G);
         E.FEXBacked = true;
         E.HostProt = PROT_READ | PROT_WRITE;
-        E.SMCOverlay = PROT_NONE;
       }
     }
 
@@ -421,8 +597,19 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
           *Result = static_cast<uint64_t>(-ENOMEM);
           return true;
         }
-        void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(prot), flags | MAP_FIXED,
-                         Anonymous ? -1 : fd, FileOffset);
+        // FEX_HWTSO: the same refusal protocol as GuestMmap. A file the kernel
+        // will not map with PROT_SAO (device memory, some filesystems) is
+        // retried exactly as the guest asked; a success on ordinary memory is
+        // an ordering hole and revokes hardware TSO below, outside the
+        // VMATracking scope. The anonymous mmaps on this path cannot refuse.
+        const int HostProt = FEX::HLE::HardwareTSO::ApplyGuestProt(prot);
+        void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, HostProt, flags | MAP_FIXED, Anonymous ? -1 : fd, FileOffset);
+        if (M == MAP_FAILED && HostProt != prot) {
+          M = ::mmap(reinterpret_cast<void*>(G), HostSize, prot, flags | MAP_FIXED, Anonymous ? -1 : fd, FileOffset);
+          if (M != MAP_FAILED) {
+            RevokeHWTSO |= FEX::HLE::HardwareTSO::OnRangeRefusedSAO("mmap", M, HostSize, Anonymous ? -1 : fd);
+          }
+        }
         if (M == MAP_FAILED) {
           *Result = static_cast<uint64_t>(-errno);
           return true;
@@ -432,13 +619,54 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
         auto* E = Tracking.Granules.FindMutable(G);
         if (E) {
           E->FEXBacked = false;
-          E->SMCOverlay = PROT_NONE;
         }
         continue;
       }
 
+      // A granule the shared-file passthrough owns: re-map it MAP_PRIVATE from
+      // the same file and offset. Pages the guest never writes keep tracking
+      // the file through the page cache (the live KUSER_SHARED_DATA page),
+      // pages it writes are copied on that write and become private (the
+      // dispatcher-pointer page), which is what the anonymous request asked
+      // for. The file is extended to cover the granule so the tail pages
+      // exist; if it cannot be, the request is refused as before.
+      if (auto* SE = Tracking.Granules.FindMutable(G); SE && !SE->FEXBacked && SE->SharedFd >= 0) {
+        struct stat st {};
+        const uint64_t Need = SE->SharedOffset + HostSize;
+        if (::fstat(SE->SharedFd, &st) == 0 && static_cast<uint64_t>(st.st_size) < Need && ::ftruncate(SE->SharedFd, Need) != 0) {
+          LogMan::Msg::EFmt("64K granule emulation: shared-file granule {:#x} cannot be extended for a private sub-granule request ({})", G,
+                            ::strerror(errno));
+        } else {
+          void* M = ::mmap(reinterpret_cast<void*>(G), HostSize, FEX::HLE::HardwareTSO::ApplyGuestProt(PROT_READ | PROT_WRITE),
+                           MAP_FIXED | MAP_PRIVATE, SE->SharedFd, static_cast<off_t>(SE->SharedOffset));
+          if (M != MAP_FAILED) {
+            if (G == kWineUserSharedData) {
+              void* Live = ::mmap(nullptr, HostSize, PROT_READ, MAP_SHARED, SE->SharedFd, static_cast<off_t>(SE->SharedOffset));
+              if (Live != MAP_FAILED) {
+                RegisterUsdMirror(G, static_cast<const uint8_t*>(Live));
+                LogMan::Msg::IFmt("64K granule emulation: KUSER_SHARED_DATA at {:#x} is a private copy now; its clocks are refreshed from the live "
+                                  "mapping every millisecond",
+                                  G);
+              } else {
+                LogMan::Msg::EFmt("64K granule emulation: could not map the live KUSER_SHARED_DATA mirror ({}); this process's Windows clocks will "
+                                  "freeze",
+                                  ::strerror(errno));
+              }
+            }
+            ::close(SE->SharedFd);
+            SE->SharedFd = -1;
+            SE->FEXBacked = true;
+            SE->HostProt = PROT_READ | PROT_WRITE;
+            LogMan::Msg::IFmt("64K granule emulation: granule {:#x} re-mapped MAP_PRIVATE from its shared file for a private request at [{:#x}, {:#x}); "
+                              "guest writes to the formerly shared pages no longer propagate (none expected)",
+                              G, SubBase, SubEnd);
+          }
+        }
+      }
       const int64_t Prepared = MakeGranuleFEXBacked(Tracking, G, SubBase, SubEnd);
       if (Prepared < 0) {
+        LogMan::Msg::EFmt("64K granule emulation: sub-granule mmap refused ({}): [{:#x}, {:#x}) flags={:#x} prot={:#x} fd={} offset={:#x} in granule {:#x}",
+                          -Prepared, SubBase, SubEnd, flags, prot, fd, static_cast<uint64_t>(FileOffset), G);
         *Result = static_cast<uint64_t>(Prepared);
         return true;
       }
@@ -461,10 +689,26 @@ bool Mmap(FEXCore::Core::InternalThreadState* Thread, bool Is64Bit, void* addr, 
       Tracking.Granules.RematerialiseIfNeeded(G);
     }
 
+    // FEX_THP=guest (off by default): an anonymous private request that came
+    // this way (a 4K-multiple length, glibc's usual malloc mmap) is now a run
+    // of per-granule VMAs; one hint over the whole run marks them all and lets
+    // the kernel merge them back into one huge-page-eligible VMA.
+    if (Anonymous) {
+      FEXCore::Allocator::THP::HintGuestMapping(reinterpret_cast<void*>(GranuleStart), GranuleEnd - GranuleStart,
+                                                (flags & ~(MAP_SHARED | MAP_SHARED_VALIDATE)) | MAP_ANONYMOUS | MAP_PRIVATE, -1);
+    }
+
     // VMATracking keeps describing what the GUEST asked for, at guest
     // granularity. That is the fiction discipline of §7: the granule table is
     // the only place the host's coarser reality is recorded.
     LateMetadata = Hndl->TrackMmap(Thread, GuestBase, Size, prot, flags, fd, offset, CachedSection);
+  }
+
+  // FEX_HWTSO: same placement as GuestMmap -- first thing outside the
+  // VMATracking scope (RevokeHardwareTSO takes ThreadCreationMutex and the
+  // exclusive CodeInvalidationMutex) and before the result reaches the guest.
+  if (RevokeHWTSO) {
+    Hndl->RevokeHardwareTSO(Thread, "mmap", reinterpret_cast<void*>(GuestBase), Size);
   }
 
   Hndl->InvalidateCodeRangeIfNecessary(Thread, GuestBase, Size);

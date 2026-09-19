@@ -12,6 +12,7 @@
 #include <Interface/Core/OpcodeDispatcher.h>
 #include <Interface/IR/PassManager.h>
 
+#include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -28,10 +29,13 @@
 // ComputeCodeMapId streams the mapped file to derive a content-based cache
 // identity. close() was already used unguarded in this file, so POSIX is
 // assumed here rather than newly introduced.
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sys/stat.h>
 #include <time.h>
@@ -157,10 +161,21 @@ void CodeMapWriter::AppendBlock(const FEXCore::ExecutableFileSectionInfo& Sectio
     return;
   }
 
-  BlockEntry -= SectionInfo.FileStartVA;
-  if (BlockEntry > std::numeric_limits<uint32_t>::max()) {
-    ERROR_AND_DIE_FMT("Cannot write code map");
+  // A block outside the 4 GiB window above the section's FileStartVA has no
+  // code-map representation. That used to be fatal, which killed every
+  // fexproton title on the 64K host: wine maps a PE image in several views
+  // and FirstVMA is not always the lowest one, so a block from a view below
+  // it went negative here. The code map is an optimisation; skip the block.
+  const uint64_t Offset = BlockEntry - SectionInfo.FileStartVA;
+  if (Offset > std::numeric_limits<uint32_t>::max()) {
+    static std::atomic<bool> Logged {false};
+    if (!Logged.exchange(true)) {
+      LogMan::Msg::EFmt("Code map: block {:#x} lies outside the 4 GiB window of {} (FileStartVA {:#x}); not recorded (reported once)",
+                        BlockEntry, SectionInfo.FileInfo.Filename, SectionInfo.FileStartVA);
+    }
+    return;
   }
+  BlockEntry = Offset;
 
   // Register new library if not already known
   bool NewLibraryLoad = false;
@@ -256,7 +271,21 @@ uint64_t SanitizeId(uint64_t Id) {
   }
   return Id;
 }
+
+// Detected host features, registered by the context before the id is first
+// computed. See SetCodeCacheHostFeatures.
+std::atomic<const HostFeatures*> CodeCacheHostFeatures {nullptr};
 } // namespace
+
+void SetCodeCacheHostFeatures(const HostFeatures& Features) {
+  // The first context's features win; later contexts in the process are built
+  // from the same detection.
+  static std::once_flag Once;
+  std::call_once(Once, [&Features] {
+    static const HostFeatures Copy = Features;
+    CodeCacheHostFeatures.store(&Copy, std::memory_order_release);
+  });
+}
 
 uint64_t ComputeCodeCacheConfigId() {
   // Computed once: config is loaded before any mapping is tracked and does not
@@ -567,22 +596,40 @@ uint64_t ComputeCodeCacheConfigId() {
     // provably cannot change the bytes of a cache-mode compile. Do not "fix"
     // this by enabling linking under caching.
 
-    // NOT hashed, and this one IS a gap — flagged deliberately, scoped
-    // separately, do not bolt a fix on here. Everything above is requested
-    // config or an env switch. NOT ONE detected host capability is hashed, and
-    // several of them decide which instructions get emitted:
-    //   * HostFeatures::SupportsISA30 (Source/Common/HostFeatures.cpp:746, from
-    //     HWCAP2 & PPC_FEATURE2_ARCH_3_00_) gates lxvx / stxvx / lxsibzx /
-    //     lxsihzx / mcrxrx. A POWER9-generated cache loaded on POWER8 is a
-    //     SIGILL on the first lxvx, not a slowdown.
-    //   * HostFeatures::DCacheLineSize (:729/:796) is baked into the dcbz block
-    //     shift, so a cache from a host with a different line size zeroes the
-    //     wrong span.
-    // The effective-HWTSO hash above is one instance of this class that had a
-    // live consequence, which is why it was fixed on its own. Closing the rest
-    // needs a decision on how host capability is canonicalised (the detected
-    // set, or the subset the emitters actually branch on) and belongs in its own
-    // change.
+    // 3. Detected host capabilities. Several decide which instructions are
+    //    emitted: SupportsISA30 gates lxvx / stxvx / lxsibzx / lxsihzx / mcrxrx
+    //    (a POWER9 cache on POWER8 is a SIGILL), and DCacheLineSize is baked
+    //    into the dcbz block shift. Every field is hashed; the size assert
+    //    catches a new one. MIDRs as distinct values, since their count follows
+    //    the CPU affinity.
+    {
+      const auto* Features = CodeCacheHostFeatures.load(std::memory_order_acquire);
+      if (!Features) {
+        XXH3_freeState(State);
+        return InvalidFileId;
+      }
+      static_assert(sizeof(HostFeatures) == 72, "HostFeatures changed: hash the new field below");
+      const auto& F = *Features;
+      for (uint64_t V : {uint64_t {F.DCacheLineSize}, uint64_t {F.ICacheLineSize}}) {
+        Hasher.Add(V);
+      }
+      for (bool B : {F.SupportsCacheMaintenanceOps, F.SupportsAES, F.SupportsCRC, F.SupportsCLZERO, F.SupportsAtomics, F.SupportsRCPC,
+                     F.SupportsTSOImm9, F.SupportsTSODisp16, F.SupportsRAND, F.SupportsAVX, F.SupportsAVX2, F.SupportsSVE128, F.SupportsSVE256,
+                     F.SupportsSHA, F.SupportsPMULL_128Bit, F.SupportsCSSC, F.SupportsFCMA, F.SupportsFlagM, F.SupportsFlagM2, F.SupportsFCmpX86,
+                     F.SupportsRPRES, F.SupportsPreserveAllABI, F.SupportsAES256, F.SupportsSVEBitPerm, F.SupportsCPUIndexInTPIDRRO,
+                     F.SupportsFRINTTS, F.SupportsECV, F.SupportsWFXT, F.Supports3DNow, F.SupportsSSE4a, F.SupportsMOPS, F.SupportsISA30,
+                     F.SupportsVCmpFlagBranch, F.SupportsFlagTransparentSelect, F.SupportsAFP, F.SupportsFloatExceptions, F.IsInstCountCI}) {
+        Hasher.Add(uint64_t {B});
+      }
+      fextl::vector<uint32_t> MIDRs = F.CPUMIDRs;
+      std::sort(MIDRs.begin(), MIDRs.end());
+      MIDRs.erase(std::unique(MIDRs.begin(), MIDRs.end()), MIDRs.end());
+      Hasher.Add(uint64_t {MIDRs.size()});
+      for (uint32_t MIDR : MIDRs) {
+        Hasher.Add(uint64_t {MIDR});
+      }
+    }
+
 #undef HASH_OPT
 #undef HASH_STR_OPT
 
@@ -1511,6 +1558,22 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       if (Left < MinCodePageEntrySize) {
         LogMan::Msg::EFmt("Rejecting code cache for {}: code page entry {} of {} runs past the end of the {:#x} byte file",
                           BinarySection.FileInfo.Filename, i, header.NumCodePages, FileSize);
+        CTX.LatestOffset -= header.CodeBufferSize;
+        return false;
+      }
+
+      // FEX_SMCGRANULEMIXED (64K hosts): cached blocks carry no per-instruction
+      // validation guards and the load's MarkGuestExecutableRange would not
+      // arm a demoted granule, so a section touching one cannot be loaded
+      // soundly. Rare by construction (the granule must have been demoted
+      // while this image was mapped but before its cache loaded); the cost is
+      // a recompile of the section, which then guards where it must.
+      uint64_t CodePage;
+      ::memcpy(&CodePage, Cursor, sizeof(CodePage));
+      if (CTX.SyscallHandler && CTX.SyscallHandler->GuestCodePageValidateOnly(CodePage + BinarySection.FileStartVA)) {
+        LogMan::Msg::IFmt("Rejecting code cache for {}: guest page {:#x} lies in a demoted mixed code/data granule (FEX_SMCGRANULEMIXED) "
+                          "and cached blocks carry no validation guards",
+                          BinarySection.FileInfo.Filename, CodePage + BinarySection.FileStartVA);
         CTX.LatestOffset -= header.CodeBufferSize;
         return false;
       }

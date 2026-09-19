@@ -8,6 +8,7 @@ $end_info$
 
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/THP.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
 #include "Interface/Context/Context.h"
@@ -34,7 +35,18 @@ GuestToHostMap::GuestToHostMap() {
 LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   : ctx {CTX} {
 
-  TotalCacheSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE + MAX_L1_SIZE;
+  const size_t L2TableSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8;
+
+  // THP (FEX_THP=lookup): the hints below only take on a PMD-aligned window,
+  // and neither the reservation base (4K-granular placement hint) nor the L1's
+  // offset (the 32-bit L2 table is 8 MiB) is aligned by construction. When the
+  // site is on and the kernel has THP, align the reservation to the PMD and pad
+  // the L2 table up to a PMD multiple so PageMemory and the L1 both start on a
+  // boundary. Address space only: the pad is never touched. Off, or on a
+  // kernel without THP, ThpAlign is 0 and the layout is the historical one.
+  const size_t ThpAlign = FEXCore::Allocator::THP::AlignmentFor(FEXCore::Allocator::THP::Lookup, MAX_L1_SIZE);
+  L2TableSpan = ThpAlign ? ((L2TableSize + ThpAlign - 1) & ~(ThpAlign - 1)) : L2TableSize;
+  TotalCacheSize = L2TableSpan + CODE_SIZE + MAX_L1_SIZE;
 
   // Block cache ends up looking like this
   // PageMemoryMap[VirtualMemoryRegion >> 12]
@@ -48,16 +60,25 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // Allocate a region of memory that we can use to back our block pointers
   // We need one pointer per page of virtual memory
   // At 64GB of virtual memory this will allocate 128MB of virtual memory space
-  PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
-  LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
+  if (ThpAlign) {
+    void* Raw = FEXCore::Allocator::VirtualAlloc(TotalCacheSize + ThpAlign, false, false);
+    void* Aligned = Raw ? FEXCore::Allocator::THP::TrimToAlignment(Raw, TotalCacheSize + ThpAlign, TotalCacheSize, ThpAlign) : nullptr;
+    if (!Aligned && Raw) {
+      Aligned = Raw;
+      FEXCore::Allocator::VirtualFree(static_cast<uint8_t*>(Raw) + TotalCacheSize, ThpAlign);
+    }
+    PagePointer = reinterpret_cast<uintptr_t>(Aligned);
+  } else {
+    PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
+  }
+  LOGMAN_THROW_A_FMT(PagePointer != -1ULL && PagePointer != 0, "Failed to allocate PagePointer");
 
   // Disable THP across the whole reservation by default: the L2 *entry pool*
   // (the CODE_SIZE middle region) is bump-allocated sparsely and does not want
   // 2 MiB granularity. The two randomly-indexed tables re-enable it below.
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
 
-  FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
-                                  ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE);
+  FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer), L2TableSpan + CODE_SIZE);
   CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
 
   // Allocate our memory backing our pages
@@ -65,7 +86,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // XXX: We can drop down to 16KB if we store 4byte offsets from the code base
   // We currently limit to 128MB of real memory for caching for the total cache size.
   // Can end up being inefficient if we compile a small number of blocks per page
-  PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8;
+  PageMemory = PagePointer + L2TableSpan;
 
   // L1 Cache
   L1Pointer = PageMemory + CODE_SIZE;
@@ -97,10 +118,13 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // is still exactly one madvise() syscall with no userspace allocation, and
   // the memset fallback still works if it fails. The only behavioural change
   // is that the first touch after a scrub re-faults at huge-page granularity.
-  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(L1Pointer), MAX_L1_SIZE, FEXCore::Allocator::THPControl::Enable);
-  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer),
-                                        ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8,
-                                        FEXCore::Allocator::THPControl::Enable);
+  //
+  // Knob-gated (FEX_THP=lookup, OFF by default): the cache is per thread, so
+  // with the reservation now actually aligned every thread's first L1 touch
+  // would fault a whole 16 MiB huge page (a 100-thread title: +1.6 GiB RSS)
+  // even at MIN_L1_ENTRIES. That is a measurement, not a default.
+  FEXCore::Allocator::THP::Hint(reinterpret_cast<const void*>(L1Pointer), MAX_L1_SIZE, FEXCore::Allocator::THP::Lookup);
+  FEXCore::Allocator::THP::Hint(reinterpret_cast<const void*>(PagePointer), L2TableSpan, FEXCore::Allocator::THP::Lookup);
 
   VirtualMemSize = ctx->Config.VirtualMemSize;
 
@@ -125,8 +149,9 @@ LookupCache::~LookupCache() {
 void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
   // Clear out the page memory
   // PagePointer and PageMemory are sequential with each other. Clear both at once.
-  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
-                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_GUEST_PAGE_SIZE * 8 + CODE_SIZE, false);
+  // L2TableSpan, not the raw table size: under FEX_THP=lookup the table is padded
+  // to the PMD and PageMemory starts after the pad.
+  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer), L2TableSpan + CODE_SIZE, false);
   AllocateOffset = 0;
 }
 

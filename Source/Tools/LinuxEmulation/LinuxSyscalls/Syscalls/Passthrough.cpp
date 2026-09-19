@@ -670,10 +670,23 @@ uint64_t ObservedFutexSyscall(FEXCore::Core::CpuStateFrame* Frame,
       }
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
-      char buf[192];
-      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x\n",
+      // The guest return address ([rsp] at the syscall instruction), read
+      // fault-free: the RIP is always libc's syscall wrapper, the caller is
+      // the thing to name (wine's ntdll.so for a Proton title).
+      uint64_t RetAddr = 0;
+      {
+        struct iovec RL;
+        RL.iov_base = &RetAddr;
+        RL.iov_len = sizeof(RetAddr);
+        struct iovec RR;
+        RR.iov_base = reinterpret_cast<void*>(Frame->State.gregs[FEXCore::X86State::REG_RSP]);
+        RR.iov_len = sizeof(RetAddr);
+        process_vm_readv(::getpid(), &RL, 1, &RR, 1, 0);
+      }
+      char buf[256];
+      int n = snprintf(buf, sizeof(buf), "[FTX %ld.%03ld] t=%d op=0x%lx u=0x%lx val=0x%lx to=0x%lx r=%ld cur=0x%x rip=0x%lx ret=0x%lx\n",
                        (long)now.tv_sec, now.tv_nsec / 1000000, static_cast<int>(tls_tid), (unsigned long)futex_op,
-                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur);
+                       (unsigned long)uaddr, (unsigned long)val, (unsigned long)timeout, (long)signed_result, cur, static_cast<unsigned long>(Frame->State.rip), static_cast<unsigned long>(RetAddr));
       [[maybe_unused]] auto _ = write(trace_fd, buf, n);
       }
     }
@@ -1364,6 +1377,82 @@ namespace x64 {
         return static_cast<uint64_t>(-EINTR);
       }
 
+      // FEX_NTSYNC_TRACE entry line for waits: the return-side line below
+      // cannot exist for a thread that is parked in its wait right now, which
+      // is exactly the thread a wedge investigation needs to see. Same arming
+      // and file as the return-side trace (opened there on first use; here we
+      // only write if it is already open).
+      if (NtsyncWait) {
+        static const bool trace_ntsync_entry = (getenv("FEX_NTSYNC_TRACE") != nullptr);
+        if (trace_ntsync_entry && access("/tmp/nts_on", F_OK) == 0) {
+          char path[64];
+          snprintf(path, sizeof(path), "/tmp/nts.%d.log", static_cast<int>(::getpid()));
+          const int efd = ::open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
+          if (efd >= 0) {
+            struct timespec ts {};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            char line[768];
+            int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d ENTER nr=0x%x arg=0x%lx", static_cast<long>(ts.tv_sec),
+                             static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(::syscall(SYS_gettid)), IoctlNr, arg);
+            // The wait arguments, and each object's live state through the
+            // *_READ ioctls (the one that succeeds also names the type: wine's
+            // server creates the objects, so the client trace has no CREATE
+            // lines to type them from). A thread parking on an object that
+            // reads as signalled is a lost wake.
+            struct WaitArgsE {
+              uint64_t timeout;
+              uint64_t objs;
+              uint32_t count;
+              uint32_t index;
+              uint32_t flags;
+              uint32_t owner;
+              uint32_t alert;
+              uint32_t pad;
+            };
+            WaitArgsE WA {};
+            struct iovec L;
+            L.iov_base = &WA;
+            L.iov_len = sizeof(WA);
+            struct iovec R;
+            R.iov_base = reinterpret_cast<void*>(arg);
+            R.iov_len = sizeof(WA);
+            if (n > 0 && process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
+              uint32_t Objs[16] = {};
+              const uint32_t Count = WA.count > 16 ? 16 : WA.count;
+              struct iovec L2;
+              L2.iov_base = Objs;
+              L2.iov_len = Count * sizeof(uint32_t);
+              struct iovec R2;
+              R2.iov_base = reinterpret_cast<void*>(WA.objs);
+              R2.iov_len = Count * sizeof(uint32_t);
+              process_vm_readv(::getpid(), &L2, 1, &R2, 1, 0);
+              n += snprintf(line + n, sizeof(line) - n, " to=%lx count=%u owner=%u alert=%u objs=", static_cast<unsigned long>(WA.timeout),
+                            WA.count, WA.owner, WA.alert);
+              for (uint32_t i = 0; i < Count && n < static_cast<int>(sizeof(line)) - 64; ++i) {
+                uint32_t St[2];
+                St[0] = 0;
+                St[1] = 0;
+                const char* Type = "?";
+                // PPC encodings of _IOR('N', 0x8d/0x8b/0x8c, 8-byte struct).
+                if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8d, St) == 0) {
+                  Type = "event";
+                } else if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8b, St) == 0) {
+                  Type = "sem";
+                } else if (::ioctl(static_cast<int>(Objs[i]), 0x40084e8c, St) == 0) {
+                  Type = "mutex";
+                }
+                n += snprintf(line + n, sizeof(line) - n, "%s%u:%s(%u,%u)", i ? "," : "", Objs[i], Type, St[0], St[1]);
+              }
+            }
+            n += snprintf(line + n, sizeof(line) - n, "\n");
+            if (n > 0) {
+              [[maybe_unused]] auto _ = ::write(efd, line, static_cast<size_t>(n));
+            }
+            ::close(efd);
+          }
+        }
+      }
+
       uint64_t Result = ::ioctl(fd, cmd, arg);
       if (NtsyncWait) {
         while (Result == static_cast<uint64_t>(-1) && errno == EINTR && !HasGuestDeliverableSignal(Frame)) {
@@ -1413,10 +1502,51 @@ namespace x64 {
             struct timespec ts {};
             clock_gettime(CLOCK_MONOTONIC, &ts);
             const int64_t sr = static_cast<int64_t>(Result);
-            char line[192];
-            const int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
+            char line[512];
+            int n = snprintf(line, sizeof(line), "[NTS %ld.%03ld] t=%d fd=%d nr=0x%x cmd=0x%x arg=0x%lx r=%ld errno=%d\n",
                                    static_cast<long>(ts.tv_sec), static_cast<long>(ts.tv_nsec / 1000000), static_cast<int>(nts_tid), fd,
                                    IoctlNr, cmd, arg, static_cast<long>(sr), sr == -1 ? saved_errno : 0);
+            // WAIT_ANY/WAIT_ALL: the wait arguments and the object fds, read
+            // fault-free, so a park shows WHICH objects the waiters block on
+            // (the fd -> type map comes from the CREATE_* lines above them).
+            if (n > 0 && NtsyncWait) {
+              // Inside a registration macro: no commas in declarations.
+              struct WaitArgs {
+                uint64_t timeout;
+                uint64_t objs;
+                uint32_t count;
+                uint32_t index;
+                uint32_t flags;
+                uint32_t owner;
+                uint32_t alert;
+                uint32_t pad;
+              };
+              WaitArgs WA {};
+              struct iovec L;
+              L.iov_base = &WA;
+              L.iov_len = sizeof(WA);
+              struct iovec R;
+              R.iov_base = reinterpret_cast<void*>(arg);
+              R.iov_len = sizeof(WA);
+              if (process_vm_readv(::getpid(), &L, 1, &R, 1, 0) == static_cast<ssize_t>(sizeof(WA))) {
+                uint32_t Objs[16] = {};
+                const uint32_t Count = WA.count > 16 ? 16 : WA.count;
+                struct iovec L2;
+                L2.iov_base = Objs;
+                L2.iov_len = Count * sizeof(uint32_t);
+                struct iovec R2;
+                R2.iov_base = reinterpret_cast<void*>(WA.objs);
+                R2.iov_len = Count * sizeof(uint32_t);
+                process_vm_readv(::getpid(), &L2, 1, &R2, 1, 0);
+                int m = snprintf(line + n - 1, sizeof(line) - n + 1, " wait{to=%lx count=%u owner=%u alert=%u idx=%u objs=",
+                                 static_cast<unsigned long>(WA.timeout), WA.count, WA.owner, WA.alert, WA.index);
+                for (uint32_t i = 0; i < Count && m > 0 && n - 1 + m < static_cast<int>(sizeof(line)) - 8; ++i) {
+                  m += snprintf(line + n - 1 + m, sizeof(line) - n + 1 - m, "%s%u", i ? "," : "", Objs[i]);
+                }
+                m += snprintf(line + n - 1 + m, sizeof(line) - n + 1 - m, "}\n");
+                n = n - 1 + m;
+              }
+            }
             if (n > 0) {
               [[maybe_unused]] auto _ = ::write(nts_fd, line, static_cast<size_t>(n));
             }

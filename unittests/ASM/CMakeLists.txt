@@ -55,6 +55,16 @@ foreach(ASM_SRC ${ASM_SOURCES})
       "FEX_SILENTLOG=0 FEX_DUMPGPRS=1 FEX_MAXINST=1 FEX_MULTIBLOCK=0 FEX_TSOENABLED=0"   "jit_1"     "jit"
       "FEX_SILENTLOG=0 FEX_DUMPGPRS=1 FEX_MAXINST=500 FEX_MULTIBLOCK=0 FEX_TSOENABLED=0" "jit_500"   "jit"
       "FEX_SILENTLOG=0 FEX_DUMPGPRS=1 FEX_MAXINST=500 FEX_MULTIBLOCK=1 FEX_TSOENABLED=0" "jit_500_m" "jit")
+    if (ENABLE_SMC_FULL_TESTS)
+      # The SMCChecks=full tier: every instruction is compiled as its own
+      # continuation block (multi-instruction jit_500 blocks are what
+      # exercise it). Never covered before 2026-09-14, which is how
+      # 3bada1c9d's cached-constant bug hid. Per-variant expectations go
+      # into Known_Failures_jit / Disabled_Tests by full name,
+      # "jit_500_smcfull/Test_64Bit_<path>.asm".
+      list(APPEND TEST_ARGS
+        "FEX_SILENTLOG=0 FEX_DUMPGPRS=1 FEX_MAXINST=500 FEX_MULTIBLOCK=0 FEX_TSOENABLED=0 FEX_SMCCHECKS=full" "jit_500_smcfull" "jit")
+    endif()
   endif()
 
   if (ENABLE_VIXL_SIMULATOR)
@@ -83,7 +93,7 @@ foreach(ASM_SRC ${ASM_SOURCES})
     set(TEST_NAME "${TEST_DESC}/Test_64Bit_${REL_TEST_ASM}")
     string(REPLACE " " ";" FEX_ARGS_LIST ${FEX_ARGS})
 
-    if (TEST_NAME MATCHES "SelfModifyingCode")
+    if (TEST_NAME MATCHES "SelfModifyingCode" AND NOT "FEX_SMCCHECKS=full" IN_LIST FEX_ARGS_LIST)
       list(APPEND FEX_ARGS_LIST "FEX_SMCCHECKS=full")
     endif()
 

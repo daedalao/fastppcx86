@@ -85,6 +85,12 @@ using GuestAddressRange = std::pair<uint64_t, uint64_t>;
  */
 FEX_DEFAULT_VISIBILITY uint64_t ComputeCodeCacheConfigId();
 
+struct HostFeatures;
+// Records the detected host features that ComputeCodeCacheConfigId folds in.
+// Must be called before the first ComputeCodeCacheConfigId; without it the id
+// is the invalid sentinel and nothing is loaded or written.
+FEX_DEFAULT_VISIBILITY void SetCodeCacheHostFeatures(const HostFeatures&);
+
 // Information associated with a specific section of an executable file
 struct ExecutableFileSectionInfo {
   const ExecutableFileInfo& FileInfo;
@@ -98,6 +104,12 @@ struct ExecutableFileSectionInfo {
 
   // End address that of the section mapping
   uintptr_t EndVA;
+
+  // Optional owner of FileInfo. A frontend whose file infos can be retired
+  // by another thread while a section is in flight (the Linux frontend's
+  // MappedResource, freed by munmap) sets it so FileInfo stays valid for the
+  // section's lifetime; aggregate initialisers that omit it are unchanged.
+  fextl::shared_ptr<const ExecutableFileInfo> Keepalive {};
 };
 
 using CodeMapFileId = uint64_t;

@@ -302,6 +302,7 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
   , CodeCache {*this} {
+  FEXCore::SetCodeCacheHostFeatures(Features);
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
@@ -1197,6 +1198,25 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
 
+    // FEX_SMCGRANULEMIXED (64K hosts): a guest page whose host granule mtrack
+    // has stopped write-protecting gets the SMCCHECKS=full treatment per block
+    // instead -- every instruction validated against its decoded bytes. The
+    // answer is read here, under this function's shared CodeInvalidationMutex,
+    // and MarkGuestExecutableRange below reads the same bit under the same
+    // hold; a demotion in between is followed by an exclusive invalidation of
+    // the granule that kills whatever this compile publishes. Decided over all
+    // of the decode's pages: a multiblock that touches one demoted page is
+    // guarded in full. See LinuxSyscalls/SMCHostGranule.h.
+    bool CodePagesValidateOnly = false;
+    if (SyscallHandler && Config.SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+      for (auto CodePage : BlockInfo->CodePages) {
+        if (SyscallHandler->GuestCodePageValidateOnly(CodePage)) {
+          CodePagesValidateOnly = true;
+          break;
+        }
+      }
+    }
+
     Thread->OpDispatcher->BeginFunction(GuestRIP, CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
 
@@ -1216,6 +1236,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     std::shared_lock ForceTSOlk(ForceTSOMutex);
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
+      // Per-instruction ValidateCode guards: the whole process (SMCCHECKS=full),
+      // the mono tailcall block (Frontend), or a demoted mixed granule.
+      const bool FullSMCValidation =
+        Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || CodePagesValidateOnly;
 
 #ifdef ZYDIS_DISASSEMBLER
       if (FEXCore::Config::Get_X86DISASSEMBLE() && CodeBlocks->size() > 1) {
@@ -1347,7 +1371,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // (DEF_OP(GuestOpcode) only records the cursor).
         Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        if (FullSMCValidation) {
           // Evidence gate for the accumulator-vs-decoder-PC audit: use
           // DecodedInfo->PC (the address the decoder actually decoded from)
           // as the validated address, not InstAddress (a running total
@@ -1454,7 +1478,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           //     instruction, which swallowed instructions would not get.
           // Both are rare/one-off modes, so refusing to fuse in them costs
           // nothing and removes two whole classes of interaction.
-          const bool FusionWindowSafe = !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !Block.ForceFullSMCDetection;
+          const bool FusionWindowSafe = !ExtendedDebugInfo && !FullSMCValidation;
           Thread->OpDispatcher->SetDecodeWindow(FusionWindowSafe ? &Block : nullptr, i);
 
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
@@ -1958,6 +1982,21 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
     return 0;
   }
 
+  // FEX_SMCGRANULEMIXED: a retained block was compiled without per-instruction
+  // guards, and the re-arm below is skipped for a demoted granule, so a
+  // retained block on a demoted page has nothing keeping it sound. Refuse the
+  // relink; the fresh compile that follows reads the demoted bit and guards.
+  if (SyscallHandler) {
+    for (auto CodePage : Retained->CodePages) {
+      if (SyscallHandler->GuestCodePageValidateOnly(CodePage)) {
+        if (SMCAuditCompileFD() >= 0) {
+          dprintf(SMCAuditCompileFD(), "relink-refused-demoted rip=%lx page=%lx\n", GuestRIP, CodePage);
+        }
+        return 0;
+      }
+    }
+  }
+
   // Unchanged: re-publish. Registering the code pages again re-arms mtrack's
   // write protection through the same path a fresh compile uses, so the page
   // becomes protected exactly when live code reappears on it.
@@ -1971,6 +2010,36 @@ uintptr_t ContextImpl::TryRelinkSoftInvalidatedBlock(FEXCore::Core::InternalThre
       Thread, Entrypoints, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE, Retained->GuestRangeStart, Retained->GuestRangeLength);
     if (NewPage) {
       SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+    }
+  }
+
+  // SMC soundness -- VERIFY-AFTER-ARM.  The CurrentHash compare at the top of
+  // this function ran with the granule still WRITABLE: on the strict/mtrack
+  // path the fault handler unprotects the granule to R+W and returns, and the
+  // faulting guest store retires only after sigreturn.  A store the handler had
+  // already admitted but that had not yet retired was therefore invisible to
+  // that first hash -- it matched the stale bytes, and we arrived here about to
+  // republish a translation of code that is about to change.  This is the 64K
+  // concurrent-self-modification race (CoreCLR tiering / JVM re-JIT patch a call
+  // site on a background thread while a mutator relinks the same granule).
+  //
+  // MarkGuestExecutableRange above re-armed every code page with an
+  // mprotect(PROT_READ) -- a full barrier with a TLB shootdown -- so the racing
+  // store now either landed BEFORE the arm (and a re-hash sees it) or lands
+  // AFTER it (and faults, soft-invalidating this block).  Re-hash under the arm;
+  // a mismatch means the bytes moved out from under this translation, so drop it
+  // and let the caller compile fresh, exactly as the first-hash miss does.  The
+  // re-hash costs one XXH3 over the retained span, only on the relink path.
+  // See Interface/Core/SMCSoftInvalidate.h, "VERIFY-AFTER-ARM".
+  {
+    const uint64_t ArmedHash =
+      FEXCore::SMC::HashGuestBlock(Retained->CodePages, Retained->GuestRangeStart, Retained->GuestRangeLength);
+    if (ArmedHash != Retained->GuestHash) {
+      RecordCodeRangeInvalidation(Retained->GuestRangeStart, Retained->GuestRangeLength);
+      if (SMCAuditCompileFD() >= 0) {
+        dprintf(SMCAuditCompileFD(), "relink-miss-postarm rip=%lx\n", GuestRIP);
+      }
+      return 0;
     }
   }
 

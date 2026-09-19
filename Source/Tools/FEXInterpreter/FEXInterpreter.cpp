@@ -7,9 +7,11 @@ $end_info$
 */
 
 #include "Common/HostPageGate.h"
+#include <FEXCore/Utils/THP.h>
 #include "Common/ArgumentLoader.h"
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
+#include "Common/FDUtils.h"
 #include "Common/HostFeatures.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "PortabilityInfo.h"
@@ -79,7 +81,67 @@ static int OutputFD {STDERR_FILENO};
 // Set an empty style to disable coloring when FEXServer output is e.g. piped to a file
 static bool DisableOutputColors {};
 
+// Messages logged before Init() has read SilentLog and OutputLog. Until then
+// the destination isn't known, and stderr belongs to the guest: writing there
+// breaks programs that capture or compare it (a server start race once put
+// "Couldn't connect to ...Server socket" into a compiler's stderr). Init()
+// replays these to the configured log. When logging is silent (the default)
+// it drops the debug and info ones but keeps holding the errors: they are
+// written to stderr if the process then fails (FlushHeldErrorsToStderr), so a
+// FEXServer or rootfs problem that stops the guest is still explained, while a
+// successful run prints nothing.
+// A fixed buffer: this runs before the allocator is set up.
+static bool Initialized {};
+// The process that ran Init(); a forked child inherits the held errors but
+// must not report them a second time.
+static pid_t HeldErrorsPID {};
+static char EarlyMessages[8192];
+static size_t EarlyMessagesUsed {};
+
+static void HoldEarlyMessage(LogMan::DebugLevels Level, const char* Message) {
+  // Entry: level byte, message, NUL. Messages that don't fit are dropped.
+  const size_t Len = strlen(Message);
+  if (EarlyMessagesUsed + Len + 2 > sizeof(EarlyMessages)) {
+    return;
+  }
+  EarlyMessages[EarlyMessagesUsed++] = static_cast<char>(Level);
+  memcpy(EarlyMessages + EarlyMessagesUsed, Message, Len + 1);
+  EarlyMessagesUsed += Len + 1;
+}
+
+static void ReplayEarlyMessages(void (*Handler)(LogMan::DebugLevels, const char*)) {
+  for (size_t Offset = 0; Offset < EarlyMessagesUsed;) {
+    const auto Level = static_cast<LogMan::DebugLevels>(EarlyMessages[Offset]);
+    const char* Message = EarlyMessages + Offset + 1;
+    if (Handler) {
+      Handler(Level, Message);
+    }
+    Offset += strlen(Message) + 2;
+  }
+  EarlyMessagesUsed = 0;
+}
+
+// Drops the held messages below error level, keeping ERROR and ASSERT.
+static void KeepEarlyErrors() {
+  size_t Kept = 0;
+  for (size_t Offset = 0; Offset < EarlyMessagesUsed;) {
+    const auto Level = static_cast<LogMan::DebugLevels>(EarlyMessages[Offset]);
+    const size_t EntryLen = strlen(EarlyMessages + Offset + 1) + 2;
+    if (Level == LogMan::ERROR || Level == LogMan::ASSERT) {
+      memmove(EarlyMessages + Kept, EarlyMessages + Offset, EntryLen);
+      Kept += EntryLen;
+    }
+    Offset += EntryLen;
+  }
+  EarlyMessagesUsed = Kept;
+}
+
 void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
+  if (!Initialized) {
+    HoldEarlyMessage(Level, Message);
+    return;
+  }
+
   if (SilentLog) {
     return;
   }
@@ -91,7 +153,43 @@ void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
 }
 
 void AssertHandler(const char* Message) {
+  if (!Initialized) {
+    // The process is about to trap: say why, wherever it goes.
+    const auto Output = fextl::fmt::format("{} {}\n", LogMan::DebugLevelStr(LogMan::ASSERT), Message);
+    write(STDERR_FILENO, Output.c_str(), Output.size());
+    return;
+  }
   return MsgHandler(LogMan::ASSERT, Message);
+}
+
+// For a start-up failure before Init(): the guest never ran, so the held
+// messages are the only explanation the user gets.
+void FlushEarlyMessagesToStderr() {
+  Initialized = true;
+  SilentLog = false;
+  OutputFD = STDERR_FILENO;
+  DisableOutputColors = !isatty(OutputFD);
+  ReplayEarlyMessages(MsgHandler);
+}
+
+// The process is failing (start-up could not finish, or the guest exits with a
+// nonzero status) while logging is silent: write the errors held from before
+// Init() to stderr, since they may be the only explanation. Nothing is held,
+// and nothing is written, unless something logged an error before Init().
+void FlushHeldErrorsToStderr() {
+  if (EarlyMessagesUsed == 0 || getpid() != HeldErrorsPID) {
+    return;
+  }
+  const bool Colors = isatty(STDERR_FILENO);
+  for (size_t Offset = 0; Offset < EarlyMessagesUsed;) {
+    const auto Level = static_cast<LogMan::DebugLevels>(EarlyMessages[Offset]);
+    const char* Message = EarlyMessages + Offset + 1;
+    const auto Style = Colors ? LogMan::DebugLevelStyle(Level) : fmt::text_style {};
+    const auto Output = fextl::fmt::format("{} {}\n", fmt::styled(LogMan::DebugLevelStr(Level), Style), Message);
+    (void)!write(STDERR_FILENO, Output.c_str(), Output.size());
+    Offset += strlen(Message) + 2;
+  }
+  EarlyMessagesUsed = 0;
 }
 
 namespace FEXServer {
@@ -125,12 +223,15 @@ void Init() {
     // can run in to problems of writing to some file
     auto LogFD = OutputFD;
     if (LogFile == "stderr") {
-      LogFD = dup(STDERR_FILENO);
+      LogFD = FEX::MoveFDOutOfGuestRange(dup(STDERR_FILENO));
     } else if (LogFile == "server") {
       Logging::FEXServer::FEXServerFD = FEXServerClient::RequestLogFD(FEXServerClient::GetServerFD());
       if (FEXServer::FEXServerFD != -1) {
         LogMan::Throw::InstallHandler(Logging::FEXServer::AssertHandler);
         LogMan::Msg::InstallHandler(Logging::FEXServer::MsgHandler);
+      } else {
+        // No server log: go silent rather than fall back to the guest's stderr.
+        LogFD = -1;
       }
     } else if (!LogFile.empty()) {
       constexpr int USER_PERMS = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
@@ -138,17 +239,33 @@ void Init() {
       // run writes fewer bytes than the previous one. Alternative would be
       // O_APPEND (accumulate across runs), but the historical shape here is
       // "one log per run" — matches the stderr/stdout paths above.
-      LogFD = open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS);
+      LogFD = FEX::MoveFDOutOfGuestRange(open(LogFile.c_str(), O_CREAT | O_TRUNC | O_CLOEXEC | O_WRONLY, USER_PERMS));
+      if (LogFD == -1) {
+        // A real error: the user named a file. (A server without a log fd is
+        // the silent case by design and logs nothing; this message used to
+        // fire for it too, and being logged before Initialized it was held
+        // and replayed on every nonzero guest exit.)
+        LogMan::Msg::EFmt("Couldn't open log file {}. Going Silent.", LogFile);
+      }
     }
 
     if (LogFD == -1) {
-      LogMan::Msg::EFmt("Couldn't open log file. Going Silent.");
       Logging::SilentLog = true;
     } else {
       OutputFD = LogFD;
     }
   }
   DisableOutputColors = !isatty(OutputFD);
+  Initialized = true;
+
+  if (SilentLog) {
+    HeldErrorsPID = getpid();
+    KeepEarlyErrors();
+  } else if (FEXServer::FEXServerFD != -1) {
+    ReplayEarlyMessages(FEXServer::MsgHandler);
+  } else {
+    ReplayEarlyMessages(MsgHandler);
+  }
 }
 
 } // namespace FEX::Logging
@@ -459,6 +576,9 @@ int main(int argc, char** argv, char** const envp) {
 
   int FEXFD {StealFEXFDFromEnv("FEX_EXECVEFD")};
   int FEXSeccompFD {StealFEXFDFromEnv("FEX_SECCOMPFD")};
+  // Set by ExecveHandler: the argument after the program path is the guest's
+  // own argv[0].
+  const bool ExecveArgv0 {StealFEXFDFromEnv("FEX_EXECVEARGV0") == 1};
 
   // Early init trivial handlers.
   LogMan::Throw::InstallHandler(FEX::Logging::AssertHandler);
@@ -481,11 +601,40 @@ int main(int argc, char** argv, char** const envp) {
   FEXCore::Config::ReloadMetaLayer();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, InterpreterInstalled ? "1" : "0");
 
+  // SMC store backpatching and the code cache do not mix: the cache replays the
+  // code buffer, and backpatch stubs (absolute helper addresses, PC-relative
+  // branches to store sites) do not survive that, so
+  // CodeBufferManager::TryAllocateAuxMemory refuses every stub while
+  // EnableCodeCachingWIP is set. With the cache only loading (CodeCacheScope
+  // off) the syscall handler still enabled backpatching, which then silently
+  // placed no stub at all. The explicit SMC mode wins: turn the cache off here,
+  // before anything has read the option.
+  // Key on the EFFECTIVE mode: backpatching only arms with SMCStoreEmulation
+  // under SMCChecks=mtrack (Syscalls.cpp), so a stray FEX_SMCSTOREBACKPATCH=1
+  // without those must not cost the cache.
+  if (FEXCore::Config::Get_SMCSTOREBACKPATCH() && FEXCore::Config::Get_SMCSTOREEMULATION() &&
+      FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK && FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "0");
+    LogMan::Msg::IFmt("SMC store backpatching is on: code caching turned off (the cache cannot hold backpatch stubs)");
+  }
+
   // Host-page-size gate (64K port). Config is loaded and merged, and nothing
   // downstream exists yet: no context (CreateNewContext below caches SMCChecks
   // at construction, which is why degrade-mode forcing has to happen HERE), no
   // thread state, no guest mapping, no compiled code. Refusing is still clean.
   FEX::HostPageGate::CheckHostPageSize(true);
+
+  // THP policy (FEX_THP / FEX_THPLOG, FEXCore/Utils/THP.h). The merged config
+  // layer wins over the raw environment the header falls back to, so a
+  // per-title AppConfig row can carry it; applied before anything large is
+  // reserved (the 64-bit allocator's arena comes with InitAllocator below).
+  if (auto Value = FEXCore::Config::Get(FEXCore::Config::CONFIG_THP); Value && *Value && !(*Value)->empty()) {
+    FEXCore::Allocator::THP::SetMask(FEXCore::Allocator::THP::ParseMask((*Value)->c_str()));
+  }
+  if (auto Value = FEXCore::Config::Get(FEXCore::Config::CONFIG_THPLOG); Value && *Value && !(*Value)->empty()) {
+    FEXCore::Allocator::THP::SetLogLevel(static_cast<int>(std::strtol((*Value)->c_str(), nullptr, 10)));
+  }
+  FEXCore::Allocator::THP::InstallReportAtExit();
 #ifdef VIXL_SIMULATOR
   // If running under the vixl simulator, ensure that indirect runtime calls are enabled.
   FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "0");
@@ -512,6 +661,7 @@ int main(int argc, char** argv, char** const envp) {
   auto SelfPath = FEX::GetSelfPath();
   if (!FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
     LogMan::Msg::EFmt("FEXServerClient: Failure to setup client");
+    FEX::Logging::FlushEarlyMessagesToStderr();
     return -1;
   }
 
@@ -546,6 +696,7 @@ int main(int argc, char** argv, char** const envp) {
     // Early exit if the program passed in doesn't exist
     // Will prevent a crash later
     fextl::fmt::print(stderr, "{}: command not found\n", Program.ProgramPath);
+    FEX::Logging::FlushHeldErrorsToStderr();
     return -ENOEXEC;
   }
 
@@ -559,6 +710,10 @@ int main(int argc, char** argv, char** const envp) {
     // We are going to keep these alive in memory.
     // No need to split the string with setenv
     putenv(HostEnv.data());
+  }
+
+  if (ExecveArgv0 && Args.size() > 1) {
+    Args.erase(Args.begin());
   }
 
   ELFCodeLoader Loader {Program.ProgramPath, FEXFD, LDPath(), Args, ParsedArgs, envp, &Environment};
@@ -577,6 +732,7 @@ int main(int argc, char** argv, char** const envp) {
 #endif
     }
 #endif
+    FEX::Logging::FlushHeldErrorsToStderr();
     return -ENOEXEC;
   }
 
@@ -636,11 +792,19 @@ int main(int argc, char** argv, char** const envp) {
                           FEX::HLE::x64::CreateHandler(CTX.get(), SignalDelegation.get(), ThunkHandler.get()) :
                           FEX::HLE::x32::CreateHandler(CTX.get(), SignalDelegation.get(), ThunkHandler.get(), std::move(Allocator));
   SyscallHandler->SetCodeLoader(&Loader);
+  FEX::HLE::GuestErrorExitHook = FEX::Logging::FlushHeldErrorsToStderr;
   CTX->SetSignalDelegator(SignalDelegation.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->SetThunkHandler(ThunkHandler.get());
 
-  if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+  // The code map only feeds server-side offline generation (FEX_SERVERCODECACHE,
+  // below). Without it the writer is a server round trip plus a write per
+  // compiled block that nothing reads.
+  const bool ServerCodeCache = FEXCore::Config::Get_ENABLECODECACHINGWIP() && [] {
+    const char* Env = getenv("FEX_SERVERCODECACHE");
+    return Env && *Env && *Env != '0';
+  }();
+  if (ServerCodeCache) {
     CTX->SetCodeMapWriter(fextl::make_unique<FEXCore::CodeMapWriter>(*SyscallHandler));
   }
 
@@ -673,6 +837,7 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   if (!CTX->InitCore()) {
+    FEX::Logging::FlushHeldErrorsToStderr();
     return 1;
   }
 
@@ -698,6 +863,7 @@ int main(int argc, char** argv, char** const envp) {
     if (!Loader.MapMemory(SyscallHandler.get(), ParentThread->Thread)) {
       // failed to map
       LogMan::Msg::EFmt("Failed to map {}-bit elf file.", Loader.Is64BitMode() ? 64 : 32);
+      FEX::Logging::FlushHeldErrorsToStderr();
       return -ENOEXEC;
     }
   }
@@ -706,9 +872,22 @@ int main(int argc, char** argv, char** const envp) {
 
   SyscallHandler->DefaultProgramBreak(BRKInfo.Base, BRKInfo.Size);
 
-  // Request code cache generation
-  if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
-    FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+  // Request server-side code cache generation. Opt-in (FEX_SERVERCODECACHE=1)
+  // until the generator can reproduce the requesting client's configuration:
+  // FEXServer's staleness test compares against a cache filename with a zero
+  // unique id that nothing ever writes, so every request schedules an offline
+  // recompile of every binary in the code map, and FEXOfflineCompiler loads
+  // its config with an empty environment, so the cache id it writes never
+  // matches the id a runtime reader computes (docs/TASK_QUEUE.md T1/T3). The
+  // path was dormant only while FEXOfflineCompiler was off PATH; the fexplay
+  // launcher puts the build's Bin on PATH, and on the 64K box every Linux-lane
+  // launch was spawning offline compiles (seconds of a core each) whose
+  // output nobody loaded. The runtime writer (SaveCodeCaches, FEX_CODECACHESCOPE) is the
+  // generator whose id matches its reader, and it needs no server help.
+  {
+    if (ServerCodeCache) {
+      FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    }
   }
 
   // Pull RIP and stack pointer from loader and set the thread data to it.
@@ -738,6 +917,9 @@ int main(int argc, char** argv, char** const envp) {
   SyscallHandler->SaveCodeCaches(ParentThread->Thread, true);
 
   auto ProgramStatus = ParentThread->StatusCode;
+  if (ProgramStatus & 0xff) {
+    FEX::Logging::FlushHeldErrorsToStderr();
+  }
 
   FEX::VDSO::UnloadVDSOMapping(ParentThread->Thread, SyscallHandler.get(), VDSOMapping);
 

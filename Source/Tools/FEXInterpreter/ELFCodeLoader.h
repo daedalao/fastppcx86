@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #pragma once
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // Host page size (64K port, stage S2)
@@ -131,7 +132,16 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
     // The shared first host page may already carry a read-only protection from
     // the previous segment; open a write window over it for the pread.
-    const uintptr_t OverlapEnd = std::min(HostEnd, HostMappedEnd);
+    // Clamped to [HostStart, HostEnd]: for the first segment of a file (or any
+    // segment not adjoining the previous one) HostMappedEnd lies below
+    // HostStart and there is no overlap at all. Unclamped, OverlapEnd was 0 for
+    // a file whose FIRST segment needs the fallback, so the final protection
+    // below became mprotect(0, HostEnd, prot), failed on the unmapped low
+    // range, and the segment kept its PROT_READ|PROT_WRITE write window: every
+    // non-PIE i386 executable (text at 0x8048000, never 64K-aligned) ran with
+    // a read-write, non-executable text and died at its entry block with
+    // "NoExec instruction" on the 64K host (Dex, 2026-09-14).
+    const uintptr_t OverlapEnd = std::clamp(HostMappedEnd, HostStart, HostEnd);
     if (HostStart < OverlapEnd) {
       Handler->GuestMprotect(Thread, (void*)HostStart, OverlapEnd - HostStart, PROT_READ | PROT_WRITE);
     }
@@ -164,6 +174,58 @@ class ELFCodeLoader final : public FEX::CodeLoader {
     const uintptr_t LastHostPage = HostEnd - FEXCore::HostPage::Size();
     HostTailProt = (LastHostPage < OverlapEnd) ? (prot | HostTailProt) : prot;
     HostMappedEnd = HostEnd;
+    return true;
+  }
+
+  // 64K: back [BSSStart, BSSPageEnd) when the host page is larger than 4K.
+  // BSSStart is wherever p_filesz ends and BSSPageEnd is only 4K-aligned, so the
+  // BSS can begin inside a host page that is
+  //   (a) already materialised by this ELF: the file-backed tail of this
+  //       segment's own mapping, or a previous segment's last host page (text
+  //       and a p_filesz == 0 RW segment share one when p_align < host page), or
+  //   (b) not mapped at all, when p_filesz == 0 and no earlier segment reaches
+  //       that host page.
+  // Case (b) used to be skipped: the anonymous map started at the host page
+  // ABOVE BSSStart, so the first host page of .bss stayed unmapped and a write
+  // to it faulted. Case (a) could leave the BSS read-only (the previous
+  // segment's protection) and, for a real file mapping, full of file bytes:
+  // the kernel only zeroes past EOF, and on a 4K kernel everything past
+  // p_filesz up to the next 4K page is zeroed by the ELF loader and the rest is
+  // fresh anonymous memory.
+  bool MapBSSHostGranular(const Elf64_Phdr& Header, uintptr_t BSSStart, uintptr_t BSSPageEnd, int MapProt, int MapType,
+                          FEX::HLE::SyscallMmapInterface* const Handler, FEXCore::Core::InternalThreadState* Thread) {
+    const uintptr_t HostPage = FEXCore::HostPage::Size();
+    const uintptr_t HostBSSStart = FEXCore::HostPage::AlignDown(BSSStart);
+    const uintptr_t HostBSSEnd = FEXCore::HostPage::AlignUp(BSSPageEnd);
+
+    // (a) Host pages this ELF has already materialised.
+    const uintptr_t SharedEnd = std::min(HostMappedEnd, HostBSSEnd);
+    if (HostBSSStart < SharedEnd) {
+      // Only the last materialised host page can carry a protection other than
+      // this segment's; everything below it is this segment's own file mapping.
+      const uintptr_t TailPage = HostMappedEnd - HostPage;
+      if (TailPage < SharedEnd && (HostTailProt & MapProt) != MapProt) {
+        const uintptr_t ProtStart = std::max(HostBSSStart, TailPage);
+        Handler->GuestMprotect(Thread, (void*)ProtStart, SharedEnd - ProtStart, MapProt | HostTailProt);
+        HostTailProt |= MapProt;
+      }
+      if (Header.p_flags & PF_W) {
+        memset((void*)BSSStart, 0, std::min(SharedEnd, BSSPageEnd) - BSSStart);
+      }
+    }
+
+    // (b) Everything above them is fresh anonymous memory, starting at the host
+    // page that contains BSSStart when no segment has reached it.
+    const uintptr_t AnonStart = std::max(HostMappedEnd, HostBSSStart);
+    if (AnonStart < HostBSSEnd) {
+      auto bss = Handler->GuestMmap(Thread, (void*)AnonStart, HostBSSEnd - AnonStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
+      if (FEX::HLE::HasSyscallError(bss)) {
+        LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
+        return false;
+      }
+      HostTailProt = MapProt;
+      HostMappedEnd = HostBSSEnd;
+    }
     return true;
   }
 
@@ -283,12 +345,12 @@ class ELFCodeLoader final : public FEX::CodeLoader {
         auto BSSPageStart = PAGE_ALIGN(BSSStart);
         auto BSSPageEnd = PAGE_ALIGN(LoadBase + Header.p_vaddr + Header.p_memsz);
 
-        // Only clear padding bytes if the section is writable
-        if (Header.p_flags & PF_W) {
-          memset((void*)BSSStart, 0, BSSPageStart - BSSStart);
-        }
-
         if (FEXCore::HostPage::MatchesGuest()) {
+          // Only clear padding bytes if the section is writable
+          if (Header.p_flags & PF_W) {
+            memset((void*)BSSStart, 0, BSSPageStart - BSSStart);
+          }
+
           if (BSSPageStart != BSSPageEnd) {
             auto bss = Handler->GuestMmap(Thread, (void*)BSSPageStart, BSSPageEnd - BSSPageStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
             if (FEX::HLE::HasSyscallError(bss)) {
@@ -296,29 +358,8 @@ class ELFCodeLoader final : public FEX::CodeLoader {
               return {};
             }
           }
-        } else {
-          // 64K: BSSPageStart is only 4K-aligned, so a MAP_FIXED anonymous map there
-          // is rejected outright -- and the host pages up to HostMappedEnd are
-          // already mapped and already zero (the kernel zeroed the tail of a real
-          // mapping, MapFileFallback memset it for a pread'd one). Only map what
-          // lies beyond them.
-          const uintptr_t AnonStart = std::max<uintptr_t>(HostMappedEnd, FEXCore::HostPage::AlignUp(BSSStart));
-          const uintptr_t AnonEnd = FEXCore::HostPage::AlignUp(BSSPageEnd);
-          if (AnonStart < AnonEnd) {
-            auto bss = Handler->GuestMmap(Thread, (void*)AnonStart, AnonEnd - AnonStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
-            if (FEX::HLE::HasSyscallError(bss)) {
-              LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
-              return {};
-            }
-            HostTailProt = MapProt;
-          } else if (HostMappedEnd > FEXCore::HostPage::AlignDown(BSSPageEnd)) {
-            // The whole BSS lives inside an already-mapped host page. It still has
-            // to be writable, which the file segment's protection may not be.
-            Handler->GuestMprotect(Thread, (void*)FEXCore::HostPage::AlignDown(BSSStart),
-                                   FEXCore::HostPage::AlignUp(BSSPageEnd) - FEXCore::HostPage::AlignDown(BSSStart), MapProt | HostTailProt);
-            HostTailProt |= MapProt;
-          }
-          HostMappedEnd = std::max(HostMappedEnd, AnonEnd);
+        } else if (!MapBSSHostGranular(Header, BSSStart, BSSPageEnd, MapProt, MapType, Handler, Thread)) {
+          return {};
         }
       }
 
@@ -788,7 +829,9 @@ public:
     AuxVariables.emplace_back(auxv_t {16, HWCap});                        // AT_HWCAP
     AuxVariables.emplace_back(auxv_t {26, HWCap2});                       // AT_HWCAP2
     AuxVariables.emplace_back(auxv_t {51, CalculateSignalStackSize()});   // AT_MINSIGSTKSZ
-    AuxPlatform = &AuxVariables.emplace_back(auxv_t {24, ~0ULL});         // AT_PLATFORM
+    // AT_PLATFORM is 15; 24 is AT_BASE_PLATFORM, which the kernel does not set
+    // on x86. glibc reads its platform (and getauxval(AT_PLATFORM)) from 15.
+    AuxPlatform = &AuxVariables.emplace_back(auxv_t {AT_PLATFORM, ~0ULL}); // AT_PLATFORM
     AuxExecFN = &AuxVariables.emplace_back(auxv_t {AT_EXECFN, ~0ULL});    // AT_EXECFN
 
     if (Is64BitMode()) {
@@ -950,17 +993,22 @@ public:
 
   // Point the OS to our new stack's argument data
   void RemapArgumentData(uintptr_t NewArgStart, uint64_t ArgSize) {
+    ArgumentDataStart = NewArgStart;
+    ArgumentDataSize = ArgSize;
     struct prctl_mm_map map {};
     if (GetCurrentMap(map)) {
       map.arg_start = NewArgStart;
       map.arg_end = NewArgStart + ArgSize;
 
       int r = prctl(PR_SET_MM, PR_SET_MM_MAP, &map, sizeof(map), 0L);
+      ArgumentDataRemapped = r == 0;
       if (r != 0) {
-        LogMan::Msg::EFmt("Failed to remap /proc/pid/cmdline data (prctl failed: result {}, errno {})", r, errno);
+        // PR_SET_MM_MAP needs CONFIG_CHECKPOINT_RESTORE (EPERM without it).
+        // Not an error: /proc/self/cmdline is emulated instead.
+        LogMan::Msg::IFmt("/proc/pid/cmdline not remapped (prctl errno {}); emulating /proc/self/cmdline", errno);
       }
     } else {
-      LogMan::Msg::EFmt("Failed to remap /proc/pid/cmdline data (GetCurrentMap failed)");
+      LogMan::Msg::IFmt("/proc/pid/cmdline not remapped (no current map); emulating /proc/self/cmdline");
     }
   }
 
@@ -1084,6 +1132,14 @@ public:
     return LoaderArgs;
   }
 
+  ArgumentDataResult GetArgumentData() const override {
+    return {
+      .address = ArgumentDataStart,
+      .size = ArgumentDataSize,
+      .KernelRemapped = ArgumentDataRemapped,
+    };
+  }
+
   AuxvResult GetAuxv() const override {
     return {
       .address = AuxTabBase,
@@ -1188,6 +1244,9 @@ public:
   uint64_t AuxTabBase {}, AuxTabSize {};
   uint64_t ArgumentBackingSize {};
   uint64_t ArgumentOffset {};
+  uint64_t ArgumentDataStart {};
+  uint64_t ArgumentDataSize {};
+  bool ArgumentDataRemapped {};
   uint64_t EnvironmentBackingSize {};
   uint64_t BaseOffset {};
   void* VDSOBase {};

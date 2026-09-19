@@ -94,6 +94,7 @@ Absorb-by-default behaviours; setting these makes them loud.
 | `FEX_NOEXEC_ABORT` | Abort on the entry-block NoExec tripwire instead of absorbing. |
 | `FEX_EXITLINK_ABORT` | Abort on a suspect `ExitFunctionLink` instead of absorbing. |
 | `FEX_EXITLINK_NOBYPASS` | Disable the `ExitFunctionLink` bypass. |
+| `FEX_HOSTFAULT_INJECT` | `=<guest syscall nr>[,segv]`. Raises a fault inside FEX's own syscall body (a `trap`, or a null store with `,segv`) whenever the guest makes that syscall; drives the host-fault gate test (`hostfault_gate`). |
 | `FEX_ABORT_TRIPWIRE` | Log every guest-delivered fatal-class sync signal with `si_addr`/`si_code` and the guest RIP. |
 | `FEX_TRIPWIRE_PROBE` | Post-mortem probe of memory pointed at by SRA-reconstructed block-entry GPRs. Written for RimWorld's UnityPlayer fault. |
 | `FEX_SIGRIPWATCH` | Signals arriving while the guest is in JIT code with static registers live; reports host PC and loop registers. |
@@ -103,6 +104,9 @@ Absorb-by-default behaviours; setting these makes them loud.
 | `FEX_SMC_AUDIT` | Compile-side SMC logger, `O_APPEND` alongside the syscall-side one. |
 | `FEX_SMCGRANULEPOLICY` | 64K hosts only. What happens to the tracked SIBLINGS of a faulting guest page when the granule-wide unprotect opens them. `invalidate` (default) widens the invalidation to the granule, which discharges the soundness rule by construction; `rearm` invalidates only the faulting page and soft-invalidates the granule at the next SMC drain point, which is **unsound by construction** in exactly the way `FEX_SMCLAZYINVAL` is and exists only to measure the mixed code/data thrash against. Forced to `invalidate` on a 4K host. |
 | `FEX_SMCGRANULEFLIPLOG` | 64K hosts only. Faults per granule per second above which one rate-limited line is logged (from the next non-signal mtrack mark, never from the handler) naming the granule, its flip count and how many of its guest pages are actually tracked code. Default `64`, `0` disables. |
+| `FEX_SMCGRANULEMIXED` | 64K hosts only. `=<flips per second>` demotes a granule with at most `FEX_SMCGRANULEMIXEDMAXTRACKED` (4) tracked pages to per-instruction validation after that many faults in a second: mtrack stops arming it. **Default 0 (off)** since the 2026-09-14 frame-log A/B halved RimWorld's in-world fps with it on; the fault storms it removes are cheaper than the guards. |
+| `FEX_SMCGRANULEMIXEDMAXTRACKED` | 64K hosts only. A granule with more tracked (code) pages than this is never demoted by `FEX_SMCGRANULEMIXED`, however often it flips: it is code, and validating all of it would cost more than the faults. Default `4` of 16. |
+| `FEX_FRAMELOG` | `=<path>`: the GL host thunk appends one row per `glXSwapBuffers` as a MangoHud-shaped CSV (`fps,frametime,elapsed`), so `scene_stats.py` reads it. The fps column for GL Linux-lane titles, which MangoHud cannot see through the thunk. |
 | `FEX_BUFSTATS` | Code-buffer rotation log, written as it goes so a SIGKILLed Proton session still leaves it. |
 | `FEX_LOG_UNEXPECTED_FUTEX` | Log futex returns glibc treats as fatal (the "unexpected error code" panic). |
 
@@ -129,6 +133,8 @@ Two-stage arming where noted: set the var, then `touch` the trigger file.
 | `FEX_SA_RESTART_TIMED` | Restart behaviour for timed syscalls. |
 | `FEX_FUTEX_EINTR_PASSTHRU` | Escape hatch: restore always-surface `EINTR` on futex. |
 | `FEX_FUTEX_RESCUE` | Futex wedge rescue path. |
+| `FEX_HOSTFAULTTOGUEST` | Escape hatch for the host-fault gate: a synchronous fault raised in FEX's own host code (deferred-signal section, dispatcher, FABI crossing, or any SIGTRAP/SIGILL/SIGFPE outside JIT code) is reported and then delivered to the guest as before, instead of terminating with the default disposition. Bisection lever only; the delivery abandons the host frame and its locks. |
+| `FEX_SERVERCODECACHE` | `=1` re-enables the client's request for server-side code cache generation (FEXServer spawning `FEXOfflineCompiler`). Off by default: the server's staleness test never finds the cache it looks for and the offline compiler's cache id never matches a runtime reader (TASK_QUEUE T1/T3), so with `FEXOfflineCompiler` on PATH every launch spent seconds of a core recompiling caches nobody loaded. |
 | `FEX_NO_THUNK_PARTIAL_FILL` | Disable partial thunk fill. Presence-tested — `=0` enables it. |
 
 ### Paths and test hooks

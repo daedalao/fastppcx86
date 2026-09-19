@@ -60,6 +60,16 @@ public:
     return OSABI;
   }
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+  // 64K hosts, FEX_SMCGRANULEMIXED: true when the guest page lies in a host
+  // granule mtrack has stopped write-protecting because it is mostly data, so
+  // every block compiled from that page must carry the per-instruction
+  // ValidateCode guard (the SMCCHECKS=full form) instead. Consulted by the
+  // fresh compile, the soft relink and the code cache load; the answer is
+  // stable for as long as the caller holds CodeInvalidationMutex shared. See
+  // LinuxSyscalls/SMCHostGranule.h for the soundness argument.
+  virtual bool GuestCodePageValidateOnly(uint64_t Page) {
+    return false;
+  }
   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}

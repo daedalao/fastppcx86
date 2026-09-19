@@ -300,8 +300,41 @@ private:
     TYPE_NONREALTIME, ///< Signal restore type is from a `non-realtime` signal.
     TYPE_PAUSE,       ///< Signal restore type is from a GDB pause event.
   };
-  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext);
+  // Where a guest signal frame lands, computed BEFORE anything is written so
+  // that StoreThreadState can see which outstanding frames the new one is
+  // about to overwrite. The Setup*Frame builders lay their frames out from
+  // exactly these values; RestoreThreadState walks the same distances back
+  // up from the sigreturn RSP.
+  struct GuestFrameLayout {
+    uint64_t Top;               ///< First byte above the frame (the guest red zone is above this).
+    uint64_t HostStackLocation; ///< The 16-byte {ContextBackup*, Cookie} slot.
+    uint64_t FPStateLocation;
+    uint64_t SigInfoLocation;   ///< 0 for 32-bit frames (siginfo is inside the frame struct).
+    uint64_t UContextLocation;  ///< x86-64 ucontext_t, or the 32-bit (RT)SigFrame_i32.
+    uint64_t Bottom;            ///< Guest SP at handler entry.
+  };
+  static constexpr uint64_t HostStackSlotSize = 2 * sizeof(uint64_t);
+  GuestFrameLayout LayoutFrame_x64(uint64_t GuestSP) const;
+  GuestFrameLayout LayoutFrame_ia32(uint64_t GuestSP, bool SigInfoFrame) const;
+
+  // [Lo, Hi): the guest bytes a frame about to be built will write.
+  struct GuestFrameExtent {
+    uint64_t Lo;
+    uint64_t Hi;
+  };
+
+  // With ThreadObject + Extent + SlotAddress the backup is recorded in the
+  // thread's OutstandingBackups and may be placed in space reclaimed from
+  // abandoned predecessors; without them (GDB pause) it is placed under the
+  // interrupted SP and not tracked.
+  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext,
+                                                        FEX::HLE::ThreadStateObject* ThreadObject = nullptr,
+                                                        const GuestFrameExtent* Extent = nullptr, uint64_t SlotAddress = 0);
   void RestoreThreadState(FEXCore::Core::InternalThreadState* Thread, void* ucontext, RestoreType Type);
+  void MarkAbandonedBackups(FEX::HLE::ThreadStateObject* ThreadObject, const GuestFrameExtent& Extent) const;
+  // Mixed into every cookie so a stale slot from a previous process image
+  // (fork, or stack garbage) does not validate by accident.
+  uint64_t BackupCookieSalt {};
   bool HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext,
                                    GuestSigAction* GuestAction, stack_t* GuestStack);
   bool HandleSignalPause(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);

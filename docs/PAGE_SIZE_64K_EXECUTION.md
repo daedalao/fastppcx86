@@ -431,17 +431,23 @@ instance did 60 fps at the menu. Before calling it a 64K problem, measure the
 tutorial under mtrack on 64K and on op4k; RimWorld's Linux lane has not been
 profiled on either kernel. Queued under (8) below.
 
-Open items, in priority order: (1) a fatal trap or fault raised in FEX's own
-host code must never be delivered to the guest as a signal (it abandons the
-host frame with its locks); (2) mtrack arming
-heuristic for mixed code/data granules (S4c's `TrackedCount` is the input;
-also the flip log prints the count after clearing it); (3) route the raw
-`GuestM*` host calls in `SyscallsSMCTracking.cpp` through the granule layer
-and wire `SetSMCOverlay`/`GranuleFullyBacked` between S4b and S4c; (4) HWTSO
-SAO refusal on an emulated granule does not revoke HWTSO; (5) the 4K price
+Open items, in priority order: (1) DONE 09-14: a fatal trap or fault raised
+in FEX's own host code is no longer delivered to the guest as a signal (the
+host-fault gate in `HandleGuestSignal`, below); (2) DONE 09-14: mtrack arming
+heuristic for mixed code/data granules (`FEX_SMCGRANULEMIXED`, below; S4c's
+tracked count and flip rate are its inputs); (3) DONE 09-14: the
+S4b/S4c wiring (below; the raw `GuestM*` host calls are reached only for
+whole-granule ranges, whose table entries the `Granule::*` front already
+keeps in step); (4) DONE 09-14: HWTSO
+SAO refusal on an emulated granule now retries plain and revokes (the
+whole-granule file mmap inside `Granule::Mmap` was the only refusable site;
+the anonymous mmaps and the FEX-backed mprotects cannot refuse); (5) the 4K price
 check for S1/S2 and the 4K regression run of S4 (`granule_page` test) on the
-op4k boot; (6) `Scripts/granule_page_64k.sh` can go now the loader fallback
-exists; (7) DONE 09-12: NCS code cache on 64K (host page in the identity hash, no format change needed, launcher default on); (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile).
+op4k boot [HELD 2026-09-15, user directive: no 4K kernel boot until the 64K
+workstream is done, so this regression run and the CP2077 64K-vs-4K comparison
+both wait]; (6) DONE 09-14: `Scripts/granule_page_64k.sh` removed -- the ELF
+loader fallback makes any x86-64 binary a granule_page repro (test comment
+records the deletion); (7) DONE 09-12: NCS code cache on 64K (host page in the identity hash, no format change needed, launcher default on); (8) RimWorld Linux-lane performance (tutorial fps under mtrack, 64K vs 4K, then profile); (9) OPEN 09-17, deferred (no title hits it): the 64K suite baseline under `FEX_HOSTPAGEMODE=force` is 12 real failures -- `granule_page`, `trap_flag`, `smc-2`, `smc-madvise-dontneed` (both widths), `smc-shared-1.64`, `execveat_memfd` (both widths), plus `thunk_testlib` without thunks -- all predating 09-17 (a `tail`'d ctest listing hid them for a day; never tail a ctest failure list). Root-caused for the `granule_page`/`smc-madvise-dontneed` class: the guest `read()`s into a static buffer whose 64K granule shares a host page with `.text`; mtrack re-arms that granule `PROT_READ` after the code runs and the kernel's copy into a read-only user page returns `-EFAULT` instead of taking the fault that would unarm it (strace: `read(3, buf, ..) = -1 EFAULT` right after `mprotect(granule, R|X)`). Passes with `SMCChecks=full` or `FEX_SMCGRANULEMIXED=1`. Fix shape: pre-unarm the destination granule before host syscalls that write guest memory (the syscall wrappers know their out-pointers), or catch `EFAULT` from those syscalls, unarm, retry. Only a guest whose syscall output lands in data adjacent to its own text (small static binaries) is exposed; Wine titles and the Linux games are not. `smc-2`/`smc-shared-1`: a refused MAP_SHARED sub-granule conversion to private backing and a host SIGSEGV inside a syscall body -- separate gaps, not yet traced. `sigtest_sigmask` is back in Known_Failures (handler edits of `uc_sigmask` are not read back; unrelated to 64K).
 
 2026-09-12, Portal 2: the "wow64 SEH storm" every 64K run died in was not
 64K, WoW64 or ntsync. Every fault was at a guest register + 0xF3000000:
@@ -491,6 +497,365 @@ the granule layer refuses an unaligned MAP_SHARED file mapping (EINVAL, the
 survey's known refusal); pre-existing, the ld.so and main-executable
 mappings placed by the ELF loader itself are not cache-loaded on either
 kernel.
+
+2026-09-14, the host-fault gate (open item 1). `HandleGuestSignal` now
+classifies a synchronous fatal-class signal (kernel `si_code`) whose host PC
+is outside every JIT code buffer: raised in a deferred-signal section (syscall
+body, block linker/compiler, VMA tracking), at a dispatcher or FABI-stub PC or
+inside a FABI crossing, or a SIGTRAP/SIGILL/SIGFPE anywhere in host text, it is
+FEX's own fault. Such a fault is reported on stderr with the host backtrace
+(and the VMA lock holder under `FEX_LOCKDIAG`), then the signal's default
+disposition is restored and the handler returns, so the kernel re-raises it
+at the original instruction and the core carries the real context. The Break
+op's synthesized guest faults are exempt by their state marker
+(`FaultToTopAndGeneratedException`), in-JIT faults and SMC faults never reach
+the gate, and a SIGSEGV/SIGBUS inside a thunk's host library with no deferred
+section active keeps the historical outside-JIT delivery (no FEX lock is held
+there). `FEX_HOSTFAULTTOGUEST=1` restores the old delivery after the report.
+Test: `unittests/FEXLinuxTests/tests/signal/hostfault_gate.cpp`, driven by
+the `FEX_HOSTFAULT_INJECT=<syscall nr>[,segv]` hook in `HandleSyscallImpl`.
+
+2026-09-14, S4b/S4c wiring (open item 3). The hole: mtrack arms a whole
+granule with its own `mprotect(PROT_READ)` and nothing told the VMATracking
+granule table, so the next sub-granule guest mprotect that changed the
+granule's union (a JIT engine `mprotect(RWX)`-ing a data page next to
+compiled code) rematerialised the union and silently undid the arm. The
+`SetSMCOverlay` push the design sketched cannot be called from the SMC fault
+path (which holds no VMATracking lock, by the fork lock-order rule), so the
+table pulls instead: `GranuleTable::WantedProt` leaves `PROT_WRITE` out
+while `SMCGranule::Table().Armed(G)`, and `RematerialiseIfNeeded` no longer
+trusts its cached `HostProt` to skip the syscall for a granule mtrack has
+ever touched (`Known(G)`). `SMCOverlay`/`SetSMCOverlay` are gone. The arm
+side cannot race a rematerialisation (VMATracking shared vs unique); the
+fault side's losing order leaves the granule read-only with its mask
+cleared, which the next store settles with one spurious SMC fault.
+`GranuleFullyBacked` is not needed: a granule with any live page is mapped in
+full by the permissive tier's construction (recorded in SMCHostGranule.h).
+Found on the way: `RematerialiseIfNeeded` issued its mprotect without
+`ApplyGuestProt`, so under `FEX_HWTSO` every rematerialisation stripped
+`PROT_SAO` from the granule; now applied (item 4's refusal-revoke plumbing
+is still open, but a refusal there is impossible once an mmap-time refusal
+has revoked).
+
+64K survey items seen 2026-09-14 while running the mapping subset of ctest
+(26 rows, `-R "granule|mmap|mprotect|madvise|mremap"`): besides the known
+`conformance-interfaces-mmap-3-1` refusal, `madvise_test.jit.gvisor` fails
+three cases that need sub-granule madvise semantics the granule layer cannot
+express (`CleansPrivateFilePage`: DONTNEED on a private file page must
+refill from the file, not zero; `DontforkShared`/`DontforkAnonPrivate`:
+DONTFORK over a sub-64K range). Pre-existing by mechanism (none of them
+reaches the mprotect path); a future madvise emulation could split the
+granule into FEX-backed private memory the way sub-granule MAP_FIXED does.
+
+2026-09-14, the 64K CP2077 reference (nw lane, `FEX_HWTSO=1`, launcher
+defaults, `~/fex-scripts/cp2077_64k_ref.sh`): laps 2-4 after a warm-up
+`64k-nts-2..4` = 23.74 / 23.61 / 23.48 fps (scene p50 37.9-38.8 ms), against
+the 4K nw references of 23.03 (lock batch) and 24.2 (pre-lock). Parity. The
+first attempt (`64k-ref-1..4`, 11.8-13.8 fps, p50 70-81 ms, GameThread at
+100% with every worker in `anon_pipe_read`) ran without ntsync: the
+out-of-tree `ntsync.ko` in `~/ntsync-mod-64k` had a stale vermagic after the
+7.2.5-books-64k kernel update and was not loaded. Rebuilt against the running
+kernel, installed under `/lib/modules/<ver>/extra`, `/etc/modules-load.d/
+ntsync.conf` added. `ls /dev/ntsync` is part of the pre-lap checklist now.
+
+2026-09-14, THP and TLB baseline on the 64K kernel (CP2077 nw lane, mid
+benchmark, whole process, 10 s `perf stat`). THP is `madvise` with 16 MB
+huge pages (POWER8 hash MMU has THP only with a 64K base page, so every
+`MADV_HUGEPAGE` hint in FEX is live for the first time). Coverage:
+AnonHugePages 426 MB of 5.37 GB anonymous RSS (8%); 3.3 GB resident sits in
+anonymous VMAs with no huge pages, the two largest (1.65 GB, 0.6 GB) being
+wine's own guest heap views, which FEX does not allocate. Miss rates per
+1000 instructions: DERAT 64K 0.75, DERAT 16M 0.11, IERAT 64K 0.28, IERAT
+16M 0.13, TLB 0.20, dTLB 0.09, iTLB 0.005; CPI 1.9. At tens of cycles per
+reload that is about 1% of cycles, so huge pages are bounded to roughly
+that on the nw lane; the instruction-count wall stands. Also recorded: the
+box had rebooted with `ondemand`; `/etc/default/cpupower` now pins
+`performance` and `cpupower.service` is enabled, next to the ntsync
+modules-load entry.
+
+2026-09-14, test infrastructure for the 64K workstream (branch
+`wt/64k-tests`, verified in `src/build-wt-tests` on op64k, a copy of
+build-smc's configuration). Two pieces.
+
+(a) FEXLinuxTests build in the gaming configuration. build-smc had
+`BUILD_FEX_LINUX_TESTS=OFF`, so `hostfault_gate` (bd60de758) had never been
+built through ctest. Turning it on hit four breaks, all fixed on the
+branch: the 32-bit tests project was handed `X86_DEV_ROOTFS` (the x86_64
+cross sysroot, no i686 crt/libgcc: `cannot open crtbeginS.o`, `-lgcc`);
+`X86_DEV_ROOTFS_32` is now declared at the top of the tree and the 32-bit
+tests use it (91591fe04). `ptr_integrity_mt` is 64-only but its
+`target_link_libraries` was unconditional (32-bit configure error);
+`greg_mutation.64` spun on a numeric `1: ... jz 1b` label that clang
+22's Intel-syntax parser reads as a binary number (e7467600a); and
+`atomics_smp.cpp` names rax/rdx in every asm block, so it is now
+`atomics_smp.64.cpp` (bed81f74c, ctest name unchanged). Nothing in the
+toolchain files needed to change: `toolchain_x86_64.cmake` autodetects
+`/usr/x86_64-pc-linux-gnu` as the sysroot and clang finds that gcc's
+libstdc++ on its own, so `X86_DEV_ROOTFS=/` is fine for the 64-bit side.
+
+To flip build-smc (its cache already carries `X86_DEV_ROOTFS_32`; merge
+`wt/64k-tests` first, then reconfigure in place):
+
+```bash
+cd ~/projects/fex-emu-ppc64le/src
+cmake -DBUILD_FEX_LINUX_TESTS=ON -DENABLE_SMC_FULL_TESTS=ON build-smc
+nice ninja -C build-smc
+```
+
+The full fresh-configure line that reproduced build-smc plus these two
+options is `~/scratch-64k/tests/configure.sh` on op64k (RelWithDebInfo,
+clang + lld, `ENABLE_LTO=False`, `ENABLE_ASSERTIONS=False`,
+`BUILD_TESTS=True`, `BUILD_THUNKS=True`, `BUILD_THUNKS_32BIT=True`,
+`BUILD_GUEST_THUNKS_32=ON`, `ENABLE_CLANG_GUEST_THUNKS_32=ON`,
+`X86_DEV_ROOTFS_32=$HOME/.local/share/fex-emu/RootFS/ArchLinux`,
+`BUILD_FEX_LINUX_TESTS=ON`, `ENABLE_SMC_FULL_TESTS=ON`). Suite census
+with both on: 13437 tests; the FEXLinuxTests binaries land in
+`unittests/FEXLinuxTests/FEXLinuxTests_{64,32}/` (58 and 50).
+
+Results on 64K (`ulimit -c 0; FEX_HOSTPAGEMODE=force ctest -R hostfault_gate`):
+`hostfault_gate.64.jit.flt` and `hostfault_gate.32.jit.flt` both pass,
+and the verbose log shows the injection firing (`FEX: FATAL host fault:
+signal 5 ... raised in a deferred-signal section ... Not delivered to the
+guest`, 4 assertions), so the pass is not the vacuous no-injection path.
+
+(b) The SMC-full CI row (229672b95). `ENABLE_SMC_FULL_TESTS` (default
+OFF, so the 4K count is unchanged) adds `jit_500_smcfull/Test_64Bit_*`:
+jit_500's configuration plus `FEX_SMCCHECKS=full`, 2019 rows, the same
+2019 as `jit_500/Test_64Bit_*`. Known failures and disabled tests apply
+per variant by full name (`jit_500_smcfull/Test_64Bit_<path>.asm`) in
+`Known_Failures_jit` / `Disabled_Tests`; `testharness_runner.py` now
+matches the disabled list by full name too. Run on 64K
+(`FEX_HOSTPAGEMODE=force ctest -j16 -R jit_500_smcfull`, 10 s wall):
+**2018/2019 pass**. The one failure, `Displacement_Encoding`, fails the
+same way under `jit_1` and `jit_500` on this host (the 4K page at
+0x7FFFF000, the open granule/loader item above), so it is a 64K-host
+failure and not an SMC-full one; it is deliberately not on a known-
+failures list, since it passes on 4K. This confirms the 09-11 state: the
+~170 `jit_500` failures under full mode are gone after 3bada1c9d, and
+the row would now catch a regression of that class.
+
+2026-09-14, the mixed code/data granule heuristic (open item 2,
+`FEX_SMCGRANULEMIXED`, branch `wt/64k-mixed`). The measurement that framed
+it: RimWorld Linux (Mono) under mtrack on this kernel, lazy recipe, code
+cache on, 4m20s (`~/benchlogs/rimworld-64k-smoke-0914.log`): the flip log
+reported 172 times over 81 distinct granules flipping >= 64 times a second,
+103 of the reports with exactly 1 of 16 guest pages tracked (the hottest
+granule re-reported 12 times); each flip is a granule-wide unprotect, an
+invalidation across every thread and a re-arm at the next compile, and on a
+4K host none of those granules would ever flip. Design chosen: (a) from the
+prompt's three. A granule that reaches N faults inside a one-second window
+while holding at most M tracked pages is *demoted*: mtrack never arms it
+again, and every block compiled from any of its guest pages carries the
+per-instruction `ValidateCode` guard that `SMCCHECKS=full` wraps around
+every instruction -- the per-block opt-in already existed
+(`Block.ForceFullSMCDetection`, the mono tailcall block, and the 3bada1c9d
+continuation-block fix covers this path); `GuestCodePageValidateOnly` on the
+syscall handler is the page-driven input. (b) is unsound by the `rearm`
+policy's own construction; (c) is the `FEX_SMCLAZYINVAL` argument HotSpot
+disproved. Soundness (section 5's rule): an unguarded block may live on a
+page only while its granule is armed; demotion happens in `NoteFault`, on a
+fault whose service invalidates the whole granule under the exclusive
+`CodeInvalidationMutex` (forced granule-wide under `rearm` and never
+deferred by the lazy path for the demoting fault), so it orders after every
+compile that read "not demoted" and kills what they published, and every
+later compile (under the shared lock, the same hold in which
+`MarkGuestExecutableRange` reads the bit) guards. All three block publishers
+consult it: the fresh compile guards a block if any of its `CodePages` is
+demoted, `TryRelinkSoftInvalidatedBlock` refuses a retained (unguarded)
+block on a demoted page, and the code cache rejects a section whose page
+table touches a demoted granule before registering any block. `Forget`
+keeps a demoted entry while the granule is only partially retired (the mark
+path is NewPage-gated and would not run again for the surviving pages). The
+S4b contract holds: `Armed()` stays false for a demoted granule, so
+`WantedProt` keeps `PROT_WRITE` in the union. Full argument in
+`SMCHostGranule.h`. Knobs: `FEX_SMCGRANULEMIXED=<flips/s>` (default 64, 0
+off, forced off on 4K), `FEX_SMCGRANULEMIXEDMAXTRACKED` (default 4). The one
+smoke run (budget: one, the box carried a concurrent ctest run at load ~24;
+`build-wt-mixed`, same launcher env as the baseline via `fexplay-wtsmc`,
+3 minutes, `op64k:~/scratch-64k/mixed/play_rimworld_20260914-081548.log`):
+40 flip-log lines, every one a demotion of a distinct granule at its 64th
+flip (28 with 1/16 tracked, 7 with 2/16, 5 with 3/16), and no granule
+reported again after its demotion -- against the baseline's 172 reports
+with granules re-reporting up to 12 times per session. No code-cache
+rejection fired, no error, RimWorld 1.6.4850 loaded and the engine ran the
+full 3 minutes (61642 UnityPlayer blocks saved at exit). Default ON on that
+evidence. NOT verified: the invalidator's CPU share (the mid-run
+`perf record` failed to find the game pid by comm and the budget did not
+allow a second run), fps, and the cost of the guarded blocks themselves
+(28 demoted granules hold one code page each; if a hot Mono method lives
+there its block runs the full-mode guard per instruction). Next: a
+counterbalanced fps lap pair with `FEX_SMCGRANULEMIXED=0` vs default, and
+`perf` on the game pid (comm under FEX is not `RimWorldLinux`; find it by
+args).
+
+### 2026-09-14, transparent huge pages on 64K: audit and the FEX_THP knob
+
+On a POWER8 hash MMU THP exists only with a 64K base page; op64k runs
+`/sys/kernel/mm/transparent_hugepage/enabled = madvise`, `hpage_pmd_size` =
+16 MiB. So every `MADV_HUGEPAGE` FEX ever issued was dead on the 4K box and is
+live on 64K -- but a hint only takes for a 16 MiB-aligned, 16 MiB window that
+lies entirely inside one VMA, and FEX's internal placement hint
+(`GetInternalPlacementHint`, 4K-granular, bumps by size + one 4K page) makes
+every reservation misaligned by construction. An `mprotect` or `MADV_DONTNEED`
+over part of a huge page splits it back to base pages (correct, just no longer
+huge). The table is every large anonymous reservation FEX makes, with the
+state *before* this change in the "hinted" column.
+
+| site | size / count | lifetime | 16 MiB-aligned & sized? | sub-16 MiB mprotect / DONTNEED? | hinted before | verdict |
+|---|---|---|---|---|---|---|
+| JIT code buffers, `CodeBuffer` (`FEXMemJIT`, CPUBackend.cpp) | 16 -> 32 -> 64 -> 128 MiB, geometric; starts at 128 MiB when the code cache is on; process-wide, old buffers linger while a thread still runs them | process | sized yes; aligned NO (placement hint) | the trailing guard page (`PROT_NONE`, one host page) splits the last PMD; nothing else | yes, unconditional | **can benefit**: aligned now under `code`; a 128 MiB buffer gets 7 huge pages (the guard page costs the 8th), 16 MiB gets none |
+| per-buffer block index (`FEXBlockIndex`) | AllocatedSize/64*4 = 8 MiB at 128 MiB | with its buffer | no (< 16 MiB) | no | no | cannot |
+| L2 page-pointer table (`FEXMem_Lookup` head, LookupCache.cpp) | VirtualMemSize/4K*8: 128 MiB (64-bit), 8 MiB (32-bit); **per thread** | thread | sized only for 64-bit; aligned NO | whole-table DONTNEED only (ClearL2Cache) | yes (Enable), dead by alignment | can benefit (sparse by guest VA: one huge page per 1 GiB of guest VA that has code) -- `lookup`, OFF |
+| L2 entry pool (`FEXMem_Lookup` middle) | 128 MiB per thread, bump-allocated in 32 KiB steps | thread | sized yes; aligned NO | whole-pool DONTNEED only | explicitly NOHUGEPAGE | left off: dense while it grows, but 100 threads x 16 MiB first-touch is the RSS story below |
+| L1 lookup table (`FEXMem_Lookup_L1`) | 16 MiB per thread, dynamic L1 starts at 128 KiB | thread | sized yes; aligned NO (base + 8/128 MiB) | whole-L1 DONTNEED on resize/scrub (zaps, never splits) | yes (Enable), dead by alignment | can benefit -- `lookup`, OFF: every thread's first touch faults a whole 16 MiB (100 threads: +1.6 GiB RSS) |
+| 64-bit allocator object arena (`FEXMem_Misc`, 64BitAllocator.cpp) | 64 MiB, forward-only, dense | process | sized yes; aligned by luck (a `/proc/self/maps` gap edge) | no | yes, unconditional | **can benefit**: aligned now under `alloc64` |
+| FEX-internal mappings through the 64-bit allocator (`VirtualAlloc` -> `OSAllocator_64Bit::Mmap`, MAP_FIXED into the 48-bit reservations) | the code buffers, lookup caches, block index, callret stacks land here for a 64-bit guest | varies | per site above | per site above | per site above | covered by the per-site rows; the allocator itself adds nothing |
+| 64-bit guest mappings (`SyscallHandler::GuestMmap`, straight to the host kernel, kernel-placed below the 48-bit region) | guest-sized | guest | guest's choice | guest mprotect (4K-granular via the granule layer) splits | no; guest `madvise` passes through | `guest`, OFF: hint anon-private only, measured not assumed |
+| 32-bit guest mappings (`GuestMmap` -> `LinuxAllocator.cpp`) | guest-sized | guest | guest's choice | same | no | `guest`, OFF, same site |
+| rpmalloc spans (`FEXAllocator`, AllocatorHooks.cpp `FEX_rp_mmap`) | 256 MiB span mapped as 512 MiB VA and aligned to 256 MiB, per thread heap per page class (64K / 4M / 64M) | thread heap | sized and aligned YES | DONTNEED decommit per page class splits | explicitly NOHUGEPAGE | `rpmalloc`, OFF: would take, but sparse per-heap spans make it an RSS bet |
+| granule private backing (`MakeGranuleFEXBacked`, GranuleMemory.cpp) | one 64K host page per call, MAP_FIXED | guest | no (one host page) | it *is* the sub-16 MiB unit | no | cannot |
+| thunk low-4G trampoline pool (`ThunkLibs/include/common/Host.h`) | max(64K, host page) per pool | process | no | no | no | cannot |
+| dispatcher code (`PPC64Dispatcher.cpp`) | 64 KiB | process | no | no | no | cannot |
+| callret shadow stacks (`FEXMem_CallRetStacks`, ThreadManager.cpp) | CALLRET_STACK_SIZE + 2 guard pages per thread, mapped PROT_NONE then mprotected | thread | no | guard pages | explicitly NOHUGEPAGE | cannot; keep off |
+| bridge thread stacks, HLT page, SAO probe (FexBridge.cpp) | stack-sized / one page | thread | no | guard page | no | cannot; bridge code buffers are FEXCore's `CodeBuffer` (covered by `code`) |
+| stats shm (`ThreadManager::StatAlloc`), fault page, guest-trace ring | 4 MiB shared / 1 page / file-backed | process | no / shared / file | -- | no | not anonymous-THP material |
+
+Implemented (`FEXCore/include/FEXCore/Utils/THP.h`, header-only so the
+bundled-allocator static library, FEXCore, the syscall layer and the bridge
+all read one mask): `FEX_THP=<names|mask>` with `code`=1, `lookup`=2,
+`alloc64`=4, `rpmalloc`=8, `guest`=16, `all`, `none`; **default `code,alloc64`**
+-- the two dense sites that were hinted before, now placed so the hint can
+take (over-map by one PMD and trim, or skip to the boundary in the stolen
+region; address space only, no RSS, and on a kernel without THP `PMDSize()`
+is 0 and every layout is the historical one, bit for bit). `lookup` also
+pads the L2 table up to a PMD multiple so the entry pool and L1 land on
+boundaries (`L2TableSpan`; ClearL2Cache scrubs by it). `rpmalloc` off keeps
+the historical `MADV_NOHUGEPAGE`; `guest` hints anonymous private mappings
+once, at `SyscallHandler::GuestMmap`'s success path (both widths; the first
+cut put it in the 64-bit *allocator*, which only FEX's own reservations go
+through -- the live-process `smaps` check caught the guest VMA without `hg`),
+the guest's own madvise still passing through. The interpreter applies the merged config
+(`THP`/`THPLog` rows in Config.json.in, so a config-book row can carry them)
+before `InitAllocator`; the bridge reads the environment raw, as it does for
+every knob. `FEX_THPLOG=1` prints one `[FEX THP] pid= exit= mask= pmd=
+enabled= AnonHugePages= Rss=` line from `/proc/self/smaps_rollup` at
+`exit_group`, on the fatal-signal path (open/read/write only, no allocation)
+and through `atexit` for the bridge lane; `=2` adds a per-VMA-name breakdown
+(`FEXMemJIT`, `FEXMem_Lookup_L1`, `FEXMem_Misc`, `FEXAllocator`, `[anon]`,
+library basenames) from `/proc/self/smaps`. Branch `wt/64k-thp`.
+
+Verified on op64k (`build-wt-thp`, python3 allocating and touching 200 MB
+under `FEX_HOSTPAGEMODE=force FEX_THPLOG=2`; the guest reads its own
+`smaps_rollup` while the block is live, FEX reports at `exit_group` after
+python has freed it):
+
+| FEX_THP | guest-visible AnonHugePages (block live) | FEX exit report | per name |
+|---|---|---|---|
+| `none` | 0 kB | 0 kB, Rss 65 MB | -- |
+| default (`code,alloc64`) | 32 MB | 32 MB, Rss 85 MB | FEXMem_Misc 16 MB, code buffer 16 MB (the first PMD of the 1 GiB buffer; python compiles a few MB of code, so THP rounds that up to 16 MB RSS) |
+| `guest` | 192 MB (12 of the 200 MB block's 12 aligned windows) | 0 kB (freed) | -- |
+| `all` | 256 MB | 64 MB, Rss 101 MB | + FEXAllocator 16 MB; the L1/L2 hints took (`madvise` seen in strace) but python's single thread touched less than a huge page of each |
+
+Two things the runs caught, both fixed on the branch: (1) the first cut
+tested `flags & MAP_SHARED_VALIDATE`, which is `MAP_SHARED|MAP_PRIVATE` as a
+bit pattern and so rejected every private mapping -- the `hg` flag missing
+from the guest VMA in a live `smaps` was the tell; (2) `VirtualName` latched
+"unsupported" on the first `EINVAL`, and Core.cpp's naming of the malloc'd
+`InternalThreadState` (unaligned, 4224 bytes) is always EINVAL, so
+`FEXMem_Lookup`, `FEXMemJIT`, `FEXBlockIndex` and `FEXMem_CallRetStacks`
+were never named on either kernel; unaligned requests are skipped now and
+EINVAL no longer latches. Not run: `ctest` in `build-wt-thp` (only `Bin/FEX`
+and `Bin/FEXServer` were built there, per the one-run budget); the mapping
+subset is the orchestrator's to run on the merged tree.
+
+Measurement plan (orchestrator): each lane at `FEX_THP=none` (the true
+pre-64K baseline: no hint takes), default, `code,alloc64,lookup`, `all`, with
+`FEX_THPLOG=2` to read coverage and the per-name RSS; watch Rss against the
+`none` run before reading fps. nw lane (CP2077, W3): `code` is the only site
+that matters (Wine owns guest memory, FEX's `guest` bit is inert there;
+`lookup` is the RSS question with ~100 threads). Linux lane (RimWorld,
+python): `guest` is the interesting bit -- it is the only one that can move a
+data-TLB-bound workload, and the only one that can cost real memory.
+
+2026-09-14, FEX_SMCGRANULEMIXED A/B on RimWorld Linux (`-quicktest`, a
+generated map straight into play, mtrack + lazy recipe, code cache on; driver
+`~/fex-scripts/rimworld_granule_ab.sh`, `perf stat` over the 20 s window
+starting 120 s after launch; MangoHud cannot see the GL thunk, so no fps
+column). Heuristic off (`FEX_SMCGRANULEMIXED=0`) vs on (default 64):
+page faults 879,368 vs 5,141 per window (44 K/s vs 260/s), kernel cycles
+28.3 G (8.7%) vs 17.7 G (4.9%), user instructions retired 68.6 G vs 141.7 G
+at 296 G vs 340 G user cycles (IPC 0.23 vs 0.42), task-clock 95 s vs 104 s.
+Flip reports 201 (storms for the whole lap) vs 77 with 75 demotions, none
+repeated. Guarded blocks add instructions, but retiring twice the user work
+for 15% more cycles is the off arm stalling in the fault storms and their
+granule-wide invalidations, not guard overhead. Verdict: default ON stands.
+Open: an in-game frame or tick counter for the Linux lane (the GL thunk
+needs a MangoHud path or a RimWorld-side TPS log) before a fps number is
+claimed. Found on the way: FEXServer's offline cache generation was live on
+the Linux lane (the fexplay launcher puts Bin on PATH) and spawned
+`FEXOfflineCompiler` runs at every launch (a second or two of a core each,
+per the ps sampler) for caches nobody loads; the
+client request is now opt-in (`FEX_SERVERCODECACHE=1`, e2a106ee3).
+
+2026-09-14 13:36, FEX_SMCGRANULEMIXED verdict REVERSED by the frame log.
+With `FEX_FRAMELOG` (f74dffe96) and `vblank_mode=0`, the same quicktest A/B
+measured in-world frametimes (60-220 s in, counterbalanced, 2 laps each):
+heuristic off p50 4.30 / 4.16 ms (185.8 / 159.0 fps), on p50 8.50 / 8.45 ms
+(99.7 / 100.3 fps). The per-instruction validation on the demoted code pages
+halves the main thread's throughput; the fault storms it removes land mostly
+on worker threads. The perf-stat reading earlier today ("twice the user
+instructions retired at higher IPC") was the guards, not extra work: a
+counter A/B without a frame counter is not a verdict. Default is now 0
+(off); the knob and the mechanism stay for a cheaper validation form (per
+block entry rather than per instruction) or a hotness-aware demotion.
+Next: the same fps A/B for `FEX_SMCGRANULEPOLICY=rearm`, the other way to
+narrow the storms without guarding code.
+
+2026-09-14 14:18, `FEX_SMCGRANULEPOLICY=rearm` vs default (`invalidate`),
+same frame-log A/B, five legs each alternating: default p50 medians 4.04,
+4.10, 4.13, 4.17, 4.24 ms (median 4.13); rearm 1.24, 4.18, 4.19, 4.24, 4.25
+(median 4.19; the 1.24 ms leg was a lighter random map, quicktest seeds
+differ per launch). No effect. Together with the mixed-heuristic reversal
+above: on a young quicktest colony the granule flip storms (44 K faults/s,
+~200 hot-granule reports per lap) do not bound the main thread, so neither
+way of suppressing them buys fps, and the guards actively cost it. Open
+item 2 is closed as "measured, not a bottleneck here"; the knobs stay. What
+bounds RimWorld's frame on 64K is unmeasured: the next step is a main-thread
+profile in-world (select the game with `pgrep -f "Bin/FEX .*RimWorldLinux"`,
+not `pgrep -x FEX`), and a late-game save for the load that matters.
+
+2026-09-14 14:30, CORRECTION (user caught it): every RimWorld fps number
+above was taken on the world-gen LOADING SCREEN. One long quicktest leg with
+the frame log gives the phases (seconds since launch, p50 frametime): 0-60
+menu/splash 1.2-1.4 ms; 60-210 world-gen loading screen 4.2-4.8 ms (the
+window all of today's A/Bs used); 210-240 map load, a 13 s hitch; in world
+from ~240 s at 28.6-29.3 ms (~34 fps), drifting to 31-41 ms (24-32 fps) by
+480 s as the colony ages. So: the mixed-heuristic "halves fps" and the
+"rearm no effect" verdicts are loading-screen results and are VOID for play;
+the in-world RimWorld reference on 64K is ~29 ms p50 on a fresh quicktest
+map. The driver now runs 540 s legs and reports 270-450 s only; the in-world
+A/Bs are being redone (mixed on/off first, rearm after). Lesson for the
+harness: a scene window must be located from the frame log's phase change,
+never assumed from a wall-clock offset.
+
+2026-09-14 16:10, FEX_SMCGRANULEMIXED in-world, phase-aware (the window
+starts 20 s after each leg's own map-load stall, the last frame over 5 s;
+a fixed offset mislabels because the loading screen's length depends on the
+config under test). Heuristic on: map loaded at 394 / 401 s, in-world p50
+55.2 / 54.1 ms (17.0 / 17.6 fps). Off: map loaded at 208 / 235 s, p50 23.6 /
+31.9 ms (40.6 / 26.7 fps). The guards nearly double world generation and
+halve play. Default OFF confirmed on the right window; the mechanism stays
+under its knob for a cheaper validation form. The in-world 64K reference for
+a fresh quicktest colony is 24-32 ms p50 (27-41 fps, map-dependent; quicktest
+seeds differ per launch, so four legs per arm). `rwgran-*` stats and the
+driver use this rule from now on; the rearm A/B still needs the in-world
+rerun.
+
+2026-09-14 16:43, `FEX_SMCGRANULEPOLICY=rearm` in-world, phase-aware: rearm
+p50 26.5 / 22.8 ms (35.4 / 42.2 fps), default 35.3 / 25.2 ms (30.1 / 38.1
+fps). A lean toward rearm inside the map-to-map spread; not a default change
+on two legs each. Worth a config-book row for RimWorld once a fixed-seed
+scenario exists; otherwise closed with the item.
 
 ### Morning kickoff checklist (orchestrator)
 

@@ -146,10 +146,10 @@ __attribute__((naked)) void RunComputeCtx(TestCtx* /*rdi*/) {
     mov r12, [r13 + 0x10]
     mov r15, [r13 + 0x18]
     mov r10, [r13 + 0x40]            // r10 = &flag
-  1:
+  .Lspin%=:
     mov ecx, dword ptr [r10]
     test ecx, ecx
-    jz 1b
+    jz .Lspin%=
     mov [r13 + 0x20], rax
     mov [r13 + 0x28], rbx
     mov [r13 + 0x30], r12

@@ -11,6 +11,8 @@ struct X86ContextBackup {
   uint64_t GPRs[23];
   FEXCore::x86_64::_libc_fpstate FPRState;
   uint64_t sa_mask;
+  // The guest signal mask before the delivery that built this backup.
+  uint64_t GuestSignalMask;
   uint16_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
@@ -20,9 +22,15 @@ struct X86ContextBackup {
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
+  // See PPC64ContextBackup::Cookie.
+  uint64_t Cookie;
   FEXCore::Core::CPUState GuestState;
 
   static constexpr int RedZoneSize = 128;
+  // x86-64 callers do not write above their own SP; nothing to protect.
+  static constexpr size_t LinkagePadSize = 0;
+  // See PPC64ContextBackup::ReclaimSlack.
+  static constexpr size_t ReclaimSlack = 160;
 };
 
 using ContextBackup = X86ContextBackup;

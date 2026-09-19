@@ -95,12 +95,17 @@ void Shutdown(const fextl::string& ApplicationName) {
                                   FEXCore::File::FileModes::WRITE | FEXCore::File::FileModes::CREATE | FEXCore::File::FileModes::TRUNCATE);
 
   if (File.IsValid()) {
+    // One write and no fsync. Every emulated process ends here, and in a build
+    // that is hundreds of short processes: the fsync alone measured 6-16 ms per
+    // process and one write per line 29 syscalls. A counter file lost to a host
+    // crash is not worth that; the rename above still keeps one backup.
+    fextl::string Text;
     for (size_t i = 0; i < TelemetryType::TYPE_LAST; ++i) {
       auto& Name = TelemetryNames.at(i);
       auto& Data = TelemetryValues.at(i);
-      fextl::fmt::print(File, "{}: {}\n", Name, Data.load());
+      Text += fextl::fmt::format("{}: {}\n", Name, Data.load());
     }
-    File.Flush();
+    File.Write(Text);
   }
 }
 

@@ -1311,6 +1311,10 @@ private:
   uintptr_t L1PointerMask;
 
   size_t TotalCacheSize;
+  // Bytes from PagePointer to PageMemory: the L2 page-pointer table, padded up
+  // to the THP PMD when FEX_THP=lookup aligns the reservation (else exactly
+  // VirtualMemSize / 4096 * 8).
+  size_t L2TableSpan {};
 
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.

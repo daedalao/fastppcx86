@@ -320,6 +320,8 @@ endif()
 # Meta-library to link jemalloc libraries enabled in the build configuration.
 # Only needed for targets that run emulation. For others, use JemallocDummy.
 add_library(JemallocLibs STATIC Utils/AllocatorHooks.cpp)
+# FEXCore/Utils/THP.h (header-only THP policy shared with the rpmalloc mapper).
+target_include_directories(JemallocLibs PRIVATE "${PROJECT_SOURCE_DIR}/include/")
 if (ENABLE_FEX_ALLOCATOR)
   target_compile_definitions(JemallocLibs PRIVATE ENABLE_FEX_ALLOCATOR=1)
   target_link_libraries(JemallocLibs PUBLIC rpmalloc)

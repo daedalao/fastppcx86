@@ -3,6 +3,7 @@
 #include "Common/Config.h"
 #include "FDUtils.h"
 #include "Common/FEXServerClient.h"
+#include "Common/FileFormatCheck.h"
 
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/FileLoading.h>
@@ -13,6 +14,8 @@
 #include <FEXHeaderUtils/Filesystem.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <linux/limits.h>
@@ -197,7 +200,7 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
       LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketName, errno);
     }
   } else {
-    return SocketFD;
+    return FEX::MoveFDOutOfGuestRange(SocketFD);
   }
 #endif
 
@@ -214,7 +217,7 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
       LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketPath, errno);
     }
   } else {
-    return SocketFD;
+    return FEX::MoveFDOutOfGuestRange(SocketFD);
   }
 
   close(SocketFD);
@@ -230,6 +233,7 @@ bool SetupClient(std::string_view InterpreterPath) {
   // If we were started in a container then we want to use the rootfs that they provided.
   // In the pressure-vessel case this is a combination of our rootfs and the steam soldier runtime.
   if (FEXCore::Config::FindContainer() != "pressure-vessel") {
+    FEX_CONFIG_OPT(LDPath, ROOTFS);
     fextl::string RootFSPath = FEXServerClient::RequestRootFSPath(ServerFD);
 
     // Only overwrite the configured rootfs if the server returned a non-empty path. An empty response
@@ -237,7 +241,11 @@ bool SetupClient(std::string_view InterpreterPath) {
     // and clobbering CONFIG_ROOTFS with "" makes every subsequent guest ELF fail to load.
     if (!RootFSPath.empty()) {
       FEXCore::Config::Set(FEXCore::Config::CONFIG_ROOTFS, RootFSPath);
-    } else {
+    } else if (FEX::FormatCheck::IsSquashFS(LDPath()) || FEX::FormatCheck::IsEroFS(LDPath())) {
+      // Only an error when the configured rootfs is an image the server should
+      // have mounted. With no rootfs (static programs) or a directory, an empty
+      // answer is normal; logging it at error level would print it after every
+      // guest that exits with a nonzero status.
       LogMan::Msg::EFmt("FEXServer returned empty rootfs path; keeping configured value");
     }
   }
@@ -305,10 +313,14 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
       uint64_t error {1};
       write(fds[1], &error, sizeof(error));
 
-      // Give a hopefully helpful error message for users
-      LogMan::Msg::EFmt("Couldn't execute: {}", argv[0]);
-      LogMan::Msg::EFmt("This means the squashFS rootfs won't be mounted.");
-      LogMan::Msg::EFmt("Expect errors!");
+      // Give a hopefully helpful error message for users. Straight to stderr:
+      // this child exits right away, so a message the log handler holds until
+      // the log destination is known would be lost with it, and the parent
+      // fails client setup, so the guest never runs.
+      fextl::fmt::print(stderr, "E Couldn't execute: {}\n", argv[0]);
+      fextl::fmt::print(stderr, "E This means the squashFS rootfs won't be mounted.\n");
+      fextl::fmt::print(stderr, "E Expect errors!\n");
+      fflush(stderr);
       // Destroy this fork
       exit(1);
     }
@@ -336,14 +348,24 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
       return -1;
     }
 
-    for (size_t i = 0; i < 5; ++i) {
-      LocalServerFD = ConnectToServer(ConnectionOption::Default);
+    // The pipe also closes when the child loses the lock to a server another
+    // client started at the same moment; that server may not be listening yet.
+    // Refused and missing sockets are expected until it is, so retry quietly
+    // with a short backoff (up to about 5 s in total) instead of logging each
+    // miss and sleeping a whole second.
+    auto Delay = std::chrono::milliseconds(1);
+    auto Waited = std::chrono::milliseconds(0);
+    const auto Limit = std::chrono::milliseconds(5000);
+    for (;;) {
+      LocalServerFD = ConnectToServer(ConnectionOption::NoPrintConnectionError);
 
-      if (LocalServerFD != -1) {
+      if (LocalServerFD != -1 || Waited >= Limit) {
         break;
       }
 
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      std::this_thread::sleep_for(Delay);
+      Waited += Delay;
+      Delay = std::min(Delay * 2, std::chrono::milliseconds(100));
     }
 
     if (LocalServerFD == -1) {
@@ -380,7 +402,7 @@ void RequestServerKill(int ServerSocket) {
 }
 
 int RequestLogFD(int ServerSocket) {
-  return RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_LOG_FD);
+  return FEX::MoveFDOutOfGuestRange(RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_LOG_FD));
 }
 
 fextl::string RequestRootFSPath(int ServerSocket) {

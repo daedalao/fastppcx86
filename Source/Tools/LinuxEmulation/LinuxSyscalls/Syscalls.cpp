@@ -485,9 +485,18 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
       Filename = pathname;
     }
 
-    bool exists = FHU::Filesystem::Exists(Filename);
-    if (!exists) {
-      return -ENOENT;
+    // The kernel's order (do_open_execat): lookup errors (ENOENT, ENOTDIR,
+    // ELOOP, ...), then EACCES for anything but a regular file or without
+    // execute permission. Only after that does the format matter (ENOEXEC).
+    struct stat ExecStat {};
+    if (stat(Filename.c_str(), &ExecStat) == -1) {
+      return -errno;
+    }
+    if (!S_ISREG(ExecStat.st_mode)) {
+      return -EACCES;
+    }
+    if (faccessat(AT_FDCWD, Filename.c_str(), X_OK, AT_EACCESS) == -1) {
+      return -errno;
     }
 
     int pid = getpid();
@@ -511,6 +520,20 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   const bool IsShebang = !ShebangInterpreter.empty();
   if (IsShebang) {
     InterpreterType = ELFLoader::ELFContainer::GetELFType(ShebangInterpreter);
+  }
+
+  if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE && !IsFDExec) {
+    // A script whose interpreter can't be found: binfmt_script fails to open
+    // the interpreter, which is ENOENT, not ENOEXEC.
+    char Magic[2] {};
+    int FD = open(Filename.c_str(), O_RDONLY | O_CLOEXEC);
+    if (FD != -1) {
+      const bool IsScript = pread(FD, Magic, sizeof(Magic), 0) == sizeof(Magic) && Magic[0] == '#' && Magic[1] == '!';
+      close(FD);
+      if (IsScript) {
+        return -ENOENT;
+      }
+    }
   }
 
   if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE) {
@@ -648,6 +671,7 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   }
 
   if (IsBinfmtCompatible || IsOtherELF || IsForeignShebang) {
+    FEX::HLE::VForkChildSync();
     Result = ::syscall(SYS_execveat, Args.dirfd, Filename.c_str(), argv, EnvpPtr, Args.flags);
     CloseSeccompFD();
     CloseFDExecFD();
@@ -671,30 +695,60 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   const char NullString[] = "";
   fextl::vector<const char*> ExecveArgs = SyscallHandler->GetCodeLoader()->GetExecveArguments();
 
-  if (argv) {
-    // Overwrite the filename with the new one we are redirecting to
-    ExecveArgs.emplace_back(Filename.c_str());
+  // The loader takes the program to load as its first argument. The kernel
+  // hands an ELF the argv it was given, argv[0] included (multi-call binaries
+  // like busybox dispatch on it), while a script's argv[0] is replaced by the
+  // interpreter and the script path. So for an ELF the guest's argv[0] is
+  // passed after the program path, and the loader drops the path: through
+  // FEX_EXECVEARGV0 for a path exec, and implicitly for an FD exec, where the
+  // loader already skips its first argument.
+  const bool PreserveArgv0 = !IsShebang;
+  fextl::string PreserveArgv0Env;
 
-    auto OldArgv = argv;
+  // Overwrite the filename with the new one we are redirecting to
+  ExecveArgs.emplace_back(Filename.c_str());
 
-    // It is valid to provide nullptr first argument.
-    if (*OldArgv) {
-      // Skip filename argument
-      ++OldArgv;
-      while (*OldArgv) {
-        // Append the arguments together
-        ExecveArgs.emplace_back(*OldArgv);
-        ++OldArgv;
-      }
-    } else {
-      // Linux kernel will stick an empty argument in to the argv list if none are provided.
-      ExecveArgs.emplace_back(NullString);
+  // It is valid to provide a NULL or empty argv. Linux sticks an empty
+  // argument in to the argv list if none are provided.
+  auto OldArgv = argv;
+  if (OldArgv && *OldArgv) {
+    if (PreserveArgv0) {
+      ExecveArgs.emplace_back(*OldArgv);
     }
-
-    // Emplace nullptr at the end to stop
-    ExecveArgs.emplace_back(nullptr);
+    // Skip filename argument
+    ++OldArgv;
+    while (*OldArgv) {
+      // Append the arguments together
+      ExecveArgs.emplace_back(*OldArgv);
+      ++OldArgv;
+    }
+  } else {
+    ExecveArgs.emplace_back(NullString);
   }
 
+  // Emplace nullptr at the end to stop
+  ExecveArgs.emplace_back(nullptr);
+
+  if (PreserveArgv0 && !IsFDExec) {
+    // Key this on NeedsEnvpCopy, not on pointer identity: a guest execve with
+    // envp == NULL and no copy leaves both EnvpPtr and EnvpArgs.data() null,
+    // and the pop_back below would then underflow an empty vector.
+    if (!NeedsEnvpCopy) {
+      EnvpArgs.clear();
+      for (auto OldEnvp = envp; OldEnvp && *OldEnvp; ++OldEnvp) {
+        EnvpArgs.emplace_back(*OldEnvp);
+      }
+    } else {
+      // Drop the terminator; it is added back below.
+      EnvpArgs.pop_back();
+    }
+    PreserveArgv0Env = "FEX_EXECVEARGV0=1";
+    EnvpArgs.emplace_back(PreserveArgv0Env.data());
+    EnvpArgs.emplace_back(nullptr);
+    EnvpPtr = const_cast<char* const*>(EnvpArgs.data());
+  }
+
+  FEX::HLE::VForkChildSync();
   Result = ::syscall(SYS_execveat, Args.dirfd, "/proc/self/exe", const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
   CloseSeccompFD();
   CloseFDExecFD();
@@ -1045,14 +1099,9 @@ uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Ad
     // Allocating out data space
     uint64_t NewEnd = reinterpret_cast<uint64_t>(Addr);
     if (NewEnd < DataSpace) {
-      // Not allowed to move brk end below original start
-      // Set the size to zero
-      DataSpaceSize = 0;
-
-      // Munmap the whole space.
-      [[maybe_unused]] auto ok = GuestMunmap(Frame->Thread, reinterpret_cast<void*>(DataSpace), DataSpaceMappedSize);
-      LOGMAN_THROW_A_FMT(ok != -1, "Munmap failed");
-      DataSpaceMappedSize = 0;
+      // mm/mmap.c brk: a break below the start of the data segment is refused
+      // and the current break is returned, with nothing unmapped. This used to
+      // unmap the whole break area, taking a live malloc heap with it.
     } else {
       uint64_t NewSize = NewEnd - DataSpace;
       // HOST: DataSpaceMappedSize describes real mappings, so the emulated break
@@ -1407,6 +1456,17 @@ uint64_t SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXC
 #endif
 }
 
+// See the FEX_HOSTFAULT_INJECT comment in HandleSyscallImpl. Resolved once at
+// load so the per-syscall check is a compare against a constant.
+static const uint64_t HostFaultInjectSyscall = [] {
+  const char* Env = getenv("FEX_HOSTFAULT_INJECT");
+  return (Env && *Env) ? strtoull(Env, nullptr, 0) : ~0ull;
+}();
+static const bool HostFaultInjectSegv = [] {
+  const char* Env = getenv("FEX_HOSTFAULT_INJECT");
+  return Env && strstr(Env, ",segv") != nullptr;
+}();
+
 uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args, uint64_t JITPC) {
   // Phase 3 of signal-cluster fix: defer async signals across the entire
   // host syscall body. Background:
@@ -1440,6 +1500,21 @@ uint64_t SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, 
   // fault correctly. This Phase 3 closes the loop by actually arming the guard
   // at the right scope.
   FEXCore::DeferredSignalRefCountGuard SignalGuard(Frame->Thread);
+
+  // FEX_HOSTFAULT_INJECT=<guest syscall nr>[,segv]: test hook for the
+  // SignalDelegator host-fault gate. Raises a fault in FEX's own host code,
+  // inside this deferred-signal section, whenever the guest makes that
+  // syscall: a `trap` (SIGTRAP, the shape of every FEX assert) or, with
+  // ",segv", a store through a null pointer (SIGSEGV). unittests/FEXLinuxTests
+  // signal/hostfault_gate.cpp drives it with getppid. One load and one
+  // predictable compare per syscall when unset.
+  if (Args->Argument[0] == HostFaultInjectSyscall) [[unlikely]] {
+    if (HostFaultInjectSegv) {
+      *reinterpret_cast<volatile uint32_t*>(8) = 0;
+    } else {
+      FEX_TRAP_EXECUTION;
+    }
+  }
 
   // FEX_SMCLAZYINVAL drain point (b): guest syscall entry.
   //
