@@ -246,7 +246,12 @@ Design P1 then P2, in the design's break-first order.
    (4K literal) and the 32-bit pool in `ThunkLibs/include/common/Host.h`.
 6. Register binfmt on the 64K boot pointing at `build-smc/Bin/FEX` once
    Steam launches; flip `FEX_HOSTPAGEMODE` default to `degrade`
-   (auto-forces `SMCCHECKS=full` on 64K until S5).
+   (auto-forces `SMCCHECKS=full` on 64K until S5). DONE 2026-10-09, as
+   `force` not `degrade`: `HostPageMode` defaults to `force` in the config
+   layer and in every tool's `CheckHostPageSize` default, silently. Trigger:
+   an agent ran `hermesc` through binfmt from a shell without the export and
+   the gate's trap surfaced in dmesg as `unhandled trap (5) ... in FEX[...]`,
+   which reads like a JIT fault and is not one. `abort` stays selectable.
 
 Verification: ctest on 64K approaches the 4K count (the 11291 figure will
 not be matched exactly; mremap/clock_getres kernel-drift XFAILs already

@@ -36,7 +36,7 @@ game's environment.
 
 | Setting | Value | Why |
 |---|---|---|
-| `FEX_HOSTPAGEMODE` | `force` | Run the 4K memory-tracking (mtrack) configuration on a 64K host. The default for FEXInterpreter lanes would otherwise abort. |
+| `FEX_HOSTPAGEMODE` | `force` | Run the 4K memory-tracking (mtrack) configuration on a 64K host. This IS the built-in default since 2026-10-09 (it was `abort`); exporting it is harmless and keeps old scripts working. |
 | `FEX_ENABLECODECACHINGWIP` | `1` | Persistent x86→ppc64le translation cache. The host page size is part of the cache identity, so 64K and 4K caches never collide. |
 | `FEX_CODECACHESCOPE` | `all` | Generate and load the cache. |
 | `PROTON_NO_NTSYNC` | `1` | Full-emulation lane only. ntsync under full emulation is an open wedge on 64K; leave it off there. The native-wine lane keeps ntsync. |

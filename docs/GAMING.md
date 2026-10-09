@@ -55,11 +55,12 @@ survives being copied to another machine.
 
 ## Prerequisites
 
-**A 4K-page kernel.** The self-modifying-code tracker (`SMCChecks=mtrack`, the default)
-write-protects guest pages at a fixed 4K granularity, matching the `AT_PAGESZ=4096` the guest is
-told. On a host booted with 64K pages, mtrack misbehaves or aborts. Boot a 4K kernel, or run
-everything with `FEX_SMCCHECKS=full`, which validates code before every run and is much slower.
-Check with `getconf PAGESIZE`.
+**A 64K-page kernel.** The 64K kernel is the production
+configuration: every recipe in this guide and in `docs/PLAYBOOK_64K.md` was validated there, and
+4K kernels are no longer measured or supported as a target. The self-modifying-code tracker
+(`SMCChecks=mtrack`, the default) tracks the guest's 4K pages on top of 64K host granules. The
+`FEX` launcher continues on a 64K host by default (`HostPageMode=force` since 2026-10-09; the
+playbook lists the rest of the 64K baseline). Check the page size with `getconf PAGESIZE`.
 
 **An x86-64 root filesystem.** Everything the guest links against (glibc, SDL, libX11, Mesa's
 guest-side stubs) comes from the rootfs, not from the host. `FEXRootFSFetcher` downloads a

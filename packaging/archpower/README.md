@@ -27,15 +27,14 @@ architecture name is `powerpc64le`.
 
 `makedepends` in the PKGBUILD is the authoritative list.
 
-### 4K page kernel
+### Page size
 
-The SMC (self-modifying-code) `mtrack` path, which is what makes Mono/Unity
-titles usable, needs a 4 KiB page-size kernel. Arch POWER's stock kernel builds
-exist in both 4K and 64K page flavours; check with `getconf PAGESIZE` (must
-print `4096`). On a 64K-page kernel the emulator still runs but must fall back
-to `SMCChecks=full`, which validates code before every run and is much slower.
-
-The package itself builds on either; this only affects runtime behaviour.
+The 64K-page kernel is the production target since 2026-09-14; Arch POWER's
+stock 64K kernel is the one everything is validated on, and 4K kernels are no
+longer measured. The package builds identically on either. At runtime the `FEX`
+launcher continues on a 64K host by default (`HostPageMode=force` since
+2026-10-09; nothing to export -- the full 64K baseline is in
+`docs/PLAYBOOK_64K.md`). Check with `getconf PAGESIZE`.
 
 ## Building
 

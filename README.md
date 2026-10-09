@@ -10,29 +10,33 @@ split-lock handling) and the self-modifying-code subsystem are written for POWER
   gated behind runtime feature detection, not assumed.
 - **POWER9 hosts are supported** and get additional codegen improvements where the ISA allows it,
   but nothing requires POWER9.
-- **Host page size: 4K and 64K kernels, one binary.** The guest is always told `AT_PAGESZ=4096`;
-  the host page size is a runtime quantity (`FEXCore::HostPage`), read once at start-up. On a 64K
-  ppc64le kernel the port emulates the guest's 4K view on top of 64K host granules:
+- **Host page size: 64K is the production kernel.** Development, benchmarking and every
+  game verdict since 2026-09-14 are on a 64K-page ppc64le kernel, which is what Fedora and the
+  Arch POWER 64K kernel boot by default. 4K-page kernels are no longer a target: the binary still
+  runs there, but nothing is measured or validated on 4K any more. The guest is always told
+  `AT_PAGESZ=4096`; the host page size is a runtime quantity (`FEXCore::HostPage`), read once at
+  start-up, and the port emulates the guest's 4K view on top of 64K host granules:
   - the ELF loader and the guest `mmap`/`munmap`/`mprotect`/`mremap` family map, copy or protect
     whole host granules and keep a per-guest-page table of what the guest intended
     (`docs/PAGE_SIZE_64K_PLAN.md` §2, the *permissive tier*: a protection stricter than the
     granule union is tracked but not enforced, so a 4K guard page inside a live granule does not
     fault);
   - `mincore`/`msync`/`madvise` and `/proc/self/maps` answer at guest granularity from that table;
-  - mtrack SMC write-protects whole granules and invalidates every tracked guest page in a granule
-    it opens (`docs/PAGE_SIZE_64K_PLAN.md` §5). Mixed code/data granules thrash; `FEX_SMCGRANULEFLIPLOG`
-    reports them and `FEX_HOSTPAGEMODE=degrade` switches to hash-checked SMC instead.
+  - mtrack SMC (`SMCChecks=mtrack`, the default) write-protects whole granules and invalidates
+    every tracked guest page in a granule it opens (`docs/PAGE_SIZE_64K_PLAN.md` §5).
+    `FEX_SMCGRANULEFLIPLOG` reports granules that thrash; `FEX_HOSTPAGEMODE=degrade` switches to
+    hash-checked SMC instead.
   - Wine's native ppc64le build (`wine-ppc64le`, the `nw` lane) does its own 64K handling and the
     bridge lane needs none of the above.
 
-  The 64K lane is new (2026-09-11): The Witcher 3, Cyberpunk 2077, RimWorld and Portal 2 (32-bit,
-  2026-09-12) run through the native-wine lane, and Linux-native guests load and run. `FEX_HOSTPAGEMODE` (`abort`, the default
-  for the FEX launcher; `degrade`; `force`) gates a non-4K host. Status, measurements and open items:
-  [`docs/PAGE_SIZE_64K_EXECUTION.md`](docs/PAGE_SIZE_64K_EXECUTION.md); design:
+  **A 64K host needs no setting**: `HostPageMode` defaults to `force` in every lane since
+  2026-10-09 (it was `abort`, which refused to start without an export). The full set of 64K
+  launch defaults is in [`docs/PLAYBOOK_64K.md`](docs/PLAYBOOK_64K.md). Status, measurements and
+  open items: [`docs/PAGE_SIZE_64K_EXECUTION.md`](docs/PAGE_SIZE_64K_EXECUTION.md); design:
   [`docs/PAGE_SIZE_64K_PLAN.md`](docs/PAGE_SIZE_64K_PLAN.md); site audit:
   [`docs/PAGE_SIZE_AUDIT.md`](docs/PAGE_SIZE_AUDIT.md). The bundled `jemalloc_glibc` is compiled
-  for a 64K page (`LG_PAGE 16`) so that one build serves both kernels; a 64K-page host
-  needs `x86_64-pc-linux-gnu-gcc` for the thunk generator like any other.
+  for a 64K page (`LG_PAGE 16`); a 64K-page host needs `x86_64-pc-linux-gnu-gcc` for the thunk
+  generator like any other.
 
 ## Documentation
 
@@ -278,8 +282,8 @@ are off by default and must be opted into (globally or per-app).
 
 | Flag | Type (default) | Fork? | Description |
 |---|---|---|---|
-| `SMCChecks` | uint8 (mtrack) | | Base SMC detection mode: `none` (no checks), `mtrack` (page-tracking-based invalidation, default), `full` (validate code before every run; slow, and the correctness fallback on a 64K-page host where mtrack thrashes on mixed code/data granules). |
-| `HostPageMode` | string (abort) | **Fork** | What to do on a host whose page is larger than the guest's 4K: `abort` (default for the `FEX` launcher: refuse with an explanation), `degrade` (continue and force `SMCChecks=full`), `force` (continue, force nothing). FexBridge defaults to `force`: in the native-wine lane Wine owns every guest mapping. Env `FEX_HOSTPAGEMODE`; `FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1` is an alias for `force`. |
+| `SMCChecks` | uint8 (mtrack) | | Base SMC detection mode: `none` (no checks), `mtrack` (page-tracking-based invalidation, default), `full` (validate code before every run; slow; what `HostPageMode=degrade` selects for a guest whose mixed code/data granules thrash under mtrack). |
+| `HostPageMode` | string (force) | **Fork** | What to do on a host whose page is larger than the guest's 4K: `force` (default: continue with the configured `SMCChecks`; **the production setting on the 64K kernel**, see `docs/PLAYBOOK_64K.md`), `degrade` (continue and force `SMCChecks=full`), `abort` (refuse with an explanation; the default before 2026-10-09). FexBridge defaults to `force`: in the native-wine lane Wine owns every guest mapping. Env `FEX_HOSTPAGEMODE`; `FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1` is an alias for `force`. |
 | `FEX_SMCGRANULEPOLICY` | env (invalidate) | **Fork** | 64K hosts only. What happens to the tracked siblings of a faulting guest page when mtrack opens a granule: `invalidate` (sound: the invalidation is widened to the granule) or `rearm` (unsound measurement mode: invalidate the page, soft-invalidate the granule at the next drain). |
 | `FEX_SMCGRANULEFLIPLOG` | env (64) | **Fork** | 64K hosts only. Faults per granule per second above which one rate-limited line names the granule and its tracked-page count; `0` disables. |
 | `SMCSoftInvalidate` | bool (false) | **Fork** | On an SMC write fault, soft-invalidate the page's blocks (unlink from lookup caches, sever inbound links) but keep the compiled code and a hash of its source bytes instead of discarding it. The next dispatch re-hashes and relinks if unchanged; only genuinely modified blocks recompile. |

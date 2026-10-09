@@ -16,18 +16,23 @@ namespace FEX::HostPageGate {
  *
  * FEX's guest contract is AT_PAGESZ=4096 and that never changes. What changes
  * with the host kernel is the granularity real mmap/mprotect/munmap demand, and
- * the port that makes that a runtime quantity is staged (docs/PAGE_SIZE_64K_PLAN.md,
- * docs/PAGE_SIZE_64K_EXECUTION.md). Until the guest memory syscalls and mtrack
- * are granule-aware (stages S4/S5), a host page larger than 4096 is not a
- * supported configuration, and the failure modes are silent: deferred signals
- * that never arm and a guest that hangs with no diagnostic.
+ * the port that makes that a runtime quantity is done (docs/PAGE_SIZE_64K_PLAN.md,
+ * docs/PAGE_SIZE_64K_EXECUTION.md): the guest memory syscalls and mtrack are
+ * granule-aware, and the 64K-page kernel is the production host (2026-09-21).
  *
- * FEX_HOSTPAGEMODE selects what happens on such a host:
- *   abort   (default) - explain and refuse to start.
+ * FEX_HOSTPAGEMODE selects what happens on a host page larger than 4096:
+ *   force   (default) - continue with the configured SMCChecks, silently.
+ *                       Until 2026-10-09 the launcher's
+ *                       default was abort and every 64K user had to export
+ *                       FEX_HOSTPAGEMODE=force; a binfmt launch from a shell
+ *                       without that export (hermesc, 2026-10-09) died on the
+ *                       gate's trap, which the kernel reports as "unhandled
+ *                       trap (5) ... in FEX[...]" -- this was never a JIT fault.
  *   degrade           - continue, and force SMCChecks=full, which is the
  *                       correctness fallback that does not depend on host-page
  *                       protection granularity. Log the relaxed contract once.
- *   force             - continue, force nothing. For bring-up work.
+ *   abort             - explain and refuse to start. The old default, kept as
+ *                       a lever for proving a lane was never run on a large page.
  *
  * FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 is kept as an alias for `force`.
  *
@@ -80,16 +85,16 @@ inline Mode GetMode(bool ConfigAvailable, Mode DefaultMode, bool* Explicit) {
 /**
  * @brief Call first thing in every tool that hosts guest code.
  *
- * No-op on a 4K host, which is every path the shipping build takes today.
+ * No-op on a 4K host.
  *
- * DefaultMode applies when neither config nor environment says otherwise. The
- * FEX launcher keeps Abort: the Linux syscall lane still has the loader,
- * guest-mmap and mtrack gaps. FexBridge passes Force: in the bridge lane Wine
- * does every guest mapping itself, host-granular, and the bridge forces
- * SMCChecks off in favour of Wine's explicit invalidation, so none of the
- * remaining gaps applies -- the stage-S2 fixes are the whole requirement.
+ * DefaultMode applies when neither config nor environment says otherwise, i.e.
+ * only for a caller that passes ConfigAvailable=false (the config layer's own
+ * default is force). Every tool defaults to Force: the Linux syscall lane
+ * emulates the 4K contract through the granule table, and in the bridge lane
+ * Wine does every guest mapping itself, host-granular, with SMCChecks forced
+ * off in favour of Wine's explicit invalidation.
  */
-inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = Mode::Abort) {
+inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = Mode::Force) {
   const long HostPageSize = ::sysconf(_SC_PAGESIZE);
   if (HostPageSize <= 0 || static_cast<uint64_t>(HostPageSize) == FEXCore::Utils::FEX_GUEST_PAGE_SIZE) {
     // Either the expected 4K host, or sysconf failed and there is nothing
@@ -101,10 +106,13 @@ inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = M
   bool Explicit = false;
   const Mode SelectedMode = GetMode(ConfigAvailable, DefaultMode, &Explicit);
 
-  if (!Explicit && SelectedMode == Mode::Force) {
-    // The caller vouched for this lane: one line, not the bring-up banner.
-    fextl::fmt::print(stderr, "FEX: host page size is {} (guest page {}); this lane is host-granular, continuing.\n",
-                      HostPageSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
+  if (SelectedMode == Mode::Force) {
+    // The production configuration: silent. Every guest exec (each binfmt
+    // launch, every process a title spawns) passes through here, so a notice
+    // would be a per-process stderr line on the only host we run. Explicit or
+    // not makes no difference -- the config layer's default IS force, so a
+    // config read always looks explicit.
+    (void)Explicit;
     return;
   }
 
@@ -121,9 +129,9 @@ inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = M
                     "This is tested on the gaming lanes but not proven for every guest; a guest that\n"
                     "depends on sub-granule faults (GC write barriers, guard pages) may misbehave.\n"
                     "\n"
-                    "FEX_HOSTPAGEMODE=abort (default) refuses to start; =force continues with the\n"
-                    "configured SMCChecks (recommended: mtrack, the 4K configuration); =degrade\n"
-                    "continues and forces SMCChecks=full, which is several times slower.\n",
+                    "FEX_HOSTPAGEMODE=force (default) continues with the configured SMCChecks\n"
+                    "(recommended: mtrack); =degrade continues and forces SMCChecks=full, which is\n"
+                    "several times slower; =abort refuses to start.\n",
                     SelectedMode == Mode::Abort ? "FATAL" : "WARNING", HostPageSize, FEXCore::Utils::FEX_GUEST_PAGE_SIZE);
 
   switch (SelectedMode) {
@@ -139,15 +147,12 @@ inline void CheckHostPageSize(bool ConfigAvailable = false, Mode DefaultMode = M
                               "page are tracked but not enforced, sub-page guard pages do not fault, and freed\n"
                               "sub-page memory stays resident. Do not report performance numbers from this mode.\n");
     return;
-  case Mode::Force:
-    fextl::fmt::print(stderr, "FEX: FEX_HOSTPAGEMODE=force -- continuing, forcing nothing. This is a bring-up aid\n"
-                              "for working on host-page-size support, not a supported configuration.\n");
-    return;
+  case Mode::Force: // handled above
   case Mode::Abort:
   default: break;
   }
 
-  fextl::fmt::print(stderr, "\nSet FEX_HOSTPAGEMODE=degrade (or =force) to continue anyway.\n");
+  fextl::fmt::print(stderr, "\nFEX_HOSTPAGEMODE=abort was set explicitly; unset it, or set =force/=degrade, to continue.\n");
   FEX_TRAP_EXECUTION;
 }
 } // namespace FEX::HostPageGate

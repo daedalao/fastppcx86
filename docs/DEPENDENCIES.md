@@ -178,7 +178,9 @@ cmake -S . -B build -GNinja \
 
 - **ppc64le.** `CMakeLists.txt:138` rejects other processors. x86-64 hosts need
   `ENABLE_X86_HOST_DEBUG=True` and are debug-only.
-- **4K-page kernel** for `SMCChecks=mtrack`. See the note in `README.md`.
+- **Page size.** 64K-page kernels are the production target; the build is identical on 4K.
+  At runtime a 64K host needs no setting: `HostPageMode` defaults to `force` (see
+  `README.md` and `docs/PLAYBOOK_64K.md`).
 - `TUNE_CPU` defaults to `native`, which bakes `-march=native` into the binary. Set
   `-DTUNE_CPU=none` for anything another machine will run.
 - `BUILD_TESTS=False` is not enough to skip tests — `unittests/` is gated on

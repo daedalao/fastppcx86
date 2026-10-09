@@ -1280,7 +1280,9 @@ static int process_init_common(bool Is64, uint64_t ExitPage) {
   // Host page size gate (64K port). Config is up by this point, so HostPageMode and the
   // degrade-mode SMCChecks forcing both work. Bridge lane: Wine owns every guest
   // mapping (host-granular) and SMCChecks is forced off above, so a larger host page
-  // needs only the stage-S2 fixes -- default to continuing. FEX_HOSTPAGEMODE overrides.
+  // needs only the stage-S2 fixes. Force is now the default everywhere (2026-10-09);
+  // this explicit pass is kept so the bridge lane stays Force even if the config
+  // default moves again. FEX_HOSTPAGEMODE overrides.
   FEX::HostPageGate::CheckHostPageSize(true, FEX::HostPageGate::Mode::Force);
   // FEX_THP / FEX_THPLOG are read raw from the environment (FEXCore/Utils/THP.h),
   // same as every other knob in this lane. Wine exits through the host's exit(),

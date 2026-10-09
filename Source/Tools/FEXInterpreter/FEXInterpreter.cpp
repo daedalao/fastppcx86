@@ -621,7 +621,8 @@ int main(int argc, char** argv, char** const envp) {
   // Host-page-size gate (64K port). Config is loaded and merged, and nothing
   // downstream exists yet: no context (CreateNewContext below caches SMCChecks
   // at construction, which is why degrade-mode forcing has to happen HERE), no
-  // thread state, no guest mapping, no compiled code. Refusing is still clean.
+  // thread state, no guest mapping, no compiled code. Refusing (HostPageMode=abort,
+  // no longer the default since 2026-10-09) is still clean here.
   FEX::HostPageGate::CheckHostPageSize(true);
 
   // THP policy (FEX_THP / FEX_THPLOG, FEXCore/Utils/THP.h). The merged config

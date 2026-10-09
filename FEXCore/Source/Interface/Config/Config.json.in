@@ -536,17 +536,18 @@
       },
       "HostPageMode": {
         "Type": "str",
-        "Default": "abort",
+        "Default": "force",
         "Desc": [
           "What to do when the HOST kernel's page size is larger than the 4096 the",
-          "x86 guest is handed through AT_PAGESZ. See docs/PAGE_SIZE_64K_PLAN.md.",
-          "\tabort (default): explain and refuse to start. The unsupported-host",
-          "\t     failure modes are silent (deferred signals that never arm, a guest",
-          "\t     that hangs with no diagnostic), so refusing is the safe answer.",
+          "x86 guest is handed through AT_PAGESZ. See docs/PAGE_SIZE_64K_EXECUTION.md.",
+          "\tforce (default): continue with the configured SMCChecks. The 64K-page",
+          "\t     kernel is the production host (2026-09-21); the guest's 4K contract",
+          "\t     is emulated on top of the larger host page by the granule table.",
           "\tdegrade: continue, and force SMCChecks=full -- the one SMC mode whose",
           "\t     correctness does not depend on host protection granularity matching",
-          "\t     the guest's. Relaxed-correctness contract, logged once.",
-          "\tforce: continue and force nothing. Bring-up aid only.",
+          "\t     the guest's. Diagnostic tier, several times slower, logged once.",
+          "\tabort: explain and refuse to start. The pre-09-21 default, kept as a",
+          "\t     lever for proving a lane was never run on a large host page.",
           "FEX_ALLOW_UNSUPPORTED_PAGE_SIZE=1 is kept as an alias for force.",
           "No effect at all on a 4K host."
         ]
